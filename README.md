@@ -14,24 +14,24 @@ cd /opt && sudo git clone git@github.com:Five-Nines-io/Five-nines-client.git fiv
 sudo python3 -m venv five_nines_client/venv && sudo five_nines_client/venv/bin/pip3 install -r requirements.txt
 ```
 
-2 - Copy the service file
+3 - Copy the service file
 
 ```
 sudo cp /opt/five_nines_client/five-nines-client.service /etc/systemd/system/
 ```
 
-3 - Reload the service files to include the five-nines-client service
+4 - Reload the service files to include the five-nines-client service
 
 ```
 sudo systemctl daemon-reload
 ```
 
-4 - Enable five-nines-client service on every reboot
+5 - Enable five-nines-client service on every reboot
 ```
 sudo systemctl enable five-nines-client.service
 ```
 
-5 - Start the five-nines-client
+6 - Start the five-nines-client
 ```
 sudo systemctl start five-nines-client
 ```
