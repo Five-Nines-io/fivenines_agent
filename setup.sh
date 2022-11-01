@@ -18,7 +18,7 @@ sudo five_nines_client/venv/bin/pip3 install -r requirements.txt
 # Copy the service file
 sudo cp /opt/five_nines_client/five-nines-client.service /etc/systemd/system/
 
-# Reload the service files
+# Reload the service files to include the five-nines-client service
 sudo systemctl daemon-reload
 
 # Enable five-nines-client service on every reboot
