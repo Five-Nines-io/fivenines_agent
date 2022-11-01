@@ -1,11 +1,12 @@
 #!/bin/bash
 
-# Save the server token
+# Check that token is parameter is present
 if [ $# -eq 0 ] ; then
   echo 'Usage: ./setup.sh SERVER_TOKEN'
   exit 1
 fi
 
+# Save the server token
 echo -n "$1" > TOKEN
 
 # Generate the environment
