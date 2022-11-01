@@ -1,7 +1,6 @@
 #!/bin/bash
 
 # Save the server token
-
 if [ $# -eq 0 ] ; then
   echo 'Usage: ./setup.sh SERVER_TOKEN'
   exit 1
