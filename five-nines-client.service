@@ -1,0 +1,14 @@
+[Unit]
+Description=Small and powerful server monitoring tool
+
+[Service]
+Type=notify
+User=root
+WorkingDirectory=/opt/five_nines_client
+ExecStart=/bin/bash -c 'source five_nines/bin/activate && pip3 install -r requirements.txt && python3 client.py TOKEN'
+RestartSec=1
+Restart=alwys
+WatchdogSec=30
+
+[Install]
+WantedBy=multi-user.target
