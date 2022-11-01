@@ -6,58 +6,29 @@ This client collects server metrics and send it to the [Five nines](https://five
 
 1 - Clone this repository to the `/opt` folder
 ```
-cd /opt && sudo git clone git@github.com:Five-Nines-io/Five-nines-client.git five_nines_client
+git clone git@github.com:Five-Nines-io/Five-nines-client.git /opt/five_nines_client
 ```
 
-2 - Install dependencies
+2 - Setup the client
 ```
-sudo python3 -m venv five_nines_client/venv && sudo five_nines_client/venv/bin/pip3 install -r requirements.txt
-```
-
-3 - Copy the service file
-
-```
-sudo cp /opt/five_nines_client/five-nines-client.service /etc/systemd/system/
+cd /opt/five_nines_client && ./install.sh TOKEN
 ```
 
-4 - Reload the service files to include the five-nines-client service
-
+3 - Check that the client is running
 ```
-sudo systemctl daemon-reload
-```
-
-5 - Enable five-nines-client service on every reboot
-```
-sudo systemctl enable five-nines-client.service
-```
-
-6 - Start the five-nines-client
-```
-sudo systemctl start five-nines-client
+sudo systemctl status five-nines-client
 ```
 
 ## Update
 
-1 - Fetch the latest client version
+1 - Run the updater
 ```
-cd /opt/five_nines_client/ && sudo git pull
-```
-
-2 - Copy the service file
-
-```
-sudo cp /opt/five-nines-client.service /etc/systemd/system/
+cd /opt/five_nines_client && ./update.sh
 ```
 
-3 - Reload the service files to update the service
-
+2 - Check that the client is running
 ```
-sudo systemctl daemon-reload
-```
-
-4 - Restart the service
-```
-sudo systemctl restart five-nines-client
+sudo systemctl status five-nines-client
 ```
 
 ## Contribute

@@ -10,11 +10,13 @@ INTERVAL = 5 # seconds
 
 wd = systemd_watchdog.watchdog()
 
-try:
-    TOKEN = sys.argv[1]
-except IndexError:
-    wd.notify_error('Usage: client.py TOKEN')
-    sys.exit(2)
+def token():
+    try:
+        f = open('../TOKEN')
+        return f.read().strip('\n')
+    except FileNotFoundError:
+        wd.notify_error('TOKEN file is missing')
+        sys.exit(2)
 
 def version():
     f = open('../VERSION')
@@ -22,11 +24,12 @@ def version():
 
 def send_request(data):
     try:
-        conn.request("POST", "", json.dumps(data), { 'Authorize': f'Bearer {TOKEN}' })
+        conn.request("POST", "", json.dumps(data), { 'Authorize': f'Bearer {token}' })
     except Exception as e:
         print(e, file=sys.stderr)
         print(traceback.print_exc(), file=sys.stderr)
 
+token = token()
 version = version()
 print(f'Five nines client v{version} started')
 
