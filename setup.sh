@@ -10,13 +10,16 @@ fi
 echo -n "$1" > TOKEN
 
 # Generate the environment
-sudo python3 -m venv five_nines_client/venv
+sudo python3 -m venv venv
+
+# Activate the environment
+sudo source venv/bin/activate
 
 # Install dependencies
-sudo five_nines_client/venv/bin/pip3 install -r requirements.txt
+sudo venv/bin/pip3 install -r requirements.txt
 
 # Copy the service file
-sudo cp /opt/five_nines_client/five-nines-client.service /etc/systemd/system/
+sudo cp five-nines-client.service /etc/systemd/system/
 
 # Reload the service files to include the five-nines-client service
 sudo systemctl daemon-reload
