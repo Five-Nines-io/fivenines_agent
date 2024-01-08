@@ -7,7 +7,22 @@ if [ $# -eq 0 ] ; then
 fi
 
 # Save the server token
-echo -n "$1" > TOKEN
+sudo echo -n "$1" > TOKEN
+
+# Determine the package manager
+if [ -x "$(command -v apt-get)" ]; then
+  sudo apt-get update
+  sudo apt-get install -y python3 python3-venv
+elif [ -x "$(command -v yum)" ]; then
+  sudo yum update
+  sudo yum install -y python3 python3-venv
+elif [ -x "$(command -v pacman)" ]; then
+  sudo pacman -Syu
+  sudo pacman -S --noconfirm python python-virtualenv
+else
+  echo 'Error: No package manager found'
+  exit 1
+fi
 
 # Generate the environment
 sudo python3 -m venv venv

@@ -6,12 +6,12 @@ This client collects server metrics and send it to the [Five nines](https://five
 
 1 - Clone this repository to the `/opt` folder
 ```
-git clone git@github.com:Five-Nines-io/Five-nines-client.git /opt/five_nines_client
+sudo git clone https://github.com/Five-Nines-io/Five-nines-client.git /opt/five_nines_client
 ```
 
 2 - Setup the client
 ```
-cd /opt/five_nines_client && ./install.sh TOKEN
+cd /opt/five_nines_client && ./setup.sh TOKEN
 ```
 
 3 - Check that the client is running
