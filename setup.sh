@@ -9,16 +9,16 @@ fi
 # Save the server token
 echo -n "$1" | sudo tee TOKEN > /dev/null
 
-# Determine the package manager
+# Determine the package manager and install dependencies
 if [ -x "$(command -v apt-get)" ]; then
   sudo apt-get update
-  sudo apt-get install -y python3 python3-venv
+  sudo apt-get install -y gcc python3 python3-venv
 elif [ -x "$(command -v yum)" ]; then
   sudo yum update
-  sudo yum install -y python3 python3-venv
+  sudo yum install -y gcc python3 python3-venv
 elif [ -x "$(command -v pacman)" ]; then
   sudo pacman -Syu
-  sudo pacman -S --noconfirm python python-virtualenv
+  sudo pacman -S --noconfirm gcc python python-virtualenv
 else
   echo 'Error: No package manager found'
   exit 1
