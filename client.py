@@ -7,19 +7,20 @@ import systemd_watchdog
 import psutil
 
 INTERVAL = 5 # seconds
+ROOT_PATH = '/opt/five_nines_client'
 
 wd = systemd_watchdog.watchdog()
 
 def token():
     try:
-        f = open('../TOKEN')
+        f = open(f'{ROOT_PATH}/TOKEN')
         return f.read().strip('\n')
     except FileNotFoundError:
         wd.notify_error('TOKEN file is missing')
         sys.exit(2)
 
 def version():
-    f = open('../VERSION')
+    f = open(f'{ROOT_PATH}/VERSION')
     return f.read().strip('\n')
 
 def send_request(data):
