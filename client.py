@@ -1,3 +1,4 @@
+import os
 import sys
 import traceback
 import time
@@ -6,13 +7,22 @@ import http.client
 import systemd_watchdog
 import psutil
 
-API_URL = 'api.five-nines.io'
-CHECK_INTERVAL = 5 # seconds
-ROOT_PATH = '/opt/five_nines_client'
+from dotenv import load_dotenv
 
-wd = systemd_watchdog.watchdog()
+load_dotenv()
 
-def token():
+def get_env(name, default):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value
+
+API_URL = get_env('API_URL', 'api.five-nines.io')
+API_TIMEOUT = int(get_env('API_TIMEOUT', 5)) # seconds
+ROOT_PATH = get_env('ROOT_PATH', '/opt/five_nines_client')
+CHECK_INTERVAL = int(get_env('CHECK_INTERVAL', 5)) # seconds
+
+def get_token():
     try:
         f = open(f'{ROOT_PATH}/TOKEN')
         return f.read().strip('\n')
@@ -20,7 +30,7 @@ def token():
         wd.notify_error('TOKEN file is missing')
         sys.exit(2)
 
-def version():
+def get_version():
     f = open(f'{ROOT_PATH}/VERSION')
     return f.read().strip('\n')
 
@@ -31,14 +41,15 @@ def send_request(data):
         print(e, file=sys.stderr)
         print(traceback.print_exc(), file=sys.stderr)
 
-token = token()
-version = version()
+token = get_token()
+version = get_version()
 print(f'Five nines client v{version} started')
 
-conn = http.client.HTTPSConnection(API_URL, timeout=5)
+wd = systemd_watchdog.watchdog()
 wd.ready()
 
 sleep_time = CHECK_INTERVAL
+conn = http.client.HTTPSConnection(API_URL, timeout=API_TIMEOUT)
 
 while(True):
     time.sleep(sleep_time)
@@ -52,11 +63,11 @@ while(True):
         _cpu_usage.update(v._asdict())
         cpus_usage.append(_cpu_usage)
 
-    partitions = []
-    disks = {}
+    partitions_metadata = []
+    partitions_usage = {}
     for _, v in enumerate(psutil.disk_partitions(all=False)):
-        partitions.append(v._asdict())
-        disks[v.mountpoint] = psutil.disk_usage(v.mountpoint)._asdict()
+        partitions_metadata.append(v._asdict())
+        partitions_usage[v.mountpoint] = psutil.disk_usage(v.mountpoint)._asdict()
 
     io = []
     for k, v in psutil.disk_io_counters(perdisk=True).items():
@@ -72,11 +83,11 @@ while(True):
         'load_average': psutil.getloadavg(),
         'memory': psutil.virtual_memory()._asdict(),
         'swap': psutil.swap_memory()._asdict(),
-        'partitions': partitions,
+        'partitions_metadata': partitions_metadata,
+        'partitions_usage': partitions_usage,
         'cpu': cpus_usage,
         'io': io,
         'network': network,
-        'disks': disks,
     }
     send_request(data)
     wd.ping()
