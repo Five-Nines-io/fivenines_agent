@@ -7,7 +7,7 @@ if [ $# -eq 0 ] ; then
 fi
 
 # Save the server token
-sudo echo -n "$1" > TOKEN
+echo -n "$1" | sudo tee TOKEN
 
 # Determine the package manager
 if [ -x "$(command -v apt-get)" ]; then
