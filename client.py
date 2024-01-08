@@ -6,7 +6,8 @@ import http.client
 import systemd_watchdog
 import psutil
 
-INTERVAL = 5 # seconds
+API_URL = 'api.five-nines.io'
+CHECK_INTERVAL = 5 # seconds
 ROOT_PATH = '/opt/five_nines_client'
 
 wd = systemd_watchdog.watchdog()
@@ -34,10 +35,10 @@ token = token()
 version = version()
 print(f'Five nines client v{version} started')
 
-conn = http.client.HTTPSConnection('api.five-nines.io', timeout=5)
+conn = http.client.HTTPSConnection(API_URL, timeout=5)
 wd.ready()
 
-sleep_time = INTERVAL
+sleep_time = CHECK_INTERVAL
 
 while(True):
     time.sleep(sleep_time)
@@ -80,4 +81,4 @@ while(True):
     send_request(data)
     wd.ping()
 
-    sleep_time = INTERVAL - (time.monotonic() - start_time)
+    sleep_time = CHECK_INTERVAL - (time.monotonic() - start_time)
