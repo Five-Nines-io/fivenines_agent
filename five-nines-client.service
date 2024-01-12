@@ -1,5 +1,5 @@
 [Unit]
-Description=Small and powerful server monitoring tool
+Description=Five Nines monitoring client
 
 [Service]
 Type=notify

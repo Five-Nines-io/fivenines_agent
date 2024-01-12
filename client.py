@@ -25,9 +25,9 @@ ROOT_PATH = get_env('ROOT_PATH', '/opt/five_nines_client')
 CHECK_INTERVAL = int(get_env('CHECK_INTERVAL', 5)) # seconds
 
 PING_REGIONS = {
-    'asia': 'dev.puyet.fr',
-    'usa': 'dev.puyet.fr',
-    'europe': 'dev.puyet.fr'
+    'asia': 'google.com',
+    'usa': 'google.com',
+    'europe': 'google.com'
 }
 
 def get_token():
