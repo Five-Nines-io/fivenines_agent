@@ -164,7 +164,7 @@ while(True):
     }
 
     for region, ping_ip in PING_REGIONS.items():
-        result = os.popen(f'ping -c 1 {ping_ip} | grep time | cut -d " " -f7 | cut -d "=" -f2').read()
+        result = os.popen(f'ping -c 1 {ping_ip} | grep "time=" | cut -d " " -f7 | cut -d "=" -f2').read()
         data[f'ping_{region}'] = float(result.rstrip('\n'))
 
     send_request(data)
