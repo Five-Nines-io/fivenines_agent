@@ -49,7 +49,7 @@ def get_version():
 
 def get_ip():
     try:
-        conn = http.client.HTTPSConnection('ifconfig.io', timeout=2)
+        conn = http.client.HTTPSConnection('ip.fivenines.io', timeout=2)
         conn.request("GET", "/ip")
         res = conn.getresponse()
         return res.read().decode("utf-8").rstrip('\n')
