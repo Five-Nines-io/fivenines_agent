@@ -10,5 +10,8 @@ RestartSec=1
 Restart=always
 WatchdogSec=30
 
+StandardOutput=append:/var/log/five-nines-client.stdout.log
+StandardError=append:/var/log/five-nines-client.stderr.log
+
 [Install]
 WantedBy=multi-user.target
