@@ -1,6 +1,6 @@
 # Five nines client
 
-This client collects server metrics and send it to the [Five nines](https://five-nines.io) API.
+This client collects server metrics and send it to the [Five nines](https://fivenines.io) API.
 
 ## Setup
 
@@ -37,4 +37,4 @@ Feel free to open a PR if you see potential bugfixes or improvements.
 
 ## Contact
 
-You can shoot me an email at: [sebastien@five-nines.io](mailto:sebastien@five-nines.io)
+You can shoot me an email at: [sebastien@fivenines.io](mailto:sebastien@fivenines.io)

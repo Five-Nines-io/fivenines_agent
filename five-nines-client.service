@@ -7,7 +7,7 @@ User=root
 WorkingDirectory=/opt/five_nines_client
 ExecStart=/bin/bash -c 'source venv/bin/activate && venv/bin/python3 client.py'
 RestartSec=1
-Restart=alwys
+Restart=always
 WatchdogSec=30
 
 [Install]
