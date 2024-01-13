@@ -21,18 +21,17 @@ def get_env(name, default):
 
 API_URL = get_env('API_URL', 'api.five-nines.io')
 API_TIMEOUT = int(get_env('API_TIMEOUT', 5)) # seconds
-ROOT_PATH = get_env('ROOT_PATH', '/opt/five_nines_client')
 CHECK_INTERVAL = int(get_env('CHECK_INTERVAL', 5)) # seconds
 
 PING_REGIONS = {
-    'asia': 'google.com',
-    'usa': 'google.com',
-    'europe': 'google.com'
+    'asia': 'asia.fivenines.io',
+    'usa': 'us.fivenines.io',
+    'europe': 'eu.fivenines.io'
 }
 
 def get_token():
     try:
-        f = open(f'{ROOT_PATH}/TOKEN')
+        f = open(f'TOKEN')
         return f.read().strip('\n')
     except FileNotFoundError:
         wd.notify_error('TOKEN file is missing')
@@ -40,7 +39,7 @@ def get_token():
 
 def get_version():
     try:
-        f = open(f'{ROOT_PATH}/VERSION')
+        f = open(f'VERSION')
         return f.read().rstrip('\n')
     except FileNotFoundError:
         wd.notify_error('VERSION file is missing')
