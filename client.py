@@ -76,6 +76,15 @@ def get_cpu_model(operating_system):
     else:
         '-'
 
+def get_network_interfaces(operating_system):
+    if operating_system == 'Linux':
+        return os.popen("ls -l /sys/class/net/ | grep -v virtual | grep devices | cut -d ' ' -f9").read().strip().split("\n")
+    elif operating_system == 'Darwin':
+        return os.popen("scutil --nwi | grep 'Network interfaces' | cut -d ' ' -f3").read().strip().split("\n")
+    else:
+        return []
+
+
 
 def get_file_handles(operating_system):
     if operating_system != 'Linux':
@@ -136,7 +145,11 @@ while(True):
         io.append({ k: v._asdict()})
 
     network = []
+    network_interfaces = get_network_interfaces(operating_system)
+
     for k, v in psutil.net_io_counters(pernic=True).items():
+        if k not in network_interfaces:
+            continue
         network.append({ k: v._asdict() })
 
     file_handles_usage, _, file_handles_limit = get_file_handles(operating_system)
