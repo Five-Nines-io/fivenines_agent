@@ -103,7 +103,7 @@ def get_file_handles(operating_system):
 def send_request(data):
     try:
         conn = http.client.HTTPSConnection(API_URL, timeout=API_TIMEOUT)
-        res = conn.request("POST", "/collect", json.dumps(data), { 'Authorization': f'Bearer {token}', 'Content-Type': 'application/json' })
+        res = conn.request('POST', '/collect', json.dumps(data), { 'Authorization': f'Bearer {token}', 'Content-Type': 'application/json' })
         res = conn.getresponse()
         if DEBUG_MODE:
             print(f'Status: {res.status}')
@@ -112,26 +112,29 @@ def send_request(data):
         print(e, file=sys.stderr)
         print(traceback.print_exc(), file=sys.stderr)
 
-def get_processes():
+def get_processes(operating_system):
     processes = []
     attrs = [
-        "pid",
-        "ppid",
-        "name",
-        "username",
-        "create_time",
-        "memory_percent",
-        "memory_full_info",
-        "cpu_percent",
-        "cpu_times",
-        "num_fds",
-        "cwd",
-        "nice",
-        "num_threads",
-        "status",
-        "connections",
-        "threads"
+        'pid',
+        'ppid',
+        'name',
+        'username',
+        'create_time',
+        'memory_percent',
+        'memory_full_info',
+        'cpu_percent',
+        'cpu_times',
+        'num_fds',
+        'cwd',
+        'nice',
+        'num_threads',
+        'status',
+        'connections',
+        'threads'
     ]
+    if operating_system == 'Linux':
+        attrs.append('io_counters')
+
     for proc in psutil.process_iter(attrs=attrs):
         try:
             process = proc.as_dict(attrs=attrs)
@@ -210,7 +213,7 @@ while(True):
         'network': network,
         'file_handles_usage': file_handles_usage,
         'file_handles_limit': file_handles_limit,
-        'processes': get_processes(),
+        'processes': get_processes(operating_system),
     }
 
     for region, ping_ip in PING_REGIONS.items():
