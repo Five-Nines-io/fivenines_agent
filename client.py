@@ -8,6 +8,7 @@ import http.client
 import systemd_watchdog
 import psutil
 import platform
+from datetime import datetime
 
 from dotenv import load_dotenv
 
@@ -22,6 +23,7 @@ def get_env(name, default):
 API_URL = get_env('API_URL', 'api.five-nines.io')
 API_TIMEOUT = int(get_env('API_TIMEOUT', 5)) # seconds
 CHECK_INTERVAL = int(get_env('CHECK_INTERVAL', 5)) # seconds
+DEBUG_MODE = get_env('DEBUG_MODE', 'false') == 'true'
 
 PING_REGIONS = {
     'asia': 'asia.fivenines.io',
@@ -101,10 +103,42 @@ def get_file_handles(operating_system):
 def send_request(data):
     try:
         conn = http.client.HTTPSConnection(API_URL, timeout=API_TIMEOUT)
-        conn.request("POST", "/api/collect", json.dumps(data), { 'Authorization': f'Bearer {token}', 'Content-Type': 'application/json' })
+        res = conn.request("POST", "/collect", json.dumps(data), { 'Authorization': f'Bearer {token}', 'Content-Type': 'application/json' })
+        res = conn.getresponse()
+        if DEBUG_MODE:
+            print(f'Status: {res.status}')
+            print(f'Response: {res.read().decode("utf-8")}')
     except Exception as e:
         print(e, file=sys.stderr)
         print(traceback.print_exc(), file=sys.stderr)
+
+def get_processes():
+    processes = []
+    attrs = [
+        "pid",
+        "ppid",
+        "name",
+        "username",
+        "create_time",
+        "memory_percent",
+        "memory_full_info",
+        "cpu_percent",
+        "cpu_times",
+        "num_fds",
+        "cwd",
+        "nice",
+        "num_threads",
+        "status",
+        "connections",
+        "threads"
+    ]
+    for proc in psutil.process_iter(attrs=attrs):
+        try:
+            process = proc.as_dict(attrs=attrs)
+            processes.append(process)
+        except psutil.NoSuchProcess:
+            pass
+    return processes
 
 token = get_token()
 version = get_version()
@@ -125,6 +159,9 @@ sleep_time = CHECK_INTERVAL
 while(True):
     time.sleep(sleep_time)
     start_time = time.monotonic()
+
+    if DEBUG_MODE:
+        print(f'Collecting data at {datetime.now()}')
 
     cpu_times_percent = psutil.cpu_times_percent(percpu=True)
     cpu_percent = psutil.cpu_percent(percpu=True)
@@ -172,12 +209,15 @@ while(True):
         'io': io,
         'network': network,
         'file_handles_usage': file_handles_usage,
-        'file_handles_limit': file_handles_limit
+        'file_handles_limit': file_handles_limit,
+        'processes': get_processes(),
     }
 
     for region, ping_ip in PING_REGIONS.items():
-        result = os.popen(f'ping -c 1 {ping_ip} | grep "time=" | cut -d " " -f7 | cut -d "=" -f2').read()
-        data[f'ping_{region}'] = float(result.rstrip('\n'))
+        result = os.popen(f'ping -c 1 {ping_ip} | grep "time=" | cut -d " " -f7 | cut -d "=" -f2').read().rstrip('\n')
+        if DEBUG_MODE:
+            print(f'ping_{region}: {result}')
+        data[f'ping_{region}'] = float(result)
 
     send_request(data)
     wd.ping()
@@ -185,3 +225,5 @@ while(True):
     sleep_time = CHECK_INTERVAL - (time.monotonic() - start_time)
     if sleep_time < 0:
         sleep_time = 0
+    if DEBUG_MODE:
+        print(f'Sleeping for {sleep_time} seconds')
