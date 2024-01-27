@@ -145,11 +145,9 @@ def get_processes(operating_system):
 
 token = get_token()
 version = get_version()
-hostname = socket.gethostname()
 ip = get_ip()
-operating_system = platform.system()
-kernel_version = platform.release()
-cpu_architecture = platform.machine()
+uname = platform.uname()
+operating_system = uname.system
 cpu_model = get_cpu_model(operating_system)
 
 print(f'Five nines client v{version} started')
@@ -196,10 +194,7 @@ while(True):
 
     data = {
         'version': version,
-        'hostname': hostname,
-        'operating_system': operating_system,
-        'kernel_version': kernel_version,
-        'cpu_architecture': cpu_architecture,
+        'uname': uname._asdict(),
         'cpu_model': cpu_model,
         'ip': ip,
         'boot_time': psutil.boot_time(),
