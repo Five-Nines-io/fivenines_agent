@@ -196,6 +196,7 @@ while(True):
         'version': version,
         'uname': uname._asdict(),
         'cpu_model': cpu_model,
+        'cpu_count': psutil.cpu_count(),
         'ip': ip,
         'boot_time': psutil.boot_time(),
         'load_average': psutil.getloadavg(),
