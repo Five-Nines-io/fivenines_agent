@@ -12,10 +12,10 @@ echo -n "$1" | sudo tee TOKEN > /dev/null
 # Determine the package manager and install dependencies
 if [ -x "$(command -v apt-get)" ]; then
   sudo apt-get update
-  sudo apt-get install -y gcc python3 python3-venv
+  sudo apt-get install -y gcc python3 python3-dev python3-venv
 elif [ -x "$(command -v yum)" ]; then
   sudo yum update
-  sudo yum install -y gcc python3 python3-venv
+  sudo yum install -y gcc python3 python3-dev python3-venv
 elif [ -x "$(command -v pacman)" ]; then
   sudo pacman -Syu
   sudo pacman -S --noconfirm gcc python python-virtualenv

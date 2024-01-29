@@ -215,8 +215,8 @@ while(True):
     for region, ping_ip in PING_REGIONS.items():
         result = os.popen(f'ping -c 1 {ping_ip} | grep "time=" | cut -d " " -f7 | cut -d "=" -f2').read().rstrip('\n')
         if DEBUG_MODE:
-            print(f'ping_{region}: {result}')
-        data[f'ping_{region}'] = float(result)
+            print(f'ping_{region}: {repr(result)}')
+        data[f'ping_{region}'] = float(result) if result != '' else None
 
     send_request(data)
     wd.ping()
