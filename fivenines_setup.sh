@@ -44,3 +44,6 @@ sudo systemctl enable fivenines-agent.service
 
 # Start the fivenines-agent
 sudo systemctl start fivenines-agent
+
+# Remove the setup script
+rm fivenines_setup.sh
