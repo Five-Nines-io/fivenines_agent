@@ -10,6 +10,11 @@ fi
 sudo mkdir -p /etc/fivenines_agent
 echo -n "$1" | sudo tee /etc/fivenines_agent/TOKEN > /dev/null
 
+# Create a system user for the agent
+if ! id -u fivenines >/dev/null 2>&1; then
+  sudo useradd --system --user-group --key USERGROUPS_ENAB=yes fivenines --shell /bin/false --create-home
+fi
+
 # Determine the package manager and install dependencies
 if [ -x "$(command -v apt-get)" ]; then
   echo "apt-get found"
@@ -23,7 +28,7 @@ elif [ -x "$(command -v yum)" ]; then
   # Install pipx through pip3 if yum doesn't have it
   if ! sudo yum info pipx >/dev/null 2>&1; then
     sudo yum install -y python3-pip
-    sudo python3 -m pip install --user pipx
+    sudo su - fivenines -s /bin/bash -c 'python3 -m pip install --user pipx'
   else
     sudo yum install -y pipx
   fi
@@ -35,11 +40,6 @@ elif [ -x "$(command -v pacman)" ]; then
 else
   echo 'Error: No package manager found'
   exit 1
-fi
-
-# Create a system user for the agent
-if ! id -u fivenines >/dev/null 2>&1; then
-  sudo useradd --system --user-group --key USERGROUPS_ENAB=yes fivenines --shell /bin/false --create-home
 fi
 
 # Install the agent
