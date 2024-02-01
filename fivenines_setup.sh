@@ -19,7 +19,7 @@ elif [ -x "$(command -v yum)" ]; then
   sudo yum install -y python3 python3-pip
 elif [ -x "$(command -v pacman)" ]; then
   sudo pacman -Syu
-  sudo pacman -S --noconfirm python python-pip
+  sudo pacman -S --noconfirm python python-pipx
 else
   echo 'Error: No package manager found'
   exit 1
