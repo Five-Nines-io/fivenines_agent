@@ -12,12 +12,15 @@ echo -n "$1" | sudo tee /etc/fivenines_agent/TOKEN > /dev/null
 
 # Determine the package manager and install dependencies
 if [ -x "$(command -v apt-get)" ]; then
+  echo "apt-get found"
   sudo apt-get update
   sudo apt-get install -y python3 pipx
 elif [ -x "$(command -v yum)" ]; then
+  echo "yum found"
   sudo yum update
   sudo yum install -y python3 python3-pipx
 elif [ -x "$(command -v pacman)" ]; then
+  echo "pacman found"
   sudo pacman -Syu
   sudo pacman -S --noconfirm python python-pipx
 else
