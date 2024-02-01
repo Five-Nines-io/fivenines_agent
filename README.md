@@ -1,6 +1,6 @@
-# Five nines client
+# fivenines agent
 
-This client collects server metrics and send it to the [Five nines](https://fivenines.io) API.
+This agent collects server metrics from the monitored host and send it to the [fivenines](https://fivenines.io) API.
 
 ## Setup
 
@@ -16,7 +16,7 @@ cd /opt/five_nines_client && ./setup.sh TOKEN
 
 3 - Check that the client is running
 ```
-sudo systemctl status five-nines-client
+sudo systemctl status fivenine-agent
 ```
 
 ## Update
@@ -28,7 +28,7 @@ cd /opt/five_nines_client && ./update.sh
 
 2 - Check that the client is running
 ```
-sudo systemctl status five-nines-client
+sudo systemctl status fivenine-agent
 ```
 
 ## Contribute

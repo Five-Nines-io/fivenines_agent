@@ -1,8 +1,6 @@
 import psutil
 import os
 import platform
-import systemd_watchdog as wd
-
 
 def cpu_data():
     cpu_times_percent = psutil.cpu_times_percent(percpu=True)

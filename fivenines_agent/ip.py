@@ -1,7 +1,6 @@
 import os
 import sys
 import traceback
-import systemd_watchdog as wd
 
 def ipv4():
   try:

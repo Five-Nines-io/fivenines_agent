@@ -19,11 +19,13 @@ from five_nines_agent.disks import io
 from five_nines_agent.files import file_handles_used, file_handles_limit
 
 from dotenv import load_dotenv
-load_dotenv()
+
+CONFIG_DIR = "/etc/fivenines_agent"
+load_dotenv(dotenv_path=f'{CONFIG_DIR}/.env')
 
 class Agent:
   def __init__(self):
-    for file in ["TOKEN", "VERSION"]:
+    for file in ["TOKEN"]:
        self.load_file(file)
 
     default_env = {
@@ -34,13 +36,19 @@ class Agent:
     for env, default in default_env.items():
       self.load_env(env, default)
 
+    self.version = '0.1.2'
+    print(self.api_url)
+    print(self.token)
+    print(self.version)
+
     self.config = { "request_options": { "timeout": 5 } }
     self.config = self.sync({"get_config": True})['config']
     print(self.config)
 
   def load_file(self, file):
+    print(f'{CONFIG_DIR}/{file}')
     try:
-        f = open(file)
+        f = open(f'{CONFIG_DIR}/{file}', 'r')
         setattr(self, file.lower(), f.read().rstrip('\n'))
     except FileNotFoundError:
         print(f'{file} file is missing')
