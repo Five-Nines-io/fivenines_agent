@@ -10,7 +10,7 @@ wget -q -N https://raw.githubusercontent.com/Five-Nines-io/five_nines_agent/deve
 
 ## Update
 
-````bash
+```bash
 sudo python3 -m pip install fivenines_agent --upgrade
 ```
 
