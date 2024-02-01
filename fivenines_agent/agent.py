@@ -10,13 +10,13 @@ import json
 import platform
 import psutil
 
-from five_nines_agent.cpu import cpu_data, cpu_model
-from five_nines_agent.ip import ipv4
-from five_nines_agent.network import network
-from five_nines_agent.partitions import partitions_metadata, partitions_usage
-from five_nines_agent.processes import processes
-from five_nines_agent.disks import io
-from five_nines_agent.files import file_handles_used, file_handles_limit
+from fivenines_agent.cpu import cpu_data, cpu_model
+from fivenines_agent.ip import ipv4
+from fivenines_agent.network import network
+from fivenines_agent.partitions import partitions_metadata, partitions_usage
+from fivenines_agent.processes import processes
+from fivenines_agent.disks import io
+from fivenines_agent.files import file_handles_used, file_handles_limit
 
 from dotenv import load_dotenv
 
