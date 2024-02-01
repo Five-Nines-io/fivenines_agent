@@ -22,7 +22,7 @@ elif [ -x "$(command -v yum)" ]; then
 
   # Install pipx through pip3 if yum doesn't have it
   if ! sudo yum info pipx >/dev/null 2>&1; then
-    sudo sudp yum install -y python3-pip
+    sudo yum install -y python3-pip
     sudo python3 -m pip install --user pipx
   else
     sudo yum install -y pipx
