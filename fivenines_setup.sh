@@ -18,7 +18,7 @@ if [ -x "$(command -v apt-get)" ]; then
 elif [ -x "$(command -v yum)" ]; then
   echo "yum found"
   sudo yum update
-  sudo yum install -y python3 python3-pipx
+  sudo yum install -y python3 pipx
 elif [ -x "$(command -v pacman)" ]; then
   echo "pacman found"
   sudo pacman -Syu
