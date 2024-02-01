@@ -11,7 +11,7 @@ wget -q -N https://raw.githubusercontent.com/Five-Nines-io/five_nines_agent/deve
 ## Update
 
 ```bash
-sudo python3 -m pip install fivenines_agent --upgrade
+wget -q -N https://raw.githubusercontent.com/Five-Nines-io/five_nines_agent/develop/fivenines_update.sh && sudo bash fivenines_update.sh
 ```
 
 ## Contribute
