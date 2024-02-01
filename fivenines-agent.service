@@ -1,17 +1,16 @@
 [Unit]
-Description=Five Nines monitoring client
+Description=Five Nines monitoring agent
 
 [Service]
 Type=notify
-User=root
-WorkingDirectory=/opt/five_nines_client
-ExecStart=/bin/bash -c 'source venv/bin/activate && venv/bin/python3 client.py'
+User=fivenines
+ExecStart=/usr/local/bin/fivenines_agent
 RestartSec=1
 Restart=always
 WatchdogSec=30
 
-StandardOutput=append:/var/log/five-nines-client.stdout.log
-StandardError=append:/var/log/five-nines-client.stderr.log
+StandardOutput=append:/var/log/fivenines-agent.stdout.log
+StandardError=append:/var/log/fivenines-agent.stderr.log
 
 [Install]
 WantedBy=multi-user.target
