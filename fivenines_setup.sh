@@ -28,7 +28,7 @@ fi
 useradd --system --user-group --key USERGROUPS_ENAB=yes -M fivenines --shell /bin/false
 
 # Install the agent
-sudo python3 -m pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple fivenines_agent
+sudo python3 -m pipx install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple fivenines_agent
 
 # Download the service file
 wget https://raw.githubusercontent.com/Five-Nines-io/five_nines_agent/develop/fivenines-agent.service -O fivenines-agent.service
