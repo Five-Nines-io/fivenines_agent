@@ -37,13 +37,8 @@ class Agent:
             self.load_env(env, default)
 
         self.version = '0.1.2'
-        print(self.api_url)
-        print(self.token)
-        print(self.version)
-
         self.config = {"request_options": {"timeout": 5}}
         self.config = self.sync({"get_config": True})['config']
-        print(self.config)
 
     def load_file(self, file):
         print(f'{CONFIG_DIR}/{file}')
@@ -69,6 +64,10 @@ class Agent:
 
         while True:
             wd.ping()
+
+            if self.config['enabled'] == False:
+                self.wait(25)
+                continue
 
             start_time = time.monotonic()
             data = {}
