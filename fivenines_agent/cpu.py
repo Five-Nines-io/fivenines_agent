@@ -18,14 +18,14 @@ def cpu_data():
 def cpu_model():
     operating_system = platform.system()
     if operating_system == 'Linux':
-      try:
-          f = open('/proc/cpuinfo')
-          for line in f:
-              if line.startswith('model name'):
-                  return line.split(':')[1].strip()
-      except FileNotFoundError:
-          print('CPU info file is missing')
-          return '-'
+        try:
+            with open('/proc/cpuinfo', 'r') as f:
+                for line in f:
+                    if line.startswith('model name'):
+                        return line.split(':')[1].strip()
+        except FileNotFoundError:
+            print('CPU info file is missing')
+            return '-'
     elif operating_system == 'Darwin':
         try:
             return os.popen('/usr/sbin/sysctl -n machdep.cpu.brand_string').read().strip()
