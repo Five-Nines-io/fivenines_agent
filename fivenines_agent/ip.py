@@ -1,12 +1,15 @@
-import os
+import http
 import sys
 import traceback
 
 def ipv4():
   try:
-    return os.popen('curl -4 -s https://ip.fivenines.io').read().rstrip('\n')
+    conn = http.client.HTTPSConnection('ip.fivenines.io', timeout=5)
+    res = conn.request('GET', '/')
+    res = conn.getresponse()
+    body = res.read().decode("utf-8")
+    return body
+
   except Exception as e:
-    print('IPv4 address could not be retrieved')
     print(e, file=sys.stderr)
     print(traceback.print_exc(), file=sys.stderr)
-    return '-'
