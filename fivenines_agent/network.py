@@ -3,12 +3,14 @@ import platform
 import psutil
 
 def interfaces(operating_system):
-  if operating_system == 'Linux':
-      return os.popen("ls -l /sys/class/net/ | grep -v virtual | grep devices | cut -d ' ' -f9").read().strip().split("\n")
-  elif operating_system == 'Darwin':
-      return os.popen("scutil --nwi | grep 'Network interfaces' | cut -d ' ' -f3").read().strip().split("\n")
-  else:
-      return []
+    if operating_system == 'Linux':
+        with os.popen('ls -l /sys/class/net/ | grep -v virtual | grep devices | cut -d ' ' -f9') as f:
+            return f.read().strip().split('\n')
+    elif operating_system == 'Darwin':
+        with os.popen('scutil --nwi | grep "Network interfaces" | cut -d " " -f3') as f:
+            return f.read().strip().split('\n')
+    else:
+        return []
 
 def network():
     network = []

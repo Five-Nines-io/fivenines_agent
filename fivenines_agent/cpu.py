@@ -28,7 +28,8 @@ def cpu_model():
             return '-'
     elif operating_system == 'Darwin':
         try:
-            return os.popen('/usr/sbin/sysctl -n machdep.cpu.brand_string').read().strip()
+            with os.popen('/usr/sbin/sysctl -n machdep.cpu.brand_string') as f:
+                return f.read().strip()
         except FileNotFoundError:
             print('CPU info file is missing')
             return '-'
