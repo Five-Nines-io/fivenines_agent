@@ -29,11 +29,34 @@ class Agent:
             self.load_file(file)
 
         self.version = '0.1.2'
-        self.config = {"request_options": {"timeout": 5}}
-        self.config = self.sync({"get_config": True})['config']
+        self.get_config()
+
+    def get_config(self):
+        self.config = {
+            "request_options": {
+                "timeout": 5
+            }
+        }
+
+        result = self.with_retry(self.sync, {"get_config": True})
+        if result == None:
+            print('Failed to get config')
+            sys.exit(2)
+        self.config = result['config']
+
+    def with_retry(self, func, *args, delay=0.5, max_retries=3, backoff=2):
+        for i in range(max_retries):
+            try:
+                return func(*args)
+            except Exception as e:
+                if debug_mode():
+                    print(f'Error: {e}')
+                    traceback.print_exc()
+                wait_time = delay * (backoff ** i)
+                print(f'Retrying in {wait_time} seconds')
+                time.sleep(wait_time)
 
     def load_file(self, file):
-        print(f'{CONFIG_DIR}/{file}')
         try:
             with open(f'{CONFIG_DIR}/{file}', 'r') as f:
                 setattr(self, file.lower(), f.read().rstrip('\n'))
@@ -93,10 +116,9 @@ class Agent:
             if self.config['processes']:
                 data['processes'] = processes()
 
-            new_config = self.sync(data)
-
-            if new_config['config'] != None and new_config['config'] != self.config:
-                self.config = new_config['config']
+            response = self.with_retry(self.sync, data, delay=0.2)
+            if response != None and response['config'] != self.config:
+                self.config = response['config']
             self.wait(start_time)
 
     def wait(self, start_time):
@@ -118,19 +140,14 @@ class Agent:
             return float(result)
 
     def sync(self, data):
-        try:
-            conn = http.client.HTTPSConnection(
-                api_url(), timeout=self.config['request_options']['timeout'])
-            res = conn.request('POST', '/collect', json.dumps(data), {
-                               'Authorization': f'Bearer {self.token}', 'Content-Type': 'application/json'})
-            res = conn.getresponse()
-            body = res.read().decode("utf-8")
+        conn = http.client.HTTPSConnection(
+            api_url(), timeout=self.config['request_options']['timeout'])
+        res = conn.request('POST', '/collect', json.dumps(data), {
+                            'Authorization': f'Bearer {self.token}', 'Content-Type': 'application/json'})
+        res = conn.getresponse()
+        body = res.read().decode("utf-8")
 
-            if debug_mode():
-                print(f'Status: {res.status}')
-                print(f'Response: {body}')
-
+        if res.status == 200:
             return json.loads(body)
-        except Exception as e:
-            print(e, file=sys.stderr)
-            print(traceback.print_exc(), file=sys.stderr)
+        else:
+            raise Exception(f'Failed to sync: {res.status}')
