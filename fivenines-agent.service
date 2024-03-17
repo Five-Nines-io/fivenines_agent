@@ -9,8 +9,7 @@ RestartSec=5
 Restart=always
 WatchdogSec=30
 
-StandardOutput=append:/var/log/fivenines-agent.stdout.log
-StandardError=append:/var/log/fivenines-agent.stderr.log
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target

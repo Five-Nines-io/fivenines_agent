@@ -6,5 +6,3 @@ def io():
     io.append({ k: v._asdict()})
 
   return io
-
-

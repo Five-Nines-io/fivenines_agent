@@ -2,7 +2,6 @@ import platform
 import psutil
 
 def processes():
-    operating_system = platform.system()
     processes = []
     attrs = [
         'pid',
@@ -11,12 +10,13 @@ def processes():
         'username',
         'memory_percent',
         'cpu_percent',
+        'cpu_times',
         'num_threads',
         'status',
         'connections',
     ]
 
-    for proc in psutil.process_iter(attrs=attrs):
+    for proc in psutil.process_iter():
         try:
             process = proc.as_dict(attrs=attrs)
             processes.append(process)

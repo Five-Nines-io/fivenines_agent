@@ -43,10 +43,10 @@ else
 fi
 
 # Install the agent
-sudo su - fivenines -s /bin/bash -c 'python3 -m pipx install --index-url https://test.pypi.org/simple/ --pip-args="--extra-index-url https://pypi.org/simple" fivenines_agent'
+sudo su - fivenines -s /bin/bash -c 'python3 -m pipx install --index-url https://pypi.org/simple/ --pip-args="--extra-index-url https://pypi.org/simple" fivenines_agent'
 
 # Download the service file
-wget https://raw.githubusercontent.com/Five-Nines-io/five_nines_agent/develop/fivenines-agent.service -O fivenines-agent.service
+wget https://raw.githubusercontent.com/Five-Nines-io/five_nines_agent/main/fivenines-agent.service -O fivenines-agent.service
 
 # Move the service file to the systemd directory
 sudo mv fivenines-agent.service /etc/systemd/system/

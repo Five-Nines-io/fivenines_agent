@@ -17,5 +17,4 @@ def file_handles_stats():
             with open('/proc/sys/fs/file-nr', 'r') as f:
                 return list(map(int, f.read().strip().split('\t')))
         except FileNotFoundError:
-            print('File handles file is missing')
             return [0, 0, 0]

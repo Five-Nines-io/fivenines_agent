@@ -14,7 +14,6 @@ def ipv4():
     if result != '':
       return result
   except Exception as e:
-    print('IPv4 address could not be retrieved')
     print(e, file=sys.stderr)
     print(traceback.print_exc(), file=sys.stderr)
 
@@ -28,6 +27,5 @@ def ipv6():
     if result != '':
       return result
   except Exception as e:
-    print('IPv6 address could not be retrieved')
     print(e, file=sys.stderr)
     print(traceback.print_exc(), file=sys.stderr)

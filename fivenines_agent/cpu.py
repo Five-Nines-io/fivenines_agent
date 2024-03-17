@@ -24,14 +24,12 @@ def cpu_model():
                     if line.startswith('model name'):
                         return line.split(':')[1].strip()
         except FileNotFoundError:
-            print('CPU info file is missing')
             return '-'
     elif operating_system == 'Darwin':
         try:
             with os.popen('/usr/sbin/sysctl -n machdep.cpu.brand_string') as f:
                 return f.read().strip()
         except FileNotFoundError:
-            print('CPU info file is missing')
             return '-'
     else:
         '-'
