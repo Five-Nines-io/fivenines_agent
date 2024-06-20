@@ -1,4 +1,3 @@
-import platform
 import psutil
 
 def processes():
