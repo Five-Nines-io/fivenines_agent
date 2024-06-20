@@ -16,6 +16,7 @@ from fivenines_agent.partitions import partitions_metadata, partitions_usage
 from fivenines_agent.processes import processes
 from fivenines_agent.disks import io
 from fivenines_agent.files import file_handles_used, file_handles_limit
+from fivenines_agent.redis import redis_metrics
 from fivenines_agent.synchronizer import Synchronizer
 from fivenines_agent.synchronization_queue import SynchronizationQueue
 
@@ -109,6 +110,9 @@ class Agent:
 
                 if self.config['processes']:
                     data['processes'] = processes()
+
+                if self.config['redis']:
+                    data['redis'] = redis_metrics(**self.config['redis'])
 
                 self.queue.put(data)
                 self.wait(start_time)
