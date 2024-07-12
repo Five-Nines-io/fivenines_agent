@@ -10,13 +10,14 @@ import signal
 
 from fivenines_agent.env import debug_mode
 from fivenines_agent.cpu import cpu_data, cpu_model
-from fivenines_agent.ip import ipv4, ipv6
+from fivenines_agent.ip import get_ip
 from fivenines_agent.network import network
 from fivenines_agent.partitions import partitions_metadata, partitions_usage
 from fivenines_agent.processes import processes
 from fivenines_agent.disks import io
 from fivenines_agent.files import file_handles_used, file_handles_limit
 from fivenines_agent.redis import redis_metrics
+from fivenines_agent.nginx import nginx_metrics
 from fivenines_agent.synchronizer import Synchronizer
 from fivenines_agent.synchronization_queue import SynchronizationQueue
 
@@ -93,10 +94,10 @@ class Agent:
                     data['swap'] = psutil.swap_memory()._asdict()
 
                 if self.config['ipv4']:
-                    data['ipv4'] = ipv4()
+                    data['ipv4'] = get_ip(4)
 
                 if self.config['ipv6']:
-                    data['ipv6'] = ipv6()
+                    data['ipv6'] = get_ip(6)
 
                 if self.config['network']:
                     data['network'] = network()
@@ -113,6 +114,9 @@ class Agent:
 
                 if self.config['redis']:
                     data['redis'] = redis_metrics(**self.config['redis'])
+
+                if self.config['nginx']:
+                    data['nginx'] = nginx_metrics()
 
                 self.queue.put(data)
                 self.wait(start_time)

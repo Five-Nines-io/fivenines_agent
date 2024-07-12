@@ -28,14 +28,16 @@ def redis_metrics(port=6379, password=None):
       metrics = {}
       for result in results:
         key, value = result.split(':')
-        if key.startswith('db'):
+        if key == 'redis_version':
+          metrics[key] = value.strip()
+        elif key.startswith('db'):
           metrics[key] = {}
           values = value.split(',')
           for v in values:
             k, v = v.split('=')
-            metrics[key][k] = v
+            metrics[key][k] = int(v.strip())
         else:
-          metrics[key] = value.strip()
+          metrics[key] = int(value.strip())
 
       return metrics
 
