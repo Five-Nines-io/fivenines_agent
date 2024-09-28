@@ -21,7 +21,7 @@ After a distribution upgrade, the agent may not start because of a [known pipx i
 To fix it, you can reinstall packages managed by pipx:
 
 ```bash
-sudo su - fivenines -s /bin/bash -c 'python3 -m pipx reinstall-all
+sudo su - fivenines -s /bin/bash -c 'python3 -m pipx reinstall-all'
 ```
 
 ## Contribute
