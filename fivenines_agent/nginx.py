@@ -29,14 +29,15 @@ def nginx_metrics(status_page_url='http://127.0.0.1', status_page_port=8080):
 
     try:
       with os.popen(f'curl -s {status_page_url}:{status_page_port}/nginx_status', 'r') as f:
-        results = f.read().rstrip('\n').split('\n')
+        results = list(filter(None, f.read().rstrip('\n').split('\n')))
 
-      metrics = {}
-      metrics['nginx_version'] = version
-      metrics['active_connections'] = int(results[0].split(':')[1].strip())
-      metrics['reading_connections'] = int(results[3].split(' ')[1])
-      metrics['writing_connections'] = int(results[3].split(' ')[3])
-      metrics['waiting_connections'] = int(results[3].split(' ')[5])
+      metrics = { 'nginx_version': version }
+
+      if len(results) > 0:
+        metrics['active_connections'] = int(results[0].split(':')[1].strip())
+        metrics['reading_connections'] = int(results[3].split(' ')[1])
+        metrics['writing_connections'] = int(results[3].split(' ')[3])
+        metrics['waiting_connections'] = int(results[3].split(' ')[5])
 
       return metrics
 
