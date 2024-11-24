@@ -23,21 +23,23 @@ def redis_metrics(port=6379, password=None):
 
     try:
       with os.popen(f'echo "{auth_prefix}INFO\nQUIT" | curl -s telnet://localhost:{port} | grep -e "{METRICS}"', 'r') as f:
-        results = f.read().rstrip('\n').split('\n')
+        results = list(filter(None, f.read().rstrip('\n').split('\n')))
 
       metrics = {}
-      for result in results:
-        key, value = result.split(':')
-        if key == 'redis_version':
-          metrics[key] = value.strip()
-        elif key.startswith('db'):
-          metrics[key] = {}
-          values = value.split(',')
-          for v in values:
-            k, v = v.split('=')
-            metrics[key][k] = int(v.strip())
-        else:
-          metrics[key] = int(value.strip())
+
+      if len(results) > 0:
+        for result in results:
+          key, value = result.split(':')
+          if key == 'redis_version':
+            metrics[key] = value.strip()
+          elif key.startswith('db'):
+            metrics[key] = {}
+            values = value.split(',')
+            for v in values:
+              k, v = v.split('=')
+              metrics[key][k] = int(v.strip())
+          else:
+            metrics[key] = int(value.strip())
 
       return metrics
 

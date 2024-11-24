@@ -2,7 +2,7 @@ from queue import Queue
 from fivenines_agent.env import debug_mode
 
 class SynchronizationQueue(Queue):
-    def __init__(self, maxsize=10):
+    def __init__(self, maxsize=100):
         Queue.__init__(self, maxsize)
 
     def put(self, data):

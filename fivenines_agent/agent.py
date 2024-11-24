@@ -30,12 +30,12 @@ class Agent:
         signal.signal(signal.SIGTERM, self.shutdown)
         signal.signal(signal.SIGINT, self.shutdown)
 
-        self.version = '0.0.1'
+        self.version = '0.0.2'
 
         for file in ["TOKEN"]:
             self.load_file(file)
 
-        self.queue = SynchronizationQueue(maxsize=10)
+        self.queue = SynchronizationQueue(maxsize=100)
         self.synchronizer = Synchronizer(self.token, self.queue)
         self.synchronizer.start()
 
@@ -140,7 +140,7 @@ class Agent:
         time.sleep(sleep_time)
 
     def ping(self, host):
-        with os.popen(f'ping -c 1 {host} | grep "time=" | cut -d " " -f7 | cut -d "=" -f2', 'r') as f:
+        with os.popen(f'ping -c 1 {host} -W 5000 | grep "time=" | cut -d " " -f7 | cut -d "=" -f2', 'r') as f:
             result = f.read().rstrip('\n')
         if debug_mode():
             print(f'ping_{host}: {repr(result)}')
