@@ -30,7 +30,7 @@ class Agent:
         signal.signal(signal.SIGTERM, self.shutdown)
         signal.signal(signal.SIGINT, self.shutdown)
 
-        self.version = '0.0.3'
+        self.version = '0.0.4'
 
         for file in ["TOKEN"]:
             self.load_file(file)
