@@ -30,7 +30,7 @@ class Agent:
         signal.signal(signal.SIGTERM, self.shutdown)
         signal.signal(signal.SIGINT, self.shutdown)
 
-        self.version = '0.0.4'
+        self.version = '1.0.0'
 
         for file in ["TOKEN"]:
             self.load_file(file)
@@ -140,13 +140,19 @@ class Agent:
         time.sleep(sleep_time)
 
     def ping(self, host):
-        f = os.popen(f'ping -c 1 {host} -t 5 | grep "time=" | cut -d " " -f7 | cut -d "=" -f2', 'r')
+        operating_system = platform.system()
+
+        if operating_system == 'Darwin':
+            f = os.popen(f'ping -c 1 -t 5 {host}  | grep "time=" | cut -d " " -f7 | cut -d "=" -f2', 'r')
+        else:
+            f = os.popen(f'ping -c 1 -w 5 {host}  | grep "time=" | cut -d " " -f7 | cut -d "=" -f2', 'r')
+
         result = f.read().rstrip('\n')
         status = f.close()
 
         if debug_mode():
             print(f'ping_{host}: {repr(result)}')
 
-        if status != 0:
+        if status:
             return None
         return float(result)
