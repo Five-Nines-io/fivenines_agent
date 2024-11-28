@@ -140,10 +140,13 @@ class Agent:
         time.sleep(sleep_time)
 
     def ping(self, host):
-        with os.popen(f'ping -c 1 {host} -W 5000 | grep "time=" | cut -d " " -f7 | cut -d "=" -f2', 'r') as f:
-            result = f.read().rstrip('\n')
+        f = os.popen(f'ping -c 1 {host} -t 5 | grep "time=" | cut -d " " -f7 | cut -d "=" -f2', 'r')
+        result = f.read().rstrip('\n')
+        status = f.close()
+
         if debug_mode():
             print(f'ping_{host}: {repr(result)}')
 
-        if result != '':
-            return float(result)
+        if status != 0:
+            return None
+        return float(result)
