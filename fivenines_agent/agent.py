@@ -7,6 +7,7 @@ import time
 import platform
 import psutil
 import signal
+import socket
 
 from fivenines_agent.env import debug_mode
 from fivenines_agent.cpu import cpu_data, cpu_model
@@ -82,7 +83,7 @@ class Agent:
 
                 if self.config['ping']:
                     for region, host in self.config['ping'].items():
-                        data[f'ping_{region}'] = self.ping(host)
+                        data[f'ping_{region}'] = self.tcp_ping(host)
 
                 if self.config['cpu']:
                     data['cpu'] = cpu_data()
@@ -139,20 +140,16 @@ class Agent:
             print(f'Sleeping for {sleep_time} seconds')
         time.sleep(sleep_time)
 
-    def ping(self, host):
-        operating_system = platform.system()
-
-        if operating_system == 'Darwin':
-            f = os.popen(f'ping -c 1 -t 5 {host}  | grep "time=" | cut -d " " -f7 | cut -d "=" -f2', 'r')
-        else:
-            f = os.popen(f'ping -c 1 -w 5 {host}  | grep "time=" | cut -d " " -f7 | cut -d "=" -f2', 'r')
-
-        result = f.read().rstrip('\n')
-        status = f.close()
-
+    def tcp_ping(self, host, port=80, timeout=5):
         if debug_mode():
-            print(f'ping_{host}: {repr(result)}')
-
-        if status:
+            print(f"Pinging {host}:{port} with timeout {timeout} seconds")
+        try:
+            start_time = time.time()
+            with socket.create_connection((host, port), timeout):
+                end_time = time.time()
+                ms = (end_time - start_time) * 1000
+                if debug_mode():
+                    print(f"Ping {host}:{port} took {ms} ms")
+                return ms
+        except (socket.timeout, socket.error):
             return None
-        return float(result)
