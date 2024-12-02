@@ -42,7 +42,7 @@ else
   exit 1
 fi
 
-if ! python3 --version | cut -d " " -f2 | grep -E '^3.(6|78|9|1.+|2.+)$' > /dev/null; then
+if ! python3 --version | cut -d " " -f2 | grep -E '^3.(6|7|8|9|1.+|2.+)..+$' > /dev/null; then
   echo "Error: Python version must be 3.6 or higher, you have $(python3 --version | cut -d " " -f2)"
   echo "Please install Python 3.6 or higher and try again"
   exit 1
