@@ -19,7 +19,7 @@ fi
 if [ -x "$(command -v apt-get)" ]; then
   echo "apt-get found"
   sudo apt-get update
-  sudo apt-get install -y python3 pipx
+  sudo apt-get install -y python3 pipx gcc
 elif [ -x "$(command -v yum)" ]; then
   echo "yum found"
   sudo yum update
@@ -27,7 +27,7 @@ elif [ -x "$(command -v yum)" ]; then
 
   # Install pipx through pip3 if yum doesn't have it
   if ! sudo yum info pipx >/dev/null 2>&1; then
-    sudo yum install -y python3-pip
+    sudo yum install -y python3-pip gcc
     sudo su - fivenines -s /bin/bash -c 'python3 -m pip install --user pipx'
   else
     sudo yum install -y pipx
@@ -36,9 +36,15 @@ elif [ -x "$(command -v yum)" ]; then
 elif [ -x "$(command -v pacman)" ]; then
   echo "pacman found"
   sudo pacman -Syu
-  sudo pacman -S --noconfirm python python-pipx
+  sudo pacman -S --noconfirm python python-pipx gcc
 else
   echo 'Error: No package manager found'
+  exit 1
+fi
+
+if ! python3 --version | cut -d " " -f2 | grep -E '^3.(6|78|9|1.+|2.+)$' > /dev/null; then
+  echo "Error: Python version must be 3.6 or higher, you have $(python3 --version | cut -d " " -f2)"
+  echo "Please install Python 3.6 or higher and try again"
   exit 1
 fi
 
