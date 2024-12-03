@@ -11,7 +11,7 @@ class Synchronizer(Thread):
         Thread.__init__(self)
         self.config_lock = Lock()
         self.token = token
-        self.config = { 'enabled': True, 'request_options': { 'timeout': 5, 'retry': 3, 'retry_interval': 5 } }
+        self.config = { 'enabled': False, 'request_options': { 'timeout': 5, 'retry': 3, 'retry_interval': 5 } }
         self.queue = queue
 
         self.send_request({'get_config': True})

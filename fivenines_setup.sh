@@ -12,6 +12,17 @@ if [ $# -eq 0 ] ; then
   exit 1
 fi
 
+# Check if SELinux is installed
+if command -v getenforce &> /dev/null; then
+  selinux_status=$(getenforce 2>/dev/null || echo "Disabled")
+  echo "SELinux status: $selinux_status"
+  if [ "$selinux_status" == "Enforcing" ]; then
+    exit_with_contact "SELinux is enabled in enforcing mode. fivenines agent will not work without disabling SELinux."
+  fi
+else
+  echo "SELinux is not installed on this system."
+fi
+
 # Save the client token
 sudo mkdir -p /etc/fivenines_agent
 echo -n "$1" | sudo tee /etc/fivenines_agent/TOKEN > /dev/null
@@ -68,17 +79,6 @@ wget https://raw.githubusercontent.com/Five-Nines-io/five_nines_agent/main/fiven
 
 # Move the service file to the systemd directory
 sudo mv fivenines-agent.service /etc/systemd/system/
-
-  # Check if SELinux is installed
-if command -v getenforce &> /dev/null; then
-  selinux_status=$(getenforce 2>/dev/null || echo "Disabled")
-  echo "SELinux status: $selinux_status"
-  if [ "$selinux_status" == "Enforcing" ]; then
-    exit_with_contact "SELinux is enabled in enforcing mode. fivenines agent will not work without disabling SELinux."
-  fi
-else
-  echo "SELinux is not installed on this system."
-fi
 
 hosts=("asia.fivenines.io" "eu.fivenines.io" "us.fivenines.io")
 
