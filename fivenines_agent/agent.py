@@ -72,7 +72,7 @@ class Agent:
                 self.config = self.synchronizer.get_config()
 
                 if self.config['enabled'] == False:
-                    self.wait(25)
+                    time.sleep(25)
                     continue
 
                 data = static_data.copy()
