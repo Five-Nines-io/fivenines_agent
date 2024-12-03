@@ -29,7 +29,7 @@ echo -n "$1" | sudo tee /etc/fivenines_agent/TOKEN > /dev/null
 
 # Create a system user for the agent
 if ! id -u fivenines >/dev/null 2>&1; then
-  sudo useradd --system --user-group --key USERGROUPS_ENAB=yes fivenines --shell /bin/false --create-home
+  sudo useradd --system --user-group --key USERGROUPS_ENAB=yes fivenines --shell /bin/false --create-home -b /opt/
 fi
 
 # Determine the package manager and install dependencies
