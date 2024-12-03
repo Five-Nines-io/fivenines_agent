@@ -31,7 +31,9 @@ class Agent:
         signal.signal(signal.SIGTERM, self.shutdown)
         signal.signal(signal.SIGINT, self.shutdown)
 
-        self.version = '1.0.0'
+        self.version = '1.0.1'
+
+        print(f'fivenines agent v{self.version}')
 
         for file in ["TOKEN"]:
             self.load_file(file)
