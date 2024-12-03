@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "fivenines_agent"
-version = "1.0.1"
+version = "1.0.2"
 description = ""
 authors = ["Sébastien Puyet <sebastien@fivenines.io>"]
 license = "WTFPL"
