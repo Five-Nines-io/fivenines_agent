@@ -97,10 +97,10 @@ class Agent:
                     data['swap'] = psutil.swap_memory()._asdict()
 
                 if self.config['ipv4']:
-                    data['ipv4'] = get_ip(4)
+                    data['ipv4'] = get_ip(ipv6=False)
 
                 if self.config['ipv6']:
-                    data['ipv6'] = get_ip(6)
+                    data['ipv6'] = get_ip(ipv6=True)
 
                 if self.config['network']:
                     data['network'] = network()
