@@ -1,5 +1,5 @@
 #!/bin/bash
-# This script is used to update the fivenines agent, and run by root
+# This script is used to update the fivenines agent
 
 # stop the agent
 sudo systemctl stop fivenines-agent.service
