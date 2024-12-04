@@ -1,5 +1,5 @@
 #!/bin/bash
-# This script is used to update the fivenines agent, and run by root
+# This script is used to update the fivenines agent
 
 # stop the agent
 sudo systemctl stop fivenines-agent.service
@@ -13,6 +13,7 @@ if [ "$(getent passwd fivenines | cut -d: -f6)" == "/home/fivenines" ]; then
                 exit 1
         fi
         sudo usermod -m -d /opt/fivenines fivenines
+        echo "fivenines.io's working directory migrated to /opt/fivenines"
 
         # Reinstall the agent due to path changes
         echo "Reinstalling the fivenines_agent package"
@@ -28,9 +29,6 @@ if [ "$(getent passwd fivenines | cut -d: -f6)" == "/home/fivenines" ]; then
         else
                 echo "Successfully Reinstalled the fivenines_agent package"
         fi
-fi
-if [ "$(getent passwd fivenines | cut -d: -f6)" == "/opt/fivenines" ] && [ -d /opt/fivenines ]; then
-    echo "fivenines.io's working directory is already migrated to /opt/fivenines"
 fi
 
 # if the service file ExecStart is /home/fivenines/, replace it with /opt/fivenines/
