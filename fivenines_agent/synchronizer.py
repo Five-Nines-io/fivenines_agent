@@ -1,6 +1,7 @@
 import time
 import http.client
 import json
+import gzip
 from threading import Thread
 from threading import Lock
 
@@ -27,14 +28,20 @@ class Synchronizer(Thread):
 
     def send_request(self, data):
         try_count = 0
+        compressed_data = gzip.compress(json.dumps(data).encode('utf-8'))
+        headers = {
+            'Content-Type': 'application/json',
+            'Content-Encoding': 'gzip',
+            'Content-Length': str(len(compressed_data)),
+            'Authorization': f'Bearer {self.token}'
+        }
 
         while try_count < self.config['request_options']['retry']:
             try:
                 start_time = time.monotonic()
                 conn = http.client.HTTPSConnection(
                     api_url(), timeout=self.config['request_options']['timeout'])
-                res = conn.request('POST', '/collect', json.dumps(data), {
-                                    'Authorization': f'Bearer {self.token}', 'Content-Type': 'application/json'})
+                res = conn.request('POST', '/collect', compressed_data, headers)
                 res = conn.getresponse()
                 body = res.read().decode("utf-8")
 
