@@ -7,13 +7,17 @@ license = "WTFPL"
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = "^3.6"
+python = ">=3.8,<3.14"
 python-dotenv = "^0.20.0"
 psutil = "^5.9.8"
 systemd-watchdog = "^0.9.0"
 
 [tool.poetry.scripts]
 fivenines_agent = "fivenines_agent.__main__:start"
+
+[tool.poetry.group.dev.dependencies]
+poetry-plugin-export = "^1.8.0"
+pyinstaller = "^6.11.1"
 
 [build-system]
 requires = ["poetry-core"]
