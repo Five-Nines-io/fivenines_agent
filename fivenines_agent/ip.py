@@ -1,38 +1,52 @@
 import sys
 import traceback
 import socket
-import requests.packages.urllib3.util.connection
+import ssl
+import http.client
 
 from fivenines_agent.env import debug_mode
+class CustomHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(self, host, port=None, ipv6=False, timeout=5, **kwargs):
+        super().__init__(host, port, timeout=timeout, **kwargs)
+        self.ipv6 = ipv6
+        self.timeout = timeout
 
-def set_ip_version(ip_version: int = 6):
-    if ip_version == 4:
-        def allowed_gai_family():
-            return socket.AF_INET
+    def connect(self):
+        family = socket.AF_INET6 if self.ipv6 else socket.AF_INET
 
-    elif ip_version == 6:
-        def allowed_gai_family():
-            if requests.packages.urllib3.util.connection.HAS_IPV6:
-                return socket.AF_INET6
-            return socket.AF_INET
+        for res in socket.getaddrinfo(self.host, self.port, family, socket.SOCK_STREAM):
+            af, socktype, proto, canonname, sa = res
+            try:
+                self.sock = socket.socket(af, socktype, proto)
+                self.sock.connect(sa)
 
-    else:
-        return False
+                self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
+                return
+            except OSError:
+                if self.sock:
+                    self.sock.close()
+                raise ConnectionError(
+                    f"Could not connect to {self.host} on port {self.port} with family {'IPv6' if self.ipv6 else 'IPv4'}"
+                )
 
-    requests.packages.urllib3.util.connection.allowed_gai_family = allowed_gai_family
-    return True
+def get_ip(ipv6=False):
+    try:
+        context = ssl.create_default_context()
 
-def get_ip(version: int = 6):
-  set_ip_version(version)
+        conn = CustomHTTPSConnection("ip.fivenines.io", ipv6=ipv6, context=context)
+        conn.request("GET", "")
+        response = conn.getresponse()
+        body = response.read().decode("utf-8")
 
-  try:
-    res = requests.get("https://ip.fivenines.io")
-    result = res.text.strip()
-    if debug_mode():
-      print(f'ipv4: {repr(result)}')
+        if debug_mode():
+            print(f"Status: {response.status}, Reason: {response.reason}")
+            print(body)
 
-    if result != '':
-      return result
-  except Exception as e:
-    print(e, file=sys.stderr)
-    print(traceback.print_exc(), file=sys.stderr)
+        if response.status == 200:
+            return body.strip()
+    except Exception as e:
+        print(e, file=sys.stderr)
+        print(traceback.print_exc(), file=sys.stderr)
+    finally:
+        if conn:
+            conn.close()
