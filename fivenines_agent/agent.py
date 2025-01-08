@@ -69,9 +69,11 @@ class Agent:
         while True:
             try:
                 wd.ping()
-                self.config = self.synchronizer.get_config()
 
+                self.config = self.synchronizer.get_config()
                 if self.config['enabled'] == False:
+                    # If the agent is disabled, refresh the config every 25 seconds
+                    self.queue.put({'get_config': True})
                     time.sleep(25)
                     continue
 
