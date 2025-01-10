@@ -1,5 +1,7 @@
 import time
 import http.client
+import ssl
+import certifi
 import json
 import gzip
 from threading import Thread
@@ -36,11 +38,12 @@ class Synchronizer(Thread):
             'Authorization': f'Bearer {self.token}'
         }
 
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
         while try_count < self.config['request_options']['retry']:
             try:
                 start_time = time.monotonic()
                 conn = http.client.HTTPSConnection(
-                    api_url(), timeout=self.config['request_options']['timeout'])
+                    api_url(), timeout=self.config['request_options']['timeout'], context=ssl_context)
                 res = conn.request('POST', '/collect', compressed_data, headers)
                 res = conn.getresponse()
                 body = res.read().decode("utf-8")
