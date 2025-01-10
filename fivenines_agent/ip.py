@@ -2,6 +2,7 @@ import sys
 import traceback
 import socket
 import ssl
+import certifi
 import http.client
 
 from fivenines_agent.env import debug_mode
@@ -31,9 +32,9 @@ class CustomHTTPSConnection(http.client.HTTPSConnection):
 
 def get_ip(ipv6=False):
     try:
-        context = ssl.create_default_context()
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
 
-        conn = CustomHTTPSConnection("ip.fivenines.io", ipv6=ipv6, context=context)
+        conn = CustomHTTPSConnection("ip.fivenines.io", ipv6=ipv6, context=ssl_context)
         conn.request("GET", "")
         response = conn.getresponse()
         body = response.read().decode("utf-8")
