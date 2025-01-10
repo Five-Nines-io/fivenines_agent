@@ -31,13 +31,11 @@ fi
 wget https://github.com/Five-Nines-io/fivenines_agent/releases/download/v.1.0.6/fivenines-agent-linux-amd64 -O /opt/fivenines/fivenines_agent
 chmod +x /opt/fivenines/fivenines_agent
 
-# if the service file ExecStart is /home/fivenines/, replace it with /opt/fivenines/
-if [ "$(grep -E '^ExecStart=/home/fivenines/.*' /etc/systemd/system/fivenines-agent.service)" ] || [ "$(grep -E '^ExecStart=/opt/fivenines/.local/bin/fivenines_agent' /etc/systemd/system/fivenines-agent.service)" ]; then
-        echo "Updating the service file"
-        wget https://raw.githubusercontent.com/Five-Nines-io/five_nines_agent/main/fivenines-agent.service -O /etc/systemd/system/fivenines-agent.service
-        echo "Reloading the systemd daemon"
-        systemctl daemon-reload
-fi
+
+echo "Updating the service file"
+wget https://raw.githubusercontent.com/Five-Nines-io/five_nines_agent/main/fivenines-agent.service -O /etc/systemd/system/fivenines-agent.service
+echo "Reloading the systemd daemon"
+systemctl daemon-reload
 
 # Restart the agent
 systemctl restart fivenines-agent.service
