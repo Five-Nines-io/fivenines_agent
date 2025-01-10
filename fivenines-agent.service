@@ -4,7 +4,7 @@ Description=Five Nines monitoring agent
 [Service]
 Type=notify
 User=fivenines
-ExecStart=/opt/fivenines/.local/bin/fivenines_agent
+ExecStart=/opt/fivenines/fivenines_agent
 RestartSec=5
 Restart=always
 WatchdogSec=30
