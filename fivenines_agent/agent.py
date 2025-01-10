@@ -8,6 +8,7 @@ import platform
 import psutil
 import signal
 import socket
+from threading import Event
 
 from fivenines_agent.env import debug_mode
 from fivenines_agent.cpu import cpu_data, cpu_model
@@ -30,6 +31,7 @@ class Agent:
     def __init__(self):
         signal.signal(signal.SIGTERM, self.shutdown)
         signal.signal(signal.SIGINT, self.shutdown)
+        signal.signal(signal.SIGHUP, self.shutdown)
 
         self.version = '1.0.5'
 
@@ -66,7 +68,9 @@ class Agent:
             'boot_time': psutil.boot_time(),
         }
 
-        while True:
+        exit = Event()
+
+        while not exit.is_set():
             try:
                 wd.ping()
 
@@ -74,7 +78,7 @@ class Agent:
                 if self.config['enabled'] == False:
                     # If the agent is disabled, refresh the config every 25 seconds
                     self.queue.put({'get_config': True})
-                    time.sleep(25)
+                    exit.wait(25)
                     continue
 
                 data = static_data.copy()
@@ -142,7 +146,7 @@ class Agent:
 
         if debug_mode():
             print(f'Sleeping for {sleep_time} seconds')
-        time.sleep(sleep_time)
+        exit.wait(sleep_time)
 
     def tcp_ping(self, host, port=80, timeout=5):
         if debug_mode():
