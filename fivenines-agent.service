@@ -8,6 +8,7 @@ ExecStart=/opt/fivenines/fivenines_agent
 RestartSec=5
 Restart=always
 WatchdogSec=30
+NotifyAccess=all
 
 Environment=PYTHONUNBUFFERED=1
 
