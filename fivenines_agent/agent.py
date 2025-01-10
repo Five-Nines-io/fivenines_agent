@@ -26,6 +26,7 @@ from fivenines_agent.synchronization_queue import SynchronizationQueue
 CONFIG_DIR = "/etc/fivenines_agent"
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=f'{CONFIG_DIR}/.env')
+exit = Event()
 
 class Agent:
     def __init__(self):
@@ -67,8 +68,6 @@ class Agent:
             'uname': platform.uname()._asdict(),
             'boot_time': psutil.boot_time(),
         }
-
-        exit = Event()
 
         while not exit.is_set():
             try:
