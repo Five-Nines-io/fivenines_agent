@@ -33,7 +33,7 @@ if ! id -u fivenines >/dev/null 2>&1; then
 fi
 
 # Download the agent
-wget https://github.com/Five-Nines-io/fivenines_agent/releases/download/v.1.0.6/fivenines-agent-linux-amd64 -O /opt/fivenines/fivenines_agent
+wget https://github.com/Five-Nines-io/fivenines_agent/releases/latest/download/fivenines-agent-linux-amd64 -O /opt/fivenines/fivenines_agent
 chmod +x /opt/fivenines/fivenines_agent
 
 # Download the service file
