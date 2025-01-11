@@ -23,11 +23,13 @@ class CustomHTTPSConnection(http.client.HTTPSConnection):
 
                 self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
                 return
-            except OSError:
+            except socket.gaierror as e:
+                raise ConnectionError(f"DNS resolution failed for {self.host}: {e}")
+            except OSError as e:
                 if self.sock:
                     self.sock.close()
                 raise ConnectionError(
-                    f"Could not connect to {self.host} on port {self.port} with family {'IPv6' if self.ipv6 else 'IPv4'}"
+                    f"Could not connect to {self.host} on port {self.port} with family {'IPv6' if self.ipv6 else 'IPv4'}: {e}"
                 )
 
 def get_ip(ipv6=False):
@@ -45,9 +47,14 @@ def get_ip(ipv6=False):
 
         if response.status == 200:
             return body.strip()
+
+    except ConnectionError as e:
+        # Log the error and optionally retry or handle IPv4 fallback
+        print(f"Unexpected error occurred: {e}", file=sys.stderr)
+
     except Exception as e:
         print(e, file=sys.stderr)
-        print(traceback.print_exc(), file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
     finally:
         if conn:
             conn.close()
