@@ -42,8 +42,8 @@ def get_ip(ipv6=False):
         body = response.read().decode("utf-8")
 
         if debug_mode():
-            print(f"Status: {response.status}, Reason: {response.reason}")
-            print(body)
+            print(f"Status: {response.status}, Reason: {response.reason}", file=sys.stderr)
+            print(f"Response body: {body}", file=sys.stderr)
 
         if response.status == 200:
             return body.strip()

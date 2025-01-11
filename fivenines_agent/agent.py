@@ -71,7 +71,7 @@ class Agent:
 
         while not exit.is_set():
             try:
-                wd.ping()
+                wd.notify()
 
                 self.config = self.synchronizer.get_config()
                 if self.config['enabled'] == False:
