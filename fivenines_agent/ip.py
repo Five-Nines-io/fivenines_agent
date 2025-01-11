@@ -48,13 +48,16 @@ def get_ip(ipv6=False):
         if response.status == 200:
             return body.strip()
 
+        return None
     except ConnectionError as e:
         # Log the error and optionally retry or handle IPv4 fallback
         print(f"Unexpected error occurred: {e}", file=sys.stderr)
+        return None
 
     except Exception as e:
         print(e, file=sys.stderr)
         traceback.print_exc(file=sys.stderr)
+        return None
     finally:
         if conn:
             conn.close()
