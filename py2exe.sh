@@ -59,7 +59,9 @@ poetry run pyinstaller \
         --distpath ./build \
         --dist dist/linux \
         --clean \
-        ./py2exe_entrypoint.py
+	--add-binary "/usr/lib/x86_64-linux-gnu/libssl.so.3:." \
+	--add-binary "/usr/lib/x86_64-linux-gnu/libcrypto.so.3:." \
+	./py2exe_entrypoint.py
 
 #
 # Clean up
