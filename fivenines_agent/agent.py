@@ -34,7 +34,7 @@ class Agent:
         signal.signal(signal.SIGINT, self.shutdown)
         signal.signal(signal.SIGHUP, self.shutdown)
 
-        self.version = '1.0.5'
+        self.version = '1.0.6'
 
         print(f'fivenines agent v{self.version}')
 
