@@ -46,9 +46,12 @@ class Agent:
         self.synchronizer.start()
 
     def shutdown(self, _signum, _frame):
+        print('fivenines agent shutting down')
         self.queue.clear()
+        self.synchronizer.stop()
         self.queue.put(None)
         self.synchronizer.join()
+        exit.set()
         sys.exit(0)
 
     def load_file(self, file):
@@ -130,7 +133,7 @@ class Agent:
                 self.wait(start_time)
 
             except KeyboardInterrupt:
-                self.shutdown()
+                self.shutdown(None, None)
 
     def wait(self, start_time):
         running_time = time.monotonic() - start_time

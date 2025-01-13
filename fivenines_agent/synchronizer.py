@@ -6,12 +6,14 @@ import json
 import gzip
 from threading import Thread
 from threading import Lock
+from threading import Event
 
 from fivenines_agent.env import debug_mode, api_url
 
 class Synchronizer(Thread):
     def __init__(self, token, queue):
         Thread.__init__(self)
+        self._stop_event = Event()
         self.config_lock = Lock()
         self.token = token
         self.config = { 'enabled': False, 'request_options': { 'timeout': 5, 'retry': 3, 'retry_interval': 5 } }
@@ -20,13 +22,14 @@ class Synchronizer(Thread):
         self.send_request({'get_config': True})
 
     def run(self):
-        while True:
+        while not self._stop_event.is_set():
             data = self.queue.get()
-            if data == None:
-                break
+            if data is not None:
+                self.send_request(data)
+                self.queue.task_done()
 
-            self.send_request(data)
-            self.queue.task_done()
+    def stop(self):
+        self._stop_event.set()
 
     def send_request(self, data):
         try_count = 0
