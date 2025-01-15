@@ -1,3 +1,5 @@
+#!/bin/bash
+# This script is used to uninstall the fivenines agent
 
 # Stop the fivenines-agent service
 if systemctl is-active --quiet fivenines-agent.service; then
