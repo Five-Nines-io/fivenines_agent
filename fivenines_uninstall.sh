@@ -51,4 +51,6 @@ else
   echo "System user fivenines does not exist."
 fi
 
+rm fivenines_uninstall.sh
+
 echo "fivenines agent uninstallation complete."
