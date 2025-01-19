@@ -32,8 +32,15 @@ if ! id -u fivenines >/dev/null 2>&1; then
   sudo useradd --system --user-group --key USERGROUPS_ENAB=yes fivenines --shell /bin/false --create-home -b /opt/
 fi
 
-# Download the agent
-wget https://github.com/Five-Nines-io/fivenines_agent/releases/latest/download/fivenines-agent-linux-amd64 -O /opt/fivenines/fivenines_agent
+CURRENT_ARCH=$(uname -m)
+# Download the agent based on the architecture
+echo "Detected architecture: $CURRENT_ARCH"
+if [ "$CURRENT_ARCH" == "aarch64" ]; then
+        wget https://github.com/Five-Nines-io/fivenines_agent/releases/latest/download/fivenines-agent-linux-arm64 -O /opt/fivenines/fivenines_agent
+else
+        wget https://github.com/Five-Nines-io/fivenines_agent/releases/latest/download/fivenines-agent-linux-amd64 -O /opt/fivenines/fivenines_agent
+fi
+
 chmod +x /opt/fivenines/fivenines_agent
 
 # Download the service file
