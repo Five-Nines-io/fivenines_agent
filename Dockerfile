@@ -30,6 +30,7 @@ RUN yum groupinstall -y "Development Tools" && \
         xz-devel libffi-devel ncurses-devel sqlite sqlite-devel \
         openssl openssl-devel tk-devel gdbm-devel libuuid-devel \
         libnsl2-devel libtirpc-devel readline-devel uuid-devel tar && \
+        binutils-aarch64-linux-gnu binutils-arm-linux-gnueabi && \
     yum clean all
 
 # Build OpenSSL from source

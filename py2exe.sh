@@ -9,6 +9,23 @@ else
     PATH_SEPARATOR=":"
 fi
 
+# Detect architecture
+TARGET_ARCH=${1:-amd64}  # Default to amd64 if not provided
+
+if [[ "$TARGET_ARCH" == "arm64" ]]; then
+    export CC=aarch64-linux-gnu-gcc
+    export CXX=aarch64-linux-gnu-g++
+    BINARY_NAME="fivenines-agent-linux-arm64"
+elif [[ "$TARGET_ARCH" == "arm" ]]; then
+    export CC=arm-linux-gnueabi-gcc
+    export CXX=arm-linux-gnueabi-g++
+    BINARY_NAME="fivenines-agent-linux-arm"
+else
+    export CC=gcc
+    export CXX=g++
+    BINARY_NAME="fivenines-agent-linux-amd64"
+fi
+
 #
 # Install and enable virtualenv
 #
@@ -85,13 +102,13 @@ poetry export --without-hashes -o requirements.txt || {
 #
 # Build the executable
 #
-echo "Building the executable"
+echo "Building the executable for $TARGET_ARCH"
 mkdir -p build dist/linux
 
 poetry run pyinstaller \
     --noconfirm \
     --onefile \
-    --name fivenines-agent-linux-amd64 \
+    --name $BINARY_NAME \
     --workpath ./build/tmp \
     --distpath ./build \
     --dist dist/linux \
