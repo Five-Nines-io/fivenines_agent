@@ -14,6 +14,12 @@ wget -q -N https://raw.githubusercontent.com/Five-Nines-io/five_nines_agent/main
 wget -q -N https://raw.githubusercontent.com/Five-Nines-io/five_nines_agent/main/fivenines_update.sh && sudo bash fivenines_update.sh
 ```
 
+## Remove
+
+```bash
+wget -q -N https://raw.githubusercontent.com/Five-Nines-io/five_nines_agent/main/fivenines_uninstall.sh && sudo bash fivenines_uninstall.sh
+```
+
 ## Contribute
 
 Feel free to open a PR/issues if you encounter any bug or want to contribute.
