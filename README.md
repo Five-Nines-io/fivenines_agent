@@ -1,6 +1,6 @@
 # fivenines agent
 
-This agent collects server metrics from the monitored host and send it to the [fivenines](https://fivenines.io) API.
+This agent collects server metrics from the monitored host and sends it to the [fivenines](https://fivenines.io) API.
 
 ## Setup
 
