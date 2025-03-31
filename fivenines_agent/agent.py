@@ -20,6 +20,7 @@ from fivenines_agent.disks import io
 from fivenines_agent.files import file_handles_used, file_handles_limit
 from fivenines_agent.redis import redis_metrics
 from fivenines_agent.nginx import nginx_metrics
+from fivenines_agent.docker import docker_metrics
 from fivenines_agent.synchronizer import Synchronizer
 from fivenines_agent.synchronization_queue import SynchronizationQueue
 
@@ -34,7 +35,7 @@ class Agent:
         signal.signal(signal.SIGINT, self.shutdown)
         signal.signal(signal.SIGHUP, self.shutdown)
 
-        self.version = '1.0.7'
+        self.version = '1.0.8'
 
         print(f'fivenines agent v{self.version}')
 
@@ -128,6 +129,9 @@ class Agent:
 
                 if self.config['nginx']:
                     data['nginx'] = nginx_metrics()
+
+                if self.config['docker']:
+                    data['docker'] = docker_metrics(**self.config['docker'])
 
                 self.queue.put(data)
                 self.wait(start_time)
