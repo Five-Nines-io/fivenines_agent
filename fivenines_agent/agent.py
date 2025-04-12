@@ -23,7 +23,7 @@ from fivenines_agent.nginx import nginx_metrics
 from fivenines_agent.docker import docker_metrics
 from fivenines_agent.synchronizer import Synchronizer
 from fivenines_agent.synchronization_queue import SynchronizationQueue
-
+from fivenines_agent.ports import listening_ports
 CONFIG_DIR = "/etc/fivenines_agent"
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=f'{CONFIG_DIR}/.env')
@@ -123,6 +123,9 @@ class Agent:
 
                 if self.config['processes']:
                     data['processes'] = processes()
+
+                if self.config['ports']:
+                    data['ports'] = listening_ports()
 
                 if self.config['redis']:
                     data['redis'] = redis_metrics(**self.config['redis'])
