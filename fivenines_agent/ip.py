@@ -4,7 +4,7 @@ import socket
 import ssl
 import certifi
 import http.client
-
+from fivenines_agent.dns_resolver import DNSResolver
 from fivenines_agent.env import debug_mode
 class CustomHTTPSConnection(http.client.HTTPSConnection):
     def __init__(self, host, port=None, ipv6=False, timeout=5, **kwargs):
@@ -13,24 +13,32 @@ class CustomHTTPSConnection(http.client.HTTPSConnection):
         self.timeout = timeout
 
     def connect(self):
-        family = socket.AF_INET6 if self.ipv6 else socket.AF_INET
+        resolver = DNSResolver(self.host)
+        record_type = "AAAA" if self.ipv6 else "A"
+        try:
+            answers = resolver.resolve(record_type)
+            if not answers:
+                raise ConnectionError(f"No DNS records found for {self.host} ({record_type})")
+        except Exception as e:
+            raise ConnectionError(f"DNS resolution failed for {self.host}: {e}")
 
-        for res in socket.getaddrinfo(self.host, self.port, family, socket.SOCK_STREAM):
-            af, socktype, proto, canonname, sa = res
+        for rdata in answers:
+            ip = rdata.address
+            af = socket.AF_INET6 if self.ipv6 else socket.AF_INET
             try:
-                self.sock = socket.socket(af, socktype, proto)
-                self.sock.connect(sa)
-
+                self.sock = socket.socket(af, socket.SOCK_STREAM)
+                self.sock.connect((ip, self.port))
                 self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
                 return
-            except socket.gaierror as e:
-                raise ConnectionError(f"DNS resolution failed for {self.host}: {e}")
             except OSError as e:
                 if self.sock:
                     self.sock.close()
-                raise ConnectionError(
-                    f"Could not connect to {self.host} on port {self.port} with family {'IPv6' if self.ipv6 else 'IPv4'}: {e}"
-                )
+                print(f"Could not connect to {ip}: {e}")
+                continue  # Try next IP
+
+        raise ConnectionError(
+            f"Could not connect to {self.host} on port {self.port} with family {'IPv6' if self.ipv6 else 'IPv4'}"
+        )
 
 def get_ip(ipv6=False):
     try:

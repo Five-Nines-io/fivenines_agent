@@ -47,7 +47,7 @@ class Agent:
         self.synchronizer.start()
 
     def shutdown(self, _signum, _frame):
-        print('fivenines agent shutting down')
+        print('fivenines agent shutting down. Please wait...')
         self.queue.clear()
         self.synchronizer.stop()
         self.queue.put(None)
