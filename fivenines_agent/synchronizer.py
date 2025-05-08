@@ -7,6 +7,7 @@ import gzip
 from threading import Thread
 from threading import Lock
 from threading import Event
+import socket
 
 from fivenines_agent.env import debug_mode, api_url
 from fivenines_agent.dns_resolver import DNSResolver
@@ -48,7 +49,9 @@ class Synchronizer(Thread):
             try:
                 start_time = time.monotonic()
                 conn = self.get_conn()
-                headers['Host'] = api_url()
+                if conn is None:
+                    raise Exception("Failed to establish connection (DNS resolution or connection setup failed)")
+
                 conn.request('POST', '/collect', compressed_data, headers)
                 res = conn.getresponse()
                 body = res.read().decode("utf-8")
@@ -73,27 +76,40 @@ class Synchronizer(Thread):
 
     def get_conn(self):
         url = api_url()
-        # Use DNSResolver to resolve the API host only if it's not localhost
         if not url.startswith('localhost'):
-            resolver = DNSResolver(url.split(':')[0])
-            answers = resolver.resolve("A")
-            if not answers:
-                print(f"Could not resolve API host: {url}")
-                return
+            try:
+                resolver = DNSResolver(url.split(':')[0])
+                answers = resolver.resolve("A")
+                if not answers:
+                    print(f"Could not resolve API host: {url}")
+                    return None
 
-            api_ip = answers[0].address
-            ssl_context = ssl.create_default_context(cafile=certifi.where())
-            conn = http.client.HTTPSConnection(
-                api_ip,
-                timeout=self.config['request_options']['timeout'],
-                context=ssl_context
-            )
+                api_ip = answers[0].address
+                hostname = url.split(':')[0]
+
+                ssl_context = ssl.create_default_context(cafile=certifi.where())
+                port = 443
+                if ':' in url:
+                    port = int(url.split(':')[1])
+
+                sock = socket.create_connection((api_ip, port), timeout=self.config['request_options']['timeout'])
+                sock = ssl_context.wrap_socket(sock, server_hostname=hostname)
+
+                conn = http.client.HTTPSConnection(
+                    hostname,
+                    timeout=self.config['request_options']['timeout']
+                )
+                conn.sock = sock
+                return conn
+            except Exception as e:
+                print(f"Error during DNS resolution or connection setup: {e}")
+                return None
         else:
             conn = http.client.HTTPConnection(
                 url,
                 timeout=self.config['request_options']['timeout'],
             )
-        return conn
+            return conn
 
     def get_config(self):
         if self.config['enabled'] == None:
