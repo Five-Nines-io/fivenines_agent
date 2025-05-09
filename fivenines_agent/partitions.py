@@ -1,4 +1,6 @@
 import psutil
+from fivenines_agent.env import debug_mode
+
 
 IGNORED_DEVICES = ['/loop', '/snap']
 IGNORED_FS = ['squashfs', 'cagefs-skeleton']
@@ -26,12 +28,17 @@ def partitions_usage():
     partitions_usage = {}
 
     for _, v in enumerate(psutil.disk_partitions(all=False)):
-        if v.device.startswith(tuple(IGNORED_DEVICES)):
-            continue
+        try:
+            if v.device.startswith(tuple(IGNORED_DEVICES)):
+                continue
 
-        if v.fstype in IGNORED_FS:
-            continue
+            if v.fstype in IGNORED_FS:
+                continue
 
-        partitions_usage[v.mountpoint] = psutil.disk_usage(v.mountpoint)._asdict()
+            partitions_usage[v.mountpoint] = psutil.disk_usage(v.mountpoint)._asdict()
+        except PermissionError as e:
+            if debug_mode:
+                print(f"Error getting disk usage for {v.mountpoint}: {e}")
+            continue
 
     return partitions_usage
