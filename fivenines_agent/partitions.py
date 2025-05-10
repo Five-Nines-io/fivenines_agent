@@ -1,17 +1,12 @@
 import psutil
 from fivenines_agent.env import debug_mode
 
-
-IGNORED_DEVICES = ['/loop', '/snap']
-IGNORED_FS = ['squashfs', 'cagefs-skeleton']
+IGNORED_FS = ['squashfs', 'cagefs-skeleton', 'overlay', 'devtmpfs', 'tmpfs', 'loop']
 
 def partitions_metadata():
     partitions_metadata = []
 
     for part in psutil.disk_partitions(False):
-        if part.device.startswith(tuple(IGNORED_DEVICES)):
-            continue
-
         if part.fstype in IGNORED_FS:
             continue
 
@@ -29,9 +24,6 @@ def partitions_usage():
 
     for _, v in enumerate(psutil.disk_partitions(all=False)):
         try:
-            if v.device.startswith(tuple(IGNORED_DEVICES)):
-                continue
-
             if v.fstype in IGNORED_FS:
                 continue
 
