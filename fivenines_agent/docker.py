@@ -26,7 +26,7 @@ def docker_containers(socket_url=None):
             if previous_stats.get(container.id):
                 containers_data[container.id] = {
                     'name': container.name,
-                    'image': container.image.tags[0],
+                    'image': container.image.tags[0] if container.image.tags else container.image.short_id,
                     'status': container.status,
                     'cpu_percent': calculate_cpu_percent(stats, previous_stats[container.id]),
                     'memory_percent': calculate_memory_percent(stats),
