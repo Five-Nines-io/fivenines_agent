@@ -7,7 +7,7 @@ import time
 
 from fivenines_agent.env import debug_mode
 
-_disk_smart_cache = {
+_disk_cache = {
     "timestamp": 0,
     "data": []
 }
@@ -33,7 +33,7 @@ def extract_attribute(attributes, attr_id):
             return attr.get("raw", {}).get("value")
     return None
 
-def get_disk_smart_info(device):
+def get_disk_info(device):
     """Get the SMART info of a given block device."""
     try:
         result = subprocess.run(
@@ -64,13 +64,13 @@ def get_disk_smart_info(device):
     except Exception as e:
         return {"device": device, "status": "error", "error": str(e)}
 
-def disk_smart():
+def disk_health():
     """Collect SMART info, but only once per minute (cached)."""
-    global _disk_smart_cache
+    global _disk_cache
     now = time.time()
 
-    if now - _disk_smart_cache["timestamp"] < 60:
-        return _disk_smart_cache["data"]
+    if now - _disk_cache["timestamp"] < 60:
+        return _disk_cache["data"]
 
     if not smartctl_available():
         if debug_mode:
@@ -83,8 +83,8 @@ def disk_smart():
                 print("No /dev/sdX devices found")
             data = []
         else:
-            data = [get_disk_smart_info(dev) for dev in devices]
+            data = [get_disk_info(dev) for dev in devices]
 
-    _disk_smart_cache["timestamp"] = now
-    _disk_smart_cache["data"] = data
+    _disk_cache["timestamp"] = now
+    _disk_cache["data"] = data
     return data
