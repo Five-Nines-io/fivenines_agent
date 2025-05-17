@@ -268,16 +268,13 @@ def clean_smart_results(results):
         cleaned_results['temperature_sensors'] = temperature_sensors
 
     # Process ATA SMART attributes
-    smart_attributes = {
-        key.split('_')[2]: {
-            'name': SMART_ATTRIBUTE_NAMES.get(key.split('_')[2], 'Unknown'),
-            'raw_value': safe_int_conversion(value)
-        }
-        for key, value in results.items()
-        if key.startswith('smart_attr_')
-    }
-    if smart_attributes:
-        cleaned_results['smart_attributes'] = smart_attributes
+    for key, value in results.items():
+        if key.startswith('smart_attr_'):
+            attr_id = key.split('_')[2]
+            attr_name = SMART_ATTRIBUTE_NAMES.get(attr_id, 'unknown')
+            raw_value = safe_int_conversion(value)
+            if raw_value is not None:
+                cleaned_results[attr_name] = raw_value
 
     return cleaned_results
 
