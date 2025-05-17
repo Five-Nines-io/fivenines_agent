@@ -17,7 +17,7 @@ from fivenines_agent.network import network
 from fivenines_agent.partitions import partitions_metadata, partitions_usage
 from fivenines_agent.processes import processes
 from fivenines_agent.io import io
-from fivenines_agent.storage import storage_identification, storage_health
+from fivenines_agent.smart_storage import smart_storage_identification, smart_storage_health
 from fivenines_agent.files import file_handles_used, file_handles_limit
 from fivenines_agent.redis import redis_metrics
 from fivenines_agent.nginx import nginx_metrics
@@ -122,9 +122,9 @@ class Agent:
                 if self.config['io']:
                     data['io'] = io()
 
-                if self.config['storage_health']:
-                    data['storage_identification'] = storage_identification()
-                    data['storage_health'] = storage_health()
+                if self.config['smart_storage_health']:
+                    data['smart_storage_identification'] = smart_storage_identification()
+                    data['smart_storage_health'] = smart_storage_health()
 
                 if self.config['processes']:
                     data['processes'] = processes()

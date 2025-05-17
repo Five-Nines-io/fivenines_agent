@@ -344,7 +344,7 @@ def get_storage_identification(device):
             print('Error fetching storage identification for device: ', device, 'error: ', e)
         return None
 
-def storage_identification():
+def smart_storage_identification():
     """Collect storage identification for all storage devices.
     Uses smartctl for all devices.
     Cached for 60 seconds.
@@ -378,7 +378,7 @@ def storage_identification():
 
     return data
 
-def storage_health():
+def smart_storage_health():
     """
     Collect health info for all storage devices.
     Uses smartctl for all devices and enhances NVMe devices with nvme-cli when available.
