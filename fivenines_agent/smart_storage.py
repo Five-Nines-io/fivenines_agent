@@ -334,12 +334,18 @@ def smart_storage_identification():
     now = time.time()
 
 
-    # Cache for 10 minutes, we don't need to update this too often
+    # Cache for 10 minutes as we don't need to update this too often
     # This can change only for hotswapped drives
     if now - _identification_storage_cache["timestamp"] < 600:
         return _identification_storage_cache["data"]
 
-    if not smartctl_available():
+    # Get tool versions only if we have devices to process
+    tool_versions = {
+        "smartctl_version": get_smartctl_version() if smartctl_available() else None,
+        "nvme_cli_version": get_nvme_cli_version() if nvme_cli_available() else None
+    }
+
+    if tool_versions["smartctl_version"] is None:
         if debug_mode:
             print("smartctl not installed")
         data = []
@@ -351,6 +357,8 @@ def smart_storage_identification():
             data = []
         else:
             data = [get_storage_identification(dev) for dev in devices]
+            for device_info in data:
+                device_info.update(tool_versions)
 
     data = [d for d in data if d is not None]
 
@@ -382,16 +390,9 @@ def smart_storage_health():
                 print("No storage devices found")
             data = []
         else:
-            # Get tool versions only if we have devices to process
-            tool_versions = {
-                "smartctl_version": get_smartctl_version() if smartctl_available() else None,
-                "nvme_cli_version": get_nvme_cli_version() if nvme_cli_available() else None
-            }
             data = [get_storage_info(dev) for dev in devices]
             # Remove None values and add tool versions
             data = [d for d in data if d is not None]
-            for device_info in data:
-                device_info.update(tool_versions)
 
     _health_storage_cache["timestamp"] = now
     _health_storage_cache["data"] = data
