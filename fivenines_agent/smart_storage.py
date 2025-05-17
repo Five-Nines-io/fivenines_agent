@@ -355,10 +355,9 @@ def smart_storage_identification():
             data = []
         else:
             data = [get_storage_identification(dev) for dev in devices]
+            data = [d for d in data if d is not None]
             for device_info in data:
                 device_info.update(tool_versions)
-
-    data = [d for d in data if d is not None]
 
     _identification_storage_cache["timestamp"] = now
     _identification_storage_cache["data"] = data
