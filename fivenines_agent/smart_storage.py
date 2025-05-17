@@ -305,7 +305,7 @@ def get_storage_identification(device):
             capture_output=True, text=True, check=True
         )
 
-        results = {}
+        results = { "device": device.split('/')[-1] }
         for line in result.stdout.splitlines():
             # Split on first occurrence of colon to handle values that might contain colons
             parts = line.split(':', 1)
