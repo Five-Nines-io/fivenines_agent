@@ -125,6 +125,7 @@ class Agent:
                     data['io'] = io()
 
                 data['storage_health'] = storage_health()
+                print(data['storage_health'])
                 # if self.config['nvme_health']:
                     # data['nvme_health'] = nvme_health()
 

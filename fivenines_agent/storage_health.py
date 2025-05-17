@@ -77,6 +77,26 @@ SMART_ATTRIBUTE_NAMES = {
     '254': 'Free_Fall_Protection'
 }
 
+# Standard NVMe attribute names, values are not used are there for reference
+NVME_ATTRIBUTE_NAMES = {
+    'temperature': 'Temperature',
+    'avail_spare': 'Available Spare',
+    'spare_thresh': 'Available Spare Threshold',
+    'percent_used': 'Percentage Used',
+    'data_units_read': 'Data Units Read',
+    'data_units_written': 'Data Units Written',
+    'host_read_commands': 'Host Read Commands',
+    'host_write_commands': 'Host Write Commands',
+    'controller_busy_time': 'Controller Busy Time',
+    'power_cycles': 'Power Cycles',
+    'power_on_hours': 'Power On Hours',
+    'unsafe_shutdowns': 'Unsafe Shutdowns',
+    'media_errors': 'Media Errors',
+    'num_err_log_entries': 'Error Information Log Entries',
+    'warning_temp_time': 'Warning Composite Temperature Time',
+    'critical_comp_time': 'Critical Composite Temperature Time'
+}
+
 def smartctl_available():
     """Check if smartctl is available on the system."""
     return shutil.which("smartctl") is not None
@@ -111,24 +131,17 @@ def get_nvme_enhanced_info(device):
         )
         raw = json.loads(result.stdout)
 
-        return {
-            "controller_busy_time": raw.get("controller_busy_time"),
-            "temperature": raw.get("temperature") - 273.15,  # convert to celsius
-            "percentage_used": raw.get("percent_used"),
-            "power_cycles": raw.get("power_cycles"),
-            "power_on_hours": raw.get("power_on_hours"),
-            "host_read_commands": raw.get("host_read_commands"),
-            "host_write_commands": raw.get("host_write_commands"),
-            "available_spare_percentage": raw.get("avail_spare"),
-            "available_spare_threshold_percentage": raw.get("spare_thresh"),
-            "media_errors": raw.get("media_errors"),
-            "unsafe_shutdowns": raw.get("unsafe_shutdowns"),
-            "data_units_written": raw.get("data_units_written"),
-            "data_units_read": raw.get("data_units_read"),
-            "error_information_log_entries": raw.get("num_err_log_entries"),
-            "warning_comp_temperature_time": raw.get("warning_temp_time"),
-            "critical_comp_temperature_time": raw.get("critical_comp_time"),
-        }
+        # Convert raw values to standardized format
+        enhanced_info = {}
+        for key, name in NVME_ATTRIBUTE_NAMES.items():
+            if key in raw:
+                value = raw[key]
+                # Special handling for temperature (convert from Kelvin to Celsius)
+                if key == 'temperature':
+                    value = value - 273.15
+                enhanced_info[key] = value
+
+        return enhanced_info
     except Exception as e:
         if debug_mode:
             print('Error fetching NVMe enhanced info for device: ', device, 'error: ', e)
