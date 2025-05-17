@@ -17,8 +17,9 @@ from fivenines_agent.network import network
 from fivenines_agent.partitions import partitions_metadata, partitions_usage
 from fivenines_agent.processes import processes
 from fivenines_agent.io import io
-from fivenines_agent.nvme_health import nvme_health
-from fivenines_agent.disk_health import disk_health
+# from fivenines_agent.nvme_health import nvme_health
+# from fivenines_agent.disk_health import disk_health
+from fivenines_agent.storage_health import storage_health
 from fivenines_agent.files import file_handles_used, file_handles_limit
 from fivenines_agent.redis import redis_metrics
 from fivenines_agent.nginx import nginx_metrics
@@ -123,11 +124,12 @@ class Agent:
                 if self.config['io']:
                     data['io'] = io()
 
-                if self.config['nvme_health']:
-                    data['nvme_health'] = nvme_health()
+                data['storage_health'] = storage_health()
+                # if self.config['nvme_health']:
+                    # data['nvme_health'] = nvme_health()
 
-                if self.config['disk_health']:
-                    data['disk_health'] = disk_health()
+                # if self.config['disk_health']:
+                    # data['disk_health'] = disk_health()
 
                 if self.config['processes']:
                     data['processes'] = processes()
