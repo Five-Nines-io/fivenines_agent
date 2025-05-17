@@ -12,7 +12,6 @@ def processes():
         'cpu_times',
         'num_threads',
         'status',
-        'connections',
     ]
 
     for proc in psutil.process_iter():
