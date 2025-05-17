@@ -80,7 +80,7 @@ class Agent:
                 wd.notify()
 
                 self.config = self.synchronizer.get_config()
-                if self.config['enabled'] == False:
+                if not self.config['enabled']:
                     # If the agent is disabled, refresh the config every 25 seconds
                     self.queue.put({'get_config': True})
                     exit.wait(25)

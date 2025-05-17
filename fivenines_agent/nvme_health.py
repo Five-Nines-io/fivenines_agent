@@ -1,14 +1,9 @@
 import subprocess
 import json
-import os
-import re
 import shutil
 import time
 
 from fivenines_agent.env import debug_mode
-
-_NVME_CTRL_RE   = re.compile(r'^nvme(\d+)$')          # -> controller  number
-_NVME_NS_RE     = re.compile(r'^nvme(\d+)n(\d+)$')    # -> controller, namespace
 
 _nvme_cache = {
     "timestamp": 0,
@@ -18,78 +13,56 @@ _nvme_cache = {
 def nvme_cli_available() -> bool:
     return shutil.which("nvme") is not None
 
-def _discover_nvme_nodes():
-    """
-    Yield dicts:
-      {"path": "/dev/nvme0",   "type": "controller", "ctrl": 0}
-      {"path": "/dev/nvme0n1", "type": "namespace",  "ctrl": 0, "ns": 1}
-    """
-    for entry in os.listdir("/dev"):
-        m_ctrl = _NVME_CTRL_RE.match(entry)
-        m_ns   = _NVME_NS_RE.match(entry)
-        if m_ctrl:
-            yield {"path": f"/dev/{entry}", "type": "controller",
-                   "ctrl": int(m_ctrl.group(1))}
-        elif m_ns:
-            yield {"path": f"/dev/{entry}", "type": "namespace",
-                   "ctrl": int(m_ns.group(1)), "ns": int(m_ns.group(2))}
-
-
 def list_nvme_devices():
-    """Return the discovered devices."""
-    devices = list(_discover_nvme_nodes())
-    return sorted(devices,
-                  key=lambda d: (d["ctrl"], d.get("ns", -1)))   # namespaces after their ctrl
+    devices = []
 
+    try:
+        raw_data = subprocess.Popen('sudo nvme --list --output-format=json', stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True).communicate()[0]
+        devices_info = json.loads(raw_data)
+        for device_info in devices_info['Devices']:
+            devices.append(device_info['DevicePath'])
+        return devices
 
-def _run_nvme(cmd, device):
-    """Run nvme‑cli and return parsed JSON or raise."""
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    return json.loads(result.stdout)
+    except Exception as e:
+        if debug_mode:
+            print("Error fetching nvme status information: ", e)
+        return []
 
-
-def get_nvme_info(dev_dict):
+def get_nvme_info(device):
     """Fetch SMART/health data for a controller or namespace."""
     try:
-        if dev_dict["type"] == "controller":
-            raw = _run_nvme(
-                ["nvme", "smart-log", dev_dict["path"], "-o", "json"],
-                dev_dict["path"]
-            )
-
-        else:  # namespace
-            ctrl_path = f"/dev/nvme{dev_dict['ctrl']}"
-            nsid      = dev_dict["ns"]
-            # “smart-log --namespace-id=<id> <ctrl>” works everywhere ns‑SMART is supported
-            raw = _run_nvme(
-                ["nvme", "smart-log", f"--namespace-id={nsid}",
-                 ctrl_path, "-o", "json"],
-                dev_dict["path"]
-            )
+        result = subprocess.run(
+            ["sudo", "nvme", "smart-log", device, "-o", "json"],
+            capture_output=True, text=True, check=True
+        )
+        raw = json.loads(result.stdout)
 
         return {
-            "device": dev_dict["path"],
-            "status": "ok",
+            "device": device.split('/')[-1],
+            "controller_busy_time": raw.get("controller_busy_time"),
             "temperature": raw.get("temperature") - 273.15, # convert to celsius
-            "percentage_used": raw.get("percentage_used"),
-            "available_spare": raw.get("available_spare"),
+            "percentage_used": raw.get("percent_used"),
+            "power_cycles": raw.get("power_cycles"),
+            "power_on_hours": raw.get("power_on_hours"),
+            "host_read_commands": raw.get("host_read_commands"),
+            "host_write_commands": raw.get("host_write_commands"),
+            "available_spare_percentage": raw.get("avail_spare"),
+            "available_spare_threshold_percentage": raw.get("spare_thresh"),
             "media_errors": raw.get("media_errors"),
             "unsafe_shutdowns": raw.get("unsafe_shutdowns"),
             "power_on_hours": raw.get("power_on_hours"),
             "critical_warning": raw.get("critical_warning"),
             "data_units_written": raw.get("data_units_written"),
             "data_units_read": raw.get("data_units_read"),
+            "error_information_log_entries": raw.get("num_err_log_entries"),
+            "warning_comp_temperature_time": raw.get("warning_temp_time"),
+            "critical_comp_temperature_time": raw.get("critical_comp_time"),
         }
 
-    except subprocess.CalledProcessError as e:
-        return {"device": dev_dict["path"], "status": "error",
-                "error": e.stderr.strip()}
-    except (json.JSONDecodeError, ValueError):
-        return {"device": dev_dict["path"], "status": "error",
-                "error": "Invalid JSON from nvme-cli"}
     except Exception as e:
-        return {"device": dev_dict["path"], "status": "error",
-                "error": str(e)}
+        if debug_mode:
+            print('Error fetching nvme info for device: ', device, 'error: ', e)
+        return None
 
 
 def nvme_health():
@@ -116,6 +89,10 @@ def nvme_health():
         else:
             data = [get_nvme_info(dev) for dev in devices]
 
+    # Remove None values
+    data = [d for d in data if d is not None]
+
     _nvme_cache["timestamp"] = now
     _nvme_cache["data"] = data
+
     return data
