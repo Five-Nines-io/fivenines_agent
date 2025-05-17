@@ -122,13 +122,25 @@ def nvme_cli_available():
     """Check if nvme-cli is available on the system."""
     return shutil.which("nvme") is not None
 
+def is_partition(device):
+    """Check if a device is a partition."""
+    # NVMe partitions end with 'p' followed by numbers
+    if device.startswith('/dev/nvme') and 'p' in device:
+        return True
+    # SATA/SCSI partitions end with numbers
+    if device.startswith('/dev/sd') and device[-1].isdigit():
+        return True
+    return False
+
 def list_storage_devices():
     """List all storage devices using smartctl."""
     devices = []
     try:
         lines = subprocess.Popen('sudo smartctl --scan', stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True).communicate()[0].decode().splitlines()
         for line in lines:
-            devices.append(line.split(' ')[0])
+            device = line.split(' ')[0]
+            if not is_partition(device):
+                devices.append(device)
     except Exception as e:
         if debug_mode:
             print('Error fetching storage devices: ', e)
@@ -168,9 +180,9 @@ def get_nvme_enhanced_info(device):
 def get_storage_info(device):
     """Get storage device information using smartctl and optionally nvme-cli."""
     try:
-        results = {}
-
-        # Get basic SMART info using smartctl
+        results = {
+            "device": device.split('/')[-1]
+        }
         storage_stats = os.popen('sudo smartctl -A -H {}'.format(device)).read().splitlines()
 
         # Skip header lines until we find the SMART data section
@@ -180,10 +192,12 @@ def get_storage_info(device):
             if "=== START OF SMART DATA SECTION ===" in stats:
                 found_section = True
                 current_section = "nvme"
+                results["device_type"] = "nvme"
                 continue
             elif "=== START OF READ SMART DATA SECTION ===" in stats:
                 found_section = True
                 current_section = "ata"
+                results["device_type"] = "ata"
                 continue
             if not found_section:
                 continue
@@ -195,8 +209,9 @@ def get_storage_info(device):
                         parts = stats.split()
                         if len(parts) >= 10:
                             attr_id = parts[0]
-                            # Store raw value with ID as key
-                            results[f"smart_attr_{attr_id}"] = parts[9]
+                            # Use standardized attribute name if available
+                            attr_name = SMART_ATTRIBUTE_NAMES.get(attr_id, f"smart_attr_{attr_id}")
+                            results[attr_name] = safe_int_conversion(parts[9])
                     except Exception as e:
                         if debug_mode:
                             print(f'Error parsing ATA attribute: {e}')
@@ -207,22 +222,23 @@ def get_storage_info(device):
             if len(parts) != 2:
                 continue
 
-            key = parts[0].strip().replace(' ', '_').replace('-', '_').lower()
-            results[key] = parts[1].strip()
+            key = parts[0].strip()
+            value = parts[1].strip()
 
-        results["device"] = device.split('/')[-1]
-        results["device_type"] = current_section
-
-        # Clean and process the basic SMART info
-        cleaned_results = clean_smart_results(results)
+            # Map to standardized keys
+            if key in STORAGE_IDENTIFICATION_ATTRIBUTES:
+                results[STORAGE_IDENTIFICATION_ATTRIBUTES[key]] = value
+            elif key == "SMART overall-health self-assessment test result":
+                results["smart_overall_health"] = value
+            elif key == "Critical Warning":
+                results["critical_warning"] = safe_int_conversion(value, 16)
 
         # If it's an NVMe device and nvme-cli is available, get enhanced info
-        if is_nvme_device(device) and nvme_cli_available():
+        if current_section == "nvme" and nvme_cli_available():
             nvme_info = get_nvme_enhanced_info(device)
-            # Update cleaned results with NVMe specific data
-            cleaned_results.update(nvme_info)
+            results.update(nvme_info)
 
-        return cleaned_results
+        return results
 
     except Exception as e:
         if debug_mode:
@@ -250,31 +266,6 @@ def safe_temperature_conversion(value):
         return safe_int_conversion(parts)
     except (ValueError, TypeError, IndexError):
         return None
-
-def clean_smart_results(results):
-    """Clean and standardize the SMART info results."""
-    cleaned_results = {
-        "device": results.get("device"),
-        "device_type": results.get("device_type")
-    }
-
-    # Process basic SMART info
-    if 'smart_overall_health_self_assessment_test_result' in results:
-        cleaned_results['smart_overall_health'] = results['smart_overall_health_self_assessment_test_result']
-
-    if 'critical_warning' in results:
-        cleaned_results['critical_warning'] = safe_int_conversion(results['critical_warning'], 16)
-
-    # Process ATA SMART attributes
-    for key, value in results.items():
-        if key.startswith('smart_attr_'):
-            attr_id = key.split('_')[2]
-            attr_name = SMART_ATTRIBUTE_NAMES.get(attr_id, 'unknown')
-            raw_value = safe_int_conversion(value)
-            if raw_value is not None:
-                cleaned_results[attr_name] = raw_value
-
-    return cleaned_results
 
 def get_smartctl_version():
     """Get smartctl version information."""
