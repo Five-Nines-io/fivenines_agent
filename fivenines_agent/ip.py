@@ -3,9 +3,14 @@ import traceback
 import socket
 import ssl
 import certifi
+import time
 import http.client
 from fivenines_agent.dns_resolver import DNSResolver
 from fivenines_agent.env import debug_mode
+
+_ip_v4_cache = { "timestamp": 0, "ip": None }
+_ip_v6_cache = { "timestamp": 0, "ip": None }
+
 class CustomHTTPSConnection(http.client.HTTPSConnection):
     def __init__(self, host, port=None, ipv6=False, timeout=5, **kwargs):
         super().__init__(host, port, timeout=timeout, **kwargs)
@@ -41,6 +46,16 @@ class CustomHTTPSConnection(http.client.HTTPSConnection):
         )
 
 def get_ip(ipv6=False):
+    global _ip_v4_cache, _ip_v6_cache
+    now = time.time()
+
+    if ipv6:
+        if now - _ip_v6_cache["timestamp"] < 60:
+            return _ip_v6_cache["ip"]
+    else:
+        if now - _ip_v4_cache["timestamp"] < 60:
+            return _ip_v4_cache["ip"]
+
     try:
         ssl_context = ssl.create_default_context(cafile=certifi.where())
 
