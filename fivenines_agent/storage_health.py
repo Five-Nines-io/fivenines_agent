@@ -138,7 +138,7 @@ def get_nvme_enhanced_info(device):
                 value = raw[key]
                 # Special handling for temperature (convert from Kelvin to Celsius)
                 if key == 'temperature':
-                    value = value - 273.15
+                    value = round(value - 273.15, 1)
                 enhanced_info[key] = value
 
         return enhanced_info
@@ -281,6 +281,36 @@ def clean_smart_results(results):
 
     return cleaned_results
 
+def get_smartctl_version():
+    """Get smartctl version information."""
+    try:
+        result = subprocess.run(
+            ["smartctl", "--version"],
+            capture_output=True, text=True, check=True
+        )
+        # Extract version from first line
+        version_line = result.stdout.split('\n')[0]
+        return version_line.strip()
+    except Exception as e:
+        if debug_mode:
+            print('Error fetching smartctl version: ', e)
+        return None
+
+def get_nvme_cli_version():
+    """Get nvme-cli version information."""
+    try:
+        result = subprocess.run(
+            ["nvme", "version"],
+            capture_output=True, text=True, check=True
+        )
+        # Extract version from first line
+        version_line = result.stdout.split('\n')[0]
+        return version_line.strip()
+    except Exception as e:
+        if debug_mode:
+            print('Error fetching nvme-cli version: ', e)
+        return None
+
 def storage_health():
     """
     Collect health info for all storage devices.
@@ -304,10 +334,16 @@ def storage_health():
                 print("No storage devices found")
             data = []
         else:
+            # Get tool versions only if we have devices to process
+            tool_versions = {
+                "smartctl_version": get_smartctl_version() if smartctl_available() else None,
+                "nvme_cli_version": get_nvme_cli_version() if nvme_cli_available() else None
+            }
             data = [get_storage_info(dev) for dev in devices]
-
-    # Remove None values
-    data = [d for d in data if d is not None]
+            # Remove None values and add tool versions
+            data = [d for d in data if d is not None]
+            for device_info in data:
+                device_info.update(tool_versions)
 
     _storage_cache["timestamp"] = now
     _storage_cache["data"] = data
