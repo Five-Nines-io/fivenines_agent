@@ -83,11 +83,13 @@ SMART_ATTRIBUTE_NAMES = {
 }
 
 STORAGE_IDENTIFICATION_ATTRIBUTES = {
+    "Model Number": "model_family",
     "Model Family": "model_family",
     "Device Model": "device_model",
     "Serial Number": "serial_number",
     "Firmware Version": "firmware_version",
-    "User Capacity": "user_capacity",
+    "User Capacity": "total_capacity",
+    "Total NVM Capacity": "total_capacity",
     "Sector Size": "sector_size",
     "Rotation Rate": "rotation_rate"
 }
