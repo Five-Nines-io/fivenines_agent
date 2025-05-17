@@ -1,7 +1,7 @@
 import psutil
 from fivenines_agent.env import debug_mode
 
-IGNORED_FS = ['squashfs', 'cagefs-skeleton', 'overlay', 'devtmpfs', 'tmpfs', 'loop']
+IGNORED_FS = ['squashfs', 'cagefs-skeleton', 'overlay', 'devtmpfs', 'tmpfs', 'loop', 'nullfs']
 
 def partitions_metadata():
     partitions_metadata = []

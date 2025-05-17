@@ -16,7 +16,8 @@ from fivenines_agent.ip import get_ip
 from fivenines_agent.network import network
 from fivenines_agent.partitions import partitions_metadata, partitions_usage
 from fivenines_agent.processes import processes
-from fivenines_agent.disks import io
+from fivenines_agent.io import io
+from fivenines_agent.smart_storage import smart_storage_identification, smart_storage_health
 from fivenines_agent.files import file_handles_used, file_handles_limit
 from fivenines_agent.redis import redis_metrics
 from fivenines_agent.nginx import nginx_metrics
@@ -78,7 +79,7 @@ class Agent:
                 wd.notify()
 
                 self.config = self.synchronizer.get_config()
-                if self.config['enabled'] == False:
+                if not self.config['enabled']:
                     # If the agent is disabled, refresh the config every 25 seconds
                     self.queue.put({'get_config': True})
                     exit.wait(25)
@@ -121,6 +122,10 @@ class Agent:
                 if self.config['io']:
                     data['io'] = io()
 
+                if self.config['smart_storage_health']:
+                    data['smart_storage_identification'] = smart_storage_identification()
+                    data['smart_storage_health'] = smart_storage_health()
+
                 if self.config['processes']:
                     data['processes'] = processes()
 
@@ -136,15 +141,16 @@ class Agent:
                 if self.config['docker']:
                     data['docker'] = docker_metrics(**self.config['docker'])
 
+                running_time = time.monotonic() - start_time
+                data['running_time'] = running_time
                 self.queue.put(data)
-                self.wait(start_time)
+
+                self.wait(running_time)
 
             except KeyboardInterrupt:
                 self.shutdown(None, None)
 
-    def wait(self, start_time):
-        running_time = time.monotonic() - start_time
-
+    def wait(self, running_time):
         if debug_mode():
             print(f'Running time: {running_time}')
 
