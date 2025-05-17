@@ -141,15 +141,16 @@ class Agent:
                 if self.config['docker']:
                     data['docker'] = docker_metrics(**self.config['docker'])
 
+                running_time = time.monotonic() - start_time
+                data['running_time'] = running_time
                 self.queue.put(data)
-                self.wait(start_time)
+
+                self.wait(running_time)
 
             except KeyboardInterrupt:
                 self.shutdown(None, None)
 
-    def wait(self, start_time):
-        running_time = time.monotonic() - start_time
-
+    def wait(self, running_time):
         if debug_mode():
             print(f'Running time: {running_time}')
 
