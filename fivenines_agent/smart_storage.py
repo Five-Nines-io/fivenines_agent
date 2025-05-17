@@ -83,33 +83,33 @@ SMART_ATTRIBUTE_NAMES = {
 }
 
 STORAGE_IDENTIFICATION_ATTRIBUTES = {
-    "model_family": "Model Family",
-    "device_model": "Device Model",
-    "serial_number": "Serial Number",
-    "firmware_version": "Firmware Version",
-    "user_capacity": "User Capacity",
-    "sector_size": "Sector Size",
-    "rotation_rate": "Rotation Rate"
+    "Model Family": "model_family",
+    "Device Model": "device_model",
+    "Serial Number": "serial_number",
+    "Firmware Version": "firmware_version",
+    "User Capacity": "user_capacity",
+    "Sector Size": "sector_size",
+    "Rotation Rate": "rotation_rate"
 }
 
 # Standard NVMe attribute names, values are not used are there for reference
 NVME_ATTRIBUTE_NAMES = {
-    'temperature': 'Temperature',
-    'avail_spare': 'Available Spare',
-    'spare_thresh': 'Available Spare Threshold',
-    'percent_used': 'Percentage Used',
-    'data_units_read': 'Data Units Read',
-    'data_units_written': 'Data Units Written',
-    'host_read_commands': 'Host Read Commands',
-    'host_write_commands': 'Host Write Commands',
-    'controller_busy_time': 'Controller Busy Time',
-    'power_cycles': 'Power Cycles',
-    'power_on_hours': 'Power On Hours',
-    'unsafe_shutdowns': 'Unsafe Shutdowns',
-    'media_errors': 'Media Errors',
-    'num_err_log_entries': 'Error Information Log Entries',
-    'warning_temp_time': 'Warning Composite Temperature Time',
-    'critical_comp_time': 'Critical Composite Temperature Time'
+    'Temperature': 'temperature',
+    'Available Spare': 'avail_spare',
+    'Available Spare Threshold': 'spare_thresh',
+    'Percentage Used': 'percent_used',
+    'Data Units Read': 'data_units_read',
+    'Data Units Written': 'data_units_written',
+    'Host Read Commands': 'host_read_commands',
+    'Host Write Commands': 'host_write_commands',
+    'Controller Busy Time': 'controller_busy_time',
+    'Power Cycles': 'power_cycles',
+    'Power On Hours': 'power_on_hours',
+    'Unsafe Shutdowns': 'unsafe_shutdowns',
+    'Media Errors': 'media_errors',
+    'Error Information Log Entries': 'num_err_log_entries',
+    'Warning Composite Temperature Time': 'warning_temp_time',
+    'Critical Composite Temperature Time': 'critical_comp_time'
 }
 
 def smartctl_available():
@@ -148,7 +148,7 @@ def get_nvme_enhanced_info(device):
 
         # Convert raw values to standardized format
         enhanced_info = {}
-        for key, name in NVME_ATTRIBUTE_NAMES.items():
+        for name, key in NVME_ATTRIBUTE_NAMES.items():
             if key in raw:
                 value = raw[key]
                 # Special handling for temperature (convert from Kelvin to Celsius)
@@ -169,12 +169,12 @@ def get_storage_info(device):
         results = {}
 
         # Get basic SMART info using smartctl
-        disk_stats = os.popen('sudo smartctl -A -H {}'.format(device)).read().splitlines()
+        storage_stats = os.popen('sudo smartctl -A -H {}'.format(device)).read().splitlines()
 
         # Skip header lines until we find the SMART data section
         found_section = False
         current_section = None
-        for stats in disk_stats:
+        for stats in storage_stats:
             if "=== START OF SMART DATA SECTION ===" in stats:
                 found_section = True
                 current_section = "nvme"
@@ -238,17 +238,6 @@ def safe_int_conversion(value, base=10):
     except (ValueError, TypeError):
         return None
 
-def safe_percentage_conversion(value):
-    """Safely extract percentage value from string."""
-    if not value:
-        return None
-    try:
-        # Extract first number before % or space
-        parts = value.split('%')[0].split(' ')[0]
-        return safe_int_conversion(parts)
-    except (ValueError, TypeError, IndexError):
-        return None
-
 def safe_temperature_conversion(value):
     """Safely extract temperature value from string."""
     if not value:
@@ -273,15 +262,6 @@ def clean_smart_results(results):
 
     if 'critical_warning' in results:
         cleaned_results['critical_warning'] = safe_int_conversion(results['critical_warning'], 16)
-
-    # Process temperature sensors
-    temperature_sensors = {
-        key.split('_')[-1]: safe_temperature_conversion(value)
-        for key, value in results.items()
-        if key.startswith('temperature_sensor_')
-    }
-    if temperature_sensors:
-        cleaned_results['temperature_sensors'] = temperature_sensors
 
     # Process ATA SMART attributes
     for key, value in results.items():
@@ -334,9 +314,17 @@ def get_storage_identification(device):
 
         results = {}
         for line in result.stdout.splitlines():
-            for key, value in STORAGE_IDENTIFICATION_ATTRIBUTES.items():
-                if line.rfind(value) != -1:
-                    results[key] = line.split(value)[1].strip()
+            # Split on first occurrence of colon to handle values that might contain colons
+            parts = line.split(':', 1)
+            if len(parts) != 2:
+                continue
+
+            key = parts[0].strip()
+            value = parts[1].strip()
+
+            # Use direct mapping to get standardized key
+            if key in STORAGE_IDENTIFICATION_ATTRIBUTES:
+                results[STORAGE_IDENTIFICATION_ATTRIBUTES[key]] = value
 
         return results
     except Exception as e:
