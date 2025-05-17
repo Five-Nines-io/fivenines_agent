@@ -6,7 +6,12 @@ import time
 
 from fivenines_agent.env import debug_mode
 
-_storage_cache = {
+_health_storage_cache = {
+    "timestamp": 0,
+    "data": []
+}
+
+_identification_storage_cache = {
     "timestamp": 0,
     "data": []
 }
@@ -31,7 +36,7 @@ SMART_ATTRIBUTE_NAMES = {
     '187': 'reported_uncorrectable_errors',
     '188': 'command_timeout',
     '189': 'high_fly_writes',
-    '190': 'airflow_temperature_cel',
+    '190': 'airflow_temperature_celsius',
     '191': 'g_sense_error_rate',
     '192': 'power_off_retract_count',
     '193': 'load_cycle_count',
@@ -75,6 +80,16 @@ SMART_ATTRIBUTE_NAMES = {
     '251': 'minimum_spares_remaining',
     '252': 'newly_added_bad_flash_block',
     '254': 'free_fall_protection'
+}
+
+STORAGE_IDENTIFICATION_ATTRIBUTES = {
+    "model_family": "Model Family",
+    "device_model": "Device Model",
+    "serial_number": "Serial Number",
+    "firmware_version": "Firmware Version",
+    "user_capacity": "User Capacity",
+    "sector_size": "Sector Size",
+    "rotation_rate": "Rotation Rate"
 }
 
 # Standard NVMe attribute names, values are not used are there for reference
@@ -138,6 +153,7 @@ def get_nvme_enhanced_info(device):
                 value = raw[key]
                 # Special handling for temperature (convert from Kelvin to Celsius)
                 if key == 'temperature':
+                    key = 'temperature_celsius'
                     value = round(value - 273.15, 1)
                 enhanced_info[key] = value
 
@@ -308,17 +324,71 @@ def get_nvme_cli_version():
             print('Error fetching nvme-cli version: ', e)
         return None
 
+def get_storage_identification(device):
+    """Get storage device identification using smartctl."""
+    try:
+        result = subprocess.run(
+            ["smartctl", "--identify", device],
+            capture_output=True, text=True, check=True
+        )
+
+        results = {}
+        for line in result.stdout.splitlines():
+            for key, value in STORAGE_IDENTIFICATION_ATTRIBUTES.items():
+                if line.rfind(value) != -1:
+                    results[key] = line.split(value)[1].strip()
+
+        return results
+    except Exception as e:
+        if debug_mode:
+            print('Error fetching storage identification for device: ', device, 'error: ', e)
+        return None
+
+def storage_identification():
+    """Collect storage identification for all storage devices.
+    Uses smartctl for all devices.
+    Cached for 60 seconds.
+    """
+    global _identification_storage_cache
+    now = time.time()
+
+
+    # Cache for 10 minutes, we don't need to update this too often
+    # This can change only for hotswapped drives
+    if now - _identification_storage_cache["timestamp"] < 600:
+        return _identification_storage_cache["data"]
+
+    if not smartctl_available():
+        if debug_mode:
+            print("smartctl not installed")
+        data = []
+    else:
+        devices = list_storage_devices()
+        if not devices:
+            if debug_mode:
+                print("No storage devices found")
+            data = []
+        else:
+            data = [get_storage_identification(dev) for dev in devices]
+
+    data = [d for d in data if d is not None]
+
+    _identification_storage_cache["timestamp"] = now
+    _identification_storage_cache["data"] = data
+
+    return data
+
 def storage_health():
     """
     Collect health info for all storage devices.
     Uses smartctl for all devices and enhances NVMe devices with nvme-cli when available.
     Cached for 60 seconds.
     """
-    global _storage_cache
+    global _health_storage_cache
     now = time.time()
 
-    if now - _storage_cache["timestamp"] < 60:
-        return _storage_cache["data"]
+    if now - _health_storage_cache["timestamp"] < 60:
+        return _health_storage_cache["data"]
 
     if not smartctl_available():
         if debug_mode:
@@ -342,7 +412,7 @@ def storage_health():
             for device_info in data:
                 device_info.update(tool_versions)
 
-    _storage_cache["timestamp"] = now
-    _storage_cache["data"] = data
+    _health_storage_cache["timestamp"] = now
+    _health_storage_cache["data"] = data
 
     return data
