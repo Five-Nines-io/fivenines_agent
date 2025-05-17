@@ -308,7 +308,7 @@ def get_storage_identification(device):
     """Get storage device identification using smartctl."""
     try:
         result = subprocess.run(
-            ["sudo", "smartctl", "--identify", device],
+            ["sudo", "smartctl", "-i", device],
             capture_output=True, text=True, check=True
         )
 
