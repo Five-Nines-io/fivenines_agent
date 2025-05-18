@@ -32,6 +32,7 @@ class CustomHTTPSConnection(http.client.HTTPSConnection):
             af = socket.AF_INET6 if self.ipv6 else socket.AF_INET
             try:
                 self.sock = socket.socket(af, socket.SOCK_STREAM)
+                self.sock.settimeout(self.timeout)
                 self.sock.connect((ip, self.port))
                 self.sock = self._context.wrap_socket(self.sock, server_hostname=self.host)
                 return
