@@ -1,6 +1,5 @@
 import subprocess
 import json
-import shutil
 import os
 import time
 
@@ -115,12 +114,21 @@ NVME_ATTRIBUTE_NAMES = {
 }
 
 def smartctl_available():
+
     """Check if smartctl is available on the system."""
-    return shutil.which("smartctl") is not None
+    try:
+        subprocess.run(["sudo", "smartctl", "--version"], check=True)
+        return True
+    except Exception:
+        return False
 
 def nvme_cli_available():
     """Check if nvme-cli is available on the system."""
-    return shutil.which("nvme") is not None
+    try:
+        subprocess.run(["sudo", "nvme", "version"], check=True)
+        return True
+    except Exception:
+        return False
 
 def is_partition(device):
     """Check if a device is a partition."""
@@ -269,7 +277,7 @@ def get_smartctl_version():
     """Get smartctl version information."""
     try:
         result = subprocess.run(
-            ["smartctl", "--version"],
+            ["sudo", "smartctl", "--version"],
             capture_output=True, text=True, check=True
         )
         # Extract version from first line
@@ -284,7 +292,7 @@ def get_nvme_cli_version():
     """Get nvme-cli version information."""
     try:
         result = subprocess.run(
-            ["nvme", "version"],
+            ["sudo", "nvme", "version"],
             capture_output=True, text=True, check=True
         )
         # Extract version from first line
