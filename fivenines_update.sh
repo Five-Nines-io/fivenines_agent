@@ -31,15 +31,15 @@ CURRENT_ARCH=$(uname -m)
 # Update the agent based on the architecture
 echo "Detected architecture: $CURRENT_ARCH"
 if [ "$CURRENT_ARCH" == "aarch64" ]; then
-        wget https://github.com/Five-Nines-io/fivenines_agent/releases/latest/download/fivenines-agent-linux-arm64 -O /opt/fivenines/fivenines_agent
+        wget --connect-timeout=3 https://github.com/Five-Nines-io/fivenines_agent/releases/latest/download/fivenines-agent-linux-arm64 -O /opt/fivenines/fivenines_agent
 else
-        wget https://github.com/Five-Nines-io/fivenines_agent/releases/latest/download/fivenines-agent-linux-amd64 -O /opt/fivenines/fivenines_agent
+        wget --connect-timeout=3 https://github.com/Five-Nines-io/fivenines_agent/releases/latest/download/fivenines-agent-linux-amd64 -O /opt/fivenines/fivenines_agent
 fi
 
 chmod +x /opt/fivenines/fivenines_agent
 
 echo "Updating the service file"
-wget https://raw.githubusercontent.com/Five-Nines-io/five_nines_agent/main/fivenines-agent.service -O /etc/systemd/system/fivenines-agent.service
+wget --connect-timeout=3 https://raw.githubusercontent.com/Five-Nines-io/five_nines_agent/main/fivenines-agent.service -O /etc/systemd/system/fivenines-agent.service
 echo "Reloading the systemd daemon"
 systemctl daemon-reload
 

@@ -5,19 +5,19 @@ This agent collects server metrics from the monitored host and sends it to the [
 ## Setup
 
 ```bash
-wget -q -N https://raw.githubusercontent.com/Five-Nines-io/five_nines_agent/main/fivenines_setup.sh && sudo bash fivenines_setup.sh TOKEN
+wget --connect-timeout=3 -q -N https://raw.githubusercontent.com/Five-Nines-io/five_nines_agent/main/fivenines_setup.sh && sudo bash fivenines_setup.sh TOKEN
 ```
 
 ## Update
 
 ```bash
-wget -q -N https://raw.githubusercontent.com/Five-Nines-io/five_nines_agent/main/fivenines_update.sh && sudo bash fivenines_update.sh
+wget --connect-timeout=3 -q -N https://raw.githubusercontent.com/Five-Nines-io/five_nines_agent/main/fivenines_update.sh && sudo bash fivenines_update.sh
 ```
 
 ## Remove
 
 ```bash
-wget -q -N https://raw.githubusercontent.com/Five-Nines-io/five_nines_agent/main/fivenines_uninstall.sh && sudo bash fivenines_uninstall.sh
+wget --connect-timeout=3 -q -N https://raw.githubusercontent.com/Five-Nines-io/five_nines_agent/main/fivenines_uninstall.sh && sudo bash fivenines_uninstall.sh
 ```
 
 ## Contribute
