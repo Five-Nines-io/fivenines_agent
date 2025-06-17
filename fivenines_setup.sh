@@ -24,12 +24,12 @@ else
 fi
 
 # Save the client token
-sudo mkdir -p /etc/fivenines_agent
-echo -n "$1" | sudo tee /etc/fivenines_agent/TOKEN > /dev/null
+mkdir -p /etc/fivenines_agent
+echo -n "$1" | tee /etc/fivenines_agent/TOKEN > /dev/null
 
 # Create a system user for the agent
 if ! id -u fivenines >/dev/null 2>&1; then
-  sudo useradd --system --user-group --key USERGROUPS_ENAB=yes fivenines --shell /bin/false --create-home -b /opt/
+  useradd --system --user-group --key USERGROUPS_ENAB=yes fivenines --shell /bin/false --create-home -b /opt/
 fi
 
 CURRENT_ARCH=$(uname -m)
@@ -47,7 +47,7 @@ chmod +x /opt/fivenines/fivenines_agent
 wget --connect-timeout=3 https://raw.githubusercontent.com/Five-Nines-io/five_nines_agent/main/fivenines-agent.service -O fivenines-agent.service
 
 # Move the service file to the systemd directory
-sudo mv fivenines-agent.service /etc/systemd/system/
+mv fivenines-agent.service /etc/systemd/system/
 
 hosts=("asia.fivenines.io" "eu.fivenines.io" "us.fivenines.io" "api.fivenines.io")
 
@@ -62,13 +62,13 @@ for host in "${hosts[@]}"; do
 done
 
 # Reload the service files to include the new fivenines-agent service
-sudo systemctl daemon-reload
+systemctl daemon-reload
 
 # Enable fivenines-agent service on every reboot
-sudo systemctl enable fivenines-agent.service
+systemctl enable fivenines-agent.service
 
 # Start the fivenines-agent
-sudo systemctl start fivenines-agent
+systemctl start fivenines-agent
 
 if [ $? -ne 0 ]; then
   exit_with_contact "Failed to start the fivenines-agent service. Check the system logs for more information."
