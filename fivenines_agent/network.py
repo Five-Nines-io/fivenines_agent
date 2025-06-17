@@ -4,8 +4,29 @@ import psutil
 
 def interfaces(operating_system):
     if operating_system == 'Linux':
-        with os.popen('ls -l /sys/class/net/ | grep -v virtual | grep devices | rev | cut -d "/" -f1 | rev') as f:
-            return f.read().strip().split('\n')
+        all_interfaces = psutil.net_if_stats()
+        working_interfaces = []
+
+        for interface, stats in all_interfaces.items():
+            # Skip interfaces that are down
+            if not stats.isup:
+                continue
+
+            # Skip loopback interfaces
+            if interface == 'lo':
+                continue
+
+            # Skip interfaces with no address
+            try:
+                addrs = psutil.net_if_addrs().get(interface, [])
+                if not addrs:
+                    continue
+            except Exception:
+                continue
+
+            working_interfaces.append(interface)
+
+        return working_interfaces
     elif operating_system == 'Darwin':
         with os.popen('scutil --nwi | grep "Network interfaces" | cut -d " " -f3') as f:
             return f.read().strip().split('\n')
