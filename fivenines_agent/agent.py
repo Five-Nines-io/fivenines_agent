@@ -140,7 +140,7 @@ class Agent:
                     data['redis'] = redis_metrics(**self.config['redis'])
 
                 if self.config['nginx']:
-                    data['nginx'] = nginx_metrics()
+                    data['nginx'] = nginx_metrics(**self.config['nginx'])
 
                 if self.config['docker']:
                     data['docker'] = docker_metrics(**self.config['docker'])

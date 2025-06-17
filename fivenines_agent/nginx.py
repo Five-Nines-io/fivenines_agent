@@ -17,7 +17,7 @@ import traceback
 #  5 5 5
 # Reading: 0 Writing: 1 Waiting: 0
 
-def nginx_metrics(status_page_url='http://127.0.0.1', status_page_port=8080):
+def nginx_metrics(status_page_url='http://127.0.0.1:8080/nginx_status'):
     nginx_installed = False
     if os.system('which nginx > /dev/null') == 0:
       nginx_installed = True
@@ -28,7 +28,7 @@ def nginx_metrics(status_page_url='http://127.0.0.1', status_page_port=8080):
     version = os.popen('nginx -v 2>&1').read().strip().split('/')[1]
 
     try:
-      with os.popen(f'curl -s {status_page_url}:{status_page_port}/nginx_status', 'r') as f:
+      with os.popen(f'curl -s {status_page_url}', 'r') as f:
         results = list(filter(None, f.read().rstrip('\n').split('\n')))
 
       metrics = { 'nginx_version': version }
