@@ -7,6 +7,7 @@ import time
 import http.client
 from fivenines_agent.dns_resolver import DNSResolver
 from fivenines_agent.env import debug_mode
+from fivenines_agent.debug import debug
 
 _ip_v4_cache = { "timestamp": 0, "ip": None }
 _ip_v6_cache = { "timestamp": 0, "ip": None }
@@ -46,6 +47,7 @@ class CustomHTTPSConnection(http.client.HTTPSConnection):
             f"Could not connect to {self.host} on port {self.port} with family {'IPv6' if self.ipv6 else 'IPv4'}"
         )
 
+@debug('get_ip')
 def get_ip(ipv6=False):
     global _ip_v4_cache, _ip_v6_cache
     now = time.time()

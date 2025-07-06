@@ -1,11 +1,13 @@
 import platform
+from fivenines_agent.debug import debug
 
+@debug('file_handles_used')
 def file_handles_used():
-    file_handles_stats()[0]
+    return file_handles_stats()[0]
 
+@debug('file_handles_limit')
 def file_handles_limit():
-    file_handles_stats()[2]
-
+    return file_handles_stats()[2]
 
 def file_handles_stats():
     operating_system = platform.system()

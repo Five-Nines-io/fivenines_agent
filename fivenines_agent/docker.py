@@ -1,5 +1,5 @@
 import docker
-
+from fivenines_agent.debug import debug
 previous_stats = {}
 
 def get_docker_client(socket_url=None):
@@ -72,6 +72,7 @@ def calculate_memory_usage(stats):
         return stats['memory_stats']['usage'] - stats['memory_stats']['stats']['inactive_file']
     return stats['memory_stats']['usage']
 
+@debug('docker_metrics')
 def docker_metrics(socket_url=None):
     return {
         'containers': docker_containers(socket_url),

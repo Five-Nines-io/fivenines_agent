@@ -1,7 +1,9 @@
 import psutil
 import os
 import platform
+from fivenines_agent.debug import debug
 
+@debug('cpu_data')
 def cpu_data():
     cpu_times_percent = psutil.cpu_times_percent(percpu=True)
     cpu_percent = psutil.cpu_percent(percpu=True)
@@ -14,22 +16,25 @@ def cpu_data():
 
     return cores_usage
 
-
+@debug('cpu_model')
 def cpu_model():
+    cpu_model = '-'
     operating_system = platform.system()
-    if operating_system == 'Linux':
-        try:
+
+    try:
+        if operating_system == 'Linux':
             with open('/proc/cpuinfo', 'r') as f:
                 for line in f:
                     if line.startswith('model name'):
-                        return line.split(':')[1].strip()
-        except FileNotFoundError:
-            return '-'
-    elif operating_system == 'Darwin':
-        try:
-            with os.popen('/usr/sbin/sysctl -n machdep.cpu.brand_string') as f:
-                return f.read().strip()
-        except FileNotFoundError:
-            return '-'
-    else:
-        '-'
+                        cpu_model =  line.split(':')[1].strip()
+        elif operating_system == 'Darwin':
+                with os.popen('/usr/sbin/sysctl -n machdep.cpu.brand_string') as f:
+                    cpu_model = f.read().strip()
+    except FileNotFoundError:
+        pass
+
+    return cpu_model
+
+@debug('cpu_count')
+def cpu_count():
+    return os.cpu_count()

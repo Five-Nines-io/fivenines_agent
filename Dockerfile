@@ -43,11 +43,11 @@ RUN curl -LO https://www.openssl.org/source/openssl-1.1.1u.tar.gz && \
     echo "/usr/local/openssl/lib" > /etc/ld.so.conf.d/openssl.conf && ldconfig
 
 # Build Python from source
+
 RUN curl -O https://www.python.org/ftp/python/3.10.12/Python-3.10.12.tgz && \
     tar -xzf Python-3.10.12.tgz && \
     cd Python-3.10.12 && \
-    ./configure --enable-optimizations \
-                --enable-shared \
+    ./configure --enable-shared \
                 --with-ssl-default-suites=openssl \
                 --with-openssl=/usr/local/openssl \
                 LDFLAGS="-L/usr/local/openssl/lib -L/usr/lib64 -Wl,-rpath,/usr/local/openssl/lib" \

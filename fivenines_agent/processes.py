@@ -1,5 +1,7 @@
 import psutil
+from fivenines_agent.debug import debug
 
+@debug('processes')
 def processes():
     processes = []
     attrs = [

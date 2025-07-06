@@ -4,6 +4,7 @@ import os
 import time
 
 from fivenines_agent.env import debug_mode
+from fivenines_agent.debug import debug
 
 _health_storage_cache = {
     "timestamp": 0,
@@ -331,6 +332,7 @@ def get_storage_identification(device):
             print('Error fetching storage identification for device: ', device, 'error: ', e)
         return None
 
+@debug('smart_storage_identification')
 def smart_storage_identification():
     """Collect storage identification for all storage devices.
     Uses smartctl for all devices.
@@ -372,6 +374,7 @@ def smart_storage_identification():
 
     return data
 
+@debug('smart_storage_health')
 def smart_storage_health():
     """
     Collect health info for all storage devices.

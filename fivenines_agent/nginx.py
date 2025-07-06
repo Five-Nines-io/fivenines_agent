@@ -2,6 +2,9 @@ import os
 import sys
 import traceback
 
+from fivenines_agent.debug import debug
+
+
 # This function is used to get the metrics from the NGINX status page.
 # Active connections: current active client connections
 # Accepts: accepted client connections
@@ -17,6 +20,7 @@ import traceback
 #  5 5 5
 # Reading: 0 Writing: 1 Waiting: 0
 
+@debug('nginx_metrics')
 def nginx_metrics(status_page_url='http://127.0.0.1:8080/nginx_status'):
     nginx_installed = False
     if os.system('which nginx > /dev/null') == 0:

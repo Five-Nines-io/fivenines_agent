@@ -1,6 +1,7 @@
 import os
 import platform
 import psutil
+from fivenines_agent.debug import debug
 
 def interfaces(operating_system):
     if operating_system == 'Linux':
@@ -33,6 +34,7 @@ def interfaces(operating_system):
     else:
         return []
 
+@debug('network')
 def network():
     network = []
     network_interfaces = interfaces(platform.system())

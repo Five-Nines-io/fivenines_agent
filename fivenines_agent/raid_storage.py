@@ -2,6 +2,7 @@ import subprocess
 import time
 
 from fivenines_agent.env import debug_mode
+from fivenines_agent.debug import debug
 
 _raid_cache = {
     "timestamp": 0,
@@ -114,6 +115,7 @@ def get_raid_info(device):
             print(f'Error fetching RAID info for device {device}: {e}')
         return None
 
+@debug('raid_storage_health')
 def raid_storage_health():
     """
     Collect health info for all RAID devices managed by mdadm.

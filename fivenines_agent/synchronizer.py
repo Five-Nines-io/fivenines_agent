@@ -11,6 +11,7 @@ import socket
 
 from fivenines_agent.env import debug_mode, api_url
 from fivenines_agent.dns_resolver import DNSResolver
+from fivenines_agent.env import dry_run
 
 class Synchronizer(Thread):
     def __init__(self, token, queue):
@@ -36,6 +37,9 @@ class Synchronizer(Thread):
         self._stop_event.set()
 
     def send_request(self, data):
+        if dry_run():
+            print(f'Sending request: {data}')
+
         try_count = 0
         compressed_data = gzip.compress(json.dumps(data).encode('utf-8'))
         headers = {
@@ -58,7 +62,7 @@ class Synchronizer(Thread):
 
                 if res.status == 200:
                     if debug_mode():
-                        print(f'Sync time: {time.monotonic() - start_time}')
+                        print(f'Sync time: {(time.monotonic() - start_time) * 1000} ms')
                     config = json.loads(body)['config']
                     with self.config_lock:
                         self.config = config

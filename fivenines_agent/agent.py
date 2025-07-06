@@ -11,7 +11,9 @@ import socket
 from threading import Event
 
 from fivenines_agent.env import debug_mode
-from fivenines_agent.cpu import cpu_data, cpu_model
+from fivenines_agent.load_average import load_average
+from fivenines_agent.cpu import cpu_data, cpu_model, cpu_count
+from fivenines_agent.memory import memory, swap
 from fivenines_agent.ip import get_ip
 from fivenines_agent.network import network
 from fivenines_agent.partitions import partitions_metadata, partitions_usage
@@ -26,6 +28,9 @@ from fivenines_agent.docker import docker_metrics
 from fivenines_agent.synchronizer import Synchronizer
 from fivenines_agent.synchronization_queue import SynchronizationQueue
 from fivenines_agent.ports import listening_ports
+from fivenines_agent.debug import debug
+from fivenines_agent.env import dry_run
+
 CONFIG_DIR = "/etc/fivenines_agent"
 from dotenv import load_dotenv
 load_dotenv(dotenv_path=f'{CONFIG_DIR}/.env')
@@ -88,9 +93,8 @@ class Agent:
 
                 data = static_data.copy()
                 start_time = time.monotonic()
-                ts = time.time()
-                data['ts'] = ts
-                data['load_average'] = psutil.getloadavg()
+                data['ts'] = time.time()
+                data['load_average'] = load_average()
                 data['file_handles_used'] = file_handles_used()
                 data['file_handles_limit'] = file_handles_limit()
 
@@ -101,11 +105,11 @@ class Agent:
                 if self.config['cpu']:
                     data['cpu'] = cpu_data()
                     data['cpu_model'] = cpu_model()
-                    data['cpu_count'] = os.cpu_count()
+                    data['cpu_count'] = cpu_count()
 
                 if self.config['memory']:
-                    data['memory'] = psutil.virtual_memory()._asdict()
-                    data['swap'] = psutil.swap_memory()._asdict()
+                    data['memory'] = memory()
+                    data['swap'] = swap()
 
                 if self.config['ipv4']:
                     data['ipv4'] = get_ip(ipv6=False)
@@ -149,6 +153,9 @@ class Agent:
                 data['running_time'] = running_time
                 self.queue.put(data)
 
+                if dry_run():
+                    self.shutdown(None, None)
+
                 self.wait(running_time)
 
             except KeyboardInterrupt:
@@ -164,19 +171,16 @@ class Agent:
             sleep_time = 0.1
 
         if debug_mode():
-            print(f'Sleeping for {sleep_time} seconds')
+            print(f'Sleeping time: {sleep_time * 1000} ms')
         exit.wait(sleep_time)
 
+    @debug('tcp_ping')
     def tcp_ping(self, host, port=80, timeout=5):
-        if debug_mode():
-            print(f"Pinging {host}:{port} with timeout {timeout} seconds")
         try:
             start_time = time.time()
             with socket.create_connection((host, port), timeout):
                 end_time = time.time()
                 ms = (end_time - start_time) * 1000
-                if debug_mode():
-                    print(f"Ping {host}:{port} took {ms} ms")
                 return ms
         except (socket.timeout, socket.error):
             return None

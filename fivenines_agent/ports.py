@@ -1,3 +1,5 @@
+from fivenines_agent.debug import debug
+
 TCP_STATES = {
     '01': 'ESTABLISHED',
     '02': 'SYN_SENT',
@@ -55,6 +57,7 @@ def extract_ipv4_addr(hex_addr):
     bytes_list.reverse()
     return ".".join([str(int(byte, 16)) for byte in bytes_list])
 
+@debug('listening_ports')
 def listening_ports():
     """Get only listening ports with protocol information, excluding ephemeral ports"""
     results = []

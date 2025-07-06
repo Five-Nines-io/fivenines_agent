@@ -2,6 +2,8 @@ import os
 import sys
 import traceback
 
+from fivenines_agent.debug import debug
+
 METRICS = '\|'.join([
   'redis_version',
   'connected_clients',
@@ -9,6 +11,7 @@ METRICS = '\|'.join([
   '^db[0-9]'
 ])
 
+@debug('redis_metrics')
 def redis_metrics(port=6379, password=None):
     redis_installed = False
     if os.system('which redis-server > /dev/null') == 0:
