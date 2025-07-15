@@ -58,7 +58,7 @@ def extract_ipv4_addr(hex_addr):
     return ".".join([str(int(byte, 16)) for byte in bytes_list])
 
 @debug('listening_ports')
-def listening_ports():
+def listening_ports(monitored_ports=[]):
     """Get only listening ports with protocol information, excluding ephemeral ports"""
     results = []
     dual_stack_enabled = check_ipv6_dual_stack()
@@ -81,7 +81,7 @@ def listening_ports():
                         port = int(port_hex, 16)
 
                         # Skip ephemeral ports
-                        if ephemeral_start <= port <= ephemeral_end:
+                        if ephemeral_start <= port <= ephemeral_end and port not in monitored_ports:
                             continue
 
                         # Check if this is a listening socket

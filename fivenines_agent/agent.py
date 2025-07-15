@@ -132,7 +132,7 @@ class Agent:
                 if self.config.get('processes'):
                     data['processes'] = processes()
                 if self.config.get('ports'):
-                    data['ports'] = listening_ports()
+                    data['ports'] = listening_ports(**self.config['ports'])
                 if self.config.get('redis'):
                     data['redis'] = redis_metrics(**self.config['redis'])
                 if self.config.get('nginx'):
