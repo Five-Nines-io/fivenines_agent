@@ -20,6 +20,14 @@ wget --connect-timeout=3 -q -N https://raw.githubusercontent.com/Five-Nines-io/f
 wget --connect-timeout=3 -q -N https://raw.githubusercontent.com/Five-Nines-io/five_nines_agent/main/fivenines_uninstall.sh && sudo bash fivenines_uninstall.sh
 ```
 
+## Debug
+
+If you need to debug the agent collected data, you can run the following command:
+
+```bash
+/opt/fivenines/fivenines_agent --dry-run
+```
+
 ## Contribute
 
 Feel free to open a PR/issues if you encounter any bug or want to contribute.
