@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 
 from fivenines_agent.env import debug_mode, dry_run
 from fivenines_agent.load_average import load_average
-from fivenines_agent.cpu import cpu_data, cpu_model, cpu_count
+from fivenines_agent.cpu import cpu_usage, cpu_data, cpu_model, cpu_count
 from fivenines_agent.memory import memory, swap
 from fivenines_agent.ip import get_ip
 from fivenines_agent.network import network
@@ -108,6 +108,7 @@ class Agent:
                         data[f'ping_{region}'] = self.tcp_ping(host)
                 if self.config.get('cpu'):
                     data['cpu'] = cpu_data()
+                    data['cpu_usage'] = cpu_usage()
                     data['cpu_model'] = cpu_model()
                     data['cpu_count'] = cpu_count()
                 if self.config.get('memory'):

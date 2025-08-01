@@ -16,6 +16,10 @@ def cpu_data():
 
     return cores_usage
 
+@debug('cpu_usage')
+def cpu_usage():
+    return psutil.cpu_times(percpu=True)
+
 @debug('cpu_model')
 def cpu_model():
     cpu_model = '-'
