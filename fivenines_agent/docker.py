@@ -32,9 +32,12 @@ def docker_containers(socket_url=None):
                     'memory_percent': calculate_memory_percent(stats),
                     'memory_usage': calculate_memory_usage(stats),
                     'memory_limit': stats['memory_stats']['limit'],
-                    'networks': stats['networks'],
                     'blkio_stats': stats['blkio_stats'],
                 }
+                # Networks key is not always defined.
+                if stats.get('networks'):
+                    containers_data[container.id]['networks'] = stats['networks']
+
             previous_stats[container.id] = stats
     except Exception as e:
         print(f"Error collecting Docker metrics: {e}")
