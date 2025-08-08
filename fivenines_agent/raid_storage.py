@@ -1,5 +1,6 @@
 import subprocess
 import time
+import re
 
 from fivenines_agent.env import debug_mode
 from fivenines_agent.debug import debug
@@ -50,8 +51,31 @@ def list_raid_devices():
             print('Error reading /proc/mdstat: ', e)
     return devices
 
+def _parse_size_with_units(size_str):
+    """Parse size string with units and return numeric value."""
+    if not size_str:
+        return None
+
+    # Extract the numeric part
+    match = re.match(r'(\d+)', size_str)
+    if match:
+        return int(match.group(1))
+    return None
+
+def _parse_timestamp(timestamp_str):
+    """Parse timestamp string and return epoch time."""
+    if not timestamp_str:
+        return None
+
+    try:
+        import datetime
+        dt = datetime.datetime.strptime(timestamp_str, "%a %b %d %H:%M:%S %Y")
+        return int(dt.timestamp())
+    except (ValueError, AttributeError):
+        return None
+
 def get_raid_info(device):
-    """Get RAID device information using mdadm."""
+    """Get comprehensive RAID device information using mdadm."""
     try:
         raid_info = {
             "device": device.split('/')[-1],
@@ -61,7 +85,33 @@ def get_raid_info(device):
             "total_devices": 0,
             "failed_devices": 0,
             "spare_devices": 0,
-            "component_devices": []
+            "working_devices": 0,
+            "component_devices": [],
+            "version": None,
+            "creation_time": None,
+            "creation_time_epoch": None,
+            "update_time": None,
+            "update_time_epoch": None,
+            "array_size": None,
+            "array_size_num": None,
+            "used_dev_size": None,
+            "used_dev_size_num": None,
+            "chunk_size": None,
+            "chunk_size_num": None,
+            "events": None,
+            "events_num": None,
+            "name": None,
+            "uuid": None,
+            "persistence": None,
+            "consistency_policy": None,
+            "resync_status": None,
+            "resync_status_percent": None,
+            "check_status": None,
+            "check_status_percent": None,
+            "rebuild_status": None,
+            "rebuild_status_percent": None,
+            "preferred_minor": None,
+            "physical_disks": None
         }
 
         detail_result = subprocess.run(
@@ -70,43 +120,90 @@ def get_raid_info(device):
         )
 
         in_component_section = False
+        device_table_lines = []
+
         for line in detail_result.stdout.splitlines():
             line = line.strip()
 
             # Check if we're entering the component devices section
-            if "Number   Major   Minor   RaidDevice State" in line:
+            if "Number   Major   Minor   RaidDevice State" in line or "Number   Major   Minor   RaidDevice" in line:
                 in_component_section = True
+                device_table_lines.append(line)
                 continue
 
             # Skip if we're not in the component section yet
             if not in_component_section:
-                if "Raid Level" in line:
-                    raid_info["raid_level"] = line.split(":")[1].strip()
-                elif "State" in line:
-                    raid_info["state"] = line.split(":")[1].strip()
-                elif "Active Devices" in line:
-                    raid_info["active_devices"] = int(line.split(":")[1].strip())
-                elif "Total Devices" in line:
-                    raid_info["total_devices"] = int(line.split(":")[1].strip())
-                elif "Failed Devices" in line:
-                    raid_info["failed_devices"] = int(line.split(":")[1].strip())
-                elif "Spare Devices" in line:
-                    raid_info["spare_devices"] = int(line.split(":")[1].strip())
-            else:
-                # We're in the component section, parse device lines
-                # Skip empty lines and the header line
-                if not line or "Number" in line:
-                    continue
+                if " : " in line:
+                    key, value = line.split(" : ", 1)
+                    key = key.strip().lower()
+                    key = re.sub(r'[^a-z0-9]', '_', key)
+                    key = key.strip('_')
+                    value = value.strip()
 
-                # Parse device lines that start with a number (the device number)
-                if line and line[0].isdigit():
-                    parts = line.split()
-                    if len(parts) >= 7:
-                        component = {
-                            "device": parts[-1].split('/')[-1],
-                            "state": f"{parts[-3]} {parts[-2]}"
-                        }
-                        raid_info["component_devices"].append(component)
+                    # Map common fields
+                    if key == "raid_level":
+                        raid_info["raid_level"] = value
+                    elif key == "state":
+                        raid_info["state"] = value.split(", ")
+                    elif key == "active_devices":
+                        raid_info["active_devices"] = int(value)
+                    elif key == "total_devices":
+                        raid_info["total_devices"] = int(value)
+                    elif key == "failed_devices":
+                        raid_info["failed_devices"] = int(value)
+                    elif key == "spare_devices":
+                        raid_info["spare_devices"] = int(value)
+                    elif key == "working_devices":
+                        raid_info["working_devices"] = int(value)
+                    elif key == "version":
+                        raid_info["version"] = value
+                    elif key == "creation_time":
+                        raid_info["creation_time"] = value
+                        raid_info["creation_time_epoch"] = _parse_timestamp(value)
+                    elif key == "update_time":
+                        raid_info["update_time"] = value
+                        raid_info["update_time_epoch"] = _parse_timestamp(value)
+                    elif key == "array_size":
+                        raid_info["array_size"] = value
+                        raid_info["array_size_num"] = _parse_size_with_units(value)
+                    elif key == "used_dev_size":
+                        raid_info["used_dev_size"] = value
+                        raid_info["used_dev_size_num"] = _parse_size_with_units(value)
+                    elif key == "chunk_size":
+                        raid_info["chunk_size"] = value
+                        raid_info["chunk_size_num"] = _parse_size_with_units(value)
+                    elif key == "events":
+                        raid_info["events"] = value
+                        raid_info["events_num"] = int(value) if value.isdigit() else None
+                    elif key == "name":
+                        raid_info["name"] = value
+                    elif key == "uuid":
+                        raid_info["uuid"] = value
+                    elif key == "persistence":
+                        raid_info["persistence"] = value
+                    elif key == "consistency_policy":
+                        raid_info["consistency_policy"] = value
+                    elif key == "resync_status":
+                        raid_info["resync_status"] = value
+                        if "%" in value:
+                            raid_info["resync_status_percent"] = int(value.split('%')[0])
+                    elif key == "check_status":
+                        raid_info["check_status"] = value
+                        if "%" in value:
+                            raid_info["check_status_percent"] = int(value.split('%')[0])
+                    elif key == "rebuild_status":
+                        raid_info["rebuild_status"] = value
+                        if "%" in value:
+                            raid_info["rebuild_status_percent"] = int(value.split('%')[0])
+                    elif key == "preferred_minor":
+                        raid_info["preferred_minor"] = int(value)
+                    elif key == "physical_disks":
+                        raid_info["physical_disks"] = int(value)
+            else:
+                device_table_lines.append(line)
+
+        if device_table_lines:
+            raid_info["component_devices"] = _parse_device_table(device_table_lines)
 
         return raid_info
 
@@ -114,6 +211,37 @@ def get_raid_info(device):
         if debug_mode:
             print(f'Error fetching RAID info for device {device}: {e}')
         return None
+
+def _parse_device_table(table_lines):
+    """Parse the device table section from mdadm output."""
+    devices = []
+
+    for line in table_lines:
+        line = line.strip()
+
+        # Skip header lines and empty lines
+        if not line or "Number" in line or "Major" in line:
+            continue
+
+        if line and line[0].isdigit():
+            parts = line.split()
+            if len(parts) >= 4:
+                device_info = {
+                    "number": int(parts[0]) if parts[0].isdigit() else None,
+                    "major": int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None,
+                    "minor": int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else None,
+                    "raid_device": int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else None,
+                    "state": [],
+                    "device": None
+                }
+
+                if len(parts) >= 5:
+                    device_info["device"] = parts[-1]
+                    device_info["state"] = parts[4:-1]
+
+                devices.append(device_info)
+
+    return devices
 
 @debug('raid_storage_health')
 def raid_storage_health():
