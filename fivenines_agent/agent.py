@@ -33,6 +33,8 @@ from fivenines_agent.docker import docker_metrics
 from fivenines_agent.synchronizer import Synchronizer
 from fivenines_agent.synchronization_queue import SynchronizationQueue
 from fivenines_agent.ports import listening_ports
+from fivenines_agent.temperatures import temperatures
+from fivenines_agent.fans import fans
 from fivenines_agent.debug import debug
 
 CONFIG_DIR = "/etc/fivenines_agent"
@@ -134,6 +136,10 @@ class Agent:
                     data['processes'] = processes()
                 if self.config.get('ports'):
                     data['ports'] = listening_ports(**self.config['ports'])
+                if self.config.get('temperatures'):
+                    data['temperatures'] = temperatures()
+                if self.config.get('fans'):
+                    data['fans'] = fans()
                 if self.config.get('redis'):
                     data['redis'] = redis_metrics(**self.config['redis'])
                 if self.config.get('nginx'):
