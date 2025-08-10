@@ -3,4 +3,7 @@ from fivenines_agent.debug import debug
 
 @debug('fans')
 def fans():
-    return psutil.sensors_fans()
+  if not hasattr(psutil, "sensors_fans"):
+    return {}
+
+  return psutil.sensors_fans()
