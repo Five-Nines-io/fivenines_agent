@@ -182,4 +182,3 @@ class LibvirtKVMCollector:
 @debug('libvirt_metrics')
 def libvirt_metrics():
     return LibvirtKVMCollector().poll()
-```
