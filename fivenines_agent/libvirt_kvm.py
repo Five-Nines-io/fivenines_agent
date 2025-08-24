@@ -233,6 +233,6 @@ class LibvirtKVMCollector:
         return data
 
 
-@debug('libvirt_metrics')
-def libvirt_metrics():
+@debug('libvirt_kvm_metrics')
+def libvirt_kvm_metrics():
     return LibvirtKVMCollector().collect()
