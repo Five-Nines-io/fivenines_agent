@@ -66,149 +66,149 @@ class LibvirtKVMCollector:
     #         return res
 
 
-  def _xml_devices(dom):
-      """
-      Parse domain XML once to discover disk and interface device names.
-      Returns (disks, ifaces) where disks=['vda', ...], ifaces=['vnet0', ...]
-      """
-      disks, ifaces = [], []
-      try:
-          xml = dom.XMLDesc(0)
-          root = ET.fromstring(xml)
-          # Disks
-          for d in root.findall(".//devices/disk"):
-              tgt = d.find("target")
-              if tgt is not None and tgt.get("dev"):
-                  disks.append(tgt.get("dev"))
-          # NICs
-          for n in root.findall(".//devices/interface/target"):
-              dev = n.get("dev")
-              if dev:
-                  ifaces.append(dev)
-      except Exception:
-          pass
-      return disks, ifaces
+    def _xml_devices(dom):
+        """
+        Parse domain XML once to discover disk and interface device names.
+        Returns (disks, ifaces) where disks=['vda', ...], ifaces=['vnet0', ...]
+        """
+        disks, ifaces = [], []
+        try:
+            xml = dom.XMLDesc(0)
+            root = ET.fromstring(xml)
+            # Disks
+            for d in root.findall(".//devices/disk"):
+                tgt = d.find("target")
+                if tgt is not None and tgt.get("dev"):
+                    disks.append(tgt.get("dev"))
+            # NICs
+            for n in root.findall(".//devices/interface/target"):
+                dev = n.get("dev")
+                if dev:
+                    ifaces.append(dev)
+        except Exception:
+            pass
+        return disks, ifaces
 
 
-  def _get_all_stats(self):
-      """
-      Best-effort bulk stats; graceful per-domain fallback with disk/NIC counters.
-      Returns a list of (dom, stats_dict) shaped like getAllDomainStats().
-      """
-      # --- Try bulk if method + flags exist ---
-      has_bulk = hasattr(self.conn, "getAllDomainStats")
-      need = [
-          "VIR_CONNECT_GET_ALL_DOMAINS_STATS_ACTIVE",
-          "VIR_DOMAIN_STATS_CPU",
-          "VIR_DOMAIN_STATS_BALLOON",
-          "VIR_DOMAIN_STATS_BLOCK",
-          "VIR_DOMAIN_STATS_INTERFACE",
-      ]
-      has_flags = all(hasattr(libvirt, n) for n in need)
+    def _get_all_stats(self):
+        """
+        Best-effort bulk stats; graceful per-domain fallback with disk/NIC counters.
+        Returns a list of (dom, stats_dict) shaped like getAllDomainStats().
+        """
+        # --- Try bulk if method + flags exist ---
+        has_bulk = hasattr(self.conn, "getAllDomainStats")
+        need = [
+            "VIR_CONNECT_GET_ALL_DOMAINS_STATS_ACTIVE",
+            "VIR_DOMAIN_STATS_CPU",
+            "VIR_DOMAIN_STATS_BALLOON",
+            "VIR_DOMAIN_STATS_BLOCK",
+            "VIR_DOMAIN_STATS_INTERFACE",
+        ]
+        has_flags = all(hasattr(libvirt, n) for n in need)
 
-      if has_bulk and has_flags:
-          try:
-              flags = (
-                  libvirt.VIR_CONNECT_GET_ALL_DOMAINS_STATS_ACTIVE
-                  | libvirt.VIR_DOMAIN_STATS_CPU
-                  | libvirt.VIR_DOMAIN_STATS_BALLOON
-                  | libvirt.VIR_DOMAIN_STATS_BLOCK
-                  | libvirt.VIR_DOMAIN_STATS_INTERFACE
-              )
-              return self.conn.getAllDomainStats([], flags)
-          except Exception as e:
-              # Warn once; after that, keep quiet
-              if not getattr(self, "_bulk_warned", False):
-                  self._log("warning", f"Bulk stats failed, using fallback. ({e})")
-                  self._bulk_warned = True
+        if has_bulk and has_flags:
+            try:
+                flags = (
+                    libvirt.VIR_CONNECT_GET_ALL_DOMAINS_STATS_ACTIVE
+                    | libvirt.VIR_DOMAIN_STATS_CPU
+                    | libvirt.VIR_DOMAIN_STATS_BALLOON
+                    | libvirt.VIR_DOMAIN_STATS_BLOCK
+                    | libvirt.VIR_DOMAIN_STATS_INTERFACE
+                )
+                return self.conn.getAllDomainStats([], flags)
+            except Exception as e:
+                # Warn once; after that, keep quiet
+                if not getattr(self, "_bulk_warned", False):
+                    self._log("warning", f"Bulk stats failed, using fallback. ({e})")
+                    self._bulk_warned = True
 
-      # --- Per-domain fallback (works everywhere) ---
-      res = []
-      try:
-          doms = self.conn.listAllDomains()
-      except Exception as e:
-          self._log("error", f"listAllDomains failed: {e}")
-          return res
+        # --- Per-domain fallback (works everywhere) ---
+        res = []
+        try:
+            doms = self.conn.listAllDomains()
+        except Exception as e:
+            self._log("error", f"listAllDomains failed: {e}")
+            return res
 
-      for dom in doms:
-          stats = {}
+        for dom in doms:
+            stats = {}
 
-          # CPU time (ns) via getCPUStats()
-          try:
-              cpu = dom.getCPUStats(False)
-              if cpu:
-                  stats["cpu.time"] = int(cpu[0].get("cpu_time", 0))
-          except Exception:
-              pass
+            # CPU time (ns) via getCPUStats()
+            try:
+                cpu = dom.getCPUStats(False)
+                if cpu:
+                    stats["cpu.time"] = int(cpu[0].get("cpu_time", 0))
+            except Exception:
+                pass
 
-          # Memory (normalize KB -> bytes)
-          try:
-              mem = dom.memoryStats()
-              if mem:
-                  if mem.get("actual"):
-                      stats["balloon.maximum"] = int(mem["actual"]) * 1024
-                  if mem.get("rss"):
-                      stats["balloon.rss"] = int(mem["rss"]) * 1024
-                  if mem.get("usable"):
-                      stats["balloon.current"] = int(mem["usable"]) * 1024
-          except Exception:
-              pass
+            # Memory (normalize KB -> bytes)
+            try:
+                mem = dom.memoryStats()
+                if mem:
+                    if mem.get("actual"):
+                        stats["balloon.maximum"] = int(mem["actual"]) * 1024
+                    if mem.get("rss"):
+                        stats["balloon.rss"] = int(mem["rss"]) * 1024
+                    if mem.get("usable"):
+                        stats["balloon.current"] = int(mem["usable"]) * 1024
+            except Exception:
+                pass
 
-          # Discover disks/NICs from XML once
-          disks, ifaces = _xml_devices(dom)
+            # Discover disks/NICs from XML once
+            disks, ifaces = _xml_devices(dom)
 
-          # Disk counters (cumulative)
-          # Prefer blockStatsFlags if available, else blockStats
-          block_count = 0
-          for i, dev in enumerate(disks):
-              rd_bytes = wr_bytes = rd_reqs = wr_reqs = 0
-              try:
-                  if hasattr(dom, "blockStatsFlags"):
-                      bs = dom.blockStatsFlags(dev, 0) or {}
-                      rd_bytes = int(bs.get("rd_bytes", 0))
-                      wr_bytes = int(bs.get("wr_bytes", 0))
-                      rd_reqs = int(bs.get("rd_operations", 0))
-                      wr_reqs = int(bs.get("wr_operations", 0))
-                  else:
-                      # Older API returns a tuple
-                      # (rd_reqs, rd_bytes, wr_reqs, wr_bytes, errs)
-                      bs = dom.blockStats(dev)
-                      rd_reqs, rd_bytes, wr_reqs, wr_bytes = map(int, bs[:4])
-                  # Shape to look like bulk stats
-                  stats.setdefault("block.count", 0)
-                  stats["block.count"] += 1
-                  pfx = f"block.{i}"
-                  stats[f"{pfx}.name"] = dev
-                  stats[f"{pfx}.rd.bytes"] = rd_bytes
-                  stats[f"{pfx}.wr.bytes"] = wr_bytes
-                  stats[f"{pfx}.rd.reqs"] = rd_reqs
-                  stats[f"{pfx}.wr.reqs"] = wr_reqs
-                  block_count += 1
-              except Exception:
-                  continue
+            # Disk counters (cumulative)
+            # Prefer blockStatsFlags if available, else blockStats
+            block_count = 0
+            for i, dev in enumerate(disks):
+                rd_bytes = wr_bytes = rd_reqs = wr_reqs = 0
+                try:
+                    if hasattr(dom, "blockStatsFlags"):
+                        bs = dom.blockStatsFlags(dev, 0) or {}
+                        rd_bytes = int(bs.get("rd_bytes", 0))
+                        wr_bytes = int(bs.get("wr_bytes", 0))
+                        rd_reqs = int(bs.get("rd_operations", 0))
+                        wr_reqs = int(bs.get("wr_operations", 0))
+                    else:
+                        # Older API returns a tuple
+                        # (rd_reqs, rd_bytes, wr_reqs, wr_bytes, errs)
+                        bs = dom.blockStats(dev)
+                        rd_reqs, rd_bytes, wr_reqs, wr_bytes = map(int, bs[:4])
+                    # Shape to look like bulk stats
+                    stats.setdefault("block.count", 0)
+                    stats["block.count"] += 1
+                    pfx = f"block.{i}"
+                    stats[f"{pfx}.name"] = dev
+                    stats[f"{pfx}.rd.bytes"] = rd_bytes
+                    stats[f"{pfx}.wr.bytes"] = wr_bytes
+                    stats[f"{pfx}.rd.reqs"] = rd_reqs
+                    stats[f"{pfx}.wr.reqs"] = wr_reqs
+                    block_count += 1
+                except Exception:
+                    continue
 
-          # NIC counters (cumulative)
-          net_count = 0
-          for i, iface in enumerate(ifaces):
-              try:
-                  rx, rxp, tx, txp, rxerr, txerr, rxdrop, txdrop = dom.interfaceStats(iface)
-                  stats.setdefault("net.count", 0)
-                  stats["net.count"] += 1
-                  pfx = f"net.{i}"
-                  stats[f"{pfx}.name"] = iface
-                  stats[f"{pfx}.rx.bytes"] = int(rx)
-                  stats[f"{pfx}.tx.bytes"] = int(tx)
-                  stats[f"{pfx}.rx.pkts"] = int(rxp)
-                  stats[f"{pfx}.tx.pkts"] = int(txp)
-                  stats[f"{pfx}.rx.drop"] = int(rxdrop)
-                  stats[f"{pfx}.tx.drop"] = int(txdrop)
-                  net_count += 1
-              except Exception:
-                  continue
+            # NIC counters (cumulative)
+            net_count = 0
+            for i, iface in enumerate(ifaces):
+                try:
+                    rx, rxp, tx, txp, rxerr, txerr, rxdrop, txdrop = dom.interfaceStats(iface)
+                    stats.setdefault("net.count", 0)
+                    stats["net.count"] += 1
+                    pfx = f"net.{i}"
+                    stats[f"{pfx}.name"] = iface
+                    stats[f"{pfx}.rx.bytes"] = int(rx)
+                    stats[f"{pfx}.tx.bytes"] = int(tx)
+                    stats[f"{pfx}.rx.pkts"] = int(rxp)
+                    stats[f"{pfx}.tx.pkts"] = int(txp)
+                    stats[f"{pfx}.rx.drop"] = int(rxdrop)
+                    stats[f"{pfx}.tx.drop"] = int(txdrop)
+                    net_count += 1
+                except Exception:
+                    continue
 
-          res.append((dom, stats))
+            res.append((dom, stats))
 
-      return res
+        return res
 
 
     def poll(self):
