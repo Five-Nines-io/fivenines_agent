@@ -169,10 +169,10 @@ class Agent:
             self._cleanup()
 
     def _wait_interval(self, running_time):
-        log(f'Running time: {running_time:.3f}s')
+        log(f'Running time: {running_time:.3f}s', 'debug')
         interval = self.config.get('interval', 60)
         sleep_time = max(interval - running_time, 0.1)
-        log(f'Sleeping time: {sleep_time * 1000:.0f} ms')
+        log(f'Sleeping time: {sleep_time * 1000:.0f} ms', 'debug')
         exit_event.wait(sleep_time)
 
     @debug('tcp_ping')
