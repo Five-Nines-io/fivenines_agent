@@ -12,7 +12,7 @@ import psutil
 import systemd_watchdog
 from dotenv import load_dotenv
 
-from fivenines_agent.env import debug_mode, dry_run
+from fivenines_agent.env import dry_run
 from fivenines_agent.load_average import load_average
 from fivenines_agent.cpu import cpu_usage, cpu_data, cpu_model, cpu_count
 from fivenines_agent.memory import memory, swap
@@ -36,7 +36,7 @@ from fivenines_agent.synchronization_queue import SynchronizationQueue
 from fivenines_agent.ports import listening_ports
 from fivenines_agent.temperatures import temperatures
 from fivenines_agent.fans import fans
-from fivenines_agent.debug import debug
+from fivenines_agent.debug import debug, log
 
 CONFIG_DIR = "/etc/fivenines_agent"
 load_dotenv(dotenv_path=os.path.join(CONFIG_DIR, '.env'))
@@ -51,7 +51,7 @@ class Agent:
         signal.signal(signal.SIGHUP,  self._on_signal)
 
         self.version = '1.1.5'
-        print(f'fivenines agent v{self.version}')
+        log(f'fivenines agent v{self.version}')
 
         # Load token
         self._load_file('TOKEN')
@@ -70,7 +70,7 @@ class Agent:
             with open(path, 'r') as f:
                 setattr(self, filename.lower(), f.read().strip())
         except FileNotFoundError:
-            print(f'{filename} file is missing', file=sys.stderr)
+            log(f'{filename} file is missing', 'error')
             sys.exit(2)
 
     def run(self):
@@ -163,17 +163,15 @@ class Agent:
 
         except Exception as e:
             # Log unexpected errors before exiting
-            print(f'Error: {e}', file=sys.stderr)
+            log(f'Error: {e}', 'error')
         finally:
             self._cleanup()
 
     def _wait_interval(self, running_time):
-        if debug_mode():
-            print(f'Running time: {running_time:.3f}s')
+        log(f'Running time: {running_time:.3f}s')
         interval = self.config.get('interval', 60)
         sleep_time = max(interval - running_time, 0.1)
-        if debug_mode():
-            print(f'Sleeping time: {sleep_time * 1000:.0f} ms')
+        log(f'Sleeping time: {sleep_time * 1000:.0f} ms')
         exit_event.wait(sleep_time)
 
     @debug('tcp_ping')
@@ -186,7 +184,7 @@ class Agent:
             return None
 
     def _cleanup(self):
-        print('fivenines agent shutting down. Please wait...')
+        log('fivenines agent shutting down. Please wait...')
         self.queue.clear()
         self.synchronizer.stop()
         self.queue.put(None)

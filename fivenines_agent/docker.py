@@ -1,5 +1,5 @@
 import docker
-from fivenines_agent.debug import debug
+from fivenines_agent.debug import debug, log
 previous_stats = {}
 
 def get_docker_client(socket_url=None):
@@ -9,8 +9,7 @@ def get_docker_client(socket_url=None):
         else:
             return docker.from_env()
     except docker.errors.DockerException as e:
-        print("Error connecting to Docker daemon.")
-        print(e)
+        log(f"Error connecting to Docker daemon: {e}", 'error')
         return None
 
 def docker_containers(socket_url=None):
@@ -40,7 +39,7 @@ def docker_containers(socket_url=None):
 
             previous_stats[container.id] = stats
     except Exception as e:
-        print(f"Error collecting Docker metrics: {e}")
+        log(f"Error collecting Docker metrics: {e}", 'error')
         return {}
 
     return containers_data

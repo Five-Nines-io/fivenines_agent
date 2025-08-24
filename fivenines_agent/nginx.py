@@ -46,5 +46,4 @@ def nginx_metrics(status_page_url='http://127.0.0.1:8080/nginx_status'):
       return metrics
 
     except Exception as e:
-      print(e, file=sys.stderr)
-      print(traceback.print_exc(), file=sys.stderr)
+      log(f"Error collecting NGINX metrics: {e}", 'error')

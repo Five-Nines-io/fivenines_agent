@@ -47,5 +47,4 @@ def redis_metrics(port=6379, password=None):
       return metrics
 
     except Exception as e:
-      print(e, file=sys.stderr)
-      print(traceback.print_exc(), file=sys.stderr)
+      log(f"Error collecting Redis metrics: {e}", 'error')

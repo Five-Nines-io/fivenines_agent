@@ -1,6 +1,5 @@
 import psutil
-from fivenines_agent.env import debug_mode
-from fivenines_agent.debug import debug
+from fivenines_agent.debug import debug, log
 
 IGNORED_FS = ['squashfs', 'cagefs-skeleton', 'overlay', 'devtmpfs', 'tmpfs', 'loop', 'nullfs']
 
@@ -33,8 +32,7 @@ def partitions_usage():
 
             partitions_usage[v.mountpoint] = psutil.disk_usage(v.mountpoint)._asdict()
         except PermissionError as e:
-            if debug_mode:
-                print(f"Error getting disk usage for {v.mountpoint}: {e}")
+            log(f"Error getting disk usage for {v.mountpoint}: {e}")
             continue
 
     return partitions_usage

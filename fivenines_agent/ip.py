@@ -6,8 +6,7 @@ import certifi
 import time
 import http.client
 from fivenines_agent.dns_resolver import DNSResolver
-from fivenines_agent.env import debug_mode
-from fivenines_agent.debug import debug
+from fivenines_agent.debug import debug, log
 
 _ip_v4_cache = { "timestamp": 0, "ip": None }
 _ip_v6_cache = { "timestamp": 0, "ip": None }
@@ -40,7 +39,7 @@ class CustomHTTPSConnection(http.client.HTTPSConnection):
             except OSError as e:
                 if self.sock:
                     self.sock.close()
-                print(f"Could not connect to {ip}: {e}")
+                log(f"Could not connect to {ip}: {e}", 'error')
                 continue  # Try next IP
 
         raise ConnectionError(
@@ -67,9 +66,8 @@ def get_ip(ipv6=False):
         response = conn.getresponse()
         body = response.read().decode("utf-8")
 
-        if debug_mode():
-            print(f"Status: {response.status}, Reason: {response.reason}", file=sys.stderr)
-            print(f"Response body: {body}", file=sys.stderr)
+        log(f"Status: {response.status}, Reason: {response.reason}", 'debug')
+        log(f"Response body: {body}", 'debug')
 
         if response.status == 200:
             return body.strip()
@@ -77,11 +75,11 @@ def get_ip(ipv6=False):
         return None
     except ConnectionError as e:
         # Log the error and optionally retry or handle IPv4 fallback
-        print(f"Unexpected error occurred: {e}", file=sys.stderr)
+        log(f"Unexpected error occurred: {e}", 'error')
         return None
 
     except Exception as e:
-        print(e, file=sys.stderr)
+        log(f"Unexpected error occurred: {e}", 'error')
         traceback.print_exc(file=sys.stderr)
         return None
     finally:

@@ -3,8 +3,7 @@ import json
 import os
 import time
 
-from fivenines_agent.env import debug_mode
-from fivenines_agent.debug import debug
+from fivenines_agent.debug import debug, log
 
 _health_storage_cache = {
     "timestamp": 0,
@@ -151,8 +150,7 @@ def list_storage_devices():
             if not is_partition(device):
                 devices.append(device)
     except Exception as e:
-        if debug_mode:
-            print('Error fetching storage devices: ', e)
+        log(f"Error fetching storage devices: {e}", 'error')
         return []
     return devices
 
@@ -182,8 +180,7 @@ def get_nvme_enhanced_info(device):
 
         return enhanced_info
     except Exception as e:
-        if debug_mode:
-            print('Error fetching NVMe enhanced info for device: ', device, 'error: ', e)
+        log(f"Error fetching NVMe enhanced info for device: {device}: {e}", 'error')
         return {}
 
 def get_storage_info(device):
@@ -222,8 +219,7 @@ def get_storage_info(device):
                             attr_name = SMART_ATTRIBUTE_NAMES.get(attr_id, f"smart_attr_{attr_id}")
                             results[attr_name] = safe_int_conversion(parts[9])
                     except Exception as e:
-                        if debug_mode:
-                            print(f'Error parsing ATA attribute: {e}')
+                        log(f"Error parsing ATA attribute: {e}", 'error')
                 continue
 
             parts = stats.split(':', 1)
@@ -248,8 +244,7 @@ def get_storage_info(device):
         return results
 
     except Exception as e:
-        if debug_mode:
-            print('Error fetching storage info for device: ', device, 'error: ', e)
+        log(f"Error fetching storage info for device: {device}: {e}", 'error')
         return None
 
 def safe_int_conversion(value, base=10):
@@ -285,8 +280,7 @@ def get_smartctl_version():
         version_line = result.stdout.split('\n')[0]
         return version_line.strip()
     except Exception as e:
-        if debug_mode:
-            print('Error fetching smartctl version: ', e)
+        log(f"Error fetching smartctl version: {e}", 'error')
         return None
 
 def get_nvme_cli_version():
@@ -300,8 +294,7 @@ def get_nvme_cli_version():
         version_line = result.stdout.split('\n')[0]
         return version_line.strip()
     except Exception as e:
-        if debug_mode:
-            print('Error fetching nvme-cli version: ', e)
+        log(f"Error fetching nvme-cli version: {e}", 'error')
         return None
 
 def get_storage_identification(device):
@@ -328,8 +321,7 @@ def get_storage_identification(device):
 
         return results
     except Exception as e:
-        if debug_mode:
-            print('Error fetching storage identification for device: ', device, 'error: ', e)
+        log(f"Error fetching storage identification for device: {device}: {e}", 'error')
         return None
 
 @debug('smart_storage_identification')
@@ -354,14 +346,12 @@ def smart_storage_identification():
     }
 
     if tool_versions["smartctl_version"] is None:
-        if debug_mode:
-            print("smartctl not installed")
+        log("smartctl not installed", 'error')
         data = []
     else:
         devices = list_storage_devices()
         if not devices:
-            if debug_mode:
-                print("No storage devices found")
+            log("No storage devices found", 'error')
             data = []
         else:
             data = [get_storage_identification(dev) for dev in devices]
@@ -388,14 +378,12 @@ def smart_storage_health():
         return _health_storage_cache["data"]
 
     if not smartctl_available():
-        if debug_mode:
-            print("smartctl not installed")
+        log("smartctl not installed", 'error')
         data = []
     else:
         devices = list_storage_devices()
         if not devices:
-            if debug_mode:
-                print("No storage devices found")
+            log("No storage devices found", 'error')
             data = []
         else:
             data = [get_storage_info(dev) for dev in devices]
