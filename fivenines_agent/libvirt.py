@@ -1,30 +1,43 @@
 # fivenines_agent — VM monitoring via libvirt/KVM (Proxmox-compatible)
 # Created: 2025-08-24 11:55:39 UTC
 # from __future__ import annotations
-import os, time
+import os
+import time
 from typing import Dict, Any, Optional
 # try:
 import libvirt  # type: ignore
 # except Exception as e:  # pragma: no cover
     # libvirt = None
+
+import xml.etree.ElementTree as ET
+
 from fivenines_agent.debug import debug
 
-STATE_MAP = {0:"nostate",1:"running",2:"blocked",3:"paused",4:"shutdown",5:"shutoff",6:"crashed",7:"pmsuspended",8:"last"}
-def _state_to_str(code:int)->str: return STATE_MAP.get(int(code), str(code))
+STATE_MAP = {0: "nostate", 1: "running", 2: "blocked", 3: "paused",
+    4: "shutdown", 5: "shutoff", 6: "crashed", 7: "pmsuspended", 8: "last"}
+
+
+def _state_to_str(code: int) -> str: return STATE_MAP.get(int(code), str(code))
+
 
 class LibvirtKVMCollector:
-    def __init__(self, uri: str="qemu:///system", emit=None, logger=None, host_id: Optional[str]=None):
+    def __init__(self, uri: str = "qemu:///system", emit=None, logger=None, host_id: Optional[str] = None):
         if libvirt is None: raise RuntimeError("libvirt-python not available.")
-        self.uri=uri; self.emit=emit or (lambda m,v,l:None); self.logger=logger; self.host_id=host_id or os.uname().nodename
+        self.uri = uri; self.emit = emit or (
+            lambda m, v, l: None); self.logger = logger; self.host_id = host_id or os.uname().nodename
         self.prev: Dict[str, Dict[str, Any]] = {}
-        self.conn=None; self._connect()
-    def _log(self, level:str, msg:str):
-        if self.logger and hasattr(self.logger, level): getattr(self.logger, level)(msg)
+        self.conn = None; self._connect()
+
+    def _log(self, level: str, msg: str):
+        if self.logger and hasattr(self.logger, level): getattr(
+            self.logger, level)(msg)
         else: print(f"[{level.upper()}] {msg}")
+
     def _connect(self):
         try:
             self.conn = libvirt.openReadOnly(self.uri)
-            if self.conn is None: raise RuntimeError("libvirt.openReadOnly returned None")
+            if self.conn is None: raise RuntimeError(
+                "libvirt.openReadOnly returned None")
         except Exception as e:
             raise RuntimeError(f"Cannot connect to libvirt at {self.uri}: {e}")
     # def _get_all_stats(self):
@@ -52,7 +65,6 @@ class LibvirtKVMCollector:
     #             res.append((dom, stats))
     #         return res
 
-  import xml.etree.ElementTree as ET
 
   def _xml_devices(dom):
       """
