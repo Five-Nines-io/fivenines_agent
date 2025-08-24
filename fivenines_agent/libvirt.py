@@ -7,6 +7,7 @@ from typing import Dict, Any, Optional
 import libvirt  # type: ignore
 # except Exception as e:  # pragma: no cover
     # libvirt = None
+import fivenines_agent.debug as debug
 
 STATE_MAP = {0:"nostate",1:"running",2:"blocked",3:"paused",4:"shutdown",5:"shutoff",6:"crashed",7:"pmsuspended",8:"last"}
 def _state_to_str(code:int)->str: return STATE_MAP.get(int(code), str(code))
@@ -106,6 +107,7 @@ class LibvirtKVMCollector:
             except Exception as ex:
                 self._log('error', f"Domain metrics error: {ex}"); continue
 
+@debug('libvirt')
 def libvirt():
   return LibvirtKVMCollector().poll()
 
