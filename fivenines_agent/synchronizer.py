@@ -39,7 +39,6 @@ class Synchronizer(Thread):
 
     def send_request(self, data):
         log(f'Sending request: {data}', 'debug')
-
         try_count = 0
         compressed_data = gzip.compress(json.dumps(data).encode('utf-8'))
         headers = {

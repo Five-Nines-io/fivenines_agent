@@ -1,4 +1,5 @@
 import time
+import threading
 from contextlib import ContextDecorator
 from functools import wraps
 from fivenines_agent.env import dry_run, log_level
@@ -47,4 +48,4 @@ class debug(ContextDecorator):
 
 def log(message, level='info'):
     if LOG_LEVELS[log_level()] >= LOG_LEVELS[level]:
-        print(f"[{level.upper()}] {message}")
+        print(f"[{level.upper()}][thread#{threading.get_native_id()}] {message}")

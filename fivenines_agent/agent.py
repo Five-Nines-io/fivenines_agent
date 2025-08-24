@@ -38,8 +38,8 @@ from fivenines_agent.temperatures import temperatures
 from fivenines_agent.fans import fans
 from fivenines_agent.debug import debug, log
 
-CONFIG_DIR = "/etc/fivenines_agent"
-load_dotenv(dotenv_path=os.path.join(CONFIG_DIR, '.env'))
+CONFIG_DIR = config_dir()
+load_dotenv(dotenv_path=env_file())
 
 # Exit event for safe shutdown
 exit_event = Event()
