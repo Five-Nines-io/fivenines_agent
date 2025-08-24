@@ -7,6 +7,7 @@ import time
 import socket
 import signal
 from threading import Event
+import json
 
 import psutil
 import systemd_watchdog
@@ -155,6 +156,7 @@ class Agent:
 
                 # Exit immediately in dry-run
                 if dry_run():
+                    log(json.dumps(data, indent=2))
                     exit_event.set()
                 else:
                     self.queue.put(data)
