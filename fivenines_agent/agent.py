@@ -154,9 +154,9 @@ class Agent:
                 running_time = time.monotonic() - start
                 data['running_time'] = running_time
 
+                log(json.dumps(data, indent=2), 'debug')
                 # Exit immediately in dry-run
                 if dry_run():
-                    log(json.dumps(data, indent=2))
                     exit_event.set()
                 else:
                     self.queue.put(data)
