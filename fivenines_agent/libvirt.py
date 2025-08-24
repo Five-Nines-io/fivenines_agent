@@ -107,8 +107,8 @@ class LibvirtKVMCollector:
             except Exception as ex:
                 self._log('error', f"Domain metrics error: {ex}"); continue
 
-@debug('libvirt')
-def libvirt():
+@debug('libvirt_metrics')
+def libvirt_metrics():
   return LibvirtKVMCollector().poll()
 
 # if __name__ == "__main__":/
