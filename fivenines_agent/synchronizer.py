@@ -11,7 +11,6 @@ import socket
 
 from fivenines_agent.env import api_url
 from fivenines_agent.dns_resolver import DNSResolver
-from fivenines_agent.env import dry_run
 from fivenines_agent.debug import log
 
 class Synchronizer(Thread):

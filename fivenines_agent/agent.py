@@ -152,14 +152,13 @@ class Agent:
                 # Running time and enqueue
                 running_time = time.monotonic() - start
                 data['running_time'] = running_time
-                self.queue.put(data)
 
                 # Exit immediately in dry-run
                 if dry_run():
                     exit_event.set()
-
-                # Sleep respecting interval
-                self._wait_interval(running_time)
+                else:
+                    self.queue.put(data)
+                    self._wait_interval(running_time)
 
         except Exception as e:
             # Log unexpected errors before exiting
