@@ -1,8 +1,10 @@
-import os
-import time
-from typing import Dict, Any, Optional
+# fivenines_agent — VM monitoring via libvirt/KVM (Proxmox-compatible)
+# Created: 2025-08-24 11:55:39 UTC
 
-import libvirt
+import os
+from typing import Dict, Any, Optional, List, Tuple
+
+import libvirt  # type: ignore
 import xml.etree.ElementTree as ET
 
 from fivenines_agent.debug import debug
@@ -12,8 +14,10 @@ STATE_MAP = {
     4: "shutdown", 5: "shutoff", 6: "crashed", 7: "pmsuspended", 8: "last"
 }
 
+
 def _state_to_str(code: int) -> str:
     return STATE_MAP.get(int(code), str(code))
+
 
 class LibvirtKVMCollector:
     """
@@ -68,17 +72,15 @@ class LibvirtKVMCollector:
         return disks, ifaces
 
     # -------------- public --------------
-    def poll(self) -> int:
+    def poll(self) -> None:
         """
-        Collect once and emit cumulative values.
-        Returns number of points emitted (for --dry-run/debug usefulness).
+        Collect once and emit cumulative values via self.emit.
         """
-        points = 0
         try:
             doms = self.conn.listAllDomains()
         except Exception as e:
             self._log("error", f"listAllDomains failed: {e}")
-            return 0
+            return
 
         for dom in doms:
             try:
@@ -90,7 +92,7 @@ class LibvirtKVMCollector:
                 labels = {'host': self.host_id, 'vm_uuid': uuid, 'vm_name': name, 'vm_state': state}
 
                 # Uptime placeholder (0 without guest agent)
-                self.emit('vm.uptime_seconds', 0, labels); points += 1
+                self.emit('vm.uptime_seconds', 0, labels)
 
                 # ---- CPU cumulative times (ns): total + per-vCPU ----
                 total_cpu_time_ns = 0
@@ -105,7 +107,7 @@ class LibvirtKVMCollector:
                 if per_vcpu:
                     for idx, row in enumerate(per_vcpu):
                         tns = int(row.get('cpu_time', 0)) or 0
-                        self.emit('vm.vcpu.time_ns', tns, {**labels, 'vcpu': str(idx)}); points += 1
+                        self.emit('vm.vcpu.time_ns', tns, {**labels, 'vcpu': str(idx)})
                         total_cpu_time_ns += tns
                 else:
                     # Fallbacks: whole-domain CPU time
@@ -120,18 +122,18 @@ class LibvirtKVMCollector:
                         except Exception:
                             total_cpu_time_ns = 0
 
-                self.emit('vm.cpu.time_ns', total_cpu_time_ns, labels); points += 1
-                self.emit('vm.vcpu.count', vcpus, labels); points += 1
+                self.emit('vm.cpu.time_ns', total_cpu_time_ns, labels)
+                self.emit('vm.vcpu.count', vcpus, labels)
 
                 # ---- Memory (normalize KiB -> bytes) ----
                 try:
                     mem = dom.memoryStats()
                     if mem.get('actual'):
-                        self.emit('vm.mem.assigned_bytes', int(mem['actual']) * 1024, labels); points += 1
+                        self.emit('vm.mem.assigned_bytes', int(mem['actual']) * 1024, labels)
                     if mem.get('usable'):
-                        self.emit('vm.mem.balloon_bytes', int(mem['usable']) * 1024, labels); points += 1
+                        self.emit('vm.mem.balloon_bytes', int(mem['usable']) * 1024, labels)
                     if mem.get('rss'):
-                        self.emit('vm.mem.rss_bytes', int(mem['rss']) * 1024, labels); points += 1
+                        self.emit('vm.mem.rss_bytes', int(mem['rss']) * 1024, labels)
                 except Exception:
                     pass
 
@@ -151,10 +153,10 @@ class LibvirtKVMCollector:
                             rd_reqs, rd_bytes, wr_reqs, wr_bytes = map(int, dom.blockStats(dev)[:4])
 
                         lb = {**labels, 'device': dev}
-                        self.emit('vm.disk.read_bytes', rd_bytes, lb); points += 1
-                        self.emit('vm.disk.write_bytes', wr_bytes, lb); points += 1
-                        self.emit('vm.disk.read_ops', rd_reqs, lb); points += 1
-                        self.emit('vm.disk.write_ops', wr_reqs, lb); points += 1
+                        self.emit('vm.disk.read_bytes', rd_bytes, lb)
+                        self.emit('vm.disk.write_bytes', wr_bytes, lb)
+                        self.emit('vm.disk.read_ops', rd_reqs, lb)
+                        self.emit('vm.disk.write_ops', wr_reqs, lb)
                     except Exception:
                         continue
 
@@ -163,12 +165,12 @@ class LibvirtKVMCollector:
                     try:
                         rx, rxp, tx, txp, rxerr, txerr, rxdrop, txdrop = dom.interfaceStats(iface)
                         lbn = {**labels, 'iface': iface}
-                        self.emit('vm.net.rx_bytes', int(rx), lbn); points += 1
-                        self.emit('vm.net.tx_bytes', int(tx), lbn); points += 1
-                        self.emit('vm.net.rx_packets', int(rxp), lbn); points += 1
-                        self.emit('vm.net.tx_packets', int(txp), lbn); points += 1
-                        self.emit('vm.net.rx_drop', int(rxdrop), lbn); points += 1
-                        self.emit('vm.net.tx_drop', int(txdrop), lbn); points += 1
+                        self.emit('vm.net.rx_bytes', int(rx), lbn)
+                        self.emit('vm.net.tx_bytes', int(tx), lbn)
+                        self.emit('vm.net.rx_packets', int(rxp), lbn)
+                        self.emit('vm.net.tx_packets', int(txp), lbn)
+                        self.emit('vm.net.rx_drop', int(rxdrop), lbn)
+                        self.emit('vm.net.tx_drop', int(txdrop), lbn)
                     except Exception:
                         continue
 
@@ -176,9 +178,20 @@ class LibvirtKVMCollector:
                 self._log('error', f"Domain metrics error: {ex}")
                 continue
 
-        return points
-
 
 @debug('libvirt_metrics')
-def libvirt_metrics():
-    return LibvirtKVMCollector().poll()
+def libvirt_metrics() -> List[Tuple[str, float, Dict[str, Any]]]:
+    """
+    Run one collection cycle and return ALL emitted points as a list of tuples:
+      [(metric_name, value, labels_dict), ...]
+    Useful for --dry-run and tests. In normal runs, the agent will pass its own
+    emitter that ships points to the backend and ignore the return value.
+    """
+    buf: List[Tuple[str, float, Dict[str, Any]]] = []
+
+    def _emit(metric: str, value: float, labels: Dict[str, Any]):
+        buf.append((metric, value, labels))
+
+    coll = LibvirtKVMCollector(emit=_emit)
+    coll.poll()
+    return buf
