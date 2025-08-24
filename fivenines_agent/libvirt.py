@@ -94,30 +94,54 @@ class LibvirtKVMCollector:
                 # Uptime placeholder (0 without guest agent)
                 self.emit('vm.uptime_seconds', 0, labels)
 
-                # ---- CPU cumulative times (ns): total + per-vCPU ----
+                # ---- CPU cumulative times (ns): per-vCPU + total ----
                 total_cpu_time_ns = 0
+                per_vcpu_ok = False
 
-                # Preferred: per-vCPU stats (list of dicts, one per vCPU)
-                per_vcpu = []
+                # 1) Preferred: per-vCPU via getCPUStats(False)
                 try:
                     per_vcpu = dom.getCPUStats(False) or []
+                    if per_vcpu:
+                        per_vcpu_ok = True
+                        for idx, row in enumerate(per_vcpu):
+                            tns = int(row.get('cpu_time', 0)) or 0
+                            self.emit('vm.vcpu.time_ns', tns, {**labels, 'vcpu': str(idx)})
+                            total_cpu_time_ns += tns
                 except Exception:
-                    per_vcpu = []
+                    per_vcpu_ok = False
 
-                if per_vcpu:
-                    for idx, row in enumerate(per_vcpu):
-                        tns = int(row.get('cpu_time', 0)) or 0
-                        self.emit('vm.vcpu.time_ns', tns, {**labels, 'vcpu': str(idx)})
-                        total_cpu_time_ns += tns
-                else:
-                    # Fallbacks: whole-domain CPU time
+                # 2) Fallback: per-vCPU via dom.vcpus()
+                if not per_vcpu_ok:
+                    try:
+                        vinfo = dom.vcpus()  # returns (cpuinfo_list, cpu_map) in many builds
+                        cpuinfo_list = vinfo[0] if isinstance(vinfo, tuple) else vinfo
+                        # entries like: (number, state, cpuTime, cpu)
+                        if cpuinfo_list:
+                            per_vcpu_ok = True
+                            total_cpu_time_ns = 0
+                            for entry in cpuinfo_list:
+                                # support both tuple and dict-like
+                                if isinstance(entry, tuple) and len(entry) >= 3:
+                                    idx = entry[0]
+                                    tns = int(entry[2])  # nanoseconds
+                                elif isinstance(entry, dict):
+                                    idx = int(entry.get('number', 0))
+                                    tns = int(entry.get('cpuTime', 0))
+                                else:
+                                    continue
+                                self.emit('vm.vcpu.time_ns', tns, {**labels, 'vcpu': str(idx)})
+                                total_cpu_time_ns += tns
+                    except Exception:
+                        per_vcpu_ok = False
+
+                # 3) If still no per-vCPU, at least report total
+                if not per_vcpu_ok:
                     try:
                         total = dom.getCPUStats(True) or [{}]
                         total_cpu_time_ns = int(total[0].get('cpu_time', 0)) or 0
                     except Exception:
                         try:
                             info = dom.info()
-                            # info[4] is cumulative CPU time (ns)
                             total_cpu_time_ns = int(info[4]) if info and len(info) >= 5 else 0
                         except Exception:
                             total_cpu_time_ns = 0
