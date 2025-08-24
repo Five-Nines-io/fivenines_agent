@@ -89,13 +89,32 @@ class LibvirtKVMCollector:
             pass
         return disks, ifaces
 
+    def _xml_devices(self, dom):
+        """
+        Parse domain XML to discover disk and interface device names.
+        Returns (disks, ifaces)
+        """
+        disks, ifaces = [], []
+        try:
+            xml = dom.XMLDesc(0)
+            root = ET.fromstring(xml)
+            for d in root.findall(".//devices/disk"):
+                tgt = d.find("target")
+                if tgt is not None and tgt.get("dev"):
+                    disks.append(tgt.get("dev"))
+            for n in root.findall(".//devices/interface/target"):
+                dev = n.get("dev")
+                if dev:
+                    ifaces.append(dev)
+        except Exception:
+            pass
+        return disks, ifaces
 
     def _get_all_stats(self):
         """
         Best-effort bulk stats; graceful per-domain fallback with disk/NIC counters.
-        Returns a list of (dom, stats_dict) shaped like getAllDomainStats().
+        Returns a list of (dom, stats_dict) like getAllDomainStats().
         """
-        # --- Try bulk if method + flags exist ---
         has_bulk = hasattr(self.conn, "getAllDomainStats")
         need = [
             "VIR_CONNECT_GET_ALL_DOMAINS_STATS_ACTIVE",
@@ -117,12 +136,10 @@ class LibvirtKVMCollector:
                 )
                 return self.conn.getAllDomainStats([], flags)
             except Exception as e:
-                # Warn once; after that, keep quiet
                 if not getattr(self, "_bulk_warned", False):
                     self._log("warning", f"Bulk stats failed, using fallback. ({e})")
                     self._bulk_warned = True
 
-        # --- Per-domain fallback (works everywhere) ---
         res = []
         try:
             doms = self.conn.listAllDomains()
@@ -133,7 +150,7 @@ class LibvirtKVMCollector:
         for dom in doms:
             stats = {}
 
-            # CPU time (ns) via getCPUStats()
+            # CPU time (ns)
             try:
                 cpu = dom.getCPUStats(False)
                 if cpu:
@@ -141,25 +158,20 @@ class LibvirtKVMCollector:
             except Exception:
                 pass
 
-            # Memory (normalize KB -> bytes)
+            # Memory (KB -> bytes)
             try:
                 mem = dom.memoryStats()
                 if mem:
-                    if mem.get("actual"):
-                        stats["balloon.maximum"] = int(mem["actual"]) * 1024
-                    if mem.get("rss"):
-                        stats["balloon.rss"] = int(mem["rss"]) * 1024
-                    if mem.get("usable"):
-                        stats["balloon.current"] = int(mem["usable"]) * 1024
+                    if mem.get("actual"):  stats["balloon.maximum"] = int(mem["actual"]) * 1024
+                    if mem.get("rss"):     stats["balloon.rss"]     = int(mem["rss"]) * 1024
+                    if mem.get("usable"):  stats["balloon.current"] = int(mem["usable"]) * 1024
             except Exception:
                 pass
 
-            # Discover disks/NICs from XML once
-            disks, ifaces = _xml_devices(dom)
+            # Disks & NICs from XML
+            disks, ifaces = self._xml_devices(dom)
 
-            # Disk counters (cumulative)
-            # Prefer blockStatsFlags if available, else blockStats
-            block_count = 0
+            # Disk counters
             for i, dev in enumerate(disks):
                 rd_bytes = wr_bytes = rd_reqs = wr_reqs = 0
                 try:
@@ -167,49 +179,39 @@ class LibvirtKVMCollector:
                         bs = dom.blockStatsFlags(dev, 0) or {}
                         rd_bytes = int(bs.get("rd_bytes", 0))
                         wr_bytes = int(bs.get("wr_bytes", 0))
-                        rd_reqs = int(bs.get("rd_operations", 0))
-                        wr_reqs = int(bs.get("wr_operations", 0))
+                        rd_reqs  = int(bs.get("rd_operations", 0))
+                        wr_reqs  = int(bs.get("wr_operations", 0))
                     else:
-                        # Older API returns a tuple
-                        # (rd_reqs, rd_bytes, wr_reqs, wr_bytes, errs)
-                        bs = dom.blockStats(dev)
-                        rd_reqs, rd_bytes, wr_reqs, wr_bytes = map(int, bs[:4])
-                    # Shape to look like bulk stats
-                    stats.setdefault("block.count", 0)
-                    stats["block.count"] += 1
+                        rd_reqs, rd_bytes, wr_reqs, wr_bytes = map(int, dom.blockStats(dev)[:4])
+                    stats.setdefault("block.count", 0); stats["block.count"] += 1
                     pfx = f"block.{i}"
                     stats[f"{pfx}.name"] = dev
                     stats[f"{pfx}.rd.bytes"] = rd_bytes
                     stats[f"{pfx}.wr.bytes"] = wr_bytes
-                    stats[f"{pfx}.rd.reqs"] = rd_reqs
-                    stats[f"{pfx}.wr.reqs"] = wr_reqs
-                    block_count += 1
+                    stats[f"{pfx}.rd.reqs"]  = rd_reqs
+                    stats[f"{pfx}.wr.reqs"]  = wr_reqs
                 except Exception:
                     continue
 
-            # NIC counters (cumulative)
-            net_count = 0
+            # NIC counters
             for i, iface in enumerate(ifaces):
                 try:
                     rx, rxp, tx, txp, rxerr, txerr, rxdrop, txdrop = dom.interfaceStats(iface)
-                    stats.setdefault("net.count", 0)
-                    stats["net.count"] += 1
+                    stats.setdefault("net.count", 0); stats["net.count"] += 1
                     pfx = f"net.{i}"
-                    stats[f"{pfx}.name"] = iface
+                    stats[f"{pfx}.name"]     = iface
                     stats[f"{pfx}.rx.bytes"] = int(rx)
                     stats[f"{pfx}.tx.bytes"] = int(tx)
-                    stats[f"{pfx}.rx.pkts"] = int(rxp)
-                    stats[f"{pfx}.tx.pkts"] = int(txp)
-                    stats[f"{pfx}.rx.drop"] = int(rxdrop)
-                    stats[f"{pfx}.tx.drop"] = int(txdrop)
-                    net_count += 1
+                    stats[f"{pfx}.rx.pkts"]  = int(rxp)
+                    stats[f"{pfx}.tx.pkts"]  = int(txp)
+                    stats[f"{pfx}.rx.drop"]  = int(rxdrop)
+                    stats[f"{pfx}.tx.drop"]  = int(txdrop)
                 except Exception:
                     continue
 
             res.append((dom, stats))
 
         return res
-
 
     def poll(self):
         now=time.time()
