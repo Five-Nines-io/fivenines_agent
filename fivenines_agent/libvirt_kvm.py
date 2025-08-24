@@ -64,18 +64,12 @@ class LibvirtKVMCollector:
         return 0
 
     def _safe_append(self, data, metric_name, value, labels):
-        """Safely append a metric to the data list in Prometheus format."""
+        """Safely append a metric to the data list."""
         try:
-            # Convert labels dict to Prometheus format string
-            if labels:
-                label_str = "{" + ",".join([f'{k}="{v}"' for k, v in labels.items()]) + "}"
-            else:
-                label_str = ""
-
             data.append({
                 'name': metric_name,
                 'value': value,
-                'labels': label_str
+                'labels': labels
             })
         except Exception as e:
             log(f"Error appending metric {metric_name}: {e}", 'error')
