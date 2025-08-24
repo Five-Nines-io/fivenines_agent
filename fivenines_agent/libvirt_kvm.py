@@ -64,9 +64,19 @@ class LibvirtKVMCollector:
         return 0
 
     def _safe_append(self, data, metric_name, value, labels):
-        """Safely append a metric to the data list."""
+        """Safely append a metric to the data list in Prometheus format."""
         try:
-            data.append((metric_name, value, labels))
+            # Convert labels dict to Prometheus format string
+            if labels:
+                label_str = "{" + ",".join([f'{k}="{v}"' for k, v in labels.items()]) + "}"
+            else:
+                label_str = ""
+
+            data.append({
+                'name': metric_name,
+                'value': value,
+                'labels': label_str
+            })
         except Exception as e:
             log(f"Error appending metric {metric_name}: {e}", 'error')
 
@@ -83,7 +93,7 @@ class LibvirtKVMCollector:
                 per_vcpu_ok = True
                 for idx, row in enumerate(per_vcpu):
                     tns = int(row.get('cpu_time', 0)) or 0
-                    self._safe_append(data, 'vm_vcpu_time_ns', tns, {**labels, 'vcpu': str(idx)})
+                    self._safe_append(data, 'vm_vcpu_time_nanoseconds_total', tns, {**labels, 'vcpu': str(idx)})
                     total_cpu_time_ns += tns
         except Exception:
             per_vcpu_ok = False
@@ -105,7 +115,7 @@ class LibvirtKVMCollector:
                             tns = int(entry.get('cpuTime', 0))
                         else:
                             continue
-                        self._safe_append(data, 'vm_vcpu_time_ns', tns, {**labels, 'vcpu': str(idx)})
+                        self._safe_append(data, 'vm_vcpu_time_nanoseconds_total', tns, {**labels, 'vcpu': str(idx)})
                         total_cpu_time_ns += tns
             except Exception:
                 per_vcpu_ok = False
@@ -122,7 +132,7 @@ class LibvirtKVMCollector:
                 except Exception:
                     total_cpu_time_ns = 0
 
-        self._safe_append(data, 'vm_cpu_time_ns', total_cpu_time_ns, labels)
+        self._safe_append(data, 'vm_cpu_time_nanoseconds_total', total_cpu_time_ns, labels)
         self._safe_append(data, 'vm_vcpu_count', vcpus, labels)
 
     def _collect_memory_metrics(self, dom, labels, data):
@@ -130,9 +140,9 @@ class LibvirtKVMCollector:
         try:
             mem = dom.memoryStats()
             memory_metrics = [
-                ('vm_mem_assigned_bytes', 'actual'),
-                ('vm_mem_balloon_bytes', 'usable'),
-                ('vm_mem_rss_bytes', 'rss')
+                ('vm_memory_assigned_bytes', 'actual'),
+                ('vm_memory_balloon_bytes', 'usable'),
+                ('vm_memory_rss_bytes', 'rss')
             ]
 
             for metric_name, mem_key in memory_metrics:
@@ -156,10 +166,10 @@ class LibvirtKVMCollector:
 
                 device_labels = {**labels, 'device': dev}
                 disk_metrics = [
-                    ('vm_disk_read_bytes', rd_bytes),
-                    ('vm_disk_write_bytes', wr_bytes),
-                    ('vm_disk_read_ops', rd_reqs),
-                    ('vm_disk_write_ops', wr_reqs)
+                    ('vm_disk_read_bytes_total', rd_bytes),
+                    ('vm_disk_write_bytes_total', wr_bytes),
+                    ('vm_disk_read_operations_total', rd_reqs),
+                    ('vm_disk_write_operations_total', wr_reqs)
                 ]
 
                 for metric_name, value in disk_metrics:
@@ -174,12 +184,12 @@ class LibvirtKVMCollector:
                 rx, rxp, tx, txp, rxerr, txerr, rxdrop, txdrop = dom.interfaceStats(iface)
                 device_labels = {**labels, 'device': iface}
                 network_metrics = [
-                    ('vm_net_rx_bytes', int(rx)),
-                    ('vm_net_tx_bytes', int(tx)),
-                    ('vm_net_rx_packets', int(rxp)),
-                    ('vm_net_tx_packets', int(txp)),
-                    ('vm_net_rx_drop', int(rxdrop)),
-                    ('vm_net_tx_drop', int(txdrop))
+                    ('vm_network_receive_bytes_total', int(rx)),
+                    ('vm_network_transmit_bytes_total', int(tx)),
+                    ('vm_network_receive_packets_total', int(rxp)),
+                    ('vm_network_transmit_packets_total', int(txp)),
+                    ('vm_network_receive_drops_total', int(rxdrop)),
+                    ('vm_network_transmit_drops_total', int(txdrop))
                 ]
 
                 for metric_name, value in network_metrics:
@@ -199,7 +209,7 @@ class LibvirtKVMCollector:
 
             # Basic metrics
             self._safe_append(data, 'vm_state', state, labels)
-            self._safe_append(data, 'vm_uptime_seconds', self._get_vm_uptime(dom), labels)
+            self._safe_append(data, 'vm_uptime_seconds_total', self._get_vm_uptime(dom), labels)
 
             # Collect detailed metrics
             self._collect_cpu_metrics(dom, labels, data)
@@ -216,8 +226,8 @@ class LibvirtKVMCollector:
     # ---- public ----
     def collect(self):
         """
-        Run one collection cycle and return ALL points as a list of tuples:
-          [(metric_name, value, labels_dict), ...]
+        Run one collection cycle and return ALL points as a list of dictionaries:
+          [{'name': metric_name, 'value': value, 'labels': labels_dict}, ...]
         """
         data = []
 
