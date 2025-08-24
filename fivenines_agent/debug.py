@@ -47,5 +47,5 @@ class debug(ContextDecorator):
         return wrapper
 
 def log(message, level='info'):
-    if LOG_LEVELS[log_level()] >= LOG_LEVELS[level]:
+    if LOG_LEVELS[log_level()] <= LOG_LEVELS[level]:
         print(f"[{level.upper()}][thread#{threading.get_native_id()}] {message}")
