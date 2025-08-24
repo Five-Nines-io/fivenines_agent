@@ -147,7 +147,7 @@ class Agent:
                     data['nginx'] = nginx_metrics(**self.config['nginx'])
                 if self.config.get('docker'):
                     data['docker'] = docker_metrics(**self.config['docker'])
-                test = libvirt_metrics()
+                data['libvirt'] = libvirt_metrics()
 
                 # Running time and enqueue
                 running_time = time.monotonic() - start
