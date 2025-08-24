@@ -12,7 +12,7 @@ import psutil
 import systemd_watchdog
 from dotenv import load_dotenv
 
-from fivenines_agent.env import dry_run
+from fivenines_agent.env import dry_run, config_dir, env_file
 from fivenines_agent.load_average import load_average
 from fivenines_agent.cpu import cpu_usage, cpu_data, cpu_model, cpu_count
 from fivenines_agent.memory import memory, swap
