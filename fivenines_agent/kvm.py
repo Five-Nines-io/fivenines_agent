@@ -301,8 +301,8 @@ class KVMCollector:
 
 
 @debug('kvm_metrics')
-def kvm_metrics():
-    collector = KVMCollector()
+def kvm_metrics(uri="qemu:///system"):
+    collector = KVMCollector(uri)
     try:
         return collector.collect()
     finally:
