@@ -11,7 +11,7 @@ STATE_MAP = {
 }
 
 class KVMCollector:
-    def __init__(self, uri: "qemu:///system"):
+    def __init__(self, uri="qemu:///system"):
         self.uri = uri
         self.conn = None
         self._connect()
