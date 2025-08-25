@@ -148,7 +148,8 @@ class Agent:
                     data['nginx'] = nginx_metrics(**self.config['nginx'])
                 if self.config.get('docker'):
                     data['docker'] = docker_metrics(**self.config['docker'])
-                data['kvm'] = kvm_metrics()
+                if self.config.get('kvm'):
+                    data['kvm'] = kvm_metrics(**self.config['kvm'])
 
                 # Running time and enqueue
                 running_time = time.monotonic() - start
