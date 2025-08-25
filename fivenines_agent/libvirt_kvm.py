@@ -1,4 +1,3 @@
-
 import os
 import time
 import libvirt
@@ -11,47 +10,61 @@ STATE_MAP = {
     4: "shutdown", 5: "shutoff", 6: "crashed", 7: "pmsuspended", 8: "last"
 }
 
-class LibvirtKVMCollector:
+class KVMCollector:
+    """
+    Collector for KVM/QEMU virtual machine metrics via libvirt.
+
+    Metric naming convention:
+    - kvm_* prefix for all KVM-specific metrics
+    - Labels include vm_uuid and vm_name for identification
+    - Device-specific metrics include a 'device' label
+    """
+
     def __init__(self, uri: str = "qemu:///system"):
         self.uri = uri
         self.conn = None
         self._connect()
 
     def _connect(self):
+        """Establish connection to libvirt daemon."""
         try:
             self.conn = libvirt.openReadOnly(self.uri)
             if self.conn is None:
-              log("libvirt.openReadOnly returned None", 'error')
+                log("libvirt.openReadOnly returned None", 'error')
         except Exception as e:
-          log(f"Cannot connect to libvirt at {self.uri}: {e}", 'error')
+            log(f"Cannot connect to libvirt at {self.uri}: {e}", 'error')
 
     def _xml_devices(self, dom):
-        """Return (disks, ifaces) from domain XML."""
+        """Extract disk and network interface devices from domain XML."""
         disks, ifaces = [], []
         try:
             xml = dom.XMLDesc(0)
             root = ET.fromstring(xml)
+
+            # Extract disk devices
             for d in root.findall(".//devices/disk"):
                 tgt = d.find("target")
                 if tgt is not None and tgt.get("dev"):
                     disks.append(tgt.get("dev"))
+
+            # Extract network interfaces
             for n in root.findall(".//devices/interface/target"):
                 dev = n.get("dev")
                 if dev:
                     ifaces.append(dev)
-        except Exception:
-            log("Error parsing XML", 'error')
+        except Exception as e:
+            log(f"Error parsing XML for domain: {e}", 'error')
         return disks, ifaces
 
     def _get_vm_uptime(self, dom):
-        """Get VM uptime in seconds."""
+        """Get VM uptime in seconds. Returns 0 if VM is not running."""
         try:
-            # Get VM state first
+            # Check if VM is running
             state = int(dom.state()[0])
             if state != 1:  # Not running
                 return 0
 
-            # Get start time from dom.info()
+            # Get start time from domain info
             info = dom.info()
             if info and len(info) >= 6:
                 start_time = info[5]  # Start time in seconds since epoch
@@ -59,12 +72,12 @@ class LibvirtKVMCollector:
                 uptime = current_time - start_time
                 return max(0, uptime)  # Ensure non-negative
 
-        except Exception:
-            log("Error getting VM uptime", 'error')
+        except Exception as e:
+            log(f"Error getting VM uptime: {e}", 'error')
         return 0
 
     def _safe_append(self, data, metric_name, value, labels):
-        """Safely append a metric to the data list."""
+        """Safely append a metric to the data list with error handling."""
         try:
             data.append({
                 'name': metric_name,
@@ -80,14 +93,19 @@ class LibvirtKVMCollector:
         total_cpu_time_ns = 0
         per_vcpu_ok = False
 
-        # Try per-vCPU via getCPUStats(False)
+        # Try per-vCPU stats via getCPUStats(False)
         try:
             per_vcpu = dom.getCPUStats(False) or []
             if per_vcpu:
                 per_vcpu_ok = True
                 for idx, row in enumerate(per_vcpu):
                     tns = int(row.get('cpu_time', 0)) or 0
-                    self._safe_append(data, 'vm_vcpu_time_nanoseconds_total', tns, {**labels, 'vcpu': str(idx)})
+                    self._safe_append(
+                        data,
+                        'kvm_vcpu_time_nanoseconds_total',
+                        tns,
+                        {**labels, 'vcpu': str(idx)}
+                    )
                     total_cpu_time_ns += tns
         except Exception:
             per_vcpu_ok = False
@@ -109,12 +127,17 @@ class LibvirtKVMCollector:
                             tns = int(entry.get('cpuTime', 0))
                         else:
                             continue
-                        self._safe_append(data, 'vm_vcpu_time_nanoseconds_total', tns, {**labels, 'vcpu': str(idx)})
+                        self._safe_append(
+                            data,
+                            'kvm_vcpu_time_nanoseconds_total',
+                            tns,
+                            {**labels, 'vcpu': str(idx)}
+                        )
                         total_cpu_time_ns += tns
             except Exception:
                 per_vcpu_ok = False
 
-        # If still no per-vCPU, get total
+        # If still no per-vCPU data, get aggregate total
         if not per_vcpu_ok:
             try:
                 total = dom.getCPUStats(True) or [{}]
@@ -126,74 +149,122 @@ class LibvirtKVMCollector:
                 except Exception:
                     total_cpu_time_ns = 0
 
-        self._safe_append(data, 'vm_cpu_time_nanoseconds_total', total_cpu_time_ns, labels)
-        self._safe_append(data, 'vm_vcpu_count', vcpus, labels)
+        # Emit total CPU time and vCPU count
+        self._safe_append(data, 'kvm_cpu_time_nanoseconds_total', total_cpu_time_ns, labels)
+        self._safe_append(data, 'kvm_vcpu_count', vcpus, labels)
 
     def _collect_memory_metrics(self, dom, labels, data):
         """Collect memory-related metrics for a domain."""
         try:
             mem = dom.memoryStats()
+
+            # Memory metrics mapping: (metric_name, memory_stat_key)
             memory_metrics = [
-                ('vm_memory_assigned_bytes', 'actual'),
-                ('vm_memory_balloon_bytes', 'usable'),
-                ('vm_memory_rss_bytes', 'rss')
+                ('kvm_memory_assigned_bytes', 'actual'),      # Total assigned memory
+                ('kvm_memory_balloon_bytes', 'usable'),       # Usable memory (after ballooning)
+                ('kvm_memory_rss_bytes', 'rss')              # Resident set size
             ]
 
             for metric_name, mem_key in memory_metrics:
                 if mem.get(mem_key):
+                    # libvirt returns memory in KiB, convert to bytes
                     self._safe_append(data, metric_name, int(mem[mem_key]) * 1024, labels)
-        except Exception:
-            pass
+
+            # Additional memory stats if available
+            if mem.get('available'):
+                self._safe_append(data, 'kvm_memory_available_bytes', int(mem['available']) * 1024, labels)
+            if mem.get('swap_in'):
+                self._safe_append(data, 'kvm_memory_swap_in_bytes', int(mem['swap_in']) * 1024, labels)
+            if mem.get('swap_out'):
+                self._safe_append(data, 'kvm_memory_swap_out_bytes', int(mem['swap_out']) * 1024, labels)
+
+        except Exception as e:
+            log(f"Error collecting memory metrics: {e}", 'debug')
 
     def _collect_disk_metrics(self, dom, disks, labels, data):
-        """Collect disk-related metrics for a domain."""
+        """Collect disk I/O metrics for all disks attached to a domain."""
         for dev in disks:
             try:
+                # Try the newer blockStatsFlags API first
                 if hasattr(dom, "blockStatsFlags"):
                     bs = dom.blockStatsFlags(dev, 0) or {}
                     rd_bytes = int(bs.get("rd_bytes", 0))
                     wr_bytes = int(bs.get("wr_bytes", 0))
                     rd_reqs = int(bs.get("rd_operations", 0))
                     wr_reqs = int(bs.get("wr_operations", 0))
+                    rd_time_ns = int(bs.get("rd_total_time_ns", 0))
+                    wr_time_ns = int(bs.get("wr_total_time_ns", 0))
+                    flush_reqs = int(bs.get("flush_operations", 0))
+                    flush_time_ns = int(bs.get("flush_total_time_ns", 0))
                 else:
-                    rd_reqs, rd_bytes, wr_reqs, wr_bytes = map(int, dom.blockStats(dev)[:4])
+                    # Fallback to older blockStats API
+                    stats = dom.blockStats(dev)
+                    rd_reqs, rd_bytes, wr_reqs, wr_bytes = map(int, stats[:4])
+                    rd_time_ns = wr_time_ns = flush_reqs = flush_time_ns = 0
+                    if len(stats) > 4:
+                        # Some versions have errs as 5th element
+                        errs = int(stats[4]) if len(stats) > 4 else 0
 
                 device_labels = {**labels, 'device': dev}
+
+                # Basic disk metrics
                 disk_metrics = [
-                    ('vm_disk_read_bytes_total', rd_bytes),
-                    ('vm_disk_write_bytes_total', wr_bytes),
-                    ('vm_disk_read_operations_total', rd_reqs),
-                    ('vm_disk_write_operations_total', wr_reqs)
+                    ('kvm_disk_read_bytes_total', rd_bytes),
+                    ('kvm_disk_write_bytes_total', wr_bytes),
+                    ('kvm_disk_read_operations_total', rd_reqs),
+                    ('kvm_disk_write_operations_total', wr_reqs)
                 ]
+
+                # Extended metrics if available
+                if rd_time_ns > 0:
+                    disk_metrics.append(('kvm_disk_read_time_nanoseconds_total', rd_time_ns))
+                if wr_time_ns > 0:
+                    disk_metrics.append(('kvm_disk_write_time_nanoseconds_total', wr_time_ns))
+                if flush_reqs > 0:
+                    disk_metrics.append(('kvm_disk_flush_operations_total', flush_reqs))
+                if flush_time_ns > 0:
+                    disk_metrics.append(('kvm_disk_flush_time_nanoseconds_total', flush_time_ns))
 
                 for metric_name, value in disk_metrics:
                     self._safe_append(data, metric_name, value, device_labels)
-            except Exception:
+
+            except Exception as e:
+                log(f"Error collecting disk metrics for device {dev}: {e}", 'debug')
                 continue
 
     def _collect_network_metrics(self, dom, ifaces, labels, data):
-        """Collect network-related metrics for a domain."""
+        """Collect network I/O metrics for all network interfaces attached to a domain."""
         for iface in ifaces:
             try:
-                rx, rxp, tx, txp, rxerr, txerr, rxdrop, txdrop = dom.interfaceStats(iface)
+                # Get interface statistics
+                stats = dom.interfaceStats(iface)
+                rx_bytes, rx_packets, rx_errs, rx_drops = int(stats[0]), int(stats[1]), int(stats[2]), int(stats[3])
+                tx_bytes, tx_packets, tx_errs, tx_drops = int(stats[4]), int(stats[5]), int(stats[6]), int(stats[7])
+
                 device_labels = {**labels, 'device': iface}
+
                 network_metrics = [
-                    ('vm_network_receive_bytes_total', int(rx)),
-                    ('vm_network_transmit_bytes_total', int(tx)),
-                    ('vm_network_receive_packets_total', int(rxp)),
-                    ('vm_network_transmit_packets_total', int(txp)),
-                    ('vm_network_receive_drops_total', int(rxdrop)),
-                    ('vm_network_transmit_drops_total', int(txdrop))
+                    ('kvm_network_receive_bytes_total', rx_bytes),
+                    ('kvm_network_transmit_bytes_total', tx_bytes),
+                    ('kvm_network_receive_packets_total', rx_packets),
+                    ('kvm_network_transmit_packets_total', tx_packets),
+                    ('kvm_network_receive_drops_total', rx_drops),
+                    ('kvm_network_transmit_drops_total', tx_drops),
+                    ('kvm_network_receive_errors_total', rx_errs),
+                    ('kvm_network_transmit_errors_total', tx_errs)
                 ]
 
                 for metric_name, value in network_metrics:
                     self._safe_append(data, metric_name, value, device_labels)
-            except Exception:
+
+            except Exception as e:
+                log(f"Error collecting network metrics for interface {iface}: {e}", 'debug')
                 continue
 
     def _collect_domain_metrics(self, dom, data):
         """Collect all metrics for a single domain."""
         try:
+            # Get basic domain information
             uuid = dom.UUIDString()
             name = dom.name()
             state_num = int(dom.state()[0])
@@ -201,42 +272,91 @@ class LibvirtKVMCollector:
 
             labels = {'vm_uuid': uuid, 'vm_name': name}
 
-            # Basic metrics
-            self._safe_append(data, 'vm_state', state, labels)
-            self._safe_append(data, 'vm_uptime_seconds_total', self._get_vm_uptime(dom), labels)
+            # State and uptime metrics
+            self._safe_append(data, 'kvm_vm_info', 1, {**labels, 'state': state})
+            self._safe_append(data, 'kvm_vm_state_code', state_num, labels)
+            self._safe_append(data, 'kvm_vm_uptime_seconds_total', self._get_vm_uptime(dom), labels)
 
-            # Collect detailed metrics
-            self._collect_cpu_metrics(dom, labels, data)
-            self._collect_memory_metrics(dom, labels, data)
+            # Only collect detailed metrics if VM is running
+            if state_num == 1:  # running
+                # Collect all subsystem metrics
+                self._collect_cpu_metrics(dom, labels, data)
+                self._collect_memory_metrics(dom, labels, data)
 
-            # Discover devices and collect device metrics
-            disks, ifaces = self._xml_devices(dom)
-            self._collect_disk_metrics(dom, disks, labels, data)
-            self._collect_network_metrics(dom, ifaces, labels, data)
+                # Discover devices and collect device metrics
+                disks, ifaces = self._xml_devices(dom)
+                if disks:
+                    self._collect_disk_metrics(dom, disks, labels, data)
+                if ifaces:
+                    self._collect_network_metrics(dom, ifaces, labels, data)
 
         except Exception as ex:
-            log(f"Domain metrics error: {ex}", 'error')
+            log(f"Error collecting metrics for domain: {ex}", 'error')
 
-    # ---- public ----
     def collect(self):
         """
-        Run one collection cycle and return ALL points as a list of dictionaries:
-          [{'name': metric_name, 'value': value, 'labels': labels_dict}, ...]
+        Run one collection cycle and return all metrics.
+
+        Returns:
+            list: List of dictionaries with format:
+                  [{'name': metric_name, 'value': value, 'labels': labels_dict}, ...]
         """
         data = []
 
+        if not self.conn:
+            log("No libvirt connection available", 'error')
+            return data
+
         try:
+            # Get all domains (running and stopped)
             doms = self.conn.listAllDomains()
+
+            # Add hypervisor-level metrics
+            try:
+                # Get hypervisor info
+                info = self.conn.getInfo()
+                if info:
+                    hypervisor_labels = {'hypervisor': 'kvm'}
+                    self._safe_append(data, 'kvm_hypervisor_vcpus_total', info[2], hypervisor_labels)
+                    self._safe_append(data, 'kvm_hypervisor_memory_bytes', info[1] * 1024 * 1024, hypervisor_labels)
+                    self._safe_append(data, 'kvm_hypervisor_domains_total', len(doms), hypervisor_labels)
+
+                    # Count running domains
+                    running_count = sum(1 for d in doms if d.state()[0] == 1)
+                    self._safe_append(data, 'kvm_hypervisor_domains_running', running_count, hypervisor_labels)
+            except Exception as e:
+                log(f"Error collecting hypervisor metrics: {e}", 'debug')
+
         except Exception as e:
             log(f"listAllDomains failed: {e}", 'error')
             return data
 
+        # Collect metrics for each domain
         for dom in doms:
             self._collect_domain_metrics(dom, data)
 
         return data
 
+    def close(self):
+        """Close the libvirt connection."""
+        if self.conn:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
 
-@debug('libvirt_kvm_metrics')
-def libvirt_kvm_metrics():
-    return LibvirtKVMCollector().collect()
+
+@debug('kvm_metrics')
+def kvm_metrics():
+    """
+    Entry point for KVM metrics collection.
+
+    Returns:
+        list: List of metric dictionaries
+    """
+    collector = KVMCollector()
+    try:
+        return collector.collect()
+    finally:
+        collector.close()
