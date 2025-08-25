@@ -11,22 +11,12 @@ STATE_MAP = {
 }
 
 class KVMCollector:
-    """
-    Collector for KVM/QEMU virtual machine metrics via libvirt.
-
-    Metric naming convention:
-    - kvm_* prefix for all KVM-specific metrics
-    - Labels include vm_uuid and vm_name for identification
-    - Device-specific metrics include a 'device' label
-    """
-
-    def __init__(self, uri: str = "qemu:///system"):
+    def __init__(self, uri: "qemu:///system"):
         self.uri = uri
         self.conn = None
         self._connect()
 
     def _connect(self):
-        """Establish connection to libvirt daemon."""
         try:
             self.conn = libvirt.openReadOnly(self.uri)
             if self.conn is None:
@@ -35,19 +25,16 @@ class KVMCollector:
             log(f"Cannot connect to libvirt at {self.uri}: {e}", 'error')
 
     def _xml_devices(self, dom):
-        """Extract disk and network interface devices from domain XML."""
         disks, ifaces = [], []
         try:
             xml = dom.XMLDesc(0)
             root = ET.fromstring(xml)
 
-            # Extract disk devices
             for d in root.findall(".//devices/disk"):
                 tgt = d.find("target")
                 if tgt is not None and tgt.get("dev"):
                     disks.append(tgt.get("dev"))
 
-            # Extract network interfaces
             for n in root.findall(".//devices/interface/target"):
                 dev = n.get("dev")
                 if dev:
@@ -57,27 +44,23 @@ class KVMCollector:
         return disks, ifaces
 
     def _get_vm_uptime(self, dom):
-        """Get VM uptime in seconds. Returns 0 if VM is not running."""
         try:
-            # Check if VM is running
             state = int(dom.state()[0])
             if state != 1:  # Not running
                 return 0
 
-            # Get start time from domain info
             info = dom.info()
             if info and len(info) >= 6:
-                start_time = info[5]  # Start time in seconds since epoch
+                start_time = info[5]
                 current_time = int(time.time())
                 uptime = current_time - start_time
-                return max(0, uptime)  # Ensure non-negative
+                return max(0, uptime)
 
         except Exception as e:
             log(f"Error getting VM uptime: {e}", 'error')
         return 0
 
     def _safe_append(self, data, metric_name, value, labels):
-        """Safely append a metric to the data list with error handling."""
         try:
             data.append({
                 'name': metric_name,
@@ -88,7 +71,6 @@ class KVMCollector:
             log(f"Error appending metric {metric_name}: {e}", 'error')
 
     def _collect_cpu_metrics(self, dom, labels, data):
-        """Collect CPU-related metrics for a domain."""
         vcpus = max(1, int(dom.maxVcpus()))
         total_cpu_time_ns = 0
         per_vcpu_ok = False
@@ -149,16 +131,13 @@ class KVMCollector:
                 except Exception:
                     total_cpu_time_ns = 0
 
-        # Emit total CPU time and vCPU count
         self._safe_append(data, 'kvm_cpu_time_nanoseconds_total', total_cpu_time_ns, labels)
         self._safe_append(data, 'kvm_vcpu_count', vcpus, labels)
 
     def _collect_memory_metrics(self, dom, labels, data):
-        """Collect memory-related metrics for a domain."""
         try:
             mem = dom.memoryStats()
 
-            # Memory metrics mapping: (metric_name, memory_stat_key)
             memory_metrics = [
                 ('kvm_memory_assigned_bytes', 'actual'),      # Total assigned memory
                 ('kvm_memory_balloon_bytes', 'usable'),       # Usable memory (after ballooning)
@@ -167,10 +146,8 @@ class KVMCollector:
 
             for metric_name, mem_key in memory_metrics:
                 if mem.get(mem_key):
-                    # libvirt returns memory in KiB, convert to bytes
                     self._safe_append(data, metric_name, int(mem[mem_key]) * 1024, labels)
 
-            # Additional memory stats if available
             if mem.get('available'):
                 self._safe_append(data, 'kvm_memory_available_bytes', int(mem['available']) * 1024, labels)
             if mem.get('swap_in'):
@@ -182,7 +159,6 @@ class KVMCollector:
             log(f"Error collecting memory metrics: {e}", 'debug')
 
     def _collect_disk_metrics(self, dom, disks, labels, data):
-        """Collect disk I/O metrics for all disks attached to a domain."""
         for dev in disks:
             try:
                 # Try the newer blockStatsFlags API first
@@ -197,7 +173,6 @@ class KVMCollector:
                     flush_reqs = int(bs.get("flush_operations", 0))
                     flush_time_ns = int(bs.get("flush_total_time_ns", 0))
                 else:
-                    # Fallback to older blockStats API
                     stats = dom.blockStats(dev)
                     rd_reqs, rd_bytes, wr_reqs, wr_bytes = map(int, stats[:4])
                     rd_time_ns = wr_time_ns = flush_reqs = flush_time_ns = 0
@@ -207,7 +182,6 @@ class KVMCollector:
 
                 device_labels = {**labels, 'device': dev}
 
-                # Basic disk metrics
                 disk_metrics = [
                     ('kvm_disk_read_bytes_total', rd_bytes),
                     ('kvm_disk_write_bytes_total', wr_bytes),
@@ -215,7 +189,6 @@ class KVMCollector:
                     ('kvm_disk_write_operations_total', wr_reqs)
                 ]
 
-                # Extended metrics if available
                 if rd_time_ns > 0:
                     disk_metrics.append(('kvm_disk_read_time_nanoseconds_total', rd_time_ns))
                 if wr_time_ns > 0:
@@ -233,10 +206,8 @@ class KVMCollector:
                 continue
 
     def _collect_network_metrics(self, dom, ifaces, labels, data):
-        """Collect network I/O metrics for all network interfaces attached to a domain."""
         for iface in ifaces:
             try:
-                # Get interface statistics
                 stats = dom.interfaceStats(iface)
                 rx_bytes, rx_packets, rx_errs, rx_drops = int(stats[0]), int(stats[1]), int(stats[2]), int(stats[3])
                 tx_bytes, tx_packets, tx_errs, tx_drops = int(stats[4]), int(stats[5]), int(stats[6]), int(stats[7])
@@ -262,9 +233,7 @@ class KVMCollector:
                 continue
 
     def _collect_domain_metrics(self, dom, data):
-        """Collect all metrics for a single domain."""
         try:
-            # Get basic domain information
             uuid = dom.UUIDString()
             name = dom.name()
             state_num = int(dom.state()[0])
@@ -272,18 +241,15 @@ class KVMCollector:
 
             labels = {'vm_uuid': uuid, 'vm_name': name}
 
-            # State and uptime metrics
             self._safe_append(data, 'kvm_vm_info', 1, {**labels, 'state': state})
             self._safe_append(data, 'kvm_vm_state_code', state_num, labels)
             self._safe_append(data, 'kvm_vm_uptime_seconds_total', self._get_vm_uptime(dom), labels)
 
             # Only collect detailed metrics if VM is running
             if state_num == 1:  # running
-                # Collect all subsystem metrics
                 self._collect_cpu_metrics(dom, labels, data)
                 self._collect_memory_metrics(dom, labels, data)
 
-                # Discover devices and collect device metrics
                 disks, ifaces = self._xml_devices(dom)
                 if disks:
                     self._collect_disk_metrics(dom, disks, labels, data)
@@ -294,13 +260,6 @@ class KVMCollector:
             log(f"Error collecting metrics for domain: {ex}", 'error')
 
     def collect(self):
-        """
-        Run one collection cycle and return all metrics.
-
-        Returns:
-            list: List of dictionaries with format:
-                  [{'name': metric_name, 'value': value, 'labels': labels_dict}, ...]
-        """
         data = []
 
         if not self.conn:
@@ -308,12 +267,9 @@ class KVMCollector:
             return data
 
         try:
-            # Get all domains (running and stopped)
             doms = self.conn.listAllDomains()
 
-            # Add hypervisor-level metrics
             try:
-                # Get hypervisor info
                 info = self.conn.getInfo()
                 if info:
                     hypervisor_labels = {'hypervisor': 'kvm'}
@@ -321,7 +277,6 @@ class KVMCollector:
                     self._safe_append(data, 'kvm_hypervisor_memory_bytes', info[1] * 1024 * 1024, hypervisor_labels)
                     self._safe_append(data, 'kvm_hypervisor_domains_total', len(doms), hypervisor_labels)
 
-                    # Count running domains
                     running_count = sum(1 for d in doms if d.state()[0] == 1)
                     self._safe_append(data, 'kvm_hypervisor_domains_running', running_count, hypervisor_labels)
             except Exception as e:
@@ -331,14 +286,12 @@ class KVMCollector:
             log(f"listAllDomains failed: {e}", 'error')
             return data
 
-        # Collect metrics for each domain
         for dom in doms:
             self._collect_domain_metrics(dom, data)
 
         return data
 
     def close(self):
-        """Close the libvirt connection."""
         if self.conn:
             try:
                 self.conn.close()
@@ -349,12 +302,6 @@ class KVMCollector:
 
 @debug('kvm_metrics')
 def kvm_metrics():
-    """
-    Entry point for KVM metrics collection.
-
-    Returns:
-        list: List of metric dictionaries
-    """
     collector = KVMCollector()
     try:
         return collector.collect()
