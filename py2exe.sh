@@ -86,6 +86,19 @@ python3 -m pip install poetry==1.8.4 || {
 # Configure Poetry to use the current virtual environment
 echo "Configuring Poetry to avoid creating separate environments"
 poetry config virtualenvs.create false
+
+# Remove any existing libvirt-python and install correct version
+echo "Ensuring correct libvirt-python version"
+python3 -m pip uninstall -y libvirt-python 2>/dev/null || true
+python3 -m pip install --no-cache-dir libvirt-python==11.6.0 || {
+    echo "Failed to install libvirt-python. Exiting."
+    exit 1
+}
+
+# Verify the version we just installed
+echo "Verifying libvirt-python version:"
+python3 -c "import libvirt; print('libvirt version:', libvirt.getVersion())"
+
 poetry install --no-interaction || {
     echo "Poetry installation failed. Exiting."
     exit 1
@@ -104,6 +117,10 @@ poetry export --without-hashes -o requirements.txt || {
 echo "Building the executable for $TARGET_ARCH"
 mkdir -p build dist/linux
 
+# Verify which libvirt module PyInstaller will find
+echo "Checking libvirt module path:"
+python3 -c "import libvirt; print('libvirt module path:', libvirt.__file__); print('libvirt version:', libvirt.getVersion())"
+
 poetry run pyinstaller \
     --noconfirm \
     --onefile \
@@ -112,6 +129,8 @@ poetry run pyinstaller \
     --distpath ./build \
     --dist dist/linux \
     --clean \
+    --hidden-import=libvirt \
+    --hidden-import=libvirtmod \
     --add-binary "/usr/local/openssl/lib/libssl.so:." \
     --add-binary "/usr/local/openssl/lib/libcrypto.so.1.1:." \
     --add-binary "/usr/lib64/libcrypt.so.1:." \

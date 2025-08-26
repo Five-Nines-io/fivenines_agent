@@ -35,7 +35,12 @@ class QEMUCollector:
         try:
             # Log libvirt version and capabilities
             log(f"libvirt module version: {libvirt.getVersion()}", 'debug')
-            log(f"libvirt library version: {libvirt.getLibVersion()}", 'debug')
+            
+            # getLibVersion() is available in newer versions
+            try:
+                log(f"libvirt library version: {libvirt.getLibVersion()}", 'debug')
+            except AttributeError:
+                log("libvirt.getLibVersion() not available in this version", 'debug')
             
             self.conn = libvirt.openReadOnly(self.uri)
             if self.conn is None:
