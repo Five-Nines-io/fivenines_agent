@@ -15,6 +15,21 @@ class QEMUCollector:
         self.uri = uri
         self.conn = None
         self._connect()
+        self._setup_error_handler()
+
+    def _setup_error_handler(self):
+        """Setup custom error handler to suppress known cgroup v2 warnings."""
+        def error_handler(ctx, error):
+            if error and len(error) >= 2:
+                msg = str(error[1]) if error[1] else ""
+                if "getCpuacctPercpuUsage" in msg or "cgroup V2" in msg:
+                    return
+            log(f"libvirt error: {error}", 'debug')
+
+        try:
+            libvirt.registerErrorHandler(error_handler, None)
+        except Exception:
+            pass
 
     def _connect(self):
         try:
@@ -70,71 +85,84 @@ class QEMUCollector:
         except Exception as e:
             log(f"Error appending metric {metric_name}: {e}", 'error')
 
-
     def _collect_cpu_metrics(self, dom, labels, data):
+        """Collect CPU metrics with proper cgroup v2 handling."""
         vcpus = max(1, int(dom.maxVcpus()))
         total_cpu_time_ns = 0
-        per_vcpu_ok = False
+        per_vcpu_collected = False
 
-        # Try per-vCPU stats via getCPUStats(False)
+        # Method 1: Try getCPUStats(False) for per-vCPU stats
+        # This will fail on cgroup v2 systems
         try:
-            print("getCPUStats(False) start")
-            per_vcpu = dom.getCPUStats(False) or []
-            print("getCPUStats(False) end")
-            if per_vcpu:
-                per_vcpu_ok = True
-                for idx, row in enumerate(per_vcpu):
-                    tns = int(row.get('cpu_time', 0)) or 0
-                    self._safe_append(
-                        data,
-                        'vm_vcpu_time_nanoseconds_total',
-                        tns,
-                        {**labels, 'vcpu': str(idx)}
-                    )
-                    total_cpu_time_ns += tns
-        except Exception:
-            per_vcpu_ok = False
-
-        # Fallback: per-vCPU via dom.vcpus()
-        if not per_vcpu_ok:
-            try:
-                print("vcpus() start")
-                vinfo = dom.vcpus()
-                print("vcpus() end")
-                cpuinfo_list = vinfo[0] if isinstance(vinfo, tuple) else vinfo
-                if cpuinfo_list:
-                    per_vcpu_ok = True
-                    total_cpu_time_ns = 0
-                    for entry in cpuinfo_list:
-                        if isinstance(entry, tuple) and len(entry) >= 3:
-                            idx = entry[0]
-                            tns = int(entry[2])
-                        elif isinstance(entry, dict):
-                            idx = int(entry.get('number', 0))
-                            tns = int(entry.get('cpuTime', 0))
-                        else:
-                            continue
+            per_vcpu = dom.getCPUStats(False)
+            if per_vcpu and isinstance(per_vcpu, list):
+                for idx, cpu_stats in enumerate(per_vcpu):
+                    if isinstance(cpu_stats, dict) and 'cpu_time' in cpu_stats:
+                        cpu_time = int(cpu_stats['cpu_time'])
                         self._safe_append(
                             data,
                             'vm_vcpu_time_nanoseconds_total',
-                            tns,
+                            cpu_time,
                             {**labels, 'vcpu': str(idx)}
                         )
-                        total_cpu_time_ns += tns
-            except Exception:
-                per_vcpu_ok = False
+                        total_cpu_time_ns += cpu_time
+                        per_vcpu_collected = True
+        except libvirt.libvirtError as e:
+            # Expected on cgroup v2 - silently ignore
+            if "not supported" not in str(e).lower() and "cgroup" not in str(e).lower():
+                log(f"Unexpected error in getCPUStats(False): {e}", 'debug')
+        except Exception as e:
+            log(f"Error getting per-vCPU stats: {e}", 'debug')
 
-        # If still no per-vCPU data, get aggregate total
-        if not per_vcpu_ok:
+        # Method 2: Try dom.vcpus() as fallback
+        # Note: This often returns current pinning info, not CPU time
+        if not per_vcpu_collected:
             try:
-                total = dom.getCPUStats(True) or [{}]
-                total_cpu_time_ns = int(total[0].get('cpu_time', 0)) or 0
-            except Exception:
-                try:
-                    info = dom.info()
-                    total_cpu_time_ns = int(info[4]) if info and len(info) >= 5 else 0
-                except Exception:
-                    total_cpu_time_ns = 0
+                vcpu_info = dom.vcpus()
+                if vcpu_info and len(vcpu_info) == 2:
+                    # vcpu_info[0] contains the vCPU info list
+                    # vcpu_info[1] contains CPU map info (not needed here)
+                    vcpu_list = vcpu_info[0]
+                    if vcpu_list:
+                        for vcpu_data in vcpu_list:
+                            # Format: (vcpu_number, state, cpu_time_ns, cpu_num)
+                            if len(vcpu_data) >= 3:
+                                vcpu_num = vcpu_data[0]
+                                cpu_time = vcpu_data[2]  # CPU time in nanoseconds
+                                if cpu_time > 0:  # Only record if we have actual data
+                                    self._safe_append(
+                                        data,
+                                        'vm_vcpu_time_nanoseconds_total',
+                                        cpu_time,
+                                        {**labels, 'vcpu': str(vcpu_num)}
+                                    )
+                                    total_cpu_time_ns += cpu_time
+                                    per_vcpu_collected = True
+            except libvirt.libvirtError as e:
+                if "not implemented" not in str(e).lower():
+                    log(f"vcpus() error: {e}", 'debug')
+            except Exception as e:
+                log(f"Error parsing vcpus() output: {e}", 'debug')
+
+        # Method 3: Get aggregate CPU stats (usually works even on cgroup v2)
+        if total_cpu_time_ns == 0:  # If we haven't collected any CPU time yet
+            try:
+                total_stats = dom.getCPUStats(True)
+                if total_stats and isinstance(total_stats, list) and len(total_stats) > 0:
+                    if isinstance(total_stats[0], dict) and 'cpu_time' in total_stats[0]:
+                        total_cpu_time_ns = int(total_stats[0]['cpu_time'])
+            except Exception as e:
+                log(f"Error getting total CPU stats: {e}", 'debug')
+
+        # Method 4: Ultimate fallback - use dom.info()
+        if total_cpu_time_ns == 0:
+            try:
+                info = dom.info()
+                # info[4] is CPU time in nanoseconds
+                if info and len(info) > 4:
+                    total_cpu_time_ns = int(info[4])
+            except Exception as e:
+                log(f"Error getting CPU time from info(): {e}", 'debug')
 
         self._safe_append(data, 'vm_cpu_time_nanoseconds_total', total_cpu_time_ns, labels)
         self._safe_append(data, 'vm_vcpu_count', vcpus, labels)
@@ -144,9 +172,9 @@ class QEMUCollector:
             mem = dom.memoryStats()
 
             memory_metrics = [
-                ('vm_memory_assigned_bytes', 'actual'),      # Total assigned memory
-                ('vm_memory_balloon_bytes', 'usable'),       # Usable memory (after ballooning)
-                ('vm_memory_rss_bytes', 'rss')              # Resident set size
+                ('vm_memory_assigned_bytes', 'actual'),
+                ('vm_memory_balloon_bytes', 'usable'),
+                ('vm_memory_rss_bytes', 'rss')
             ]
 
             for metric_name, mem_key in memory_metrics:
@@ -166,7 +194,6 @@ class QEMUCollector:
     def _collect_disk_metrics(self, dom, disks, labels, data):
         for dev in disks:
             try:
-                # Try the newer blockStatsFlags API first
                 if hasattr(dom, "blockStatsFlags"):
                     bs = dom.blockStatsFlags(dev, 0) or {}
                     rd_bytes = int(bs.get("rd_bytes", 0))
@@ -181,9 +208,6 @@ class QEMUCollector:
                     stats = dom.blockStats(dev)
                     rd_reqs, rd_bytes, wr_reqs, wr_bytes = map(int, stats[:4])
                     rd_time_ns = wr_time_ns = flush_reqs = flush_time_ns = 0
-                    if len(stats) > 4:
-                        # Some versions have errs as 5th element
-                        errs = int(stats[4]) if len(stats) > 4 else 0
 
                 device_labels = {**labels, 'device': dev}
 
@@ -214,8 +238,14 @@ class QEMUCollector:
         for iface in ifaces:
             try:
                 stats = dom.interfaceStats(iface)
-                rx_bytes, rx_packets, rx_errs, rx_drops = int(stats[0]), int(stats[1]), int(stats[2]), int(stats[3])
-                tx_bytes, tx_packets, tx_errs, tx_drops = int(stats[4]), int(stats[5]), int(stats[6]), int(stats[7])
+                rx_bytes = int(stats[0])
+                rx_packets = int(stats[1])
+                rx_errs = int(stats[2])
+                rx_drops = int(stats[3])
+                tx_bytes = int(stats[4])
+                tx_packets = int(stats[5])
+                tx_errs = int(stats[6])
+                tx_drops = int(stats[7])
 
                 device_labels = {**labels, 'device': iface}
 
@@ -244,11 +274,11 @@ class QEMUCollector:
             state_num = int(dom.state()[0])
             state = STATE_MAP.get(state_num, str(state_num))
 
-            labels = {'vm_uuid': uuid, 'vm_name': name, 'hypervisor': 'qemu'}
+            labels = {'vm_uuid': uuid, 'vm_name': name}
 
-            self._safe_append(data, 'vm_info', 1, {**labels, 'state': state})
-            self._safe_append(data, 'vm_state_code', state_num, labels)
-            self._safe_append(data, 'vm_uptime_seconds_total', self._get_vm_uptime(dom), labels)
+            self._safe_append(data, 'vm_vm_info', 1, {**labels, 'state': state})
+            self._safe_append(data, 'vm_vm_state_code', state_num, labels)
+            self._safe_append(data, 'vm_vm_uptime_seconds_total', self._get_vm_uptime(dom), labels)
 
             # Only collect detailed metrics if VM is running
             if state_num == 1:  # running
@@ -277,13 +307,13 @@ class QEMUCollector:
             try:
                 info = self.conn.getInfo()
                 if info:
-                    hypervisor_labels = {'hypervisor': 'qemu'}
-                    self._safe_append(data, 'hypervisor_vcpus_total', info[2], hypervisor_labels)
-                    self._safe_append(data, 'hypervisor_memory_bytes', info[1] * 1024 * 1024, hypervisor_labels)
-                    self._safe_append(data, 'hypervisor_domains_total', len(doms), hypervisor_labels)
+                    hypervisor_labels = {'hypervisor': 'kvm'}
+                    self._safe_append(data, 'vm_hypervisor_vcpus_total', info[2], hypervisor_labels)
+                    self._safe_append(data, 'vm_hypervisor_memory_bytes', info[1] * 1024 * 1024, hypervisor_labels)
+                    self._safe_append(data, 'vm_hypervisor_domains_total', len(doms), hypervisor_labels)
 
                     running_count = sum(1 for d in doms if d.state()[0] == 1)
-                    self._safe_append(data, 'hypervisor_domains_running', running_count, hypervisor_labels)
+                    self._safe_append(data, 'vm_hypervisor_domains_running', running_count, hypervisor_labels)
             except Exception as e:
                 log(f"Error collecting hypervisor metrics: {e}", 'debug')
 
