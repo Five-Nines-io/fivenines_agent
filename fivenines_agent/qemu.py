@@ -301,7 +301,7 @@ class QEMUCollector:
 
 
 @debug('qemu_metrics')
-def qemy_metrics(uri="qemu:///system"):
+def qemu_metrics(uri="qemu:///system"):
     collector = QEMUCollector(uri)
     try:
         return collector.collect()
