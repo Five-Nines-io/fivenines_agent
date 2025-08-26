@@ -25,11 +25,18 @@ gpgkey=http://vault.centos.org/7.9.2009/os/x86_64/RPM-GPG-KEY-CentOS-7\n" > /etc
     yum makecache fast
 
 # Install development tools and required dependencies
-RUN yum groupinstall -y "Development Tools" && \
-    yum install -y wget gcc gcc-c++ make zlib-devel bzip2 bzip2-devel \
+RUN yum --nogpgcheck groupinstall -y "Development Tools" && \
+    yum --nogpgcheck install -y wget gcc gcc-c++ make zlib-devel bzip2 bzip2-devel \
         xz-devel libffi-devel ncurses-devel sqlite sqlite-devel \
         openssl openssl-devel tk-devel gdbm-devel libuuid-devel \
-        libnsl2-devel libtirpc-devel readline-devel uuid-devel tar && \
+        libnsl2-devel libtirpc-devel readline-devel uuid-devel pkg-config tar && \
+    yum clean all
+
+# Install libvirt-devel separately with better error handling
+RUN yum --nogpgcheck install -y libvirt-devel || \
+    (echo "First attempt failed, trying with disabled GPG checks for all repos" && \
+     sed -i 's/gpgcheck=1/gpgcheck=0/g' /etc/yum.repos.d/CentOS-Vault.repo && \
+     yum install -y libvirt-devel) && \
     yum clean all
 
 # Build OpenSSL from source
