@@ -10,7 +10,7 @@ STATE_MAP = {
     4: "shutdown", 5: "shutoff", 6: "crashed", 7: "pmsuspended", 8: "last"
 }
 
-class KVMCollector:
+class QEMUCollector:
     def __init__(self, uri="qemu:///system"):
         self.uri = uri
         self.conn = None
@@ -84,7 +84,7 @@ class KVMCollector:
                     tns = int(row.get('cpu_time', 0)) or 0
                     self._safe_append(
                         data,
-                        'kvm_vcpu_time_nanoseconds_total',
+                        'vm_vcpu_time_nanoseconds_total',
                         tns,
                         {**labels, 'vcpu': str(idx)}
                     )
@@ -111,7 +111,7 @@ class KVMCollector:
                             continue
                         self._safe_append(
                             data,
-                            'kvm_vcpu_time_nanoseconds_total',
+                            'vm_vcpu_time_nanoseconds_total',
                             tns,
                             {**labels, 'vcpu': str(idx)}
                         )
@@ -131,17 +131,17 @@ class KVMCollector:
                 except Exception:
                     total_cpu_time_ns = 0
 
-        self._safe_append(data, 'kvm_cpu_time_nanoseconds_total', total_cpu_time_ns, labels)
-        self._safe_append(data, 'kvm_vcpu_count', vcpus, labels)
+        self._safe_append(data, 'vm_cpu_time_nanoseconds_total', total_cpu_time_ns, labels)
+        self._safe_append(data, 'vm_vcpu_count', vcpus, labels)
 
     def _collect_memory_metrics(self, dom, labels, data):
         try:
             mem = dom.memoryStats()
 
             memory_metrics = [
-                ('kvm_memory_assigned_bytes', 'actual'),      # Total assigned memory
-                ('kvm_memory_balloon_bytes', 'usable'),       # Usable memory (after ballooning)
-                ('kvm_memory_rss_bytes', 'rss')              # Resident set size
+                ('vm_memory_assigned_bytes', 'actual'),      # Total assigned memory
+                ('vm_memory_balloon_bytes', 'usable'),       # Usable memory (after ballooning)
+                ('vm_memory_rss_bytes', 'rss')              # Resident set size
             ]
 
             for metric_name, mem_key in memory_metrics:
@@ -149,11 +149,11 @@ class KVMCollector:
                     self._safe_append(data, metric_name, int(mem[mem_key]) * 1024, labels)
 
             if mem.get('available'):
-                self._safe_append(data, 'kvm_memory_available_bytes', int(mem['available']) * 1024, labels)
+                self._safe_append(data, 'vm_memory_available_bytes', int(mem['available']) * 1024, labels)
             if mem.get('swap_in'):
-                self._safe_append(data, 'kvm_memory_swap_in_bytes', int(mem['swap_in']) * 1024, labels)
+                self._safe_append(data, 'vm_memory_swap_in_bytes', int(mem['swap_in']) * 1024, labels)
             if mem.get('swap_out'):
-                self._safe_append(data, 'kvm_memory_swap_out_bytes', int(mem['swap_out']) * 1024, labels)
+                self._safe_append(data, 'vm_memory_swap_out_bytes', int(mem['swap_out']) * 1024, labels)
 
         except Exception as e:
             log(f"Error collecting memory metrics: {e}", 'debug')
@@ -183,20 +183,20 @@ class KVMCollector:
                 device_labels = {**labels, 'device': dev}
 
                 disk_metrics = [
-                    ('kvm_disk_read_bytes_total', rd_bytes),
-                    ('kvm_disk_write_bytes_total', wr_bytes),
-                    ('kvm_disk_read_operations_total', rd_reqs),
-                    ('kvm_disk_write_operations_total', wr_reqs)
+                    ('vm_disk_read_bytes_total', rd_bytes),
+                    ('vm_disk_write_bytes_total', wr_bytes),
+                    ('vm_disk_read_operations_total', rd_reqs),
+                    ('vm_disk_write_operations_total', wr_reqs)
                 ]
 
                 if rd_time_ns > 0:
-                    disk_metrics.append(('kvm_disk_read_time_nanoseconds_total', rd_time_ns))
+                    disk_metrics.append(('vm_disk_read_time_nanoseconds_total', rd_time_ns))
                 if wr_time_ns > 0:
-                    disk_metrics.append(('kvm_disk_write_time_nanoseconds_total', wr_time_ns))
+                    disk_metrics.append(('vm_disk_write_time_nanoseconds_total', wr_time_ns))
                 if flush_reqs > 0:
-                    disk_metrics.append(('kvm_disk_flush_operations_total', flush_reqs))
+                    disk_metrics.append(('vm_disk_flush_operations_total', flush_reqs))
                 if flush_time_ns > 0:
-                    disk_metrics.append(('kvm_disk_flush_time_nanoseconds_total', flush_time_ns))
+                    disk_metrics.append(('vm_disk_flush_time_nanoseconds_total', flush_time_ns))
 
                 for metric_name, value in disk_metrics:
                     self._safe_append(data, metric_name, value, device_labels)
@@ -215,14 +215,14 @@ class KVMCollector:
                 device_labels = {**labels, 'device': iface}
 
                 network_metrics = [
-                    ('kvm_network_receive_bytes_total', rx_bytes),
-                    ('kvm_network_transmit_bytes_total', tx_bytes),
-                    ('kvm_network_receive_packets_total', rx_packets),
-                    ('kvm_network_transmit_packets_total', tx_packets),
-                    ('kvm_network_receive_drops_total', rx_drops),
-                    ('kvm_network_transmit_drops_total', tx_drops),
-                    ('kvm_network_receive_errors_total', rx_errs),
-                    ('kvm_network_transmit_errors_total', tx_errs)
+                    ('vm_network_receive_bytes_total', rx_bytes),
+                    ('vm_network_transmit_bytes_total', tx_bytes),
+                    ('vm_network_receive_packets_total', rx_packets),
+                    ('vm_network_transmit_packets_total', tx_packets),
+                    ('vm_network_receive_drops_total', rx_drops),
+                    ('vm_network_transmit_drops_total', tx_drops),
+                    ('vm_network_receive_errors_total', rx_errs),
+                    ('vm_network_transmit_errors_total', tx_errs)
                 ]
 
                 for metric_name, value in network_metrics:
@@ -239,11 +239,11 @@ class KVMCollector:
             state_num = int(dom.state()[0])
             state = STATE_MAP.get(state_num, str(state_num))
 
-            labels = {'vm_uuid': uuid, 'vm_name': name}
+            labels = {'vm_uuid': uuid, 'vm_name': name, 'hypervisor': 'qemu'}
 
-            self._safe_append(data, 'kvm_vm_info', 1, {**labels, 'state': state})
-            self._safe_append(data, 'kvm_vm_state_code', state_num, labels)
-            self._safe_append(data, 'kvm_vm_uptime_seconds_total', self._get_vm_uptime(dom), labels)
+            self._safe_append(data, 'vm_info', 1, {**labels, 'state': state})
+            self._safe_append(data, 'vm_state_code', state_num, labels)
+            self._safe_append(data, 'vm_uptime_seconds_total', self._get_vm_uptime(dom), labels)
 
             # Only collect detailed metrics if VM is running
             if state_num == 1:  # running
@@ -272,13 +272,13 @@ class KVMCollector:
             try:
                 info = self.conn.getInfo()
                 if info:
-                    hypervisor_labels = {'hypervisor': 'kvm'}
-                    self._safe_append(data, 'kvm_hypervisor_vcpus_total', info[2], hypervisor_labels)
-                    self._safe_append(data, 'kvm_hypervisor_memory_bytes', info[1] * 1024 * 1024, hypervisor_labels)
-                    self._safe_append(data, 'kvm_hypervisor_domains_total', len(doms), hypervisor_labels)
+                    hypervisor_labels = {'hypervisor': 'qemu'}
+                    self._safe_append(data, 'hypervisor_vcpus_total', info[2], hypervisor_labels)
+                    self._safe_append(data, 'hypervisor_memory_bytes', info[1] * 1024 * 1024, hypervisor_labels)
+                    self._safe_append(data, 'hypervisor_domains_total', len(doms), hypervisor_labels)
 
                     running_count = sum(1 for d in doms if d.state()[0] == 1)
-                    self._safe_append(data, 'kvm_hypervisor_domains_running', running_count, hypervisor_labels)
+                    self._safe_append(data, 'hypervisor_domains_running', running_count, hypervisor_labels)
             except Exception as e:
                 log(f"Error collecting hypervisor metrics: {e}", 'debug')
 
@@ -300,9 +300,9 @@ class KVMCollector:
             self.conn = None
 
 
-@debug('kvm_metrics')
-def kvm_metrics(uri="qemu:///system"):
-    collector = KVMCollector(uri)
+@debug('qemu_metrics')
+def qemy_metrics(uri="qemu:///system"):
+    collector = QEMUCollector(uri)
     try:
         return collector.collect()
     finally:

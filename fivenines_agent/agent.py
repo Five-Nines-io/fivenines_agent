@@ -31,7 +31,7 @@ from fivenines_agent.files import file_handles_used, file_handles_limit
 from fivenines_agent.redis import redis_metrics
 from fivenines_agent.nginx import nginx_metrics
 from fivenines_agent.docker import docker_metrics
-from fivenines_agent.kvm import kvm_metrics
+from fivenines_agent.qemu import qemu_metrics
 from fivenines_agent.synchronizer import Synchronizer
 from fivenines_agent.synchronization_queue import SynchronizationQueue
 from fivenines_agent.ports import listening_ports
@@ -148,8 +148,8 @@ class Agent:
                     data['nginx'] = nginx_metrics(**self.config['nginx'])
                 if self.config.get('docker'):
                     data['docker'] = docker_metrics(**self.config['docker'])
-                if self.config.get('kvm'):
-                    data['kvm'] = kvm_metrics(**self.config['kvm'])
+                if self.config.get('qemu'):
+                    data['qemu'] = qemu_metrics(**self.config['qemu'])
 
                 # Running time and enqueue
                 running_time = time.monotonic() - start
