@@ -70,6 +70,7 @@ class QEMUCollector:
         except Exception as e:
             log(f"Error appending metric {metric_name}: {e}", 'error')
 
+
     def _collect_cpu_metrics(self, dom, labels, data):
         vcpus = max(1, int(dom.maxVcpus()))
         total_cpu_time_ns = 0
@@ -77,7 +78,9 @@ class QEMUCollector:
 
         # Try per-vCPU stats via getCPUStats(False)
         try:
+            print("getCPUStats(False) start")
             per_vcpu = dom.getCPUStats(False) or []
+            print("getCPUStats(False) end")
             if per_vcpu:
                 per_vcpu_ok = True
                 for idx, row in enumerate(per_vcpu):
@@ -95,7 +98,9 @@ class QEMUCollector:
         # Fallback: per-vCPU via dom.vcpus()
         if not per_vcpu_ok:
             try:
+                print("vcpus() start")
                 vinfo = dom.vcpus()
+                print("vcpus() end")
                 cpuinfo_list = vinfo[0] if isinstance(vinfo, tuple) else vinfo
                 if cpuinfo_list:
                     per_vcpu_ok = True
