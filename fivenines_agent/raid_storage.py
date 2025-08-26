@@ -2,8 +2,7 @@ import subprocess
 import time
 import re
 
-from fivenines_agent.env import debug_mode
-from fivenines_agent.debug import debug
+from fivenines_agent.debug import debug, log
 
 _raid_cache = {
     "timestamp": 0,
@@ -31,8 +30,7 @@ def get_mdadm_version():
 
         return result.stdout.split('\n')[0].strip()
     except Exception as e:
-        if debug_mode:
-            print('Error fetching mdadm version: ', e)
+        log(f"Error fetching mdadm version: {e}", 'error')
         return None
 
 def list_raid_devices():
@@ -47,8 +45,7 @@ def list_raid_devices():
                 device = '/dev/' + line.split()[0]
                 devices.append(device)
     except Exception as e:
-        if debug_mode:
-            print('Error reading /proc/mdstat: ', e)
+        log(f"Error reading /proc/mdstat: {e}", 'error')
     return devices
 
 def _parse_size_with_units(size_str):
@@ -208,8 +205,7 @@ def get_raid_info(device):
         return raid_info
 
     except Exception as e:
-        if debug_mode:
-            print(f'Error fetching RAID info for device {device}: {e}')
+        log(f"Error fetching RAID info for device {device}: {e}", 'error')
         return None
 
 def _parse_device_table(table_lines):
@@ -256,16 +252,14 @@ def raid_storage_health():
         return _raid_cache["data"]
 
     if not mdadm_available():
-        if debug_mode:
-            print("mdadm not installed")
+        log("mdadm not installed", 'error')
         data = []
     else:
         mdadm_version = get_mdadm_version()
 
         devices = list_raid_devices()
         if not devices:
-            if debug_mode:
-                print("No RAID devices found")
+            log("No RAID devices found", 'error')
             data = []
         else:
             data = [get_raid_info(dev) for dev in devices]
