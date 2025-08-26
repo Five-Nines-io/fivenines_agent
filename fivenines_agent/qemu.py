@@ -308,12 +308,12 @@ class QEMUCollector:
                 info = self.conn.getInfo()
                 if info:
                     hypervisor_labels = {'hypervisor': 'kvm'}
-                    self._safe_append(data, 'vm_hypervisor_vcpus_total', info[2], hypervisor_labels)
-                    self._safe_append(data, 'vm_hypervisor_memory_bytes', info[1] * 1024 * 1024, hypervisor_labels)
-                    self._safe_append(data, 'vm_hypervisor_domains_total', len(doms), hypervisor_labels)
+                    self._safe_append(data, 'hypervisor_vcpus_total', info[2], hypervisor_labels)
+                    self._safe_append(data, 'hypervisor_memory_bytes', info[1] * 1024 * 1024, hypervisor_labels)
+                    self._safe_append(data, 'hypervisor_domains_total', len(doms), hypervisor_labels)
 
                     running_count = sum(1 for d in doms if d.state()[0] == 1)
-                    self._safe_append(data, 'vm_hypervisor_domains_running', running_count, hypervisor_labels)
+                    self._safe_append(data, 'hypervisor_domains_running', running_count, hypervisor_labels)
             except Exception as e:
                 log(f"Error collecting hypervisor metrics: {e}", 'debug')
 
