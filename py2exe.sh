@@ -116,6 +116,12 @@ poetry run pyinstaller \
     --add-binary "/usr/local/openssl/lib/libcrypto.so.1.1:." \
     --add-binary "/usr/lib64/libcrypt.so.1:." \
     --add-binary "/usr/lib64/libz.so.1:." \
+    --add-binary "/usr/lib64/libvirt.so.0:." \
+    --add-binary "/usr/lib64/libvirt-qemu.so.0:." \
+    --add-binary "/usr/lib64/libvirt-lxc.so.0:." \
+    --add-binary "/usr/lib64/libxml2.so.2:." \
+    --add-binary "/usr/lib64/libnuma.so.1:." \
+    --add-binary "/usr/lib64/libsystemd.so.0:." \
     ./py2exe_entrypoint.py || {
     echo "PyInstaller failed. Exiting."
     exit 1
