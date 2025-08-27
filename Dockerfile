@@ -1,36 +1,17 @@
-# Base image
-FROM centos:7
+FROM quay.io/pypa/manylinux_2_34_x86_64
 
-# Replace default YUM repositories with CentOS Vault
-RUN rm -rf /etc/yum.repos.d/* && \
-    echo -e "[base]\n\
-name=CentOS-7 - Base\n\
-baseurl=http://vault.centos.org/7.9.2009/os/x86_64/\n\
-enabled=1\n\
-gpgcheck=1\n\
-gpgkey=http://vault.centos.org/7.9.2009/os/x86_64/RPM-GPG-KEY-CentOS-7\n\n\
-[updates]\n\
-name=CentOS-7 - Updates\n\
-baseurl=http://vault.centos.org/7.9.2009/updates/x86_64/\n\
-enabled=1\n\
-gpgcheck=1\n\
-gpgkey=http://vault.centos.org/7.9.2009/os/x86_64/RPM-GPG-KEY-CentOS-7\n\n\
-[extras]\n\
-name=CentOS-7 - Extras\n\
-baseurl=http://vault.centos.org/7.9.2009/extras/x86_64/\n\
-enabled=1\n\
-gpgcheck=1\n\
-gpgkey=http://vault.centos.org/7.9.2009/os/x86_64/RPM-GPG-KEY-CentOS-7\n" > /etc/yum.repos.d/CentOS-Vault.repo && \
-    yum clean all && \
-    yum makecache fast
-
-# Install development tools and required dependencies
-RUN yum groupinstall -y "Development Tools" && \
-    yum install -y wget gcc gcc-c++ make zlib-devel bzip2 bzip2-devel \
-        xz-devel libffi-devel ncurses-devel sqlite sqlite-devel \
-        openssl openssl-devel tk-devel gdbm-devel libuuid-devel \
-        libnsl2-devel libtirpc-devel readline-devel uuid-devel tar && \
+RUN yum install -y libvirt-devel && \
     yum clean all
+
+# Use manylinux2014 for better compatibility with CentOS 7 systems
+FROM quay.io/pypa/manylinux2014_x86_64
+
+RUN yum install -y wget curl tar bzip2 xz which \
+        openssl11 openssl11-devel zlib-devel bzip2-devel xz-devel libffi-devel \
+        ncurses-devel sqlite-devel tk-devel gdbm-devel libuuid-devel \
+        readline-devel && \
+    yum clean all
+
 
 # Build OpenSSL from source
 RUN curl -LO https://www.openssl.org/source/openssl-1.1.1u.tar.gz && \
@@ -43,7 +24,6 @@ RUN curl -LO https://www.openssl.org/source/openssl-1.1.1u.tar.gz && \
     echo "/usr/local/openssl/lib" > /etc/ld.so.conf.d/openssl.conf && ldconfig
 
 # Build Python from source
-
 RUN curl -O https://www.python.org/ftp/python/3.10.12/Python-3.10.12.tgz && \
     tar -xzf Python-3.10.12.tgz && \
     cd Python-3.10.12 && \
@@ -64,8 +44,37 @@ RUN curl -O https://www.python.org/ftp/python/3.10.12/Python-3.10.12.tgz && \
 # Add Python shared library path
 ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/openssl/lib:$LD_LIBRARY_PATH"
 
-# Verify Python installation and SSL
-RUN python3 -c "import ssl; print(ssl.OPENSSL_VERSION)"
+# Copy libvirt libraries from the manylinux_2_34_x86_64 stage
+COPY --from=0 /usr/lib64/libvirt.so* /usr/lib64/
+COPY --from=0 /usr/lib64/libvirt-qemu.so* /usr/lib64/
+COPY --from=0 /usr/lib64/libvirt-lxc.so* /usr/lib64/
+
+COPY --from=0 /usr/include/libvirt/libvirt-common.h /usr/include/libvirt/libvirt-common.h
+COPY --from=0 /usr/include/libvirt/libvirt.h /usr/include/libvirt/libvirt.h
+COPY --from=0 /usr/include/libvirt/libvirt-secret.h /usr/include/libvirt/libvirt-secret.h
+COPY --from=0 /usr/include/libvirt/libvirt-domain-snapshot.h /usr/include/libvirt/libvirt-domain-snapshot.h
+COPY --from=0 /usr/include/libvirt/libvirt-domain.h /usr/include/libvirt/libvirt-domain.h
+COPY --from=0 /usr/include/libvirt/libvirt-event.h /usr/include/libvirt/libvirt-event.h
+COPY --from=0 /usr/include/libvirt/libvirt-nodedev.h /usr/include/libvirt/libvirt-nodedev.h
+
+COPY --from=0 /usr/include/libvirt/libvirt-lxc.h /usr/include/libvirt/libvirt-lxc.h
+COPY --from=0 /usr/include/libvirt/libvirt-host.h /usr/include/libvirt/libvirt-host.h
+COPY --from=0 /usr/include/libvirt/libvirt-domain-checkpoint.h /usr/include/libvirt/libvirt-domain-checkpoint.h
+COPY --from=0 /usr/include/libvirt/libvirt-storage.h /usr/include/libvirt/libvirt-storage.h
+COPY --from=0 /usr/include/libvirt/libvirt-stream.h /usr/include/libvirt/libvirt-stream.h
+COPY --from=0 /usr/include/libvirt/libvirt-nwfilter.h /usr/include/libvirt/libvirt-nwfilter.h
+COPY --from=0 /usr/include/libvirt/libvirt-interface.h /usr/include/libvirt/libvirt-interface.h
+COPY --from=0 /usr/include/libvirt/libvirt-qemu.h /usr/include/libvirt/libvirt-qemu.h
+COPY --from=0 /usr/include/libvirt/libvirt-network.h /usr/include/libvirt/libvirt-network.h
+COPY --from=0 /usr/include/libvirt/libvirt-admin.h /usr/include/libvirt/libvirt-admin.h
+
+
+COPY --from=0 /usr/lib64/libvirt.so* /usr/lib64/
+COPY --from=0 /usr/lib64/libvirt-qemu.so* /usr/lib64/
+COPY --from=0 /usr/lib64/libvirt-lxc.so* /usr/lib64/
+
+# Verify Python installation
+RUN python3 --version
 
 ENV TARGET_ARCH="amd64"
 # Set working directory

@@ -51,7 +51,7 @@ class Agent:
         signal.signal(signal.SIGINT,  self._on_signal)
         signal.signal(signal.SIGHUP,  self._on_signal)
 
-        self.version = '1.1.5'
+        self.version = '1.2.0'
         log(f'fivenines agent v{self.version}')
 
         # Load token

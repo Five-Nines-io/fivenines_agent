@@ -25,11 +25,15 @@ else
     BINARY_NAME="fivenines-agent-linux-amd64"
 fi
 
+
+# Verify libvirt library
+ls -la /usr/lib64/libvirt.so*
+
 #
 # Install and enable virtualenv
 #
 echo "Installing and enabling virtualenv"
-python3 -m pip install --user virtualenv || {
+python3 -m pip install virtualenv || {
     echo "Failed to install virtualenv. Exiting."
     exit 1
 }
@@ -78,7 +82,7 @@ fi
 # Install Poetry and dependencies
 #
 echo "Installing Poetry and dependencies"
-python3 -m pip install poetry==1.8.4 || {
+python3 -m pip install --verbose poetry==1.8.4 || {
     echo "Failed to install Poetry. Exiting."
     exit 1
 }
@@ -87,22 +91,15 @@ python3 -m pip install poetry==1.8.4 || {
 echo "Configuring Poetry to avoid creating separate environments"
 poetry config virtualenvs.create false
 
-# Remove any existing libvirt-python and install correct version
-echo "Ensuring correct libvirt-python version"
-python3 -m pip uninstall -y libvirt-python 2>/dev/null || true
-python3 -m pip install --no-cache-dir libvirt-python==11.6.0 || {
-    echo "Failed to install libvirt-python. Exiting."
-    exit 1
-}
-
-# Verify the version we just installed
-echo "Verifying libvirt-python version:"
-python3 -c "import libvirt; print('libvirt version:', libvirt.getVersion())"
-
-poetry install --no-interaction || {
+poetry install --no-interaction --verbose || {
     echo "Poetry installation failed. Exiting."
     exit 1
 }
+
+echo "Verifying libvirt-python version:"
+python3 -c "import libvirt; print('libvirt version:', libvirt.getVersion())"
+echo "Checking system libvirt library:"
+
 
 # Export dependencies to requirements.txt
 echo "Exporting dependencies to requirements.txt"
@@ -118,41 +115,34 @@ echo "Building the executable for $TARGET_ARCH"
 mkdir -p build dist/linux
 
 # Verify which libvirt module PyInstaller will find
-echo "Checking libvirt module path:"
-python3 -c "import libvirt; print('libvirt module path:', libvirt.__file__); print('libvirt version:', libvirt.getVersion())"
+# echo "Checking libvirt module path:"
+# python3 -c "import libvirt; print('libvirt module path:', libvirt.__file__); print('libvirt version:', libvirt.getVersion())"
 
-poetry run pyinstaller \
-    --noconfirm \
-    --onefile \
-    --name $BINARY_NAME \
-    --workpath ./build/tmp \
-    --distpath ./build \
-    --dist dist/linux \
-    --clean \
-    --hidden-import=libvirt \
-    --hidden-import=libvirtmod \
-    --add-binary "/usr/local/openssl/lib/libssl.so:." \
-    --add-binary "/usr/local/openssl/lib/libcrypto.so.1.1:." \
-    --add-binary "/usr/lib64/libcrypt.so.1:." \
-    --add-binary "/usr/lib64/libz.so.1:." \
-    --add-binary "/usr/lib64/libvirt.so.0:." \
-    --add-binary "/usr/lib64/libvirt-qemu.so.0:." \
-    --add-binary "/usr/lib64/libvirt-lxc.so.0:." \
-    --add-binary "/usr/lib64/libxml2.so.2:." \
-    --add-binary "/usr/lib64/libnuma.so.1:." \
-    --add-binary "/usr/lib64/libsystemd.so.0:." \
-    ./py2exe_entrypoint.py || {
-    echo "PyInstaller failed. Exiting."
-    exit 1
-}
+# # Set runtime library path environment for the binary to find bundled libraries
+# export LDFLAGS="-Wl,-rpath,./lib -Wl,-rpath,\$ORIGIN/lib"
 
-#
-# Clean up
-#
-echo "Cleaning up build files"
-rm -rf ./build/tmp ./build/*.spec
+# poetry run pyinstaller \
+#     --noconfirm \
+#     --onefile \
+#     --name $BINARY_NAME \
+#     --workpath ./build/tmp \
+#     --distpath ./build \
+#     --dist dist/linux \
+#     --clean \
+#     --hidden-import=libvirt \
+#     --hidden-import=libvirtmod \
+#     ./py2exe_entrypoint.py || {
+#     echo "PyInstaller failed. Exiting."
+#     exit 1
+# }
 
-# Reset Poetry's configuration
-echo "Resetting environment"
-poetry config virtualenvs.create true
-deactivate
+# #
+# # Clean up
+# #
+# echo "Cleaning up build files"
+# rm -rf ./build/tmp ./build/*.spec
+
+# # Reset Poetry's configuration
+# echo "Resetting environment"
+# poetry config virtualenvs.create true
+# deactivate
