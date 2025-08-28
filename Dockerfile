@@ -10,6 +10,8 @@ RUN yum install -y \
     make \
     pkgconfig \
     wget \
+    unzip \
+    python3 \
     libxml2-devel \
     gnutls-devel \
     device-mapper-devel \
@@ -17,37 +19,40 @@ RUN yum install -y \
     yajl-devel \
     libnl3-devel \
     libxslt \
+    libtirpc-devel \
     && yum clean all
 
-# Install libvirt 4.5.0 from source (has good RSS support, CentOS 7 compatible)
+# Install libvirt 6.10.0 from source (has cgroup V2 and RSS support, still CentOS 7 compatible)
 RUN cd /tmp && \
-    echo "Building libvirt 4.5.0 with RSS support..." && \
-    wget https://libvirt.org/sources/libvirt-4.5.0.tar.xz && \
-    tar xf libvirt-4.5.0.tar.xz && \
-    mkdir libvirt-build && \
-    cd libvirt-build && \
-    ../libvirt-4.5.0/configure \
+    echo "Building libvirt 6.10.0 with cgroup V2 and RSS support..." && \
+    # Use Python 3.9 from manylinux and install Meson and Ninja build system
+    /opt/python/cp39-cp39/bin/python3.9 -m pip install meson ninja docutils && \
+    export PATH="/opt/python/cp39-cp39/bin:$PATH" && \
+    wget https://libvirt.org/sources/libvirt-6.10.0.tar.xz && \
+    tar xf libvirt-6.10.0.tar.xz && \
+    cd libvirt-6.10.0 && \
+    meson setup builddir \
         --prefix=/usr \
         --localstatedir=/var \
         --sysconfdir=/etc \
-        --without-qemu \
-        --without-lxc \
-        --without-openvz \
-        --without-vmware \
-        --without-vbox \
-        --without-libxl \
-        --without-vz \
-        --without-bhyve \
-        --without-hyperv \
-        --disable-dependency-tracking \
-        --enable-shared \
-        --disable-static && \
-    make -j$(nproc) && \
-    make install && \
+        -Ddriver_qemu=disabled \
+        -Ddriver_lxc=disabled \
+        -Ddriver_openvz=disabled \
+        -Ddriver_vmware=disabled \
+        -Ddriver_vbox=disabled \
+        -Ddriver_libxl=disabled \
+        -Ddriver_vz=disabled \
+        -Ddriver_bhyve=disabled \
+        -Ddriver_hyperv=disabled \
+        -Dtests=disabled \
+        -Dbuildtype=release \
+        --default-library=shared && \
+    ninja -C builddir && \
+    ninja -C builddir install && \
     echo "/usr/lib64" > /etc/ld.so.conf.d/libvirt.conf && \
     echo "/usr/lib" >> /etc/ld.so.conf.d/libvirt.conf && \
     ldconfig && \
-    cd / && rm -rf /tmp/libvirt-4.5.0* /tmp/libvirt-build
+    cd / && rm -rf /tmp/libvirt-6.10.0* /tmp/meson* /tmp/ninja*
 
 # Find and set up the best available Python version from manylinux2014
 RUN echo "Setting up Python from manylinux2014..." && \

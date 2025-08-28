@@ -34,10 +34,10 @@ echo "Python executable path: $(which python)"
 echo "Python version: $(python --version)"
 echo "Pip version: $(python -m pip --version)"
 
-# Verify libvirt library (should be our custom built one)
+# Verify libvirt library (should be our custom built libvirt 6.10.0)
 echo "=== Libvirt Environment Check ==="
 echo "Checking for libvirt libraries:"
-ls -la /usr/local/lib64/libvirt.so* 2>/dev/null || echo "Custom libvirt not found"
+ls -la /usr/lib64/libvirt.so* 2>/dev/null || echo "Custom libvirt not found"
 ls -la /usr/lib64/libvirt.so* 2>/dev/null || echo "System libvirt not found"
 echo "PKG_CONFIG_PATH: $PKG_CONFIG_PATH"
 echo "libvirt version: $(pkg-config --modversion libvirt 2>/dev/null || echo 'not found')"
@@ -187,9 +187,12 @@ if [ ! -f "$LIBPYTHON_PATH" ]; then
         --disable-test-modules \
         --prefix=/tmp/python-shared \
         --quiet \
-        --disable-ipv6 \
         --without-ensurepip \
-        --without-static-libpython || {
+        --without-static-libpython \
+        --with-system-ffi \
+        --enable-loadable-sqlite-extensions \
+        ac_cv_working_openssl_hashlib_md5=yes \
+        ac_cv_working_openssl_ssl=yes || {
         echo "Python configure failed"
         exit 1
     }
@@ -201,9 +204,24 @@ if [ ! -f "$LIBPYTHON_PATH" ]; then
         exit 1
     }
     
-    # Verify the shared library was created
+    # Verify the shared library was created and check its dependencies
     if [ -f "libpython3.9.so" ]; then
         echo "Successfully built libpython3.9.so"
+        echo "Checking shared library dependencies:"
+        ldd libpython3.9.so || echo "ldd check failed"
+        
+        # Check if it depends on libcrypt.so.2
+        if ldd libpython3.9.so | grep -q "libcrypt.so.2"; then
+            echo "WARNING: libpython3.9.so depends on libcrypt.so.2"
+            echo "Available libcrypt libraries:"
+            find /lib64 /usr/lib64 -name "libcrypt*" 2>/dev/null || echo "No libcrypt found"
+            
+            # Try to create a compatibility link if libcrypt.so.1 exists
+            if [ -f "/lib64/libcrypt.so.1" ]; then
+                echo "Creating libcrypt.so.2 compatibility link"
+                ln -sf /lib64/libcrypt.so.1 /lib64/libcrypt.so.2
+            fi
+        fi
         
         # Copy to the expected location
         cp libpython3.9.so "$LIBPYTHON_PATH"
@@ -300,4 +318,4 @@ deactivate
 echo "✅ Build completed successfully!"
 echo "Binary location: ./dist/linux/$BINARY_NAME"
 echo ""
-echo "The binary should be compatible with CentOS 7 and include RSS support."
+echo "The binary should be compatible with CentOS 7 and include libvirt 6.10.0 with cgroup V2 and RSS support."
