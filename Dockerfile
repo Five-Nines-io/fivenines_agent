@@ -1,58 +1,107 @@
-FROM quay.io/pypa/manylinux_2_28_x86_64
+FROM quay.io/pypa/manylinux2014_x86_64
 
-# Install system packages
+# manylinux2014 is specifically built for CentOS 7 compatibility (glibc 2.17)
+# This avoids all the CentOS 7 EOL repository issues
+
+# Install system packages for building libvirt
 RUN yum install -y \
-    libvirt-devel \
     gcc \
     gcc-c++ \
     make \
     pkgconfig \
+    wget \
+    libxml2-devel \
+    gnutls-devel \
+    device-mapper-devel \
+    libpciaccess-devel \
+    yajl-devel \
+    libnl3-devel \
+    libxslt \
     && yum clean all
 
-# Find Python 3.11 installation and set it up
-RUN echo "=== Finding Python 3.11 ===" && \
-    PYTHON_311_PATH="" && \
-    for pydir in /opt/python/cp311*; do \
-        if [ -d "$pydir" ] && [ -f "$pydir/bin/python" ]; then \
-            version=$($pydir/bin/python --version 2>&1 | grep "3.11" || true); \
-            if [ -n "$version" ]; then \
-                PYTHON_311_PATH="$pydir"; \
-                echo "Found Python 3.11 at: $pydir"; \
-                echo "Version: $version"; \
-                break; \
+# Install libvirt 4.5.0 from source (has good RSS support, CentOS 7 compatible)
+RUN cd /tmp && \
+    echo "Building libvirt 4.5.0 with RSS support..." && \
+    wget https://libvirt.org/sources/libvirt-4.5.0.tar.xz && \
+    tar xf libvirt-4.5.0.tar.xz && \
+    mkdir libvirt-build && \
+    cd libvirt-build && \
+    ../libvirt-4.5.0/configure \
+        --prefix=/usr/local \
+        --without-qemu \
+        --without-lxc \
+        --without-openvz \
+        --without-vmware \
+        --without-vbox \
+        --without-libxl \
+        --without-vz \
+        --without-bhyve \
+        --without-hyperv \
+        --disable-dependency-tracking \
+        --enable-shared \
+        --disable-static && \
+    make -j$(nproc) && \
+    make install && \
+    echo "/usr/local/lib64" > /etc/ld.so.conf.d/libvirt.conf && \
+    echo "/usr/local/lib" >> /etc/ld.so.conf.d/libvirt.conf && \
+    ldconfig && \
+    cd / && rm -rf /tmp/libvirt-4.5.0* /tmp/libvirt-build
+
+# Find and set up the best available Python version from manylinux2014
+RUN echo "Setting up Python from manylinux2014..." && \
+    PYTHON_PATH="" && \
+    # Try different Python versions in order of preference for this base
+    for version in cp39 cp38 cp37; do \
+        for pydir in /opt/python/${version}*; do \
+            if [ -d "$pydir" ] && [ -f "$pydir/bin/python" ]; then \
+                PYTHON_PATH="$pydir"; \
+                echo "Found Python at: $pydir"; \
+                $pydir/bin/python --version; \
+                break 2; \
             fi; \
-        fi; \
+        done; \
     done && \
-    if [ -z "$PYTHON_311_PATH" ]; then \
-        echo "Python 3.11 not found in /opt/python/"; \
+    if [ -z "$PYTHON_PATH" ]; then \
+        echo "No suitable Python found in:"; \
+        ls -la /opt/python/; \
         exit 1; \
     fi && \
-    echo "PYTHON_311_PATH=$PYTHON_311_PATH" > /etc/python_path
+    echo "PYTHON_PATH=$PYTHON_PATH" > /etc/python_path && \
+    echo "export PATH=\"$PYTHON_PATH/bin:\$PATH\"" >> /etc/profile && \
+    echo "export PKG_CONFIG_PATH=\"/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:\$PKG_CONFIG_PATH\"" >> /etc/profile && \
+    ln -sf $PYTHON_PATH/bin/python /usr/local/bin/python && \
+    ln -sf $PYTHON_PATH/bin/pip /usr/local/bin/pip
 
-# Set up environment and symlinks
-RUN PYTHON_311_PATH=$(cat /etc/python_path | cut -d= -f2) && \
-    echo "Setting up Python 3.11 from: $PYTHON_311_PATH" && \
-    echo "export PATH=\"$PYTHON_311_PATH/bin:\$PATH\"" >> /etc/profile && \
-    echo "export PYTHON_ROOT=\"$PYTHON_311_PATH\"" >> /etc/profile && \
-    ln -sf $PYTHON_311_PATH/bin/python /usr/local/bin/python3 && \
-    ln -sf $PYTHON_311_PATH/bin/python /usr/local/bin/python && \
-    ln -sf $PYTHON_311_PATH/bin/pip /usr/local/bin/pip3 && \
-    ln -sf $PYTHON_311_PATH/bin/pip /usr/local/bin/pip
+# Configure libcrypt path for PyInstaller compatibility
+RUN echo "=== Configuring libcrypt for PyInstaller ===" && \
+    # Add /usr/local/lib to library search path
+    echo "/usr/local/lib" >> /etc/ld.so.conf.d/libcrypt.conf && \
+    # Create symlinks in standard locations for PyInstaller
+    ln -sf /usr/local/lib/libcrypt.so.1 /usr/lib64/libcrypt.so.1 && \
+    ln -sf /usr/local/lib/libcrypt.so.2 /usr/lib64/libcrypt.so.2 && \
+    # Update library cache
+    ldconfig && \
+    echo "libcrypt configuration complete" && \
+    ls -la /usr/lib64/libcrypt.so*
 
-# Source the profile to set PATH
+# Set environment variables
 ENV BASH_ENV=/etc/profile
-RUN . /etc/profile && \
-    python --version && \
-    python -m pip install --upgrade pip
+ENV PKG_CONFIG_PATH="/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:/usr/lib64/pkgconfig"
+ENV PATH="/usr/local/bin:$PATH"
 
-# Verify Python.h is available
+# Comprehensive verification
 RUN . /etc/profile && \
-    echo "=== Python installation details ===" && \
-    python -c "import sys; print('Python executable:', sys.executable)" && \
-    python -c "import sysconfig; print('Include path:', sysconfig.get_path('include'))" && \
-    PYTHON_311_PATH=$(cat /etc/python_path | cut -d= -f2) && \
-    find $PYTHON_311_PATH -name "Python.h" && \
-    echo "Python 3.11 setup complete!"
+    echo "=== Build Environment Verification ===" && \
+    echo "Base: manylinux2014 (CentOS 7 compatible - glibc 2.17)" && \
+    echo "Host glibc: $(ldd --version | head -n1)" && \
+    echo "Python version: $(python --version)" && \
+    echo "Python path: $(which python)" && \
+    echo "libvirt version: $(pkg-config --modversion libvirt)" && \
+    echo "libvirt libs: $(pkg-config --libs libvirt)" && \
+    python -c "import sysconfig; print('Python include path:', sysconfig.get_path('include'))" && \
+    PYTHON_PATH=$(cat /etc/python_path | cut -d= -f2) && \
+    find $PYTHON_PATH -name "Python.h" | head -1 && \
+    echo "manylinux2014 + libvirt 4.5.0 setup complete - should have RSS support and CentOS 7 compatibility!"
 
 ENV TARGET_ARCH="amd64"
 WORKDIR /workspace
