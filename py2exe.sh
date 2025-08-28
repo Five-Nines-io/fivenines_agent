@@ -271,7 +271,15 @@ PYTHON_LIB=$(find /opt/python/cp39-cp39/lib -name "libpython3.9.so*" -type f | h
 if [ -n "$PYTHON_LIB" ]; then
     echo "Found Python library: $PYTHON_LIB"
     poetry run pyinstaller \
-        --noconfirm \
+    	--strip \
+    	--optimize=2 \
+    	--exclude-module tkinter \
+    	--exclude-module unittest \
+    	--exclude-module pdb \
+    	--exclude-module doctest \
+    	--exclude-module test \
+    	--exclude-module distutils \
+    	--noconfirm \
         --onefile \
         --name $BINARY_NAME \
         --workpath ./build/tmp \
