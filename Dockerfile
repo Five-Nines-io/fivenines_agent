@@ -27,7 +27,9 @@ RUN cd /tmp && \
     mkdir libvirt-build && \
     cd libvirt-build && \
     ../libvirt-4.5.0/configure \
-        --prefix=/usr/local \
+        --prefix=/usr \
+        --localstatedir=/var \
+        --sysconfdir=/etc \
         --without-qemu \
         --without-lxc \
         --without-openvz \
@@ -42,8 +44,8 @@ RUN cd /tmp && \
         --disable-static && \
     make -j$(nproc) && \
     make install && \
-    echo "/usr/local/lib64" > /etc/ld.so.conf.d/libvirt.conf && \
-    echo "/usr/local/lib" >> /etc/ld.so.conf.d/libvirt.conf && \
+    echo "/usr/lib64" > /etc/ld.so.conf.d/libvirt.conf && \
+    echo "/usr/lib" >> /etc/ld.so.conf.d/libvirt.conf && \
     ldconfig && \
     cd / && rm -rf /tmp/libvirt-4.5.0* /tmp/libvirt-build
 
@@ -68,7 +70,7 @@ RUN echo "Setting up Python from manylinux2014..." && \
     fi && \
     echo "PYTHON_PATH=$PYTHON_PATH" > /etc/python_path && \
     echo "export PATH=\"$PYTHON_PATH/bin:\$PATH\"" >> /etc/profile && \
-    echo "export PKG_CONFIG_PATH=\"/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:\$PKG_CONFIG_PATH\"" >> /etc/profile && \
+    echo "export PKG_CONFIG_PATH=\"/usr/lib64/pkgconfig:/usr/lib/pkgconfig:\$PKG_CONFIG_PATH\"" >> /etc/profile && \
     ln -sf $PYTHON_PATH/bin/python /usr/local/bin/python && \
     ln -sf $PYTHON_PATH/bin/pip /usr/local/bin/pip
 
@@ -86,7 +88,7 @@ RUN echo "=== Configuring libcrypt for PyInstaller ===" && \
 
 # Set environment variables
 ENV BASH_ENV=/etc/profile
-ENV PKG_CONFIG_PATH="/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:/usr/lib64/pkgconfig"
+ENV PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/lib64/pkgconfig"
 ENV PATH="/usr/local/bin:$PATH"
 
 # Comprehensive verification
@@ -98,6 +100,8 @@ RUN . /etc/profile && \
     echo "Python path: $(which python)" && \
     echo "libvirt version: $(pkg-config --modversion libvirt)" && \
     echo "libvirt libs: $(pkg-config --libs libvirt)" && \
+    echo "Checking for libvirt libraries:" && \
+    ls -la /usr/lib64/libvirt.so* 2>/dev/null || echo "libvirt libraries not found" && \
     python -c "import sysconfig; print('Python include path:', sysconfig.get_path('include'))" && \
     PYTHON_PATH=$(cat /etc/python_path | cut -d= -f2) && \
     find $PYTHON_PATH -name "Python.h" | head -1 && \

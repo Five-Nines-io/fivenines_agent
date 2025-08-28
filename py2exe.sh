@@ -262,9 +262,9 @@ if [ -n "$PYTHON_LIB" ]; then
         --hidden-import=libvirt \
         --hidden-import=libvirtmod \
         --add-binary "$PYTHON_LIB:." \
-	--add-binary "/usr/local/lib/libcrypt.so.2:." \
-	--add-binary "/usr/local/lib/libcrypt.so.1:." \
-	./py2exe_entrypoint.py || {
+        --add-binary "/usr/local/lib/libcrypt.so.2:." \
+        --add-binary "/usr/local/lib/libcrypt.so.1:." \
+        ./py2exe_entrypoint.py || {
         echo "PyInstaller failed. Exiting."
         exit 1
     }
