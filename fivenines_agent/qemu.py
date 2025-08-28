@@ -33,9 +33,26 @@ class QEMUCollector:
 
     def _connect(self):
         try:
+            # Log libvirt version and capabilities
+            log(f"libvirt module version: {libvirt.getVersion()}", 'debug')
+
+            # getLibVersion() is available in newer versions
+            try:
+                log(f"libvirt library version: {libvirt.getLibVersion()}", 'debug')
+            except AttributeError:
+                log("libvirt.getLibVersion() not available in this version", 'debug')
+
             self.conn = libvirt.openReadOnly(self.uri)
             if self.conn is None:
                 log("libvirt.openReadOnly returned None", 'error')
+            else:
+                # Log connection info
+                try:
+                    conn_version = self.conn.getVersion()
+                    hypervisor_type = self.conn.getType()
+                    log(f"Connected to {hypervisor_type} version: {conn_version}", 'debug')
+                except Exception as e:
+                    log(f"Error getting connection info: {e}", 'debug')
         except Exception as e:
             log(f"Cannot connect to libvirt at {self.uri}: {e}", 'error')
 
@@ -170,6 +187,10 @@ class QEMUCollector:
     def _collect_memory_metrics(self, dom, labels, data):
         try:
             mem = dom.memoryStats()
+
+            # Log available keys only if RSS is missing (for debugging)
+            if not mem.get('rss'):
+                log(f"RSS metric unavailable. Available keys: {list(mem.keys())}", 'debug')
 
             memory_metrics = [
                 ('vm_memory_assigned_bytes', 'actual'),

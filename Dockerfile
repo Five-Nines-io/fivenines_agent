@@ -1,82 +1,117 @@
-# Base image
-FROM centos:7
+FROM quay.io/pypa/manylinux2014_x86_64
 
-# Replace default YUM repositories with CentOS Vault
-RUN rm -rf /etc/yum.repos.d/* && \
-    echo -e "[base]\n\
-name=CentOS-7 - Base\n\
-baseurl=http://vault.centos.org/7.9.2009/os/x86_64/\n\
-enabled=1\n\
-gpgcheck=1\n\
-gpgkey=http://vault.centos.org/7.9.2009/os/x86_64/RPM-GPG-KEY-CentOS-7\n\n\
-[updates]\n\
-name=CentOS-7 - Updates\n\
-baseurl=http://vault.centos.org/7.9.2009/updates/x86_64/\n\
-enabled=1\n\
-gpgcheck=1\n\
-gpgkey=http://vault.centos.org/7.9.2009/os/x86_64/RPM-GPG-KEY-CentOS-7\n\n\
-[extras]\n\
-name=CentOS-7 - Extras\n\
-baseurl=http://vault.centos.org/7.9.2009/extras/x86_64/\n\
-enabled=1\n\
-gpgcheck=1\n\
-gpgkey=http://vault.centos.org/7.9.2009/os/x86_64/RPM-GPG-KEY-CentOS-7\n" > /etc/yum.repos.d/CentOS-Vault.repo && \
-    yum clean all && \
-    yum makecache fast
+# manylinux2014 is specifically built for CentOS 7 compatibility (glibc 2.17)
+# This avoids all the CentOS 7 EOL repository issues
 
-# Install development tools and required dependencies
-RUN yum --nogpgcheck groupinstall -y "Development Tools" && \
-    yum --nogpgcheck install -y wget gcc gcc-c++ make zlib-devel bzip2 bzip2-devel \
-        xz-devel libffi-devel ncurses-devel sqlite sqlite-devel \
-        openssl openssl-devel tk-devel gdbm-devel libuuid-devel \
-        libnsl2-devel libtirpc-devel readline-devel uuid-devel pkg-config tar && \
-    yum clean all
+# Install system packages for building libvirt
+RUN yum install -y \
+    gcc \
+    gcc-c++ \
+    make \
+    pkgconfig \
+    wget \
+    unzip \
+    python3 \
+    libxml2-devel \
+    gnutls-devel \
+    device-mapper-devel \
+    libpciaccess-devel \
+    yajl-devel \
+    libnl3-devel \
+    libxslt \
+    libtirpc-devel \
+    && yum clean all
 
-# Install libvirt-devel separately with better error handling
-RUN yum --nogpgcheck install -y libvirt-devel || \
-    (echo "First attempt failed, trying with disabled GPG checks for all repos" && \
-     sed -i 's/gpgcheck=1/gpgcheck=0/g' /etc/yum.repos.d/CentOS-Vault.repo && \
-     yum install -y libvirt-devel) && \
-    yum clean all
+# Install libvirt 6.10.0 from source (has cgroup V2 and RSS support, still CentOS 7 compatible)
+RUN cd /tmp && \
+    echo "Building libvirt 6.10.0 with cgroup V2 and RSS support..." && \
+    # Use Python 3.9 from manylinux and install Meson and Ninja build system
+    /opt/python/cp39-cp39/bin/python3.9 -m pip install meson ninja docutils && \
+    export PATH="/opt/python/cp39-cp39/bin:$PATH" && \
+    wget https://libvirt.org/sources/libvirt-6.10.0.tar.xz && \
+    tar xf libvirt-6.10.0.tar.xz && \
+    cd libvirt-6.10.0 && \
+    meson setup builddir \
+        --prefix=/usr \
+        --localstatedir=/var \
+        --sysconfdir=/etc \
+        -Ddriver_qemu=disabled \
+        -Ddriver_lxc=disabled \
+        -Ddriver_openvz=disabled \
+        -Ddriver_vmware=disabled \
+        -Ddriver_vbox=disabled \
+        -Ddriver_libxl=disabled \
+        -Ddriver_vz=disabled \
+        -Ddriver_bhyve=disabled \
+        -Ddriver_hyperv=disabled \
+        -Dtests=disabled \
+        -Dbuildtype=release \
+        --default-library=shared && \
+    ninja -C builddir && \
+    ninja -C builddir install && \
+    echo "/usr/lib64" > /etc/ld.so.conf.d/libvirt.conf && \
+    echo "/usr/lib" >> /etc/ld.so.conf.d/libvirt.conf && \
+    ldconfig && \
+    cd / && rm -rf /tmp/libvirt-6.10.0* /tmp/meson* /tmp/ninja*
 
-# Build OpenSSL from source
-RUN curl -LO https://www.openssl.org/source/openssl-1.1.1u.tar.gz && \
-    tar -xzf openssl-1.1.1u.tar.gz && \
-    cd openssl-1.1.1u && \
-    ./config --prefix=/usr/local/openssl --openssldir=/usr/local/openssl && \
-    make -j$(nproc) && \
-    make install && \
-    cd .. && rm -rf openssl-1.1.1u openssl-1.1.1u.tar.gz && \
-    echo "/usr/local/openssl/lib" > /etc/ld.so.conf.d/openssl.conf && ldconfig
+# Find and set up the best available Python version from manylinux2014
+RUN echo "Setting up Python from manylinux2014..." && \
+    PYTHON_PATH="" && \
+    # Try different Python versions in order of preference for this base
+    for version in cp39 cp38 cp37; do \
+        for pydir in /opt/python/${version}*; do \
+            if [ -d "$pydir" ] && [ -f "$pydir/bin/python" ]; then \
+                PYTHON_PATH="$pydir"; \
+                echo "Found Python at: $pydir"; \
+                $pydir/bin/python --version; \
+                break 2; \
+            fi; \
+        done; \
+    done && \
+    if [ -z "$PYTHON_PATH" ]; then \
+        echo "No suitable Python found in:"; \
+        ls -la /opt/python/; \
+        exit 1; \
+    fi && \
+    echo "PYTHON_PATH=$PYTHON_PATH" > /etc/python_path && \
+    echo "export PATH=\"$PYTHON_PATH/bin:\$PATH\"" >> /etc/profile && \
+    echo "export PKG_CONFIG_PATH=\"/usr/lib64/pkgconfig:/usr/lib/pkgconfig:\$PKG_CONFIG_PATH\"" >> /etc/profile && \
+    ln -sf $PYTHON_PATH/bin/python /usr/local/bin/python && \
+    ln -sf $PYTHON_PATH/bin/pip /usr/local/bin/pip
 
-# Build Python from source
+# Configure libcrypt path for PyInstaller compatibility
+RUN echo "=== Configuring libcrypt for PyInstaller ===" && \
+    # Add /usr/local/lib to library search path
+    echo "/usr/local/lib" >> /etc/ld.so.conf.d/libcrypt.conf && \
+    # Create symlinks in standard locations for PyInstaller
+    ln -sf /usr/local/lib/libcrypt.so.1 /usr/lib64/libcrypt.so.1 && \
+    ln -sf /usr/local/lib/libcrypt.so.2 /usr/lib64/libcrypt.so.2 && \
+    # Update library cache
+    ldconfig && \
+    echo "libcrypt configuration complete" && \
+    ls -la /usr/lib64/libcrypt.so*
 
-RUN curl -O https://www.python.org/ftp/python/3.10.12/Python-3.10.12.tgz && \
-    tar -xzf Python-3.10.12.tgz && \
-    cd Python-3.10.12 && \
-    ./configure --enable-shared \
-                --with-ssl-default-suites=openssl \
-                --with-openssl=/usr/local/openssl \
-                LDFLAGS="-L/usr/local/openssl/lib -L/usr/lib64 -Wl,-rpath,/usr/local/openssl/lib" \
-                CPPFLAGS="-I/usr/local/openssl/include -I/usr/include" \
-                LIBS="-lpthread -ldl" && \
-    make clean && \
-    LD_LIBRARY_PATH=/usr/local/openssl/lib make -j$(nproc) && \
-    make altinstall && \
-    ln -s /usr/local/bin/python3.10 /usr/bin/python3 && \
-    ln -s /usr/local/bin/pip3.10 /usr/bin/pip3 && \
-    cd .. && rm -rf Python-3.10.12 Python-3.10.12.tgz && \
-    echo "/usr/local/lib" > /etc/ld.so.conf.d/python3.conf && ldconfig
+# Set environment variables
+ENV BASH_ENV=/etc/profile
+ENV PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/lib64/pkgconfig"
+ENV PATH="/usr/local/bin:$PATH"
 
-# Add Python shared library path
-ENV LD_LIBRARY_PATH="/usr/local/lib:/usr/local/openssl/lib:$LD_LIBRARY_PATH"
-
-# Verify Python installation and SSL
-RUN python3 -c "import ssl; print(ssl.OPENSSL_VERSION)"
+# Comprehensive verification
+RUN . /etc/profile && \
+    echo "=== Build Environment Verification ===" && \
+    echo "Base: manylinux2014 (CentOS 7 compatible - glibc 2.17)" && \
+    echo "Host glibc: $(ldd --version | head -n1)" && \
+    echo "Python version: $(python --version)" && \
+    echo "Python path: $(which python)" && \
+    echo "libvirt version: $(pkg-config --modversion libvirt)" && \
+    echo "libvirt libs: $(pkg-config --libs libvirt)" && \
+    echo "Checking for libvirt libraries:" && \
+    ls -la /usr/lib64/libvirt.so* 2>/dev/null || echo "libvirt libraries not found" && \
+    python -c "import sysconfig; print('Python include path:', sysconfig.get_path('include'))" && \
+    PYTHON_PATH=$(cat /etc/python_path | cut -d= -f2) && \
+    find $PYTHON_PATH -name "Python.h" | head -1 && \
+    echo "manylinux2014 + libvirt 4.5.0 setup complete - should have RSS support and CentOS 7 compatibility!"
 
 ENV TARGET_ARCH="amd64"
-# Set working directory
 WORKDIR /workspace
-
-# Default command
 CMD ["bash"]
