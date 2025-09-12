@@ -1,39 +1,21 @@
 #!/bin/bash
-# Fivenines Agent Auto-Start Script for UNRAID
-# This script starts the fivenines agent at array startup
+# Fivenines Agent Boot Script for UNRAID
 
-AGENT_PATH="/usr/local/bin/fivenines_agent"
-TOKEN_FILE="/etc/fivenines_agent/TOKEN"
+# Kill any existing instances
+pkill -f "fivenines_agent" 2>/dev/null || true
+
+AGENT_PATH="/boot/config/custom/fivenines_agent/fivenines_agent"
+AGENT_EXEC="/usr/local/bin/fivenines_agent"
 LOG_FILE="/var/log/fivenines-agent.log"
 
-# Check if token file exists
-if [ ! -f "$TOKEN_FILE" ]; then
-    echo "Error: Token file not found at $TOKEN_FILE"
-    exit 1
-fi
-# Check if already running
-if pgrep -f "fivenines_agent" > /dev/null; then
-    echo "Fivenines agent is already running"
-    exit 0
-fi
+cp $AGENT_PATH $AGENT_EXEC
+chmod 755 $AGENT_EXEC
+mkdir -p /etc/fivenines_agent
 
-# Start the agent as fivenines user, fallback to root if needed
-echo "Starting fivenines agent..."
-if id fivenines >/dev/null 2>&1; then
-    su fivenines -s /bin/sh -c "$AGENT_PATH" > "$LOG_FILE" 2>&1 &
-    sleep 2
-    if ! pgrep -f "fivenines_agent" > /dev/null; then
-        echo "Failed to start as fivenines user, running as root..."
-        $AGENT_PATH > "$LOG_FILE" 2>&1 &
-    fi
-else
-    $AGENT_PATH > "$LOG_FILE" 2>&1 &
-fi
+useradd --system --user-group fivenines --shell /bin/false --create-home
 
-if pgrep -f "fivenines_agent" > /dev/null; then
-    echo "Fivenines agent started successfully"
-    echo "Log file: $LOG_FILE"
-else
-    echo "Failed to start fivenines agent"
-    exit 1
-fi
+cp /boot/config/custom/fivenines_agent/TOKEN /etc/fivenines_agent/TOKEN
+chown fivenines:fivenines /etc/fivenines_agent/TOKEN
+chmod 600 /etc/fivenines_agent/TOKEN
+
+su fivenines -s /bin/sh -c "$AGENT_EXEC" > $LOG_FILE 2>&1 &
