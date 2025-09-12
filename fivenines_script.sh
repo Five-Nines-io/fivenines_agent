@@ -2,7 +2,10 @@
 # Fivenines Agent Boot Script for UNRAID
 
 # Kill any existing instances
-pkill -f "fivenines_agent" 2>/dev/null || true
+if ! pgrep -f "fivenines_agent" > /dev/null; then
+  echo "Killing existing fivenines_agent instances"
+  pkill -f "fivenines_agent" 2>/dev/null || true
+fi
 
 AGENT_PATH="/boot/config/custom/fivenines_agent/fivenines_agent"
 AGENT_EXEC="/usr/local/bin/fivenines_agent"
