@@ -14,6 +14,7 @@ def processes():
         'cpu_times',
         'num_threads',
         'status',
+        'io_counters',
     ]
 
     for proc in psutil.process_iter():
