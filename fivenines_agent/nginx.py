@@ -1,8 +1,9 @@
 import os
 import sys
 import traceback
+import requests
 
-from fivenines_agent.debug import debug
+from fivenines_agent.debug import debug, log
 
 
 # This function is used to get the metrics from the NGINX status page.
@@ -22,18 +23,17 @@ from fivenines_agent.debug import debug
 
 @debug('nginx_metrics')
 def nginx_metrics(status_page_url='http://127.0.0.1:8080/nginx_status'):
-    nginx_installed = False
-    if os.system('which nginx > /dev/null') == 0:
-      nginx_installed = True
-
-    if not nginx_installed:
-      return None
-
-    version = os.popen('nginx -v 2>&1').read().strip().split('/')[1]
-
     try:
-      with os.popen(f'curl -s {status_page_url}', 'r') as f:
-        results = list(filter(None, f.read().rstrip('\n').split('\n')))
+      response = requests.get(status_page_url)
+      if response.status_code != 200:
+        return None
+
+      results = response.text.splitlines()
+      header_version = response.headers['Server']
+      if header_version:
+        version = header_version.split('/')[1]
+      else:
+        version = None
 
       metrics = { 'nginx_version': version }
 

@@ -13,13 +13,6 @@ METRICS = '\|'.join([
 
 @debug('redis_metrics')
 def redis_metrics(port=6379, password=None):
-    redis_installed = False
-    if os.system('which redis-server > /dev/null') == 0:
-      redis_installed = True
-
-    if not redis_installed:
-      return None
-
     auth_prefix = ''
     if password:
       auth_prefix = f'AUTH {password}\n'
