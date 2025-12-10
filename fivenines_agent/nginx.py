@@ -29,11 +29,7 @@ def nginx_metrics(status_page_url='http://127.0.0.1:8080/nginx_status'):
         return None
 
       results = response.text.splitlines()
-      header_version = response.headers['Server']
-      if header_version:
-        version = header_version.split('/')[1]
-      else:
-        version = None
+      version = response.headers['Server']
 
       metrics = { 'nginx_version': version }
 
