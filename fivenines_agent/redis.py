@@ -1,13 +1,22 @@
 import os
 import sys
+import re
+import socket
 import traceback
 
-from fivenines_agent.debug import debug
+from fivenines_agent.debug import debug, log
 
-METRICS = '\|'.join([
+METRICS_REGEX = '|'.join([
   'redis_version',
+  'uptime_in_seconds',
+  'blocked_clients',
   'connected_clients',
+  'evicted_clients',
   'maxclients',
+  'total_connections_received',
+  'total_commands_processed',
+  'evicted_keys',
+  'expired_keys',
   '^db[0-9]'
 ])
 
@@ -18,8 +27,35 @@ def redis_metrics(port=6379, password=None):
       auth_prefix = f'AUTH {password}\n'
 
     try:
-      with os.popen(f'echo "{auth_prefix}INFO\nQUIT" | curl -s telnet://localhost:{port} | grep -e "{METRICS}"', 'r') as f:
-        results = list(filter(None, f.read().rstrip('\n').split('\n')))
+
+      # Use create_connection for better address handling (IPv4/IPv6)
+      s = socket.create_connection(('localhost', int(port)), timeout=5)
+
+      commands = []
+      if password:
+          commands.append(f'AUTH {password}')
+      commands.append('INFO')
+      commands.append('QUIT')
+
+      # Use CRLF for Redis protocol
+      full_command = '\r\n'.join(commands) + '\r\n'
+      s.sendall(full_command.encode())
+
+      data = b""
+      while True:
+          chunk = s.recv(4096)
+          if not chunk:
+              break
+          data += chunk
+      s.close()
+
+      results = []
+      for line in data.decode('utf-8', errors='ignore').split('\n'):
+          line = line.strip()
+          if not line:
+              continue
+          if re.search(METRICS_REGEX, line):
+              results.append(line)
 
       metrics = {}
 
