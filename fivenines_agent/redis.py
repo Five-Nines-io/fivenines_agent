@@ -68,10 +68,10 @@ def redis_metrics(port=6379, password=None):
             metrics[key] = {}
             values = value.split(',')
             for v in values:
-              k, v = v.split('=')
-              metrics[key][k] = int(v.strip())
+              k, raw_val = v.split('=')
+              metrics[key][k.strip()] = float(raw_val.strip())
           else:
-            metrics[key] = int(value.strip())
+            metrics[key] = float(value.strip())
 
       return metrics
 
