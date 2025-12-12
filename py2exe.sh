@@ -263,14 +263,12 @@ mkdir -p build dist/linux
 echo "Checking libvirt module path:"
 python -c "import libvirt; print('libvirt module path:', libvirt.__file__); print('libvirt version:', libvirt.getVersion())"
 
-# Build with PyInstaller
-export LD_LIBRARY_PATH="/opt/python/cp39-cp39/lib:$LD_LIBRARY_PATH"
-
 # Try to find the actual Python shared library
 PYTHON_LIB=$(find /opt/python/cp39-cp39/lib -name "libpython3.9.so*" -type f | head -1)
 if [ -n "$PYTHON_LIB" ]; then
     echo "Found Python library: $PYTHON_LIB"
-    poetry run pyinstaller \
+    # Set LD_LIBRARY_PATH only for PyInstaller (not globally, to avoid polluting sudo/system commands later)
+    LD_LIBRARY_PATH="/opt/python/cp39-cp39/lib:$LD_LIBRARY_PATH" poetry run pyinstaller \
     	--strip \
     	--optimize=2 \
     	--exclude-module tkinter \
