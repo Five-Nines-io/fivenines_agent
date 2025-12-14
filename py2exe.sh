@@ -297,17 +297,20 @@ else
     exit 1
 fi
 
-# Check built binary
+# Check built binary (onedir creates a directory with the executable inside)
 echo "=== Binary Verification ==="
-echo "Binary size: $(ls -lh ./build/$BINARY_NAME | awk '{print $5}')"
+echo "Directory contents:"
+ls -lh ./build/$BINARY_NAME/
+echo "Executable size: $(ls -lh ./build/$BINARY_NAME/$BINARY_NAME | awk '{print $5}')"
+echo "Total directory size: $(du -sh ./build/$BINARY_NAME | awk '{print $1}')"
 echo "Binary dependencies:"
-ldd ./build/$BINARY_NAME | head -10 || echo "ldd check failed (might be expected)"
+ldd ./build/$BINARY_NAME/$BINARY_NAME | head -10 || echo "ldd check failed (might be expected)"
 
 # Quick test of the binary
 echo "=== Testing Built Binary ==="
-./build/$BINARY_NAME --version || echo "Version check failed, but binary was built"
+./build/$BINARY_NAME/$BINARY_NAME --version || echo "Version check failed, but binary was built"
 
-# Move to final location
+# Move to final location (move the entire directory)
 mv ./build/$BINARY_NAME ./dist/linux/
 
 #
@@ -322,6 +325,7 @@ poetry config virtualenvs.create true
 deactivate
 
 echo "✅ Build completed successfully!"
-echo "Binary location: ./dist/linux/$BINARY_NAME"
+echo "Output directory: ./dist/linux/$BINARY_NAME/"
+echo "Executable: ./dist/linux/$BINARY_NAME/$BINARY_NAME"
 echo ""
-echo "The binary should be compatible with CentOS 7 and include libvirt 6.10.0 with cgroup V2 and RSS support."
+echo "The distribution should be compatible with CentOS 7 and include libvirt 6.10.0 with cgroup V2 and RSS support."
