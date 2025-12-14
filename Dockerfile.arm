@@ -20,6 +20,7 @@ RUN yum install -y \
     libnl3-devel \
     libxslt \
     libtirpc-devel \
+    libnsl \
     && yum clean all
 
 # Install libvirt 6.10.0 from source (has cgroup V2 and RSS support, still CentOS 7 compatible)
