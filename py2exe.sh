@@ -278,7 +278,7 @@ if [ -n "$PYTHON_LIB" ]; then
     	--exclude-module test \
     	--exclude-module distutils \
     	--noconfirm \
-        --onefile \
+        --onedir \
         --name $BINARY_NAME \
         --workpath ./build/tmp \
         --distpath ./build \
