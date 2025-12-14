@@ -126,6 +126,15 @@ if ! id -u fivenines >/dev/null 2>&1; then
   fi
 fi
 
+# CloudLinux: add fivenines to clsupergid group for proper permissions
+if [ -f "/etc/cloudlinux-release" ]; then
+  echo "CloudLinux detected"
+  if getent group clsupergid >/dev/null 2>&1; then
+    echo "Adding fivenines user to clsupergid group"
+    usermod -a -G clsupergid fivenines
+  fi
+fi
+
 mkdir -p /etc/fivenines_agent
 # Save the client token in appropriate location
 if [ "$SYSTEM_TYPE" == "unraid" ]; then
