@@ -13,6 +13,7 @@ import psutil
 import systemd_watchdog
 from dotenv import load_dotenv
 
+from fivenines_agent.cli import VERSION
 from fivenines_agent.env import dry_run, config_dir, env_file
 from fivenines_agent.load_average import load_average
 from fivenines_agent.cpu import cpu_usage, cpu_data, cpu_model, cpu_count
@@ -51,10 +52,7 @@ class Agent:
         signal.signal(signal.SIGINT,  self._on_signal)
         signal.signal(signal.SIGHUP,  self._on_signal)
 
-        self.version = '1.2.3'
-        if dry_run():
-            self.version = f'{self.version}-dry-run'
-        log(f'fivenines agent v{self.version}', 'info')
+        log(f'fivenines agent v{VERSION}', 'info')
 
         # Load token
         self._load_file('TOKEN')
@@ -83,7 +81,7 @@ class Agent:
 
         # Static info
         static_data = {
-            'version': self.version,
+            'version': VERSION,
             'uname': platform.uname()._asdict(),
             'boot_time': psutil.boot_time(),
         }

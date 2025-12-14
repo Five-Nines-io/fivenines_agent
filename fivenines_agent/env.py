@@ -1,5 +1,7 @@
 import os
-import sys
+
+from fivenines_agent.cli import get_args
+
 
 def api_url():
   return os.environ.get('API_URL', 'api.fivenines.io')
@@ -11,7 +13,12 @@ def env_file():
   return os.path.join(config_dir(), '.env')
 
 def dry_run():
-  return os.environ.get('DRY_RUN') == 'true' or '--dry-run' in sys.argv
+  # Check environment variable first
+  if os.environ.get('DRY_RUN') == 'true':
+    return True
+  # Check parsed args
+  args = get_args()
+  return args is not None and args.dry_run
 
 def log_level():
   if dry_run():
