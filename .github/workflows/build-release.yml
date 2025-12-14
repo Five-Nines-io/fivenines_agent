@@ -1,0 +1,209 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - 'release/**'
+      - 'feature/**'
+    tags:
+      - 'v*'
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image for amd64
+        run: |
+          docker build -t fivenines-builder:amd64 -f Dockerfile .
+
+      - name: Build agent binary (amd64)
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -e TARGET_ARCH=amd64 \
+            fivenines-builder:amd64 \
+            bash /workspace/py2exe.sh
+
+      - name: Create tarball (amd64)
+        run: |
+          cd dist/linux
+          tar -czvf fivenines-agent-linux-amd64.tar.gz fivenines-agent-linux-amd64/
+          mv fivenines-agent-linux-amd64.tar.gz ../
+
+      - name: Upload artifact (amd64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: fivenines-agent-linux-amd64
+          path: dist/fivenines-agent-linux-amd64.tar.gz
+          retention-days: 7
+
+  build-arm64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image for arm64
+        run: |
+          docker build --platform linux/arm64 -t fivenines-builder:arm64 -f Dockerfile.arm .
+
+      - name: Build agent binary (arm64)
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v ${{ github.workspace }}:/workspace \
+            -e TARGET_ARCH=arm64 \
+            fivenines-builder:arm64 \
+            bash /workspace/py2exe.sh
+
+      - name: Create tarball (arm64)
+        run: |
+          cd dist/linux
+          tar -czvf fivenines-agent-linux-arm64.tar.gz fivenines-agent-linux-arm64/
+          mv fivenines-agent-linux-arm64.tar.gz ../
+
+      - name: Upload artifact (arm64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: fivenines-agent-linux-arm64
+          path: dist/fivenines-agent-linux-arm64.tar.gz
+          retention-days: 7
+
+  # Pre-release for feature and release branches
+  pre-release:
+    needs: [build-amd64, build-arm64]
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'push' &&
+      !startsWith(github.ref, 'refs/tags/') &&
+      (startsWith(github.ref, 'refs/heads/release/') || startsWith(github.ref, 'refs/heads/feature/'))
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate release tag name
+        id: release_info
+        run: |
+          # Extract branch name and sanitize it (replace / with -)
+          BRANCH_NAME="${GITHUB_REF#refs/heads/}"
+          SANITIZED_BRANCH=$(echo "$BRANCH_NAME" | sed 's/\//-/g')
+
+          # Get short commit hash
+          SHORT_SHA=$(echo "$GITHUB_SHA" | cut -c1-7)
+
+          # Create tag name: branch-name-commithash
+          TAG_NAME="${SANITIZED_BRANCH}-${SHORT_SHA}"
+
+          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_OUTPUT
+          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          echo "SHORT_SHA=$SHORT_SHA" >> $GITHUB_OUTPUT
+
+          echo "Generated tag name: $TAG_NAME"
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          mv artifacts/fivenines-agent-linux-amd64/fivenines-agent-linux-amd64.tar.gz release/
+          mv artifacts/fivenines-agent-linux-arm64/fivenines-agent-linux-arm64.tar.gz release/
+          ls -la release/
+
+      - name: Delete existing pre-release with same tag (if exists)
+        run: |
+          gh release delete "${{ steps.release_info.outputs.TAG_NAME }}" --yes || true
+          git push origin --delete "refs/tags/${{ steps.release_info.outputs.TAG_NAME }}" || true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create Pre-Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_info.outputs.TAG_NAME }}
+          name: "Test Build: ${{ steps.release_info.outputs.BRANCH_NAME }} (${{ steps.release_info.outputs.SHORT_SHA }})"
+          draft: false
+          prerelease: true
+          body: |
+            ## Test Build
+
+            **Branch:** `${{ steps.release_info.outputs.BRANCH_NAME }}`
+            **Commit:** `${{ github.sha }}`
+
+            This is an automated pre-release build for testing purposes.
+
+            ### Download URLs
+            ```
+            # AMD64
+            https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-linux-amd64.tar.gz
+
+            # ARM64
+            https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-linux-arm64.tar.gz
+            ```
+          files: |
+            release/fivenines-agent-linux-amd64.tar.gz
+            release/fivenines-agent-linux-arm64.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Production release for version tags
+  release:
+    needs: [build-amd64, build-arm64]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          mv artifacts/fivenines-agent-linux-amd64/fivenines-agent-linux-amd64.tar.gz release/
+          mv artifacts/fivenines-agent-linux-arm64/fivenines-agent-linux-arm64.tar.gz release/
+          ls -la release/
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ steps.version.outputs.VERSION }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          files: |
+            release/fivenines-agent-linux-amd64.tar.gz
+            release/fivenines-agent-linux-arm64.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
