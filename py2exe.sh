@@ -269,17 +269,17 @@ if [ -n "$PYTHON_LIB" ]; then
     echo "Found Python library: $PYTHON_LIB"
     # Set LD_LIBRARY_PATH only for PyInstaller (not globally, to avoid polluting sudo/system commands later)
     LD_LIBRARY_PATH="/opt/python/cp39-cp39/lib:$LD_LIBRARY_PATH" poetry run pyinstaller \
-    	--strip \
-    	--optimize=2 \
-    	--exclude-module tkinter \
-    	--exclude-module unittest \
-    	--exclude-module pdb \
-    	--exclude-module doctest \
-    	--exclude-module test \
-    	--exclude-module distutils \
-    	--noconfirm \
+        --strip \
+        --optimize=2 \
+        --exclude-module tkinter \
+        --exclude-module unittest \
+        --exclude-module pdb \
+        --exclude-module doctest \
+        --exclude-module test \
+        --exclude-module distutils \
+        --noconfirm \
         --onedir \
-        --name $BINARY_NAME \
+        --name "$BINARY_NAME" \
         --workpath ./build/tmp \
         --distpath ./build \
         --clean \
@@ -288,6 +288,8 @@ if [ -n "$PYTHON_LIB" ]; then
         --add-binary "$PYTHON_LIB:." \
         --add-binary "/usr/local/lib/libcrypt.so.2:." \
         --add-binary "/usr/local/lib/libcrypt.so.1:." \
+        --add-binary "/usr/lib64/libnsl.so.1:." \
+        --add-binary "/usr/lib64/libtirpc.so.3:." \
         ./py2exe_entrypoint.py || {
         echo "PyInstaller failed. Exiting."
         exit 1
