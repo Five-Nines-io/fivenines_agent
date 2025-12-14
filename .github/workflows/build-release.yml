@@ -69,8 +69,9 @@ jobs:
             ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:latest \
             bash /workspace/py2exe.sh
 
-      - name: Create tarball (amd64)
+      - name: Fix permissions and create tarball (amd64)
         run: |
+          sudo chown -R $(id -u):$(id -g) dist/
           cd dist/linux
           tar -czvf fivenines-agent-linux-amd64.tar.gz fivenines-agent-linux-amd64/
           mv fivenines-agent-linux-amd64.tar.gz ../
@@ -134,8 +135,9 @@ jobs:
             ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:latest \
             bash /workspace/py2exe.sh
 
-      - name: Create tarball (arm64)
+      - name: Fix permissions and create tarball (arm64)
         run: |
+          sudo chown -R $(id -u):$(id -g) dist/
           cd dist/linux
           tar -czvf fivenines-agent-linux-arm64.tar.gz fivenines-agent-linux-arm64/
           mv fivenines-agent-linux-arm64.tar.gz ../
