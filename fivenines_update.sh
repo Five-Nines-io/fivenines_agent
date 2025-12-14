@@ -82,6 +82,17 @@ rm -f "${INSTALL_DIR}/run_agent.sh"
 chown -R fivenines:fivenines "$INSTALL_DIR"
 chmod -R 755 "$AGENT_DIR"
 
+# CloudLinux: ensure fivenines is in clsupergid group for proper permissions
+if [ -f "/etc/cloudlinux-release" ]; then
+        echo "CloudLinux detected"
+        if getent group clsupergid >/dev/null 2>&1; then
+                if ! id -nG fivenines | grep -qw clsupergid; then
+                        echo "Adding fivenines user to clsupergid group"
+                        usermod -a -G clsupergid fivenines
+                fi
+        fi
+fi
+
 echo "Agent updated successfully at $AGENT_DIR"
 
 echo "Updating the service file"
