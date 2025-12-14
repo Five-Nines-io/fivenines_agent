@@ -142,29 +142,65 @@ fi
 
 CURRENT_ARCH=$(uname -m)
 
+# Set install directory and binary name based on system type and architecture
 if [ "$SYSTEM_TYPE" == "unraid" ]; then
-  AGENT_PATH="/boot/config/custom/fivenines_agent/fivenines_agent"
+  INSTALL_DIR="/boot/config/custom/fivenines_agent"
 else
-  AGENT_PATH="/opt/fivenines/fivenines_agent"
+  INSTALL_DIR="/opt/fivenines"
 fi
 
-# Download the agent based on the architecture
+# Ensure install directory exists
+mkdir -p "$INSTALL_DIR"
+
+# Download the agent tarball based on the architecture
 echo "Detected architecture: $CURRENT_ARCH"
 if [ "$CURRENT_ARCH" == "aarch64" ]; then
-        wget --connect-timeout=3 https://github.com/Five-Nines-io/fivenines_agent/releases/latest/download/fivenines-agent-linux-arm64 -O $AGENT_PATH || exit_with_contact "Failed to download ARM64 agent"
+  BINARY_NAME="fivenines-agent-linux-arm64"
+  DOWNLOAD_URL="https://github.com/Five-Nines-io/fivenines_agent/releases/latest/download/fivenines-agent-linux-arm64.tar.gz"
 else
-        wget --connect-timeout=3 https://github.com/Five-Nines-io/fivenines_agent/releases/latest/download/fivenines-agent-linux-amd64 -O $AGENT_PATH || exit_with_contact "Failed to download AMD64 agent"
+  BINARY_NAME="fivenines-agent-linux-amd64"
+  DOWNLOAD_URL="https://github.com/Five-Nines-io/fivenines_agent/releases/latest/download/fivenines-agent-linux-amd64.tar.gz"
+fi
+
+TARBALL_PATH="/tmp/${BINARY_NAME}.tar.gz"
+AGENT_DIR="${INSTALL_DIR}/${BINARY_NAME}"
+AGENT_EXECUTABLE="${AGENT_DIR}/${BINARY_NAME}"
+
+echo "Downloading agent from $DOWNLOAD_URL..."
+wget --connect-timeout=3 "$DOWNLOAD_URL" -O "$TARBALL_PATH" || exit_with_contact "Failed to download agent"
+
+# Remove old installation if it exists
+if [ -d "$AGENT_DIR" ]; then
+  echo "Removing previous installation..."
+  rm -rf "$AGENT_DIR"
+fi
+
+# Extract the tarball
+echo "Extracting agent to $INSTALL_DIR..."
+tar -xzf "$TARBALL_PATH" -C "$INSTALL_DIR" || exit_with_contact "Failed to extract agent"
+
+# Clean up the tarball
+rm -f "$TARBALL_PATH"
+
+# Verify extraction was successful
+if [ ! -f "$AGENT_EXECUTABLE" ]; then
+  exit_with_contact "Agent executable not found after extraction at $AGENT_EXECUTABLE"
 fi
 
 # Handle different systems for file permissions and binary location
 if [ "$SYSTEM_TYPE" == "unraid" ]; then
-  # Set correct ownership for non-UNRAID systems
-  cp $AGENT_PATH /usr/local/bin/fivenines_agent
-  chmod 755 /usr/local/bin/fivenines_agent
+  # For UNRAID, create a symlink in /usr/local/bin for easy access
+  chmod -R 755 "$AGENT_DIR"
+  ln -sf "$AGENT_EXECUTABLE" /usr/local/bin/fivenines_agent
 else
-  chown -R fivenines:fivenines /opt/fivenines
-  chmod 755 $AGENT_PATH
+  # Create a symlink at a fixed path for the systemd service
+  ln -sf "$AGENT_EXECUTABLE" "${INSTALL_DIR}/fivenines_agent"
+
+  chown -R fivenines:fivenines "$INSTALL_DIR"
+  chmod -R 755 "$AGENT_DIR"
 fi
+
+echo "Agent installed successfully at $AGENT_DIR"
 
 
 # Test connectivity
