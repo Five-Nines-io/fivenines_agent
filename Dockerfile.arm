@@ -24,10 +24,11 @@ RUN yum install -y \
     && yum clean all
 
 # Install libnsl from source (required by libvirt, not available as package in manylinux2014)
+# Using v1.3.0 for compatibility with older libtirpc in manylinux2014
 RUN cd /tmp && \
-    wget https://github.com/thkukuk/libnsl/releases/download/v2.0.1/libnsl-2.0.1.tar.xz && \
-    tar xf libnsl-2.0.1.tar.xz && \
-    cd libnsl-2.0.1 && \
+    wget https://github.com/thkukuk/libnsl/releases/download/v1.3.0/libnsl-1.3.0.tar.xz && \
+    tar xf libnsl-1.3.0.tar.xz && \
+    cd libnsl-1.3.0 && \
     ./configure --prefix=/usr --libdir=/usr/lib64 && \
     make -j$(nproc) && \
     make install && \
