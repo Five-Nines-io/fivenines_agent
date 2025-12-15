@@ -288,8 +288,7 @@ if [ -n "$PYTHON_LIB" ]; then
         --add-binary "$PYTHON_LIB:." \
         --add-binary "/usr/local/lib/libcrypt.so.2:." \
         --add-binary "/usr/local/lib/libcrypt.so.1:." \
-        --add-binary "/usr/lib64/libnsl.so.1:." \
-        --add-binary "/usr/lib64/libtirpc.so.1:." \
+        --add-binary "/usr/lib64/libtirpc.so.3:." \
         ./py2exe_entrypoint.py || {
         echo "PyInstaller failed. Exiting."
         exit 1

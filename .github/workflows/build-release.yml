@@ -7,6 +7,7 @@ on:
       - master
       - 'release/**'
       - 'feature/**'
+      - 'fix/**'
     tags:
       - 'v*'
   pull_request:

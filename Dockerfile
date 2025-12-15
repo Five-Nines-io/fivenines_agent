@@ -4,6 +4,7 @@ FROM quay.io/pypa/manylinux2014_x86_64
 # This avoids all the CentOS 7 EOL repository issues
 
 # Install system packages for building libvirt
+# Note: We build libtirpc from source (without libnsl dependency) instead of using libtirpc-devel
 RUN yum install -y \
     gcc \
     gcc-c++ \
@@ -19,8 +20,24 @@ RUN yum install -y \
     yajl-devel \
     libnl3-devel \
     libxslt \
-    libtirpc-devel \
+    xz \
+    autoconf \
+    automake \
+    libtool \
     && yum clean all
+
+# Build libtirpc from source WITHOUT libnsl dependency
+# This avoids the libnsl runtime dependency that causes issues on newer systems
+RUN cd /tmp && \
+    wget https://downloads.sourceforge.net/libtirpc/libtirpc-1.3.3.tar.bz2 && \
+    tar xf libtirpc-1.3.3.tar.bz2 && \
+    cd libtirpc-1.3.3 && \
+    ./configure --prefix=/usr --libdir=/usr/lib64 --disable-gssapi --disable-static && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig && \
+    cd / && rm -rf /tmp/libtirpc-* && \
+    echo "libtirpc installed:" && pkg-config --modversion libtirpc
 
 # Install libvirt 6.10.0 from source (has cgroup V2 and RSS support, still CentOS 7 compatible)
 RUN cd /tmp && \
