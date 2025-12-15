@@ -20,7 +20,20 @@ RUN yum install -y \
     libnl3-devel \
     libxslt \
     libtirpc-devel \
+    xz \
     && yum clean all
+
+# Install libnsl from source (required by libvirt, not available as package in manylinux2014)
+RUN cd /tmp && \
+    wget https://github.com/thkukuk/libnsl/releases/download/v2.0.1/libnsl-2.0.1.tar.xz && \
+    tar xf libnsl-2.0.1.tar.xz && \
+    cd libnsl-2.0.1 && \
+    ./configure --prefix=/usr --libdir=/usr/lib64 && \
+    make -j$(nproc) && \
+    make install && \
+    ldconfig && \
+    cd / && rm -rf /tmp/libnsl-* && \
+    echo "libnsl installed:" && ls -la /usr/lib64/libnsl*
 
 # Install libvirt 6.10.0 from source (has cgroup V2 and RSS support, still CentOS 7 compatible)
 RUN cd /tmp && \
