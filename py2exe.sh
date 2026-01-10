@@ -130,6 +130,16 @@ python -c "import libvirt; print('libvirt version:', libvirt.getVersion())"
 # Install Poetry and dependencies
 #
 echo "=== Installing Poetry and Dependencies ==="
+
+# Create pip constraints to avoid buggy virtualenv 20.32.0
+# (fixes 'PythonSpec' object has no attribute 'version_specifier' bug)
+echo "virtualenv>=20.33.0" > /tmp/pip-constraints.txt
+export PIP_CONSTRAINT=/tmp/pip-constraints.txt
+
+python -m pip install "virtualenv>=20.33.0" || {
+    echo "Failed to install virtualenv. Exiting."
+    exit 1
+}
 python -m pip install poetry==2.1.3 || {
     echo "Failed to install Poetry. Exiting."
     exit 1
@@ -138,6 +148,8 @@ python -m pip install poetry==2.1.3 || {
 # Configure Poetry to use the current virtual environment
 echo "Configuring Poetry to avoid creating separate environments"
 poetry config virtualenvs.create false
+# Use pip as the installer to respect PIP_CONSTRAINT
+poetry config installer.modern-installation false
 # Clear any existing Poetry cache to avoid conflicts
 poetry cache clear --all . || true
 poetry config installer.max-workers 1
@@ -146,6 +158,10 @@ poetry install --no-interaction || {
     echo "Poetry installation failed. Exiting."
     exit 1
 }
+
+# Clean up constraints
+unset PIP_CONSTRAINT
+rm -f /tmp/pip-constraints.txt
 
 # Final verification
 echo "=== Final Verification ==="
