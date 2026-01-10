@@ -148,11 +148,15 @@ python -m pip install poetry==2.1.3 || {
 # Configure Poetry to use the current virtual environment
 echo "Configuring Poetry to avoid creating separate environments"
 poetry config virtualenvs.create false
-# Use pip as the installer to respect PIP_CONSTRAINT
-poetry config installer.modern-installation false
 # Clear any existing Poetry cache to avoid conflicts
 poetry cache clear --all . || true
 poetry config installer.max-workers 1
+# Disable parallel installation to avoid race conditions
+poetry config installer.parallel false
+
+# Force install correct virtualenv version right before poetry install
+# (Poetry's resolver might try to downgrade it)
+pip install "virtualenv>=20.33.0" --force-reinstall --quiet
 
 poetry install --no-interaction || {
     echo "Poetry installation failed. Exiting."
