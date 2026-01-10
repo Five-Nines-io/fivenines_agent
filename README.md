@@ -172,7 +172,6 @@ When the agent starts, it displays a banner showing which features are available
   Storage:
     ✗ Smart Storage (requires: sudo smartctl)
     ✗ Raid Storage (requires: sudo mdadm)
-    ✗ Zfs (requires: zfs permissions)
 
   Services:
     ✓ Docker
