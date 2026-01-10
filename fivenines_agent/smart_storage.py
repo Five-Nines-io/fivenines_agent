@@ -114,19 +114,42 @@ NVME_ATTRIBUTE_NAMES = {
 }
 
 def smartctl_available():
-
-    """Check if smartctl is available on the system."""
+    """
+    Check if smartctl is available and we have permission to run it.
+    Uses sudo -n (non-interactive) to detect if sudoers is configured.
+    Returns False if:
+    - smartctl is not installed
+    - sudo is not configured for this user
+    - sudo would require a password
+    """
     try:
-        subprocess.run(["sudo", "smartctl", "--version"], check=True)
-        return True
+        result = subprocess.run(
+            ["sudo", "-n", "smartctl", "--version"],
+            capture_output=True,
+            timeout=5
+        )
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        log("smartctl availability check timed out", 'error')
+        return False
     except Exception:
         return False
 
 def nvme_cli_available():
-    """Check if nvme-cli is available on the system."""
+    """
+    Check if nvme-cli is available and we have permission to run it.
+    Uses sudo -n (non-interactive) to detect if sudoers is configured.
+    """
     try:
-        subprocess.run(["sudo", "nvme", "version"], check=True)
-        return True
+        result = subprocess.run(
+            ["sudo", "-n", "nvme", "version"],
+            capture_output=True,
+            timeout=5
+        )
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        log("nvme availability check timed out", 'error')
+        return False
     except Exception:
         return False
 
@@ -346,7 +369,7 @@ def smart_storage_identification():
     }
 
     if tool_versions["smartctl_version"] is None:
-        log("smartctl not installed", 'error')
+        log("smartctl unavailable (not installed or no sudo permissions)", 'debug')
         data = []
     else:
         devices = list_storage_devices()
@@ -378,7 +401,7 @@ def smart_storage_health():
         return _health_storage_cache["data"]
 
     if not smartctl_available():
-        log("smartctl not installed", 'error')
+        log("smartctl unavailable (not installed or no sudo permissions)", 'debug')
         data = []
     else:
         devices = list_storage_devices()

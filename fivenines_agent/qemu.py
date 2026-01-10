@@ -1,6 +1,6 @@
 import os
 import time
-import libvirt
+# import libvirt
 import xml.etree.ElementTree as ET
 
 from fivenines_agent.debug import debug, log
