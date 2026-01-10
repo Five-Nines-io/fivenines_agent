@@ -130,7 +130,8 @@ python -c "import libvirt; print('libvirt version:', libvirt.getVersion())"
 # Install Poetry and dependencies
 #
 echo "=== Installing Poetry and Dependencies ==="
-python -m pip install poetry==2.1.3 || {
+
+python -m pip install poetry==2.2.1 || {
     echo "Failed to install Poetry. Exiting."
     exit 1
 }

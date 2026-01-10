@@ -10,10 +10,24 @@ _raid_cache = {
 }
 
 def mdadm_available() -> bool:
-    """Check if mdadm is available on the system."""
+    """
+    Check if mdadm is available and we have permission to run it.
+    Uses sudo -n (non-interactive) to detect if sudoers is configured.
+    Returns False if:
+    - mdadm is not installed
+    - sudo is not configured for this user
+    - sudo would require a password
+    """
     try:
-        subprocess.run(["sudo", "mdadm", "--version", ""], check=True)
-        return True
+        result = subprocess.run(
+            ["sudo", "-n", "mdadm", "--version"],
+            capture_output=True,
+            timeout=5
+        )
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        log("mdadm availability check timed out", 'error')
+        return False
     except Exception:
         return False
 
@@ -252,7 +266,7 @@ def raid_storage_health():
         return _raid_cache["data"]
 
     if not mdadm_available():
-        log("mdadm not installed", 'error')
+        log("mdadm unavailable (not installed or no sudo permissions)", 'debug')
         data = []
     else:
         mdadm_version = get_mdadm_version()

@@ -6,6 +6,8 @@ import platform
 import time
 import socket
 import signal
+import pwd
+import grp
 from threading import Event
 import json
 
@@ -39,20 +41,76 @@ from fivenines_agent.ports import listening_ports
 from fivenines_agent.temperatures import temperatures
 from fivenines_agent.fans import fans
 from fivenines_agent.debug import debug, log
+from fivenines_agent.permissions import get_permissions, print_capabilities_banner
 
 CONFIG_DIR = config_dir()
 load_dotenv(dotenv_path=env_file())
 
+
+def get_user_context():
+    """Get information about the user running the agent."""
+    try:
+        uid = os.getuid()
+        euid = os.geteuid()
+        gid = os.getgid()
+
+        # Get username
+        try:
+            username = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            username = str(uid)
+
+        # Get primary group name
+        try:
+            groupname = grp.getgrgid(gid).gr_name
+        except KeyError:
+            groupname = str(gid)
+
+        # Get all groups the user belongs to
+        try:
+            groups = [grp.getgrgid(g).gr_name for g in os.getgroups()]
+        except Exception:
+            groups = [str(g) for g in os.getgroups()]
+
+        # Determine installation type based on config directory
+        is_user_install = CONFIG_DIR.startswith(os.path.expanduser('~'))
+
+        return {
+            'username': username,
+            'uid': uid,
+            'euid': euid,
+            'gid': gid,
+            'groupname': groupname,
+            'groups': groups,
+            'is_root': uid == 0,
+            'is_user_install': is_user_install,
+            'config_dir': CONFIG_DIR,
+            'home_dir': os.path.expanduser('~'),
+        }
+    except Exception as e:
+        log(f"Error getting user context: {e}", 'error')
+        return {
+            'username': 'unknown',
+            'is_root': False,
+            'is_user_install': False,
+        }
+
 # Exit event for safe shutdown
 exit_event = Event()
+# Event to signal permission refresh needed
+refresh_permissions_event = Event()
 
 class Agent:
     def __init__(self):
-        signal.signal(signal.SIGTERM, self._on_signal)
-        signal.signal(signal.SIGINT,  self._on_signal)
-        signal.signal(signal.SIGHUP,  self._on_signal)
+        signal.signal(signal.SIGTERM, self._on_exit_signal)
+        signal.signal(signal.SIGINT,  self._on_exit_signal)
+        signal.signal(signal.SIGHUP,  self._on_sighup)
 
         log(f'fivenines agent v{VERSION}', 'info')
+
+        # Probe permissions and show capabilities banner
+        self.permissions = get_permissions()
+        print_capabilities_banner()
 
         # Load token
         self._load_file('TOKEN')
@@ -61,9 +119,14 @@ class Agent:
         self.synchronizer = Synchronizer(self.token, self.queue)
         self.synchronizer.start()
 
-    def _on_signal(self, signum, frame):
+    def _on_exit_signal(self, signum, frame):
         # Only set the exit flag; defer cleanup to main loop
         exit_event.set()
+
+    def _on_sighup(self, signum, frame):
+        # SIGHUP triggers permission refresh instead of exit
+        log("Received SIGHUP - will refresh capabilities", 'info')
+        refresh_permissions_event.set()
 
     def _load_file(self, filename):
         try:
@@ -84,11 +147,22 @@ class Agent:
             'version': VERSION,
             'uname': platform.uname()._asdict(),
             'boot_time': psutil.boot_time(),
+            'capabilities': self.permissions.get_all(),
+            'user_context': get_user_context(),
         }
 
         try:
             while not exit_event.is_set():
                 wd.notify()
+
+                # Check for permission refresh (SIGHUP or periodic)
+                if refresh_permissions_event.is_set():
+                    refresh_permissions_event.clear()
+                    self.permissions.force_refresh()
+                    static_data['capabilities'] = self.permissions.get_all()
+                    print_capabilities_banner()
+                elif self.permissions.refresh_if_needed():
+                    static_data['capabilities'] = self.permissions.get_all()
 
                 # Refresh config if disabled
                 self.config = self.synchronizer.get_config()
