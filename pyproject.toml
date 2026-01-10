@@ -22,6 +22,7 @@ fivenines_agent = "fivenines_agent.__main__:start"
 [tool.poetry.group.dev.dependencies]
 poetry-plugin-export = "^1.8.0"
 pyinstaller = "^6.11.1"
+virtualenv = ">=20.33.0"
 
 [build-system]
 requires = ["poetry-core"]
