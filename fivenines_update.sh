@@ -1,6 +1,35 @@
 #!/bin/bash
 # This script is used to update the fivenines agent
 
+# Mirror URLs (R2 is IPv6-compatible, GitHub is fallback)
+R2_BASE_URL="https://releases.fivenines.io/latest"
+GITHUB_RELEASES_URL="https://github.com/Five-Nines-io/fivenines_agent/releases/latest/download"
+GITHUB_RAW_URL="https://raw.githubusercontent.com/Five-Nines-io/five_nines_agent/main"
+
+function download_with_fallback() {
+  local filename="$1"
+  local output="$2"
+  local r2_url="${R2_BASE_URL}/${filename}"
+  local github_url="$3"
+
+  echo "Downloading ${filename}..."
+
+  # Try R2 first (IPv6 compatible)
+  if wget --connect-timeout=5 -q "$r2_url" -O "$output" 2>/dev/null; then
+    echo "  Downloaded from releases.fivenines.io"
+    return 0
+  fi
+
+  # Fallback to GitHub
+  echo "  R2 mirror unavailable, trying GitHub..."
+  if wget --connect-timeout=5 -q "$github_url" -O "$output" 2>/dev/null; then
+    echo "  Downloaded from GitHub"
+    return 0
+  fi
+
+  return 1
+}
+
 # stop the agent
 systemctl stop fivenines-agent.service
 
@@ -34,18 +63,16 @@ INSTALL_DIR="/opt/fivenines"
 echo "Detected architecture: $CURRENT_ARCH"
 if [ "$CURRENT_ARCH" == "aarch64" ]; then
         BINARY_NAME="fivenines-agent-linux-arm64"
-        DOWNLOAD_URL="https://github.com/Five-Nines-io/fivenines_agent/releases/latest/download/fivenines-agent-linux-arm64.tar.gz"
 else
         BINARY_NAME="fivenines-agent-linux-amd64"
-        DOWNLOAD_URL="https://github.com/Five-Nines-io/fivenines_agent/releases/latest/download/fivenines-agent-linux-amd64.tar.gz"
 fi
 
-TARBALL_PATH="/tmp/${BINARY_NAME}.tar.gz"
+TARBALL_NAME="${BINARY_NAME}.tar.gz"
+TARBALL_PATH="/tmp/${TARBALL_NAME}"
 AGENT_DIR="${INSTALL_DIR}/${BINARY_NAME}"
 AGENT_EXECUTABLE="${AGENT_DIR}/${BINARY_NAME}"
 
-echo "Downloading agent from $DOWNLOAD_URL..."
-wget --connect-timeout=3 "$DOWNLOAD_URL" -O "$TARBALL_PATH" || { echo "Failed to download agent"; exit 1; }
+download_with_fallback "$TARBALL_NAME" "$TARBALL_PATH" "${GITHUB_RELEASES_URL}/${TARBALL_NAME}" || { echo "Failed to download agent"; exit 1; }
 
 # Remove old installation if it exists
 if [ -d "$AGENT_DIR" ]; then
@@ -96,7 +123,7 @@ fi
 echo "Agent updated successfully at $AGENT_DIR"
 
 echo "Updating the service file"
-wget --connect-timeout=3 https://raw.githubusercontent.com/Five-Nines-io/five_nines_agent/main/fivenines-agent.service -O /etc/systemd/system/fivenines-agent.service
+download_with_fallback "fivenines-agent.service" "/etc/systemd/system/fivenines-agent.service" "${GITHUB_RAW_URL}/fivenines-agent.service"
 echo "Reloading the systemd daemon"
 systemctl daemon-reload
 

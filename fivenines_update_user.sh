@@ -7,6 +7,10 @@
 
 set -e
 
+# Mirror URLs (R2 is IPv6-compatible, GitHub is fallback)
+R2_BASE_URL="https://releases.fivenines.io/latest"
+GITHUB_RELEASES_URL="https://github.com/Five-Nines-io/fivenines_agent/releases/latest/download"
+
 INSTALL_DIR="${FIVENINES_INSTALL_DIR:-$HOME/.local/fivenines}"
 CONFIG_DIR="${FIVENINES_CONFIG_DIR:-$HOME/.config/fivenines_agent}"
 
@@ -32,6 +36,41 @@ function print_error() {
 function exit_with_error() {
     print_error "$1"
     exit 1
+}
+
+function download_file() {
+    local url="$1"
+    local output="$2"
+
+    if command -v wget &> /dev/null; then
+        wget -q --connect-timeout=10 "$url" -O "$output"
+    elif command -v curl &> /dev/null; then
+        curl -sL --connect-timeout 10 "$url" -o "$output"
+    else
+        return 1
+    fi
+}
+
+function download_with_fallback() {
+    local filename="$1"
+    local output="$2"
+    local r2_url="${R2_BASE_URL}/${filename}"
+    local github_url="${GITHUB_RELEASES_URL}/${filename}"
+
+    # Try R2 first (IPv6 compatible)
+    if download_file "$r2_url" "$output" 2>/dev/null; then
+        print_success "Downloaded from releases.fivenines.io"
+        return 0
+    fi
+
+    # Fallback to GitHub
+    print_warning "R2 mirror unavailable, trying GitHub..."
+    if download_file "$github_url" "$output" 2>/dev/null; then
+        print_success "Downloaded from GitHub"
+        return 0
+    fi
+
+    return 1
 }
 
 echo ""
@@ -80,18 +119,10 @@ print_success "Agent stopped"
 
 # Download new version
 echo "Downloading latest version..."
-DOWNLOAD_URL="https://github.com/Five-Nines-io/fivenines_agent/releases/latest/download/${BINARY_NAME}.tar.gz"
-TARBALL_PATH="/tmp/${BINARY_NAME}.tar.gz"
+TARBALL_NAME="${BINARY_NAME}.tar.gz"
+TARBALL_PATH="/tmp/${TARBALL_NAME}"
 
-if command -v wget &> /dev/null; then
-    wget -q --connect-timeout=10 "$DOWNLOAD_URL" -O "$TARBALL_PATH" || exit_with_error "Download failed"
-elif command -v curl &> /dev/null; then
-    curl -sL --connect-timeout 10 "$DOWNLOAD_URL" -o "$TARBALL_PATH" || exit_with_error "Download failed"
-else
-    exit_with_error "Neither wget nor curl found"
-fi
-
-print_success "Downloaded"
+download_with_fallback "$TARBALL_NAME" "$TARBALL_PATH" || exit_with_error "Download failed"
 
 # Backup old version
 if [ -d "$INSTALL_DIR/$BINARY_NAME" ]; then

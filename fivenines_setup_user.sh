@@ -11,6 +11,11 @@
 set -e
 
 VERSION="1.0.0"
+
+# Mirror URLs (R2 is IPv6-compatible, GitHub is fallback)
+R2_BASE_URL="https://releases.fivenines.io/latest"
+GITHUB_RELEASES_URL="https://github.com/Five-Nines-io/fivenines_agent/releases/latest/download"
+
 INSTALL_DIR="${FIVENINES_INSTALL_DIR:-$HOME/.local/fivenines}"
 CONFIG_DIR="${FIVENINES_CONFIG_DIR:-$HOME/.config/fivenines_agent}"
 LOG_FILE="$INSTALL_DIR/agent.log"
@@ -89,6 +94,28 @@ function download_file() {
     fi
 }
 
+function download_with_fallback() {
+    local filename="$1"
+    local output="$2"
+    local r2_url="${R2_BASE_URL}/${filename}"
+    local github_url="${GITHUB_RELEASES_URL}/${filename}"
+
+    # Try R2 first (IPv6 compatible)
+    if download_file "$r2_url" "$output" 2>/dev/null; then
+        print_success "Downloaded from releases.fivenines.io"
+        return 0
+    fi
+
+    # Fallback to GitHub
+    print_warning "R2 mirror unavailable, trying GitHub..."
+    if download_file "$github_url" "$output" 2>/dev/null; then
+        print_success "Downloaded from GitHub"
+        return 0
+    fi
+
+    return 1
+}
+
 function detect_architecture() {
     ARCH=$(uname -m)
     case "$ARCH" in
@@ -130,16 +157,15 @@ function save_token() {
 function download_agent() {
     echo "Downloading agent..."
 
-    local download_url="https://github.com/Five-Nines-io/fivenines_agent/releases/latest/download/${BINARY_NAME}.tar.gz"
-    local tarball_path="/tmp/${BINARY_NAME}.tar.gz"
+    local tarball_name="${BINARY_NAME}.tar.gz"
+    local tarball_path="/tmp/${tarball_name}"
 
     # Remove old installation if exists
     if [ -d "$INSTALL_DIR/$BINARY_NAME" ]; then
         rm -rf "$INSTALL_DIR/$BINARY_NAME"
     fi
 
-    download_file "$download_url" "$tarball_path" || exit_with_error "Failed to download agent"
-    print_success "Downloaded from GitHub"
+    download_with_fallback "$tarball_name" "$tarball_path" || exit_with_error "Failed to download agent"
 
     tar -xzf "$tarball_path" -C "$INSTALL_DIR" || exit_with_error "Failed to extract agent"
     print_success "Extracted to $INSTALL_DIR"

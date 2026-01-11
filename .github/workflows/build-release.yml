@@ -270,3 +270,63 @@ jobs:
             release/fivenines-agent-linux-arm64.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Sync releases to Cloudflare R2 for IPv6 support
+  sync-to-r2:
+    needs: [release]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare files for R2
+        run: |
+          mkdir -p r2-upload/latest
+
+          # Copy release binaries
+          cp artifacts/fivenines-agent-linux-amd64/fivenines-agent-linux-amd64.tar.gz r2-upload/latest/
+          cp artifacts/fivenines-agent-linux-arm64/fivenines-agent-linux-arm64.tar.gz r2-upload/latest/
+
+          # Copy static files
+          cp fivenines-agent.service r2-upload/latest/
+          cp fivenines_script.sh r2-upload/latest/
+
+          ls -la r2-upload/latest/
+
+      - name: Install rclone
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone for R2
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf << EOF
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = ${{ secrets.CLOUDFLARE_R2_ACCESS_KEY_ID }}
+          secret_access_key = ${{ secrets.CLOUDFLARE_R2_SECRET_ACCESS_KEY }}
+          endpoint = https://${{ secrets.CLOUDFLARE_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          acl = private
+          EOF
+
+      - name: Sync to R2
+        run: |
+          # Upload to /latest/ (always the most recent release)
+          rclone sync r2-upload/latest/ r2:${{ secrets.R2_BUCKET_NAME }}/latest/ --verbose
+
+          # Also upload to versioned path for reference
+          VERSION="${GITHUB_REF#refs/tags/}"
+          rclone sync r2-upload/latest/ r2:${{ secrets.R2_BUCKET_NAME }}/${VERSION}/ --verbose
+
+          echo "Files synced to R2:"
+          echo "  - https://releases.fivenines.io/latest/fivenines-agent-linux-amd64.tar.gz"
+          echo "  - https://releases.fivenines.io/latest/fivenines-agent-linux-arm64.tar.gz"
+          echo "  - https://releases.fivenines.io/latest/fivenines-agent.service"
+          echo "  - https://releases.fivenines.io/latest/fivenines_script.sh"
