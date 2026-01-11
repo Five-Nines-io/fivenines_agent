@@ -35,6 +35,7 @@ from fivenines_agent.redis import redis_metrics
 from fivenines_agent.nginx import nginx_metrics
 from fivenines_agent.docker import docker_metrics
 from fivenines_agent.qemu import qemu_metrics
+from fivenines_agent.fail2ban import fail2ban_metrics
 from fivenines_agent.synchronizer import Synchronizer
 from fivenines_agent.synchronization_queue import SynchronizationQueue
 from fivenines_agent.ports import listening_ports
@@ -224,6 +225,8 @@ class Agent:
                     data['docker'] = docker_metrics(**self.config['docker'])
                 if self.config.get('qemu'):
                     data['qemu'] = qemu_metrics(**self.config['qemu'])
+                if self.config.get('fail2ban'):
+                    data['fail2ban'] = fail2ban_metrics()
 
                 # Running time and enqueue
                 running_time = time.monotonic() - start

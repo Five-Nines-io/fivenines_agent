@@ -51,6 +51,9 @@ class PermissionProbe:
             'smart_storage': self._can_run_sudo('smartctl', '--version'),
             'raid_storage': self._can_run_sudo('mdadm', '--version'),
 
+            # Security - requires sudo
+            'fail2ban': self._can_run_sudo('fail2ban-client', 'status'),
+
             # ZFS - doesn't need sudo but needs permissions or delegation
             'zfs': self._can_run_zfs(),
 
@@ -214,6 +217,7 @@ def print_capabilities_banner():
     hardware = ['temperatures', 'fans']
     storage = ['smart_storage', 'raid_storage', 'zfs']
     services = ['docker', 'qemu']
+    security = ['fail2ban']
 
     print("")
     print("═" * 60)
@@ -239,6 +243,8 @@ def print_capabilities_banner():
                     hint = " (requires: docker group)"
                 elif cap == 'qemu':
                     hint = " (requires: libvirt group)"
+                elif cap == 'fail2ban':
+                    hint = " (requires: sudo fail2ban-client)"
                 elif cap == 'zfs':
                     hint = " (requires: zfs permissions)"
                 elif cap in ['temperatures', 'fans']:
@@ -251,6 +257,7 @@ def print_capabilities_banner():
     print_section("Hardware Sensors", hardware)
     print_section("Storage", storage)
     print_section("Services", services)
+    print_section("Security", security)
 
     unavailable = probe.get_unavailable()
     if unavailable:
