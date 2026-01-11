@@ -78,33 +78,42 @@ class Synchronizer(Thread):
     def get_conn(self):
         url = api_url()
         if not url.startswith('localhost'):
-            try:
-                resolver = DNSResolver(url.split(':')[0])
-                answers = resolver.resolve("A")
-                if not answers:
-                    log(f"Could not resolve API host: {url}", 'error')
-                    return None
+            hostname = url.split(':')[0]
+            port = 443
+            if ':' in url:
+                port = int(url.split(':')[1])
 
-                api_ip = answers[0].address
-                hostname = url.split(':')[0]
+            resolver = DNSResolver(hostname)
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
 
-                ssl_context = ssl.create_default_context(cafile=certifi.where())
-                port = 443
-                if ':' in url:
-                    port = int(url.split(':')[1])
+            # Try IPv4 first, then fallback to IPv6
+            for record_type, af in [("A", socket.AF_INET), ("AAAA", socket.AF_INET6)]:
+                try:
+                    answers = resolver.resolve(record_type)
+                    if not answers:
+                        continue
 
-                sock = socket.create_connection((api_ip, port), timeout=self.config['request_options']['timeout'])
-                sock = ssl_context.wrap_socket(sock, server_hostname=hostname)
+                    api_ip = answers[0].address
+                    log(f"Trying {record_type} ({api_ip}) for {hostname}", 'debug')
 
-                conn = http.client.HTTPSConnection(
-                    hostname,
-                    timeout=self.config['request_options']['timeout']
-                )
-                conn.sock = sock
-                return conn
-            except Exception as e:
-                log(f"Error during DNS resolution or connection setup: {e}", 'error')
-                return None
+                    sock = socket.socket(af, socket.SOCK_STREAM)
+                    sock.settimeout(self.config['request_options']['timeout'])
+                    sock.connect((api_ip, port))
+                    sock = ssl_context.wrap_socket(sock, server_hostname=hostname)
+
+                    conn = http.client.HTTPSConnection(
+                        hostname,
+                        timeout=self.config['request_options']['timeout']
+                    )
+                    conn.sock = sock
+                    log(f"Connected via {record_type} ({api_ip})", 'debug')
+                    return conn
+                except Exception as e:
+                    log(f"Failed to connect via {record_type}: {e}", 'debug')
+                    continue
+
+            log(f"Could not connect to API host: {hostname} (tried IPv4 and IPv6)", 'error')
+            return None
         else:
             conn = http.client.HTTPConnection(
                 url,
