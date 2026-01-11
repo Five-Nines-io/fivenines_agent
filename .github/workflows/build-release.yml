@@ -293,9 +293,17 @@ jobs:
           cp artifacts/fivenines-agent-linux-amd64/fivenines-agent-linux-amd64.tar.gz r2-upload/latest/
           cp artifacts/fivenines-agent-linux-arm64/fivenines-agent-linux-arm64.tar.gz r2-upload/latest/
 
-          # Copy static files
+          # Copy static files (service and boot script)
           cp fivenines-agent.service r2-upload/latest/
           cp fivenines_script.sh r2-upload/latest/
+
+          # Copy install/update/uninstall scripts
+          cp fivenines_setup.sh r2-upload/latest/
+          cp fivenines_setup_user.sh r2-upload/latest/
+          cp fivenines_update.sh r2-upload/latest/
+          cp fivenines_update_user.sh r2-upload/latest/
+          cp fivenines_uninstall.sh r2-upload/latest/
+          cp fivenines_uninstall_user.sh r2-upload/latest/
 
           ls -la r2-upload/latest/
 
@@ -319,11 +327,11 @@ jobs:
       - name: Sync to R2
         run: |
           # Upload to /latest/ (always the most recent release)
-          rclone sync r2-upload/latest/ r2:${{ secrets.R2_BUCKET_NAME }}/latest/ --verbose
+          rclone sync r2-upload/latest/ r2:${{ secrets.R2_BUCKET_NAME }}/latest/ --s3-no-check-bucket --verbose
 
           # Also upload to versioned path for reference
           VERSION="${GITHUB_REF#refs/tags/}"
-          rclone sync r2-upload/latest/ r2:${{ secrets.R2_BUCKET_NAME }}/${VERSION}/ --verbose
+          rclone sync r2-upload/latest/ r2:${{ secrets.R2_BUCKET_NAME }}/${VERSION}/ --s3-no-check-bucket --verbose
 
           echo "Files synced to R2:"
           echo "  - https://releases.fivenines.io/latest/fivenines-agent-linux-amd64.tar.gz"
