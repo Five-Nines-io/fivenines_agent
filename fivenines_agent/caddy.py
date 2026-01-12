@@ -1,6 +1,21 @@
+import re
 import requests
 
 from fivenines_agent.debug import debug, log
+
+
+def _parse_prometheus_metric(metrics_text, metric_name):
+    """Parse a simple Prometheus metric value from metrics text."""
+    # Match lines like: metric_name 123.45 or metric_name{labels} 123.45
+    pattern = rf'^{re.escape(metric_name)}(?:\{{[^}}]*\}})?\s+([\d.e+-]+)'
+    for line in metrics_text.split('\n'):
+        match = re.match(pattern, line)
+        if match:
+            try:
+                return float(match.group(1))
+            except ValueError:
+                return None
+    return None
 
 
 # Caddy Admin API metrics collector
@@ -101,6 +116,40 @@ def caddy_metrics(admin_api_url='http://localhost:2019'):
             automation = tls_app.get('automation', {})
             policies = automation.get('policies', [])
             metrics['tls_automation_policies'] = len(policies) if policies else 0
+
+        # Get process metrics from Prometheus endpoint
+        try:
+            prom_response = requests.get(f'{admin_api_url}/metrics', timeout=5)
+            if prom_response.status_code == 200:
+                prom_text = prom_response.text
+
+                # Process metrics
+                cpu_seconds = _parse_prometheus_metric(prom_text, 'process_cpu_seconds_total')
+                if cpu_seconds is not None:
+                    metrics['process_cpu_seconds'] = cpu_seconds
+
+                memory_bytes = _parse_prometheus_metric(prom_text, 'process_resident_memory_bytes')
+                if memory_bytes is not None:
+                    metrics['process_memory_bytes'] = int(memory_bytes)
+
+                open_fds = _parse_prometheus_metric(prom_text, 'process_open_fds')
+                if open_fds is not None:
+                    metrics['process_open_fds'] = int(open_fds)
+
+                goroutines = _parse_prometheus_metric(prom_text, 'go_goroutines')
+                if goroutines is not None:
+                    metrics['goroutines'] = int(goroutines)
+
+                # Network traffic through Caddy
+                net_rx = _parse_prometheus_metric(prom_text, 'process_network_receive_bytes_total')
+                if net_rx is not None:
+                    metrics['network_receive_bytes'] = int(net_rx)
+
+                net_tx = _parse_prometheus_metric(prom_text, 'process_network_transmit_bytes_total')
+                if net_tx is not None:
+                    metrics['network_transmit_bytes'] = int(net_tx)
+        except Exception as e:
+            log(f"Could not fetch Caddy Prometheus metrics: {e}", 'debug')
 
         return metrics
 
