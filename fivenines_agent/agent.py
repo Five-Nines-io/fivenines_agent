@@ -37,6 +37,7 @@ from fivenines_agent.docker import docker_metrics
 from fivenines_agent.qemu import qemu_metrics
 from fivenines_agent.fail2ban import fail2ban_metrics
 from fivenines_agent.caddy import caddy_metrics
+from fivenines_agent.postgresql import postgresql_metrics
 from fivenines_agent.synchronizer import Synchronizer
 from fivenines_agent.synchronization_queue import SynchronizationQueue
 from fivenines_agent.ports import listening_ports
@@ -230,6 +231,8 @@ class Agent:
                     data['fail2ban'] = fail2ban_metrics()
                 if self.config.get('caddy'):
                     data['caddy'] = caddy_metrics(**self.config['caddy'])
+                if self.config.get('postgresql'):
+                    data['postgresql'] = postgresql_metrics(**self.config['postgresql'])
 
                 # Running time and enqueue
                 running_time = time.monotonic() - start
