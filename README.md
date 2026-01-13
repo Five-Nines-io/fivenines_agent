@@ -98,6 +98,7 @@ The agent works without sudo, but these features will be unavailable:
 |---------|-------------|
 | SMART disk health | `sudo smartctl` |
 | RAID array status | `sudo mdadm` |
+| Fail2ban status | `sudo fail2ban-client` |
 | Docker containers | `docker` group membership |
 | QEMU/KVM VMs | `libvirt` group membership |
 | ZFS pools | ZFS delegation or permissions |
@@ -150,37 +151,92 @@ sudo systemctl restart fivenines-agent
 When the agent starts, it displays a banner showing which features are available:
 
 ```
-═══════════════════════════════════════════════════════════════
+============================================================
   Fivenines Agent - Capabilities Detection
-═══════════════════════════════════════════════════════════════
+============================================================
 
   Core Metrics:
-    ✓ Cpu
-    ✓ Memory
-    ✓ Load Average
-    ✓ Io
-    ✓ Network
-    ✓ Partitions
-    ✓ File Handles
-    ✓ Ports
-    ✓ Processes
+    [OK] Cpu
+    [OK] Memory
+    [OK] Load Average
+    [OK] Io
+    [OK] Network
+    [OK] Partitions
+    [OK] File Handles
+    [OK] Ports
+    [OK] Processes
 
   Hardware Sensors:
-    ✓ Temperatures
-    ✗ Fans (no accessible sensors)
+    [OK] Temperatures
+    [X] Fans (no accessible sensors)
 
   Storage:
-    ✗ Smart Storage (requires: sudo smartctl)
-    ✗ Raid Storage (requires: sudo mdadm)
+    [X] Smart Storage (requires: sudo smartctl)
+    [X] Raid Storage (requires: sudo mdadm)
 
   Services:
-    ✓ Docker
-    ✗ Qemu (requires: libvirt group)
+    [OK] Docker
+    [OK] Caddy
+    [X] Qemu (requires: libvirt group)
 
-  ⚠ Some features unavailable. See: https://docs.fivenines.io/agent/permissions
+  Security:
+    [X] Fail2Ban (requires: sudo fail2ban-client)
 
-═══════════════════════════════════════════════════════════════
+  [!] Some features unavailable. See: https://docs.fivenines.io/agent/permissions
+
+============================================================
 ```
+
+## Application Integrations
+
+The agent can collect metrics from various applications when configured.
+
+### Caddy
+
+Collects metrics from Caddy's admin API (default: `http://localhost:2019`):
+- Upstream health status
+- HTTP server configuration
+- TLS automation policies
+- Process metrics (CPU, memory, goroutines)
+
+Caddy's admin API is enabled by default. No additional configuration required.
+
+### Nginx
+
+Collects metrics from Nginx's stub status module:
+- Active connections
+- Reading/writing/waiting connections
+
+Requires the `stub_status` module enabled in Nginx config:
+```nginx
+location /nginx_status {
+    stub_status;
+    allow 127.0.0.1;
+    deny all;
+}
+```
+
+### PostgreSQL
+
+Collects metrics via `psql`:
+- Connection counts by state
+- Database statistics (transactions, cache hit ratio)
+- Database sizes
+- Replication lag (for replicas)
+- Lock counts
+
+Requires `psql` available and appropriate database credentials.
+
+### Redis
+
+Collects metrics via Redis protocol:
+- Version and uptime
+- Connected/blocked clients
+- Commands processed
+- Evicted/expired keys
+- Per-database key counts
+
+Connects to `localhost:6379` by default.
 
 ## Contribute
 
