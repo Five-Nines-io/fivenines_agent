@@ -93,8 +93,16 @@ class PermissionProbe:
     def _can_read(self, path):
         """Check if a file/directory is readable."""
         try:
-            return os.access(path, os.R_OK)
-        except Exception:
+            exists = os.path.exists(path)
+            if not exists:
+                log(f"_can_read: '{path}' does not exist", 'debug')
+                return False
+
+            readable = os.access(path, os.R_OK)
+            log(f"_can_read: '{path}' -> {'READABLE' if readable else 'NOT READABLE'}", 'debug')
+            return readable
+        except Exception as e:
+            log(f"_can_read: '{path}' exception: {type(e).__name__}: {e}", 'debug')
             return False
 
     def _can_run_sudo(self, cmd, *args):
@@ -102,44 +110,89 @@ class PermissionProbe:
         Check if we can run a command with sudo non-interactively.
         Uses sudo -n which fails immediately if password is required.
         """
-        if not shutil.which(cmd):
+        cmd_path = shutil.which(cmd)
+        full_cmd = ['sudo', '-n', cmd, *args]
+        full_cmd_str = ' '.join(full_cmd)
+
+        if not cmd_path:
+            log(f"_can_run_sudo: '{cmd}' not found in PATH", 'debug')
             return False
+
+        log(f"_can_run_sudo: '{cmd}' found at {cmd_path}", 'debug')
+        log(f"_can_run_sudo: running '{full_cmd_str}'", 'debug')
 
         try:
             result = subprocess.run(
-                ['sudo', '-n', cmd, *args],
+                full_cmd,
                 capture_output=True,
                 timeout=5
             )
-            return result.returncode == 0
+            stdout = result.stdout.decode('utf-8', errors='ignore').strip()
+            stderr = result.stderr.decode('utf-8', errors='ignore').strip()
+
+            log(f"_can_run_sudo: '{cmd}' returned code {result.returncode}", 'debug')
+            if stdout:
+                log(f"_can_run_sudo: '{cmd}' stdout: {stdout[:200]}", 'debug')
+            if stderr:
+                log(f"_can_run_sudo: '{cmd}' stderr: {stderr[:200]}", 'debug')
+
+            success = result.returncode == 0
+            log(f"_can_run_sudo: '{cmd}' -> {'AVAILABLE' if success else 'UNAVAILABLE'}", 'debug')
+            return success
         except subprocess.TimeoutExpired:
+            log(f"_can_run_sudo: '{cmd}' timed out after 5s", 'debug')
             return False
-        except Exception:
+        except Exception as e:
+            log(f"_can_run_sudo: '{cmd}' exception: {type(e).__name__}: {e}", 'debug')
             return False
 
     def _can_access_hwmon(self):
         """Check if hardware monitoring sensors are readable."""
         hwmon_path = '/sys/class/hwmon'
+        log(f"_can_access_hwmon: checking {hwmon_path}", 'debug')
+
         if not os.path.exists(hwmon_path):
+            log(f"_can_access_hwmon: {hwmon_path} does not exist", 'debug')
             return False
 
         try:
+            devices = os.listdir(hwmon_path)
+            log(f"_can_access_hwmon: found {len(devices)} hwmon devices: {devices}", 'debug')
+
             # Check if we can read any hwmon device
-            for device in os.listdir(hwmon_path):
+            for device in devices:
                 device_path = os.path.join(hwmon_path, device)
-                temp_files = [f for f in os.listdir(device_path) if f.startswith('temp') and f.endswith('_input')]
-                for temp_file in temp_files:
-                    temp_path = os.path.join(device_path, temp_file)
-                    if os.access(temp_path, os.R_OK):
-                        return True
+                try:
+                    all_files = os.listdir(device_path)
+                    temp_files = [f for f in all_files if f.startswith('temp') and f.endswith('_input')]
+                    log(f"_can_access_hwmon: {device} has {len(temp_files)} temp files", 'debug')
+
+                    for temp_file in temp_files:
+                        temp_path = os.path.join(device_path, temp_file)
+                        readable = os.access(temp_path, os.R_OK)
+                        log(f"_can_access_hwmon: {temp_path} -> {'READABLE' if readable else 'NOT READABLE'}", 'debug')
+                        if readable:
+                            log(f"_can_access_hwmon: -> AVAILABLE (found readable sensor)", 'debug')
+                            return True
+                except Exception as e:
+                    log(f"_can_access_hwmon: error reading {device}: {type(e).__name__}: {e}", 'debug')
+                    continue
+
+            log("_can_access_hwmon: -> UNAVAILABLE (no readable sensors found)", 'debug')
             return False
-        except Exception:
+        except Exception as e:
+            log(f"_can_access_hwmon: exception: {type(e).__name__}: {e}", 'debug')
             return False
 
     def _can_run_zfs(self):
         """Check if zpool commands work."""
-        if not shutil.which('zpool'):
+        zpool_path = shutil.which('zpool')
+        if not zpool_path:
+            log("_can_run_zfs: 'zpool' not found in PATH", 'debug')
             return False
+
+        log(f"_can_run_zfs: 'zpool' found at {zpool_path}", 'debug')
+        log("_can_run_zfs: running 'zpool list -H'", 'debug')
 
         try:
             # Try running zpool list - doesn't need sudo on properly configured systems
@@ -148,23 +201,49 @@ class PermissionProbe:
                 capture_output=True,
                 timeout=5
             )
+            stdout = result.stdout.decode('utf-8', errors='ignore').strip()
+            stderr = result.stderr.decode('utf-8', errors='ignore').strip()
+
+            log(f"_can_run_zfs: returned code {result.returncode}", 'debug')
+            if stdout:
+                log(f"_can_run_zfs: stdout: {stdout[:200]}", 'debug')
+            if stderr:
+                log(f"_can_run_zfs: stderr: {stderr[:200]}", 'debug')
+
             # Return code 0 means success, even if no pools exist
             # Return code 1 with "no pools available" is also OK (ZFS works, just no pools)
             if result.returncode == 0:
+                log("_can_run_zfs: -> AVAILABLE (returncode 0)", 'debug')
                 return True
-            stderr = result.stderr.decode('utf-8', errors='ignore').lower()
-            if 'no pools available' in stderr:
+            if 'no pools available' in stderr.lower():
+                log("_can_run_zfs: -> AVAILABLE (no pools but ZFS works)", 'debug')
                 return True
+
+            log("_can_run_zfs: -> UNAVAILABLE", 'debug')
             return False
-        except Exception:
+        except subprocess.TimeoutExpired:
+            log("_can_run_zfs: timed out after 5s", 'debug')
+            return False
+        except Exception as e:
+            log(f"_can_run_zfs: exception: {type(e).__name__}: {e}", 'debug')
             return False
 
     def _can_access_docker(self):
         """Check if Docker socket is accessible."""
         docker_socket = '/var/run/docker.sock'
+        log(f"_can_access_docker: checking {docker_socket}", 'debug')
+
         if not os.path.exists(docker_socket):
+            log(f"_can_access_docker: {docker_socket} does not exist", 'debug')
             return False
-        return os.access(docker_socket, os.R_OK | os.W_OK)
+
+        readable = os.access(docker_socket, os.R_OK)
+        writable = os.access(docker_socket, os.W_OK)
+        accessible = readable and writable
+
+        log(f"_can_access_docker: readable={readable}, writable={writable}", 'debug')
+        log(f"_can_access_docker: -> {'AVAILABLE' if accessible else 'UNAVAILABLE'}", 'debug')
+        return accessible
 
     def _can_access_libvirt(self):
         """Check if libvirt socket is accessible."""
@@ -173,9 +252,21 @@ class PermissionProbe:
             '/var/run/libvirt/libvirt-sock-ro',
             '/var/run/libvirt/libvirt-sock',
         ]
+        log(f"_can_access_libvirt: checking socket paths: {socket_paths}", 'debug')
+
         for path in socket_paths:
-            if os.path.exists(path) and os.access(path, os.R_OK):
+            exists = os.path.exists(path)
+            if not exists:
+                log(f"_can_access_libvirt: {path} does not exist", 'debug')
+                continue
+
+            readable = os.access(path, os.R_OK)
+            log(f"_can_access_libvirt: {path} exists, readable={readable}", 'debug')
+            if readable:
+                log(f"_can_access_libvirt: -> AVAILABLE (via {path})", 'debug')
                 return True
+
+        log("_can_access_libvirt: -> UNAVAILABLE (no accessible sockets)", 'debug')
         return False
 
     def get(self, capability, default=False):
