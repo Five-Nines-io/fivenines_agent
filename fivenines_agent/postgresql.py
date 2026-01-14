@@ -2,6 +2,7 @@ import subprocess
 import json
 
 from fivenines_agent.debug import debug, log
+from fivenines_agent.subprocess_utils import get_clean_env
 
 
 # PostgreSQL metrics collector
@@ -31,12 +32,16 @@ def _run_psql_query(query, host='localhost', port=5432, user='postgres', passwor
     ]
 
     try:
+        # Use clean env to avoid PyInstaller library conflicts, merge in PGPASSWORD if set
+        clean_env = get_clean_env()
+        if env:
+            clean_env.update(env)
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             timeout=10,
-            env={**dict(__import__('os').environ), **env} if env else None
+            env=clean_env
         )
         if result.returncode != 0:
             log(f"psql error: {result.stderr}", 'debug')

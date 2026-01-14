@@ -3,6 +3,7 @@ import time
 import re
 
 from fivenines_agent.debug import debug, log
+from fivenines_agent.subprocess_utils import get_clean_env
 
 _raid_cache = {
     "timestamp": 0,
@@ -22,7 +23,8 @@ def mdadm_available() -> bool:
         result = subprocess.run(
             ["sudo", "-n", "mdadm", "--version"],
             capture_output=True,
-            timeout=5
+            timeout=5,
+            env=get_clean_env()
         )
         return result.returncode == 0
     except subprocess.TimeoutExpired:
@@ -39,7 +41,8 @@ def get_mdadm_version():
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            check=True
+            check=True,
+            env=get_clean_env()
         )
 
         return result.stdout.split('\n')[0].strip()
@@ -127,7 +130,8 @@ def get_raid_info(device):
 
         detail_result = subprocess.run(
             ["sudo", "mdadm", "--detail", device],
-            capture_output=True, text=True, check=True
+            capture_output=True, text=True, check=True,
+            env=get_clean_env()
         )
 
         in_component_section = False

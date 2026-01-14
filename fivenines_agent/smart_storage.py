@@ -4,6 +4,7 @@ import os
 import time
 
 from fivenines_agent.debug import debug, log
+from fivenines_agent.subprocess_utils import get_clean_env
 
 _health_storage_cache = {
     "timestamp": 0,
@@ -126,7 +127,8 @@ def smartctl_available():
         result = subprocess.run(
             ["sudo", "-n", "smartctl", "--version"],
             capture_output=True,
-            timeout=5
+            timeout=5,
+            env=get_clean_env()
         )
         return result.returncode == 0
     except subprocess.TimeoutExpired:
@@ -144,7 +146,8 @@ def nvme_cli_available():
         result = subprocess.run(
             ["sudo", "-n", "nvme", "version"],
             capture_output=True,
-            timeout=5
+            timeout=5,
+            env=get_clean_env()
         )
         return result.returncode == 0
     except subprocess.TimeoutExpired:
@@ -167,7 +170,12 @@ def list_storage_devices():
     """List all storage devices using smartctl."""
     devices = []
     try:
-        lines = subprocess.Popen('sudo smartctl --scan', stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True).communicate()[0].decode().splitlines()
+        result = subprocess.run(
+            ['sudo', 'smartctl', '--scan'],
+            capture_output=True,
+            env=get_clean_env()
+        )
+        lines = result.stdout.decode().splitlines()
         for line in lines:
             device = line.split(' ')[0]
             if not is_partition(device):
@@ -186,7 +194,8 @@ def get_nvme_enhanced_info(device):
     try:
         result = subprocess.run(
             ["sudo", "nvme", "smart-log", device, "-o", "json"],
-            capture_output=True, text=True, check=True
+            capture_output=True, text=True, check=True,
+            env=get_clean_env()
         )
         raw = json.loads(result.stdout)
 
@@ -212,7 +221,12 @@ def get_storage_info(device):
         results = {
             "device": device.split('/')[-1]
         }
-        storage_stats = os.popen('sudo smartctl -A -H {}'.format(device)).read().splitlines()
+        proc_result = subprocess.run(
+            ['sudo', 'smartctl', '-A', '-H', device],
+            capture_output=True, text=True,
+            env=get_clean_env()
+        )
+        storage_stats = proc_result.stdout.splitlines()
 
         # Skip header lines until we find the SMART data section
         found_section = False
@@ -297,7 +311,8 @@ def get_smartctl_version():
     try:
         result = subprocess.run(
             ["sudo", "smartctl", "--version"],
-            capture_output=True, text=True, check=True
+            capture_output=True, text=True, check=True,
+            env=get_clean_env()
         )
         # Extract version from first line
         version_line = result.stdout.split('\n')[0]
@@ -311,7 +326,8 @@ def get_nvme_cli_version():
     try:
         result = subprocess.run(
             ["sudo", "nvme", "version"],
-            capture_output=True, text=True, check=True
+            capture_output=True, text=True, check=True,
+            env=get_clean_env()
         )
         # Extract version from first line
         version_line = result.stdout.split('\n')[0]
@@ -325,7 +341,8 @@ def get_storage_identification(device):
     try:
         result = subprocess.run(
             ["sudo", "smartctl", "-i", device],
-            capture_output=True, text=True, check=True
+            capture_output=True, text=True, check=True,
+            env=get_clean_env()
         )
 
         results = { "device": device.split('/')[-1] }

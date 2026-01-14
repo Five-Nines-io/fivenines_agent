@@ -8,9 +8,13 @@ import subprocess
 import shutil
 import time
 from fivenines_agent.debug import log
+from fivenines_agent.subprocess_utils import get_clean_env
 
 # Re-probe interval in seconds (5 minutes)
 REPROBE_INTERVAL = 300
+
+# Max chars for stdout/stderr in debug logs
+DEBUG_OUTPUT_LIMIT = 500
 
 
 class PermissionProbe:
@@ -125,16 +129,17 @@ class PermissionProbe:
             result = subprocess.run(
                 full_cmd,
                 capture_output=True,
-                timeout=5
+                timeout=5,
+                env=get_clean_env()
             )
             stdout = result.stdout.decode('utf-8', errors='ignore').strip()
             stderr = result.stderr.decode('utf-8', errors='ignore').strip()
 
             log(f"_can_run_sudo: '{cmd}' returned code {result.returncode}", 'debug')
             if stdout:
-                log(f"_can_run_sudo: '{cmd}' stdout: {stdout[:200]}", 'debug')
+                log(f"_can_run_sudo: '{cmd}' stdout: {stdout[:DEBUG_OUTPUT_LIMIT]}", 'debug')
             if stderr:
-                log(f"_can_run_sudo: '{cmd}' stderr: {stderr[:200]}", 'debug')
+                log(f"_can_run_sudo: '{cmd}' stderr: {stderr[:DEBUG_OUTPUT_LIMIT]}", 'debug')
 
             success = result.returncode == 0
             log(f"_can_run_sudo: '{cmd}' -> {'AVAILABLE' if success else 'UNAVAILABLE'}", 'debug')
@@ -199,16 +204,17 @@ class PermissionProbe:
             result = subprocess.run(
                 ['zpool', 'list', '-H'],
                 capture_output=True,
-                timeout=5
+                timeout=5,
+                env=get_clean_env()
             )
             stdout = result.stdout.decode('utf-8', errors='ignore').strip()
             stderr = result.stderr.decode('utf-8', errors='ignore').strip()
 
             log(f"_can_run_zfs: returned code {result.returncode}", 'debug')
             if stdout:
-                log(f"_can_run_zfs: stdout: {stdout[:200]}", 'debug')
+                log(f"_can_run_zfs: stdout: {stdout[:DEBUG_OUTPUT_LIMIT]}", 'debug')
             if stderr:
-                log(f"_can_run_zfs: stderr: {stderr[:200]}", 'debug')
+                log(f"_can_run_zfs: stderr: {stderr[:DEBUG_OUTPUT_LIMIT]}", 'debug')
 
             # Return code 0 means success, even if no pools exist
             # Return code 1 with "no pools available" is also OK (ZFS works, just no pools)
