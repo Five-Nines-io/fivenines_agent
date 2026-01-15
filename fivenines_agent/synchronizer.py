@@ -11,7 +11,7 @@ import socket
 
 from fivenines_agent.env import api_url
 from fivenines_agent.dns_resolver import DNSResolver
-from fivenines_agent.debug import log
+from fivenines_agent.debug import log, debug
 
 class Synchronizer(Thread):
     def __init__(self, token, queue):
@@ -39,7 +39,14 @@ class Synchronizer(Thread):
     def send_request(self, data):
         log(f'Sending request: {data}', 'debug')
         try_count = 0
-        compressed_data = gzip.compress(json.dumps(data).encode('utf-8'))
+
+        with debug('json_serialize') as d:
+            json_data = json.dumps(data).encode('utf-8')
+            d.result = f'{len(json_data)} bytes'
+
+        with debug('gzip_compress') as d:
+            compressed_data = gzip.compress(json_data)
+            d.result = f'{len(json_data)} -> {len(compressed_data)} bytes ({100 - len(compressed_data) * 100 // len(json_data)}% reduction)'
         headers = {
             'Content-Type': 'application/json',
             'Content-Encoding': 'gzip',
