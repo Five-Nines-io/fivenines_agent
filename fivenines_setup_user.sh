@@ -5,6 +5,14 @@
 #
 # Usage: bash fivenines_setup_user.sh YOUR_TOKEN
 #
+# Environment variables:
+#   FIVENINES_AGENT_URL   - Custom download URL for the agent tarball (e.g., feature branch builds)
+#   FIVENINES_INSTALL_DIR - Custom install directory (default: ~/.local/fivenines)
+#   FIVENINES_CONFIG_DIR  - Custom config directory (default: ~/.config/fivenines_agent)
+#
+# Example with custom build:
+#   FIVENINES_AGENT_URL="https://github.com/Five-Nines-io/fivenines_agent/releases/download/feature-branch/fivenines-agent-linux-amd64.tar.gz" bash fivenines_setup_user.sh YOUR_TOKEN
+#
 # This installs the agent in your home directory and runs as your user.
 # Some features (SMART, RAID) won't be available without sudo permissions.
 
@@ -165,7 +173,14 @@ function download_agent() {
         rm -rf "$INSTALL_DIR/$BINARY_NAME"
     fi
 
-    download_with_fallback "$tarball_name" "$tarball_path" || exit_with_error "Failed to download agent"
+    # Use custom URL if provided, otherwise use fallback mechanism
+    if [ -n "${FIVENINES_AGENT_URL:-}" ]; then
+        print_warning "Using custom agent URL: $FIVENINES_AGENT_URL"
+        download_file "$FIVENINES_AGENT_URL" "$tarball_path" || exit_with_error "Failed to download agent from custom URL"
+        print_success "Downloaded from custom URL"
+    else
+        download_with_fallback "$tarball_name" "$tarball_path" || exit_with_error "Failed to download agent"
+    fi
 
     tar -xzf "$tarball_path" -C "$INSTALL_DIR" || exit_with_error "Failed to extract agent"
     print_success "Extracted to $INSTALL_DIR"
