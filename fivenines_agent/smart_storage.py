@@ -15,6 +15,81 @@ _identification_storage_cache = {
     "data": []
 }
 
+# SMART attributes where normalized VALUE (0-100%) is more meaningful than RAW_VALUE
+# These typically represent wear/life percentages
+SMART_LIFE_ATTRIBUTES = {'177', '202', '231', '232', '233'}
+
+# Vendor-specific life attribute mapping
+# Maps (pattern_type, pattern) -> attribute_id
+# pattern_type: 'model_family' or 'device_model'
+# The attribute's normalized VALUE (0-100) represents life remaining
+VENDOR_LIFE_ATTRIBUTE_MAP = [
+    # Samsung SSDs - use attribute 177 (Wear_Leveling_Count)
+    ('model_family', 'Samsung', '177'),
+    ('device_model', 'Samsung', '177'),
+    # Intel SSDs - use attribute 233 (Media_Wearout_Indicator)
+    ('model_family', 'Intel', '233'),
+    ('device_model', 'Intel', '233'),
+    # Crucial/Micron SSDs - use attribute 202 (Percent_Lifetime_Remain)
+    ('model_family', 'Crucial', '202'),
+    ('device_model', 'Crucial', '202'),
+    ('model_family', 'Micron', '202'),
+    ('device_model', 'Micron', '202'),
+    # SanDisk SSDs - use attribute 230 or 232
+    ('model_family', 'SanDisk', '232'),
+    ('device_model', 'SanDisk', '232'),
+    # Western Digital SSDs - use attribute 231
+    ('model_family', 'Western Digital', '231'),
+    ('device_model', 'WD', '231'),
+    ('device_model', 'WDC', '231'),
+    # Kingston SSDs - use attribute 231
+    ('model_family', 'Kingston', '231'),
+    ('device_model', 'Kingston', '231'),
+    # Toshiba/Kioxia SSDs - use attribute 233
+    ('model_family', 'Toshiba', '233'),
+    ('device_model', 'Toshiba', '233'),
+    ('model_family', 'KIOXIA', '233'),
+    ('device_model', 'KIOXIA', '233'),
+    # SK Hynix SSDs - use attribute 231
+    ('model_family', 'SK hynix', '231'),
+    ('device_model', 'SK hynix', '231'),
+    ('device_model', 'HFS', '231'),  # SK Hynix model prefix
+    # ADATA SSDs - use attribute 231
+    ('model_family', 'ADATA', '231'),
+    ('device_model', 'ADATA', '231'),
+    # Transcend SSDs - use attribute 177
+    ('model_family', 'Transcend', '177'),
+    ('device_model', 'Transcend', '177'),
+    # PNY SSDs - use attribute 231
+    ('model_family', 'PNY', '231'),
+    ('device_model', 'PNY', '231'),
+    # Seagate SSDs - use attribute 231
+    ('model_family', 'Seagate', '231'),
+    ('device_model', 'Seagate', '231'),
+    # Corsair SSDs - use attribute 231
+    ('model_family', 'Corsair', '231'),
+    ('device_model', 'Corsair', '231'),
+    # Plextor SSDs - use attribute 177
+    ('model_family', 'Plextor', '177'),
+    ('device_model', 'Plextor', '177'),
+    # OCZ SSDs - use attribute 233
+    ('model_family', 'OCZ', '233'),
+    ('device_model', 'OCZ', '233'),
+    # Lite-On SSDs - use attribute 177
+    ('model_family', 'LITE-ON', '177'),
+    ('device_model', 'LITE-ON', '177'),
+    # Team Group SSDs - use attribute 231
+    ('model_family', 'Team', '231'),
+    ('device_model', 'Team', '231'),
+    # Patriot SSDs - use attribute 231
+    ('model_family', 'Patriot', '231'),
+    ('device_model', 'Patriot', '231'),
+]
+
+# Fallback priority order for unknown SSDs
+# Check these attributes in order, use first one with valid value
+LIFE_ATTRIBUTE_FALLBACK_ORDER = ['231', '232', '233', '177', '202']
+
 # Standard SMART attribute names by ID
 SMART_ATTRIBUTE_NAMES = {
     '1': 'raw_read_error_rate',
@@ -30,6 +105,7 @@ SMART_ATTRIBUTE_NAMES = {
     '11': 'recalibration_retries',
     '12': 'power_cycle_count',
     '13': 'soft_read_error_rate',
+    '177': 'wear_leveling_count',
     '183': 'runtime_bad_block',
     '184': 'end_to_end_error',
     '187': 'reported_uncorrectable_errors',
@@ -80,6 +156,64 @@ SMART_ATTRIBUTE_NAMES = {
     '252': 'newly_added_bad_flash_block',
     '254': 'free_fall_protection'
 }
+
+def get_life_attribute_for_drive(model_family, device_model):
+    """
+    Determine which SMART attribute to use for life remaining based on drive vendor.
+    Returns the attribute ID string (e.g., '177') or None if unknown.
+    """
+    # Try vendor-specific mapping first
+    for field_type, pattern, attr_id in VENDOR_LIFE_ATTRIBUTE_MAP:
+        value = model_family if field_type == 'model_family' else device_model
+        if value and pattern.lower() in value.lower():
+            return attr_id
+    return None
+
+
+def calculate_percentage_used(results, model_family=None, device_model=None):
+    """
+    Calculate unified percentage_used for a drive.
+
+    For NVMe: uses 100 - percent_used
+    For SATA SSD: uses vendor-specific attribute or fallback heuristic
+    For HDD: returns None (not applicable)
+
+    Returns the percentage used (0-100) or None if not available.
+    """
+    device_type = results.get('device_type')
+
+    # NVMe drives: use standardized percent_used
+    if device_type == 'nvme':
+        percent_used = results.get('percent_used')
+        if percent_used is not None:
+            return percent_used
+        return None
+
+    # HDD detection: has rotation rate that's not "Solid State Device"
+    rotation_rate = results.get('rotation_rate', '')
+    if rotation_rate and 'Solid State' not in rotation_rate:
+        return None
+
+    # SATA SSD: try vendor-specific attribute first
+    life_attr_id = get_life_attribute_for_drive(model_family, device_model)
+
+    if life_attr_id:
+        attr_name = SMART_ATTRIBUTE_NAMES.get(life_attr_id, f"smart_attr_{life_attr_id}")
+        pct_key = f"{attr_name}_pct"
+        if pct_key in results and results[pct_key] is not None:
+            value = results[pct_key]
+            return max(0, min(100, 100 - value))
+
+    # Fallback: try common life attributes in priority order
+    for attr_id in LIFE_ATTRIBUTE_FALLBACK_ORDER:
+        attr_name = SMART_ATTRIBUTE_NAMES.get(attr_id, f"smart_attr_{attr_id}")
+        pct_key = f"{attr_name}_pct"
+        if pct_key in results and results[pct_key] is not None:
+            value = results[pct_key]
+            return max(0, min(100, 100 - value))
+
+    return None
+
 
 STORAGE_IDENTIFICATION_ATTRIBUTES = {
     "Model Number": "model_family",
@@ -241,6 +375,9 @@ def get_storage_info(device):
                             # Use standardized attribute name if available
                             attr_name = SMART_ATTRIBUTE_NAMES.get(attr_id, f"smart_attr_{attr_id}")
                             results[attr_name] = safe_int_conversion(parts[9])
+                            # For wear/life attributes, also capture the normalized VALUE (0-100%)
+                            if attr_id in SMART_LIFE_ATTRIBUTES:
+                                results[f"{attr_name}_pct"] = safe_int_conversion(parts[3])
                     except Exception as e:
                         log(f"Error parsing ATA attribute: {e}", 'error')
                 continue
@@ -263,6 +400,15 @@ def get_storage_info(device):
         if current_section == "nvme" and nvme_cli_available():
             nvme_info = get_nvme_enhanced_info(device)
             results.update(nvme_info)
+
+        # Calculate unified percentage_used
+        percentage_used = calculate_percentage_used(
+            results,
+            model_family=results.get('model_family'),
+            device_model=results.get('device_model')
+        )
+        if percentage_used is not None:
+            results['percentage_used'] = percentage_used
 
         return results
 
