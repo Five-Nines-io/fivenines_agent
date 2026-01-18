@@ -4,6 +4,7 @@ import subprocess
 import time
 import re
 from fivenines_agent.debug import debug, log
+from fivenines_agent.subprocess_utils import get_clean_env
 
 _fail2ban_cache = {
     "timestamp": 0,
@@ -22,7 +23,8 @@ def fail2ban_available() -> bool:
         result = subprocess.run(
             ["sudo", "-n", "fail2ban-client", "status"],
             capture_output=True,
-            timeout=5
+            timeout=5,
+            env=get_clean_env()
         )
         return result.returncode == 0
     except subprocess.TimeoutExpired:
@@ -39,7 +41,8 @@ def get_fail2ban_version() -> str:
             ["sudo", "-n", "fail2ban-client", "version"],
             capture_output=True,
             text=True,
-            timeout=5
+            timeout=5,
+            env=get_clean_env()
         )
         if result.returncode == 0:
             # Output is like "Fail2Ban v0.11.2"
@@ -60,7 +63,8 @@ def get_jail_list() -> list:
             ["sudo", "-n", "fail2ban-client", "status"],
             capture_output=True,
             text=True,
-            timeout=10
+            timeout=10,
+            env=get_clean_env()
         )
         if result.returncode != 0:
             log(f"fail2ban-client status failed: {result.stderr}", 'error')
@@ -88,7 +92,8 @@ def get_jail_status(jail_name: str) -> dict:
             ["sudo", "-n", "fail2ban-client", "status", jail_name],
             capture_output=True,
             text=True,
-            timeout=10
+            timeout=10,
+            env=get_clean_env()
         )
         if result.returncode != 0:
             log(f"fail2ban-client status {jail_name} failed: {result.stderr}", 'error')

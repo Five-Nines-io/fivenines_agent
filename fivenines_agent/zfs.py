@@ -4,6 +4,7 @@ import subprocess
 import time
 
 from fivenines_agent.debug import debug, log
+from fivenines_agent.subprocess_utils import get_clean_env
 
 _zfs_cache = {
     "timestamp": 0,
@@ -22,7 +23,8 @@ def get_zfs_version():
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
-            check=True
+            check=True,
+            env=get_clean_env()
         )
         return result.stdout.split('\n')[0].strip()
     except Exception as e:
@@ -38,7 +40,8 @@ def list_zfs_pools():
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            check=True
+            check=True,
+            env=get_clean_env()
         )
         for line in result.stdout.splitlines():
             if line.strip():
@@ -50,7 +53,7 @@ def list_zfs_pools():
 def _run(cmd):
     return subprocess.run(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, check=False
+        text=True, check=False, env=get_clean_env()
     )
 
 def _safe_int(x, default=None):
