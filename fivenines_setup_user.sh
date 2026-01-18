@@ -365,7 +365,7 @@ print_banner
 if [ $# -eq 0 ]; then
     echo "Usage: bash $0 YOUR_TOKEN"
     echo ""
-    echo "Get your token from https://app.fivenines.io"
+    echo "Get your token from https://fivenines.io"
     exit 1
 fi
 
