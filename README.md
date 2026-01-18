@@ -178,6 +178,7 @@ When the agent starts, it displays a banner showing which features are available
     [OK] Docker
     [OK] Caddy
     [X] Qemu (requires: libvirt group)
+    [OK] Proxmox
 
   Security:
     [X] Fail2Ban (requires: sudo fail2ban-client)

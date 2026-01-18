@@ -62,6 +62,9 @@ class PermissionProbe:
 
             # QEMU/libvirt - needs libvirt group membership
             'qemu': self._can_access_libvirt(),
+
+            # Proxmox VE - needs API access or local node
+            'proxmox': self._can_access_proxmox(),
         }
 
         # Log any capability changes (only after first probe)
@@ -269,6 +272,17 @@ class PermissionProbe:
         log("_can_access_libvirt: -> UNAVAILABLE (no accessible sockets)", 'debug')
         return False
 
+    def _can_access_proxmox(self):
+        """Check if Proxmox VE is accessible (local node detection)."""
+        # Check if this is a Proxmox node by looking for /etc/pve
+        # The API access will be configured separately via credentials
+        if os.path.exists('/etc/pve') and os.path.isdir('/etc/pve'):
+            return True
+        # Also check for pvesh command (Proxmox shell)
+        if shutil.which('pvesh'):
+            return True
+        return False
+
     def get(self, capability, default=False):
         """Get a specific capability status."""
         return self.capabilities.get(capability, default)
@@ -307,7 +321,7 @@ def print_capabilities_banner():
     core_metrics = ['cpu', 'memory', 'load_average', 'io', 'network', 'partitions', 'file_handles', 'ports', 'processes']
     hardware = ['temperatures', 'fans']
     storage = ['smart_storage', 'raid_storage', 'zfs']
-    services = ['docker', 'qemu']
+    services = ['docker', 'qemu', 'proxmox']
     security = ['fail2ban']
 
     print("")
@@ -320,7 +334,7 @@ def print_capabilities_banner():
         print(f"  {title}:")
         for cap in caps_list:
             status = caps.get(cap, False)
-            icon = "[OK]" if status else "[X]"
+            icon = "✓" if status else "✗"
             name = cap.replace('_', ' ').title()
 
             # Add hints for unavailable features
@@ -334,6 +348,8 @@ def print_capabilities_banner():
                     hint = " (requires: docker group)"
                 elif cap == 'qemu':
                     hint = " (requires: libvirt group)"
+                elif cap == 'proxmox':
+                    hint = " (requires: Proxmox VE host)"
                 elif cap == 'fail2ban':
                     hint = " (requires: sudo fail2ban-client)"
                 elif cap == 'zfs':
@@ -355,9 +371,9 @@ def print_capabilities_banner():
         # Filter out core metrics that shouldn't fail
         important_unavailable = [c for c in unavailable if c not in core_metrics]
         if important_unavailable:
-            print("  [!] Some features unavailable. See: https://docs.fivenines.io/agent/permissions")
+            print("  ⚠ Some features unavailable. See: https://docs.fivenines.io/agent/permissions")
     else:
-        print("  [OK] Full monitoring capabilities available")
+        print("  ✓ Full monitoring capabilities available")
 
     print("")
     print("=" * 60)

@@ -286,6 +286,8 @@ if [ -n "$PYTHON_LIB" ]; then
         --clean \
         --hidden-import=libvirt \
         --hidden-import=libvirtmod \
+        --hidden-import=proxmoxer.backends \
+        --hidden-import=proxmoxer.backends.https \
         --add-binary "$PYTHON_LIB:." \
         --add-binary "/usr/local/lib/libcrypt.so.2:." \
         --add-binary "/usr/local/lib/libcrypt.so.1:." \
