@@ -340,7 +340,7 @@ def print_capabilities_banner():
         print(f"  {title}:")
         for cap in caps_list:
             status = caps.get(cap, False)
-            icon = "✓" if status else "✗"
+            icon = "[+]" if status else "[-]"
             name = cap.replace('_', ' ').title()
 
             # Add hints for unavailable features
@@ -377,9 +377,9 @@ def print_capabilities_banner():
         # Filter out core metrics that shouldn't fail
         important_unavailable = [c for c in unavailable if c not in core_metrics]
         if important_unavailable:
-            print("  ⚠ Some features unavailable. See: https://docs.fivenines.io/agent/permissions")
+            print("  [!] Some features unavailable. See: https://docs.fivenines.io/agent/permissions")
     else:
-        print("  ✓ Full monitoring capabilities available")
+        print("  [+] Full monitoring capabilities available")
 
     print("")
     print("=" * 60)

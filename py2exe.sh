@@ -328,7 +328,7 @@ echo "Resetting environment"
 poetry config virtualenvs.create true
 deactivate
 
-echo "✅ Build completed successfully!"
+echo "[OK] Build completed successfully!"
 echo "Output directory: ./dist/linux/$BINARY_NAME/"
 echo "Executable: ./dist/linux/$BINARY_NAME/$BINARY_NAME"
 echo ""

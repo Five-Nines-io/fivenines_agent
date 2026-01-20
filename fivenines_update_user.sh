@@ -22,15 +22,15 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 function print_success() {
-    echo -e "${GREEN}✓${NC} $1"
+    echo -e "${GREEN}[+]${NC} $1"
 }
 
 function print_warning() {
-    echo -e "${YELLOW}⚠${NC} $1"
+    echo -e "${YELLOW}[!]${NC} $1"
 }
 
 function print_error() {
-    echo -e "${RED}✗${NC} $1"
+    echo -e "${RED}[-]${NC} $1"
 }
 
 function exit_with_error() {
@@ -74,9 +74,9 @@ function download_with_fallback() {
 }
 
 echo ""
-echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+echo -e "${BLUE}===============================================================${NC}"
 echo -e "${BLUE}  Fivenines Agent - User-Level Update${NC}"
-echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+echo -e "${BLUE}===============================================================${NC}"
 echo ""
 
 # Check if installation exists

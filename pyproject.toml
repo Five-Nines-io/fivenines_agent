@@ -2,7 +2,7 @@
 name = "fivenines_agent"
 version = "1.4.0"
 description = ""
-authors = ["Sébastien Puyet <sebastien@fivenines.io>"]
+authors = ["Sebastien Puyet <sebastien@fivenines.io>"]
 license = "WTFPL"
 readme = "README.md"
 

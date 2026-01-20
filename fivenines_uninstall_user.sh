@@ -16,17 +16,17 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 function print_success() {
-    echo -e "${GREEN}✓${NC} $1"
+    echo -e "${GREEN}[+]${NC} $1"
 }
 
 function print_warning() {
-    echo -e "${YELLOW}⚠${NC} $1"
+    echo -e "${YELLOW}[!]${NC} $1"
 }
 
 echo ""
-echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+echo -e "${BLUE}===============================================================${NC}"
 echo -e "${BLUE}  Fivenines Agent - User-Level Uninstall${NC}"
-echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+echo -e "${BLUE}===============================================================${NC}"
 echo ""
 
 # Confirm

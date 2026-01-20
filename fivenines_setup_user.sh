@@ -37,22 +37,22 @@ NC='\033[0m' # No Color
 
 function print_banner() {
     echo ""
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}===============================================================${NC}"
     echo -e "${BLUE}  Fivenines Agent - User-Level Installation${NC}"
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}===============================================================${NC}"
     echo ""
 }
 
 function print_success() {
-    echo -e "${GREEN}✓${NC} $1"
+    echo -e "${GREEN}[+]${NC} $1"
 }
 
 function print_warning() {
-    echo -e "${YELLOW}⚠${NC} $1"
+    echo -e "${YELLOW}[!]${NC} $1"
 }
 
 function print_error() {
-    echo -e "${RED}✗${NC} $1"
+    echo -e "${RED}[-]${NC} $1"
 }
 
 function exit_with_error() {
@@ -328,9 +328,9 @@ function start_agent() {
 }
 
 function print_crontab_instructions() {
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}===============================================================${NC}"
     echo -e "${BLUE}  Auto-Start on Reboot (Optional)${NC}"
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}===============================================================${NC}"
     echo ""
     echo "To automatically start the agent when your server reboots,"
     echo "add this line to your crontab (run: crontab -e):"
@@ -340,9 +340,9 @@ function print_crontab_instructions() {
 }
 
 function print_final_instructions() {
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}===============================================================${NC}"
     echo -e "${BLUE}  Installation Complete!${NC}"
-    echo -e "${BLUE}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}===============================================================${NC}"
     echo ""
     echo "Management commands:"
     echo "  $INSTALL_DIR/start.sh    - Start the agent"

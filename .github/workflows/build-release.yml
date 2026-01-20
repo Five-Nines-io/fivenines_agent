@@ -18,7 +18,35 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check for non-ASCII characters
+        run: |
+          echo "Checking for non-ASCII characters in source files..."
+          NON_ASCII=$(find . -type f \( -name "*.py" -o -name "*.toml" -o -name "*.yml" -o -name "*.yaml" -o -name "*.json" -o -name "*.sh" \) \
+            ! -path "./.git/*" \
+            -exec grep -Pl '[^\x00-\x7F]' {} \; 2>/dev/null || true)
+
+          if [ -n "$NON_ASCII" ]; then
+            echo "ERROR: Non-ASCII characters found in the following files:"
+            echo "$NON_ASCII"
+            echo ""
+            echo "Details:"
+            for file in $NON_ASCII; do
+              echo "=== $file ==="
+              grep -Pn '[^\x00-\x7F]' "$file" || true
+            done
+            exit 1
+          fi
+
+          echo "All source files contain only ASCII characters."
+
   build-amd64:
+    needs: [lint]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -85,6 +113,7 @@ jobs:
           retention-days: 7
 
   build-arm64:
+    needs: [lint]
     runs-on: ubuntu-24.04-arm  # Native ARM64 runner - much faster than QEMU
     permissions:
       contents: read
