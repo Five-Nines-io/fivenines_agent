@@ -17,12 +17,24 @@ def packages_available():
 
 
 def get_distro():
-    """Read /etc/os-release and return the lowercase distribution ID."""
+    """Read /etc/os-release and return 'id:version_id' (e.g. 'debian:13')."""
     try:
+        fields = {}
         with open("/etc/os-release", "r") as f:
             for line in f:
                 if line.startswith("ID="):
-                    return line.strip().split("=", 1)[1].strip('"').lower()
+                    fields["id"] = line.strip().split("=", 1)[1].strip('"').lower()
+                elif line.startswith("VERSION_ID="):
+                    fields["version_id"] = (
+                        line.strip().split("=", 1)[1].strip('"').lower()
+                    )
+        distro_id = fields.get("id")
+        if not distro_id:
+            return "unknown"
+        version_id = fields.get("version_id")
+        if version_id:
+            return f"{distro_id}:{version_id}"
+        return distro_id
     except Exception as e:
         log(f"Error reading /etc/os-release: {e}", "error")
     return "unknown"

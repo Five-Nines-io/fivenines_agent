@@ -49,16 +49,22 @@ def test_packages_available_none(mock_which):
 def test_get_distro_debian():
     content = 'PRETTY_NAME="Debian GNU/Linux 12"\nID=debian\nVERSION_ID="12"\n'
     with patch("builtins.open", mock_open(read_data=content)):
-        assert get_distro() == "debian"
+        assert get_distro() == "debian:12"
 
 
 def test_get_distro_ubuntu():
     content = 'ID=ubuntu\nVERSION_ID="22.04"\n'
     with patch("builtins.open", mock_open(read_data=content)):
-        assert get_distro() == "ubuntu"
+        assert get_distro() == "ubuntu:22.04"
 
 
 def test_get_distro_quoted():
+    content = 'ID="alpine"\nVERSION_ID="3.19"\n'
+    with patch("builtins.open", mock_open(read_data=content)):
+        assert get_distro() == "alpine:3.19"
+
+
+def test_get_distro_no_version():
     content = 'ID="alpine"\n'
     with patch("builtins.open", mock_open(read_data=content)):
         assert get_distro() == "alpine"
