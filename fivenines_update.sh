@@ -1,5 +1,11 @@
 #!/bin/bash
 # This script is used to update the fivenines agent
+#
+# Environment variables:
+#   FIVENINES_AGENT_URL - Custom download URL for the agent tarball (e.g., pre-release builds)
+#
+# Example with custom build:
+#   FIVENINES_AGENT_URL="https://github.com/Five-Nines-io/fivenines_agent/releases/download/feature-branch-abc1234/fivenines-agent-linux-amd64.tar.gz" bash fivenines_update.sh
 
 # Mirror URLs (R2 is IPv6-compatible, GitHub is fallback)
 R2_BASE_URL="https://releases.fivenines.io/latest"
@@ -72,7 +78,13 @@ TARBALL_PATH="/tmp/${TARBALL_NAME}"
 AGENT_DIR="${INSTALL_DIR}/${BINARY_NAME}"
 AGENT_EXECUTABLE="${AGENT_DIR}/${BINARY_NAME}"
 
-download_with_fallback "$TARBALL_NAME" "$TARBALL_PATH" "${GITHUB_RELEASES_URL}/${TARBALL_NAME}" || { echo "Failed to download agent"; exit 1; }
+if [ -n "${FIVENINES_AGENT_URL:-}" ]; then
+    echo "Using custom agent URL: $FIVENINES_AGENT_URL"
+    wget --connect-timeout=10 -q "$FIVENINES_AGENT_URL" -O "$TARBALL_PATH" || { echo "Failed to download from custom URL"; exit 1; }
+    echo "  Downloaded from custom URL"
+else
+    download_with_fallback "$TARBALL_NAME" "$TARBALL_PATH" "${GITHUB_RELEASES_URL}/${TARBALL_NAME}" || { echo "Failed to download agent"; exit 1; }
+fi
 
 # Remove old installation if it exists
 if [ -d "$AGENT_DIR" ]; then

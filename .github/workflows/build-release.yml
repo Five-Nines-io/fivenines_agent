@@ -246,6 +246,15 @@ jobs:
 
             This is an automated pre-release build for testing purposes.
 
+            ### Quick Install (replace existing agent)
+            ```bash
+            # System install (root)
+            FIVENINES_AGENT_URL="https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-linux-amd64.tar.gz" bash fivenines_update.sh
+
+            # User install
+            FIVENINES_AGENT_URL="https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-linux-amd64.tar.gz" bash fivenines_update_user.sh
+            ```
+
             ### Download URLs
             ```
             # AMD64
