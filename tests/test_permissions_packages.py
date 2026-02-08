@@ -38,6 +38,18 @@ def test_can_list_packages_apk(mock_probe):
 
 
 @patch.object(PermissionProbe, "_probe_all")
+def test_can_list_packages_pacman(mock_probe):
+    """pacman available should return True."""
+    probe = PermissionProbe.__new__(PermissionProbe)
+    probe.capabilities = {}
+    with patch("fivenines_agent.permissions.shutil.which") as mock_which:
+        mock_which.side_effect = lambda cmd: (
+            "/usr/bin/pacman" if cmd == "pacman" else None
+        )
+        assert probe._can_list_packages() is True
+
+
+@patch.object(PermissionProbe, "_probe_all")
 def test_can_list_packages_none(mock_probe):
     """No package manager should return False."""
     probe = PermissionProbe.__new__(PermissionProbe)

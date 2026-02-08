@@ -12,7 +12,7 @@ from fivenines_agent.subprocess_utils import get_clean_env
 
 def packages_available():
     """Check if a supported package manager is available."""
-    for cmd in ("dpkg-query", "rpm", "apk"):
+    for cmd in ("dpkg-query", "rpm", "apk", "pacman"):
         if shutil.which(cmd):
             return True
     return False
@@ -114,6 +114,26 @@ def _get_packages_apk():
     return packages
 
 
+def _get_packages_pacman():
+    """Get installed packages via pacman."""
+    result = subprocess.run(
+        ["pacman", "-Q"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=get_clean_env(),
+    )
+    if result.returncode != 0:
+        log(f"pacman failed: {result.stderr}", "error")
+        return []
+    packages = []
+    for line in result.stdout.strip().split("\n"):
+        if " " in line:
+            name, version = line.split(" ", 1)
+            packages.append({"name": name, "version": version})
+    return packages
+
+
 @debug("get_installed_packages")
 def get_installed_packages():
     """Detect package manager and return sorted list of installed packages."""
@@ -124,6 +144,8 @@ def get_installed_packages():
             packages = _get_packages_rpm()
         elif shutil.which("apk"):
             packages = _get_packages_apk()
+        elif shutil.which("pacman"):
+            packages = _get_packages_pacman()
         else:
             log("No supported package manager found", "debug")
             return []

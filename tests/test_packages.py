@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, mock_open, patch
 from fivenines_agent.packages import (
     _get_packages_apk,
     _get_packages_dpkg,
+    _get_packages_pacman,
     _get_packages_rpm,
     get_distro,
     get_installed_packages,
@@ -35,6 +36,14 @@ def test_packages_available_rpm(mock_which):
 @patch("fivenines_agent.packages.shutil.which")
 def test_packages_available_apk(mock_which):
     mock_which.side_effect = lambda cmd: "/sbin/apk" if cmd == "apk" else None
+    assert packages_available() is True
+
+
+@patch("fivenines_agent.packages.shutil.which")
+def test_packages_available_pacman(mock_which):
+    mock_which.side_effect = lambda cmd: (
+        "/usr/bin/pacman" if cmd == "pacman" else None
+    )
     assert packages_available() is True
 
 
@@ -188,6 +197,44 @@ def test_get_packages_apk_empty_lines(mock_run, mock_env):
     assert result == []
 
 
+# --- _get_packages_pacman ---
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_pacman_success(mock_run, mock_env):
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout="linux 6.7.4.arch1-1\nopenssl 3.2.1-1\nzlib 1.3.1-1\n",
+    )
+    result = _get_packages_pacman()
+    assert result == [
+        {"name": "linux", "version": "6.7.4.arch1-1"},
+        {"name": "openssl", "version": "3.2.1-1"},
+        {"name": "zlib", "version": "1.3.1-1"},
+    ]
+    mock_run.assert_called_once()
+    args = mock_run.call_args
+    assert args[0][0] == ["pacman", "-Q"]
+    assert args[1]["timeout"] == 30
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_pacman_failure(mock_run, mock_env):
+    mock_run.return_value = MagicMock(returncode=1, stderr="error")
+    result = _get_packages_pacman()
+    assert result == []
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_pacman_empty(mock_run, mock_env):
+    mock_run.return_value = MagicMock(returncode=0, stdout="")
+    result = _get_packages_pacman()
+    assert result == []
+
+
 # --- get_installed_packages ---
 
 
@@ -224,6 +271,17 @@ def test_get_installed_packages_apk(mock_apk, mock_which):
     mock_apk.return_value = [{"name": "musl", "version": "1.2"}]
     result = get_installed_packages()
     assert result == [{"name": "musl", "version": "1.2"}]
+
+
+@patch("fivenines_agent.packages.shutil.which")
+@patch("fivenines_agent.packages._get_packages_pacman")
+def test_get_installed_packages_pacman(mock_pacman, mock_which):
+    mock_which.side_effect = lambda cmd: (
+        "/usr/bin/pacman" if cmd == "pacman" else None
+    )
+    mock_pacman.return_value = [{"name": "linux", "version": "6.7"}]
+    result = get_installed_packages()
+    assert result == [{"name": "linux", "version": "6.7"}]
 
 
 @patch("fivenines_agent.packages.shutil.which", return_value=None)
