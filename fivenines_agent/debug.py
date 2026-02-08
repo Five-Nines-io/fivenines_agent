@@ -1,8 +1,10 @@
-import time
 import threading
+import time
 from contextlib import ContextDecorator
 from functools import wraps
 from fivenines_agent.env import dry_run, log_level
+
+_thread_local = threading.local()
 
 LOG_LEVELS = {
     'debug': 0,
@@ -11,6 +13,7 @@ LOG_LEVELS = {
     'error': 3,
     'critical': 4,
 }
+
 
 class debug(ContextDecorator):
     def __init__(self, name: str):
@@ -46,6 +49,23 @@ class debug(ContextDecorator):
 
         return wrapper
 
+
+def start_log_capture():
+    _thread_local.log_buffer = []
+
+
+def stop_log_capture():
+    buffer = getattr(_thread_local, 'log_buffer', None)
+    _thread_local.log_buffer = None
+    return buffer or []
+
+
 def log(message, level='info'):
     if LOG_LEVELS[log_level()] <= LOG_LEVELS[level]:
         print(f"[{level.upper()}][thread#{threading.get_native_id()}] {message}")
+    # Buffer error messages when capture is active (thread-local).
+    # Intentionally outside the log-level check: errors are always
+    # captured for backend telemetry regardless of configured log level.
+    buffer = getattr(_thread_local, 'log_buffer', None)
+    if buffer is not None and level == 'error':
+        buffer.append(message)

@@ -1,7 +1,10 @@
 """Declarative collector registry for metric dispatch."""
 
+import time
+
 from fivenines_agent.caddy import caddy_metrics
 from fivenines_agent.cpu import cpu_count, cpu_data, cpu_model, cpu_usage
+from fivenines_agent.debug import log, start_log_capture, stop_log_capture
 from fivenines_agent.docker import docker_metrics
 from fivenines_agent.fail2ban import fail2ban_metrics
 from fivenines_agent.fans import fans
@@ -78,10 +81,34 @@ COLLECTORS = [
 ]
 
 
-def collect_metrics(config, data):
+def _collect_with_telemetry(name, fn, telemetry, *args, **kwargs):
+    """Wrap a collector call with timing and log capture for telemetry."""
+    start = time.monotonic()
+    start_log_capture()
+    try:
+        result = fn(*args, **kwargs)
+        duration_ms = round((time.monotonic() - start) * 1000, 2)
+        errors = stop_log_capture()
+        entry = {"duration_ms": duration_ms}
+        if errors:
+            entry["errors"] = errors
+        telemetry[name] = entry
+        return result
+    except Exception as e:
+        errors = stop_log_capture()
+        errors.append(str(e))
+        duration_ms = round((time.monotonic() - start) * 1000, 2)
+        telemetry[name] = {"duration_ms": duration_ms, "errors": errors}
+        log(f"Error collecting {name}: {e}", "error")
+        return None
+
+
+def collect_metrics(config, data, telemetry=None):
     """Run all registered collectors based on config flags.
 
     Mutates *data* in place, adding one key per collected metric.
+    When *telemetry* is not None, each collector is wrapped with timing
+    and log capture.
     """
     for config_key, collectors in COLLECTORS:
         config_value = config.get(config_key)
@@ -89,6 +116,13 @@ def collect_metrics(config, data):
             continue
         for data_key, fn, pass_kwargs in collectors:
             if pass_kwargs and isinstance(config_value, dict):
-                data[data_key] = fn(**config_value)
+                kw = config_value
             else:
-                data[data_key] = fn()
+                kw = {}
+            if telemetry is not None:
+                data[data_key] = _collect_with_telemetry(data_key, fn, telemetry, **kw)
+            else:
+                if kw:
+                    data[data_key] = fn(**kw)
+                else:
+                    data[data_key] = fn()

@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 
 from fivenines_agent.cli import VERSION
 from fivenines_agent.collectors import collect_metrics
-from fivenines_agent.debug import log
+from fivenines_agent.debug import log, start_log_capture, stop_log_capture
 from fivenines_agent.env import config_dir, dry_run, env_file, get_user_context
 from fivenines_agent.files import file_handles_limit, file_handles_used
 from fivenines_agent.ip import get_ip
@@ -105,10 +105,12 @@ class Agent:
                 data = static_data.copy()
                 data["ts"] = time.time()
                 start = time.monotonic()
+                self._telemetry = {}
 
                 self._collect_metrics(data)
 
-                packages_sync(self.config, self.synchronizer.send_packages)
+                self._packages_sync_with_telemetry()
+                data["_telemetry"] = self._telemetry
 
                 # Running time and enqueue
                 running_time = time.monotonic() - start
@@ -130,21 +132,60 @@ class Agent:
 
     def _collect_metrics(self, data):
         # Core metrics (always enabled)
-        data["load_average"] = load_average()
-        data["file_handles_used"] = file_handles_used()
-        data["file_handles_limit"] = file_handles_limit()
+        data["load_average"] = self._collect("load_average", load_average)
+        data["file_handles_used"] = self._collect("file_handles_used", file_handles_used)
+        data["file_handles_limit"] = self._collect("file_handles_limit", file_handles_limit)
 
         # Conditional metrics via registry
-        collect_metrics(self.config, data)
+        collect_metrics(self.config, data, self._telemetry)
 
         # Special-case collectors (unique dispatch patterns)
         if self.config.get("ping"):
             for region, host in self.config["ping"].items():
-                data[f"ping_{region}"] = tcp_ping(host)
+                data[f"ping_{region}"] = self._collect(f"ping_{region}", tcp_ping, host)
         if self.config.get("ipv4"):
-            data["ipv4"] = get_ip(ipv6=False)
+            data["ipv4"] = self._collect("ipv4", get_ip, ipv6=False)
         if self.config.get("ipv6"):
-            data["ipv6"] = get_ip(ipv6=True)
+            data["ipv6"] = self._collect("ipv6", get_ip, ipv6=True)
+
+    def _collect(self, name, fn, *args, **kwargs):
+        start = time.monotonic()
+        start_log_capture()
+        try:
+            result = fn(*args, **kwargs)
+            duration_ms = round((time.monotonic() - start) * 1000, 2)
+            errors = stop_log_capture()
+            entry = {"duration_ms": duration_ms}
+            if errors:
+                entry["errors"] = errors
+            self._telemetry[name] = entry
+            return result
+        except Exception as e:
+            errors = stop_log_capture()
+            errors.append(str(e))
+            duration_ms = round((time.monotonic() - start) * 1000, 2)
+            self._telemetry[name] = {"duration_ms": duration_ms, "errors": errors}
+            log(f"Error collecting {name}: {e}", "error")
+            return None
+
+    def _packages_sync_with_telemetry(self):
+        ps_start = time.monotonic()
+        start_log_capture()
+        try:
+            packages_sync(self.config, self.synchronizer.send_packages)
+        except Exception as e:
+            errors = stop_log_capture()
+            errors.append(str(e))
+            duration_ms = round((time.monotonic() - ps_start) * 1000, 2)
+            self._telemetry["packages_sync"] = {"duration_ms": duration_ms, "errors": errors}
+            log(f"Error in packages_sync: {e}", "error")
+            return
+        errors = stop_log_capture()
+        duration_ms = round((time.monotonic() - ps_start) * 1000, 2)
+        entry = {"duration_ms": duration_ms}
+        if errors:
+            entry["errors"] = errors
+        self._telemetry["packages_sync"] = entry
 
     def _handle_permission_refresh(self, static_data):
         if refresh_permissions_event.is_set():
