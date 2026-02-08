@@ -127,8 +127,6 @@ class Agent:
         # Load token
         self._load_file("TOKEN")
 
-        self._last_packages_hash = ""
-
         self.queue = SynchronizationQueue(maxsize=100)
         self.synchronizer = Synchronizer(self.token, self.queue)
         self.synchronizer.start()
@@ -249,11 +247,12 @@ class Agent:
                 if self.config.get("proxmox"):
                     data["proxmox"] = proxmox_metrics(**self.config["proxmox"])
 
+                self.packages_sync()
+
                 # Running time and enqueue
                 running_time = time.monotonic() - start
                 data["running_time"] = running_time
 
-                self._maybe_run_security_scan()
 
                 log(json.dumps(data, indent=2), "debug")
                 # Exit immediately in dry-run
@@ -276,39 +275,40 @@ class Agent:
         log(f"Sleeping time: {sleep_time * 1000:.0f} ms", "debug")
         exit_event.wait(sleep_time)
 
-    def _maybe_run_security_scan(self):
-        """Run security scan if configured by the backend."""
-        security_scan_config = self.config.get("security_scan")
-        if not isinstance(security_scan_config, dict):
+    def packages_sync(self):
+        """Sync packages if backend requests it via packages.scan."""
+        packages_config = self.config.get("packages")
+        if not isinstance(packages_config, dict):
+            return
+        if not packages_config.get("scan"):
             return
 
         distro = get_distro()
         packages = get_installed_packages()
         if not packages:
-            log("Security scan: no packages found", "debug")
+            log("Packages synchronization: no packages found", "debug")
             return
 
         packages_hash = get_packages_hash(packages)
-        if packages_hash == self._last_packages_hash:
-            log("Security scan: packages unchanged, skipping", "debug")
+        if packages_hash == packages_config.get("last_package_hash"):
+            log("Packages synchronization: packages unchanged, skipping", "debug")
             return
 
-        scan_data = {
+        packages_data = {
             "distro": distro,
             "packages_hash": packages_hash,
             "packages": packages,
         }
 
         if dry_run():
-            log(f"Security scan (dry-run): {json.dumps(scan_data, indent=2)}", "debug")
+            log(f"Packages synchronization (dry-run): {json.dumps(packages_data, indent=2)}", "debug")
             return
 
-        response = self.synchronizer.send_security_scan(scan_data)
+        response = self.synchronizer.send_packages(packages_data)
         if response is not None:
-            self._last_packages_hash = packages_hash
-            log("Security scan sent successfully", "info")
+            log("Packages synchronization sent successfully", "info")
         else:
-            log("Security scan failed, will retry", "error")
+            log("Packages synchronization failed, will retry", "error")
 
     @debug("tcp_ping")
     def tcp_ping(self, host, port=80, timeout=5):

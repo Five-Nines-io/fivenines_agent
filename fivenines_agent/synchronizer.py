@@ -99,9 +99,9 @@ class Synchronizer(Thread):
             with self.config_lock:
                 self.config = config
 
-    def send_security_scan(self, scan_data):
-        """Send security scan data to /security_scan. Returns response or None."""
-        return self._post("/security_scan", scan_data)
+    def send_packages(self, packages_data):
+        """Send packages data to /packages. Returns response or None."""
+        return self._post("/packages", packages_data)
 
     def get_conn(self):
         url = api_url()

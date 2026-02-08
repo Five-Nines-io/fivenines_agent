@@ -1,4 +1,4 @@
-"""Tests for synchronizer _post() and send_security_scan() methods."""
+"""Tests for synchronizer _post() and send_packages() methods."""
 
 import json
 from threading import Event
@@ -104,11 +104,11 @@ def test_send_metrics_no_update_on_none(mock_post):
     assert sync.config == original_config
 
 
-# --- send_security_scan ---
+# --- send_packages ---
 
 
 @patch.object(Synchronizer, "_post")
-def test_send_security_scan_success(mock_post):
+def test_send_packages_success(mock_post):
     sync = make_synchronizer()
     mock_post.return_value = {"status": "queued"}
 
@@ -117,15 +117,15 @@ def test_send_security_scan_success(mock_post):
         "packages_hash": "abc123",
         "packages": [{"name": "openssl", "version": "3.0"}],
     }
-    result = sync.send_security_scan(scan_data)
+    result = sync.send_packages(scan_data)
     assert result == {"status": "queued"}
-    mock_post.assert_called_once_with("/security_scan", scan_data)
+    mock_post.assert_called_once_with("/packages", scan_data)
 
 
 @patch.object(Synchronizer, "_post")
-def test_send_security_scan_failure(mock_post):
+def test_send_packages_failure(mock_post):
     sync = make_synchronizer()
     mock_post.return_value = None
 
-    result = sync.send_security_scan({"distro": "debian", "packages": []})
+    result = sync.send_packages({"distro": "debian", "packages": []})
     assert result is None
