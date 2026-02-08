@@ -129,3 +129,59 @@ def test_send_packages_failure(mock_post):
 
     result = sync.send_packages({"distro": "debian", "packages": []})
     assert result is None
+
+
+# --- get_config ---
+
+
+def test_get_config_returns_config_when_enabled():
+    sync = make_synchronizer()
+    sync.config = {"enabled": True, "interval": 60}
+    result = sync.get_config()
+    assert result == {"enabled": True, "interval": 60}
+
+
+@patch.object(Synchronizer, "send_metrics")
+def test_get_config_fetches_when_enabled_is_none(mock_send):
+    sync = make_synchronizer()
+    sync.config = {
+        "enabled": None,
+        "request_options": {"timeout": 5, "retry": 3, "retry_interval": 0},
+    }
+
+    def update_config(data):
+        with sync.config_lock:
+            sync.config = {"enabled": True, "interval": 30}
+
+    mock_send.side_effect = update_config
+
+    result = sync.get_config()
+    mock_send.assert_called_once_with({"get_config": True})
+    assert result == {"enabled": True, "interval": 30}
+
+
+@patch.object(Synchronizer, "send_metrics")
+def test_get_config_reads_under_lock(mock_send):
+    """get_config always reads config under the lock, not outside it."""
+    sync = make_synchronizer()
+    sync.config = {"enabled": False, "interval": 60}
+
+    # Acquire the lock to prove get_config waits for it
+    sync.config_lock.acquire()
+    import threading
+
+    results = []
+
+    def call_get_config():
+        results.append(sync.get_config())
+
+    t = threading.Thread(target=call_get_config)
+    t.start()
+    # Give the thread a moment to block
+    t.join(timeout=0.1)
+    assert t.is_alive()  # Thread should be blocked on the lock
+
+    sync.config_lock.release()
+    t.join(timeout=1)
+    assert not t.is_alive()
+    assert results[0] == {"enabled": False, "interval": 60}

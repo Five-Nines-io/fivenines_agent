@@ -152,9 +152,10 @@ class Synchronizer(Thread):
             return conn
 
     def get_config(self):
-        if self.config["enabled"] == None:
+        with self.config_lock:
+            config = self.config
+        if config["enabled"] is None:
             self.send_metrics({"get_config": True})
-            return self.config
-        else:
             with self.config_lock:
                 return self.config
+        return config
