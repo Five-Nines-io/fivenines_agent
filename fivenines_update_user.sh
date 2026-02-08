@@ -4,6 +4,14 @@
 # Updates an existing user-level installation
 #
 # Usage: bash fivenines_update_user.sh
+#
+# Environment variables:
+#   FIVENINES_AGENT_URL   - Custom download URL for the agent tarball (e.g., pre-release builds)
+#   FIVENINES_INSTALL_DIR - Custom install directory (default: ~/.local/fivenines)
+#   FIVENINES_CONFIG_DIR  - Custom config directory (default: ~/.config/fivenines_agent)
+#
+# Example with custom build:
+#   FIVENINES_AGENT_URL="https://github.com/Five-Nines-io/fivenines_agent/releases/download/feature-branch-abc1234/fivenines-agent-linux-amd64.tar.gz" bash fivenines_update_user.sh
 
 set -e
 
@@ -79,6 +87,11 @@ echo -e "${BLUE}  Fivenines Agent - User-Level Update${NC}"
 echo -e "${BLUE}===============================================================${NC}"
 echo ""
 
+if [ -n "${FIVENINES_AGENT_URL:-}" ]; then
+    echo -e "${YELLOW}  Custom build URL detected${NC}"
+    echo ""
+fi
+
 # Check if installation exists
 if [ ! -d "$INSTALL_DIR" ]; then
     exit_with_error "No installation found at $INSTALL_DIR"
@@ -122,7 +135,13 @@ echo "Downloading latest version..."
 TARBALL_NAME="${BINARY_NAME}.tar.gz"
 TARBALL_PATH="/tmp/${TARBALL_NAME}"
 
-download_with_fallback "$TARBALL_NAME" "$TARBALL_PATH" || exit_with_error "Download failed"
+if [ -n "${FIVENINES_AGENT_URL:-}" ]; then
+    print_warning "Using custom agent URL: $FIVENINES_AGENT_URL"
+    download_file "$FIVENINES_AGENT_URL" "$TARBALL_PATH" || exit_with_error "Failed to download from custom URL"
+    print_success "Downloaded from custom URL"
+else
+    download_with_fallback "$TARBALL_NAME" "$TARBALL_PATH" || exit_with_error "Download failed"
+fi
 
 # Backup old version
 if [ -d "$INSTALL_DIR/$BINARY_NAME" ]; then
