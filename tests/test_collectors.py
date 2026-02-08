@@ -132,3 +132,73 @@ def test_registry_entries_are_tuples():
             assert isinstance(data_key, str)
             assert callable(fn)
             assert isinstance(pass_kwargs, bool)
+
+
+# --- Telemetry support ---
+
+
+def test_collect_metrics_with_telemetry_records_timing():
+    """When telemetry dict is passed, duration_ms is recorded per collector."""
+    mock_fn = MagicMock(return_value=42)
+    registry = [("metric", [("metric", mock_fn, False)])]
+    config = {"metric": True}
+    data = {}
+    telemetry = {}
+
+    with patch("fivenines_agent.collectors.COLLECTORS", registry):
+        collect_metrics(config, data, telemetry)
+
+    assert data == {"metric": 42}
+    assert "metric" in telemetry
+    assert "duration_ms" in telemetry["metric"]
+    assert isinstance(telemetry["metric"]["duration_ms"], float)
+    assert "errors" not in telemetry["metric"]
+
+
+def test_collect_metrics_with_telemetry_captures_error():
+    """When a collector raises, telemetry records errors and data gets None."""
+    mock_fn = MagicMock(side_effect=RuntimeError("fail"))
+    registry = [("broken", [("broken", mock_fn, False)])]
+    config = {"broken": True}
+    data = {}
+    telemetry = {}
+
+    with patch("fivenines_agent.collectors.COLLECTORS", registry):
+        collect_metrics(config, data, telemetry)
+
+    assert data["broken"] is None
+    assert "broken" in telemetry
+    assert "duration_ms" in telemetry["broken"]
+    assert "errors" in telemetry["broken"]
+    assert "fail" in telemetry["broken"]["errors"]
+
+
+def test_collect_metrics_with_telemetry_kwargs():
+    """Kwargs collector works correctly with telemetry."""
+    mock_fn = MagicMock(return_value={"ok": True})
+    registry = [("svc", [("svc", mock_fn, True)])]
+    config = {"svc": {"host": "localhost", "port": 8080}}
+    data = {}
+    telemetry = {}
+
+    with patch("fivenines_agent.collectors.COLLECTORS", registry):
+        collect_metrics(config, data, telemetry)
+
+    mock_fn.assert_called_once_with(host="localhost", port=8080)
+    assert data == {"svc": {"ok": True}}
+    assert "svc" in telemetry
+    assert "duration_ms" in telemetry["svc"]
+
+
+def test_collect_metrics_without_telemetry_unchanged():
+    """When telemetry is None (default), original behavior is preserved."""
+    mock_fn = MagicMock(return_value=42)
+    registry = [("metric", [("metric", mock_fn, False)])]
+    config = {"metric": True}
+    data = {}
+
+    with patch("fivenines_agent.collectors.COLLECTORS", registry):
+        collect_metrics(config, data)
+
+    mock_fn.assert_called_once_with()
+    assert data == {"metric": 42}
