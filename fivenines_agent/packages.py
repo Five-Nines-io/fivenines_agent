@@ -1,10 +1,12 @@
 """Package collection for fivenines agent security scanning."""
 
 import hashlib
+import json
 import shutil
 import subprocess
 
 from fivenines_agent.debug import debug, log
+from fivenines_agent.env import dry_run
 from fivenines_agent.subprocess_utils import get_clean_env
 
 
@@ -138,3 +140,42 @@ def get_packages_hash(packages):
     """Compute SHA256 hash of package list for delta optimization."""
     content = "".join(f"{p['name']}={p['version']}\n" for p in packages)
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def packages_sync(config, send_packages_fn):
+    """Sync installed packages if backend requests it via packages.scan."""
+    packages_config = config.get("packages")
+    if not isinstance(packages_config, dict):
+        return
+    if not packages_config.get("scan"):
+        return
+
+    distro = get_distro()
+    packages = get_installed_packages()
+    if not packages:
+        log("Packages synchronization: no packages found", "debug")
+        return
+
+    packages_hash = get_packages_hash(packages)
+    if packages_hash == packages_config.get("last_package_hash"):
+        log("Packages synchronization: packages unchanged, skipping", "debug")
+        return
+
+    packages_data = {
+        "distro": distro,
+        "packages_hash": packages_hash,
+        "packages": packages,
+    }
+
+    if dry_run():
+        log(
+            f"Packages synchronization (dry-run): {json.dumps(packages_data, indent=2)}",
+            "debug",
+        )
+        return
+
+    response = send_packages_fn(packages_data)
+    if response is not None:
+        log("Packages synchronization sent successfully", "info")
+    else:
+        log("Packages synchronization failed, will retry", "error")

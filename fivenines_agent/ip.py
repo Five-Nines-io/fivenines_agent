@@ -48,7 +48,6 @@ class CustomHTTPSConnection(http.client.HTTPSConnection):
 
 @debug('get_ip')
 def get_ip(ipv6=False):
-    global _ip_v4_cache, _ip_v6_cache
     now = time.time()
 
     if ipv6:
@@ -70,7 +69,11 @@ def get_ip(ipv6=False):
         log(f"Response body: {body}", 'debug')
 
         if response.status == 200:
-            return body.strip()
+            ip = body.strip()
+            cache = _ip_v6_cache if ipv6 else _ip_v4_cache
+            cache["timestamp"] = now
+            cache["ip"] = ip
+            return ip
 
         return None
     except ConnectionError as e:
