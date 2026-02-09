@@ -115,6 +115,7 @@ The agent works without sudo, but these features will be unavailable:
 - Open file handles
 - Listening ports
 - Process list (own user's processes)
+- Packages
 
 **May Work Without Sudo/Root:**
 - Hardware temperatures (depends on `/sys/class/hwmon` permissions)
@@ -182,6 +183,7 @@ When the agent starts, it displays a banner showing which features are available
 
   Security:
     [X] Fail2Ban (requires: sudo fail2ban-client)
+    [X] Packages
 
   [!] Some features unavailable. See: https://docs.fivenines.io/agent/permissions
 
