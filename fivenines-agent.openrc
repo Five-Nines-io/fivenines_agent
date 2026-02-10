@@ -17,3 +17,9 @@ depend() {
     need net
     after firewall
 }
+
+start_pre() {
+    # Ensure log file exists and is writable by the service user
+    touch "$output_log"
+    chown fivenines:fivenines "$output_log"
+}
