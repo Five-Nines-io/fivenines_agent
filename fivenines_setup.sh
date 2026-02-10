@@ -91,13 +91,13 @@ function detect_system() {
   fi
 
   # Check if OpenRC is available (Alpine Linux)
-  if command -v rc-service &> /dev/null && [ -d "/etc/init.d" ]; then
+  if command -v rc-service >/dev/null 2>&1 && [ -d "/etc/init.d" ]; then
     echo "openrc"
     return
   fi
 
   # Check if systemd is available
-  if command -v systemctl &> /dev/null && [ -d "/etc/systemd/system" ]; then
+  if command -v systemctl >/dev/null 2>&1 && [ -d "/etc/systemd/system" ]; then
     echo "systemd"
     return
   fi
@@ -209,7 +209,7 @@ SYSTEM_TYPE=$(detect_system)
 print_success "Detected system type: $SYSTEM_TYPE"
 
 # Check if SELinux is installed
-if command -v getenforce &> /dev/null; then
+if command -v getenforce >/dev/null 2>&1; then
   selinux_status=$(getenforce 2>/dev/null || echo "Disabled")
   print_success "SELinux status: $selinux_status"
   if [ "$selinux_status" == "Enforcing" ]; then
@@ -334,11 +334,8 @@ print_success "Agent installed successfully at $AGENT_DIR"
 
 # Test connectivity
 echo "Testing connectivity..."
-hosts=("asia.fivenines.io" "eu.fivenines.io" "us.fivenines.io" "api.fivenines.io")
-
-# Loop through each host and ping once
-for host in "${hosts[@]}"; do
-  if ping -c 1 -W 5 "$host" &> /dev/null; then
+for host in asia.fivenines.io eu.fivenines.io us.fivenines.io api.fivenines.io; do
+  if ping -c 1 -W 5 "$host" >/dev/null 2>&1; then
     print_success "Connected to $host"
   else
     exit_with_contact "Ping to $host failed or timed out. Check your network connection."

@@ -2,9 +2,9 @@
 # This script is used to uninstall the fivenines agent
 
 function detect_system() {
-  if command -v rc-service &> /dev/null && [ -d "/etc/init.d" ]; then
+  if command -v rc-service >/dev/null 2>&1 && [ -d "/etc/init.d" ]; then
     echo "openrc"
-  elif command -v systemctl &> /dev/null && [ -d "/etc/systemd/system" ]; then
+  elif command -v systemctl >/dev/null 2>&1 && [ -d "/etc/systemd/system" ]; then
     echo "systemd"
   else
     echo "unknown"
@@ -15,7 +15,7 @@ SYSTEM_TYPE=$(detect_system)
 
 if [ "$SYSTEM_TYPE" == "openrc" ]; then
   # OpenRC: Stop the service
-  if rc-service fivenines-agent status &>/dev/null; then
+  if rc-service fivenines-agent status >/dev/null 2>&1; then
     echo "Stopping fivenines-agent service..."
     sudo rc-service fivenines-agent stop
   else

@@ -71,9 +71,9 @@ function detect_libc() {
 }
 
 function detect_system() {
-  if command -v rc-service &> /dev/null && [ -d "/etc/init.d" ]; then
+  if command -v rc-service >/dev/null 2>&1 && [ -d "/etc/init.d" ]; then
     echo "openrc"
-  elif command -v systemctl &> /dev/null && [ -d "/etc/systemd/system" ]; then
+  elif command -v systemctl >/dev/null 2>&1 && [ -d "/etc/systemd/system" ]; then
     echo "systemd"
   else
     echo "unknown"
