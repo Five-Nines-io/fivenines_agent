@@ -124,20 +124,45 @@ function download_with_fallback() {
     return 1
 }
 
+function detect_libc() {
+    if ldd --version 2>&1 | grep -qi musl; then
+        echo "musl"
+    elif [ -f "/lib/ld-musl-x86_64.so.1" ] || [ -f "/lib/ld-musl-aarch64.so.1" ]; then
+        echo "musl"
+    else
+        echo "glibc"
+    fi
+}
+
 function detect_architecture() {
     ARCH=$(uname -m)
-    case "$ARCH" in
-        x86_64|amd64)
-            BINARY_NAME="fivenines-agent-linux-amd64"
-            ;;
-        aarch64|arm64)
-            BINARY_NAME="fivenines-agent-linux-arm64"
-            ;;
-        *)
-            exit_with_error "Unsupported architecture: $ARCH"
-            ;;
-    esac
-    print_success "Architecture: $ARCH ($BINARY_NAME)"
+    LIBC_TYPE=$(detect_libc)
+    if [ "$LIBC_TYPE" = "musl" ]; then
+        case "$ARCH" in
+            x86_64|amd64)
+                BINARY_NAME="fivenines-agent-alpine-amd64"
+                ;;
+            aarch64|arm64)
+                BINARY_NAME="fivenines-agent-alpine-arm64"
+                ;;
+            *)
+                exit_with_error "Unsupported architecture: $ARCH"
+                ;;
+        esac
+    else
+        case "$ARCH" in
+            x86_64|amd64)
+                BINARY_NAME="fivenines-agent-linux-amd64"
+                ;;
+            aarch64|arm64)
+                BINARY_NAME="fivenines-agent-linux-arm64"
+                ;;
+            *)
+                exit_with_error "Unsupported architecture: $ARCH"
+                ;;
+        esac
+    fi
+    print_success "Architecture: $ARCH, libc: $LIBC_TYPE ($BINARY_NAME)"
 }
 
 function create_directories() {

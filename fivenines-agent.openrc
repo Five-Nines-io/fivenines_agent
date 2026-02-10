@@ -1,0 +1,19 @@
+#!/sbin/openrc-run
+
+name="fivenines-agent"
+description="Five Nines monitoring agent"
+supervisor="supervise-daemon"
+
+command="/opt/fivenines/fivenines_agent"
+command_user="fivenines:fivenines"
+pidfile="/run/${RC_SVCNAME}.pid"
+
+supervise_daemon_args="--env PYTHONUNBUFFERED=1 --respawn-delay 5 --respawn-max 0"
+
+output_log="/var/log/fivenines-agent.log"
+error_log="/var/log/fivenines-agent.log"
+
+depend() {
+    need net
+    after firewall
+}

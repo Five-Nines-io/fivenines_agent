@@ -45,6 +45,7 @@ if [ -f "$INSTALL_DIR/stop.sh" ]; then
     "$INSTALL_DIR/stop.sh" 2>/dev/null || true
 fi
 pkill -f "fivenines-agent-linux" 2>/dev/null || true
+pkill -f "fivenines-agent-alpine" 2>/dev/null || true
 sleep 1
 print_success "Agent stopped"
 

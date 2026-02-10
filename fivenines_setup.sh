@@ -66,10 +66,26 @@ function exit_with_contact() {
   exit 1
 }
 
+function detect_libc() {
+  if ldd --version 2>&1 | grep -qi musl; then
+    echo "musl"
+  elif [ -f "/lib/ld-musl-x86_64.so.1" ] || [ -f "/lib/ld-musl-aarch64.so.1" ]; then
+    echo "musl"
+  else
+    echo "glibc"
+  fi
+}
+
 function detect_system() {
   # Check if this is UNRAID
   if [ -f "/etc/unraid-version" ] || [ -d "/boot/config" ]; then
     echo "unraid"
+    return
+  fi
+
+  # Check if OpenRC is available (Alpine Linux)
+  if command -v rc-service &> /dev/null && [ -d "/etc/init.d" ]; then
+    echo "openrc"
     return
   fi
 
@@ -145,6 +161,28 @@ function setup_unraid() {
   fi
 }
 
+function setup_openrc() {
+  print_success "Detected OpenRC system - using OpenRC service"
+
+  # Download the OpenRC init script
+  download_with_fallback "fivenines-agent.openrc" "/etc/init.d/fivenines-agent" "${GITHUB_RAW_URL}/fivenines-agent.openrc" || exit_with_contact "Failed to download OpenRC init script"
+
+  # Make it executable
+  chmod 755 /etc/init.d/fivenines-agent
+
+  # Enable on boot
+  rc-update add fivenines-agent default
+
+  # Start the agent
+  rc-service fivenines-agent start
+
+  if [ $? -ne 0 ]; then
+    exit_with_contact "Failed to start the fivenines-agent service. Check /var/log/fivenines-agent.log for details."
+  fi
+
+  print_success "OpenRC service installed and started successfully"
+}
+
 # Main execution starts here
 print_banner
 
@@ -179,6 +217,9 @@ if ! id -u fivenines >/dev/null 2>&1; then
   print_success "Creating system user fivenines"
   if [ "$SYSTEM_TYPE" == "unraid" ]; then
     useradd --system --user-group fivenines --shell /bin/false --create-home
+  elif [ "$SYSTEM_TYPE" == "openrc" ]; then
+    addgroup -S fivenines 2>/dev/null || true
+    adduser -S -G fivenines -s /sbin/nologin -h /opt/fivenines fivenines 2>/dev/null || true
   else
     useradd --system --user-group --key USERGROUPS_ENAB=yes fivenines --shell /bin/false --create-home -b /opt/
   fi
@@ -219,12 +260,22 @@ fi
 # Ensure install directory exists
 mkdir -p "$INSTALL_DIR"
 
-# Download the agent tarball based on the architecture
+# Download the agent tarball based on the architecture and libc
+LIBC_TYPE=$(detect_libc)
 print_success "Detected architecture: $CURRENT_ARCH"
-if [ "$CURRENT_ARCH" == "aarch64" ]; then
-  BINARY_NAME="fivenines-agent-linux-arm64"
+print_success "Detected libc: $LIBC_TYPE"
+if [ "$LIBC_TYPE" == "musl" ]; then
+  if [ "$CURRENT_ARCH" == "aarch64" ]; then
+    BINARY_NAME="fivenines-agent-alpine-arm64"
+  else
+    BINARY_NAME="fivenines-agent-alpine-amd64"
+  fi
 else
-  BINARY_NAME="fivenines-agent-linux-amd64"
+  if [ "$CURRENT_ARCH" == "aarch64" ]; then
+    BINARY_NAME="fivenines-agent-linux-arm64"
+  else
+    BINARY_NAME="fivenines-agent-linux-amd64"
+  fi
 fi
 
 TARBALL_NAME="${BINARY_NAME}.tar.gz"
@@ -287,11 +338,14 @@ case "$SYSTEM_TYPE" in
   "unraid")
     setup_unraid "$1"
     ;;
+  "openrc")
+    setup_openrc
+    ;;
   "systemd")
     setup_systemd
     ;;
   *)
-    exit_with_contact "Unsupported system type: $SYSTEM_TYPE. This script supports systemd-based systems and UNRAID."
+    exit_with_contact "Unsupported system type: $SYSTEM_TYPE. This script supports systemd, OpenRC, and UNRAID systems."
     ;;
 esac
 
@@ -308,6 +362,13 @@ if [ "$SYSTEM_TYPE" == "unraid" ]; then
   echo "Management options:"
   echo "  Settings -> User Scripts -> fivenines_agent"
   echo "  Log file: /var/log/fivenines-agent.log"
+elif [ "$SYSTEM_TYPE" == "openrc" ]; then
+  echo "The agent is now running as an OpenRC service and will start automatically on boot."
+  echo ""
+  echo "Management commands:"
+  echo "  rc-service fivenines-agent status   - Check status"
+  echo "  tail -f /var/log/fivenines-agent.log - View logs"
+  echo "  rc-service fivenines-agent stop/start - Stop/start"
 else
   echo "The agent is now running as a systemd service and will start automatically on boot."
   echo ""

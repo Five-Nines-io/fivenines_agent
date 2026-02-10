@@ -9,8 +9,12 @@ import time
 from threading import Event
 
 import psutil
-import systemd_watchdog
 from dotenv import load_dotenv
+
+try:
+    import systemd_watchdog
+except ImportError:
+    systemd_watchdog = None
 
 from fivenines_agent.cli import VERSION
 from fivenines_agent.collectors import collect_metrics
@@ -77,9 +81,12 @@ class Agent:
             sys.exit(2)
 
     def run(self):
-        # Notify systemd watchdog
-        wd = systemd_watchdog.watchdog()
-        wd.ready()
+        # Notify systemd watchdog (no-op on non-systemd systems like Alpine)
+        if systemd_watchdog is not None:
+            wd = systemd_watchdog.watchdog()
+            wd.ready()
+        else:
+            wd = None
 
         # Static info
         static_data = {
@@ -92,7 +99,8 @@ class Agent:
 
         try:
             while not exit_event.is_set():
-                wd.notify()
+                if wd is not None:
+                    wd.notify()
                 self._handle_permission_refresh(static_data)
 
                 # Refresh config if disabled
