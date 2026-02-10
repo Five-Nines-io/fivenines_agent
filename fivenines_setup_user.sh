@@ -96,7 +96,7 @@ function download_file() {
     local output="$2"
 
     if [ "$DOWNLOADER" = "wget" ]; then
-        wget -q --connect-timeout=10 "$url" -O "$output"
+        wget -q -T 10 "$url" -O "$output"
     else
         curl -sL --connect-timeout 10 "$url" -o "$output"
     fi

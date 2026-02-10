@@ -51,7 +51,7 @@ function download_file() {
     local output="$2"
 
     if command -v wget &> /dev/null; then
-        wget -q --connect-timeout=10 "$url" -O "$output"
+        wget -q -T 10 "$url" -O "$output"
     elif command -v curl &> /dev/null; then
         curl -sL --connect-timeout 10 "$url" -o "$output"
     else

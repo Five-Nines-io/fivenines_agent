@@ -45,14 +45,14 @@ function download_with_fallback() {
   print_warning "Downloading ${filename}..."
 
   # Try R2 first (IPv6 compatible)
-  if wget --connect-timeout=5 -q "$r2_url" -O "$output" 2>/dev/null; then
+  if wget -T 5 -q "$r2_url" -O "$output" 2>/dev/null; then
     print_success "Downloaded from releases.fivenines.io"
     return 0
   fi
 
   # Fallback to GitHub
   print_warning "R2 mirror unavailable, trying GitHub..."
-  if wget --connect-timeout=5 -q "$github_url" -O "$output" 2>/dev/null; then
+  if wget -T 5 -q "$github_url" -O "$output" 2>/dev/null; then
     print_success "Downloaded from GitHub"
     return 0
   fi
@@ -149,7 +149,7 @@ AGENT_EXECUTABLE="${AGENT_DIR}/${BINARY_NAME}"
 
 if [ -n "${FIVENINES_AGENT_URL:-}" ]; then
     print_warning "Using custom agent URL: $FIVENINES_AGENT_URL"
-    wget --connect-timeout=10 -q "$FIVENINES_AGENT_URL" -O "$TARBALL_PATH" || exit_with_error "Failed to download from custom URL"
+    wget -T 10 -q "$FIVENINES_AGENT_URL" -O "$TARBALL_PATH" || exit_with_error "Failed to download from custom URL"
     print_success "Downloaded from custom URL"
 else
     download_with_fallback "$TARBALL_NAME" "$TARBALL_PATH" "${GITHUB_RELEASES_URL}/${TARBALL_NAME}" || exit_with_error "Failed to download agent"
