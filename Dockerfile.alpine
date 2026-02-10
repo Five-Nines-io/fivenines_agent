@@ -1,0 +1,44 @@
+FROM python:3.11-alpine3.21
+
+# Alpine uses musl libc - no glibc compatibility issues
+# No need to build libtirpc/libcrypt from source (musl provides these)
+
+# Install system packages for building libvirt-python and PyInstaller
+RUN apk add --no-cache \
+    gcc \
+    g++ \
+    make \
+    pkgconfig \
+    wget \
+    musl-dev \
+    linux-headers \
+    libxml2-dev \
+    gnutls-dev \
+    libvirt-dev \
+    libffi-dev \
+    openssl-dev \
+    zlib-dev \
+    binutils \
+    patchelf
+
+# Determine libvirt version and install matching libvirt-python
+RUN LIBVIRT_VERSION=$(pkg-config --modversion libvirt) && \
+    echo "System libvirt version: $LIBVIRT_VERSION" && \
+    pip install --no-cache-dir libvirt-python==$LIBVIRT_VERSION
+
+# Verify libvirt-python
+RUN python -c "import libvirt; print('libvirt-python version:', libvirt.getVersion())"
+
+# Comprehensive verification
+RUN echo "=== Alpine Build Environment Verification ===" && \
+    echo "Base: Alpine 3.21 (musl libc)" && \
+    echo "libc: $(ldd --version 2>&1 | head -n1 || echo musl)" && \
+    echo "Python version: $(python --version)" && \
+    echo "Python path: $(which python)" && \
+    echo "libvirt version: $(pkg-config --modversion libvirt)" && \
+    echo "libvirt libs: $(pkg-config --libs libvirt)" && \
+    python -c "import sysconfig; print('Python include path:', sysconfig.get_path('include'))"
+
+ENV TARGET_ARCH="amd64"
+WORKDIR /workspace
+CMD ["sh"]

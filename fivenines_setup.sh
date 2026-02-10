@@ -1,7 +1,13 @@
 #!/bin/bash
 
 # Fivenines Agent Setup Script
-# Works on both standard Linux systems (systemd) and UNRAID
+# Works on standard Linux systems (systemd), OpenRC (Alpine), and UNRAID
+#
+# Environment variables:
+#   FIVENINES_AGENT_URL - Custom download URL for the agent tarball (e.g., pre-release builds)
+#
+# Example with custom build:
+#   FIVENINES_AGENT_URL="https://github.com/Five-Nines-io/fivenines_agent/releases/download/feature-branch-abc1234/fivenines-agent-linux-amd64.tar.gz" bash fivenines_setup.sh YOUR_TOKEN
 
 # Mirror URLs (R2 is IPv6-compatible, GitHub is fallback)
 R2_BASE_URL="https://releases.fivenines.io/latest"
@@ -44,14 +50,15 @@ function download_with_fallback() {
   print_warning "Downloading ${filename}..."
 
   # Try R2 first (IPv6 compatible)
-  if wget --connect-timeout=5 -q "$r2_url" -O "$output" 2>/dev/null; then
+  # Use -T (BusyBox-compatible) instead of --connect-timeout (GNU wget only)
+  if wget -T 5 -q "$r2_url" -O "$output" 2>/dev/null; then
     print_success "Downloaded from releases.fivenines.io"
     return 0
   fi
 
   # Fallback to GitHub
   print_warning "R2 mirror unavailable, trying GitHub..."
-  if wget --connect-timeout=5 -q "$github_url" -O "$output" 2>/dev/null; then
+  if wget -T 5 -q "$github_url" -O "$output" 2>/dev/null; then
     print_success "Downloaded from GitHub"
     return 0
   fi
@@ -66,6 +73,16 @@ function exit_with_contact() {
   exit 1
 }
 
+function detect_libc() {
+  if ldd --version 2>&1 | grep -qi musl; then
+    echo "musl"
+  elif [ -f "/lib/ld-musl-x86_64.so.1" ] || [ -f "/lib/ld-musl-aarch64.so.1" ]; then
+    echo "musl"
+  else
+    echo "glibc"
+  fi
+}
+
 function detect_system() {
   # Check if this is UNRAID
   if [ -f "/etc/unraid-version" ] || [ -d "/boot/config" ]; then
@@ -73,8 +90,14 @@ function detect_system() {
     return
   fi
 
+  # Check if OpenRC is available (Alpine Linux)
+  if command -v rc-service >/dev/null 2>&1 && [ -d "/etc/init.d" ]; then
+    echo "openrc"
+    return
+  fi
+
   # Check if systemd is available
-  if command -v systemctl &> /dev/null && [ -d "/etc/systemd/system" ]; then
+  if command -v systemctl >/dev/null 2>&1 && [ -d "/etc/systemd/system" ]; then
     echo "systemd"
     return
   fi
@@ -145,6 +168,28 @@ function setup_unraid() {
   fi
 }
 
+function setup_openrc() {
+  print_success "Detected OpenRC system - using OpenRC service"
+
+  # Download the OpenRC init script
+  download_with_fallback "fivenines-agent.openrc" "/etc/init.d/fivenines-agent" "${GITHUB_RAW_URL}/fivenines-agent.openrc" || exit_with_contact "Failed to download OpenRC init script"
+
+  # Make it executable
+  chmod 755 /etc/init.d/fivenines-agent
+
+  # Enable on boot
+  rc-update add fivenines-agent default
+
+  # Start the agent
+  rc-service fivenines-agent start
+
+  if [ $? -ne 0 ]; then
+    exit_with_contact "Failed to start the fivenines-agent service. Check /var/log/fivenines-agent.log for details."
+  fi
+
+  print_success "OpenRC service installed and started successfully"
+}
+
 # Main execution starts here
 print_banner
 
@@ -154,8 +199,8 @@ if [ $# -eq 0 ] ; then
   exit 1
 fi
 
-# Check if running as root
-if [ "$EUID" -ne 0 ]; then
+# Check if running as root (use `id -u` for BusyBox/ash compatibility)
+if [ "$(id -u)" -ne 0 ]; then
   exit_with_contact "This script must be run as root"
 fi
 
@@ -164,7 +209,7 @@ SYSTEM_TYPE=$(detect_system)
 print_success "Detected system type: $SYSTEM_TYPE"
 
 # Check if SELinux is installed
-if command -v getenforce &> /dev/null; then
+if command -v getenforce >/dev/null 2>&1; then
   selinux_status=$(getenforce 2>/dev/null || echo "Disabled")
   print_success "SELinux status: $selinux_status"
   if [ "$selinux_status" == "Enforcing" ]; then
@@ -179,6 +224,9 @@ if ! id -u fivenines >/dev/null 2>&1; then
   print_success "Creating system user fivenines"
   if [ "$SYSTEM_TYPE" == "unraid" ]; then
     useradd --system --user-group fivenines --shell /bin/false --create-home
+  elif [ "$SYSTEM_TYPE" == "openrc" ]; then
+    addgroup -S fivenines 2>/dev/null || true
+    adduser -S -G fivenines -s /sbin/nologin -h /opt/fivenines fivenines 2>/dev/null || true
   else
     useradd --system --user-group --key USERGROUPS_ENAB=yes fivenines --shell /bin/false --create-home -b /opt/
   fi
@@ -219,12 +267,22 @@ fi
 # Ensure install directory exists
 mkdir -p "$INSTALL_DIR"
 
-# Download the agent tarball based on the architecture
+# Download the agent tarball based on the architecture and libc
+LIBC_TYPE=$(detect_libc)
 print_success "Detected architecture: $CURRENT_ARCH"
-if [ "$CURRENT_ARCH" == "aarch64" ]; then
-  BINARY_NAME="fivenines-agent-linux-arm64"
+print_success "Detected libc: $LIBC_TYPE"
+if [ "$LIBC_TYPE" == "musl" ]; then
+  if [ "$CURRENT_ARCH" == "aarch64" ]; then
+    BINARY_NAME="fivenines-agent-alpine-arm64"
+  else
+    BINARY_NAME="fivenines-agent-alpine-amd64"
+  fi
 else
-  BINARY_NAME="fivenines-agent-linux-amd64"
+  if [ "$CURRENT_ARCH" == "aarch64" ]; then
+    BINARY_NAME="fivenines-agent-linux-arm64"
+  else
+    BINARY_NAME="fivenines-agent-linux-amd64"
+  fi
 fi
 
 TARBALL_NAME="${BINARY_NAME}.tar.gz"
@@ -232,7 +290,13 @@ TARBALL_PATH="/tmp/${TARBALL_NAME}"
 AGENT_DIR="${INSTALL_DIR}/${BINARY_NAME}"
 AGENT_EXECUTABLE="${AGENT_DIR}/${BINARY_NAME}"
 
-download_with_fallback "$TARBALL_NAME" "$TARBALL_PATH" "${GITHUB_RELEASES_URL}/${TARBALL_NAME}" || exit_with_contact "Failed to download agent"
+if [ -n "${FIVENINES_AGENT_URL:-}" ]; then
+  print_warning "Using custom agent URL: $FIVENINES_AGENT_URL"
+  wget -T 10 -q "$FIVENINES_AGENT_URL" -O "$TARBALL_PATH" || exit_with_contact "Failed to download from custom URL"
+  print_success "Downloaded from custom URL"
+else
+  download_with_fallback "$TARBALL_NAME" "$TARBALL_PATH" "${GITHUB_RELEASES_URL}/${TARBALL_NAME}" || exit_with_contact "Failed to download agent"
+fi
 
 # Remove old installation if it exists
 if [ -d "$AGENT_DIR" ]; then
@@ -270,11 +334,8 @@ print_success "Agent installed successfully at $AGENT_DIR"
 
 # Test connectivity
 echo "Testing connectivity..."
-hosts=("asia.fivenines.io" "eu.fivenines.io" "us.fivenines.io" "api.fivenines.io")
-
-# Loop through each host and ping once
-for host in "${hosts[@]}"; do
-  if ping -c 1 -W 5 "$host" &> /dev/null; then
+for host in asia.fivenines.io eu.fivenines.io us.fivenines.io api.fivenines.io; do
+  if ping -c 1 -W 5 "$host" >/dev/null 2>&1; then
     print_success "Connected to $host"
   else
     exit_with_contact "Ping to $host failed or timed out. Check your network connection."
@@ -287,11 +348,14 @@ case "$SYSTEM_TYPE" in
   "unraid")
     setup_unraid "$1"
     ;;
+  "openrc")
+    setup_openrc
+    ;;
   "systemd")
     setup_systemd
     ;;
   *)
-    exit_with_contact "Unsupported system type: $SYSTEM_TYPE. This script supports systemd-based systems and UNRAID."
+    exit_with_contact "Unsupported system type: $SYSTEM_TYPE. This script supports systemd, OpenRC, and UNRAID systems."
     ;;
 esac
 
@@ -308,6 +372,13 @@ if [ "$SYSTEM_TYPE" == "unraid" ]; then
   echo "Management options:"
   echo "  Settings -> User Scripts -> fivenines_agent"
   echo "  Log file: /var/log/fivenines-agent.log"
+elif [ "$SYSTEM_TYPE" == "openrc" ]; then
+  echo "The agent is now running as an OpenRC service and will start automatically on boot."
+  echo ""
+  echo "Management commands:"
+  echo "  rc-service fivenines-agent status   - Check status"
+  echo "  tail -f /var/log/fivenines-agent.log - View logs"
+  echo "  rc-service fivenines-agent stop/start - Stop/start"
 else
   echo "The agent is now running as a systemd service and will start automatically on boot."
   echo ""

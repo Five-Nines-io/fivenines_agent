@@ -45,19 +45,39 @@ function download_with_fallback() {
   print_warning "Downloading ${filename}..."
 
   # Try R2 first (IPv6 compatible)
-  if wget --connect-timeout=5 -q "$r2_url" -O "$output" 2>/dev/null; then
+  if wget -T 5 -q "$r2_url" -O "$output" 2>/dev/null; then
     print_success "Downloaded from releases.fivenines.io"
     return 0
   fi
 
   # Fallback to GitHub
   print_warning "R2 mirror unavailable, trying GitHub..."
-  if wget --connect-timeout=5 -q "$github_url" -O "$output" 2>/dev/null; then
+  if wget -T 5 -q "$github_url" -O "$output" 2>/dev/null; then
     print_success "Downloaded from GitHub"
     return 0
   fi
 
   return 1
+}
+
+function detect_libc() {
+  if ldd --version 2>&1 | grep -qi musl; then
+    echo "musl"
+  elif [ -f "/lib/ld-musl-x86_64.so.1" ] || [ -f "/lib/ld-musl-aarch64.so.1" ]; then
+    echo "musl"
+  else
+    echo "glibc"
+  fi
+}
+
+function detect_system() {
+  if command -v rc-service >/dev/null 2>&1 && [ -d "/etc/init.d" ]; then
+    echo "openrc"
+  elif command -v systemctl >/dev/null 2>&1 && [ -d "/etc/systemd/system" ]; then
+    echo "systemd"
+  else
+    echo "unknown"
+  fi
 }
 
 # Print banner
@@ -67,9 +87,16 @@ echo -e "${BLUE}  Fivenines Agent - System Update${NC}"
 echo -e "${BLUE}===============================================================${NC}"
 echo ""
 
+# Detect system type
+SYSTEM_TYPE=$(detect_system)
+
 # stop the agent
 print_warning "Stopping fivenines-agent service..."
-systemctl stop fivenines-agent.service
+if [ "$SYSTEM_TYPE" == "openrc" ]; then
+  rc-service fivenines-agent stop 2>/dev/null || true
+else
+  systemctl stop fivenines-agent.service
+fi
 print_success "Agent stopped"
 
 # if the home directory of user "fivenines" is /home/fivenines (which is the old location), migrate user's home directory to /opt/fivenines
@@ -97,12 +124,22 @@ fi
 CURRENT_ARCH=$(uname -m)
 INSTALL_DIR="/opt/fivenines"
 
-# Update the agent based on the architecture
+# Update the agent based on the architecture and libc
+LIBC_TYPE=$(detect_libc)
 print_success "Detected architecture: $CURRENT_ARCH"
-if [ "$CURRENT_ARCH" == "aarch64" ]; then
-        BINARY_NAME="fivenines-agent-linux-arm64"
+print_success "Detected libc: $LIBC_TYPE"
+if [ "$LIBC_TYPE" == "musl" ]; then
+        if [ "$CURRENT_ARCH" == "aarch64" ]; then
+                BINARY_NAME="fivenines-agent-alpine-arm64"
+        else
+                BINARY_NAME="fivenines-agent-alpine-amd64"
+        fi
 else
-        BINARY_NAME="fivenines-agent-linux-amd64"
+        if [ "$CURRENT_ARCH" == "aarch64" ]; then
+                BINARY_NAME="fivenines-agent-linux-arm64"
+        else
+                BINARY_NAME="fivenines-agent-linux-amd64"
+        fi
 fi
 
 TARBALL_NAME="${BINARY_NAME}.tar.gz"
@@ -112,7 +149,7 @@ AGENT_EXECUTABLE="${AGENT_DIR}/${BINARY_NAME}"
 
 if [ -n "${FIVENINES_AGENT_URL:-}" ]; then
     print_warning "Using custom agent URL: $FIVENINES_AGENT_URL"
-    wget --connect-timeout=10 -q "$FIVENINES_AGENT_URL" -O "$TARBALL_PATH" || exit_with_error "Failed to download from custom URL"
+    wget -T 10 -q "$FIVENINES_AGENT_URL" -O "$TARBALL_PATH" || exit_with_error "Failed to download from custom URL"
     print_success "Downloaded from custom URL"
 else
     download_with_fallback "$TARBALL_NAME" "$TARBALL_PATH" "${GITHUB_RELEASES_URL}/${TARBALL_NAME}" || exit_with_error "Failed to download agent"
@@ -166,13 +203,22 @@ fi
 print_success "Agent updated successfully at $AGENT_DIR"
 
 print_warning "Updating the service file..."
-download_with_fallback "fivenines-agent.service" "/etc/systemd/system/fivenines-agent.service" "${GITHUB_RAW_URL}/fivenines-agent.service"
-print_warning "Reloading the systemd daemon..."
-systemctl daemon-reload
+if [ "$SYSTEM_TYPE" == "openrc" ]; then
+  download_with_fallback "fivenines-agent.openrc" "/etc/init.d/fivenines-agent" "${GITHUB_RAW_URL}/fivenines-agent.openrc"
+  chmod 755 /etc/init.d/fivenines-agent
+else
+  download_with_fallback "fivenines-agent.service" "/etc/systemd/system/fivenines-agent.service" "${GITHUB_RAW_URL}/fivenines-agent.service"
+  print_warning "Reloading the systemd daemon..."
+  systemctl daemon-reload
+fi
 
 # Restart the agent
 print_warning "Restarting fivenines-agent service..."
-systemctl restart fivenines-agent.service
+if [ "$SYSTEM_TYPE" == "openrc" ]; then
+  rc-service fivenines-agent restart
+else
+  systemctl restart fivenines-agent.service
+fi
 print_success "Agent restarted"
 
 echo ""

@@ -1,34 +1,68 @@
 #!/bin/bash
 # This script is used to uninstall the fivenines agent
 
-# Stop the fivenines-agent service
-if systemctl is-active --quiet fivenines-agent.service; then
-  echo "Stopping fivenines-agent service..."
-  sudo systemctl stop fivenines-agent.service
+function detect_system() {
+  if command -v rc-service >/dev/null 2>&1 && [ -d "/etc/init.d" ]; then
+    echo "openrc"
+  elif command -v systemctl >/dev/null 2>&1 && [ -d "/etc/systemd/system" ]; then
+    echo "systemd"
+  else
+    echo "unknown"
+  fi
+}
+
+SYSTEM_TYPE=$(detect_system)
+
+if [ "$SYSTEM_TYPE" == "openrc" ]; then
+  # OpenRC: Stop the service
+  if rc-service fivenines-agent status >/dev/null 2>&1; then
+    echo "Stopping fivenines-agent service..."
+    sudo rc-service fivenines-agent stop
+  else
+    echo "fivenines-agent service is not running."
+  fi
+
+  # OpenRC: Remove from default runlevel
+  if rc-update show default | grep -q fivenines-agent; then
+    echo "Removing fivenines-agent from default runlevel..."
+    sudo rc-update del fivenines-agent default
+  fi
+
+  # OpenRC: Remove the init script
+  if [ -f /etc/init.d/fivenines-agent ]; then
+    echo "Removing fivenines-agent init script..."
+    sudo rm /etc/init.d/fivenines-agent
+  fi
 else
-  echo "fivenines-agent service is not running."
+  # systemd: Stop the service
+  if systemctl is-active --quiet fivenines-agent.service; then
+    echo "Stopping fivenines-agent service..."
+    sudo systemctl stop fivenines-agent.service
+  else
+    echo "fivenines-agent service is not running."
+  fi
+
+  # systemd: Disable the service
+  if systemctl is-enabled --quiet fivenines-agent.service; then
+    echo "Disabling fivenines-agent service..."
+    sudo systemctl disable fivenines-agent.service
+  else
+    echo "fivenines-agent service is not enabled."
+  fi
+
+  # systemd: Remove the service file
+  if [ -f /etc/systemd/system/fivenines-agent.service ]; then
+    echo "Removing fivenines-agent.service file..."
+    sudo rm /etc/systemd/system/fivenines-agent.service
+  fi
+
+  # systemd: Reload daemon
+  echo "Reloading systemd daemon..."
+  sudo systemctl daemon-reload
 fi
 
-# Disable the fivenines-agent service
-if systemctl is-enabled --quiet fivenines-agent.service; then
-  echo "Disabling fivenines-agent service..."
-  sudo systemctl disable fivenines-agent.service
-else
-  echo "fivenines-agent service is not enabled."
-fi
-
-# Remove the fivenines-agent service file
-if [ -f /etc/systemd/system/fivenines-agent.service ]; then
-  echo "Removing fivenines-agent.service file..."
-  sudo rm /etc/systemd/system/fivenines-agent.service
-fi
-
-# Reload systemd daemon
-echo "Reloading systemd daemon..."
-sudo systemctl daemon-reload
-
-# Uninstall fivenines_agent
-if su - fivenines -s /bin/bash -c 'pipx list | grep -q fivenines_agent'; then
+# Uninstall fivenines_agent (legacy pipx)
+if su - fivenines -s /bin/bash -c 'pipx list | grep -q fivenines_agent' 2>/dev/null; then
   echo "Uninstalling fivenines_agent..."
   sudo su - fivenines -s /bin/bash -c 'pipx uninstall fivenines_agent'
 else
@@ -46,7 +80,12 @@ fi
 # Remove the system user for the agent
 if id -u fivenines >/dev/null 2>&1; then
   echo "Removing system user fivenines..."
-  sudo userdel -r fivenines
+  if [ "$SYSTEM_TYPE" == "openrc" ]; then
+    sudo deluser --remove-home fivenines 2>/dev/null || sudo userdel -r fivenines 2>/dev/null || true
+    sudo delgroup fivenines 2>/dev/null || true
+  else
+    sudo userdel -r fivenines
+  fi
 else
   echo "System user fivenines does not exist."
 fi

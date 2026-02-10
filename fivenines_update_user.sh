@@ -51,7 +51,7 @@ function download_file() {
     local output="$2"
 
     if command -v wget &> /dev/null; then
-        wget -q --connect-timeout=10 "$url" -O "$output"
+        wget -q -T 10 "$url" -O "$output"
     elif command -v curl &> /dev/null; then
         curl -sL --connect-timeout 10 "$url" -o "$output"
     else
@@ -81,6 +81,16 @@ function download_with_fallback() {
     return 1
 }
 
+function detect_libc() {
+    if ldd --version 2>&1 | grep -qi musl; then
+        echo "musl"
+    elif [ -f "/lib/ld-musl-x86_64.so.1" ] || [ -f "/lib/ld-musl-aarch64.so.1" ]; then
+        echo "musl"
+    else
+        echo "glibc"
+    fi
+}
+
 echo ""
 echo -e "${BLUE}===============================================================${NC}"
 echo -e "${BLUE}  Fivenines Agent - User-Level Update${NC}"
@@ -104,21 +114,36 @@ fi
 
 print_success "Found existing installation"
 
-# Detect architecture
+# Detect architecture and libc
 ARCH=$(uname -m)
-case "$ARCH" in
-    x86_64|amd64)
-        BINARY_NAME="fivenines-agent-linux-amd64"
-        ;;
-    aarch64|arm64)
-        BINARY_NAME="fivenines-agent-linux-arm64"
-        ;;
-    *)
-        exit_with_error "Unsupported architecture: $ARCH"
-        ;;
-esac
+LIBC_TYPE=$(detect_libc)
+if [ "$LIBC_TYPE" = "musl" ]; then
+    case "$ARCH" in
+        x86_64|amd64)
+            BINARY_NAME="fivenines-agent-alpine-amd64"
+            ;;
+        aarch64|arm64)
+            BINARY_NAME="fivenines-agent-alpine-arm64"
+            ;;
+        *)
+            exit_with_error "Unsupported architecture: $ARCH"
+            ;;
+    esac
+else
+    case "$ARCH" in
+        x86_64|amd64)
+            BINARY_NAME="fivenines-agent-linux-amd64"
+            ;;
+        aarch64|arm64)
+            BINARY_NAME="fivenines-agent-linux-arm64"
+            ;;
+        *)
+            exit_with_error "Unsupported architecture: $ARCH"
+            ;;
+    esac
+fi
 
-print_success "Architecture: $ARCH"
+print_success "Architecture: $ARCH, libc: $LIBC_TYPE"
 
 # Stop the agent if running
 echo "Stopping agent..."
