@@ -2,7 +2,7 @@
 
 import argparse
 
-VERSION = '1.5.1'
+VERSION = '1.5.2'
 
 # Global args storage (set by parse_args)
 _args = None
