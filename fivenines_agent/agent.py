@@ -67,8 +67,17 @@ class Agent:
         # Load token
         self._load_file("TOKEN")
 
+        # Static info sent with every request
+        self.static_data = {
+            "version": VERSION,
+            "uname": platform.uname()._asdict(),
+            "boot_time": psutil.boot_time(),
+            "capabilities": self.permissions.get_all(),
+            "user_context": get_user_context(CONFIG_DIR),
+        }
+
         self.queue = SynchronizationQueue(maxsize=100)
-        self.synchronizer = Synchronizer(self.token, self.queue)
+        self.synchronizer = Synchronizer(self.token, self.queue, self.static_data)
         self.synchronizer.start()
 
     def _load_file(self, filename):
@@ -88,29 +97,20 @@ class Agent:
         else:
             wd = None
 
-        # Static info
-        static_data = {
-            "version": VERSION,
-            "uname": platform.uname()._asdict(),
-            "boot_time": psutil.boot_time(),
-            "capabilities": self.permissions.get_all(),
-            "user_context": get_user_context(CONFIG_DIR),
-        }
-
         try:
             while not exit_event.is_set():
                 if wd is not None:
                     wd.notify()
-                self._handle_permission_refresh(static_data)
+                self._handle_permission_refresh()
 
                 # Refresh config if disabled
                 self.config = self.synchronizer.get_config()
                 if not self.config.get("enabled", False):
-                    self.queue.put({"get_config": True})
+                    self.queue.put({"get_config": True, **self.static_data})
                     exit_event.wait(25)
                     continue
 
-                data = static_data.copy()
+                data = self.static_data.copy()
                 data["ts"] = time.time()
                 start = time.monotonic()
                 self._telemetry = {}
@@ -195,14 +195,14 @@ class Agent:
             entry["errors"] = errors
         self._telemetry["packages_sync"] = entry
 
-    def _handle_permission_refresh(self, static_data):
+    def _handle_permission_refresh(self):
         if refresh_permissions_event.is_set():
             refresh_permissions_event.clear()
             self.permissions.force_refresh()
-            static_data["capabilities"] = self.permissions.get_all()
+            self.static_data["capabilities"] = self.permissions.get_all()
             print_capabilities_banner()
         elif self.permissions.refresh_if_needed():
-            static_data["capabilities"] = self.permissions.get_all()
+            self.static_data["capabilities"] = self.permissions.get_all()
 
     def _wait_interval(self, running_time):
         log(f"Running time: {running_time:.3f}s", "debug")

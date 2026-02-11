@@ -21,15 +21,15 @@ def make_agent():
     agent.permissions.get_all.return_value = {}
     agent.permissions.refresh_if_needed.return_value = False
     agent.queue = MagicMock()
+    agent.static_data = {"version": "test"}
     agent._telemetry = {}
     return agent
 
 
 @patch("fivenines_agent.agent.dry_run", return_value=True)
-@patch("fivenines_agent.agent.get_user_context", return_value={})
 @patch("fivenines_agent.agent.collect_metrics")
 @patch("fivenines_agent.agent.packages_sync")
-def test_run_with_watchdog_none(mock_ps, mock_cm, mock_uc, mock_dr):
+def test_run_with_watchdog_none(mock_ps, mock_cm, mock_dr):
     """When systemd_watchdog is None, agent.run() works without calling watchdog."""
     agent = make_agent()
     agent.config = {"enabled": True, "interval": 60}
@@ -47,10 +47,9 @@ def test_run_with_watchdog_none(mock_ps, mock_cm, mock_uc, mock_dr):
 
 
 @patch("fivenines_agent.agent.dry_run", return_value=True)
-@patch("fivenines_agent.agent.get_user_context", return_value={})
 @patch("fivenines_agent.agent.collect_metrics")
 @patch("fivenines_agent.agent.packages_sync")
-def test_run_with_watchdog_present(mock_ps, mock_cm, mock_uc, mock_dr):
+def test_run_with_watchdog_present(mock_ps, mock_cm, mock_dr):
     """When systemd_watchdog is available, agent.run() calls wd.ready() and wd.notify()."""
     agent = make_agent()
     agent.config = {"enabled": True, "interval": 60}

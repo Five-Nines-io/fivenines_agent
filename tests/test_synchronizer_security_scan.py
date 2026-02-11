@@ -19,6 +19,7 @@ def make_synchronizer():
         "request_options": {"timeout": 5, "retry": 3, "retry_interval": 0},
     }
     sync.queue = queue
+    sync.static_data = {}
     return sync
 
 

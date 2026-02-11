@@ -15,7 +15,7 @@ from fivenines_agent.env import api_url, config_dir
 
 
 class Synchronizer(Thread):
-    def __init__(self, token, queue):
+    def __init__(self, token, queue, static_data=None):
         Thread.__init__(self)
         self._stop_event = Event()
         self.config_lock = Lock()
@@ -25,10 +25,11 @@ class Synchronizer(Thread):
             "request_options": {"timeout": 5, "retry": 3, "retry_interval": 5},
         }
         self.queue = queue
+        self.static_data = static_data or {}
 
     def run(self):
         # We fetch the config from the server before starting to collect metrics
-        self.send_metrics({"get_config": True})
+        self.send_metrics({"get_config": True, **self.static_data})
 
         while not self._stop_event.is_set():
             data = self.queue.get()
@@ -167,7 +168,7 @@ class Synchronizer(Thread):
         with self.config_lock:
             config = self.config
         if config["enabled"] is None:
-            self.send_metrics({"get_config": True})
+            self.send_metrics({"get_config": True, **self.static_data})
             with self.config_lock:
                 return self.config
         return config
