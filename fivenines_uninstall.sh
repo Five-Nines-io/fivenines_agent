@@ -1,7 +1,7 @@
-#!/bin/bash
+#!/bin/sh
 # This script is used to uninstall the fivenines agent
 
-function detect_system() {
+detect_system() {
   if command -v rc-service >/dev/null 2>&1 && [ -d "/etc/init.d" ]; then
     echo "openrc"
   elif command -v systemctl >/dev/null 2>&1 && [ -d "/etc/systemd/system" ]; then

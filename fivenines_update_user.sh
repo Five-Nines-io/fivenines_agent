@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 # Fivenines Agent User-Level Update Script
 # Updates an existing user-level installation
@@ -29,37 +29,37 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-function print_success() {
+print_success() {
     echo -e "${GREEN}[+]${NC} $1"
 }
 
-function print_warning() {
+print_warning() {
     echo -e "${YELLOW}[!]${NC} $1"
 }
 
-function print_error() {
+print_error() {
     echo -e "${RED}[-]${NC} $1"
 }
 
-function exit_with_error() {
+exit_with_error() {
     print_error "$1"
     exit 1
 }
 
-function download_file() {
+download_file() {
     local url="$1"
     local output="$2"
 
-    if command -v wget &> /dev/null; then
+    if command -v wget > /dev/null 2>&1; then
         wget -q -T 10 "$url" -O "$output"
-    elif command -v curl &> /dev/null; then
+    elif command -v curl > /dev/null 2>&1; then
         curl -sL --connect-timeout 10 "$url" -o "$output"
     else
         return 1
     fi
 }
 
-function download_with_fallback() {
+download_with_fallback() {
     local filename="$1"
     local output="$2"
     local r2_url="${R2_BASE_URL}/${filename}"
@@ -81,7 +81,7 @@ function download_with_fallback() {
     return 1
 }
 
-function detect_libc() {
+detect_libc() {
     if ldd --version 2>&1 | grep -qi musl; then
         echo "musl"
     elif [ -f "/lib/ld-musl-x86_64.so.1" ] || [ -f "/lib/ld-musl-aarch64.so.1" ]; then

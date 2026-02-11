@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 # Fivenines Agent User-Level Setup Script
 # For environments without root access (shared hosting, managed VPS, etc.)
@@ -35,7 +35,7 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-function print_banner() {
+print_banner() {
     echo ""
     echo -e "${BLUE}===============================================================${NC}"
     echo -e "${BLUE}  Fivenines Agent - User-Level Installation${NC}"
@@ -43,33 +43,33 @@ function print_banner() {
     echo ""
 }
 
-function print_success() {
+print_success() {
     echo -e "${GREEN}[+]${NC} $1"
 }
 
-function print_warning() {
+print_warning() {
     echo -e "${YELLOW}[!]${NC} $1"
 }
 
-function print_error() {
+print_error() {
     echo -e "${RED}[-]${NC} $1"
 }
 
-function exit_with_error() {
+exit_with_error() {
     print_error "$1"
     echo ""
     echo "For assistance, contact: sebastien@fivenines.io"
     exit 1
 }
 
-function check_requirements() {
+check_requirements() {
     echo "Checking requirements..."
 
     # Check for wget or curl
-    if command -v wget &> /dev/null; then
+    if command -v wget > /dev/null 2>&1; then
         DOWNLOADER="wget"
         print_success "wget available"
-    elif command -v curl &> /dev/null; then
+    elif command -v curl > /dev/null 2>&1; then
         DOWNLOADER="curl"
         print_success "curl available"
     else
@@ -77,7 +77,7 @@ function check_requirements() {
     fi
 
     # Check for tar
-    if ! command -v tar &> /dev/null; then
+    if ! command -v tar > /dev/null 2>&1; then
         exit_with_error "tar not found. Please install tar."
     fi
     print_success "tar available"
@@ -91,7 +91,7 @@ function check_requirements() {
     echo ""
 }
 
-function download_file() {
+download_file() {
     local url="$1"
     local output="$2"
 
@@ -102,7 +102,7 @@ function download_file() {
     fi
 }
 
-function download_with_fallback() {
+download_with_fallback() {
     local filename="$1"
     local output="$2"
     local r2_url="${R2_BASE_URL}/${filename}"
@@ -124,7 +124,7 @@ function download_with_fallback() {
     return 1
 }
 
-function detect_libc() {
+detect_libc() {
     if ldd --version 2>&1 | grep -qi musl; then
         echo "musl"
     elif [ -f "/lib/ld-musl-x86_64.so.1" ] || [ -f "/lib/ld-musl-aarch64.so.1" ]; then
@@ -134,7 +134,7 @@ function detect_libc() {
     fi
 }
 
-function detect_architecture() {
+detect_architecture() {
     ARCH=$(uname -m)
     LIBC_TYPE=$(detect_libc)
     if [ "$LIBC_TYPE" = "musl" ]; then
@@ -165,7 +165,7 @@ function detect_architecture() {
     print_success "Architecture: $ARCH, libc: $LIBC_TYPE ($BINARY_NAME)"
 }
 
-function create_directories() {
+create_directories() {
     echo "Creating directories..."
 
     mkdir -p "$INSTALL_DIR"
@@ -177,7 +177,7 @@ function create_directories() {
     echo ""
 }
 
-function save_token() {
+save_token() {
     local token="$1"
 
     echo "Saving token..."
@@ -187,7 +187,7 @@ function save_token() {
     echo ""
 }
 
-function download_agent() {
+download_agent() {
     echo "Downloading agent..."
 
     local tarball_name="${BINARY_NAME}.tar.gz"
@@ -219,14 +219,14 @@ function download_agent() {
     echo ""
 }
 
-function test_connectivity() {
+test_connectivity() {
     echo "Testing connectivity..."
 
     local hosts=("api.fivenines.io" "eu.fivenines.io" "us.fivenines.io")
     local connected=false
 
     for host in "${hosts[@]}"; do
-        if ping -c 1 -W 3 "$host" &> /dev/null 2>&1; then
+        if ping -c 1 -W 3 "$host" > /dev/null 2>&1; then
             print_success "Connected to $host"
             connected=true
             break
@@ -245,7 +245,7 @@ function test_connectivity() {
     echo ""
 }
 
-function create_run_script() {
+create_run_script() {
     echo "Creating helper scripts..."
 
     # Create start script
@@ -334,7 +334,7 @@ EOF
     echo ""
 }
 
-function start_agent() {
+start_agent() {
     echo "Starting agent..."
 
     "$INSTALL_DIR/start.sh"
@@ -352,7 +352,7 @@ function start_agent() {
     echo ""
 }
 
-function print_crontab_instructions() {
+print_crontab_instructions() {
     echo -e "${BLUE}===============================================================${NC}"
     echo -e "${BLUE}  Auto-Start on Reboot (Optional)${NC}"
     echo -e "${BLUE}===============================================================${NC}"
@@ -364,7 +364,7 @@ function print_crontab_instructions() {
     echo ""
 }
 
-function print_final_instructions() {
+print_final_instructions() {
     echo -e "${BLUE}===============================================================${NC}"
     echo -e "${BLUE}  Installation Complete!${NC}"
     echo -e "${BLUE}===============================================================${NC}"

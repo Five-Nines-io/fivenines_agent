@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # This script is used to update the fivenines agent
 #
 # Environment variables:
@@ -19,24 +19,24 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-function print_success() {
+print_success() {
     echo -e "${GREEN}[+]${NC} $1"
 }
 
-function print_warning() {
+print_warning() {
     echo -e "${YELLOW}[!]${NC} $1"
 }
 
-function print_error() {
+print_error() {
     echo -e "${RED}[-]${NC} $1"
 }
 
-function exit_with_error() {
+exit_with_error() {
     print_error "$1"
     exit 1
 }
 
-function download_with_fallback() {
+download_with_fallback() {
   local filename="$1"
   local output="$2"
   local r2_url="${R2_BASE_URL}/${filename}"
@@ -60,7 +60,7 @@ function download_with_fallback() {
   return 1
 }
 
-function detect_libc() {
+detect_libc() {
   if ldd --version 2>&1 | grep -qi musl; then
     echo "musl"
   elif [ -f "/lib/ld-musl-x86_64.so.1" ] || [ -f "/lib/ld-musl-aarch64.so.1" ]; then
@@ -70,7 +70,7 @@ function detect_libc() {
   fi
 }
 
-function detect_system() {
+detect_system() {
   if command -v rc-service >/dev/null 2>&1 && [ -d "/etc/init.d" ]; then
     echo "openrc"
   elif command -v systemctl >/dev/null 2>&1 && [ -d "/etc/systemd/system" ]; then

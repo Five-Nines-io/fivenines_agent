@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 # Fivenines Agent Setup Script
 # Works on standard Linux systems (systemd), OpenRC (Alpine), and UNRAID
@@ -21,7 +21,7 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-function print_banner() {
+print_banner() {
     echo ""
     echo -e "${BLUE}===============================================================${NC}"
     echo -e "${BLUE}  Fivenines Agent - System Installation${NC}"
@@ -29,19 +29,19 @@ function print_banner() {
     echo ""
 }
 
-function print_success() {
+print_success() {
     echo -e "${GREEN}[+]${NC} $1"
 }
 
-function print_warning() {
+print_warning() {
     echo -e "${YELLOW}[!]${NC} $1"
 }
 
-function print_error() {
+print_error() {
     echo -e "${RED}[-]${NC} $1"
 }
 
-function download_with_fallback() {
+download_with_fallback() {
   local filename="$1"
   local output="$2"
   local r2_url="${R2_BASE_URL}/${filename}"
@@ -66,14 +66,14 @@ function download_with_fallback() {
   return 1
 }
 
-function exit_with_contact() {
+exit_with_contact() {
   print_error "$1"
   echo ""
   echo "For assistance, contact: sebastien@fivenines.io"
   exit 1
 }
 
-function detect_libc() {
+detect_libc() {
   if ldd --version 2>&1 | grep -qi musl; then
     echo "musl"
   elif [ -f "/lib/ld-musl-x86_64.so.1" ] || [ -f "/lib/ld-musl-aarch64.so.1" ]; then
@@ -83,7 +83,7 @@ function detect_libc() {
   fi
 }
 
-function detect_system() {
+detect_system() {
   # Check if this is UNRAID
   if [ -f "/etc/unraid-version" ] || [ -d "/boot/config" ]; then
     echo "unraid"
@@ -118,7 +118,7 @@ function detect_system() {
   fi
 }
 
-function setup_systemd() {
+setup_systemd() {
   print_success "Detected systemd system - using systemd service"
 
   # Download the service file
@@ -143,7 +143,7 @@ function setup_systemd() {
   print_success "Systemd service installed and started successfully"
 }
 
-function setup_unraid() {
+setup_unraid() {
   print_warning "Starting fivenines agent..."
 
   download_with_fallback "fivenines_script.sh" "/boot/config/custom/fivenines_agent/fivenines_boot" "${GITHUB_RAW_URL}/fivenines_script.sh" || exit_with_contact "Failed to download fivenines_script.sh"
@@ -168,7 +168,7 @@ function setup_unraid() {
   fi
 }
 
-function setup_openrc() {
+setup_openrc() {
   print_success "Detected OpenRC system - using OpenRC service"
 
   # Download the OpenRC init script

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 # Fivenines Agent User-Level Uninstall Script
 # Removes a user-level installation
@@ -15,11 +15,11 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-function print_success() {
+print_success() {
     echo -e "${GREEN}[+]${NC} $1"
 }
 
-function print_warning() {
+print_warning() {
     echo -e "${YELLOW}[!]${NC} $1"
 }
 
