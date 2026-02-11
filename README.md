@@ -9,7 +9,7 @@ This agent collects server metrics from the monitored host and sends it to the [
 Requires sudo/root access for initial setup. The agent runs as a dedicated `fivenines` user with limited permissions.
 
 ```bash
-wget --connect-timeout=3 -q https://releases.fivenines.io/latest/fivenines_setup.sh && sudo bash fivenines_setup.sh TOKEN
+wget -T 3 -q https://releases.fivenines.io/latest/fivenines_setup.sh && sudo bash fivenines_setup.sh TOKEN
 ```
 
 ### User-Level Installation (No Sudo/Root Access)
@@ -17,7 +17,7 @@ wget --connect-timeout=3 -q https://releases.fivenines.io/latest/fivenines_setup
 For environments where you don't have sudo/root access (shared hosting, managed VPS, etc.):
 
 ```bash
-wget --connect-timeout=3 -q https://releases.fivenines.io/latest/fivenines_setup_user.sh && bash fivenines_setup_user.sh TOKEN
+wget -T 3 -q https://releases.fivenines.io/latest/fivenines_setup_user.sh && bash fivenines_setup_user.sh TOKEN
 ```
 
 This installs to `~/.local/fivenines` and creates helper scripts:
@@ -42,13 +42,13 @@ To auto-start on reboot, add to crontab (`crontab -e`):
 ### Standard Update (with sudo/root)
 
 ```bash
-wget --connect-timeout=3 -q https://releases.fivenines.io/latest/fivenines_update.sh && sudo bash fivenines_update.sh
+wget -T 3 -q https://releases.fivenines.io/latest/fivenines_update.sh && sudo bash fivenines_update.sh
 ```
 
 ### User-Level Update (no sudo/root)
 
 ```bash
-wget --connect-timeout=3 -q https://releases.fivenines.io/latest/fivenines_update_user.sh && bash fivenines_update_user.sh
+wget -T 3 -q https://releases.fivenines.io/latest/fivenines_update_user.sh && bash fivenines_update_user.sh
 ```
 
 ## Remove
@@ -56,13 +56,13 @@ wget --connect-timeout=3 -q https://releases.fivenines.io/latest/fivenines_updat
 ### Standard Removal (with sudo/root)
 
 ```bash
-wget --connect-timeout=3 -q https://releases.fivenines.io/latest/fivenines_uninstall.sh && sudo bash fivenines_uninstall.sh
+wget -T 3 -q https://releases.fivenines.io/latest/fivenines_uninstall.sh && sudo bash fivenines_uninstall.sh
 ```
 
 ### User-Level Removal (no sudo/root)
 
 ```bash
-wget --connect-timeout=3 -q https://releases.fivenines.io/latest/fivenines_uninstall_user.sh && bash fivenines_uninstall_user.sh
+wget -T 3 -q https://releases.fivenines.io/latest/fivenines_uninstall_user.sh && bash fivenines_uninstall_user.sh
 ```
 
 ## Debug
