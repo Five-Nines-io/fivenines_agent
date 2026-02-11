@@ -71,7 +71,7 @@ If you need to debug the agent collected data, you can run the following command
 
 ```bash
 # Standard installation
-/opt/fivenines/fivenines_agent --dry-run
+sudo -u fivenines /opt/fivenines/fivenines_agent --dry-run
 
 # User-level installation
 ~/.local/fivenines/fivenines-agent-linux-*/fivenines-agent-linux-* --dry-run

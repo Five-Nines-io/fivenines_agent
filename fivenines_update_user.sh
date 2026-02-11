@@ -30,15 +30,15 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 print_success() {
-    echo -e "${GREEN}[+]${NC} $1"
+    printf '%b\n' "${GREEN}[+]${NC} $1"
 }
 
 print_warning() {
-    echo -e "${YELLOW}[!]${NC} $1"
+    printf '%b\n' "${YELLOW}[!]${NC} $1"
 }
 
 print_error() {
-    echo -e "${RED}[-]${NC} $1"
+    printf '%b\n' "${RED}[-]${NC} $1"
 }
 
 exit_with_error() {
@@ -92,13 +92,13 @@ detect_libc() {
 }
 
 echo ""
-echo -e "${BLUE}===============================================================${NC}"
-echo -e "${BLUE}  Fivenines Agent - User-Level Update${NC}"
-echo -e "${BLUE}===============================================================${NC}"
+printf '%b\n' "${BLUE}===============================================================${NC}"
+printf '%b\n' "${BLUE}  Fivenines Agent - User-Level Update${NC}"
+printf '%b\n' "${BLUE}===============================================================${NC}"
 echo ""
 
 if [ -n "${FIVENINES_AGENT_URL:-}" ]; then
-    echo -e "${YELLOW}  Custom build URL detected${NC}"
+    printf '%b\n' "${YELLOW}  Custom build URL detected${NC}"
     echo ""
 fi
 
@@ -202,7 +202,7 @@ else
 fi
 
 echo ""
-echo -e "${GREEN}Update complete!${NC}"
+printf '%b\n' "${GREEN}Update complete!${NC}"
 echo ""
 
 # Clean up script

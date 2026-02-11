@@ -13,7 +13,7 @@ detect_system() {
 
 SYSTEM_TYPE=$(detect_system)
 
-if [ "$SYSTEM_TYPE" == "openrc" ]; then
+if [ "$SYSTEM_TYPE" = "openrc" ]; then
   # OpenRC: Stop the service
   if rc-service fivenines-agent status >/dev/null 2>&1; then
     echo "Stopping fivenines-agent service..."
@@ -80,7 +80,7 @@ fi
 # Remove the system user for the agent
 if id -u fivenines >/dev/null 2>&1; then
   echo "Removing system user fivenines..."
-  if [ "$SYSTEM_TYPE" == "openrc" ]; then
+  if [ "$SYSTEM_TYPE" = "openrc" ]; then
     sudo deluser --remove-home fivenines 2>/dev/null || sudo userdel -r fivenines 2>/dev/null || true
     sudo delgroup fivenines 2>/dev/null || true
   else

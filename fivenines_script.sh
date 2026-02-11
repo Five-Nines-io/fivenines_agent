@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 # Fivenines Agent Boot Script for UNRAID
 
 # Kill any existing instances
@@ -9,7 +9,7 @@ fi
 
 # Detect architecture and set paths
 CURRENT_ARCH=$(uname -m)
-if [ "$CURRENT_ARCH" == "aarch64" ]; then
+if [ "$CURRENT_ARCH" = "aarch64" ]; then
   BINARY_NAME="fivenines-agent-linux-arm64"
 else
   BINARY_NAME="fivenines-agent-linux-amd64"

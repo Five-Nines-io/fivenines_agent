@@ -20,15 +20,15 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 print_success() {
-    echo -e "${GREEN}[+]${NC} $1"
+    printf '%b\n' "${GREEN}[+]${NC} $1"
 }
 
 print_warning() {
-    echo -e "${YELLOW}[!]${NC} $1"
+    printf '%b\n' "${YELLOW}[!]${NC} $1"
 }
 
 print_error() {
-    echo -e "${RED}[-]${NC} $1"
+    printf '%b\n' "${RED}[-]${NC} $1"
 }
 
 exit_with_error() {
@@ -82,9 +82,9 @@ detect_system() {
 
 # Print banner
 echo ""
-echo -e "${BLUE}===============================================================${NC}"
-echo -e "${BLUE}  Fivenines Agent - System Update${NC}"
-echo -e "${BLUE}===============================================================${NC}"
+printf '%b\n' "${BLUE}===============================================================${NC}"
+printf '%b\n' "${BLUE}  Fivenines Agent - System Update${NC}"
+printf '%b\n' "${BLUE}===============================================================${NC}"
 echo ""
 
 # Detect system type
@@ -92,7 +92,7 @@ SYSTEM_TYPE=$(detect_system)
 
 # stop the agent
 print_warning "Stopping fivenines-agent service..."
-if [ "$SYSTEM_TYPE" == "openrc" ]; then
+if [ "$SYSTEM_TYPE" = "openrc" ]; then
   rc-service fivenines-agent stop 2>/dev/null || true
 else
   systemctl stop fivenines-agent.service
@@ -100,7 +100,7 @@ fi
 print_success "Agent stopped"
 
 # if the home directory of user "fivenines" is /home/fivenines (which is the old location), migrate user's home directory to /opt/fivenines
-if [ "$(getent passwd fivenines | cut -d: -f6)" == "/home/fivenines" ]; then
+if [ "$(getent passwd fivenines | cut -d: -f6)" = "/home/fivenines" ]; then
         print_warning "Migrating fivenines.io's working directory from /home/fivenines to /opt/fivenines"
         # if /opt/fivenines exists, or /home/fivenines not exists, exit
         if [ -d /opt/fivenines ] || [ ! -d /home/fivenines ]; then
@@ -128,14 +128,14 @@ INSTALL_DIR="/opt/fivenines"
 LIBC_TYPE=$(detect_libc)
 print_success "Detected architecture: $CURRENT_ARCH"
 print_success "Detected libc: $LIBC_TYPE"
-if [ "$LIBC_TYPE" == "musl" ]; then
-        if [ "$CURRENT_ARCH" == "aarch64" ]; then
+if [ "$LIBC_TYPE" = "musl" ]; then
+        if [ "$CURRENT_ARCH" = "aarch64" ]; then
                 BINARY_NAME="fivenines-agent-alpine-arm64"
         else
                 BINARY_NAME="fivenines-agent-alpine-amd64"
         fi
 else
-        if [ "$CURRENT_ARCH" == "aarch64" ]; then
+        if [ "$CURRENT_ARCH" = "aarch64" ]; then
                 BINARY_NAME="fivenines-agent-linux-arm64"
         else
                 BINARY_NAME="fivenines-agent-linux-amd64"
@@ -203,7 +203,7 @@ fi
 print_success "Agent updated successfully at $AGENT_DIR"
 
 print_warning "Updating the service file..."
-if [ "$SYSTEM_TYPE" == "openrc" ]; then
+if [ "$SYSTEM_TYPE" = "openrc" ]; then
   download_with_fallback "fivenines-agent.openrc" "/etc/init.d/fivenines-agent" "${GITHUB_RAW_URL}/fivenines-agent.openrc"
   chmod 755 /etc/init.d/fivenines-agent
 else
@@ -214,7 +214,7 @@ fi
 
 # Restart the agent
 print_warning "Restarting fivenines-agent service..."
-if [ "$SYSTEM_TYPE" == "openrc" ]; then
+if [ "$SYSTEM_TYPE" = "openrc" ]; then
   rc-service fivenines-agent restart
 else
   systemctl restart fivenines-agent.service
@@ -222,9 +222,9 @@ fi
 print_success "Agent restarted"
 
 echo ""
-echo -e "${BLUE}===============================================================${NC}"
-echo -e "${BLUE}  Update Complete!${NC}"
-echo -e "${BLUE}===============================================================${NC}"
+printf '%b\n' "${BLUE}===============================================================${NC}"
+printf '%b\n' "${BLUE}  Update Complete!${NC}"
+printf '%b\n' "${BLUE}===============================================================${NC}"
 echo ""
 
 # Remove the update script

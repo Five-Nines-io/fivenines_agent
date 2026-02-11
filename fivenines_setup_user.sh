@@ -37,22 +37,22 @@ NC='\033[0m' # No Color
 
 print_banner() {
     echo ""
-    echo -e "${BLUE}===============================================================${NC}"
-    echo -e "${BLUE}  Fivenines Agent - User-Level Installation${NC}"
-    echo -e "${BLUE}===============================================================${NC}"
+    printf '%b\n' "${BLUE}===============================================================${NC}"
+    printf '%b\n' "${BLUE}  Fivenines Agent - User-Level Installation${NC}"
+    printf '%b\n' "${BLUE}===============================================================${NC}"
     echo ""
 }
 
 print_success() {
-    echo -e "${GREEN}[+]${NC} $1"
+    printf '%b\n' "${GREEN}[+]${NC} $1"
 }
 
 print_warning() {
-    echo -e "${YELLOW}[!]${NC} $1"
+    printf '%b\n' "${YELLOW}[!]${NC} $1"
 }
 
 print_error() {
-    echo -e "${RED}[-]${NC} $1"
+    printf '%b\n' "${RED}[-]${NC} $1"
 }
 
 exit_with_error() {
@@ -222,10 +222,9 @@ download_agent() {
 test_connectivity() {
     echo "Testing connectivity..."
 
-    local hosts=("api.fivenines.io" "eu.fivenines.io" "us.fivenines.io")
     local connected=false
 
-    for host in "${hosts[@]}"; do
+    for host in api.fivenines.io eu.fivenines.io us.fivenines.io; do
         if ping -c 1 -W 3 "$host" > /dev/null 2>&1; then
             print_success "Connected to $host"
             connected=true
@@ -353,21 +352,21 @@ start_agent() {
 }
 
 print_crontab_instructions() {
-    echo -e "${BLUE}===============================================================${NC}"
-    echo -e "${BLUE}  Auto-Start on Reboot (Optional)${NC}"
-    echo -e "${BLUE}===============================================================${NC}"
+    printf '%b\n' "${BLUE}===============================================================${NC}"
+    printf '%b\n' "${BLUE}  Auto-Start on Reboot (Optional)${NC}"
+    printf '%b\n' "${BLUE}===============================================================${NC}"
     echo ""
     echo "To automatically start the agent when your server reboots,"
     echo "add this line to your crontab (run: crontab -e):"
     echo ""
-    echo -e "${GREEN}@reboot $INSTALL_DIR/start.sh${NC}"
+    printf '%b\n' "${GREEN}@reboot $INSTALL_DIR/start.sh${NC}"
     echo ""
 }
 
 print_final_instructions() {
-    echo -e "${BLUE}===============================================================${NC}"
-    echo -e "${BLUE}  Installation Complete!${NC}"
-    echo -e "${BLUE}===============================================================${NC}"
+    printf '%b\n' "${BLUE}===============================================================${NC}"
+    printf '%b\n' "${BLUE}  Installation Complete!${NC}"
+    printf '%b\n' "${BLUE}===============================================================${NC}"
     echo ""
     echo "Management commands:"
     echo "  $INSTALL_DIR/start.sh    - Start the agent"
@@ -377,7 +376,7 @@ print_final_instructions() {
     echo "  $INSTALL_DIR/refresh.sh  - Refresh capabilities (after permission changes)"
     echo ""
     print_crontab_instructions
-    echo -e "${YELLOW}Note:${NC} Some features (SMART, RAID) are unavailable without sudo."
+    printf '%b\n' "${YELLOW}Note:${NC} Some features (SMART, RAID) are unavailable without sudo."
     echo ""
     echo "Happy monitoring!"
     echo ""

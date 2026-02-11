@@ -16,26 +16,29 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 print_success() {
-    echo -e "${GREEN}[+]${NC} $1"
+    printf '%b\n' "${GREEN}[+]${NC} $1"
 }
 
 print_warning() {
-    echo -e "${YELLOW}[!]${NC} $1"
+    printf '%b\n' "${YELLOW}[!]${NC} $1"
 }
 
 echo ""
-echo -e "${BLUE}===============================================================${NC}"
-echo -e "${BLUE}  Fivenines Agent - User-Level Uninstall${NC}"
-echo -e "${BLUE}===============================================================${NC}"
+printf '%b\n' "${BLUE}===============================================================${NC}"
+printf '%b\n' "${BLUE}  Fivenines Agent - User-Level Uninstall${NC}"
+printf '%b\n' "${BLUE}===============================================================${NC}"
 echo ""
 
 # Confirm
-read -p "This will remove the Fivenines agent. Continue? [y/N] " -n 1 -r
-echo ""
-if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-    echo "Cancelled."
-    exit 0
-fi
+printf "This will remove the Fivenines agent. Continue? [y/N] "
+read REPLY
+case "$REPLY" in
+    [Yy]*) ;;
+    *)
+        echo "Cancelled."
+        exit 0
+        ;;
+esac
 
 echo ""
 
@@ -75,7 +78,7 @@ else
 fi
 
 echo ""
-echo -e "${GREEN}Uninstall complete!${NC}"
+printf '%b\n' "${GREEN}Uninstall complete!${NC}"
 echo ""
 
 # Clean up script

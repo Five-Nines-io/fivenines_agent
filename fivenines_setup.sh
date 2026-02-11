@@ -23,22 +23,22 @@ NC='\033[0m' # No Color
 
 print_banner() {
     echo ""
-    echo -e "${BLUE}===============================================================${NC}"
-    echo -e "${BLUE}  Fivenines Agent - System Installation${NC}"
-    echo -e "${BLUE}===============================================================${NC}"
+    printf '%b\n' "${BLUE}===============================================================${NC}"
+    printf '%b\n' "${BLUE}  Fivenines Agent - System Installation${NC}"
+    printf '%b\n' "${BLUE}===============================================================${NC}"
     echo ""
 }
 
 print_success() {
-    echo -e "${GREEN}[+]${NC} $1"
+    printf '%b\n' "${GREEN}[+]${NC} $1"
 }
 
 print_warning() {
-    echo -e "${YELLOW}[!]${NC} $1"
+    printf '%b\n' "${YELLOW}[!]${NC} $1"
 }
 
 print_error() {
-    echo -e "${RED}[-]${NC} $1"
+    printf '%b\n' "${RED}[-]${NC} $1"
 }
 
 download_with_fallback() {
@@ -212,7 +212,7 @@ print_success "Detected system type: $SYSTEM_TYPE"
 if command -v getenforce >/dev/null 2>&1; then
   selinux_status=$(getenforce 2>/dev/null || echo "Disabled")
   print_success "SELinux status: $selinux_status"
-  if [ "$selinux_status" == "Enforcing" ]; then
+  if [ "$selinux_status" = "Enforcing" ]; then
     exit_with_contact "SELinux is enabled in enforcing mode. fivenines agent will not work without disabling SELinux."
   fi
 else
@@ -222,9 +222,9 @@ fi
 # Create a system user for the agent first
 if ! id -u fivenines >/dev/null 2>&1; then
   print_success "Creating system user fivenines"
-  if [ "$SYSTEM_TYPE" == "unraid" ]; then
+  if [ "$SYSTEM_TYPE" = "unraid" ]; then
     useradd --system --user-group fivenines --shell /bin/false --create-home
-  elif [ "$SYSTEM_TYPE" == "openrc" ]; then
+  elif [ "$SYSTEM_TYPE" = "openrc" ]; then
     addgroup -S fivenines 2>/dev/null || true
     adduser -S -G fivenines -s /sbin/nologin -h /opt/fivenines fivenines 2>/dev/null || true
   else
@@ -243,7 +243,7 @@ fi
 
 mkdir -p /etc/fivenines_agent
 # Save the client token in appropriate location
-if [ "$SYSTEM_TYPE" == "unraid" ]; then
+if [ "$SYSTEM_TYPE" = "unraid" ]; then
   mkdir -p /boot/config/custom/fivenines_agent
   echo -n "$1" | tee /boot/config/custom/fivenines_agent/TOKEN > /dev/null
   chown fivenines:fivenines /boot/config/custom/fivenines_agent/TOKEN
@@ -258,7 +258,7 @@ fi
 CURRENT_ARCH=$(uname -m)
 
 # Set install directory and binary name based on system type and architecture
-if [ "$SYSTEM_TYPE" == "unraid" ]; then
+if [ "$SYSTEM_TYPE" = "unraid" ]; then
   INSTALL_DIR="/boot/config/custom/fivenines_agent"
 else
   INSTALL_DIR="/opt/fivenines"
@@ -271,14 +271,14 @@ mkdir -p "$INSTALL_DIR"
 LIBC_TYPE=$(detect_libc)
 print_success "Detected architecture: $CURRENT_ARCH"
 print_success "Detected libc: $LIBC_TYPE"
-if [ "$LIBC_TYPE" == "musl" ]; then
-  if [ "$CURRENT_ARCH" == "aarch64" ]; then
+if [ "$LIBC_TYPE" = "musl" ]; then
+  if [ "$CURRENT_ARCH" = "aarch64" ]; then
     BINARY_NAME="fivenines-agent-alpine-arm64"
   else
     BINARY_NAME="fivenines-agent-alpine-amd64"
   fi
 else
-  if [ "$CURRENT_ARCH" == "aarch64" ]; then
+  if [ "$CURRENT_ARCH" = "aarch64" ]; then
     BINARY_NAME="fivenines-agent-linux-arm64"
   else
     BINARY_NAME="fivenines-agent-linux-amd64"
@@ -317,7 +317,7 @@ if [ ! -f "$AGENT_EXECUTABLE" ]; then
 fi
 
 # Handle different systems for file permissions and binary location
-if [ "$SYSTEM_TYPE" == "unraid" ]; then
+if [ "$SYSTEM_TYPE" = "unraid" ]; then
   # For UNRAID, create a symlink in /usr/local/bin for easy access
   chmod -R 755 "$AGENT_DIR"
   ln -sf "$AGENT_EXECUTABLE" /usr/local/bin/fivenines_agent
@@ -361,18 +361,18 @@ esac
 
 # Final output
 echo ""
-echo -e "${BLUE}===============================================================${NC}"
-echo -e "${BLUE}  Installation Complete!${NC}"
-echo -e "${BLUE}===============================================================${NC}"
+printf '%b\n' "${BLUE}===============================================================${NC}"
+printf '%b\n' "${BLUE}  Installation Complete!${NC}"
+printf '%b\n' "${BLUE}===============================================================${NC}"
 echo ""
 
-if [ "$SYSTEM_TYPE" == "unraid" ]; then
+if [ "$SYSTEM_TYPE" = "unraid" ]; then
   echo "The agent is now running and will automatically start when your UNRAID server boots."
   echo ""
   echo "Management options:"
   echo "  Settings -> User Scripts -> fivenines_agent"
   echo "  Log file: /var/log/fivenines-agent.log"
-elif [ "$SYSTEM_TYPE" == "openrc" ]; then
+elif [ "$SYSTEM_TYPE" = "openrc" ]; then
   echo "The agent is now running as an OpenRC service and will start automatically on boot."
   echo ""
   echo "Management commands:"
