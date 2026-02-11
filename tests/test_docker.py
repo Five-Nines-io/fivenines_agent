@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import docker as docker_lib
 
 from fivenines_agent.docker import (
+    _cpu_usage_percent,
     _image_metadata,
     calculate_cpu_percent,
     calculate_memory_percent,
@@ -34,17 +35,29 @@ def _make_image(
 def _make_stats(
     cpu_total=2000,
     system_cpu=10000,
+    cpu_kernelmode=500,
+    cpu_usermode=1500,
     mem_usage=500,
     mem_limit=1000,
     mem_stats=None,
     networks=None,
     blkio_stats=None,
+    pids_stats=None,
+    throttling_data=None,
+    online_cpus=4,
 ):
     """Return a realistic Docker stats dict."""
     s = {
         "cpu_stats": {
-            "cpu_usage": {"total_usage": cpu_total},
+            "cpu_usage": {
+                "total_usage": cpu_total,
+                "usage_in_kernelmode": cpu_kernelmode,
+                "usage_in_usermode": cpu_usermode,
+            },
             "system_cpu_usage": system_cpu,
+            "online_cpus": online_cpus,
+            "throttling_data": throttling_data
+            or {"periods": 0, "throttled_periods": 0, "throttled_time": 0},
         },
         "memory_stats": {
             "usage": mem_usage,
@@ -52,6 +65,7 @@ def _make_stats(
             "stats": mem_stats or {},
         },
         "blkio_stats": blkio_stats or {},
+        "pids_stats": pids_stats or {"current": 10, "limit": 4096},
     }
     if networks is not None:
         s["networks"] = networks
@@ -180,9 +194,18 @@ class TestDockerContainers:
         cur_stats = _make_stats(
             cpu_total=2000,
             system_cpu=10000,
+            cpu_kernelmode=600,
+            cpu_usermode=1400,
             mem_usage=500,
             mem_limit=1000,
             blkio_stats={"io": []},
+            pids_stats={"current": 79, "limit": 154394},
+            throttling_data={
+                "periods": 5,
+                "throttled_periods": 1,
+                "throttled_time": 100,
+            },
+            online_cpus=32,
         )
         container = _make_container(
             cid="c1",
@@ -210,6 +233,15 @@ class TestDockerContainers:
         assert isinstance(data["memory_usage"], int)
         assert data["memory_limit"] == 1000
         assert data["blkio_stats"] == {"io": []}
+        assert data["pids_stats"] == {"current": 79, "limit": 154394}
+        assert data["cpu_throttling"] == {
+            "periods": 5,
+            "throttled_periods": 1,
+            "throttled_time": 100,
+        }
+        assert data["online_cpus"] == 32
+        assert isinstance(data["cpu_kernelmode_percent"], float)
+        assert isinstance(data["cpu_usermode_percent"], float)
         assert "networks" not in data
 
     @patch("fivenines_agent.docker.previous_stats")
@@ -264,11 +296,45 @@ class TestDockerContainers:
         assert result["c1"]["image_id"] is None
         assert result["c1"]["image_tags"] == []
         assert result["c1"]["image_repo_digests"] == []
+        assert result["c1"]["pids_stats"] == {"current": 10, "limit": 4096}
+        assert result["c1"]["online_cpus"] == 4
+        assert isinstance(result["c1"]["cpu_kernelmode_percent"], float)
+        assert isinstance(result["c1"]["cpu_usermode_percent"], float)
 
 
 # ---------------------------------------------------------------------------
 # calculate_cpu_percent
 # ---------------------------------------------------------------------------
+
+
+class TestCpuUsagePercent:
+    def test_kernelmode(self):
+        stats = _make_stats(cpu_kernelmode=600, system_cpu=10000)
+        prev = _make_stats(cpu_kernelmode=100, system_cpu=5000)
+        result = _cpu_usage_percent(stats, prev, "usage_in_kernelmode")
+        assert result == (500 / 5000) * 100.0
+
+    def test_usermode(self):
+        stats = _make_stats(cpu_usermode=1400, system_cpu=10000)
+        prev = _make_stats(cpu_usermode=400, system_cpu=5000)
+        result = _cpu_usage_percent(stats, prev, "usage_in_usermode")
+        assert result == (1000 / 5000) * 100.0
+
+    def test_zero_system_delta(self):
+        stats = _make_stats(cpu_kernelmode=600, system_cpu=5000)
+        prev = _make_stats(cpu_kernelmode=100, system_cpu=5000)
+        assert _cpu_usage_percent(stats, prev, "usage_in_kernelmode") == 0.0
+
+    def test_zero_cpu_delta(self):
+        stats = _make_stats(cpu_kernelmode=100, system_cpu=10000)
+        prev = _make_stats(cpu_kernelmode=100, system_cpu=5000)
+        assert _cpu_usage_percent(stats, prev, "usage_in_kernelmode") == 0.0
+
+    def test_missing_key_returns_zero(self):
+        """Missing usage key (e.g. Windows containers) returns 0.0 safely."""
+        stats = {"cpu_stats": {"cpu_usage": {}, "system_cpu_usage": 10000}}
+        prev = {"cpu_stats": {"cpu_usage": {}, "system_cpu_usage": 5000}}
+        assert _cpu_usage_percent(stats, prev, "usage_in_kernelmode") == 0.0
 
 
 class TestCalculateCpuPercent:

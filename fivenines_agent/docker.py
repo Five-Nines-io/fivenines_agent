@@ -55,6 +55,19 @@ def docker_containers(socket_url=None):
                     "memory_usage": calculate_memory_usage(stats),
                     "memory_limit": stats["memory_stats"]["limit"],
                     "blkio_stats": stats["blkio_stats"],
+                    "pids_stats": stats.get("pids_stats", {}),
+                    "cpu_throttling": stats["cpu_stats"].get("throttling_data", {}),
+                    "online_cpus": stats["cpu_stats"].get("online_cpus"),
+                    "cpu_kernelmode_percent": _cpu_usage_percent(
+                        stats,
+                        previous_stats[container.id],
+                        "usage_in_kernelmode",
+                    ),
+                    "cpu_usermode_percent": _cpu_usage_percent(
+                        stats,
+                        previous_stats[container.id],
+                        "usage_in_usermode",
+                    ),
                 }
                 # Networks key is not always defined.
                 if stats.get("networks"):
@@ -68,19 +81,21 @@ def docker_containers(socket_url=None):
     return containers_data
 
 
-def calculate_cpu_percent(stats, previous_stats):
-    cpu_delta = (
-        stats["cpu_stats"]["cpu_usage"]["total_usage"]
-        - previous_stats["cpu_stats"]["cpu_usage"]["total_usage"]
-    )
+def _cpu_usage_percent(stats, previous_stats, key):
+    cpu_delta = stats["cpu_stats"]["cpu_usage"].get(key, 0) - previous_stats[
+        "cpu_stats"
+    ]["cpu_usage"].get(key, 0)
     system_delta = (
         stats["cpu_stats"]["system_cpu_usage"]
         - previous_stats["cpu_stats"]["system_cpu_usage"]
     )
-
     if system_delta > 0.0 and cpu_delta > 0.0:
         return (cpu_delta / system_delta) * 100.0
     return 0.0
+
+
+def calculate_cpu_percent(stats, previous_stats):
+    return _cpu_usage_percent(stats, previous_stats, "total_usage")
 
 
 # From https://docs.docker.com/reference/cli/docker/container/stats/#description
