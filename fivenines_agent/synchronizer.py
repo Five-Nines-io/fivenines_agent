@@ -1,6 +1,7 @@
 import gzip
 import http.client
 import json
+import os
 import socket
 import ssl
 import time
@@ -10,7 +11,7 @@ import certifi
 
 from fivenines_agent.debug import debug, log
 from fivenines_agent.dns_resolver import DNSResolver
-from fivenines_agent.env import api_url
+from fivenines_agent.env import api_url, config_dir
 
 
 class Synchronizer(Thread):
@@ -95,9 +96,20 @@ class Synchronizer(Thread):
         """Send metrics to /collect and update config from response."""
         response = self._post("/collect", data)
         if response is not None:
+            if "token" in response:
+                self._swap_token(response["token"])
             config = response["config"]
             with self.config_lock:
                 self.config = config
+
+    def _swap_token(self, new_token):
+        """Persist the per-host token received after enrollment."""
+        log("Received per-host token, saving...", "info")
+        self.token = new_token
+        token_path = os.path.join(config_dir(), "TOKEN")
+        with open(token_path, "w") as f:
+            f.write(new_token)
+        log("Token swapped successfully", "info")
 
     def send_packages(self, packages_data):
         """Send packages data to /packages. Returns response or None."""
