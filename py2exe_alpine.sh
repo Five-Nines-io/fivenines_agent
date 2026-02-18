@@ -109,10 +109,12 @@ if [ -n "$PYTHON_LIB" ] && [ -f "$PYTHON_LIB" ]; then
     echo "Adding Python shared library: $PYTHON_LIB"
     pyinstaller $PYINSTALLER_ARGS \
         --add-binary "$PYTHON_LIB:." \
+        --add-binary "/usr/lib/libz.so.1:." \
         ./py2exe_entrypoint.py
 else
     echo "No Python shared library found, building without it"
     pyinstaller $PYINSTALLER_ARGS \
+        --add-binary "/usr/lib/libz.so.1:." \
         ./py2exe_entrypoint.py
 fi
 
