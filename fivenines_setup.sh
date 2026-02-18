@@ -74,7 +74,11 @@ exit_with_contact() {
 }
 
 detect_libc() {
-  if ldd --version 2>&1 | grep -qi musl; then
+  # Check ldd first - if it explicitly reports glibc or musl, trust that
+  LDD_OUTPUT=$(ldd --version 2>&1 || true)
+  if printf '%s' "$LDD_OUTPUT" | grep -qi glibc; then
+    echo "glibc"
+  elif printf '%s' "$LDD_OUTPUT" | grep -qi musl; then
     echo "musl"
   elif [ -f "/lib/ld-musl-x86_64.so.1" ] || [ -f "/lib/ld-musl-aarch64.so.1" ]; then
     echo "musl"
