@@ -24,16 +24,17 @@ echo "Detected architecture: $TARGET_ARCH"
 if [[ "$TARGET_ARCH" == "arm64" ]]; then
     export CC=aarch64-redhat-linux-gcc
     export CXX=aarch64-redhat-linux-g++
-    BINARY_NAME="fivenines-agent-synology-arm64"
+    DIR_NAME="fivenines-agent-synology-arm64"
 elif [[ "$TARGET_ARCH" == "arm" ]]; then
     export CC=arm-linux-gnueabi-gcc
     export CXX=arm-linux-gnueabi-g++
-    BINARY_NAME="fivenines-agent-synology-arm"
+    DIR_NAME="fivenines-agent-synology-arm"
 else
     export CC=gcc
     export CXX=g++
-    BINARY_NAME="fivenines-agent-synology-amd64"
+    DIR_NAME="fivenines-agent-synology-amd64"
 fi
+BINARY_NAME="fivenines-agent"
 
 # Verify we're using the correct Python from manylinux
 echo "=== Python Environment Check ==="
@@ -262,7 +263,7 @@ echo "=== Testing Built Binary ==="
 ./build/$BINARY_NAME/$BINARY_NAME --version || echo "Version check failed, but binary was built"
 
 # Move to final location
-mv ./build/$BINARY_NAME ./dist/linux/
+mv ./build/$BINARY_NAME ./dist/linux/$DIR_NAME
 
 #
 # Clean up
@@ -276,7 +277,7 @@ poetry config virtualenvs.create true
 deactivate
 
 echo "[OK] Synology build completed successfully!"
-echo "Output directory: ./dist/linux/$BINARY_NAME/"
-echo "Executable: ./dist/linux/$BINARY_NAME/$BINARY_NAME"
+echo "Output directory: ./dist/linux/$DIR_NAME/"
+echo "Executable: ./dist/linux/$DIR_NAME/$BINARY_NAME"
 echo ""
 echo "Next step: run synology/build_spk.sh to assemble the SPK package."

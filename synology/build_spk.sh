@@ -25,7 +25,7 @@ else
 fi
 
 BINARY_DIR="${REPO_ROOT}/dist/linux/fivenines-agent-synology-${BINARY_ARCH}"
-BINARY="${BINARY_DIR}/fivenines-agent-synology-${BINARY_ARCH}"
+BINARY="${BINARY_DIR}/fivenines-agent"
 SPK_NAME="fivenines-agent-${VERSION}-${ARCH}.spk"
 BUILD_DIR="/tmp/spkbuild-$$"
 
@@ -50,7 +50,7 @@ cp "${BINARY}" "${BUILD_DIR}/package/bin/fivenines-agent"
 chmod +x "${BUILD_DIR}/package/bin/fivenines-agent"
 
 # Copy all files from the binary dist dir (shared libs, etc.)
-rsync -a --exclude "fivenines-agent-synology-${BINARY_ARCH}" \
+rsync -a --exclude "fivenines-agent" \
     "${BINARY_DIR}/" "${BUILD_DIR}/package/bin/"
 
 # Create package.tgz
