@@ -37,6 +37,17 @@ To auto-start on reboot, add to crontab (`crontab -e`):
 
 > **Note:** User-level installation has limited monitoring capabilities. Features requiring sudo (SMART, RAID) won't be available. See [Permissions](#permissions) section.
 
+### Synology Installation (DSM 7+)
+
+For Synology NAS devices running DSM 7 and higher, the agent is distributed as a native `.spk` application.
+
+1. Download the appropriate `.spk` package for your architecture (x86_64 or ARM64) from the releases page.
+2. Open **Package Center** in DSM and click **Manual Install**.
+3. Upload the `.spk` file and follow the wizard.
+4. When prompted by the UI, paste your Fivenines API token. the agent will automatically configure itself and start.
+
+> **Note:** To comply with Synology DSM 7's strict security policies, the agent runs as a dedicated low-privilege system user (`sc-fivenines-agent`), not as `root`. Because it cannot use `sudo`, deep system hardware telemetry (like SMART disk health, RAID mapping, and raw `sysfs` temperature sensors) may be gracefully disabled depending on your NAS model permissions. QEMU and Proxmox metrics are also excluded from the Synology build.
+
 ## Update
 
 ### Standard Update (with sudo/root)
@@ -92,7 +103,7 @@ fivenines ALL=(ALL) NOPASSWD: /sbin/mdadm
 
 ### Limited Monitoring (No Sudo)
 
-The agent works without sudo, but these features will be unavailable:
+The agent works without sudo, but these features will be unavailable (this is also the default behavior for the Synology DSM 7 `sc-fivenines-agent` package):
 
 | Feature | Requirement |
 |---------|-------------|
