@@ -24,6 +24,9 @@ make format
 
 # Run tests with coverage (requires 100% coverage)
 make test
+
+# Run a single test file
+poetry run pytest tests/test_collectors.py -v
 ```
 
 ### Build Binary
@@ -79,6 +82,16 @@ poetry run fivenines_agent --version
 - PyInstaller bundles libraries (like libselinux from libvirt) that conflict with system utilities (sudo, smartctl, mdadm)
 - Always use `get_clean_env()` when calling subprocess commands
 
+**Environment (`env.py`)**
+- Central source for runtime configuration: `api_url()`, `config_dir()`, `dry_run()`, `log_level()`
+- Config directory defaults to `/etc/fivenines_agent`; override with `CONFIG_DIR` env var
+- `get_user_context()` collects user/group info sent with each payload
+
+**Collector Registry (`collectors.py`)**
+- Declarative `COLLECTORS` list maps config keys to `(data_key, callable, pass_kwargs)` tuples
+- `agent.py` iterates this registry each tick; `pass_kwargs=True` unpacks the config dict as `**kwargs` to the callable
+- Add new metrics here rather than modifying the agent loop
+
 ### Metric Collectors
 
 Each metric collector is a separate module that exports functions to collect specific metrics:
@@ -87,25 +100,28 @@ Each metric collector is a separate module that exports functions to collect spe
 - **Storage**: `smart_storage.py` (requires sudo smartctl), `raid_storage.py` (requires sudo mdadm), `zfs.py`
 - **Services**: `docker.py`, `qemu.py`, `proxmox.py`, `caddy.py`, `nginx.py`, `postgresql.py`, `redis.py`
 - **Security**: `fail2ban.py` (requires sudo fail2ban-client)
+- **Network/connectivity**: `ip.py` (public IPv4/IPv6 via ip.fivenines.io with 60s cache), `ping.py` (TCP latency)
+- **Security scanning**: `packages.py` (installed packages via dpkg/rpm/apk/pacman with hash-based delta sync)
 
 Collectors use the `@debug` decorator from `debug.py` to log execution time and results.
 
 ### Configuration
 
-- Agent reads `TOKEN` file from config directory (`/opt/fivenines` for system install, `~/.local/fivenines` for user install)
+- Agent reads `TOKEN` file from config directory (default `/etc/fivenines_agent`, overridable via `CONFIG_DIR`)
 - Configuration is fetched from the API server on startup and includes:
   - `enabled`: whether collection is active
   - `interval`: seconds between collections (default 60)
   - Feature flags for each metric type (cpu, memory, etc.)
   - Service-specific config (e.g., redis host/port, docker socket path)
   - `request_options`: timeout, retry count, retry interval
+  - `packages.scan`: triggers package inventory sync with hash-based deduplication
 
 ### Installation Types
 
 The agent supports two installation modes:
 
-1. **System installation** (`/opt/fivenines`): Runs as dedicated `fivenines` user via systemd service
-2. **User installation** (`~/.local/fivenines`): Runs as current user with helper scripts (start.sh, stop.sh, status.sh, logs.sh, refresh.sh)
+1. **System installation**: Runs as dedicated `fivenines` user via systemd service (`fivenines-agent.service`) or OpenRC (`fivenines-agent.openrc`)
+2. **User installation**: Runs as current user with helper scripts (start.sh, stop.sh, status.sh, logs.sh, refresh.sh)
 
 User context is collected and sent with metrics to help the backend understand permission limitations.
 

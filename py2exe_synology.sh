@@ -106,10 +106,10 @@ poetry install --no-interaction || {
     exit 1
 }
 
-# Remove libraries not needed for Synology (no libvirt, no systemd watchdog)
+# Remove libraries not needed for Synology (no libvirt, no systemd watchdog, no proxmoxer)
 echo "=== Removing Synology-incompatible dependencies ==="
-pip uninstall -y libvirt-python systemd-watchdog || true
-echo "Removed libvirt-python and systemd-watchdog"
+pip uninstall -y libvirt-python systemd-watchdog proxmoxer || true
+echo "Removed libvirt-python, systemd-watchdog, and proxmoxer"
 
 # Verify libvirt is gone (should fail)
 if python -c "import libvirt" 2>/dev/null; then
@@ -224,14 +224,13 @@ if [ -n "$PYTHON_LIB" ]; then
         --exclude-module libvirt \
         --exclude-module libvirtmod \
         --exclude-module systemd_watchdog \
+        --exclude-module proxmoxer \
         --noconfirm \
         --onedir \
         --name "$BINARY_NAME" \
         --workpath ./build/tmp \
         --distpath ./build \
         --clean \
-        --hidden-import=proxmoxer.backends \
-        --hidden-import=proxmoxer.backends.https \
         --add-binary "$PYTHON_LIB:." \
         --add-binary "/usr/local/lib/libcrypt.so.2:." \
         --add-binary "/usr/local/lib/libcrypt.so.1:." \
