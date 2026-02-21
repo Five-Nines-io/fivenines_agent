@@ -101,6 +101,10 @@ poetry config virtualenvs.create false
 poetry cache clear --all . || true
 poetry config installer.max-workers 1
 
+# Remove Synology-incompatible dependencies so Poetry doesn't try to build them
+echo "=== Removing Synology-incompatible dependencies from pyproject ==="
+poetry remove libvirt-python systemd-watchdog proxmoxer || true
+
 poetry install --no-interaction || {
     echo "Poetry installation failed. Exiting."
     exit 1

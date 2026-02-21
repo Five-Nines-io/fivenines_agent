@@ -424,6 +424,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:buildcache
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:buildcache,mode=max
+          build-args: |
+            BASE_IMAGE=quay.io/pypa/manylinux2014_aarch64
           load: true
 
       - name: Build agent binary (synology-arm64)
