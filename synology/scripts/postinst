@@ -1,7 +1,8 @@
 #!/bin/bash
 CONFIG_DIR="/var/packages/fivenines-agent/etc"
 mkdir -p "${CONFIG_DIR}"
-TOKEN="${wizard_token:-}"
+# Handle DSM 7 (SYNOPKG_WZF_ prefix) and fallback to DSM 6
+TOKEN="${SYNOPKG_WZF_wizard_token:-$wizard_token}"
 [ -n "${TOKEN}" ] && echo "${TOKEN}" > "${CONFIG_DIR}/TOKEN"
 chmod 600 "${CONFIG_DIR}/TOKEN" 2>/dev/null || true
 chown -R sc-fivenines-agent:fivenines-agent "${CONFIG_DIR}" 2>/dev/null || true
