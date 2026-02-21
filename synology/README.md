@@ -60,7 +60,7 @@ synology/
   conf/
     privilege              DSM 7 privilege declaration (runs as root)
   WIZARD_UIFILES/
-    install_uifile.json    Token input UI shown during Package Center install
+    install_uifile         Token input UI shown during Package Center install
 ```
 
 ## Notes

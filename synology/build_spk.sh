@@ -69,7 +69,7 @@ cp "${SCRIPT_DIR}/scripts/postinst" "${BUILD_DIR}/scripts/"
 chmod +x "${BUILD_DIR}/scripts/start-stop-status"
 chmod +x "${BUILD_DIR}/scripts/postinst"
 cp "${SCRIPT_DIR}/conf/privilege" "${BUILD_DIR}/conf/"
-cp "${SCRIPT_DIR}/WIZARD_UIFILES/install_uifile.json" "${BUILD_DIR}/WIZARD_UIFILES/"
+cp "${SCRIPT_DIR}/WIZARD_UIFILES/install_uifile" "${BUILD_DIR}/WIZARD_UIFILES/"
 
 # Assemble SPK (it's a tar archive)
 echo "Assembling SPK..."
