@@ -1,0 +1,36 @@
+#!/bin/bash
+PACKAGE_NAME="fivenines-agent"
+PACKAGE_DIR="/var/packages/${PACKAGE_NAME}/target"
+CONFIG_DIR="/var/packages/${PACKAGE_NAME}/etc"
+PID_FILE="/var/packages/${PACKAGE_NAME}/var/agent.pid"
+LOG_FILE="/var/packages/${PACKAGE_NAME}/var/agent.log"
+BINARY="${PACKAGE_DIR}/bin/fivenines-agent"
+
+start_daemon() {
+    mkdir -p "$(dirname $PID_FILE)"
+    if [ ! -s "${CONFIG_DIR}/TOKEN" ]; then
+        echo "TOKEN not configured. Set token at ${CONFIG_DIR}/TOKEN" >&2
+        exit 1
+    fi
+    CONFIG_DIR="${CONFIG_DIR}" PYTHONUNBUFFERED=1 \
+        "${BINARY}" >> "${LOG_FILE}" 2>&1 &
+    echo $! > "${PID_FILE}"
+}
+
+stop_daemon() {
+    [ -f "${PID_FILE}" ] && kill "$(cat ${PID_FILE})" 2>/dev/null
+    rm -f "${PID_FILE}"
+}
+
+daemon_status() {
+    [ -f "${PID_FILE}" ] && kill -0 "$(cat ${PID_FILE})" 2>/dev/null
+}
+
+case "$1" in
+    start)   daemon_status || start_daemon ;;
+    stop)    daemon_status && stop_daemon ;;
+    status)  daemon_status; exit $? ;;
+    log)     echo "${LOG_FILE}" ;;
+    *)       exit 1 ;;
+esac
+exit 0

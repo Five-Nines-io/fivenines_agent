@@ -1,0 +1,7 @@
+#!/bin/bash
+CONFIG_DIR="/var/packages/fivenines-agent/etc"
+mkdir -p "${CONFIG_DIR}"
+TOKEN="${wizard_token:-}"
+[ -n "${TOKEN}" ] && echo "${TOKEN}" > "${CONFIG_DIR}/TOKEN"
+chmod 600 "${CONFIG_DIR}/TOKEN" 2>/dev/null || true
+exit 0
