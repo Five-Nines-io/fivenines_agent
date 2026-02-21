@@ -65,8 +65,8 @@ synology/
 
 ## Notes
 
-- The agent runs as root to access SMART data, hardware sensors, and /proc.
-  DSM 7 will warn users about this during installation.
+- The agent runs as `sc-fivenines-agent` (a custom low-privilege internal user).
+  Because it does not run as `root`, some deep system telemetry (e.g., SMART data, hardware sensors) may be inaccessible depending on your NAS model's file permissions. This is gracefully handled and ignored.
 - QEMU/libvirt and Proxmox monitoring are gracefully disabled (the libraries
   are not available on NAS hardware).
 - synopkg is supported for package security scanning.
