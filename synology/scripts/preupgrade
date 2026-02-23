@@ -1,0 +1,3 @@
+#!/bin/sh
+# Pre-upgrade: check conditions only; no side effects. Non-zero aborts upgrade.
+exit 0

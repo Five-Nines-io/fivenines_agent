@@ -57,27 +57,40 @@ rsync -a --exclude "fivenines-agent" \
 echo "Creating package.tgz..."
 tar czf "${BUILD_DIR}/package.tgz" -C "${BUILD_DIR}/package" .
 
+# INFO arch: Synology uses armv8 for 64-bit ARM (see Appendix A: Platform and Arch Value Mapping)
+INFO_ARCH="${ARCH}"
+[ "$ARCH" = "aarch64" ] && INFO_ARCH="armv8"
+
 # Fill in INFO template
 sed \
     -e "s/{{VERSION}}/${VERSION}/g" \
-    -e "s/{{ARCH}}/${ARCH}/g" \
+    -e "s/{{ARCH}}/${INFO_ARCH}/g" \
     "${SCRIPT_DIR}/INFO.template" > "${BUILD_DIR}/INFO"
 
-# Copy scripts and config
-cp "${SCRIPT_DIR}/scripts/start-stop-status" "${BUILD_DIR}/scripts/"
-cp "${SCRIPT_DIR}/scripts/postinst" "${BUILD_DIR}/scripts/"
-chmod +x "${BUILD_DIR}/scripts/start-stop-status"
-chmod +x "${BUILD_DIR}/scripts/postinst"
+# Generate required Package Center icons if missing (64x64 and 256x256)
+if [ ! -f "${SCRIPT_DIR}/PACKAGE_ICON.PNG" ] || [ ! -f "${SCRIPT_DIR}/PACKAGE_ICON_256.PNG" ]; then
+    echo "Generating required PACKAGE_ICON.PNG and PACKAGE_ICON_256.PNG..."
+    python3 "${SCRIPT_DIR}/gen_icons.py"
+fi
+cp "${SCRIPT_DIR}/PACKAGE_ICON.PNG" "${SCRIPT_DIR}/PACKAGE_ICON_256.PNG" "${BUILD_DIR}/"
+
+# Copy all required lifecycle scripts (Synology developer guide: scripts.html)
+for script in start-stop-status postinst preinst preuninst postuninst preupgrade postupgrade; do
+    cp "${SCRIPT_DIR}/scripts/${script}" "${BUILD_DIR}/scripts/"
+    chmod +x "${BUILD_DIR}/scripts/${script}"
+done
 cp "${SCRIPT_DIR}/conf/privilege" "${BUILD_DIR}/conf/"
 cp "${SCRIPT_DIR}/WIZARD_UIFILES/install_uifile" "${BUILD_DIR}/WIZARD_UIFILES/"
 
-# Assemble SPK (it's a tar archive)
+# Assemble SPK (tar archive; INFO and icons first per Synology package layout)
 echo "Assembling SPK..."
 OUTPUT_DIR="${REPO_ROOT}/dist/synology"
 mkdir -p "${OUTPUT_DIR}"
 tar cf "${OUTPUT_DIR}/${SPK_NAME}" \
     -C "${BUILD_DIR}" \
     INFO \
+    PACKAGE_ICON.PNG \
+    PACKAGE_ICON_256.PNG \
     package.tgz \
     scripts \
     conf \

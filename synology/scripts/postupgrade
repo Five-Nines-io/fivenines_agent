@@ -1,0 +1,3 @@
+#!/bin/sh
+# Post-upgrade: prepare environment after upgrade. Non-zero marks package corrupted.
+exit 0

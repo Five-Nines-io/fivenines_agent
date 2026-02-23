@@ -1,0 +1,3 @@
+#!/bin/sh
+# Pre-uninstall: check conditions only; no side effects. Non-zero aborts uninstall.
+exit 0
