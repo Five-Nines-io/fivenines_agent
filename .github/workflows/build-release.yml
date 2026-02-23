@@ -456,7 +456,12 @@ jobs:
     if: |
       github.event_name == 'push' &&
       !startsWith(github.ref, 'refs/tags/') &&
-      (startsWith(github.ref, 'refs/heads/release/') || startsWith(github.ref, 'refs/heads/feature/') || startsWith(github.ref, 'refs/heads/synology'))
+      (
+        startsWith(github.ref, 'refs/heads/release/') ||
+        startsWith(github.ref, 'refs/heads/feature/') ||
+        startsWith(github.ref, 'refs/heads/synology/') ||
+        github.ref == 'refs/heads/synology'
+      )
     permissions:
       contents: write
     steps:
