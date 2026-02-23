@@ -9,6 +9,7 @@ from threading import Event, Lock, Thread
 
 import certifi
 
+from fivenines_agent.config_schema import validate_config
 from fivenines_agent.debug import debug, log
 from fivenines_agent.dns_resolver import DNSResolver
 from fivenines_agent.env import api_url, config_dir
@@ -99,7 +100,7 @@ class Synchronizer(Thread):
         if response is not None:
             if "token" in response:
                 self._swap_token(response["token"])
-            config = response["config"]
+            config = validate_config(response["config"])
             with self.config_lock:
                 self.config = config
 
@@ -109,11 +110,12 @@ class Synchronizer(Thread):
         self.token = new_token
         token_path = os.path.join(config_dir(), "TOKEN")
         try:
-            with open(token_path, "w") as f:
+            fd = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
                 f.write(new_token)
             log("Token swapped successfully", "info")
         except PermissionError:
-            log(f"Permission denied writing to {token_path}. Proceeding with in-memory token.", "warning")
+            log(f"Permission denied writing to {token_path}. Proceeding with in-memory token.", "error")
         except Exception as e:
             log(f"Error saving token: {e}", "error")
 
