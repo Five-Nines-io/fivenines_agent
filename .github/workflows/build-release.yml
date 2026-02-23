@@ -2,14 +2,9 @@ name: Build and Release
 
 on:
   push:
-    branches:
+    branches-ignore:
       - main
       - master
-      - 'release/**'
-      - 'feature/**'
-      - 'fix/**'
-      - 'synology/**'
-      - synology
     tags:
       - 'v*'
   pull_request:
@@ -454,7 +449,7 @@ jobs:
     needs: [build-amd64, build-arm64, build-alpine-amd64, build-alpine-arm64, build-synology-amd64, build-synology-arm64]
     runs-on: ubuntu-latest
     if: |
-      github.event_name == 'push' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
       !startsWith(github.ref, 'refs/tags/') &&
       github.ref != 'refs/heads/main' &&
       github.ref != 'refs/heads/master'
