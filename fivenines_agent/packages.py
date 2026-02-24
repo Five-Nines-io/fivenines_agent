@@ -12,7 +12,7 @@ from fivenines_agent.subprocess_utils import get_clean_env
 
 def packages_available():
     """Check if a supported package manager is available."""
-    for cmd in ("dpkg-query", "rpm", "apk", "pacman"):
+    for cmd in ("dpkg-query", "rpm", "apk", "pacman", "synopkg"):
         if shutil.which(cmd):
             return True
     return False
@@ -134,6 +134,28 @@ def _get_packages_pacman():
     return packages
 
 
+def _get_packages_synopkg():
+    """Get installed packages via Synology synopkg."""
+    result = subprocess.run(
+        ["synopkg", "list"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=get_clean_env(),
+    )
+    if result.returncode != 0:
+        log(f"synopkg list failed: {result.stderr}", "error")
+        return []
+    packages = []
+    for line in result.stdout.strip().split("\n"):
+        if not line:
+            continue
+        parts = line.split()
+        if len(parts) >= 2:
+            packages.append({"name": parts[0], "version": parts[1]})
+    return packages
+
+
 @debug("get_installed_packages")
 def get_installed_packages():
     """Detect package manager and return sorted list of installed packages."""
@@ -146,6 +168,8 @@ def get_installed_packages():
             packages = _get_packages_apk()
         elif shutil.which("pacman"):
             packages = _get_packages_pacman()
+        elif shutil.which("synopkg"):
+            packages = _get_packages_synopkg()
         else:
             log("No supported package manager found", "debug")
             return []

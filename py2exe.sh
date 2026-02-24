@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 
+# Build Linux agent binary (glibc, manylinux). Set SYNOLOGY=1 for Synology DSM variant
+# (excludes libvirt, systemd-watchdog, proxmoxer). Run inside manylinux Docker.
+#
+# Usage: TARGET_ARCH=amd64 ./py2exe.sh
+#        TARGET_ARCH=arm64 ./py2exe.sh
+#        SYNOLOGY=1 TARGET_ARCH=amd64 ./py2exe.sh
+
 set -e  # Exit immediately on error
 
 # Source the profile to get the correct Python in PATH (manylinux setup)
@@ -13,19 +20,27 @@ else
 fi
 
 echo "Detected architecture: $TARGET_ARCH"
+[ -n "${SYNOLOGY:-}" ] && echo "Build variant: Synology DSM"
 
 if [[ "$TARGET_ARCH" == "arm64" ]]; then
     export CC=aarch64-redhat-linux-gcc
     export CXX=aarch64-redhat-linux-g++
-    BINARY_NAME="fivenines-agent-linux-arm64"
+    ARCH_SUFFIX="arm64"
 elif [[ "$TARGET_ARCH" == "arm" ]]; then
     export CC=arm-linux-gnueabi-gcc
     export CXX=arm-linux-gnueabi-g++
-    BINARY_NAME="fivenines-agent-linux-arm"
+    ARCH_SUFFIX="arm"
 else
     export CC=gcc
     export CXX=g++
-    BINARY_NAME="fivenines-agent-linux-amd64"
+    ARCH_SUFFIX="amd64"
+fi
+
+if [ -n "${SYNOLOGY:-}" ]; then
+    BINARY_NAME="fivenines-agent"
+    DIR_NAME="fivenines-agent-synology-${ARCH_SUFFIX}"
+else
+    BINARY_NAME="fivenines-agent-linux-${ARCH_SUFFIX}"
 fi
 
 # Verify we're using the correct Python from manylinux
@@ -34,13 +49,15 @@ echo "Python executable path: $(which python)"
 echo "Python version: $(python --version)"
 echo "Pip version: $(python -m pip --version)"
 
-# Verify libvirt library (should be our custom built libvirt 6.10.0)
-echo "=== Libvirt Environment Check ==="
-echo "Checking for libvirt libraries:"
-ls -la /usr/lib64/libvirt.so* 2>/dev/null || echo "Custom libvirt not found"
-ls -la /usr/lib64/libvirt.so* 2>/dev/null || echo "System libvirt not found"
-echo "PKG_CONFIG_PATH: $PKG_CONFIG_PATH"
-echo "libvirt version: $(pkg-config --modversion libvirt 2>/dev/null || echo 'not found')"
+if [ -z "${SYNOLOGY:-}" ]; then
+    # Verify libvirt library (should be our custom built libvirt 6.10.0)
+    echo "=== Libvirt Environment Check ==="
+    echo "Checking for libvirt libraries:"
+    ls -la /usr/lib64/libvirt.so* 2>/dev/null || echo "Custom libvirt not found"
+    ls -la /usr/lib64/libvirt.so* 2>/dev/null || echo "System libvirt not found"
+    echo "PKG_CONFIG_PATH: $PKG_CONFIG_PATH"
+    echo "libvirt version: $(pkg-config --modversion libvirt 2>/dev/null || echo 'not found')"
+fi
 
 #
 # Install and enable virtualenv
@@ -90,67 +107,58 @@ fi
 echo "=== Installing Build Dependencies ==="
 python -m pip install --upgrade pip setuptools wheel
 
-# Try to install libvirt-python separately with better error handling
-echo "=== Installing libvirt-python ==="
-echo "Attempting to install libvirt-python..."
-
-# First, verify we can compile against libvirt
-echo "Testing libvirt compilation environment..."
-pkg-config --exists libvirt || {
-    echo "libvirt development headers not found."
-    echo "PKG_CONFIG_PATH: $PKG_CONFIG_PATH"
-    echo "Available .pc files:"
-    find /usr/local /usr -name "*.pc" 2>/dev/null | grep -i libvirt || echo "No libvirt.pc files found"
-    exit 1
-}
-
-echo "libvirt compile flags: $(pkg-config --cflags libvirt)"
-echo "libvirt link flags: $(pkg-config --libs libvirt)"
-
-# Install libvirt-python with explicit flags
-if ! python -m pip install libvirt-python==11.6.0; then
-    echo "Direct pip install failed. Trying with explicit flags..."
-
-    # Try with explicit flags
-    export CFLAGS="$(pkg-config --cflags libvirt)"
-    export LDFLAGS="$(pkg-config --libs libvirt)"
-
-    python -m pip install -v libvirt-python==11.6.0 || {
-        echo "libvirt-python installation failed completely. Exiting."
-        exit 1
-    }
-fi
-
-# Test libvirt-python installation
-echo "=== Testing libvirt-python Installation ==="
-python -c "import libvirt; print('libvirt-python imported successfully')"
-python -c "import libvirt; print('libvirt version:', libvirt.getVersion())"
-
 #
 # Install Poetry and dependencies
 #
 echo "=== Installing Poetry and Dependencies ==="
-
 python -m pip install poetry==2.2.1 || {
     echo "Failed to install Poetry. Exiting."
     exit 1
 }
-
-# Configure Poetry to use the current virtual environment
-echo "Configuring Poetry to avoid creating separate environments"
 poetry config virtualenvs.create false
-# Clear any existing Poetry cache to avoid conflicts
 poetry cache clear --all . || true
 poetry config installer.max-workers 1
 
-poetry install --no-interaction || {
-    echo "Poetry installation failed. Exiting."
-    exit 1
-}
-
-# Final verification
-echo "=== Final Verification ==="
-python -c "import libvirt; print('Final libvirt version check:', libvirt.getVersion())"
+if [ -n "${SYNOLOGY:-}" ]; then
+    # Synology: remove libvirt/systemd-watchdog/proxmoxer so Poetry does not build them
+    echo "=== Removing Synology-incompatible dependencies from pyproject ==="
+    poetry remove libvirt-python systemd-watchdog proxmoxer || true
+    poetry install --no-interaction || {
+        echo "Poetry installation failed. Exiting."
+        exit 1
+    }
+    echo "=== Removing Synology-incompatible dependencies ==="
+    pip uninstall -y libvirt-python systemd-watchdog proxmoxer || true
+    echo "Removed libvirt-python, systemd-watchdog, and proxmoxer"
+    if python -c "import libvirt" 2>/dev/null; then
+        echo "WARNING: libvirt is still importable after uninstall"
+    else
+        echo "Confirmed: libvirt not available (expected)"
+    fi
+else
+    # Full build: install libvirt-python then Poetry
+    echo "=== Installing libvirt-python ==="
+    pkg-config --exists libvirt || {
+        echo "libvirt development headers not found."
+        echo "PKG_CONFIG_PATH: $PKG_CONFIG_PATH"
+        exit 1
+    }
+    if ! python -m pip install libvirt-python==11.6.0; then
+        export CFLAGS="$(pkg-config --cflags libvirt)"
+        export LDFLAGS="$(pkg-config --libs libvirt)"
+        python -m pip install -v libvirt-python==11.6.0 || {
+            echo "libvirt-python installation failed completely. Exiting."
+            exit 1
+        }
+    fi
+    python -c "import libvirt; print('libvirt-python imported successfully')"
+    poetry install --no-interaction || {
+        echo "Poetry installation failed. Exiting."
+        exit 1
+    }
+    echo "=== Final Verification ==="
+    python -c "import libvirt; print('Final libvirt version check:', libvirt.getVersion())"
+fi
 
 # Export dependencies to requirements.txt
 echo "Exporting dependencies to requirements.txt"
@@ -257,50 +265,43 @@ fi
 # Build the executable
 #
 echo "=== Building Executable ==="
-echo "Building the executable for $TARGET_ARCH"
+echo "Building the executable for $TARGET_ARCH${SYNOLOGY:+ (Synology variant)}"
 mkdir -p build dist/linux
 
-# Verify which libvirt module PyInstaller will find
-echo "Checking libvirt module path:"
-python -c "import libvirt; print('libvirt module path:', libvirt.__file__); print('libvirt version:', libvirt.getVersion())"
+if [ -z "${SYNOLOGY:-}" ]; then
+    echo "Checking libvirt module path:"
+    python -c "import libvirt; print('libvirt module path:', libvirt.__file__); print('libvirt version:', libvirt.getVersion())"
+fi
 
-# Try to find the actual Python shared library
 PYTHON_LIB=$(find /opt/python/cp39-cp39/lib -name "libpython3.9.so*" -type f | head -1)
-if [ -n "$PYTHON_LIB" ]; then
-    echo "Found Python library: $PYTHON_LIB"
-    # Set LD_LIBRARY_PATH only for PyInstaller (not globally, to avoid polluting sudo/system commands later)
-    LD_LIBRARY_PATH="/opt/python/cp39-cp39/lib:$LD_LIBRARY_PATH" poetry run pyinstaller \
-        --strip \
-        --optimize=2 \
-        --exclude-module tkinter \
-        --exclude-module unittest \
-        --exclude-module pdb \
-        --exclude-module doctest \
-        --exclude-module test \
-        --exclude-module distutils \
-        --noconfirm \
-        --onedir \
-        --name "$BINARY_NAME" \
-        --workpath ./build/tmp \
-        --distpath ./build \
-        --clean \
-        --hidden-import=libvirt \
-        --hidden-import=libvirtmod \
-        --hidden-import=proxmoxer.backends \
-        --hidden-import=proxmoxer.backends.https \
-        --add-binary "$PYTHON_LIB:." \
-        --add-binary "/usr/local/lib/libcrypt.so.2:." \
-        --add-binary "/usr/local/lib/libcrypt.so.1:." \
-        --add-binary "/usr/lib64/libtirpc.so.3:." \
-        --add-binary "/usr/lib64/libz.so.1:." \
-        ./py2exe_entrypoint.py || {
-        echo "PyInstaller failed. Exiting."
-        exit 1
-    }
-else
+if [ -z "$PYTHON_LIB" ]; then
     echo "Python shared library not found after build attempt"
     exit 1
 fi
+echo "Found Python library: $PYTHON_LIB"
+
+# Common PyInstaller args for both main and Synology builds
+PYI_BASE=(
+    --strip --optimize=2
+    --exclude-module tkinter --exclude-module unittest --exclude-module pdb
+    --exclude-module doctest --exclude-module test --exclude-module distutils
+    --noconfirm --onedir --name "$BINARY_NAME"
+    --workpath ./build/tmp --distpath ./build --clean
+    --add-binary "$PYTHON_LIB:."
+    --add-binary "/usr/local/lib/libcrypt.so.2:." --add-binary "/usr/local/lib/libcrypt.so.1:."
+    --add-binary "/usr/lib64/libz.so.1:."
+)
+if [ -n "${SYNOLOGY:-}" ]; then
+    PYI_EXTRA=(--exclude-module libvirt --exclude-module libvirtmod --exclude-module systemd_watchdog --exclude-module proxmoxer)
+else
+    PYI_EXTRA=(--hidden-import=libvirt --hidden-import=libvirtmod --hidden-import=proxmoxer.backends --hidden-import=proxmoxer.backends.https --add-binary "/usr/lib64/libtirpc.so.3:.")
+fi
+
+LD_LIBRARY_PATH="/opt/python/cp39-cp39/lib:$LD_LIBRARY_PATH" poetry run pyinstaller \
+    "${PYI_BASE[@]}" "${PYI_EXTRA[@]}" ./py2exe_entrypoint.py || {
+    echo "PyInstaller failed. Exiting."
+    exit 1
+}
 
 # Check built binary (onedir creates a directory with the executable inside)
 echo "=== Binary Verification ==="
@@ -315,8 +316,12 @@ ldd ./build/$BINARY_NAME/$BINARY_NAME | head -10 || echo "ldd check failed (migh
 echo "=== Testing Built Binary ==="
 ./build/$BINARY_NAME/$BINARY_NAME --version || echo "Version check failed, but binary was built"
 
-# Move to final location (move the entire directory)
-mv ./build/$BINARY_NAME ./dist/linux/
+# Move to final location
+if [ -n "${SYNOLOGY:-}" ]; then
+    mv ./build/$BINARY_NAME ./dist/linux/$DIR_NAME
+else
+    mv ./build/$BINARY_NAME ./dist/linux/
+fi
 
 #
 # Clean up
@@ -330,7 +335,14 @@ poetry config virtualenvs.create true
 deactivate
 
 echo "[OK] Build completed successfully!"
-echo "Output directory: ./dist/linux/$BINARY_NAME/"
-echo "Executable: ./dist/linux/$BINARY_NAME/$BINARY_NAME"
-echo ""
-echo "The distribution should be compatible with CentOS 7 and include libvirt 6.10.0 with cgroup V2 and RSS support."
+if [ -n "${SYNOLOGY:-}" ]; then
+    echo "Output directory: ./dist/linux/$DIR_NAME/"
+    echo "Executable: ./dist/linux/$DIR_NAME/$BINARY_NAME"
+    echo ""
+    echo "Next step: run synology/build_spk.sh to assemble the SPK package."
+else
+    echo "Output directory: ./dist/linux/$BINARY_NAME/"
+    echo "Executable: ./dist/linux/$BINARY_NAME/$BINARY_NAME"
+    echo ""
+    echo "The distribution should be compatible with CentOS 7 and include libvirt 6.10.0 with cgroup V2 and RSS support."
+fi

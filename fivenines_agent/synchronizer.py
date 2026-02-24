@@ -108,9 +108,14 @@ class Synchronizer(Thread):
         log("Received per-host token, saving...", "info")
         self.token = new_token
         token_path = os.path.join(config_dir(), "TOKEN")
-        with open(token_path, "w") as f:
-            f.write(new_token)
-        log("Token swapped successfully", "info")
+        try:
+            with open(token_path, "w") as f:
+                f.write(new_token)
+            log("Token swapped successfully", "info")
+        except PermissionError:
+            log(f"Permission denied writing to {token_path}. Proceeding with in-memory token.", "warning")
+        except Exception as e:
+            log(f"Error saving token: {e}", "error")
 
     def send_packages(self, packages_data):
         """Send packages data to /packages. Returns response or None."""
@@ -125,7 +130,13 @@ class Synchronizer(Thread):
                 port = int(url.split(":")[1])
 
             resolver = DNSResolver(hostname)
-            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            
+            # Use certifi if bundled, otherwise fallback to system CA certificates
+            cert_path = certifi.where()
+            if os.path.exists(cert_path):
+                ssl_context = ssl.create_default_context(cafile=cert_path)
+            else:
+                ssl_context = ssl.create_default_context()
 
             # Try IPv4 first, then fallback to IPv6
             for record_type, af in [("A", socket.AF_INET), ("AAAA", socket.AF_INET6)]:
