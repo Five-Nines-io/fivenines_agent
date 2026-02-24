@@ -107,7 +107,7 @@ Collectors use the `@debug` decorator from `debug.py` to log execution time and 
 
 ### Configuration
 
-- Agent reads `TOKEN` file from config directory (default `/etc/fivenines_agent`, overridable via `CONFIG_DIR`)
+- Agent reads `TOKEN` file from config directory (default `/etc/fivenines_agent`, `~/.local/fivenines` for user install, overridable via `CONFIG_DIR`)
 - Configuration is fetched from the API server on startup and includes:
   - `enabled`: whether collection is active
   - `interval`: seconds between collections (default 60)
