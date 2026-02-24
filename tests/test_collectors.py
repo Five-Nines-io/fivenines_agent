@@ -26,6 +26,7 @@ def test_registry_has_expected_config_keys():
         "ports",
         "temperatures",
         "fans",
+        "nvidia_gpu",
         "redis",
         "nginx",
         "docker",

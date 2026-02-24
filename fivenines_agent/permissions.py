@@ -50,6 +50,8 @@ class PermissionProbe:
             # Hardware sensors - may or may not work without root
             "temperatures": self._can_access_hwmon(),
             "fans": self._can_access_hwmon(),
+            # NVIDIA GPU
+            "nvidia_gpu": self._can_access_gpu(),
             # Storage requiring sudo
             "smart_storage": self._can_run_sudo("smartctl", "--version"),
             "raid_storage": self._can_run_sudo("mdadm", "--version"),
@@ -218,6 +220,35 @@ class PermissionProbe:
             log(f"_can_access_hwmon: exception: {type(e).__name__}: {e}", "debug")
             return False
 
+    def _can_access_gpu(self):
+        """Check if NVIDIA GPU is available via pynvml."""
+        try:
+            import pynvml
+        except ImportError:
+            log("_can_access_gpu: pynvml not installed", "debug")
+            return False
+
+        try:
+            pynvml.nvmlInit()
+        except Exception as e:
+            log(f"_can_access_gpu: nvmlInit failed: {e}", "debug")
+            return False
+
+        try:
+            count = pynvml.nvmlDeviceGetCount()
+            available = count > 0
+            log(
+                f"_can_access_gpu: found {count} GPU(s) -> "
+                f"{'AVAILABLE' if available else 'UNAVAILABLE'}",
+                "debug",
+            )
+            return available
+        except Exception as e:
+            log(f"_can_access_gpu: exception: {type(e).__name__}: {e}", "debug")
+            return False
+        finally:
+            pynvml.nvmlShutdown()
+
     def _can_run_zfs(self):
         """Check if zpool commands work."""
         zpool_path = shutil.which("zpool")
@@ -373,7 +404,7 @@ def print_capabilities_banner():
         "ports",
         "processes",
     ]
-    hardware = ["temperatures", "fans"]
+    hardware = ["temperatures", "fans", "nvidia_gpu"]
     storage = ["smart_storage", "raid_storage", "zfs"]
     services = ["docker", "qemu", "proxmox"]
     security = ["fail2ban", "packages"]
@@ -410,6 +441,8 @@ def print_capabilities_banner():
                     hint = " (requires: dpkg-query, rpm, apk, or pacman)"
                 elif cap == "zfs":
                     hint = " (requires: zfs permissions)"
+                elif cap == "nvidia_gpu":
+                    hint = " (requires: NVIDIA driver)"
                 elif cap in ["temperatures", "fans"]:
                     hint = " (no accessible sensors)"
 
