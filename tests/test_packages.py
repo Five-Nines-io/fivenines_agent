@@ -9,7 +9,6 @@ from fivenines_agent.packages import (
     _get_packages_dpkg,
     _get_packages_pacman,
     _get_packages_rpm,
-    _get_packages_synopkg,
     get_distro,
     get_installed_packages,
     get_packages_hash,
@@ -44,14 +43,6 @@ def test_packages_available_apk(mock_which):
 def test_packages_available_pacman(mock_which):
     mock_which.side_effect = lambda cmd: (
         "/usr/bin/pacman" if cmd == "pacman" else None
-    )
-    assert packages_available() is True
-
-
-@patch("fivenines_agent.packages.shutil.which")
-def test_packages_available_synopkg(mock_which):
-    mock_which.side_effect = lambda cmd: (
-        "/usr/syno/bin/synopkg" if cmd == "synopkg" else None
     )
     assert packages_available() is True
 
@@ -244,55 +235,6 @@ def test_get_packages_pacman_empty(mock_run, mock_env):
     assert result == []
 
 
-# --- _get_packages_synopkg ---
-
-
-@patch("fivenines_agent.packages.get_clean_env", return_value={})
-@patch("fivenines_agent.packages.subprocess.run")
-def test_get_packages_synopkg_success(mock_run, mock_env):
-    mock_run.return_value = MagicMock(
-        returncode=0,
-        stdout="ContainerManager 20.10.0-1001\nTextEditor 3.2.0-0001\n",
-    )
-    result = _get_packages_synopkg()
-    assert result == [
-        {"name": "ContainerManager", "version": "20.10.0-1001"},
-        {"name": "TextEditor", "version": "3.2.0-0001"},
-    ]
-    mock_run.assert_called_once()
-    args = mock_run.call_args
-    assert args[0][0] == ["synopkg", "list"]
-    assert args[1]["timeout"] == 30
-
-
-@patch("fivenines_agent.packages.get_clean_env", return_value={})
-@patch("fivenines_agent.packages.subprocess.run")
-def test_get_packages_synopkg_failure(mock_run, mock_env):
-    mock_run.return_value = MagicMock(returncode=1, stderr="error")
-    result = _get_packages_synopkg()
-    assert result == []
-
-
-@patch("fivenines_agent.packages.get_clean_env", return_value={})
-@patch("fivenines_agent.packages.subprocess.run")
-def test_get_packages_synopkg_empty_lines(mock_run, mock_env):
-    mock_run.return_value = MagicMock(returncode=0, stdout="\n\n")
-    result = _get_packages_synopkg()
-    assert result == []
-
-
-@patch("fivenines_agent.packages.get_clean_env", return_value={})
-@patch("fivenines_agent.packages.subprocess.run")
-def test_get_packages_synopkg_short_line(mock_run, mock_env):
-    """Lines with fewer than 2 fields should be skipped."""
-    mock_run.return_value = MagicMock(
-        returncode=0,
-        stdout="OnlyName\nContainerManager 20.10.0-1001\n",
-    )
-    result = _get_packages_synopkg()
-    assert result == [{"name": "ContainerManager", "version": "20.10.0-1001"}]
-
-
 # --- get_installed_packages ---
 
 
@@ -340,17 +282,6 @@ def test_get_installed_packages_pacman(mock_pacman, mock_which):
     mock_pacman.return_value = [{"name": "linux", "version": "6.7"}]
     result = get_installed_packages()
     assert result == [{"name": "linux", "version": "6.7"}]
-
-
-@patch("fivenines_agent.packages.shutil.which")
-@patch("fivenines_agent.packages._get_packages_synopkg")
-def test_get_installed_packages_synopkg(mock_synopkg, mock_which):
-    mock_which.side_effect = lambda cmd: (
-        "/usr/syno/bin/synopkg" if cmd == "synopkg" else None
-    )
-    mock_synopkg.return_value = [{"name": "ContainerManager", "version": "20.10.0-1001"}]
-    result = get_installed_packages()
-    assert result == [{"name": "ContainerManager", "version": "20.10.0-1001"}]
 
 
 @patch("fivenines_agent.packages.shutil.which", return_value=None)

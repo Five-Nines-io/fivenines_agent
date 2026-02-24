@@ -10,7 +10,7 @@
 
 ## Remediation Status
 
-**Last updated:** 2026-02-23 — All STOP/HIGH findings closed. FN-SEC-001, 002, 003–008 fully remediated on `synology` branch.
+**Last updated:** 2026-02-23 — All STOP/HIGH findings closed. FN-SEC-001, 002, 003–008 fully remediated on `security-focus` branch.
 
 | ID | Status | Notes |
 |----|--------|-------|

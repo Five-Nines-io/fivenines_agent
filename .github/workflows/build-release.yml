@@ -310,143 +310,9 @@ jobs:
           path: dist/fivenines-agent-alpine-arm64.tar.gz
           retention-days: 7
 
-  build-synology-amd64:
-    needs: [lint]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set image name (lowercase)
-        id: image
-        run: |
-          IMAGE_NAME=$(echo "${{ github.repository }}-builder-synology-amd64" | tr '[:upper:]' '[:lower:]')
-          echo "name=$IMAGE_NAME" >> $GITHUB_OUTPUT
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
-          tags: |
-            type=raw,value=latest
-
-      - name: Build and push Docker image (synology-amd64)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile.synology
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:buildcache
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:buildcache,mode=max
-          load: true
-
-      - name: Build agent binary (synology-amd64)
-        run: |
-          docker run --rm \
-            -v ${{ github.workspace }}:/workspace \
-            -e TARGET_ARCH=amd64 \
-            ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:latest \
-            bash /workspace/py2exe_synology.sh
-
-      - name: Fix permissions and build SPK (synology-amd64)
-        run: |
-          sudo chown -R $(id -u):$(id -g) dist/
-          VERSION=$(grep '^version = ' pyproject.toml | head -1 | cut -d'"' -f2)
-          bash synology/build_spk.sh "$VERSION" x86_64
-
-      - name: Upload artifact (synology-amd64)
-        uses: actions/upload-artifact@v4
-        with:
-          name: fivenines-agent-synology-amd64
-          path: dist/synology/fivenines-agent-*-x86_64.spk
-          retention-days: 7
-
-  build-synology-arm64:
-    needs: [lint]
-    runs-on: ubuntu-24.04-arm  # Native ARM64 runner
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set image name (lowercase)
-        id: image
-        run: |
-          IMAGE_NAME=$(echo "${{ github.repository }}-builder-synology-arm64" | tr '[:upper:]' '[:lower:]')
-          echo "name=$IMAGE_NAME" >> $GITHUB_OUTPUT
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
-          tags: |
-            type=raw,value=latest
-
-      - name: Build and push Docker image (synology-arm64)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile.synology
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:buildcache
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:buildcache,mode=max
-          build-args: |
-            BASE_IMAGE=quay.io/pypa/manylinux2014_aarch64
-          load: true
-
-      - name: Build agent binary (synology-arm64)
-        run: |
-          docker run --rm \
-            -v ${{ github.workspace }}:/workspace \
-            -e TARGET_ARCH=arm64 \
-            ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:latest \
-            bash /workspace/py2exe_synology.sh
-
-      - name: Fix permissions and build SPK (synology-arm64)
-        run: |
-          sudo chown -R $(id -u):$(id -g) dist/
-          VERSION=$(grep '^version = ' pyproject.toml | head -1 | cut -d'"' -f2)
-          bash synology/build_spk.sh "$VERSION" aarch64
-
-      - name: Upload artifact (synology-arm64)
-        uses: actions/upload-artifact@v4
-        with:
-          name: fivenines-agent-synology-arm64
-          path: dist/synology/fivenines-agent-*-aarch64.spk
-          retention-days: 7
-
   # Pre-release for feature and release branches
   pre-release:
-    needs: [build-amd64, build-arm64, build-alpine-amd64, build-alpine-arm64, build-synology-amd64, build-synology-arm64]
+    needs: [build-amd64, build-arm64, build-alpine-amd64, build-alpine-arm64]
     runs-on: ubuntu-latest
     if: |
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
@@ -490,8 +356,6 @@ jobs:
           mv artifacts/fivenines-agent-linux-arm64/fivenines-agent-linux-arm64.tar.gz release/
           mv artifacts/fivenines-agent-alpine-amd64/fivenines-agent-alpine-amd64.tar.gz release/
           mv artifacts/fivenines-agent-alpine-arm64/fivenines-agent-alpine-arm64.tar.gz release/
-          mv artifacts/fivenines-agent-synology-amd64/*.spk release/
-          mv artifacts/fivenines-agent-synology-arm64/*.spk release/
           ls -la release/
 
       - name: Delete existing pre-release with same tag (if exists)
@@ -541,25 +405,18 @@ jobs:
 
             # ARM64 (Alpine/musl)
             https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-alpine-arm64.tar.gz
-
-            # Synology DSM 7 (x86_64 NAS)
-            https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-*-x86_64.spk
-
-            # Synology DSM 7 (aarch64 NAS)
-            https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-*-aarch64.spk
             ```
           files: |
             release/fivenines-agent-linux-amd64.tar.gz
             release/fivenines-agent-linux-arm64.tar.gz
             release/fivenines-agent-alpine-amd64.tar.gz
             release/fivenines-agent-alpine-arm64.tar.gz
-            release/*.spk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # Production release for version tags
   release:
-    needs: [build-amd64, build-arm64, build-alpine-amd64, build-alpine-arm64, build-synology-amd64, build-synology-arm64]
+    needs: [build-amd64, build-arm64, build-alpine-amd64, build-alpine-arm64]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -580,8 +437,6 @@ jobs:
           mv artifacts/fivenines-agent-linux-arm64/fivenines-agent-linux-arm64.tar.gz release/
           mv artifacts/fivenines-agent-alpine-amd64/fivenines-agent-alpine-amd64.tar.gz release/
           mv artifacts/fivenines-agent-alpine-arm64/fivenines-agent-alpine-arm64.tar.gz release/
-          mv artifacts/fivenines-agent-synology-amd64/*.spk release/
-          mv artifacts/fivenines-agent-synology-arm64/*.spk release/
           ls -la release/
 
       - name: Extract version from tag
@@ -600,7 +455,6 @@ jobs:
             release/fivenines-agent-linux-arm64.tar.gz
             release/fivenines-agent-alpine-amd64.tar.gz
             release/fivenines-agent-alpine-arm64.tar.gz
-            release/*.spk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -629,10 +483,6 @@ jobs:
           # Copy release binaries (Alpine/musl)
           cp artifacts/fivenines-agent-alpine-amd64/fivenines-agent-alpine-amd64.tar.gz r2-upload/latest/
           cp artifacts/fivenines-agent-alpine-arm64/fivenines-agent-alpine-arm64.tar.gz r2-upload/latest/
-
-          # Copy Synology SPK packages
-          cp artifacts/fivenines-agent-synology-amd64/*.spk r2-upload/latest/
-          cp artifacts/fivenines-agent-synology-arm64/*.spk r2-upload/latest/
 
           # Copy static files (service, OpenRC, and boot script)
           cp fivenines-agent.service r2-upload/latest/
@@ -680,8 +530,6 @@ jobs:
           echo "  - https://releases.fivenines.io/latest/fivenines-agent-linux-arm64.tar.gz"
           echo "  - https://releases.fivenines.io/latest/fivenines-agent-alpine-amd64.tar.gz"
           echo "  - https://releases.fivenines.io/latest/fivenines-agent-alpine-arm64.tar.gz"
-          echo "  - https://releases.fivenines.io/latest/fivenines-agent-*-x86_64.spk"
-          echo "  - https://releases.fivenines.io/latest/fivenines-agent-*-aarch64.spk"
           echo "  - https://releases.fivenines.io/latest/fivenines-agent.service"
           echo "  - https://releases.fivenines.io/latest/fivenines-agent.openrc"
           echo "  - https://releases.fivenines.io/latest/fivenines_script.sh"

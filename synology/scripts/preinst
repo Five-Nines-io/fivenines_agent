@@ -1,3 +1,0 @@
-#!/bin/sh
-# Pre-install: check conditions only; no side effects. Non-zero aborts install.
-exit 0
