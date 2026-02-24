@@ -51,7 +51,7 @@ class PermissionProbe:
             "temperatures": self._can_access_hwmon(),
             "fans": self._can_access_hwmon(),
             # NVIDIA GPU
-            "gpu": self._can_access_gpu(),
+            "nvidia_gpu": self._can_access_gpu(),
             # Storage requiring sudo
             "smart_storage": self._can_run_sudo("smartctl", "--version"),
             "raid_storage": self._can_run_sudo("mdadm", "--version"),
@@ -404,7 +404,7 @@ def print_capabilities_banner():
         "ports",
         "processes",
     ]
-    hardware = ["temperatures", "fans", "gpu"]
+    hardware = ["temperatures", "fans", "nvidia_gpu"]
     storage = ["smart_storage", "raid_storage", "zfs"]
     services = ["docker", "qemu", "proxmox"]
     security = ["fail2ban", "packages"]
@@ -441,7 +441,7 @@ def print_capabilities_banner():
                     hint = " (requires: dpkg-query, rpm, apk, or pacman)"
                 elif cap == "zfs":
                     hint = " (requires: zfs permissions)"
-                elif cap == "gpu":
+                elif cap == "nvidia_gpu":
                     hint = " (requires: NVIDIA driver)"
                 elif cap in ["temperatures", "fans"]:
                     hint = " (no accessible sensors)"

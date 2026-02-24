@@ -28,13 +28,9 @@ def _collect_processes(handle):
     ):
         try:
             for proc in getter(handle):
-                name = _safe(pynvml.nvmlSystemGetProcessName, proc.pid)
-                if isinstance(name, bytes):
-                    name = name.decode("utf-8", errors="replace")
                 processes.append(
                     {
                         "pid": proc.pid,
-                        "name": name,
                         "memory_used": proc.usedGpuMemory,
                     }
                 )
@@ -43,7 +39,7 @@ def _collect_processes(handle):
     return processes
 
 
-@debug("gpu")
+@debug("nvidia_gpu")
 def gpu_metrics():
     """Collect metrics for all NVIDIA GPUs."""
     if not HAS_NVML:
