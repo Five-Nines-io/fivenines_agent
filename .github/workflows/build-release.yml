@@ -521,11 +521,11 @@ jobs:
       - name: Sync to R2
         run: |
           # Upload to /latest/ (always the most recent release)
-          rclone sync r2-upload/latest/ r2:${{ secrets.R2_BUCKET_NAME }}/latest/ --s3-no-check-bucket --verbose
+          rclone sync r2-upload/latest/ r2:${{ secrets.R2_BUCKET_NAME }}/latest/ --s3-no-check-bucket --verbose --header-upload "Cache-Control: no-cache, must-revalidate"
 
           # Also upload to versioned path for reference
           VERSION="${GITHUB_REF#refs/tags/}"
-          rclone sync r2-upload/latest/ r2:${{ secrets.R2_BUCKET_NAME }}/${VERSION}/ --s3-no-check-bucket --verbose
+          rclone sync r2-upload/latest/ r2:${{ secrets.R2_BUCKET_NAME }}/${VERSION}/ --s3-no-check-bucket --verbose --header-upload "Cache-Control: max-age=31536000, immutable"
 
           echo "Files synced to R2:"
           echo "  - https://releases.fivenines.io/latest/fivenines-agent-linux-amd64.tar.gz"
@@ -535,3 +535,15 @@ jobs:
           echo "  - https://releases.fivenines.io/latest/fivenines-agent.service"
           echo "  - https://releases.fivenines.io/latest/fivenines-agent.openrc"
           echo "  - https://releases.fivenines.io/latest/fivenines_script.sh"
+
+      - name: Purge Cloudflare cache for /latest/
+        run: |
+          FILES_JSON=$(ls r2-upload/latest/ | jq -R '"https://releases.fivenines.io/latest/" + .' | jq -s '{"files": .}')
+          curl -sf -X POST \
+            "https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/purge_cache" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$FILES_JSON"
+        env:
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
