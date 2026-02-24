@@ -65,6 +65,9 @@ class TestGpuWithNvml:
         graphics_proc = SimpleNamespace(pid=5678, usedGpuMemory=200000000)
         nvml.nvmlDeviceGetComputeRunningProcesses.return_value = [compute_proc]
         nvml.nvmlDeviceGetGraphicsRunningProcesses.return_value = [graphics_proc]
+        nvml.nvmlSystemGetProcessName.side_effect = lambda pid: (
+            "/usr/bin/train" if pid == 1234 else "/usr/bin/xorg"
+        )
 
         gpu_mod = self._import_gpu()
         result = gpu_mod.gpu_metrics()
@@ -86,8 +89,16 @@ class TestGpuWithNvml:
         assert gpu["clock_sm"] == 2100
         assert gpu["clock_mem"] == 1200
         assert len(gpu["processes"]) == 2
-        assert gpu["processes"][0] == {"pid": 1234, "memory_used": 500000000}
-        assert gpu["processes"][1] == {"pid": 5678, "memory_used": 200000000}
+        assert gpu["processes"][0] == {
+            "pid": 1234,
+            "name": "/usr/bin/train",
+            "memory_used": 500000000,
+        }
+        assert gpu["processes"][1] == {
+            "pid": 5678,
+            "name": "/usr/bin/xorg",
+            "memory_used": 200000000,
+        }
 
         nvml.nvmlShutdown.assert_called_once()
 
@@ -234,6 +245,7 @@ class TestGpuWithNvml:
         graphics = [SimpleNamespace(pid=300, usedGpuMemory=3000)]
         nvml.nvmlDeviceGetComputeRunningProcesses.return_value = compute
         nvml.nvmlDeviceGetGraphicsRunningProcesses.return_value = graphics
+        nvml.nvmlSystemGetProcessName.return_value = "/usr/bin/app"
 
         gpu_mod = self._import_gpu()
         result = gpu_mod.gpu_metrics()
@@ -241,6 +253,7 @@ class TestGpuWithNvml:
         procs = result[0]["processes"]
         assert len(procs) == 3
         assert procs[0]["pid"] == 100
+        assert procs[0]["name"] == "/usr/bin/app"
         assert procs[1]["pid"] == 200
         assert procs[2]["pid"] == 300
 
@@ -267,6 +280,7 @@ class TestGpuWithNvml:
         nvml.nvmlDeviceGetGraphicsRunningProcesses.return_value = [
             SimpleNamespace(pid=999, usedGpuMemory=500)
         ]
+        nvml.nvmlSystemGetProcessName.return_value = "/usr/bin/render"
 
         gpu_mod = self._import_gpu()
         result = gpu_mod.gpu_metrics()
@@ -274,6 +288,72 @@ class TestGpuWithNvml:
         procs = result[0]["processes"]
         assert len(procs) == 1
         assert procs[0]["pid"] == 999
+        assert procs[0]["name"] == "/usr/bin/render"
+
+    def test_process_name_failure_returns_none(self):
+        """When nvmlSystemGetProcessName fails, name is None."""
+        nvml = self.mock_nvml
+        nvml.nvmlDeviceGetCount.return_value = 1
+
+        handle = MagicMock()
+        nvml.nvmlDeviceGetHandleByIndex.return_value = handle
+        nvml.nvmlDeviceGetName.return_value = "GPU"
+        nvml.nvmlDeviceGetTemperature.return_value = 50
+        nvml.nvmlDeviceGetFanSpeed.return_value = 30
+        nvml.nvmlDeviceGetPowerUsage.return_value = 100000
+        nvml.nvmlDeviceGetPowerManagementLimit.return_value = 300000
+        nvml.nvmlDeviceGetUtilizationRates.return_value = SimpleNamespace(
+            gpu=10, memory=5
+        )
+        nvml.nvmlDeviceGetMemoryInfo.return_value = SimpleNamespace(
+            used=1000, total=24000, free=23000
+        )
+        nvml.nvmlDeviceGetClockInfo.return_value = 1500
+        nvml.nvmlDeviceGetComputeRunningProcesses.return_value = [
+            SimpleNamespace(pid=111, usedGpuMemory=1000)
+        ]
+        nvml.nvmlDeviceGetGraphicsRunningProcesses.return_value = []
+        nvml.nvmlSystemGetProcessName.side_effect = Exception("no permission")
+
+        gpu_mod = self._import_gpu()
+        result = gpu_mod.gpu_metrics()
+
+        procs = result[0]["processes"]
+        assert len(procs) == 1
+        assert procs[0]["pid"] == 111
+        assert procs[0]["name"] is None
+
+    def test_process_name_bytes_decoded(self):
+        """Process name returned as bytes is decoded to str."""
+        nvml = self.mock_nvml
+        nvml.nvmlDeviceGetCount.return_value = 1
+
+        handle = MagicMock()
+        nvml.nvmlDeviceGetHandleByIndex.return_value = handle
+        nvml.nvmlDeviceGetName.return_value = "GPU"
+        nvml.nvmlDeviceGetTemperature.return_value = 50
+        nvml.nvmlDeviceGetFanSpeed.return_value = 30
+        nvml.nvmlDeviceGetPowerUsage.return_value = 100000
+        nvml.nvmlDeviceGetPowerManagementLimit.return_value = 300000
+        nvml.nvmlDeviceGetUtilizationRates.return_value = SimpleNamespace(
+            gpu=10, memory=5
+        )
+        nvml.nvmlDeviceGetMemoryInfo.return_value = SimpleNamespace(
+            used=1000, total=24000, free=23000
+        )
+        nvml.nvmlDeviceGetClockInfo.return_value = 1500
+        nvml.nvmlDeviceGetComputeRunningProcesses.return_value = [
+            SimpleNamespace(pid=222, usedGpuMemory=2000)
+        ]
+        nvml.nvmlDeviceGetGraphicsRunningProcesses.return_value = []
+        nvml.nvmlSystemGetProcessName.return_value = b"/usr/bin/python3"
+
+        gpu_mod = self._import_gpu()
+        result = gpu_mod.gpu_metrics()
+
+        procs = result[0]["processes"]
+        assert procs[0]["name"] == "/usr/bin/python3"
+        assert isinstance(procs[0]["name"], str)
 
 
 class TestGpuWithoutNvml:
