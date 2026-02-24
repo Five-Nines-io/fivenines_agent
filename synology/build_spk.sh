@@ -70,6 +70,8 @@ chmod +x "${BUILD_DIR}/scripts/start-stop-status"
 chmod +x "${BUILD_DIR}/scripts/postinst"
 cp "${SCRIPT_DIR}/conf/privilege" "${BUILD_DIR}/conf/"
 cp "${SCRIPT_DIR}/WIZARD_UIFILES/install_uifile" "${BUILD_DIR}/WIZARD_UIFILES/"
+cp "${SCRIPT_DIR}/PACKAGE_ICON.PNG" "${BUILD_DIR}/"
+cp "${SCRIPT_DIR}/PACKAGE_ICON_256.PNG" "${BUILD_DIR}/"
 
 # Assemble SPK (it's a tar archive)
 echo "Assembling SPK..."
@@ -81,7 +83,9 @@ tar cf "${OUTPUT_DIR}/${SPK_NAME}" \
     package.tgz \
     scripts \
     conf \
-    WIZARD_UIFILES
+    WIZARD_UIFILES \
+    PACKAGE_ICON.PNG \
+    PACKAGE_ICON_256.PNG
 
 # Clean up
 rm -rf "${BUILD_DIR}"
