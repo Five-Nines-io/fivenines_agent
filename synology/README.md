@@ -16,9 +16,9 @@ Synology DSM 7 as an SPK (Synology Package).
 Run inside the manylinux2014 Docker build environment (same as CI):
 
 ```bash
-TARGET_ARCH=amd64 ./py2exe_synology.sh
+SYNOLOGY=1 TARGET_ARCH=amd64 ./py2exe.sh
 # or
-TARGET_ARCH=arm64 ./py2exe_synology.sh
+SYNOLOGY=1 TARGET_ARCH=arm64 ./py2exe.sh
 ```
 
 This produces `./dist/linux/fivenines-agent-synology-{amd64|arm64}/`.

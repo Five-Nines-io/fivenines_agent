@@ -8,8 +8,6 @@ on:
       - 'release/**'
       - 'feature/**'
       - 'fix/**'
-      - 'synology/**'
-      - synology
     tags:
       - 'v*'
   pull_request:
@@ -316,23 +314,14 @@ jobs:
           retention-days: 7
 
   build-synology-amd64:
-    needs: [lint]
+    needs: [build-amd64]
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: write
+      packages: read
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Set image name (lowercase)
-        id: image
-        run: |
-          IMAGE_NAME=$(echo "${{ github.repository }}-builder-synology-amd64" | tr '[:upper:]' '[:lower:]')
-          echo "name=$IMAGE_NAME" >> $GITHUB_OUTPUT
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
@@ -341,32 +330,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
-          tags: |
-            type=raw,value=latest
-
-      - name: Build and push Docker image (synology-amd64)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile.synology
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:buildcache
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:buildcache,mode=max
-          load: true
-
       - name: Build agent binary (synology-amd64)
         run: |
+          IMAGE=$(echo "${{ env.REGISTRY }}/${{ github.repository }}-builder-amd64" | tr '[:upper:]' '[:lower:]')
           docker run --rm \
             -v ${{ github.workspace }}:/workspace \
             -e TARGET_ARCH=amd64 \
-            ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:latest \
-            bash /workspace/py2exe_synology.sh
+            -e SYNOLOGY=1 \
+            ${IMAGE}:latest \
+            bash /workspace/py2exe.sh
 
       - name: Fix permissions and build SPK (synology-amd64)
         run: |
@@ -382,23 +354,14 @@ jobs:
           retention-days: 7
 
   build-synology-arm64:
-    needs: [lint]
+    needs: [build-arm64]
     runs-on: ubuntu-24.04-arm  # Native ARM64 runner
     permissions:
       contents: read
-      packages: write
+      packages: read
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-
-      - name: Set image name (lowercase)
-        id: image
-        run: |
-          IMAGE_NAME=$(echo "${{ github.repository }}-builder-synology-arm64" | tr '[:upper:]' '[:lower:]')
-          echo "name=$IMAGE_NAME" >> $GITHUB_OUTPUT
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
@@ -407,34 +370,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
-          tags: |
-            type=raw,value=latest
-
-      - name: Build and push Docker image (synology-arm64)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile.synology
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:buildcache
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:buildcache,mode=max
-          build-args: |
-            BASE_IMAGE=quay.io/pypa/manylinux2014_aarch64
-          load: true
-
       - name: Build agent binary (synology-arm64)
         run: |
+          IMAGE=$(echo "${{ env.REGISTRY }}/${{ github.repository }}-builder-arm64" | tr '[:upper:]' '[:lower:]')
           docker run --rm \
             -v ${{ github.workspace }}:/workspace \
             -e TARGET_ARCH=arm64 \
-            ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:latest \
-            bash /workspace/py2exe_synology.sh
+            -e SYNOLOGY=1 \
+            ${IMAGE}:latest \
+            bash /workspace/py2exe.sh
 
       - name: Fix permissions and build SPK (synology-arm64)
         run: |
@@ -456,7 +400,7 @@ jobs:
     if: |
       github.event_name == 'push' &&
       !startsWith(github.ref, 'refs/tags/') &&
-      (startsWith(github.ref, 'refs/heads/release/') || startsWith(github.ref, 'refs/heads/feature/') || startsWith(github.ref, 'refs/heads/synology'))
+      (startsWith(github.ref, 'refs/heads/release/') || startsWith(github.ref, 'refs/heads/feature/'))
     permissions:
       contents: write
     steps:

@@ -5,7 +5,7 @@
 #   version: agent version string, e.g. 1.5.4
 #   arch:    x86_64 or aarch64
 #
-# Prerequisites: run py2exe_synology.sh first to produce the binary.
+# Prerequisites: run py2exe.sh with SYNOLOGY=1 first to produce the binary.
 
 set -e
 
@@ -31,7 +31,7 @@ BUILD_DIR="/tmp/spkbuild-$$"
 
 if [ ! -f "${BINARY}" ]; then
     echo "Binary not found: ${BINARY}"
-    echo "Run py2exe_synology.sh first."
+    echo "Run SYNOLOGY=1 TARGET_ARCH=amd64 ./py2exe.sh (or arm64) first."
     exit 1
 fi
 
