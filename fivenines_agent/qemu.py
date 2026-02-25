@@ -1,7 +1,13 @@
 import os
 import time
-import libvirt
 import xml.etree.ElementTree as ET
+
+try:
+    import libvirt
+    _LibvirtError = libvirt.libvirtError
+except ImportError:
+    libvirt = None  # type: ignore[assignment]
+    _LibvirtError = Exception
 
 from fivenines_agent.debug import debug, log
 
@@ -124,7 +130,7 @@ class QEMUCollector:
                         )
                         total_cpu_time_ns += cpu_time
                         per_vcpu_collected = True
-        except libvirt.libvirtError as e:
+        except _LibvirtError as e:
             # Expected on cgroup v2 - silently ignore
             if "not supported" not in str(e).lower() and "cgroup" not in str(e).lower():
                 log(f"Unexpected error in getCPUStats(False): {e}", 'debug')
@@ -155,7 +161,7 @@ class QEMUCollector:
                                     )
                                     total_cpu_time_ns += cpu_time
                                     per_vcpu_collected = True
-            except libvirt.libvirtError as e:
+            except _LibvirtError as e:
                 if "not implemented" not in str(e).lower():
                     log(f"vcpus() error: {e}", 'debug')
             except Exception as e:
@@ -358,6 +364,9 @@ class QEMUCollector:
 
 @debug('qemu_metrics')
 def qemu_metrics(uri="qemu:///system"):
+    if libvirt is None:
+        log("libvirt not available, skipping QEMU metrics", "debug")
+        return []
     collector = QEMUCollector(uri)
     try:
         return collector.collect()

@@ -10,7 +10,11 @@ Collects metrics from Proxmox VE clusters and standalone nodes including:
 """
 
 from fivenines_agent.debug import debug, log
-from proxmoxer import ProxmoxAPI
+
+try:
+    from proxmoxer import ProxmoxAPI
+except ImportError:
+    ProxmoxAPI = None  # type: ignore[assignment, misc]
 
 
 class ProxmoxCollector:
@@ -346,6 +350,9 @@ def proxmox_metrics(host="localhost", port=8006,
     Returns:
         dict: Proxmox metrics data or None if collection fails
     """
+    if ProxmoxAPI is None:
+        log("proxmoxer not available, skipping Proxmox metrics", "debug")
+        return None
     try:
         collector = ProxmoxCollector(
             host=host,
