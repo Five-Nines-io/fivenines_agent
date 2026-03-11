@@ -1,0 +1,212 @@
+# SELinux policy module for fivenines_agent (Rocky Linux / RHEL 8/9)
+# Confines the monitoring agent under SELinux Enforcing mode.
+#
+# Build:   make -f /usr/share/selinux/devel/Makefile
+# Install: semodule -X 400 -r fivenines_agent 2>/dev/null; \
+#          semodule -X 100 -r fivenines_agent 2>/dev/null; \
+#          semodule -i fivenines_agent.pp -X 100
+# Then:    restorecon -Rv /opt/fivenines /etc/fivenines_agent
+
+policy_module(fivenines_agent, 1.1)
+
+########################################################################
+# Required base-policy types (single block to avoid typeattributeset
+# resolution failures when loaded at priority 400 alongside base at 100)
+########################################################################
+gen_require(`
+	type init_t;
+	type bin_t, shell_exec_t, sudo_exec_t;
+	type proc_t, proc_net_t, sysctl_t, sysctl_kernel_t, sysctl_net_t;
+	type sysfs_t;
+	type etc_t, net_conf_t, passwd_file_t, locale_t;
+	type cert_t;
+	type lib_t, ld_so_t, ld_so_cache_t;
+	type usr_t;
+	type var_run_t, var_log_t, tmp_t;
+	type devpts_t, null_device_t, urandom_device_t;
+	type node_t, port_t, dns_port_t, http_port_t;
+	type postgresql_port_t, redis_port_t;
+	type fixed_disk_device_t;
+	type user_home_dir_t, user_home_t;
+')
+
+########################################################################
+# Domain types
+########################################################################
+type fivenines_agent_t;
+type fivenines_agent_exec_t;
+type fivenines_agent_config_t;
+type fivenines_agent_log_t;
+
+role system_r types fivenines_agent_t;
+
+########################################################################
+# Domain transition: init_t (systemd) runs agent binary
+########################################################################
+type_transition init_t fivenines_agent_exec_t:process fivenines_agent_t;
+allow init_t fivenines_agent_t:process transition;
+allow init_t fivenines_agent_exec_t:file { getattr open read execute };
+allow fivenines_agent_t fivenines_agent_exec_t:file { entrypoint getattr open read execute execute_no_trans map ioctl };
+
+# Agent process permissions (fork, signal self, etc.)
+allow fivenines_agent_t self:process { fork signal signull sigchld sigkill getsched setsched setrlimit };
+
+########################################################################
+# Agent binary and libraries (PyInstaller onedir: /opt/fivenines/*)
+########################################################################
+allow fivenines_agent_t fivenines_agent_exec_t:dir { getattr search open read };
+allow fivenines_agent_t fivenines_agent_exec_t:lnk_file { getattr read };
+
+# Shared libraries, linker cache
+allow fivenines_agent_t lib_t:dir { getattr search open };
+allow fivenines_agent_t lib_t:file { getattr open read execute map ioctl };
+allow fivenines_agent_t lib_t:lnk_file { getattr read };
+allow fivenines_agent_t ld_so_t:file { getattr open read execute map };
+allow fivenines_agent_t ld_so_cache_t:file { getattr open read map };
+
+# /usr/bin, /usr/sbin (subprocess exec: zpool, psql, dpkg-query, rpm, etc.)
+allow fivenines_agent_t bin_t:dir { getattr search open read };
+allow fivenines_agent_t bin_t:file { getattr open read execute execute_no_trans map ioctl };
+allow fivenines_agent_t bin_t:lnk_file { getattr read };
+allow fivenines_agent_t shell_exec_t:file { getattr open read execute execute_no_trans map };
+allow fivenines_agent_t usr_t:dir { getattr search open read };
+allow fivenines_agent_t usr_t:file { getattr open read };
+allow fivenines_agent_t usr_t:lnk_file { getattr read };
+
+# sudo (for smartctl, mdadm, fail2ban-client, nvme)
+allow fivenines_agent_t sudo_exec_t:file { getattr open read execute execute_no_trans map };
+
+########################################################################
+# Config directory: /etc/fivenines_agent (TOKEN, .env)
+########################################################################
+allow fivenines_agent_t fivenines_agent_config_t:dir { getattr search open read write add_name remove_name };
+allow fivenines_agent_t fivenines_agent_config_t:file { getattr open read write create rename unlink append lock ioctl map };
+allow fivenines_agent_t fivenines_agent_config_t:lnk_file { getattr read };
+
+########################################################################
+# Log file: /var/log/fivenines-agent.log
+########################################################################
+allow fivenines_agent_t fivenines_agent_log_t:file { getattr open read write create append lock ioctl };
+allow fivenines_agent_t var_log_t:dir { getattr search open };
+
+########################################################################
+# /proc (psutil, /proc/cpuinfo, /proc/mdstat, /proc/net/*, etc.)
+########################################################################
+allow fivenines_agent_t proc_t:dir { getattr search open read };
+allow fivenines_agent_t proc_t:file { getattr open read lock ioctl };
+allow fivenines_agent_t proc_t:lnk_file { getattr read };
+
+# /proc/net (tcp, tcp6, udp, udp6, dev, if_inet6)
+allow fivenines_agent_t proc_net_t:dir { getattr search open read };
+allow fivenines_agent_t proc_net_t:file { getattr open read lock ioctl };
+allow fivenines_agent_t proc_net_t:lnk_file { getattr read };
+
+# /proc/sys/kernel, /proc/sys/net, /proc/sys/fs
+allow fivenines_agent_t { sysctl_t sysctl_kernel_t sysctl_net_t }:dir { getattr search open read };
+allow fivenines_agent_t { sysctl_t sysctl_kernel_t sysctl_net_t }:file { getattr open read lock ioctl };
+
+########################################################################
+# /sys (hwmon temperatures/fans, net class, block devices via psutil)
+########################################################################
+allow fivenines_agent_t sysfs_t:dir { getattr search open read };
+allow fivenines_agent_t sysfs_t:file { getattr open read lock ioctl };
+allow fivenines_agent_t sysfs_t:lnk_file { getattr read };
+
+########################################################################
+# /etc (os-release, passwd, group, resolv.conf, nsswitch, ld.so.conf, locale)
+########################################################################
+allow fivenines_agent_t etc_t:dir { getattr search open read };
+allow fivenines_agent_t etc_t:file { getattr open read lock ioctl map };
+allow fivenines_agent_t etc_t:lnk_file { getattr read };
+allow fivenines_agent_t passwd_file_t:file { getattr open read lock ioctl };
+allow fivenines_agent_t net_conf_t:file { getattr open read lock ioctl };
+allow fivenines_agent_t net_conf_t:dir { getattr search open };
+allow fivenines_agent_t locale_t:dir { getattr search open };
+allow fivenines_agent_t locale_t:file { getattr open read map };
+
+# SSL/TLS CA certificates (certifi bundle, /etc/pki/tls)
+allow fivenines_agent_t cert_t:dir { getattr search open read };
+allow fivenines_agent_t cert_t:file { getattr open read lock ioctl };
+allow fivenines_agent_t cert_t:lnk_file { getattr read };
+
+########################################################################
+# Networking: outbound TCP (HTTPS 443), DNS, local service ports
+########################################################################
+
+# TCP sockets (API calls, local service checks)
+allow fivenines_agent_t self:tcp_socket { create bind connect getattr setattr listen accept read write getopt setopt shutdown ioctl };
+allow fivenines_agent_t self:udp_socket { create bind connect getattr setattr read write getopt setopt shutdown ioctl };
+
+# Node-level send/receive
+allow fivenines_agent_t node_t:node { sendto recvfrom };
+allow fivenines_agent_t node_t:tcp_socket node_bind;
+
+# Connect to any port (agent checks: API 443, Redis 6379, PostgreSQL 5432,
+# Caddy 2019, Nginx 8080, Proxmox 8006, configurable ping targets)
+allow fivenines_agent_t port_t:tcp_socket name_connect;
+allow fivenines_agent_t http_port_t:tcp_socket name_connect;
+allow fivenines_agent_t postgresql_port_t:tcp_socket name_connect;
+allow fivenines_agent_t redis_port_t:tcp_socket name_connect;
+
+# DNS resolution (TCP and UDP port 53)
+allow fivenines_agent_t dns_port_t:tcp_socket name_connect;
+allow fivenines_agent_t dns_port_t:udp_socket name_bind;
+
+# Netlink for interface enumeration (psutil net_if_addrs, routing)
+allow fivenines_agent_t self:netlink_route_socket { create bind getattr read write nlmsg_read };
+
+########################################################################
+# Unix domain sockets (systemd notify, nscd, subprocess pipes)
+########################################################################
+allow fivenines_agent_t self:unix_stream_socket { create bind connect getattr setattr listen accept read write getopt setopt shutdown };
+allow fivenines_agent_t self:unix_dgram_socket { create bind connect getattr setattr read write getopt setopt sendto };
+allow fivenines_agent_t init_t:unix_dgram_socket sendto;
+allow fivenines_agent_t var_run_t:dir { getattr search open };
+allow fivenines_agent_t var_run_t:sock_file { getattr read write };
+
+# Pipes for subprocess communication
+allow fivenines_agent_t self:fifo_file { getattr read write ioctl };
+
+########################################################################
+# Device nodes
+########################################################################
+allow fivenines_agent_t null_device_t:chr_file { getattr open read write };
+allow fivenines_agent_t urandom_device_t:chr_file { getattr open read ioctl };
+allow fivenines_agent_t devpts_t:chr_file { getattr read write ioctl };
+
+# Block devices (statvfs on mounted filesystems for partitions collector)
+allow fivenines_agent_t fixed_disk_device_t:blk_file { getattr ioctl };
+
+########################################################################
+# Temp files (Python tempfile, subprocess)
+########################################################################
+allow fivenines_agent_t tmp_t:dir { getattr search open read write add_name remove_name };
+allow fivenines_agent_t tmp_t:file { getattr open read write create unlink map };
+
+########################################################################
+# User home directories (user-install under ~/.local/fivenines, metrics)
+########################################################################
+allow fivenines_agent_t user_home_dir_t:dir { getattr search open };
+allow fivenines_agent_t user_home_t:dir { getattr search open read };
+allow fivenines_agent_t user_home_t:file { getattr open read lock ioctl };
+
+########################################################################
+# Optional: Docker container monitoring
+# (uncomment if agent monitors Docker; requires docker group membership)
+########################################################################
+# gen_require(`
+#	type container_var_run_t;
+# ')
+# allow fivenines_agent_t container_var_run_t:dir { getattr search open };
+# allow fivenines_agent_t container_var_run_t:sock_file { getattr read write };
+# allow fivenines_agent_t container_var_run_t:file { getattr open read };
+
+########################################################################
+# Optional: libvirt/QEMU VM monitoring
+# (uncomment if agent monitors QEMU/KVM VMs via libvirt)
+########################################################################
+# gen_require(`
+#	type virt_var_run_t;
+# ')
+# allow fivenines_agent_t virt_var_run_t:dir { getattr search open };
+# allow fivenines_agent_t virt_var_run_t:sock_file { getattr read write };
