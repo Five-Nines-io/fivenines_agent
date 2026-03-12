@@ -179,6 +179,80 @@ jobs:
           path: dist/fivenines-agent-linux-arm64.tar.gz
           retention-days: 7
 
+  build-arm:
+    needs: [lint]
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU for arm/v6
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/arm/v6
+
+      - name: Set image name (lowercase)
+        id: image
+        run: |
+          IMAGE_NAME=$(echo "${{ github.repository }}-builder-arm32" | tr '[:upper:]' '[:lower:]')
+          echo "name=$IMAGE_NAME" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
+          tags: |
+            type=raw,value=latest
+
+      - name: Build and push Docker image (arm32)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.arm32
+          platforms: linux/arm/v6
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:buildcache,mode=max
+          load: false
+
+      - name: Build agent binary (arm32)
+        run: |
+          docker run --rm \
+            --platform linux/arm/v6 \
+            -v ${{ github.workspace }}:/workspace \
+            -e TARGET_ARCH=arm \
+            ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:latest \
+            bash /workspace/py2exe_arm.sh
+
+      - name: Fix permissions and create tarball (arm)
+        run: |
+          sudo chown -R $(id -u):$(id -g) dist/
+          cd dist/linux
+          tar -czvf fivenines-agent-linux-arm.tar.gz fivenines-agent-linux-arm/
+          mv fivenines-agent-linux-arm.tar.gz ../
+
+      - name: Upload artifact (arm)
+        uses: actions/upload-artifact@v4
+        with:
+          name: fivenines-agent-linux-arm
+          path: dist/fivenines-agent-linux-arm.tar.gz
+          retention-days: 7
+
   build-alpine-amd64:
     needs: [lint]
     runs-on: ubuntu-latest
@@ -315,7 +389,7 @@ jobs:
 
   # Pre-release for feature and release branches
   pre-release:
-    needs: [build-amd64, build-arm64, build-alpine-amd64, build-alpine-arm64]
+    needs: [build-amd64, build-arm64, build-arm, build-alpine-amd64, build-alpine-arm64]
     runs-on: ubuntu-latest
     if: |
       github.event_name == 'push' &&
@@ -356,6 +430,7 @@ jobs:
           mkdir -p release
           mv artifacts/fivenines-agent-linux-amd64/fivenines-agent-linux-amd64.tar.gz release/
           mv artifacts/fivenines-agent-linux-arm64/fivenines-agent-linux-arm64.tar.gz release/
+          mv artifacts/fivenines-agent-linux-arm/fivenines-agent-linux-arm.tar.gz release/
           mv artifacts/fivenines-agent-alpine-amd64/fivenines-agent-alpine-amd64.tar.gz release/
           mv artifacts/fivenines-agent-alpine-arm64/fivenines-agent-alpine-arm64.tar.gz release/
           ls -la release/
@@ -402,6 +477,9 @@ jobs:
             # ARM64 (glibc)
             https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-linux-arm64.tar.gz
 
+            # ARM 32-bit (glibc, Raspberry Pi)
+            https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-linux-arm.tar.gz
+
             # AMD64 (Alpine/musl)
             https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-alpine-amd64.tar.gz
 
@@ -411,6 +489,7 @@ jobs:
           files: |
             release/fivenines-agent-linux-amd64.tar.gz
             release/fivenines-agent-linux-arm64.tar.gz
+            release/fivenines-agent-linux-arm.tar.gz
             release/fivenines-agent-alpine-amd64.tar.gz
             release/fivenines-agent-alpine-arm64.tar.gz
         env:
@@ -418,7 +497,7 @@ jobs:
 
   # Production release for version tags
   release:
-    needs: [build-amd64, build-arm64, build-alpine-amd64, build-alpine-arm64]
+    needs: [build-amd64, build-arm64, build-arm, build-alpine-amd64, build-alpine-arm64]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -437,6 +516,7 @@ jobs:
           mkdir -p release
           mv artifacts/fivenines-agent-linux-amd64/fivenines-agent-linux-amd64.tar.gz release/
           mv artifacts/fivenines-agent-linux-arm64/fivenines-agent-linux-arm64.tar.gz release/
+          mv artifacts/fivenines-agent-linux-arm/fivenines-agent-linux-arm.tar.gz release/
           mv artifacts/fivenines-agent-alpine-amd64/fivenines-agent-alpine-amd64.tar.gz release/
           mv artifacts/fivenines-agent-alpine-arm64/fivenines-agent-alpine-arm64.tar.gz release/
           ls -la release/
@@ -455,6 +535,7 @@ jobs:
           files: |
             release/fivenines-agent-linux-amd64.tar.gz
             release/fivenines-agent-linux-arm64.tar.gz
+            release/fivenines-agent-linux-arm.tar.gz
             release/fivenines-agent-alpine-amd64.tar.gz
             release/fivenines-agent-alpine-arm64.tar.gz
         env:
@@ -481,6 +562,7 @@ jobs:
           # Copy release binaries (glibc)
           cp artifacts/fivenines-agent-linux-amd64/fivenines-agent-linux-amd64.tar.gz r2-upload/latest/
           cp artifacts/fivenines-agent-linux-arm64/fivenines-agent-linux-arm64.tar.gz r2-upload/latest/
+          cp artifacts/fivenines-agent-linux-arm/fivenines-agent-linux-arm.tar.gz r2-upload/latest/
 
           # Copy release binaries (Alpine/musl)
           cp artifacts/fivenines-agent-alpine-amd64/fivenines-agent-alpine-amd64.tar.gz r2-upload/latest/
@@ -530,6 +612,7 @@ jobs:
           echo "Files synced to R2:"
           echo "  - https://releases.fivenines.io/latest/fivenines-agent-linux-amd64.tar.gz"
           echo "  - https://releases.fivenines.io/latest/fivenines-agent-linux-arm64.tar.gz"
+          echo "  - https://releases.fivenines.io/latest/fivenines-agent-linux-arm.tar.gz"
           echo "  - https://releases.fivenines.io/latest/fivenines-agent-alpine-amd64.tar.gz"
           echo "  - https://releases.fivenines.io/latest/fivenines-agent-alpine-arm64.tar.gz"
           echo "  - https://releases.fivenines.io/latest/fivenines-agent.service"

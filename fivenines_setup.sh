@@ -80,7 +80,7 @@ detect_libc() {
     echo "glibc"
   elif printf '%s' "$LDD_OUTPUT" | grep -qi musl; then
     echo "musl"
-  elif [ -f "/lib/ld-musl-x86_64.so.1" ] || [ -f "/lib/ld-musl-aarch64.so.1" ]; then
+  elif [ -f "/lib/ld-musl-x86_64.so.1" ] || [ -f "/lib/ld-musl-aarch64.so.1" ] || [ -f "/lib/ld-musl-armhf.so.1" ]; then
     echo "musl"
   else
     echo "glibc"
@@ -278,12 +278,16 @@ print_success "Detected libc: $LIBC_TYPE"
 if [ "$LIBC_TYPE" = "musl" ]; then
   if [ "$CURRENT_ARCH" = "aarch64" ]; then
     BINARY_NAME="fivenines-agent-alpine-arm64"
+  elif [ "$CURRENT_ARCH" = "armv7l" ] || [ "$CURRENT_ARCH" = "armv6l" ]; then
+    exit_with_contact "Alpine/musl on 32-bit ARM is not supported."
   else
     BINARY_NAME="fivenines-agent-alpine-amd64"
   fi
 else
   if [ "$CURRENT_ARCH" = "aarch64" ]; then
     BINARY_NAME="fivenines-agent-linux-arm64"
+  elif [ "$CURRENT_ARCH" = "armv7l" ] || [ "$CURRENT_ARCH" = "armv6l" ]; then
+    BINARY_NAME="fivenines-agent-linux-arm"
   else
     BINARY_NAME="fivenines-agent-linux-amd64"
   fi

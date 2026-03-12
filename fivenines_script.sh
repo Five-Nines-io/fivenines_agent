@@ -11,6 +11,8 @@ fi
 CURRENT_ARCH=$(uname -m)
 if [ "$CURRENT_ARCH" = "aarch64" ]; then
   BINARY_NAME="fivenines-agent-linux-arm64"
+elif [ "$CURRENT_ARCH" = "armv7l" ] || [ "$CURRENT_ARCH" = "armv6l" ]; then
+  BINARY_NAME="fivenines-agent-linux-arm"
 else
   BINARY_NAME="fivenines-agent-linux-amd64"
 fi

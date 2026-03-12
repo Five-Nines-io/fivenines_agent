@@ -88,7 +88,7 @@ detect_libc() {
         echo "glibc"
     elif printf '%s' "$LDD_OUTPUT" | grep -qi musl; then
         echo "musl"
-    elif [ -f "/lib/ld-musl-x86_64.so.1" ] || [ -f "/lib/ld-musl-aarch64.so.1" ]; then
+    elif [ -f "/lib/ld-musl-x86_64.so.1" ] || [ -f "/lib/ld-musl-aarch64.so.1" ] || [ -f "/lib/ld-musl-armhf.so.1" ]; then
         echo "musl"
     else
         echo "glibc"
@@ -129,6 +129,9 @@ if [ "$LIBC_TYPE" = "musl" ]; then
         aarch64|arm64)
             BINARY_NAME="fivenines-agent-alpine-arm64"
             ;;
+        armv7l|armv6l)
+            exit_with_error "Alpine/musl on 32-bit ARM is not supported."
+            ;;
         *)
             exit_with_error "Unsupported architecture: $ARCH"
             ;;
@@ -140,6 +143,9 @@ else
             ;;
         aarch64|arm64)
             BINARY_NAME="fivenines-agent-linux-arm64"
+            ;;
+        armv7l|armv6l)
+            BINARY_NAME="fivenines-agent-linux-arm"
             ;;
         *)
             exit_with_error "Unsupported architecture: $ARCH"

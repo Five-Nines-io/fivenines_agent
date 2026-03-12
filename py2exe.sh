@@ -19,9 +19,8 @@ if [[ "$TARGET_ARCH" == "arm64" ]]; then
     export CXX=aarch64-redhat-linux-g++
     BINARY_NAME="fivenines-agent-linux-arm64"
 elif [[ "$TARGET_ARCH" == "arm" ]]; then
-    export CC=arm-linux-gnueabi-gcc
-    export CXX=arm-linux-gnueabi-g++
-    BINARY_NAME="fivenines-agent-linux-arm"
+    echo "ERROR: 32-bit ARM builds use py2exe_arm.sh, not py2exe.sh"
+    exit 1
 else
     export CC=gcc
     export CXX=g++
