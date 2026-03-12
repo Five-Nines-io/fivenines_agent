@@ -1,7 +1,11 @@
 import os
 import time
-import libvirt
 import xml.etree.ElementTree as ET
+
+try:
+    import libvirt
+except ImportError:
+    libvirt = None
 
 from fivenines_agent.debug import debug, log
 
@@ -12,6 +16,10 @@ STATE_MAP = {
 
 class QEMUCollector:
     def __init__(self, uri="qemu:///system"):
+        if libvirt is None:
+            log("libvirt is not installed", 'error')
+            self.conn = None
+            return
         self.uri = uri
         self.conn = None
         self._connect()

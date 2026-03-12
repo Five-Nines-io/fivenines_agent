@@ -6,47 +6,14 @@ echo "Detected architecture: $TARGET_ARCH"
 
 BINARY_NAME="fivenines-agent-linux-arm"
 
+# Activate the pre-installed virtual environment (deps already in Docker image)
+echo "=== Activating pre-installed venv ==="
+. /opt/venv/bin/activate
+
 # Verify Python environment
 echo "=== Python Environment Check ==="
 echo "Python executable path: $(which python)"
 echo "Python version: $(python --version)"
-echo "Pip version: $(python -m pip --version)"
-
-#
-# Create virtual environment and install dependencies
-#
-echo "=== Setting up virtual environment ==="
-python -m venv /workspace/venv --clear
-. /workspace/venv/bin/activate
-
-# Install build dependencies
-python -m pip install --upgrade pip setuptools wheel
-
-#
-# Install Poetry and project dependencies
-#
-echo "=== Installing Poetry and Dependencies ==="
-python -m pip install poetry==2.2.1
-
-# Configure Poetry for current venv
-poetry config virtualenvs.create false
-poetry cache clear --all . || true
-poetry config installer.max-workers 1
-
-# Strip libvirt-python and proxmoxer from pyproject.toml (not needed on RPi/embedded)
-echo "=== Stripping libvirt-python and proxmoxer from pyproject.toml ==="
-sed -i '/libvirt-python/d' pyproject.toml
-sed -i '/proxmoxer/d' pyproject.toml
-
-poetry lock --no-interaction
-poetry install --no-interaction
-
-# Remove systemd-watchdog (not needed on RPi)
-pip uninstall -y systemd-watchdog 2>/dev/null || true
-
-# Export dependencies
-echo "Exporting dependencies to requirements.txt"
-poetry export --without-hashes -o requirements.txt
 
 #
 # Find Python shared library for PyInstaller
@@ -123,11 +90,6 @@ mv ./build/$BINARY_NAME ./dist/linux/
 #
 echo "=== Cleanup ==="
 rm -rf ./build/tmp ./build/*.spec
-
-# Reset Poetry
-echo "Resetting environment"
-poetry config virtualenvs.create true
-deactivate
 
 echo "[OK] ARM 32-bit build completed successfully!"
 echo "Output directory: ./dist/linux/$BINARY_NAME/"

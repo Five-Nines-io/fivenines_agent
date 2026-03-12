@@ -10,7 +10,11 @@ Collects metrics from Proxmox VE clusters and standalone nodes including:
 """
 
 from fivenines_agent.debug import debug, log
-from proxmoxer import ProxmoxAPI
+
+try:
+    from proxmoxer import ProxmoxAPI
+except ImportError:
+    ProxmoxAPI = None
 
 
 class ProxmoxCollector:
@@ -28,6 +32,10 @@ class ProxmoxCollector:
             token_secret: API token secret
             verify_ssl: Whether to verify SSL certificates
         """
+        if ProxmoxAPI is None:
+            log("proxmoxer is not installed", 'error')
+            self.proxmox = None
+            return
         self.host = host
         self.port = port
         self.verify_ssl = verify_ssl

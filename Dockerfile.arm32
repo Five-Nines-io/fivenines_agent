@@ -12,4 +12,27 @@ RUN apt-get update && apt-get install -y \
 
 ENV TARGET_ARCH="arm"
 WORKDIR /workspace
+
+# Pre-install Python dependencies in the Docker image so they are cached
+# across builds. Only rebuilds when pyproject.toml or poetry.lock change.
+# The venv lives at /opt/venv (not /workspace) because CI bind-mounts
+# the repo checkout over /workspace at runtime.
+
+COPY pyproject.toml poetry.lock ./
+
+# Strip libvirt-python and proxmoxer (not needed on RPi/embedded)
+RUN sed -i '/libvirt-python/d' pyproject.toml && \
+    sed -i '/proxmoxer/d' pyproject.toml
+
+# Create venv and install Poetry + dependencies
+RUN python -m venv /opt/venv && \
+    . /opt/venv/bin/activate && \
+    python -m pip install --upgrade pip setuptools wheel && \
+    python -m pip install poetry==2.2.1 pyinstaller && \
+    poetry config virtualenvs.create false && \
+    poetry config installer.max-workers 1 && \
+    poetry lock --no-interaction && \
+    poetry install --no-interaction && \
+    pip uninstall -y systemd-watchdog 2>/dev/null || true
+
 CMD ["bash"]
