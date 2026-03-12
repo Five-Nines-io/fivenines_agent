@@ -38,6 +38,7 @@ echo "=== Stripping libvirt-python and proxmoxer from pyproject.toml ==="
 sed -i '/libvirt-python/d' pyproject.toml
 sed -i '/proxmoxer/d' pyproject.toml
 
+poetry lock --no-update --no-interaction
 poetry install --no-interaction
 
 # Remove systemd-watchdog (not needed on RPi)
@@ -131,4 +132,4 @@ echo "[OK] ARM 32-bit build completed successfully!"
 echo "Output directory: ./dist/linux/$BINARY_NAME/"
 echo "Executable: ./dist/linux/$BINARY_NAME/$BINARY_NAME"
 echo ""
-echo "The distribution is built with glibc 2.28 for Raspberry Pi OS Buster+ compatibility."
+echo "The distribution is built with glibc 2.31 for Raspberry Pi OS Bullseye+ compatibility."
