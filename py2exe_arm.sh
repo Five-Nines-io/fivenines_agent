@@ -38,7 +38,7 @@ echo "=== Stripping libvirt-python and proxmoxer from pyproject.toml ==="
 sed -i '/libvirt-python/d' pyproject.toml
 sed -i '/proxmoxer/d' pyproject.toml
 
-poetry lock --no-update --no-interaction
+poetry lock --no-interaction
 poetry install --no-interaction
 
 # Remove systemd-watchdog (not needed on RPi)
