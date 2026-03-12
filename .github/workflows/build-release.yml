@@ -189,10 +189,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up QEMU for arm/v6
+      - name: Set up QEMU for arm/v7
         uses: docker/setup-qemu-action@v3
         with:
-          platforms: linux/arm/v6
+          platforms: linux/arm/v7
 
       - name: Set image name (lowercase)
         id: image
@@ -223,7 +223,7 @@ jobs:
         with:
           context: .
           file: ./Dockerfile.arm32
-          platforms: linux/arm/v6
+          platforms: linux/arm/v7
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:buildcache
@@ -233,7 +233,7 @@ jobs:
       - name: Build agent binary (arm32)
         run: |
           docker run --rm \
-            --platform linux/arm/v6 \
+            --platform linux/arm/v7 \
             -v ${{ github.workspace }}:/workspace \
             -e TARGET_ARCH=arm \
             ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:latest \

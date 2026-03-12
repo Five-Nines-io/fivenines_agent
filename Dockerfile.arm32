@@ -1,6 +1,7 @@
-FROM python:3.9-buster
+FROM python:3.9-bullseye
 
-# Debian Buster armv6hf via --platform linux/arm/v6 (glibc 2.28, RPi OS Buster+)
+# Debian Bullseye armhf via --platform linux/arm/v7 (glibc 2.31, RPi OS Bullseye+)
+# Covers Pi 2, Pi 3, Pi 4, Pi Zero 2 W, and all armv7+ devices
 # No libvirt needed for RPi/embedded devices
 
 RUN apt-get update && apt-get install -y \
