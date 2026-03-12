@@ -88,18 +88,19 @@ PYINSTALLER_ARGS="--strip \
     --clean \
     --hidden-import=pynvml"
 
+LIBZ=$(find /usr/lib /lib -name "libz.so.1" -type f 2>/dev/null | head -1)
+echo "libz.so.1 location: $LIBZ"
+
+EXTRA_BINARIES=""
 if [ -n "$PYTHON_LIB" ] && [ -f "$PYTHON_LIB" ]; then
     echo "Adding Python shared library: $PYTHON_LIB"
-    pyinstaller $PYINSTALLER_ARGS \
-        --add-binary "$PYTHON_LIB:." \
-        --add-binary "/usr/lib/arm-linux-gnueabihf/libz.so.1:." \
-        ./py2exe_entrypoint.py
-else
-    echo "No Python shared library found, building without it"
-    pyinstaller $PYINSTALLER_ARGS \
-        --add-binary "/usr/lib/arm-linux-gnueabihf/libz.so.1:." \
-        ./py2exe_entrypoint.py
+    EXTRA_BINARIES="--add-binary $PYTHON_LIB:."
 fi
+if [ -n "$LIBZ" ] && [ -f "$LIBZ" ]; then
+    EXTRA_BINARIES="$EXTRA_BINARIES --add-binary $LIBZ:."
+fi
+
+pyinstaller $PYINSTALLER_ARGS $EXTRA_BINARIES ./py2exe_entrypoint.py
 
 # Verify built binary
 echo "=== Binary Verification ==="
