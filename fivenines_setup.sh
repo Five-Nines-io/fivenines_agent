@@ -317,12 +317,6 @@ else
   fi
 fi
 
-if [ -n "${FIVENINES_AGENT_URL:-}" ]; then
-  # Derive binary name from the custom URL filename so the tarball contents match
-  URL_FILENAME=$(basename "$FIVENINES_AGENT_URL")
-  BINARY_NAME="${URL_FILENAME%.tar.gz}"
-fi
-
 TARBALL_NAME="${BINARY_NAME}.tar.gz"
 TARBALL_PATH="/tmp/${TARBALL_NAME}"
 AGENT_DIR="${INSTALL_DIR}/${BINARY_NAME}"

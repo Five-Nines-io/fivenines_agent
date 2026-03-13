@@ -7,8 +7,21 @@ if pgrep -f "fivenines-agent-linux" > /dev/null; then
   pkill -f "fivenines-agent-linux" 2>/dev/null || true
 fi
 
-# Detect architecture and set paths
-CURRENT_ARCH=$(uname -m)
+# Detect userspace architecture (not kernel arch, which can differ on ARM)
+if command -v dpkg >/dev/null 2>&1; then
+  DEB_ARCH=$(dpkg --print-architecture 2>/dev/null)
+  case "$DEB_ARCH" in
+    armhf|armel) CURRENT_ARCH="armv7l" ;;
+    arm64)       CURRENT_ARCH="aarch64" ;;
+    amd64)       CURRENT_ARCH="x86_64" ;;
+    *)           CURRENT_ARCH=$(uname -m) ;;
+  esac
+elif file /bin/sh 2>/dev/null | grep -q "32-bit.*ARM"; then
+  CURRENT_ARCH="armv7l"
+else
+  CURRENT_ARCH=$(uname -m)
+fi
+
 if [ "$CURRENT_ARCH" = "aarch64" ]; then
   BINARY_NAME="fivenines-agent-linux-arm64"
 elif [ "$CURRENT_ARCH" = "armv7l" ] || [ "$CURRENT_ARCH" = "armv6l" ]; then

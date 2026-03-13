@@ -125,7 +125,27 @@ else
         su - fivenines -s /bin/bash -c 'python3 -m pipx uninstall fivenines_agent'
 fi
 
-CURRENT_ARCH=$(uname -m)
+# Detect userspace architecture (not kernel arch, which can differ on ARM)
+if command -v dpkg >/dev/null 2>&1; then
+  DEB_ARCH=$(dpkg --print-architecture 2>/dev/null)
+  case "$DEB_ARCH" in
+    armhf|armel) CURRENT_ARCH="armv7l" ;;
+    arm64)       CURRENT_ARCH="aarch64" ;;
+    amd64)       CURRENT_ARCH="x86_64" ;;
+    *)           CURRENT_ARCH=$(uname -m) ;;
+  esac
+elif command -v apk >/dev/null 2>&1; then
+  APK_ARCH=$(apk --print-arch 2>/dev/null)
+  case "$APK_ARCH" in
+    armv7|armhf) CURRENT_ARCH="armv7l" ;;
+    *)           CURRENT_ARCH="$APK_ARCH" ;;
+  esac
+elif file /bin/sh 2>/dev/null | grep -q "32-bit.*ARM"; then
+  CURRENT_ARCH="armv7l"
+else
+  CURRENT_ARCH=$(uname -m)
+fi
+
 INSTALL_DIR="/opt/fivenines"
 
 # Update the agent based on the architecture and libc

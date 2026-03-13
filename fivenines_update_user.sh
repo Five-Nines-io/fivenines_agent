@@ -118,8 +118,26 @@ fi
 
 print_success "Found existing installation"
 
-# Detect architecture and libc
-ARCH=$(uname -m)
+# Detect userspace architecture (not kernel arch, which can differ on ARM)
+if command -v dpkg >/dev/null 2>&1; then
+    DEB_ARCH=$(dpkg --print-architecture 2>/dev/null)
+    case "$DEB_ARCH" in
+        armhf|armel) ARCH="armv7l" ;;
+        arm64)       ARCH="aarch64" ;;
+        amd64)       ARCH="x86_64" ;;
+        *)           ARCH=$(uname -m) ;;
+    esac
+elif command -v apk >/dev/null 2>&1; then
+    APK_ARCH=$(apk --print-arch 2>/dev/null)
+    case "$APK_ARCH" in
+        armv7|armhf) ARCH="armv7l" ;;
+        *)           ARCH="$APK_ARCH" ;;
+    esac
+elif file /bin/sh 2>/dev/null | grep -q "32-bit.*ARM"; then
+    ARCH="armv7l"
+else
+    ARCH=$(uname -m)
+fi
 LIBC_TYPE=$(detect_libc)
 if [ "$LIBC_TYPE" = "musl" ]; then
     case "$ARCH" in
