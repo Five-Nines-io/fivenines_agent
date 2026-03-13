@@ -259,7 +259,31 @@ else
   chmod 600 /etc/fivenines_agent/TOKEN
 fi
 
-CURRENT_ARCH=$(uname -m)
+# Detect the userspace architecture, not the kernel architecture.
+# uname -m reports kernel arch, which can be aarch64 even on a 32-bit userspace
+# (e.g., Raspberry Pi OS armhf on a 64-bit kernel). Use dpkg or the ELF type
+# of /bin/sh to get the actual userspace architecture.
+if command -v dpkg >/dev/null 2>&1; then
+  DEB_ARCH=$(dpkg --print-architecture 2>/dev/null)
+  case "$DEB_ARCH" in
+    armhf|armel) CURRENT_ARCH="armv7l" ;;
+    arm64)       CURRENT_ARCH="aarch64" ;;
+    amd64)       CURRENT_ARCH="x86_64" ;;
+    i386)        CURRENT_ARCH="i686" ;;
+    *)           CURRENT_ARCH=$(uname -m) ;;
+  esac
+elif command -v apk >/dev/null 2>&1; then
+  # Alpine: apk --print-arch returns armv7/aarch64/x86_64
+  APK_ARCH=$(apk --print-arch 2>/dev/null)
+  case "$APK_ARCH" in
+    armv7|armhf) CURRENT_ARCH="armv7l" ;;
+    *)           CURRENT_ARCH="$APK_ARCH" ;;
+  esac
+elif file /bin/sh 2>/dev/null | grep -q "32-bit.*ARM"; then
+  CURRENT_ARCH="armv7l"
+else
+  CURRENT_ARCH=$(uname -m)
+fi
 
 # Set install directory and binary name based on system type and architecture
 if [ "$SYSTEM_TYPE" = "unraid" ]; then
@@ -291,6 +315,12 @@ else
   else
     BINARY_NAME="fivenines-agent-linux-amd64"
   fi
+fi
+
+if [ -n "${FIVENINES_AGENT_URL:-}" ]; then
+  # Derive binary name from the custom URL filename so the tarball contents match
+  URL_FILENAME=$(basename "$FIVENINES_AGENT_URL")
+  BINARY_NAME="${URL_FILENAME%.tar.gz}"
 fi
 
 TARBALL_NAME="${BINARY_NAME}.tar.gz"
