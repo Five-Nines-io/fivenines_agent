@@ -11,7 +11,46 @@ detect_system() {
   fi
 }
 
+cleanup_selinux_contexts() {
+  if ! command -v sestatus >/dev/null 2>&1; then
+    echo "SELinux is not installed on this system."
+    return 0
+  fi
+
+  selinux_mode=$(sestatus 2>/dev/null | awk -F: '/^Current mode:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2}')
+  if [ -z "$selinux_mode" ] || [ "$selinux_mode" = "disabled" ] || [ "$selinux_mode" = "Disabled" ]; then
+    echo "SELinux status: Disabled"
+    return 0
+  fi
+
+  echo "Cleaning up SELinux policy module and contexts..."
+
+  if command -v semodule >/dev/null 2>&1; then
+    # Remove from multiple priorities to match setup behavior.
+    semodule -X 400 -r fivenines_agent 2>/dev/null || true
+    semodule -X 100 -r fivenines_agent 2>/dev/null || true
+    semodule -r fivenines_agent 2>/dev/null || true
+  fi
+
+  if command -v semanage >/dev/null 2>&1; then
+    # Remove potential custom fcontext rules from older/manual installs.
+    semanage fcontext -d "/opt/fivenines(/.*)?" 2>/dev/null || true
+    semanage fcontext -d "/etc/fivenines_agent(/.*)?" 2>/dev/null || true
+    semanage fcontext -d "/boot/config/custom/fivenines_agent(/.*)?" 2>/dev/null || true
+    semanage fcontext -d "/var/log/fivenines-agent.log" 2>/dev/null || true
+  fi
+
+  if command -v restorecon >/dev/null 2>&1; then
+    restorecon -Rv /opt/fivenines /etc/fivenines_agent /boot/config/custom/fivenines_agent 2>/dev/null || true
+    restorecon -v /var/log/fivenines-agent.log 2>/dev/null || true
+    restorecon -v /etc/systemd/system/fivenines-agent.service 2>/dev/null || true
+    restorecon -v /etc/init.d/fivenines-agent 2>/dev/null || true
+  fi
+}
+
 SYSTEM_TYPE=$(detect_system)
+
+cleanup_selinux_contexts
 
 if [ "$SYSTEM_TYPE" = "openrc" ]; then
   # OpenRC: Stop the service
