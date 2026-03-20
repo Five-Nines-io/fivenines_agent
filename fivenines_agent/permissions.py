@@ -351,7 +351,7 @@ class PermissionProbe:
 
     def _can_list_packages(self):
         """Check if a supported package manager is available."""
-        for cmd in ("dpkg-query", "rpm", "apk", "pacman"):
+        for cmd in ("dpkg-query", "rpm", "apk", "pacman", "synopkg"):
             if shutil.which(cmd):
                 log(f"_can_list_packages: found '{cmd}'", "debug")
                 return True
@@ -438,7 +438,7 @@ def print_capabilities_banner():
                 elif cap == "fail2ban":
                     hint = " (requires: sudo fail2ban-client)"
                 elif cap == "packages":
-                    hint = " (requires: dpkg-query, rpm, apk, or pacman)"
+                    hint = " (requires: dpkg-query, rpm, apk, pacman, or synopkg)"
                 elif cap == "zfs":
                     hint = " (requires: zfs permissions)"
                 elif cap == "nvidia_gpu":

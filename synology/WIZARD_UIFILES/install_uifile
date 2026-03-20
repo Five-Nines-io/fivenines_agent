@@ -1,0 +1,12 @@
+[{
+    "step_title": "Configure Fivenines Agent",
+    "items": [{
+        "type": "textfield",
+        "desc": "Enter your Fivenines token (from https://app.fivenines.io):",
+        "subitems": [{
+            "key": "wizard_token",
+            "defaultValue": "",
+            "validator": {"allowBlank": false}
+        }]
+    }]
+}]
