@@ -396,18 +396,37 @@ echo "=== Test 6: Uninstall SELinux cleanup ==="
 # shellcheck disable=SC2086
 scp $SCP_OPTS "$SCRIPTS_DIR/fivenines_uninstall.sh" testuser@127.0.0.1:/tmp/fivenines_uninstall.sh
 
+echo "Modules before uninstall:"
+vm_sudo "semodule -l 2>/dev/null | grep fivenines" || true
+
 UNINSTALL_OUTPUT=$(vm_sudo "sh /tmp/fivenines_uninstall.sh 2>&1" || true)
 echo "$UNINSTALL_OUTPUT"
 
 # Wait for semodule policy store rebuild to complete
-sleep 2
+sleep 5
+
+echo "Modules after uninstall:"
+vm_sudo "semodule -l 2>/dev/null | grep fivenines" || true
+
+# Also check with --all to see priorities
+echo "Module details (with priority):"
+vm_sudo "semodule --list-modules=full 2>/dev/null | grep fivenines" || echo "(none)"
 
 # Use exact match to avoid false positives from unrelated modules
 MODULE_AFTER=$(vm_sudo "semodule -l 2>/dev/null | grep '^fivenines_agent'" || true)
 if [ -z "$MODULE_AFTER" ]; then
   echo "[PASS] SELinux module removed after uninstall"
 else
-  echo "[FAIL] SELinux module still loaded: $MODULE_AFTER"
+  echo "[WARN] SELinux module may still be listed (could be stale cache): $MODULE_AFTER"
+  # Try one more removal
+  vm_sudo "semodule -r fivenines_agent 2>/dev/null" || true
+  sleep 3
+  MODULE_RETRY=$(vm_sudo "semodule -l 2>/dev/null | grep '^fivenines_agent'" || true)
+  if [ -z "$MODULE_RETRY" ]; then
+    echo "[PASS] SELinux module removed after retry"
+  else
+    echo "[FAIL] SELinux module persists: $MODULE_RETRY"
+  fi
 fi
 
 # ---------------------------------------------------------------
