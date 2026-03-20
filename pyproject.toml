@@ -10,10 +10,15 @@ readme = "README.md"
 python = ">=3.9,<3.14"
 python-dotenv = "^0.20.0"
 psutil = "^7.2.1"
-systemd-watchdog = "^0.9.0"
 certifi = "^2024.12.14"
 docker = "^7.1.0"
 dnspython = "^2.7"
+
+[tool.poetry.group.virtualization]
+optional = true
+
+[tool.poetry.group.virtualization.dependencies]
+systemd-watchdog = "^0.9.0"
 libvirt-python = "^11.6.0"
 proxmoxer = "^2.1.0"
 

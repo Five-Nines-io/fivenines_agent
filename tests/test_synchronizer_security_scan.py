@@ -83,6 +83,38 @@ def test_post_stops_on_stop_event(mock_get_conn):
     assert mock_get_conn.call_count == 1
 
 
+# --- _swap_token ---
+
+
+@patch("fivenines_agent.synchronizer.config_dir", return_value="/tmp/test-config")
+def test_swap_token_success(mock_config_dir, tmp_path):
+    sync = make_synchronizer()
+    token_file = tmp_path / "TOKEN"
+    mock_config_dir.return_value = str(tmp_path)
+
+    sync._swap_token("new-token-123")
+    assert sync.token == "new-token-123"
+    assert token_file.read_text() == "new-token-123"
+
+
+@patch("fivenines_agent.synchronizer.config_dir", return_value="/nonexistent/path")
+def test_swap_token_permission_error(mock_config_dir):
+    sync = make_synchronizer()
+    with patch("builtins.open", side_effect=PermissionError("denied")):
+        sync._swap_token("new-token-456")
+    # Token should still be updated in memory
+    assert sync.token == "new-token-456"
+
+
+@patch("fivenines_agent.synchronizer.config_dir", return_value="/tmp/test-config")
+def test_swap_token_generic_error(mock_config_dir):
+    sync = make_synchronizer()
+    with patch("builtins.open", side_effect=OSError("disk full")):
+        sync._swap_token("new-token-789")
+    # Token should still be updated in memory
+    assert sync.token == "new-token-789"
+
+
 # --- send_metrics ---
 
 
@@ -186,3 +218,44 @@ def test_get_config_reads_under_lock(mock_send):
     t.join(timeout=1)
     assert not t.is_alive()
     assert results[0] == {"enabled": False, "interval": 60}
+
+
+# --- get_conn certifi fallback ---
+
+
+@patch("fivenines_agent.synchronizer.api_url", return_value="api.fivenines.io")
+@patch("fivenines_agent.synchronizer.certifi")
+@patch("fivenines_agent.synchronizer.os.path.exists", return_value=False)
+@patch("fivenines_agent.synchronizer.ssl.create_default_context")
+@patch("fivenines_agent.synchronizer.DNSResolver")
+def test_get_conn_certifi_fallback(mock_resolver, mock_ssl, mock_exists, mock_certifi, mock_api_url):
+    """When certifi bundle file doesn't exist, fall back to system CAs."""
+    sync = make_synchronizer()
+    mock_certifi.where.return_value = "/nonexistent/cacert.pem"
+    mock_resolver_instance = MagicMock()
+    mock_resolver_instance.resolve.return_value = []
+    mock_resolver.return_value = mock_resolver_instance
+
+    sync.get_conn()
+
+    # ssl.create_default_context should be called without cafile
+    mock_ssl.assert_called_once_with()
+
+
+@patch("fivenines_agent.synchronizer.api_url", return_value="api.fivenines.io")
+@patch("fivenines_agent.synchronizer.certifi")
+@patch("fivenines_agent.synchronizer.os.path.exists", return_value=True)
+@patch("fivenines_agent.synchronizer.ssl.create_default_context")
+@patch("fivenines_agent.synchronizer.DNSResolver")
+def test_get_conn_certifi_exists(mock_resolver, mock_ssl, mock_exists, mock_certifi, mock_api_url):
+    """When certifi bundle exists, use it as cafile."""
+    sync = make_synchronizer()
+    mock_certifi.where.return_value = "/path/to/cacert.pem"
+    mock_resolver_instance = MagicMock()
+    mock_resolver_instance.resolve.return_value = []
+    mock_resolver.return_value = mock_resolver_instance
+
+    sync.get_conn()
+
+    # ssl.create_default_context should be called with cafile
+    mock_ssl.assert_called_once_with(cafile="/path/to/cacert.pem")

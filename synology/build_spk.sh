@@ -13,7 +13,7 @@ VERSION=${1:?"Usage: $0 <version> <arch>"}
 ARCH=${2:?"Usage: $0 <version> <arch>"}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(dirname "$SCRIPT_DIR")"
+REPO_ROOT="${REPO_ROOT:-$(dirname "$SCRIPT_DIR")}"
 
 if [ "$ARCH" = "x86_64" ]; then
     BINARY_ARCH="amd64"
@@ -69,6 +69,7 @@ cp "${SCRIPT_DIR}/scripts/postinst" "${BUILD_DIR}/scripts/"
 chmod +x "${BUILD_DIR}/scripts/start-stop-status"
 chmod +x "${BUILD_DIR}/scripts/postinst"
 cp "${SCRIPT_DIR}/conf/privilege" "${BUILD_DIR}/conf/"
+cp "${SCRIPT_DIR}/conf/logrotate.conf" "${BUILD_DIR}/conf/"
 cp "${SCRIPT_DIR}/WIZARD_UIFILES/install_uifile" "${BUILD_DIR}/WIZARD_UIFILES/"
 cp "${SCRIPT_DIR}/PACKAGE_ICON.PNG" "${BUILD_DIR}/"
 cp "${SCRIPT_DIR}/PACKAGE_ICON_256.PNG" "${BUILD_DIR}/"

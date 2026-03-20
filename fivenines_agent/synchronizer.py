@@ -113,7 +113,7 @@ class Synchronizer(Thread):
                 f.write(new_token)
             log("Token swapped successfully", "info")
         except PermissionError:
-            log(f"Permission denied writing to {token_path}. Proceeding with in-memory token.", "warning")
+            log(f"Permission denied writing to {token_path}. Proceeding with in-memory token.", "warn")
         except Exception as e:
             log(f"Error saving token: {e}", "error")
 

@@ -12,6 +12,12 @@ start_daemon() {
         echo "TOKEN not configured. Set token at ${CONFIG_DIR}/TOKEN" >&2
         exit 1
     fi
+    # Install logrotate config if available
+    LOGROTATE_SRC="${PACKAGE_DIR}/conf/logrotate.conf"
+    LOGROTATE_DST="/etc/logrotate.d/fivenines-agent"
+    if [ -f "${LOGROTATE_SRC}" ] && [ ! -f "${LOGROTATE_DST}" ]; then
+        cp "${LOGROTATE_SRC}" "${LOGROTATE_DST}" 2>/dev/null || true
+    fi
     CONFIG_DIR="${CONFIG_DIR}" PYTHONUNBUFFERED=1 \
         "${BINARY}" >> "${LOG_FILE}" 2>&1 &
     echo $! > "${PID_FILE}"

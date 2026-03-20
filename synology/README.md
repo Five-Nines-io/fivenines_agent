@@ -24,8 +24,9 @@ SYNOLOGY=1 TARGET_ARCH=arm64 ./py2exe.sh
 This produces `./dist/linux/fivenines-agent-synology-{amd64|arm64}/`.
 
 Key differences from the standard build:
-- libvirt-python is uninstalled (not available on NAS hardware)
-- systemd-watchdog is uninstalled (DSM does not use systemd)
+- libvirt-python is excluded via Poetry dependency groups (not available on NAS hardware)
+- systemd-watchdog is excluded (DSM does not use systemd)
+- proxmoxer is excluded (not applicable on NAS hardware)
 - libtirpc is not bundled (only needed for libvirt)
 
 ### 2. Assemble the SPK
@@ -58,7 +59,8 @@ synology/
     start-stop-status      DSM service lifecycle script
     postinst               Writes wizard token to config file
   conf/
-    privilege              DSM 7 privilege declaration (runs as root)
+    privilege              DSM 7 privilege declaration (runs as package user)
+    logrotate.conf         Log rotation config (installed to /etc/logrotate.d/)
   WIZARD_UIFILES/
     install_uifile         Token input UI shown during Package Center install
 ```
@@ -70,5 +72,5 @@ synology/
 - QEMU/libvirt and Proxmox monitoring are gracefully disabled (the libraries
   are not available on NAS hardware).
 - synopkg is supported for package security scanning.
-- Log file: `/var/packages/fivenines-agent/var/agent.log`
+- Log file: `/var/packages/fivenines-agent/var/agent.log` (rotated via logrotate: 3 files, 10MB max)
 - PID file: `/var/packages/fivenines-agent/var/agent.pid`

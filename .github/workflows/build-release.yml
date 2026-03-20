@@ -432,6 +432,7 @@ jobs:
           echo "Generated tag name: $TAG_NAME"
 
       - name: Prepare release assets
+        id: pre_release_assets
         run: |
           mkdir -p release
           mv artifacts/fivenines-agent-linux-amd64/fivenines-agent-linux-amd64.tar.gz release/
@@ -441,6 +442,12 @@ jobs:
           mv artifacts/fivenines-agent-synology-amd64/*.spk release/
           mv artifacts/fivenines-agent-synology-arm64/*.spk release/
           ls -la release/
+
+          # Resolve SPK filenames for download URLs
+          SPK_X86=$(basename release/*-x86_64.spk)
+          SPK_ARM=$(basename release/*-aarch64.spk)
+          echo "SPK_X86=$SPK_X86" >> $GITHUB_OUTPUT
+          echo "SPK_ARM=$SPK_ARM" >> $GITHUB_OUTPUT
 
       - name: Delete existing pre-release with same tag (if exists)
         run: |
@@ -491,10 +498,10 @@ jobs:
             https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-alpine-arm64.tar.gz
 
             # Synology DSM 7 (x86_64 NAS)
-            https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-*-x86_64.spk
+            https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/${{ steps.pre_release_assets.outputs.SPK_X86 }}
 
             # Synology DSM 7 (aarch64 NAS)
-            https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-*-aarch64.spk
+            https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/${{ steps.pre_release_assets.outputs.SPK_ARM }}
             ```
           files: |
             release/fivenines-agent-linux-amd64.tar.gz
@@ -628,8 +635,7 @@ jobs:
           echo "  - https://releases.fivenines.io/latest/fivenines-agent-linux-arm64.tar.gz"
           echo "  - https://releases.fivenines.io/latest/fivenines-agent-alpine-amd64.tar.gz"
           echo "  - https://releases.fivenines.io/latest/fivenines-agent-alpine-arm64.tar.gz"
-          echo "  - https://releases.fivenines.io/latest/fivenines-agent-*-x86_64.spk"
-          echo "  - https://releases.fivenines.io/latest/fivenines-agent-*-aarch64.spk"
+          for spk in r2-upload/latest/*.spk; do echo "  - https://releases.fivenines.io/latest/$(basename $spk)"; done
           echo "  - https://releases.fivenines.io/latest/fivenines-agent.service"
           echo "  - https://releases.fivenines.io/latest/fivenines-agent.openrc"
           echo "  - https://releases.fivenines.io/latest/fivenines_script.sh"

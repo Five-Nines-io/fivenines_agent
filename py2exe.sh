@@ -120,18 +120,14 @@ poetry cache clear --all . || true
 poetry config installer.max-workers 1
 
 if [ -n "${SYNOLOGY:-}" ]; then
-    # Synology: remove libvirt/systemd-watchdog/proxmoxer so Poetry does not build them
-    echo "=== Removing Synology-incompatible dependencies from pyproject ==="
-    poetry remove libvirt-python systemd-watchdog proxmoxer || true
-    poetry install --no-interaction || {
+    # Synology: skip the virtualization group (libvirt, systemd-watchdog, proxmoxer)
+    echo "=== Installing without virtualization dependencies (Synology) ==="
+    poetry install --no-interaction --without virtualization || {
         echo "Poetry installation failed. Exiting."
         exit 1
     }
-    echo "=== Removing Synology-incompatible dependencies ==="
-    pip uninstall -y libvirt-python systemd-watchdog proxmoxer || true
-    echo "Removed libvirt-python, systemd-watchdog, and proxmoxer"
     if python -c "import libvirt" 2>/dev/null; then
-        echo "WARNING: libvirt is still importable after uninstall"
+        echo "WARNING: libvirt is still importable (unexpected)"
     else
         echo "Confirmed: libvirt not available (expected)"
     fi
@@ -152,7 +148,7 @@ else
         }
     fi
     python -c "import libvirt; print('libvirt-python imported successfully')"
-    poetry install --no-interaction || {
+    poetry install --no-interaction --with virtualization || {
         echo "Poetry installation failed. Exiting."
         exit 1
     }
