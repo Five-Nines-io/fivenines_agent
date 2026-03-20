@@ -216,7 +216,7 @@ download_agent() {
     tar -xzf "$tarball_path" -C "$INSTALL_DIR" || exit_with_error "Failed to extract agent"
     print_success "Extracted to $INSTALL_DIR"
 
-    rm -f "$tarball_path"
+    rm -f "$tarball_path" 2>/dev/null || true
 
     # Make executable
     chmod +x "$INSTALL_DIR/$BINARY_NAME/$BINARY_NAME"

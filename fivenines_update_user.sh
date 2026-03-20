@@ -191,7 +191,7 @@ fi
 
 # Extract new version
 tar -xzf "$TARBALL_PATH" -C "$INSTALL_DIR" || exit_with_error "Extraction failed"
-rm -f "$TARBALL_PATH"
+rm -f "$TARBALL_PATH" 2>/dev/null || true
 chmod +x "$INSTALL_DIR/$BINARY_NAME/$BINARY_NAME"
 print_success "Updated agent binary"
 
