@@ -149,6 +149,7 @@ QEMU_PID=$!
 echo "--- Waiting for VM SSH (port $SSH_PORT, timeout ${VM_TIMEOUT}s) ---"
 
 SSH_OPTS="-i $WORK_DIR/vm_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 -o LogLevel=ERROR -p $SSH_PORT"
+SCP_OPTS="-i $WORK_DIR/vm_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -P $SSH_PORT"
 ELAPSED=0
 
 while [ "$ELAPSED" -lt "$VM_TIMEOUT" ]; do
@@ -222,11 +223,11 @@ fi
 echo ""
 echo "=== Copying agent and scripts to VM ==="
 # shellcheck disable=SC2086
-scp $SSH_OPTS "$AGENT_TARBALL" testuser@127.0.0.1:/tmp/agent.tar.gz
+scp $SCP_OPTS "$AGENT_TARBALL" testuser@127.0.0.1:/tmp/agent.tar.gz
 # shellcheck disable=SC2086
-scp -r $SSH_OPTS "$SCRIPTS_DIR/fivenines_setup.sh" testuser@127.0.0.1:/tmp/fivenines_setup.sh
+scp -r $SCP_OPTS "$SCRIPTS_DIR/fivenines_setup.sh" testuser@127.0.0.1:/tmp/fivenines_setup.sh
 # shellcheck disable=SC2086
-scp -r $SSH_OPTS "$SCRIPTS_DIR/selinux/" testuser@127.0.0.1:/tmp/selinux/
+scp -r $SCP_OPTS "$SCRIPTS_DIR/selinux/" testuser@127.0.0.1:/tmp/selinux/
 
 # Extract agent in the VM to simulate what setup would find
 vm_sudo "mkdir -p /opt/fivenines && tar -xzf /tmp/agent.tar.gz -C /opt/fivenines/"
@@ -348,7 +349,7 @@ echo ""
 echo "=== Test 6: Uninstall SELinux cleanup ==="
 
 # shellcheck disable=SC2086
-scp $SSH_OPTS "$SCRIPTS_DIR/fivenines_uninstall.sh" testuser@127.0.0.1:/tmp/fivenines_uninstall.sh
+scp $SCP_OPTS "$SCRIPTS_DIR/fivenines_uninstall.sh" testuser@127.0.0.1:/tmp/fivenines_uninstall.sh
 
 UNINSTALL_OUTPUT=$(vm_sudo "sh /tmp/fivenines_uninstall.sh 2>&1" || true)
 echo "$UNINSTALL_OUTPUT"
