@@ -34,7 +34,7 @@ elif command -v yum > /dev/null 2>&1; then
   yum install -y -q python3 wget > /dev/null 2>&1 || true
 elif command -v apt-get > /dev/null 2>&1; then
   # Debian / Ubuntu
-  apt-get update -qq > /dev/null 2>&1 && apt-get install -y -qq python3 wget > /dev/null 2>&1 || true
+  { apt-get update -qq > /dev/null 2>&1 && apt-get install -y -qq python3 wget > /dev/null 2>&1; } || true
 fi
 
 # Background process PID (for cleanup)
@@ -377,7 +377,7 @@ fi
 # ---------------------------------------------------------------
 # Cleanup background processes
 # ---------------------------------------------------------------
-[ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null || true
+if [ -n "$MOCK_PID" ]; then kill "$MOCK_PID" 2>/dev/null || true; fi
 
 # ---------------------------------------------------------------
 # Summary
@@ -394,7 +394,7 @@ echo ""
 
 # Write structured results for step summary
 {
-  echo "### Distro Test Results: $(cat /etc/os-release 2>/dev/null | grep ^PRETTY_NAME | cut -d= -f2 | tr -d '"' || echo 'Unknown')"
+  echo "### Distro Test Results: $(grep ^PRETTY_NAME /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' || echo 'Unknown')"
   echo ""
   echo "| Test | Status | Detail |"
   echo "|------|--------|--------|"
