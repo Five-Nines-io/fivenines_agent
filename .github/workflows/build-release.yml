@@ -562,13 +562,16 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq qemu-system-x86 qemu-utils genisoimage netcat-openbsd
 
-      - name: Verify KVM is available
+      - name: Enable KVM access
         run: |
-          if [ ! -e /dev/kvm ]; then
-            echo "WARNING: /dev/kvm not available, test will be slow (no KVM acceleration)"
-          else
-            echo "KVM is available"
+          if [ -e /dev/kvm ]; then
+            echo "KVM device found"
             ls -la /dev/kvm
+            # GitHub Actions runner may not be in the kvm group
+            sudo chmod 666 /dev/kvm
+            echo "KVM permissions set"
+          else
+            echo "WARNING: /dev/kvm not available, test will be slow (no KVM acceleration)"
           fi
 
       - name: Download RockyLinux 9 cloud image

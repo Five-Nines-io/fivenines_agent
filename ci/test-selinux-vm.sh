@@ -118,11 +118,21 @@ qemu-img create -f qcow2 -b "$ROCKY_IMAGE" -F qcow2 "$WORK_DIR/disk.qcow2" 20G
 # ---------------------------------------------------------------
 echo "--- Booting RockyLinux 9 VM (SELinux Enforcing) ---"
 
+# Use KVM if available, fall back to TCG (software emulation) otherwise
+KVM_ARGS=""
+if [ -w /dev/kvm ] 2>/dev/null; then
+  KVM_ARGS="-enable-kvm -cpu host"
+  echo "Using KVM acceleration"
+else
+  KVM_ARGS="-cpu qemu64"
+  echo "WARNING: KVM not available, using software emulation (will be slow)"
+fi
+
+# shellcheck disable=SC2086
 qemu-system-x86_64 \
-  -enable-kvm \
+  $KVM_ARGS \
   -m "$VM_MEMORY" \
   -smp 2 \
-  -cpu host \
   -drive file="$WORK_DIR/disk.qcow2",format=qcow2 \
   -cdrom "$WORK_DIR/cloud-init.iso" \
   -netdev user,id=net0,hostfwd=tcp::"$SSH_PORT"-:22 \

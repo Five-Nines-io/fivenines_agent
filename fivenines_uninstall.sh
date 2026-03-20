@@ -55,12 +55,12 @@ cleanup_selinux_contexts() {
   fi
 
   if command -v restorecon >/dev/null 2>&1; then
-    [ -d /opt/fivenines ] && restorecon -Rv /opt/fivenines 2>/dev/null || true
-    [ -d /etc/fivenines_agent ] && restorecon -Rv /etc/fivenines_agent 2>/dev/null || true
-    [ -d /boot/config/custom/fivenines_agent ] && restorecon -Rv /boot/config/custom/fivenines_agent 2>/dev/null || true
-    [ -f /var/log/fivenines-agent.log ] && restorecon -v /var/log/fivenines-agent.log 2>/dev/null || true
-    [ -f /etc/systemd/system/fivenines-agent.service ] && restorecon -v /etc/systemd/system/fivenines-agent.service 2>/dev/null || true
-    [ -f /etc/init.d/fivenines-agent ] && restorecon -v /etc/init.d/fivenines-agent 2>/dev/null || true
+    if [ -d /opt/fivenines ]; then restorecon -Rv /opt/fivenines 2>/dev/null || true; fi
+    if [ -d /etc/fivenines_agent ]; then restorecon -Rv /etc/fivenines_agent 2>/dev/null || true; fi
+    if [ -d /boot/config/custom/fivenines_agent ]; then restorecon -Rv /boot/config/custom/fivenines_agent 2>/dev/null || true; fi
+    if [ -f /var/log/fivenines-agent.log ]; then restorecon -v /var/log/fivenines-agent.log 2>/dev/null || true; fi
+    if [ -f /etc/systemd/system/fivenines-agent.service ]; then restorecon -v /etc/systemd/system/fivenines-agent.service 2>/dev/null || true; fi
+    if [ -f /etc/init.d/fivenines-agent ]; then restorecon -v /etc/init.d/fivenines-agent 2>/dev/null || true; fi
   fi
 }
 
