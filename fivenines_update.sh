@@ -84,6 +84,11 @@ detect_system() {
   fi
 }
 
+# Test mode: skip network calls and service management for CI testing
+if [ "${FIVENINES_TEST_MODE:-}" = "1" ]; then
+  print_warning "WARNING: Test mode enabled - skipping network checks and service management"
+fi
+
 # Print banner
 echo ""
 printf '%b\n' "${BLUE}===============================================================${NC}"
@@ -94,14 +99,18 @@ echo ""
 # Detect system type
 SYSTEM_TYPE=$(detect_system)
 
-# stop the agent
-print_warning "Stopping fivenines-agent service..."
-if [ "$SYSTEM_TYPE" = "openrc" ]; then
-  rc-service fivenines-agent stop 2>/dev/null || true
+# stop the agent (skip in test mode)
+if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
+  print_warning "Stopping fivenines-agent service..."
+  if [ "$SYSTEM_TYPE" = "openrc" ]; then
+    rc-service fivenines-agent stop 2>/dev/null || true
+  else
+    systemctl stop fivenines-agent.service
+  fi
+  print_success "Agent stopped"
 else
-  systemctl stop fivenines-agent.service
+  print_warning "Skipping service stop (test mode)"
 fi
-print_success "Agent stopped"
 
 # if the home directory of user "fivenines" is /home/fivenines (which is the old location), migrate user's home directory to /opt/fivenines
 if [ "$(getent passwd fivenines | cut -d: -f6)" = "/home/fivenines" ]; then
@@ -206,24 +215,29 @@ fi
 
 print_success "Agent updated successfully at $AGENT_DIR"
 
-print_warning "Updating the service file..."
-if [ "$SYSTEM_TYPE" = "openrc" ]; then
-  download_with_fallback "fivenines-agent.openrc" "/etc/init.d/fivenines-agent" "${GITHUB_RAW_URL}/fivenines-agent.openrc"
-  chmod 755 /etc/init.d/fivenines-agent
-else
-  download_with_fallback "fivenines-agent.service" "/etc/systemd/system/fivenines-agent.service" "${GITHUB_RAW_URL}/fivenines-agent.service"
-  print_warning "Reloading the systemd daemon..."
-  systemctl daemon-reload
-fi
+# Update service file and restart (skip in test mode)
+if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
+  print_warning "Updating the service file..."
+  if [ "$SYSTEM_TYPE" = "openrc" ]; then
+    download_with_fallback "fivenines-agent.openrc" "/etc/init.d/fivenines-agent" "${GITHUB_RAW_URL}/fivenines-agent.openrc"
+    chmod 755 /etc/init.d/fivenines-agent
+  else
+    download_with_fallback "fivenines-agent.service" "/etc/systemd/system/fivenines-agent.service" "${GITHUB_RAW_URL}/fivenines-agent.service"
+    print_warning "Reloading the systemd daemon..."
+    systemctl daemon-reload
+  fi
 
-# Restart the agent
-print_warning "Restarting fivenines-agent service..."
-if [ "$SYSTEM_TYPE" = "openrc" ]; then
-  rc-service fivenines-agent restart
+  # Restart the agent
+  print_warning "Restarting fivenines-agent service..."
+  if [ "$SYSTEM_TYPE" = "openrc" ]; then
+    rc-service fivenines-agent restart
+  else
+    systemctl restart fivenines-agent.service
+  fi
+  print_success "Agent restarted"
 else
-  systemctl restart fivenines-agent.service
+  print_warning "Skipping service file update and restart (test mode)"
 fi
-print_success "Agent restarted"
 
 echo ""
 printf '%b\n' "${BLUE}===============================================================${NC}"
@@ -232,4 +246,4 @@ printf '%b\n' "${BLUE}==========================================================
 echo ""
 
 # Remove the update script
-rm fivenines_update.sh
+rm -f fivenines_update.sh 2>/dev/null || true

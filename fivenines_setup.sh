@@ -194,6 +194,11 @@ setup_openrc() {
   print_success "OpenRC service installed and started successfully"
 }
 
+# Test mode: skip network calls and service management for CI testing
+if [ "${FIVENINES_TEST_MODE:-}" = "1" ]; then
+  print_warning "WARNING: Test mode enabled - skipping network checks and service management"
+fi
+
 # Main execution starts here
 print_banner
 
@@ -336,32 +341,40 @@ fi
 print_success "Agent installed successfully at $AGENT_DIR"
 
 
-# Test connectivity
-echo "Testing connectivity..."
-for host in asia.fivenines.io eu.fivenines.io us.fivenines.io api.fivenines.io; do
-  if ping -c 1 -W 5 "$host" >/dev/null 2>&1; then
-    print_success "Connected to $host"
-  else
-    exit_with_contact "Ping to $host failed or timed out. Check your network connection."
-  fi
-done
-echo ""
+# Test connectivity (skip in test mode)
+if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
+  echo "Testing connectivity..."
+  for host in asia.fivenines.io eu.fivenines.io us.fivenines.io api.fivenines.io; do
+    if ping -c 1 -W 5 "$host" >/dev/null 2>&1; then
+      print_success "Connected to $host"
+    else
+      exit_with_contact "Ping to $host failed or timed out. Check your network connection."
+    fi
+  done
+  echo ""
+else
+  print_warning "Skipping connectivity test (test mode)"
+fi
 
-# Setup based on system type
-case "$SYSTEM_TYPE" in
-  "unraid")
-    setup_unraid "$1"
-    ;;
-  "openrc")
-    setup_openrc
-    ;;
-  "systemd")
-    setup_systemd
-    ;;
-  *)
-    exit_with_contact "Unsupported system type: $SYSTEM_TYPE. This script supports systemd, OpenRC, and UNRAID systems."
-    ;;
-esac
+# Setup based on system type (skip service management in test mode)
+if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
+  case "$SYSTEM_TYPE" in
+    "unraid")
+      setup_unraid "$1"
+      ;;
+    "openrc")
+      setup_openrc
+      ;;
+    "systemd")
+      setup_systemd
+      ;;
+    *)
+      exit_with_contact "Unsupported system type: $SYSTEM_TYPE. This script supports systemd, OpenRC, and UNRAID systems."
+      ;;
+  esac
+else
+  print_warning "Skipping service setup (test mode)"
+fi
 
 # Final output
 echo ""

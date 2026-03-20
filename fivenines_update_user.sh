@@ -95,6 +95,11 @@ detect_libc() {
     fi
 }
 
+# Test mode: skip network calls and service management for CI testing
+if [ "${FIVENINES_TEST_MODE:-}" = "1" ]; then
+  print_warning "WARNING: Test mode enabled - skipping agent stop/start"
+fi
+
 echo ""
 printf '%b\n' "${BLUE}===============================================================${NC}"
 printf '%b\n' "${BLUE}  Fivenines Agent - User-Level Update${NC}"
@@ -149,15 +154,19 @@ fi
 
 print_success "Architecture: $ARCH, libc: $LIBC_TYPE"
 
-# Stop the agent if running
-echo "Stopping agent..."
-if [ -f "$INSTALL_DIR/stop.sh" ]; then
-    "$INSTALL_DIR/stop.sh" 2>/dev/null || true
+# Stop the agent if running (skip in test mode)
+if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
+  echo "Stopping agent..."
+  if [ -f "$INSTALL_DIR/stop.sh" ]; then
+      "$INSTALL_DIR/stop.sh" 2>/dev/null || true
+  else
+      pkill -f "$BINARY_NAME" 2>/dev/null || true
+  fi
+  sleep 1
+  print_success "Agent stopped"
 else
-    pkill -f "$BINARY_NAME" 2>/dev/null || true
+  print_warning "Skipping agent stop (test mode)"
 fi
-sleep 1
-print_success "Agent stopped"
 
 # Download new version
 echo "Downloading latest version..."
@@ -187,22 +196,26 @@ print_success "Updated agent binary"
 # Remove backup
 rm -rf "$INSTALL_DIR/${BINARY_NAME}.old" 2>/dev/null || true
 
-# Start the agent
-echo "Starting agent..."
-if [ -f "$INSTALL_DIR/start.sh" ]; then
-    "$INSTALL_DIR/start.sh"
-else
-    export CONFIG_DIR="$CONFIG_DIR"
-    nohup "$INSTALL_DIR/$BINARY_NAME/$BINARY_NAME" >> "$INSTALL_DIR/agent.log" 2>&1 &
-    echo "Agent started (PID: $!)"
-fi
+# Start the agent (skip in test mode)
+if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
+  echo "Starting agent..."
+  if [ -f "$INSTALL_DIR/start.sh" ]; then
+      "$INSTALL_DIR/start.sh"
+  else
+      export CONFIG_DIR="$CONFIG_DIR"
+      nohup "$INSTALL_DIR/$BINARY_NAME/$BINARY_NAME" >> "$INSTALL_DIR/agent.log" 2>&1 &
+      echo "Agent started (PID: $!)"
+  fi
 
-sleep 2
+  sleep 2
 
-if pgrep -f "$BINARY_NAME" > /dev/null; then
-    print_success "Agent is running"
+  if pgrep -f "$BINARY_NAME" > /dev/null; then
+      print_success "Agent is running"
+  else
+      print_warning "Agent may have failed to start. Check: $INSTALL_DIR/logs.sh"
+  fi
 else
-    print_warning "Agent may have failed to start. Check: $INSTALL_DIR/logs.sh"
+  print_warning "Skipping agent start (test mode)"
 fi
 
 echo ""

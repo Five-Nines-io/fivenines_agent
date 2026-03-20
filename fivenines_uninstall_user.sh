@@ -23,34 +23,45 @@ print_warning() {
     printf '%b\n' "${YELLOW}[!]${NC} $1"
 }
 
+# Test mode: skip interactive confirmation for CI testing
+if [ "${FIVENINES_TEST_MODE:-}" = "1" ]; then
+  print_warning "WARNING: Test mode enabled - skipping confirmation prompt"
+fi
+
 echo ""
 printf '%b\n' "${BLUE}===============================================================${NC}"
 printf '%b\n' "${BLUE}  Fivenines Agent - User-Level Uninstall${NC}"
 printf '%b\n' "${BLUE}===============================================================${NC}"
 echo ""
 
-# Confirm
-printf "This will remove the Fivenines agent. Continue? [y/N] "
-read REPLY
-case "$REPLY" in
-    [Yy]*) ;;
-    *)
-        echo "Cancelled."
-        exit 0
-        ;;
-esac
+# Confirm (skip in test mode)
+if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
+  printf "This will remove the Fivenines agent. Continue? [y/N] "
+  read REPLY
+  case "$REPLY" in
+      [Yy]*) ;;
+      *)
+          echo "Cancelled."
+          exit 0
+          ;;
+  esac
+fi
 
 echo ""
 
-# Stop the agent if running
-echo "Stopping agent..."
-if [ -f "$INSTALL_DIR/stop.sh" ]; then
-    "$INSTALL_DIR/stop.sh" 2>/dev/null || true
+# Stop the agent if running (skip in test mode)
+if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
+  echo "Stopping agent..."
+  if [ -f "$INSTALL_DIR/stop.sh" ]; then
+      "$INSTALL_DIR/stop.sh" 2>/dev/null || true
+  fi
+  pkill -f "fivenines-agent-linux" 2>/dev/null || true
+  pkill -f "fivenines-agent-alpine" 2>/dev/null || true
+  sleep 1
+  print_success "Agent stopped"
+else
+  print_warning "Skipping agent stop (test mode)"
 fi
-pkill -f "fivenines-agent-linux" 2>/dev/null || true
-pkill -f "fivenines-agent-alpine" 2>/dev/null || true
-sleep 1
-print_success "Agent stopped"
 
 # Remove crontab entry if exists
 if crontab -l 2>/dev/null | grep -q "fivenines"; then

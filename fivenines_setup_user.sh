@@ -386,6 +386,11 @@ print_final_instructions() {
     echo ""
 }
 
+# Test mode: skip network calls and service management for CI testing
+if [ "${FIVENINES_TEST_MODE:-}" = "1" ]; then
+  print_warning "WARNING: Test mode enabled - skipping network checks and agent startup"
+fi
+
 # Main execution
 print_banner
 
@@ -408,10 +413,18 @@ check_requirements
 detect_architecture
 create_directories
 save_token "$TOKEN"
-test_connectivity
+if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
+  test_connectivity
+else
+  print_warning "Skipping connectivity test (test mode)"
+fi
 download_agent
 create_run_script
-start_agent
+if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
+  start_agent
+else
+  print_warning "Skipping agent startup (test mode)"
+fi
 print_final_instructions
 
 # Clean up script
