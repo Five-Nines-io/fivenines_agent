@@ -214,6 +214,11 @@ fi
 
 print_success "Agent updated successfully at $AGENT_DIR"
 
+# Restore SELinux file contexts after extraction (no-op if SELinux is not active)
+if command -v restorecon >/dev/null 2>&1; then
+  restorecon -Rv "$INSTALL_DIR" 2>/dev/null || true
+fi
+
 # Update service file and restart (skip in test mode)
 if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
   print_warning "Updating the service file..."

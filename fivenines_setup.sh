@@ -122,14 +122,145 @@ detect_system() {
   fi
 }
 
+setup_selinux_contexts() {
+  # Detect SELinux mode using getenforce (part of libselinux-utils, guaranteed
+  # on every SELinux system). Falls back to sestatus if getenforce is missing.
+  if command -v getenforce >/dev/null 2>&1; then
+    selinux_mode=$(getenforce 2>/dev/null | tr '[:upper:]' '[:lower:]')
+  elif command -v sestatus >/dev/null 2>&1; then
+    selinux_mode=$(sestatus 2>/dev/null | awk -F: '/^Current mode:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print tolower($2)}')
+  else
+    print_success "SELinux is not installed on this system."
+    return 0
+  fi
+
+  if [ -z "$selinux_mode" ]; then
+    print_success "SELinux status: Disabled"
+    return 0
+  fi
+
+  print_success "SELinux mode: $selinux_mode"
+
+  if [ "$selinux_mode" = "disabled" ]; then
+    return 0
+  fi
+
+  if [ "$selinux_mode" = "permissive" ]; then
+    print_warning "SELinux is in Permissive mode. Applying default contexts for consistency."
+    if command -v restorecon >/dev/null 2>&1; then
+      restorecon -Rv "$INSTALL_DIR" /etc/fivenines_agent 2>/dev/null || true
+    fi
+    return 0
+  fi
+
+  # Enforcing mode: try to load policy module and apply file contexts
+  if [ "$selinux_mode" != "enforcing" ]; then
+    return 0
+  fi
+
+  print_warning "SELinux is Enforcing. Configuring contexts for fivenines agent..."
+
+  if ! command -v semanage >/dev/null 2>&1 || ! command -v restorecon >/dev/null 2>&1; then
+    print_warning "semanage or restorecon not found. Install policycoreutils-python-utils and run: restorecon -Rv $INSTALL_DIR /etc/fivenines_agent"
+    return 0
+  fi
+
+  SELINUX_TMP="/tmp/fivenines_agent_selinux"
+  mkdir -p "$SELINUX_TMP"
+
+  # Look for policy files bundled with the agent (preferred: version-matched)
+  SELINUX_SRC=""
+  if [ -d "$AGENT_DIR/selinux" ]; then
+    SELINUX_SRC="$AGENT_DIR/selinux"
+  fi
+
+  for f in fivenines_agent.te fivenines_agent.fc; do
+    if [ -n "$SELINUX_SRC" ] && [ -f "$SELINUX_SRC/$f" ]; then
+      cp "$SELINUX_SRC/$f" "$SELINUX_TMP/$f"
+    else
+      print_warning "SELinux policy file $f not found in agent bundle. SELinux policy not applied."
+      print_warning "To run under Enforcing, add a policy module or set SELinux to Permissive."
+      rm -rf "$SELINUX_TMP"
+      return 0
+    fi
+  done
+
+  # Copy optional modules if available (Docker, libvirt)
+  for f in fivenines_agent_docker.te fivenines_agent_libvirt.te; do
+    if [ -n "$SELINUX_SRC" ] && [ -f "$SELINUX_SRC/$f" ]; then
+      cp "$SELINUX_SRC/$f" "$SELINUX_TMP/$f"
+    fi
+  done
+
+  # Build and load module if selinux-policy-devel is available
+  if [ -f /usr/share/selinux/devel/Makefile ]; then
+    ( cd "$SELINUX_TMP" && make -f /usr/share/selinux/devel/Makefile clean 2>/dev/null; make -f /usr/share/selinux/devel/Makefile 2>/dev/null )
+    if [ -f "$SELINUX_TMP/fivenines_agent.pp" ]; then
+      # Remove any existing module from ALL priorities to avoid typeattributeset errors
+      # (a stale copy at priority 400 will override the new one at 100 and fail)
+      # NOTE: keep in sync with cleanup_selinux_contexts() in fivenines_uninstall.sh
+      semodule -X 400 -r fivenines_agent 2>/dev/null || true
+      semodule -X 100 -r fivenines_agent 2>/dev/null || true
+      semodule -r fivenines_agent 2>/dev/null || true
+      if semodule -i "$SELINUX_TMP/fivenines_agent.pp" -X 100 2>/dev/null; then
+        print_success "SELinux policy module fivenines_agent loaded."
+      else
+        print_warning "Failed to load SELinux module. Run: semodule -r fivenines_agent; semodule -i fivenines_agent.pp -X 100"
+      fi
+
+      # Load optional Docker module if built and container-selinux types exist
+      if [ -f "$SELINUX_TMP/fivenines_agent_docker.pp" ]; then
+        semodule -r fivenines_agent_docker 2>/dev/null || true
+        if semodule -i "$SELINUX_TMP/fivenines_agent_docker.pp" -X 100 2>/dev/null; then
+          print_success "SELinux optional module fivenines_agent_docker loaded."
+        else
+          print_warning "Docker SELinux module not loaded (container-selinux may not be installed). Docker monitoring may hit denials."
+        fi
+      fi
+
+      # Load optional libvirt module if built and libvirt types exist
+      if [ -f "$SELINUX_TMP/fivenines_agent_libvirt.pp" ]; then
+        semodule -r fivenines_agent_libvirt 2>/dev/null || true
+        if semodule -i "$SELINUX_TMP/fivenines_agent_libvirt.pp" -X 100 2>/dev/null; then
+          print_success "SELinux optional module fivenines_agent_libvirt loaded."
+        else
+          print_warning "Libvirt SELinux module not loaded (libvirt policy may not be installed). QEMU monitoring may hit denials."
+        fi
+      fi
+    else
+      print_warning "SELinux policy build failed. Install selinux-policy-devel and ensure refpolicy matches your distro."
+    fi
+  else
+    print_warning "SELinux policy devel Makefile not found. Install selinux-policy-devel to build the module, or use a prebuilt .pp."
+  fi
+
+  # Apply file contexts: if module was loaded, .fc is in the policy and restorecon applies it
+  if semanage fcontext -l 2>/dev/null | grep -q fivenines_agent_exec_t; then
+    restorecon -Rv "$INSTALL_DIR" /etc/fivenines_agent 2>/dev/null || true
+    if [ -f /var/log/fivenines-agent.log ]; then
+      restorecon -v /var/log/fivenines-agent.log 2>/dev/null || true
+    fi
+    print_success "SELinux file contexts applied."
+  else
+    # Module not loaded: apply default contexts so the agent may still run
+    restorecon -Rv "$INSTALL_DIR" /etc/fivenines_agent 2>/dev/null || true
+    print_warning "SELinux policy module not loaded. Agent may hit denials under Enforcing. Install selinux-policy-devel and re-run setup, or setenforce 0."
+  fi
+
+  rm -rf "$SELINUX_TMP"
+}
+
 setup_systemd() {
   print_success "Detected systemd system - using systemd service"
 
   # Download the service file
   download_with_fallback "fivenines-agent.service" "fivenines-agent.service" "${GITHUB_RAW_URL}/fivenines-agent.service" || exit_with_contact "Failed to download systemd service file"
 
-  # Move the service file to the systemd directory
+  # Move the service file to the systemd directory and fix SELinux label
   mv fivenines-agent.service /etc/systemd/system/
+  if command -v restorecon >/dev/null 2>&1; then
+    restorecon -v /etc/systemd/system/fivenines-agent.service 2>/dev/null || true
+  fi
 
   # Reload the service files to include the new fivenines-agent service
   systemctl daemon-reload
@@ -213,16 +344,7 @@ fi
 SYSTEM_TYPE=$(detect_system)
 print_success "Detected system type: $SYSTEM_TYPE"
 
-# Check if SELinux is installed
-if command -v getenforce >/dev/null 2>&1; then
-  selinux_status=$(getenforce 2>/dev/null || echo "Disabled")
-  print_success "SELinux status: $selinux_status"
-  if [ "$selinux_status" = "Enforcing" ]; then
-    exit_with_contact "SELinux is enabled in enforcing mode. fivenines agent will not work without disabling SELinux."
-  fi
-else
-  print_success "SELinux is not installed on this system."
-fi
+# SELinux contexts are configured after agent extraction (see setup_selinux_contexts)
 
 # Create a system user for the agent first
 if ! id -u fivenines >/dev/null 2>&1; then
@@ -334,10 +456,21 @@ else
 
   chown -R fivenines:fivenines "$INSTALL_DIR"
   chmod -R 755 "$AGENT_DIR"
+
+  # Restore SELinux label on the symlink (belt-and-suspenders with bulk restorecon)
+  if command -v restorecon >/dev/null 2>&1; then
+    restorecon -v "${INSTALL_DIR}/fivenines_agent" 2>/dev/null || true
+  fi
 fi
 
 print_success "Agent installed successfully at $AGENT_DIR"
 
+# Configure SELinux contexts now that files are in place (skip in test mode)
+if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
+  setup_selinux_contexts
+else
+  print_warning "Skipping SELinux setup (test mode)"
+fi
 
 # Test connectivity (skip in test mode)
 if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then

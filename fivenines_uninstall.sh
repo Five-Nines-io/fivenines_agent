@@ -1,6 +1,12 @@
 #!/bin/sh
 # This script is used to uninstall the fivenines agent
 
+# Check if running as root (use `id -u` for BusyBox/ash compatibility)
+if [ "$(id -u)" -ne 0 ]; then
+  echo "This script must be run as root"
+  exit 1
+fi
+
 detect_system() {
   if command -v rc-service >/dev/null 2>&1 && [ -d "/etc/init.d" ]; then
     echo "openrc"
@@ -11,12 +17,62 @@ detect_system() {
   fi
 }
 
+cleanup_selinux_contexts() {
+  # Detect SELinux using getenforce (same as setup script)
+  if command -v getenforce >/dev/null 2>&1; then
+    selinux_mode=$(getenforce 2>/dev/null | tr '[:upper:]' '[:lower:]')
+  elif command -v sestatus >/dev/null 2>&1; then
+    selinux_mode=$(sestatus 2>/dev/null | awk -F: '/^Current mode:/ {gsub(/^[ \t]+|[ \t]+$/, "", $2); print tolower($2)}')
+  else
+    echo "SELinux is not installed on this system."
+    return 0
+  fi
+
+  if [ -z "$selinux_mode" ] || [ "$selinux_mode" = "disabled" ]; then
+    echo "SELinux status: Disabled"
+    return 0
+  fi
+
+  echo "Cleaning up SELinux policy module and contexts..."
+
+  if command -v semodule >/dev/null 2>&1; then
+    # Remove from multiple priorities to match setup behavior.
+    # NOTE: keep in sync with setup_selinux_contexts() in fivenines_setup.sh
+    semodule -X 400 -r fivenines_agent 2>/dev/null || true
+    semodule -X 100 -r fivenines_agent 2>/dev/null || true
+    semodule -r fivenines_agent 2>/dev/null || true
+    # Remove optional modules
+    semodule -r fivenines_agent_docker 2>/dev/null || true
+    semodule -r fivenines_agent_libvirt 2>/dev/null || true
+  fi
+
+  if command -v semanage >/dev/null 2>&1; then
+    # Remove potential custom fcontext rules from older/manual installs.
+    semanage fcontext -d "/opt/fivenines(/.*)?" 2>/dev/null || true
+    semanage fcontext -d "/etc/fivenines_agent(/.*)?" 2>/dev/null || true
+    semanage fcontext -d "/boot/config/custom/fivenines_agent(/.*)?" 2>/dev/null || true
+    semanage fcontext -d "/var/log/fivenines-agent.log" 2>/dev/null || true
+  fi
+
+  if command -v restorecon >/dev/null 2>&1; then
+    [ -d /opt/fivenines ] && restorecon -Rv /opt/fivenines 2>/dev/null || true
+    [ -d /etc/fivenines_agent ] && restorecon -Rv /etc/fivenines_agent 2>/dev/null || true
+    [ -d /boot/config/custom/fivenines_agent ] && restorecon -Rv /boot/config/custom/fivenines_agent 2>/dev/null || true
+    [ -f /var/log/fivenines-agent.log ] && restorecon -v /var/log/fivenines-agent.log 2>/dev/null || true
+    [ -f /etc/systemd/system/fivenines-agent.service ] && restorecon -v /etc/systemd/system/fivenines-agent.service 2>/dev/null || true
+    [ -f /etc/init.d/fivenines-agent ] && restorecon -v /etc/init.d/fivenines-agent 2>/dev/null || true
+  fi
+}
+
 # Test mode: skip service management for CI testing
 if [ "${FIVENINES_TEST_MODE:-}" = "1" ]; then
   echo "WARNING: Test mode enabled - skipping service management"
 fi
 
 SYSTEM_TYPE=$(detect_system)
+
+# Clean up SELinux contexts before removing files
+cleanup_selinux_contexts
 
 # Service management (skip in test mode)
 if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then

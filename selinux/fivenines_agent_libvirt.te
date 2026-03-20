@@ -1,0 +1,17 @@
+# Optional SELinux policy for fivenines_agent libvirt/QEMU monitoring
+# Only load this module if libvirt is installed and the agent monitors VMs.
+#
+# Requires: libvirt SELinux policy (provides virt_var_run_t)
+# Build:    make -f /usr/share/selinux/devel/Makefile fivenines_agent_libvirt.pp
+# Install:  semodule -i fivenines_agent_libvirt.pp -X 100
+
+policy_module(fivenines_agent_libvirt, 1.0)
+
+gen_require(`
+	type fivenines_agent_t;
+	type virt_var_run_t;
+')
+
+# libvirt socket access for QEMU/KVM VM monitoring
+allow fivenines_agent_t virt_var_run_t:dir { getattr search open };
+allow fivenines_agent_t virt_var_run_t:sock_file { getattr read write };

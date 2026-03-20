@@ -1,0 +1,18 @@
+# Optional SELinux policy for fivenines_agent Docker monitoring
+# Only load this module if Docker/Podman is installed and the agent monitors containers.
+#
+# Requires: container-selinux package (provides container_var_run_t)
+# Build:    make -f /usr/share/selinux/devel/Makefile fivenines_agent_docker.pp
+# Install:  semodule -i fivenines_agent_docker.pp -X 100
+
+policy_module(fivenines_agent_docker, 1.0)
+
+gen_require(`
+	type fivenines_agent_t;
+	type container_var_run_t;
+')
+
+# Docker socket access for container monitoring
+allow fivenines_agent_t container_var_run_t:dir { getattr search open };
+allow fivenines_agent_t container_var_run_t:sock_file { getattr read write };
+allow fivenines_agent_t container_var_run_t:file { getattr open read };

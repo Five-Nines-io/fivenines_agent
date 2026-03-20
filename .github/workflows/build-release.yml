@@ -101,6 +101,7 @@ jobs:
       - name: Fix permissions and create tarball (amd64)
         run: |
           sudo chown -R $(id -u):$(id -g) dist/
+          cp -r selinux/ dist/linux/fivenines-agent-linux-amd64/selinux/
           cd dist/linux
           tar -czvf fivenines-agent-linux-amd64.tar.gz fivenines-agent-linux-amd64/
           mv fivenines-agent-linux-amd64.tar.gz ../
@@ -168,6 +169,7 @@ jobs:
       - name: Fix permissions and create tarball (arm64)
         run: |
           sudo chown -R $(id -u):$(id -g) dist/
+          cp -r selinux/ dist/linux/fivenines-agent-linux-arm64/selinux/
           cd dist/linux
           tar -czvf fivenines-agent-linux-arm64.tar.gz fivenines-agent-linux-arm64/
           mv fivenines-agent-linux-arm64.tar.gz ../
@@ -235,6 +237,7 @@ jobs:
       - name: Fix permissions and create tarball (alpine-amd64)
         run: |
           sudo chown -R $(id -u):$(id -g) dist/
+          cp -r selinux/ dist/linux/fivenines-agent-alpine-amd64/selinux/
           cd dist/linux
           tar -czvf fivenines-agent-alpine-amd64.tar.gz fivenines-agent-alpine-amd64/
           mv fivenines-agent-alpine-amd64.tar.gz ../
@@ -302,6 +305,7 @@ jobs:
       - name: Fix permissions and create tarball (alpine-arm64)
         run: |
           sudo chown -R $(id -u):$(id -g) dist/
+          cp -r selinux/ dist/linux/fivenines-agent-alpine-arm64/selinux/
           cd dist/linux
           tar -czvf fivenines-agent-alpine-arm64.tar.gz fivenines-agent-alpine-arm64/
           mv fivenines-agent-alpine-arm64.tar.gz ../
