@@ -157,7 +157,9 @@ TARBALL_PATH="/tmp/${TARBALL_NAME}"
 AGENT_DIR="${INSTALL_DIR}/${BINARY_NAME}"
 AGENT_EXECUTABLE="${AGENT_DIR}/${BINARY_NAME}"
 
-if [ -n "${FIVENINES_AGENT_URL:-}" ]; then
+if [ "${FIVENINES_TEST_MODE:-}" = "1" ] && [ -f "$TARBALL_PATH" ]; then
+    print_warning "Using pre-placed tarball at $TARBALL_PATH (test mode)"
+elif [ -n "${FIVENINES_AGENT_URL:-}" ]; then
     print_warning "Using custom agent URL: $FIVENINES_AGENT_URL"
     wget -T 10 -q "$FIVENINES_AGENT_URL" -O "$TARBALL_PATH" || exit_with_error "Failed to download from custom URL"
     print_success "Downloaded from custom URL"

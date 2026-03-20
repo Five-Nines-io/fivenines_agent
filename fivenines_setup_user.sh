@@ -203,7 +203,9 @@ download_agent() {
     fi
 
     # Use custom URL if provided, otherwise use fallback mechanism
-    if [ -n "${FIVENINES_AGENT_URL:-}" ]; then
+    if [ "${FIVENINES_TEST_MODE:-}" = "1" ] && [ -f "$tarball_path" ]; then
+        print_warning "Using pre-placed tarball at $tarball_path (test mode)"
+    elif [ -n "${FIVENINES_AGENT_URL:-}" ]; then
         print_warning "Using custom agent URL: $FIVENINES_AGENT_URL"
         download_file "$FIVENINES_AGENT_URL" "$tarball_path" || exit_with_error "Failed to download agent from custom URL"
         print_success "Downloaded from custom URL"

@@ -37,9 +37,8 @@ elif command -v apt-get > /dev/null 2>&1; then
   apt-get update -qq > /dev/null 2>&1 && apt-get install -y -qq python3 wget > /dev/null 2>&1 || true
 fi
 
-# Background process PIDs (for cleanup)
+# Background process PID (for cleanup)
 MOCK_PID=""
-FILE_SERVER_PID=""
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -144,24 +143,12 @@ fi
 echo ""
 echo "=== Test 4: System install script ==="
 
-# Create a local tarball for the install script to use
+# Create a local tarball and pre-place it where install scripts expect it.
+# In test mode, scripts skip the download and use the pre-placed tarball directly.
 TARBALL_PATH="/tmp/fivenines-agent-${BINARY_VARIANT}.tar.gz"
 (cd "$AGENT_DIR" && tar -czf "$TARBALL_PATH" "${BINARY_NAME}/")
 
-# Start a local HTTP server to serve the tarball (more portable than file://)
-FILE_SERVER_PORT=9090
-if command -v python3 > /dev/null 2>&1; then
-  python3 -m http.server "$FILE_SERVER_PORT" --directory /tmp --bind 127.0.0.1 > /dev/null 2>&1 &
-  FILE_SERVER_PID=$!
-  sleep 1
-else
-  FILE_SERVER_PID=""
-fi
-
 export FIVENINES_TEST_MODE=1
-if [ -n "$FILE_SERVER_PID" ]; then
-  export FIVENINES_AGENT_URL="http://127.0.0.1:${FILE_SERVER_PORT}/fivenines-agent-${BINARY_VARIANT}.tar.gz"
-fi
 
 if timeout 120 sh "${SCRIPTS_DIR}/fivenines_setup.sh" "test-token-ci-setup" > "${OUTPUT_DIR}/setup_output" 2>&1; then
   record_result "system-install" "PASS" ""
@@ -308,7 +295,6 @@ if [ "$(id -u)" = "0" ] && id testuser > /dev/null 2>&1; then
   chmod 644 "$TARBALL_PATH" 2>/dev/null || true
   if timeout 120 su -s /bin/sh testuser -c "
     export FIVENINES_TEST_MODE=1
-    export FIVENINES_AGENT_URL='${FIVENINES_AGENT_URL:-}'
     export FIVENINES_INSTALL_DIR='${USER_INSTALL_DIR}'
     export FIVENINES_CONFIG_DIR='${USER_CONFIG_DIR}'
     sh '${SCRIPTS_DIR}/fivenines_setup_user.sh' 'test-token-user-ci'
@@ -339,7 +325,6 @@ fi
 if [ "$(id -u)" = "0" ] && id testuser > /dev/null 2>&1 && [ -d "$USER_INSTALL_DIR" ]; then
   if timeout 120 su -s /bin/sh testuser -c "
     export FIVENINES_TEST_MODE=1
-    export FIVENINES_AGENT_URL='${FIVENINES_AGENT_URL:-}'
     export FIVENINES_INSTALL_DIR='${USER_INSTALL_DIR}'
     export FIVENINES_CONFIG_DIR='${USER_CONFIG_DIR}'
     sh '${SCRIPTS_DIR}/fivenines_update_user.sh'
@@ -393,7 +378,6 @@ fi
 # Cleanup background processes
 # ---------------------------------------------------------------
 [ -n "$MOCK_PID" ] && kill "$MOCK_PID" 2>/dev/null || true
-[ -n "$FILE_SERVER_PID" ] && kill "$FILE_SERVER_PID" 2>/dev/null || true
 
 # ---------------------------------------------------------------
 # Summary

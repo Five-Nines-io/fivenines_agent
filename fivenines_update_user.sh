@@ -173,7 +173,9 @@ echo "Downloading latest version..."
 TARBALL_NAME="${BINARY_NAME}.tar.gz"
 TARBALL_PATH="/tmp/${TARBALL_NAME}"
 
-if [ -n "${FIVENINES_AGENT_URL:-}" ]; then
+if [ "${FIVENINES_TEST_MODE:-}" = "1" ] && [ -f "$TARBALL_PATH" ]; then
+    print_warning "Using pre-placed tarball at $TARBALL_PATH (test mode)"
+elif [ -n "${FIVENINES_AGENT_URL:-}" ]; then
     print_warning "Using custom agent URL: $FIVENINES_AGENT_URL"
     download_file "$FIVENINES_AGENT_URL" "$TARBALL_PATH" || exit_with_error "Failed to download from custom URL"
     print_success "Downloaded from custom URL"
