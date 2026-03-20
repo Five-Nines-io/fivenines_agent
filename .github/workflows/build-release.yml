@@ -435,6 +435,10 @@ jobs:
             binary: linux-amd64
             runner: ubuntu-latest
             skip_ldd: "0"
+          - distro: rockylinux:8
+            binary: linux-amd64
+            runner: ubuntu-latest
+            skip_ldd: "0"
           - distro: ubuntu:20.04
             binary: linux-amd64
             runner: ubuntu-latest
@@ -455,6 +459,12 @@ jobs:
             binary: linux-amd64
             runner: ubuntu-latest
             skip_ldd: "0"
+          # TODO: Remove allow_failure when rockylinux:10 image is GA and tests pass
+          - distro: rockylinux:10
+            binary: linux-amd64
+            runner: ubuntu-latest
+            skip_ldd: "0"
+            allow_failure: "1"
           - distro: fedora:latest
             binary: linux-amd64
             runner: ubuntu-latest
@@ -512,6 +522,8 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
 
       - name: Run distro tests
+        id: distro-test
+        continue-on-error: ${{ matrix.allow_failure == '1' }}
         run: |
           mkdir -p ${{ github.workspace }}/test-output
           docker run --rm \
@@ -535,7 +547,7 @@ jobs:
           fi
 
       - name: Upload test logs on failure
-        if: failure()
+        if: steps.distro-test.outcome == 'failure'
         uses: actions/upload-artifact@v5
         with:
           name: test-logs-${{ matrix.binary }}-${{ strategy.job-index }}
