@@ -83,6 +83,46 @@ def test_post_stops_on_stop_event(mock_get_conn):
     assert mock_get_conn.call_count == 1
 
 
+# --- _swap_token ---
+
+
+def test_swap_token_file_permissions(tmp_path):
+    """TOKEN file must be created with 0600 permissions (owner-only)."""
+    sync = make_synchronizer()
+
+    with patch("fivenines_agent.synchronizer.config_dir", return_value=str(tmp_path)):
+        sync._swap_token("new-secret-token")
+
+    token_path = tmp_path / "TOKEN"
+    assert token_path.exists()
+    assert token_path.read_text() == "new-secret-token"
+    mode = oct(token_path.stat().st_mode & 0o777)
+    assert mode == oct(0o600), f"Expected 0o600, got {mode}"
+
+
+def test_swap_token_updates_in_memory(tmp_path):
+    """_swap_token always updates self.token even if the file write fails."""
+    sync = make_synchronizer()
+    sync.token = "old-token"
+
+    with patch("fivenines_agent.synchronizer.config_dir", return_value=str(tmp_path)):
+        sync._swap_token("new-token")
+
+    assert sync.token == "new-token"
+
+
+def test_swap_token_permission_error(tmp_path):
+    """PermissionError on file write is caught; in-memory token still updated."""
+    sync = make_synchronizer()
+    sync.token = "old-token"
+
+    with patch("fivenines_agent.synchronizer.config_dir", return_value=str(tmp_path)):
+        with patch("os.open", side_effect=PermissionError("denied")):
+            sync._swap_token("new-token")
+
+    assert sync.token == "new-token"
+
+
 # --- send_metrics ---
 
 
@@ -92,7 +132,8 @@ def test_send_metrics_updates_config(mock_post):
     mock_post.return_value = {"config": {"enabled": True, "interval": 30}}
 
     sync.send_metrics({"test": True})
-    assert sync.config == {"enabled": True, "interval": 30}
+    assert sync.config["enabled"] is True
+    assert sync.config["interval"] == 30
 
 
 @patch.object(Synchronizer, "_post")

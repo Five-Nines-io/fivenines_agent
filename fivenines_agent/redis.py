@@ -1,8 +1,5 @@
-import os
-import sys
 import re
 import socket
-import traceback
 
 from fivenines_agent.debug import debug, log
 
@@ -20,60 +17,65 @@ METRICS_REGEX = '|'.join([
   '^db[0-9]'
 ])
 
+
+def _resp_command(*args):
+    """Encode a Redis command using the RESP binary-safe protocol.
+
+    Length-prefixes each argument, making the encoding immune to CRLF
+    injection regardless of argument content.
+    """
+    parts = [f"*{len(args)}\r\n"]
+    for arg in args:
+        encoded = str(arg).encode("utf-8")
+        parts.append(f"${len(encoded)}\r\n{str(arg)}\r\n")
+    return "".join(parts)
+
+
 @debug('redis_metrics')
 def redis_metrics(port=6379, password=None):
-    auth_prefix = ''
-    if password:
-      auth_prefix = f'AUTH {password}\n'
-
     try:
+        s = socket.create_connection(('localhost', int(port)), timeout=5)
 
-      # Use create_connection for better address handling (IPv4/IPv6)
-      s = socket.create_connection(('localhost', int(port)), timeout=5)
+        payload = ""
+        if password:
+            payload += _resp_command("AUTH", password)
+        payload += _resp_command("INFO")
+        payload += _resp_command("QUIT")
+        s.sendall(payload.encode("utf-8"))
 
-      commands = []
-      if password:
-          commands.append(f'AUTH {password}')
-      commands.append('INFO')
-      commands.append('QUIT')
+        data = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        s.close()
 
-      # Use CRLF for Redis protocol
-      full_command = '\r\n'.join(commands) + '\r\n'
-      s.sendall(full_command.encode())
+        results = []
+        for line in data.decode('utf-8', errors='ignore').split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            if re.search(METRICS_REGEX, line):
+                results.append(line)
 
-      data = b""
-      while True:
-          chunk = s.recv(4096)
-          if not chunk:
-              break
-          data += chunk
-      s.close()
+        metrics = {}
 
-      results = []
-      for line in data.decode('utf-8', errors='ignore').split('\n'):
-          line = line.strip()
-          if not line:
-              continue
-          if re.search(METRICS_REGEX, line):
-              results.append(line)
+        if len(results) > 0:
+            for result in results:
+                key, value = result.split(':')
+                if key == 'redis_version':
+                    metrics[key] = value.strip()
+                elif key.startswith('db'):
+                    metrics[key] = {}
+                    values = value.split(',')
+                    for v in values:
+                        k, raw_val = v.split('=')
+                        metrics[key][k.strip()] = float(raw_val.strip())
+                else:
+                    metrics[key] = float(value.strip())
 
-      metrics = {}
-
-      if len(results) > 0:
-        for result in results:
-          key, value = result.split(':')
-          if key == 'redis_version':
-            metrics[key] = value.strip()
-          elif key.startswith('db'):
-            metrics[key] = {}
-            values = value.split(',')
-            for v in values:
-              k, raw_val = v.split('=')
-              metrics[key][k.strip()] = float(raw_val.strip())
-          else:
-            metrics[key] = float(value.strip())
-
-      return metrics
+        return metrics
 
     except Exception as e:
-      log(f"Error collecting Redis metrics: {e}", 'error')
+        log(f"Error collecting Redis metrics: {e}", 'error')

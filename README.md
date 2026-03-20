@@ -244,6 +244,12 @@ Collects metrics via Redis protocol:
 
 Connects to `localhost:6379` by default.
 
+## Security
+
+The agent communicates exclusively with `api.fivenines.io` over TLS, validating the server certificate against the `certifi` CA bundle. All API responses are validated and sanitized before use — server-supplied configuration cannot redirect collectors to non-loopback addresses, disable SSL verification, or inject commands through credential fields.
+
+To report a vulnerability, email [sebastien@fivenines.io](mailto:sebastien@fivenines.io).
+
 ## Contribute
 
 Feel free to open a PR/issues if you encounter any bug or want to contribute.

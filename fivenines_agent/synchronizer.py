@@ -9,6 +9,7 @@ from threading import Event, Lock, Thread
 
 import certifi
 
+from fivenines_agent.config_schema import validate_config
 from fivenines_agent.debug import debug, log
 from fivenines_agent.dns_resolver import DNSResolver
 from fivenines_agent.env import api_url, config_dir
@@ -99,7 +100,7 @@ class Synchronizer(Thread):
         if response is not None:
             if "token" in response:
                 self._swap_token(response["token"])
-            config = response["config"]
+            config = validate_config(response["config"])
             with self.config_lock:
                 self.config = config
 
@@ -108,9 +109,15 @@ class Synchronizer(Thread):
         log("Received per-host token, saving...", "info")
         self.token = new_token
         token_path = os.path.join(config_dir(), "TOKEN")
-        with open(token_path, "w") as f:
-            f.write(new_token)
-        log("Token swapped successfully", "info")
+        try:
+            fd = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write(new_token)
+            log("Token swapped successfully", "info")
+        except PermissionError:
+            log(f"Permission denied writing to {token_path}. Proceeding with in-memory token.", "error")
+        except Exception as e:
+            log(f"Error saving token: {e}", "error")
 
     def send_packages(self, packages_data):
         """Send packages data to /packages. Returns response or None."""
@@ -125,7 +132,13 @@ class Synchronizer(Thread):
                 port = int(url.split(":")[1])
 
             resolver = DNSResolver(hostname)
-            ssl_context = ssl.create_default_context(cafile=certifi.where())
+
+            # Use certifi if bundled, otherwise fallback to system CA certificates
+            cert_path = certifi.where()
+            if os.path.exists(cert_path):
+                ssl_context = ssl.create_default_context(cafile=cert_path)
+            else:
+                ssl_context = ssl.create_default_context()
 
             # Try IPv4 first, then fallback to IPv6
             for record_type, af in [("A", socket.AF_INET), ("AAAA", socket.AF_INET6)]:

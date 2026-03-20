@@ -1,7 +1,11 @@
 import os
 import time
-import libvirt
 import xml.etree.ElementTree as ET
+
+try:
+    import libvirt
+except ImportError:
+    libvirt = None  # type: ignore[assignment]
 
 from fivenines_agent.debug import debug, log
 
@@ -358,6 +362,9 @@ class QEMUCollector:
 
 @debug('qemu_metrics')
 def qemu_metrics(uri="qemu:///system"):
+    if libvirt is None:
+        log("libvirt not available, skipping QEMU metrics", "debug")
+        return []
     collector = QEMUCollector(uri)
     try:
         return collector.collect()
