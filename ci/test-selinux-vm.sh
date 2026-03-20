@@ -252,20 +252,36 @@ vm_sudo tar -xzf /tmp/agent.tar.gz -C /opt/fivenines/
 AGENT_SUBDIR=$(vm_sudo "ls /opt/fivenines/ | head -1")
 vm_sudo "sh -c 'ln -sf /opt/fivenines/$AGENT_SUBDIR/$AGENT_SUBDIR /opt/fivenines/fivenines_agent && chown -R fivenines:fivenines /opt/fivenines && chmod -R 755 /opt/fivenines/$AGENT_SUBDIR'"
 
-# 5. Run the SELinux setup function by sourcing it from the setup script
-# We create a small wrapper that sets the needed variables and sources the functions
-vm_sudo "sh -c '
-  INSTALL_DIR=/opt/fivenines
-  AGENT_DIR=/opt/fivenines/$AGENT_SUBDIR
-  # Source color codes and helper functions
-  RED=\"\\033[0;31m\"; GREEN=\"\\033[0;32m\"; YELLOW=\"\\033[1;33m\"; NC=\"\\033[0m\"
-  print_success() { printf \"%b\\n\" \"\${GREEN}[+]\${NC} \$1\"; }
-  print_warning() { printf \"%b\\n\" \"\${YELLOW}[!]\${NC} \$1\"; }
-  # Extract and run setup_selinux_contexts from the setup script
-  eval \"\$(sed -n \"/^setup_selinux_contexts/,/^}$/p\" /tmp/fivenines_setup.sh)\"
-  setup_selinux_contexts
-'" 2>&1
-SETUP_EXIT=$?
+# 5. Create and upload a test wrapper script that calls setup_selinux_contexts
+# We use a heredoc to create it locally, then scp it to the VM
+cat > "$WORK_DIR/run_selinux_setup.sh" << 'WRAPPER'
+#!/bin/sh
+# Test wrapper: sets required variables and runs setup_selinux_contexts
+# from the setup script
+INSTALL_DIR=/opt/fivenines
+AGENT_DIR="$1"
+
+# Source helper functions from the setup script (everything before main execution)
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+print_success() { printf '%b\n' "${GREEN}[+]${NC} $1"; }
+print_warning() { printf '%b\n' "${YELLOW}[!]${NC} $1"; }
+
+# Source the setup_selinux_contexts function definition from setup script
+. /tmp/fivenines_setup_funcs.sh
+
+setup_selinux_contexts
+WRAPPER
+
+# Extract just the setup_selinux_contexts function from the setup script
+sed -n '/^setup_selinux_contexts()/,/^}/p' "$SCRIPTS_DIR/fivenines_setup.sh" > "$WORK_DIR/fivenines_setup_funcs.sh"
+
+# shellcheck disable=SC2086
+scp $SCP_OPTS "$WORK_DIR/run_selinux_setup.sh" testuser@127.0.0.1:/tmp/run_selinux_setup.sh
+# shellcheck disable=SC2086
+scp $SCP_OPTS "$WORK_DIR/fivenines_setup_funcs.sh" testuser@127.0.0.1:/tmp/fivenines_setup_funcs.sh
+
+# Run the wrapper with the agent directory path
+vm_sudo "sh /tmp/run_selinux_setup.sh /opt/fivenines/$AGENT_SUBDIR" 2>&1
 
 SETUP_OUTPUT=$(vm_sudo "semodule -l 2>/dev/null | grep fivenines" || true)
 echo "semodule output: $SETUP_OUTPUT"
