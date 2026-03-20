@@ -29,8 +29,11 @@ echo "Installing test dependencies..."
 if command -v apk > /dev/null 2>&1; then
   # Alpine
   apk add --no-cache python3 wget shadow > /dev/null 2>&1 || true
+elif command -v dnf > /dev/null 2>&1; then
+  # Fedora / Rocky 9+
+  dnf install -y -q python3 wget util-linux > /dev/null 2>&1 || true
 elif command -v yum > /dev/null 2>&1; then
-  # CentOS / Rocky / Fedora
+  # CentOS 7
   yum install -y -q python3 wget > /dev/null 2>&1 || true
 elif command -v apt-get > /dev/null 2>&1; then
   # Debian / Ubuntu
@@ -229,6 +232,9 @@ if [ -f "$TOKEN_FILE" ]; then
   TOKEN_BEFORE=$(cat "$TOKEN_FILE")
 fi
 
+# Re-create tarball (setup script deletes it after extraction)
+(cd "$AGENT_DIR" && tar -czf "$TARBALL_PATH" "${BINARY_NAME}/")
+
 if timeout 120 sh "${SCRIPTS_DIR}/fivenines_update.sh" > "${OUTPUT_DIR}/update_output" 2>&1; then
   # Verify TOKEN preserved
   if [ -f "$TOKEN_FILE" ]; then
@@ -275,6 +281,9 @@ echo ""
 echo "=== Test 8: User-level install ==="
 
 # Create a non-root user for user-level tests (if running as root)
+# Re-create tarball for user install tests
+(cd "$AGENT_DIR" && tar -czf "$TARBALL_PATH" "${BINARY_NAME}/")
+
 if [ "$(id -u)" = "0" ]; then
   # Create test user (handle both glibc and Alpine)
   if command -v adduser > /dev/null 2>&1 && command -v rc-service > /dev/null 2>&1; then
@@ -315,6 +324,9 @@ fi
 # ---------------------------------------------------------------
 echo ""
 echo "=== Test 9: User-level update ==="
+
+# Re-create tarball for user update test
+(cd "$AGENT_DIR" && tar -czf "$TARBALL_PATH" "${BINARY_NAME}/")
 
 USER_TOKEN_FILE="${USER_CONFIG_DIR}/TOKEN"
 USER_TOKEN_BEFORE=""

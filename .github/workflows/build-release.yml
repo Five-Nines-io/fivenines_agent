@@ -388,10 +388,7 @@ jobs:
             runner: ubuntu-24.04-arm
             skip_ldd: "0"
           # alpine-amd64 (musl) distros
-          - distro: alpine:3.18
-            binary: alpine-amd64
-            runner: ubuntu-latest
-            skip_ldd: "1"
+          # Note: Alpine 3.18 removed - binary requires musl pwritev2 (Alpine 3.19+)
           - distro: alpine:3.21
             binary: alpine-amd64
             runner: ubuntu-latest
