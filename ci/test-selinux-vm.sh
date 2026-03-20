@@ -235,7 +235,7 @@ echo ""
 echo "=== Test 2: Run setup script ==="
 
 # Instead of running the full setup script (which tries to download service files
-# and ping external hosts — both hang without internet), we replicate the key
+# and ping external hosts -- both hang without internet), we replicate the key
 # steps manually and then source/call setup_selinux_contexts directly.
 
 # 1. Create fivenines user
