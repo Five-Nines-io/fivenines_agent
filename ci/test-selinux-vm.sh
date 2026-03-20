@@ -234,32 +234,50 @@ scp $SCP_OPTS "$SCRIPTS_DIR/fivenines_setup.sh" testuser@127.0.0.1:/tmp/fivenine
 echo ""
 echo "=== Test 2: Run setup script ==="
 
-# Start a simple HTTP server in the VM to serve the tarball (setup script uses wget)
-vm_run "cd /tmp && python3 -m http.server 8888 >/dev/null 2>&1 &"
-sleep 2
+# Instead of running the full setup script (which tries to download service files
+# and ping external hosts — both hang without internet), we replicate the key
+# steps manually and then source/call setup_selinux_contexts directly.
 
-# Run the full setup script pointing at the local HTTP server for the tarball download
-# The setup script handles extraction, user creation, SELinux setup, connectivity, and service start.
-# Connectivity test and service start will fail in the VM (no internet, no real systemd unit).
-# We capture output and check for SELinux success markers.
-SETUP_OUTPUT=$(vm_sudo "FIVENINES_AGENT_URL=http://127.0.0.1:8888/agent.tar.gz sh /tmp/fivenines_setup.sh test-token-selinux 2>&1" || true)
-echo "$SETUP_OUTPUT"
+# 1. Create fivenines user
+vm_sudo useradd --system --user-group fivenines --shell /bin/false 2>/dev/null || true
 
-# Kill the HTTP server
-vm_run "pkill -f 'http.server 8888'" || true
+# 2. Create config dir with TOKEN
+vm_sudo "sh -c 'mkdir -p /etc/fivenines_agent && echo -n test-token > /etc/fivenines_agent/TOKEN && chmod 600 /etc/fivenines_agent/TOKEN && chown fivenines:fivenines /etc/fivenines_agent/TOKEN'"
 
-if echo "$SETUP_OUTPUT" | grep -q "SELinux policy module fivenines_agent loaded"; then
-  echo "[PASS] SELinux policy module loaded successfully"
+# 3. Extract agent tarball
+vm_sudo mkdir -p /opt/fivenines
+vm_sudo tar -xzf /tmp/agent.tar.gz -C /opt/fivenines/
+
+# 4. Set permissions and create symlink (like the setup script does)
+AGENT_SUBDIR=$(vm_sudo "ls /opt/fivenines/ | head -1")
+vm_sudo "sh -c 'ln -sf /opt/fivenines/$AGENT_SUBDIR/$AGENT_SUBDIR /opt/fivenines/fivenines_agent && chown -R fivenines:fivenines /opt/fivenines && chmod -R 755 /opt/fivenines/$AGENT_SUBDIR'"
+
+# 5. Run the SELinux setup function by sourcing it from the setup script
+# We create a small wrapper that sets the needed variables and sources the functions
+vm_sudo "sh -c '
+  INSTALL_DIR=/opt/fivenines
+  AGENT_DIR=/opt/fivenines/$AGENT_SUBDIR
+  # Source color codes and helper functions
+  RED=\"\\033[0;31m\"; GREEN=\"\\033[0;32m\"; YELLOW=\"\\033[1;33m\"; NC=\"\\033[0m\"
+  print_success() { printf \"%b\\n\" \"\${GREEN}[+]\${NC} \$1\"; }
+  print_warning() { printf \"%b\\n\" \"\${YELLOW}[!]\${NC} \$1\"; }
+  # Extract and run setup_selinux_contexts from the setup script
+  eval \"\$(sed -n \"/^setup_selinux_contexts/,/^}$/p\" /tmp/fivenines_setup.sh)\"
+  setup_selinux_contexts
+'" 2>&1
+SETUP_EXIT=$?
+
+SETUP_OUTPUT=$(vm_sudo "semodule -l 2>/dev/null | grep fivenines" || true)
+echo "semodule output: $SETUP_OUTPUT"
+
+if echo "$SETUP_OUTPUT" | grep -q "fivenines_agent"; then
+  echo "[PASS] SELinux policy module loaded: $SETUP_OUTPUT"
 else
-  echo "[WARN] SELinux policy module may not have loaded"
-  echo "Checking manually..."
-  MODULE_CHECK=$(vm_sudo "semodule -l 2>/dev/null | grep fivenines" || true)
-  if [ -n "$MODULE_CHECK" ]; then
-    echo "[PASS] Module found: $MODULE_CHECK"
-  else
-    echo "[FAIL] SELinux policy module not loaded"
-    exit 1
-  fi
+  echo "[FAIL] SELinux policy module not loaded"
+  echo "  semodule output: $SETUP_OUTPUT"
+  echo "  Checking build prerequisites..."
+  vm_sudo "rpm -q selinux-policy-devel policycoreutils-python-utils" || true
+  exit 1
 fi
 
 # ---------------------------------------------------------------
