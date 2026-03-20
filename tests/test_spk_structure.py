@@ -19,7 +19,6 @@ REQUIRED_SPK_ENTRIES = [
     "scripts/start-stop-status",
     "scripts/postinst",
     "conf/privilege",
-    "conf/logrotate.conf",
     "WIZARD_UIFILES/install_uifile",
     "PACKAGE_ICON.PNG",
     "PACKAGE_ICON_256.PNG",
@@ -113,6 +112,8 @@ def test_build_spk_package_tgz_contains_binary(fake_binary):
         assert "./bin/fivenines-agent" in members
         # Shared libs should also be included
         assert "./bin/libpython3.9.so" in members
+        # Logrotate config must be inside package.tgz (target/conf/)
+        assert "./conf/logrotate.conf" in members
     finally:
         os.unlink(tmp_path)
 
