@@ -37,7 +37,7 @@ echo ""
 # Confirm (skip in test mode)
 if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
   printf "This will remove the Fivenines agent. Continue? [y/N] "
-  read REPLY
+  read -r REPLY
   case "$REPLY" in
       [Yy]*) ;;
       *)

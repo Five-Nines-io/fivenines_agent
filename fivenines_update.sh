@@ -37,10 +37,10 @@ exit_with_error() {
 }
 
 download_with_fallback() {
-  local filename="$1"
-  local output="$2"
-  local r2_url="${R2_BASE_URL}/${filename}"
-  local github_url="$3"
+  filename="$1"
+  output="$2"
+  r2_url="${R2_BASE_URL}/${filename}"
+  github_url="$3"
 
   print_warning "Downloading ${filename}..."
 
@@ -124,10 +124,7 @@ if [ "$(getent passwd fivenines | cut -d: -f6)" = "/home/fivenines" ]; then
 fi
 
 # Check if the package is installed
-su - fivenines -s /bin/bash -c 'pipx list | grep -q fivenines_agent'
-
-# Get the exit status of the pipx command
-if [ $? -ne 0 ]; then
+if ! su - fivenines -s /bin/bash -c 'pipx list | grep -q fivenines_agent'; then
         print_success "Agent is not installed with pipx. No need to clean the old package."
 else
         print_warning "Uninstalling the old fivenines_agent package"

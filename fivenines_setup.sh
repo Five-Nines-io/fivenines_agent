@@ -42,10 +42,10 @@ print_error() {
 }
 
 download_with_fallback() {
-  local filename="$1"
-  local output="$2"
-  local r2_url="${R2_BASE_URL}/${filename}"
-  local github_url="$3"
+  filename="$1"
+  output="$2"
+  r2_url="${R2_BASE_URL}/${filename}"
+  github_url="$3"
 
   print_warning "Downloading ${filename}..."
 
@@ -138,9 +138,7 @@ setup_systemd() {
   systemctl enable fivenines-agent.service
 
   # Start the fivenines-agent
-  systemctl start fivenines-agent
-
-  if [ $? -ne 0 ]; then
+  if ! systemctl start fivenines-agent; then
     exit_with_contact "Failed to start the fivenines-agent service. Check the system logs for more information."
   fi
 
@@ -185,9 +183,7 @@ setup_openrc() {
   rc-update add fivenines-agent default
 
   # Start the agent
-  rc-service fivenines-agent start
-
-  if [ $? -ne 0 ]; then
+  if ! rc-service fivenines-agent start; then
     exit_with_contact "Failed to start the fivenines-agent service. Check /var/log/fivenines-agent.log for details."
   fi
 
@@ -254,12 +250,12 @@ mkdir -p /etc/fivenines_agent
 # Save the client token in appropriate location
 if [ "$SYSTEM_TYPE" = "unraid" ]; then
   mkdir -p /boot/config/custom/fivenines_agent
-  echo -n "$1" | tee /boot/config/custom/fivenines_agent/TOKEN > /dev/null
+  printf '%s' "$1" | tee /boot/config/custom/fivenines_agent/TOKEN > /dev/null
   chown fivenines:fivenines /boot/config/custom/fivenines_agent/TOKEN
   chmod 600 /boot/config/custom/fivenines_agent/TOKEN
 else
   # Use standard location for other systems
-  echo -n "$1" | tee /etc/fivenines_agent/TOKEN > /dev/null
+  printf '%s' "$1" | tee /etc/fivenines_agent/TOKEN > /dev/null
   chown fivenines:fivenines /etc/fivenines_agent/TOKEN
   chmod 600 /etc/fivenines_agent/TOKEN
 fi

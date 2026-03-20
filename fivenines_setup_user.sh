@@ -92,8 +92,8 @@ check_requirements() {
 }
 
 download_file() {
-    local url="$1"
-    local output="$2"
+    url="$1"
+    output="$2"
 
     if [ "$DOWNLOADER" = "wget" ]; then
         wget -q -T 10 "$url" -O "$output"
@@ -103,10 +103,10 @@ download_file() {
 }
 
 download_with_fallback() {
-    local filename="$1"
-    local output="$2"
-    local r2_url="${R2_BASE_URL}/${filename}"
-    local github_url="${GITHUB_RELEASES_URL}/${filename}"
+    filename="$1"
+    output="$2"
+    r2_url="${R2_BASE_URL}/${filename}"
+    github_url="${GITHUB_RELEASES_URL}/${filename}"
 
     # Try R2 first (IPv6 compatible)
     if download_file "$r2_url" "$output" 2>/dev/null; then
@@ -182,10 +182,10 @@ create_directories() {
 }
 
 save_token() {
-    local token="$1"
+    token="$1"
 
     echo "Saving token..."
-    echo -n "$token" > "$CONFIG_DIR/TOKEN"
+    printf '%s' "$token" > "$CONFIG_DIR/TOKEN"
     chmod 600 "$CONFIG_DIR/TOKEN"
     print_success "Token saved securely"
     echo ""
@@ -194,12 +194,12 @@ save_token() {
 download_agent() {
     echo "Downloading agent..."
 
-    local tarball_name="${BINARY_NAME}.tar.gz"
-    local tarball_path="/tmp/${tarball_name}"
+    tarball_name="${BINARY_NAME}.tar.gz"
+    tarball_path="/tmp/${tarball_name}"
 
     # Remove old installation if exists
     if [ -d "$INSTALL_DIR/$BINARY_NAME" ]; then
-        rm -rf "$INSTALL_DIR/$BINARY_NAME"
+        rm -rf "${INSTALL_DIR:?}/${BINARY_NAME:?}"
     fi
 
     # Use custom URL if provided, otherwise use fallback mechanism
@@ -226,7 +226,7 @@ download_agent() {
 test_connectivity() {
     echo "Testing connectivity..."
 
-    local connected=false
+    connected=false
 
     for host in api.fivenines.io eu.fivenines.io us.fivenines.io; do
         if ping -c 1 -W 3 "$host" > /dev/null 2>&1; then

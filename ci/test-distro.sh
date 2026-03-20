@@ -108,27 +108,27 @@ if command -v python3 > /dev/null 2>&1; then
 
   # Create fake TOKEN and config dir
   mkdir -p /etc/fivenines_agent
-  echo -n "test-token-for-ci" > /etc/fivenines_agent/TOKEN
+  printf '%s' "test-token-for-ci" > /etc/fivenines_agent/TOKEN
   chmod 600 /etc/fivenines_agent/TOKEN
 
   # Point agent at mock server (API_URL is how the agent reads the API host)
   export API_URL="localhost:${MOCK_API_PORT}"
 
-  if timeout 60 "$AGENT_EXECUTABLE" --dry-run > ${OUTPUT_DIR}/dryrun_output 2>&1; then
+  if timeout 60 "$AGENT_EXECUTABLE" --dry-run > "${OUTPUT_DIR}/dryrun_output" 2>&1; then
     record_result "dry-run" "PASS" "completed successfully"
   else
     EXIT_CODE=$?
     # Exit code 2 means TOKEN file not found (different config dir)
     # Try with user config dir
     mkdir -p "$HOME/.config/fivenines_agent"
-    echo -n "test-token-for-ci" > "$HOME/.config/fivenines_agent/TOKEN"
+    printf '%s' "test-token-for-ci" > "$HOME/.config/fivenines_agent/TOKEN"
     chmod 600 "$HOME/.config/fivenines_agent/TOKEN"
-    if timeout 60 "$AGENT_EXECUTABLE" --dry-run > ${OUTPUT_DIR}/dryrun_output 2>&1; then
+    if timeout 60 "$AGENT_EXECUTABLE" --dry-run > "${OUTPUT_DIR}/dryrun_output" 2>&1; then
       record_result "dry-run" "PASS" "completed (user config dir)"
     else
       record_result "dry-run" "FAIL" "exit code $EXIT_CODE"
       echo "--- dry-run output ---"
-      cat ${OUTPUT_DIR}/dryrun_output 2>/dev/null || true
+      cat "${OUTPUT_DIR}/dryrun_output" 2>/dev/null || true
       echo "--- end output ---"
     fi
   fi
@@ -163,13 +163,13 @@ if [ -n "$FILE_SERVER_PID" ]; then
   export FIVENINES_AGENT_URL="http://127.0.0.1:${FILE_SERVER_PORT}/fivenines-agent-${BINARY_VARIANT}.tar.gz"
 fi
 
-if timeout 120 sh "${SCRIPTS_DIR}/fivenines_setup.sh" "test-token-ci-setup" > ${OUTPUT_DIR}/setup_output 2>&1; then
+if timeout 120 sh "${SCRIPTS_DIR}/fivenines_setup.sh" "test-token-ci-setup" > "${OUTPUT_DIR}/setup_output" 2>&1; then
   record_result "system-install" "PASS" ""
 else
   EXIT_CODE=$?
   record_result "system-install" "FAIL" "exit code $EXIT_CODE"
   echo "--- setup output ---"
-  cat ${OUTPUT_DIR}/setup_output 2>/dev/null || true
+  cat "${OUTPUT_DIR}/setup_output" 2>/dev/null || true
   echo "--- end output ---"
 fi
 
@@ -242,7 +242,7 @@ if [ -f "$TOKEN_FILE" ]; then
   TOKEN_BEFORE=$(cat "$TOKEN_FILE")
 fi
 
-if timeout 120 sh "${SCRIPTS_DIR}/fivenines_update.sh" > ${OUTPUT_DIR}/update_output 2>&1; then
+if timeout 120 sh "${SCRIPTS_DIR}/fivenines_update.sh" > "${OUTPUT_DIR}/update_output" 2>&1; then
   # Verify TOKEN preserved
   if [ -f "$TOKEN_FILE" ]; then
     TOKEN_AFTER=$(cat "$TOKEN_FILE")
@@ -257,7 +257,7 @@ if timeout 120 sh "${SCRIPTS_DIR}/fivenines_update.sh" > ${OUTPUT_DIR}/update_ou
 else
   record_result "system-update" "FAIL" "exit code $?"
   echo "--- update output ---"
-  cat ${OUTPUT_DIR}/update_output 2>/dev/null || true
+  cat "${OUTPUT_DIR}/update_output" 2>/dev/null || true
   echo "--- end output ---"
 fi
 
@@ -267,7 +267,7 @@ fi
 echo ""
 echo "=== Test 7: System uninstall ==="
 
-if timeout 120 sh "${SCRIPTS_DIR}/fivenines_uninstall.sh" > ${OUTPUT_DIR}/uninstall_output 2>&1; then
+if timeout 120 sh "${SCRIPTS_DIR}/fivenines_uninstall.sh" > "${OUTPUT_DIR}/uninstall_output" 2>&1; then
   # Verify cleanup
   if [ ! -d "/etc/fivenines_agent" ] || [ ! -d "$INSTALL_DIR" ]; then
     record_result "system-uninstall" "PASS" "cleaned up"
@@ -277,7 +277,7 @@ if timeout 120 sh "${SCRIPTS_DIR}/fivenines_uninstall.sh" > ${OUTPUT_DIR}/uninst
 else
   record_result "system-uninstall" "FAIL" "exit code $?"
   echo "--- uninstall output ---"
-  cat ${OUTPUT_DIR}/uninstall_output 2>/dev/null || true
+  cat "${OUTPUT_DIR}/uninstall_output" 2>/dev/null || true
   echo "--- end output ---"
 fi
 
@@ -312,12 +312,12 @@ if [ "$(id -u)" = "0" ] && id testuser > /dev/null 2>&1; then
     export FIVENINES_INSTALL_DIR='${USER_INSTALL_DIR}'
     export FIVENINES_CONFIG_DIR='${USER_CONFIG_DIR}'
     sh '${SCRIPTS_DIR}/fivenines_setup_user.sh' 'test-token-user-ci'
-  " > ${OUTPUT_DIR}/user_setup_output 2>&1; then
+  " > "${OUTPUT_DIR}/user_setup_output" 2>&1; then
     record_result "user-install" "PASS" ""
   else
     record_result "user-install" "FAIL" "exit code $?"
     echo "--- user setup output ---"
-    cat ${OUTPUT_DIR}/user_setup_output 2>/dev/null || true
+    cat "${OUTPUT_DIR}/user_setup_output" 2>/dev/null || true
     echo "--- end output ---"
   fi
 else
@@ -343,7 +343,7 @@ if [ "$(id -u)" = "0" ] && id testuser > /dev/null 2>&1 && [ -d "$USER_INSTALL_D
     export FIVENINES_INSTALL_DIR='${USER_INSTALL_DIR}'
     export FIVENINES_CONFIG_DIR='${USER_CONFIG_DIR}'
     sh '${SCRIPTS_DIR}/fivenines_update_user.sh'
-  " > ${OUTPUT_DIR}/user_update_output 2>&1; then
+  " > "${OUTPUT_DIR}/user_update_output" 2>&1; then
     # Verify TOKEN preserved
     if [ -f "$USER_TOKEN_FILE" ]; then
       USER_TOKEN_AFTER=$(cat "$USER_TOKEN_FILE")
@@ -358,7 +358,7 @@ if [ "$(id -u)" = "0" ] && id testuser > /dev/null 2>&1 && [ -d "$USER_INSTALL_D
   else
     record_result "user-update" "FAIL" "exit code $?"
     echo "--- user update output ---"
-    cat ${OUTPUT_DIR}/user_update_output 2>/dev/null || true
+    cat "${OUTPUT_DIR}/user_update_output" 2>/dev/null || true
     echo "--- end output ---"
   fi
 else
@@ -377,12 +377,12 @@ if [ "$(id -u)" = "0" ] && id testuser > /dev/null 2>&1 && [ -d "$USER_INSTALL_D
     export FIVENINES_INSTALL_DIR='${USER_INSTALL_DIR}'
     export FIVENINES_CONFIG_DIR='${USER_CONFIG_DIR}'
     sh '${SCRIPTS_DIR}/fivenines_uninstall_user.sh'
-  " > ${OUTPUT_DIR}/user_uninstall_output 2>&1; then
+  " > "${OUTPUT_DIR}/user_uninstall_output" 2>&1; then
     record_result "user-uninstall" "PASS" ""
   else
     record_result "user-uninstall" "FAIL" "exit code $?"
     echo "--- user uninstall output ---"
-    cat ${OUTPUT_DIR}/user_uninstall_output 2>/dev/null || true
+    cat "${OUTPUT_DIR}/user_uninstall_output" 2>/dev/null || true
     echo "--- end output ---"
   fi
 else
@@ -416,9 +416,9 @@ echo ""
   echo "|------|--------|--------|"
   printf '%b' "$RESULTS"
   echo ""
-} > ${OUTPUT_DIR}/test-results.md
+} > "${OUTPUT_DIR}/test-results.md"
 
-cat ${OUTPUT_DIR}/test-results.md
+cat "${OUTPUT_DIR}/test-results.md"
 
 # Exit with failure if any test failed
 if [ "$FAIL_COUNT" -gt 0 ]; then

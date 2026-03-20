@@ -31,8 +31,8 @@ exit_with_error() {
 }
 
 download_file() {
-    local url="$1"
-    local output="$2"
+    url="$1"
+    output="$2"
 
     if command -v wget > /dev/null 2>&1; then
         wget -q -T 10 "$url" -O "$output"
@@ -44,10 +44,10 @@ download_file() {
 }
 
 download_with_fallback() {
-    local filename="$1"
-    local output="$2"
-    local r2_url="${R2_BASE_URL}/${filename}"
-    local github_url="$3"
+    filename="$1"
+    output="$2"
+    r2_url="${R2_BASE_URL}/${filename}"
+    github_url="$3"
 
     print_warning "Downloading ${filename}..."
 
