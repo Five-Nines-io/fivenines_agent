@@ -48,7 +48,7 @@ allow init_t fivenines_agent_exec_t:file { getattr open read execute };
 allow fivenines_agent_t fivenines_agent_exec_t:file { entrypoint getattr open read execute execute_no_trans map ioctl };
 
 # Agent process permissions (fork, signal self, etc.)
-allow fivenines_agent_t self:process { fork signal signull sigchild sigkill getsched setsched setrlimit };
+allow fivenines_agent_t self:process { fork signal signull sigchld sigkill getsched setsched setrlimit };
 
 ########################################################################
 # Agent binary and libraries (PyInstaller onedir: /opt/fivenines/*)

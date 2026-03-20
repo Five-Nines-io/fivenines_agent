@@ -194,7 +194,7 @@ setup_selinux_contexts() {
 
   # Build and load module if selinux-policy-devel is available
   if [ -f /usr/share/selinux/devel/Makefile ]; then
-    ( cd "$SELINUX_TMP" && make -f /usr/share/selinux/devel/Makefile clean 2>/dev/null; make -f /usr/share/selinux/devel/Makefile 2>/dev/null )
+    ( cd "$SELINUX_TMP" && make -f /usr/share/selinux/devel/Makefile clean 2>/dev/null; make -f /usr/share/selinux/devel/Makefile )
     if [ -f "$SELINUX_TMP/fivenines_agent.pp" ]; then
       # Remove any existing module from ALL priorities to avoid typeattributeset errors
       # (a stale copy at priority 400 will override the new one at 100 and fail)
