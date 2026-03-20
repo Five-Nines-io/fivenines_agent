@@ -221,20 +221,12 @@ fi
 # Step 7: Copy agent tarball and scripts into VM
 # ---------------------------------------------------------------
 echo ""
-echo "=== Copying agent and scripts to VM ==="
-vm_run "mkdir -p /tmp/selinux"
+echo "=== Copying agent tarball and setup script to VM ==="
+# The tarball already contains selinux/ (bundled by CI build step)
 # shellcheck disable=SC2086
 scp $SCP_OPTS "$AGENT_TARBALL" testuser@127.0.0.1:/tmp/agent.tar.gz
 # shellcheck disable=SC2086
 scp $SCP_OPTS "$SCRIPTS_DIR/fivenines_setup.sh" testuser@127.0.0.1:/tmp/fivenines_setup.sh
-# shellcheck disable=SC2086
-scp $SCP_OPTS "$SCRIPTS_DIR/selinux/"*.te "$SCRIPTS_DIR/selinux/"*.fc testuser@127.0.0.1:/tmp/selinux/
-
-# Extract agent in the VM to simulate what setup would find
-vm_sudo "mkdir -p /opt/fivenines && tar -xzf /tmp/agent.tar.gz -C /opt/fivenines/"
-# Copy selinux directory into the agent bundle (mimics tarball bundling)
-AGENT_SUBDIR=$(vm_run "ls /opt/fivenines/ | head -1")
-vm_sudo "cp -r /tmp/selinux /opt/fivenines/$AGENT_SUBDIR/selinux"
 
 # ---------------------------------------------------------------
 # Step 8: Run the setup script
@@ -242,14 +234,19 @@ vm_sudo "cp -r /tmp/selinux /opt/fivenines/$AGENT_SUBDIR/selinux"
 echo ""
 echo "=== Test 2: Run setup script ==="
 
-# Pre-place the tarball where setup expects it
-vm_sudo "cp /tmp/agent.tar.gz /tmp/fivenines-agent-linux-amd64.tar.gz"
+# Start a simple HTTP server in the VM to serve the tarball (setup script uses wget)
+vm_run "cd /tmp && python3 -m http.server 8888 >/dev/null 2>&1 &"
+sleep 2
 
-# Run setup with a test token (non-test mode so SELinux code runs, but skip connectivity)
-# We need to skip the connectivity test and service start, but NOT skip SELinux
-# Use a modified approach: run setup but expect the service start to fail (no real agent binary for this arch maybe)
-SETUP_OUTPUT=$(vm_sudo "FIVENINES_AGENT_URL=file:///tmp/agent.tar.gz sh /tmp/fivenines_setup.sh test-token-selinux 2>&1" || true)
+# Run the full setup script pointing at the local HTTP server for the tarball download
+# The setup script handles extraction, user creation, SELinux setup, connectivity, and service start.
+# Connectivity test and service start will fail in the VM (no internet, no real systemd unit).
+# We capture output and check for SELinux success markers.
+SETUP_OUTPUT=$(vm_sudo "FIVENINES_AGENT_URL=http://127.0.0.1:8888/agent.tar.gz sh /tmp/fivenines_setup.sh test-token-selinux 2>&1" || true)
 echo "$SETUP_OUTPUT"
+
+# Kill the HTTP server
+vm_run "pkill -f 'http.server 8888'" || true
 
 if echo "$SETUP_OUTPUT" | grep -q "SELinux policy module fivenines_agent loaded"; then
   echo "[PASS] SELinux policy module loaded successfully"
@@ -320,7 +317,7 @@ echo ""
 echo "=== Test 5: Agent dry-run under SELinux ==="
 
 # Create a mock TOKEN
-vm_sudo "mkdir -p /etc/fivenines_agent && echo -n 'test-token' > /etc/fivenines_agent/TOKEN && chmod 600 /etc/fivenines_agent/TOKEN && chown root:root /etc/fivenines_agent/TOKEN"
+vm_sudo "sh -c 'mkdir -p /etc/fivenines_agent && echo -n test-token > /etc/fivenines_agent/TOKEN && chmod 600 /etc/fivenines_agent/TOKEN && chown root:root /etc/fivenines_agent/TOKEN'"
 
 # Try running the agent binary with --dry-run
 AGENT_BIN=$(vm_run "find /opt/fivenines -type f -name 'fivenines-agent-*' ! -name '*.so' | head -1")
