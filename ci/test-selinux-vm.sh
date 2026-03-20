@@ -222,12 +222,13 @@ fi
 # ---------------------------------------------------------------
 echo ""
 echo "=== Copying agent and scripts to VM ==="
+vm_run "mkdir -p /tmp/selinux"
 # shellcheck disable=SC2086
 scp $SCP_OPTS "$AGENT_TARBALL" testuser@127.0.0.1:/tmp/agent.tar.gz
 # shellcheck disable=SC2086
-scp -r $SCP_OPTS "$SCRIPTS_DIR/fivenines_setup.sh" testuser@127.0.0.1:/tmp/fivenines_setup.sh
+scp $SCP_OPTS "$SCRIPTS_DIR/fivenines_setup.sh" testuser@127.0.0.1:/tmp/fivenines_setup.sh
 # shellcheck disable=SC2086
-scp -r $SCP_OPTS "$SCRIPTS_DIR/selinux/" testuser@127.0.0.1:/tmp/selinux/
+scp $SCP_OPTS "$SCRIPTS_DIR/selinux/"*.te "$SCRIPTS_DIR/selinux/"*.fc testuser@127.0.0.1:/tmp/selinux/
 
 # Extract agent in the VM to simulate what setup would find
 vm_sudo "mkdir -p /opt/fivenines && tar -xzf /tmp/agent.tar.gz -C /opt/fivenines/"
