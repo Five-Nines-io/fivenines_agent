@@ -24,7 +24,7 @@ from fivenines_agent.debug import debug, log
 @debug('nginx_metrics')
 def nginx_metrics(status_page_url='http://127.0.0.1:8080/nginx_status'):
     try:
-      response = requests.get(status_page_url)
+      response = requests.get(status_page_url, timeout=5)
       if response.status_code != 200:
         return None
 
