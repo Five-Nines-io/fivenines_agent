@@ -101,6 +101,7 @@ jobs:
       - name: Fix permissions and create tarball (amd64)
         run: |
           sudo chown -R $(id -u):$(id -g) dist/
+          cp -r selinux/ dist/linux/fivenines-agent-linux-amd64/selinux/
           cd dist/linux
           tar -czvf fivenines-agent-linux-amd64.tar.gz fivenines-agent-linux-amd64/
           mv fivenines-agent-linux-amd64.tar.gz ../
@@ -168,6 +169,7 @@ jobs:
       - name: Fix permissions and create tarball (arm64)
         run: |
           sudo chown -R $(id -u):$(id -g) dist/
+          cp -r selinux/ dist/linux/fivenines-agent-linux-arm64/selinux/
           cd dist/linux
           tar -czvf fivenines-agent-linux-arm64.tar.gz fivenines-agent-linux-arm64/
           mv fivenines-agent-linux-arm64.tar.gz ../
@@ -235,6 +237,7 @@ jobs:
       - name: Fix permissions and create tarball (alpine-amd64)
         run: |
           sudo chown -R $(id -u):$(id -g) dist/
+          cp -r selinux/ dist/linux/fivenines-agent-alpine-amd64/selinux/
           cd dist/linux
           tar -czvf fivenines-agent-alpine-amd64.tar.gz fivenines-agent-alpine-amd64/
           mv fivenines-agent-alpine-amd64.tar.gz ../
@@ -302,6 +305,7 @@ jobs:
       - name: Fix permissions and create tarball (alpine-arm64)
         run: |
           sudo chown -R $(id -u):$(id -g) dist/
+          cp -r selinux/ dist/linux/fivenines-agent-alpine-arm64/selinux/
           cd dist/linux
           tar -czvf fivenines-agent-alpine-arm64.tar.gz fivenines-agent-alpine-arm64/
           mv fivenines-agent-alpine-arm64.tar.gz ../
@@ -413,7 +417,8 @@ jobs:
             fivenines_update_user.sh \
             fivenines_uninstall_user.sh \
             fivenines_common.sh \
-            ci/test-distro.sh
+            ci/test-distro.sh \
+            ci/test-selinux-vm.sh
 
       - name: Verify shared functions are in sync
         run: sh ci/build-scripts.sh --check || echo "Warning - shared functions out of sync (non-blocking)"
@@ -537,9 +542,64 @@ jobs:
           path: ${{ github.workspace }}/test-output/
           retention-days: 7
 
+  # SELinux integration test (RockyLinux 9 VM with SELinux Enforcing)
+  test-selinux-vm:
+    needs: [build-amd64]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Download artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: fivenines-agent-linux-amd64
+          path: artifacts
+
+      - name: Install QEMU and cloud-init tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq qemu-system-x86 qemu-utils genisoimage netcat-openbsd
+
+      - name: Enable KVM access
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo "KVM device found"
+            ls -la /dev/kvm
+            # GitHub Actions runner may not be in the kvm group
+            sudo chmod 666 /dev/kvm
+            echo "KVM permissions set"
+          else
+            echo "WARNING: /dev/kvm not available, test will be slow (no KVM acceleration)"
+          fi
+
+      - name: Download RockyLinux 9 cloud image
+        run: |
+          wget -q "https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud-Base.latest.x86_64.qcow2" \
+            -O /tmp/rocky9.qcow2
+          echo "Image size: $(du -h /tmp/rocky9.qcow2 | cut -f1)"
+
+      - name: Run SELinux VM test
+        run: |
+          bash ci/test-selinux-vm.sh
+        env:
+          AGENT_TARBALL: artifacts/fivenines-agent-linux-amd64.tar.gz
+          SCRIPTS_DIR: ${{ github.workspace }}
+          ROCKY_IMAGE: /tmp/rocky9.qcow2
+          VM_TIMEOUT: 600
+
+      - name: Upload VM logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: selinux-vm-test-logs
+          path: /tmp/vm-console.log
+          retention-days: 7
+
   # Pre-release for feature and release branches
   pre-release:
-    needs: [build-amd64, build-arm64, build-alpine-amd64, build-alpine-arm64, build-synology-amd64, build-synology-arm64, test-distro-matrix]
+    needs: [build-amd64, build-arm64, build-alpine-amd64, build-alpine-arm64, build-synology-amd64, build-synology-arm64, test-distro-matrix, test-selinux-vm]
     runs-on: ubuntu-latest
     if: |
       github.event_name == 'push' &&
@@ -658,7 +718,7 @@ jobs:
 
   # Production release for version tags
   release:
-    needs: [build-amd64, build-arm64, build-alpine-amd64, build-alpine-arm64, build-synology-amd64, build-synology-arm64, test-distro-matrix]
+    needs: [build-amd64, build-arm64, build-alpine-amd64, build-alpine-arm64, build-synology-amd64, build-synology-arm64, test-distro-matrix, test-selinux-vm]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:

@@ -1,0 +1,22 @@
+# File contexts for fivenines_agent (Rocky Linux / RHEL 8/9)
+# Build: make -f /usr/share/selinux/devel/Makefile
+# After semodule -i: restorecon -Rv /opt/fivenines /etc/fivenines_agent
+
+# Agent install directory and binary (PyInstaller onedir bundle)
+# NOTE: The entire tree gets _exec_t because the PyInstaller bundle needs
+# execute+map on its own bundled .so files. Fine-grained labeling is
+# impractical since the bundle structure changes per build.
+/opt/fivenines(/.*)?	--	system_u:object_r:fivenines_agent_exec_t:s0
+
+# Config directory (TOKEN file, .env)
+/etc/fivenines_agent(/.*)?	--	system_u:object_r:fivenines_agent_config_t:s0
+
+# Log file
+/var/log/fivenines-agent\.log	--	system_u:object_r:fivenines_agent_log_t:s0
+
+# Root user-install (~/.local/fivenines, ~/.config when running as root)
+/root/\.local/fivenines(/.*)?	--	system_u:object_r:fivenines_agent_config_t:s0
+/root/\.config/fivenines(/.*)?	--	system_u:object_r:fivenines_agent_config_t:s0
+
+# UNRAID / custom install path
+/boot/config/custom/fivenines_agent(/.*)?	--	system_u:object_r:fivenines_agent_exec_t:s0
