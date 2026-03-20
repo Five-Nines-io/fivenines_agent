@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Check for non-ASCII characters
         run: |
@@ -53,7 +53,7 @@ jobs:
       packages: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set image name (lowercase)
         id: image
@@ -62,10 +62,10 @@ jobs:
           echo "name=$IMAGE_NAME" >> $GITHUB_OUTPUT
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -73,14 +73,14 @@ jobs:
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
           tags: |
             type=raw,value=latest
 
       - name: Build and push Docker image (amd64)
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
@@ -106,7 +106,7 @@ jobs:
           mv fivenines-agent-linux-amd64.tar.gz ../
 
       - name: Upload artifact (amd64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: fivenines-agent-linux-amd64
           path: dist/fivenines-agent-linux-amd64.tar.gz
@@ -120,7 +120,7 @@ jobs:
       packages: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set image name (lowercase)
         id: image
@@ -129,10 +129,10 @@ jobs:
           echo "name=$IMAGE_NAME" >> $GITHUB_OUTPUT
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -140,14 +140,14 @@ jobs:
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
           tags: |
             type=raw,value=latest
 
       - name: Build and push Docker image (arm64)
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile.arm
@@ -173,7 +173,7 @@ jobs:
           mv fivenines-agent-linux-arm64.tar.gz ../
 
       - name: Upload artifact (arm64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: fivenines-agent-linux-arm64
           path: dist/fivenines-agent-linux-arm64.tar.gz
@@ -187,7 +187,7 @@ jobs:
       packages: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set image name (lowercase)
         id: image
@@ -196,10 +196,10 @@ jobs:
           echo "name=$IMAGE_NAME" >> $GITHUB_OUTPUT
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -207,14 +207,14 @@ jobs:
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
           tags: |
             type=raw,value=latest
 
       - name: Build and push Docker image (alpine-amd64)
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile.alpine
@@ -240,7 +240,7 @@ jobs:
           mv fivenines-agent-alpine-amd64.tar.gz ../
 
       - name: Upload artifact (alpine-amd64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: fivenines-agent-alpine-amd64
           path: dist/fivenines-agent-alpine-amd64.tar.gz
@@ -254,7 +254,7 @@ jobs:
       packages: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set image name (lowercase)
         id: image
@@ -263,10 +263,10 @@ jobs:
           echo "name=$IMAGE_NAME" >> $GITHUB_OUTPUT
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -274,14 +274,14 @@ jobs:
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
           tags: |
             type=raw,value=latest
 
       - name: Build and push Docker image (alpine-arm64)
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile.alpine-arm
@@ -307,7 +307,7 @@ jobs:
           mv fivenines-agent-alpine-arm64.tar.gz ../
 
       - name: Upload artifact (alpine-arm64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: fivenines-agent-alpine-arm64
           path: dist/fivenines-agent-alpine-arm64.tar.gz
@@ -321,7 +321,7 @@ jobs:
       packages: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
@@ -347,7 +347,7 @@ jobs:
           bash synology/build_spk.sh "$VERSION" x86_64
 
       - name: Upload artifact (synology-amd64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: fivenines-agent-synology-amd64
           path: dist/synology/fivenines-agent-*-x86_64.spk
@@ -361,7 +361,7 @@ jobs:
       packages: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
@@ -387,15 +387,159 @@ jobs:
           bash synology/build_spk.sh "$VERSION" aarch64
 
       - name: Upload artifact (synology-arm64)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: fivenines-agent-synology-arm64
           path: dist/synology/fivenines-agent-*-aarch64.spk
           retention-days: 7
 
+  # Verify install scripts are valid shell
+  shellcheck-scripts:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install shellcheck
+        run: sudo apt-get install -y shellcheck
+
+      - name: Run shellcheck on install scripts
+        run: |
+          shellcheck -s sh -e SC2034 \
+            fivenines_setup.sh \
+            fivenines_update.sh \
+            fivenines_uninstall.sh \
+            fivenines_setup_user.sh \
+            fivenines_update_user.sh \
+            fivenines_uninstall_user.sh \
+            fivenines_common.sh \
+            ci/test-distro.sh
+
+      - name: Verify shared functions are in sync
+        run: sh ci/build-scripts.sh --check || echo "Warning - shared functions out of sync (non-blocking)"
+
+  # Distro regression testing
+  test-distro-matrix:
+    needs: [build-amd64, build-arm64, build-alpine-amd64, build-alpine-arm64]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # linux-amd64 (glibc) distros
+          - distro: centos:7
+            binary: linux-amd64
+            runner: ubuntu-latest
+            skip_ldd: "0"
+          - distro: ubuntu:20.04
+            binary: linux-amd64
+            runner: ubuntu-latest
+            skip_ldd: "0"
+          - distro: ubuntu:22.04
+            binary: linux-amd64
+            runner: ubuntu-latest
+            skip_ldd: "0"
+          - distro: debian:11
+            binary: linux-amd64
+            runner: ubuntu-latest
+            skip_ldd: "0"
+          - distro: debian:12
+            binary: linux-amd64
+            runner: ubuntu-latest
+            skip_ldd: "0"
+          - distro: rockylinux:9
+            binary: linux-amd64
+            runner: ubuntu-latest
+            skip_ldd: "0"
+          - distro: fedora:latest
+            binary: linux-amd64
+            runner: ubuntu-latest
+            skip_ldd: "0"
+          # linux-arm64 (glibc) distros
+          - distro: ubuntu:22.04
+            binary: linux-arm64
+            runner: ubuntu-24.04-arm
+            skip_ldd: "0"
+          - distro: debian:12
+            binary: linux-arm64
+            runner: ubuntu-24.04-arm
+            skip_ldd: "0"
+          - distro: rockylinux:9
+            binary: linux-arm64
+            runner: ubuntu-24.04-arm
+            skip_ldd: "0"
+          # alpine-amd64 (musl) distros
+          # Note: Alpine 3.18 removed - binary requires musl pwritev2 (Alpine 3.19+)
+          - distro: alpine:3.21
+            binary: alpine-amd64
+            runner: ubuntu-latest
+            skip_ldd: "1"
+          # alpine-arm64 (musl) distros
+          - distro: alpine:3.21
+            binary: alpine-arm64
+            runner: ubuntu-24.04-arm
+            skip_ldd: "1"
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Download artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: fivenines-agent-${{ matrix.binary }}
+          path: artifacts
+
+      - name: Extract artifact
+        run: |
+          mkdir -p agent
+          tar -xzf artifacts/fivenines-agent-${{ matrix.binary }}.tar.gz -C agent/
+
+      - name: Report binary size
+        run: |
+          BINARY_PATH="agent/fivenines-agent-${{ matrix.binary }}/fivenines-agent-${{ matrix.binary }}"
+          SIZE_BYTES=$(stat -c '%s' "$BINARY_PATH" 2>/dev/null || stat -f '%z' "$BINARY_PATH")
+          SIZE_MB=$(echo "scale=2; $SIZE_BYTES / 1048576" | bc)
+          echo "### Binary Size: fivenines-agent-${{ matrix.binary }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Variant | Size |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|------|" >> $GITHUB_STEP_SUMMARY
+          echo "| fivenines-agent-${{ matrix.binary }} | ${SIZE_MB} MB (${SIZE_BYTES} bytes) |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      - name: Run distro tests
+        run: |
+          mkdir -p ${{ github.workspace }}/test-output
+          docker run --rm \
+            -v ${{ github.workspace }}/agent:/agent:ro \
+            -v ${{ github.workspace }}:/scripts:ro \
+            -v ${{ github.workspace }}/test-output:/test-output \
+            -e BINARY_VARIANT="${{ matrix.binary }}" \
+            -e AGENT_DIR="/agent" \
+            -e SCRIPTS_DIR="/scripts" \
+            -e SKIP_LDD="${{ matrix.skip_ldd }}" \
+            -e FIVENINES_TEST_MODE=1 \
+            -e TEST_OUTPUT_DIR="/test-output" \
+            ${{ matrix.distro }} \
+            sh /scripts/ci/test-distro.sh
+
+      - name: Append test results to step summary
+        if: always()
+        run: |
+          if [ -f ${{ github.workspace }}/test-output/test-results.md ]; then
+            cat ${{ github.workspace }}/test-output/test-results.md >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: test-logs-${{ matrix.binary }}-${{ strategy.job-index }}
+          path: ${{ github.workspace }}/test-output/
+          retention-days: 7
+
   # Pre-release for feature and release branches
   pre-release:
-    needs: [build-amd64, build-arm64, build-alpine-amd64, build-alpine-arm64, build-synology-amd64, build-synology-arm64]
+    needs: [build-amd64, build-arm64, build-alpine-amd64, build-alpine-arm64, build-synology-amd64, build-synology-arm64, test-distro-matrix]
     runs-on: ubuntu-latest
     if: |
       github.event_name == 'push' &&
@@ -405,10 +549,10 @@ jobs:
       contents: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: artifacts
 
@@ -514,17 +658,17 @@ jobs:
 
   # Production release for version tags
   release:
-    needs: [build-amd64, build-arm64, build-alpine-amd64, build-alpine-arm64, build-synology-amd64, build-synology-arm64]
+    needs: [build-amd64, build-arm64, build-alpine-amd64, build-alpine-arm64, build-synology-amd64, build-synology-arm64, test-distro-matrix]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: artifacts
 
@@ -566,10 +710,10 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: artifacts
 
@@ -624,11 +768,11 @@ jobs:
       - name: Sync to R2
         run: |
           # Upload to /latest/ (always the most recent release)
-          rclone sync r2-upload/latest/ r2:${{ secrets.R2_BUCKET_NAME }}/latest/ --s3-no-check-bucket --verbose
+          rclone sync r2-upload/latest/ r2:${{ secrets.R2_BUCKET_NAME }}/latest/ --s3-no-check-bucket --verbose --header-upload "Cache-Control: no-cache, must-revalidate"
 
           # Also upload to versioned path for reference
           VERSION="${GITHUB_REF#refs/tags/}"
-          rclone sync r2-upload/latest/ r2:${{ secrets.R2_BUCKET_NAME }}/${VERSION}/ --s3-no-check-bucket --verbose
+          rclone sync r2-upload/latest/ r2:${{ secrets.R2_BUCKET_NAME }}/${VERSION}/ --s3-no-check-bucket --verbose --header-upload "Cache-Control: max-age=31536000, immutable"
 
           echo "Files synced to R2:"
           echo "  - https://releases.fivenines.io/latest/fivenines-agent-linux-amd64.tar.gz"
@@ -639,3 +783,15 @@ jobs:
           echo "  - https://releases.fivenines.io/latest/fivenines-agent.service"
           echo "  - https://releases.fivenines.io/latest/fivenines-agent.openrc"
           echo "  - https://releases.fivenines.io/latest/fivenines_script.sh"
+
+      - name: Purge Cloudflare cache for /latest/
+        run: |
+          FILES_JSON=$(ls r2-upload/latest/ | jq -R '"https://releases.fivenines.io/latest/" + .' | jq -s '{"files": .}')
+          curl -sf -X POST \
+            "https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/purge_cache" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data "$FILES_JSON"
+        env:
+          CLOUDFLARE_ZONE_ID: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

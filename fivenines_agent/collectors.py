@@ -8,6 +8,7 @@ from fivenines_agent.debug import log, start_log_capture, stop_log_capture
 from fivenines_agent.docker import docker_metrics
 from fivenines_agent.fail2ban import fail2ban_metrics
 from fivenines_agent.fans import fans
+from fivenines_agent.gpu import gpu_metrics
 from fivenines_agent.io import io
 from fivenines_agent.memory import memory, swap
 from fivenines_agent.network import network
@@ -70,6 +71,7 @@ COLLECTORS = [
     ("ports", [("ports", listening_ports, True)]),
     ("temperatures", [("temperatures", temperatures, False)]),
     ("fans", [("fans", fans, False)]),
+    ("nvidia_gpu", [("nvidia_gpu", gpu_metrics, False)]),
     ("redis", [("redis", redis_metrics, True)]),
     ("nginx", [("nginx", nginx_metrics, True)]),
     ("docker", [("docker", docker_metrics, True)]),

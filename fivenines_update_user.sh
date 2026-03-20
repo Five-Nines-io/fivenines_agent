@@ -47,8 +47,8 @@ exit_with_error() {
 }
 
 download_file() {
-    local url="$1"
-    local output="$2"
+    url="$1"
+    output="$2"
 
     if command -v wget > /dev/null 2>&1; then
         wget -q -T 10 "$url" -O "$output"
@@ -60,10 +60,10 @@ download_file() {
 }
 
 download_with_fallback() {
-    local filename="$1"
-    local output="$2"
-    local r2_url="${R2_BASE_URL}/${filename}"
-    local github_url="${GITHUB_RELEASES_URL}/${filename}"
+    filename="$1"
+    output="$2"
+    r2_url="${R2_BASE_URL}/${filename}"
+    github_url="${GITHUB_RELEASES_URL}/${filename}"
 
     # Try R2 first (IPv6 compatible)
     if download_file "$r2_url" "$output" 2>/dev/null; then
@@ -94,6 +94,11 @@ detect_libc() {
         echo "glibc"
     fi
 }
+
+# Test mode: skip network calls and service management for CI testing
+if [ "${FIVENINES_TEST_MODE:-}" = "1" ]; then
+  print_warning "WARNING: Test mode enabled - skipping agent stop/start"
+fi
 
 echo ""
 printf '%b\n' "${BLUE}===============================================================${NC}"
@@ -149,22 +154,28 @@ fi
 
 print_success "Architecture: $ARCH, libc: $LIBC_TYPE"
 
-# Stop the agent if running
-echo "Stopping agent..."
-if [ -f "$INSTALL_DIR/stop.sh" ]; then
-    "$INSTALL_DIR/stop.sh" 2>/dev/null || true
+# Stop the agent if running (skip in test mode)
+if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
+  echo "Stopping agent..."
+  if [ -f "$INSTALL_DIR/stop.sh" ]; then
+      "$INSTALL_DIR/stop.sh" 2>/dev/null || true
+  else
+      pkill -f "$BINARY_NAME" 2>/dev/null || true
+  fi
+  sleep 1
+  print_success "Agent stopped"
 else
-    pkill -f "$BINARY_NAME" 2>/dev/null || true
+  print_warning "Skipping agent stop (test mode)"
 fi
-sleep 1
-print_success "Agent stopped"
 
 # Download new version
 echo "Downloading latest version..."
 TARBALL_NAME="${BINARY_NAME}.tar.gz"
 TARBALL_PATH="/tmp/${TARBALL_NAME}"
 
-if [ -n "${FIVENINES_AGENT_URL:-}" ]; then
+if [ "${FIVENINES_TEST_MODE:-}" = "1" ] && [ -f "$TARBALL_PATH" ]; then
+    print_warning "Using pre-placed tarball at $TARBALL_PATH (test mode)"
+elif [ -n "${FIVENINES_AGENT_URL:-}" ]; then
     print_warning "Using custom agent URL: $FIVENINES_AGENT_URL"
     download_file "$FIVENINES_AGENT_URL" "$TARBALL_PATH" || exit_with_error "Failed to download from custom URL"
     print_success "Downloaded from custom URL"
@@ -180,29 +191,33 @@ fi
 
 # Extract new version
 tar -xzf "$TARBALL_PATH" -C "$INSTALL_DIR" || exit_with_error "Extraction failed"
-rm -f "$TARBALL_PATH"
+rm -f "$TARBALL_PATH" 2>/dev/null || true
 chmod +x "$INSTALL_DIR/$BINARY_NAME/$BINARY_NAME"
 print_success "Updated agent binary"
 
 # Remove backup
 rm -rf "$INSTALL_DIR/${BINARY_NAME}.old" 2>/dev/null || true
 
-# Start the agent
-echo "Starting agent..."
-if [ -f "$INSTALL_DIR/start.sh" ]; then
-    "$INSTALL_DIR/start.sh"
-else
-    export CONFIG_DIR="$CONFIG_DIR"
-    nohup "$INSTALL_DIR/$BINARY_NAME/$BINARY_NAME" >> "$INSTALL_DIR/agent.log" 2>&1 &
-    echo "Agent started (PID: $!)"
-fi
+# Start the agent (skip in test mode)
+if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
+  echo "Starting agent..."
+  if [ -f "$INSTALL_DIR/start.sh" ]; then
+      "$INSTALL_DIR/start.sh"
+  else
+      export CONFIG_DIR="$CONFIG_DIR"
+      nohup "$INSTALL_DIR/$BINARY_NAME/$BINARY_NAME" >> "$INSTALL_DIR/agent.log" 2>&1 &
+      echo "Agent started (PID: $!)"
+  fi
 
-sleep 2
+  sleep 2
 
-if pgrep -f "$BINARY_NAME" > /dev/null; then
-    print_success "Agent is running"
+  if pgrep -f "$BINARY_NAME" > /dev/null; then
+      print_success "Agent is running"
+  else
+      print_warning "Agent may have failed to start. Check: $INSTALL_DIR/logs.sh"
+  fi
 else
-    print_warning "Agent may have failed to start. Check: $INSTALL_DIR/logs.sh"
+  print_warning "Skipping agent start (test mode)"
 fi
 
 echo ""

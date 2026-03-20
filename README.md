@@ -113,6 +113,7 @@ The agent works without sudo, but these features will be unavailable (this is al
 | Docker containers | `docker` group membership |
 | QEMU/KVM VMs | `libvirt` group membership |
 | ZFS pools | ZFS delegation or permissions |
+| NVIDIA GPU metrics | NVIDIA driver + pynvml library |
 
 ### Capabilities by Permission Level
 
@@ -131,6 +132,7 @@ The agent works without sudo, but these features will be unavailable (this is al
 **May Work Without Sudo/Root:**
 - Hardware temperatures (depends on `/sys/class/hwmon` permissions)
 - Fan speeds (depends on `/sys/class/hwmon` permissions)
+- NVIDIA GPU metrics (requires NVIDIA driver and pynvml library)
 
 **Requires Group Membership:**
 - Docker: Add `fivenines` user to `docker` group
@@ -181,6 +183,7 @@ When the agent starts, it displays a banner showing which features are available
   Hardware Sensors:
     [OK] Temperatures
     [X] Fans (no accessible sensors)
+    [-] Gpu (requires: NVIDIA driver)
 
   Storage:
     [X] Smart Storage (requires: sudo smartctl)

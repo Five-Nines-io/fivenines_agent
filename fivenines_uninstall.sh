@@ -11,54 +11,64 @@ detect_system() {
   fi
 }
 
+# Test mode: skip service management for CI testing
+if [ "${FIVENINES_TEST_MODE:-}" = "1" ]; then
+  echo "WARNING: Test mode enabled - skipping service management"
+fi
+
 SYSTEM_TYPE=$(detect_system)
 
-if [ "$SYSTEM_TYPE" = "openrc" ]; then
-  # OpenRC: Stop the service
-  if rc-service fivenines-agent status >/dev/null 2>&1; then
-    echo "Stopping fivenines-agent service..."
-    sudo rc-service fivenines-agent stop
+# Service management (skip in test mode)
+if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
+  if [ "$SYSTEM_TYPE" = "openrc" ]; then
+    # OpenRC: Stop the service
+    if rc-service fivenines-agent status >/dev/null 2>&1; then
+      echo "Stopping fivenines-agent service..."
+      sudo rc-service fivenines-agent stop
+    else
+      echo "fivenines-agent service is not running."
+    fi
+
+    # OpenRC: Remove from default runlevel
+    if rc-update show default | grep -q fivenines-agent; then
+      echo "Removing fivenines-agent from default runlevel..."
+      sudo rc-update del fivenines-agent default
+    fi
+
+    # OpenRC: Remove the init script
+    if [ -f /etc/init.d/fivenines-agent ]; then
+      echo "Removing fivenines-agent init script..."
+      sudo rm /etc/init.d/fivenines-agent
+    fi
   else
-    echo "fivenines-agent service is not running."
-  fi
+    # systemd: Stop the service
+    if systemctl is-active --quiet fivenines-agent.service; then
+      echo "Stopping fivenines-agent service..."
+      sudo systemctl stop fivenines-agent.service
+    else
+      echo "fivenines-agent service is not running."
+    fi
 
-  # OpenRC: Remove from default runlevel
-  if rc-update show default | grep -q fivenines-agent; then
-    echo "Removing fivenines-agent from default runlevel..."
-    sudo rc-update del fivenines-agent default
-  fi
+    # systemd: Disable the service
+    if systemctl is-enabled --quiet fivenines-agent.service; then
+      echo "Disabling fivenines-agent service..."
+      sudo systemctl disable fivenines-agent.service
+    else
+      echo "fivenines-agent service is not enabled."
+    fi
 
-  # OpenRC: Remove the init script
-  if [ -f /etc/init.d/fivenines-agent ]; then
-    echo "Removing fivenines-agent init script..."
-    sudo rm /etc/init.d/fivenines-agent
+    # systemd: Remove the service file
+    if [ -f /etc/systemd/system/fivenines-agent.service ]; then
+      echo "Removing fivenines-agent.service file..."
+      sudo rm /etc/systemd/system/fivenines-agent.service
+    fi
+
+    # systemd: Reload daemon
+    echo "Reloading systemd daemon..."
+    sudo systemctl daemon-reload
   fi
 else
-  # systemd: Stop the service
-  if systemctl is-active --quiet fivenines-agent.service; then
-    echo "Stopping fivenines-agent service..."
-    sudo systemctl stop fivenines-agent.service
-  else
-    echo "fivenines-agent service is not running."
-  fi
-
-  # systemd: Disable the service
-  if systemctl is-enabled --quiet fivenines-agent.service; then
-    echo "Disabling fivenines-agent service..."
-    sudo systemctl disable fivenines-agent.service
-  else
-    echo "fivenines-agent service is not enabled."
-  fi
-
-  # systemd: Remove the service file
-  if [ -f /etc/systemd/system/fivenines-agent.service ]; then
-    echo "Removing fivenines-agent.service file..."
-    sudo rm /etc/systemd/system/fivenines-agent.service
-  fi
-
-  # systemd: Reload daemon
-  echo "Reloading systemd daemon..."
-  sudo systemctl daemon-reload
+  echo "Skipping service management (test mode)"
 fi
 
 # Uninstall fivenines_agent (legacy pipx)
@@ -90,6 +100,6 @@ else
   echo "System user fivenines does not exist."
 fi
 
-rm fivenines_uninstall.sh
+rm -f fivenines_uninstall.sh 2>/dev/null || true
 
 echo "fivenines agent uninstallation complete."

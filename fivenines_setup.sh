@@ -42,10 +42,10 @@ print_error() {
 }
 
 download_with_fallback() {
-  local filename="$1"
-  local output="$2"
-  local r2_url="${R2_BASE_URL}/${filename}"
-  local github_url="$3"
+  filename="$1"
+  output="$2"
+  r2_url="${R2_BASE_URL}/${filename}"
+  github_url="$3"
 
   print_warning "Downloading ${filename}..."
 
@@ -138,9 +138,7 @@ setup_systemd() {
   systemctl enable fivenines-agent.service
 
   # Start the fivenines-agent
-  systemctl start fivenines-agent
-
-  if [ $? -ne 0 ]; then
+  if ! systemctl start fivenines-agent; then
     exit_with_contact "Failed to start the fivenines-agent service. Check the system logs for more information."
   fi
 
@@ -185,14 +183,17 @@ setup_openrc() {
   rc-update add fivenines-agent default
 
   # Start the agent
-  rc-service fivenines-agent start
-
-  if [ $? -ne 0 ]; then
+  if ! rc-service fivenines-agent start; then
     exit_with_contact "Failed to start the fivenines-agent service. Check /var/log/fivenines-agent.log for details."
   fi
 
   print_success "OpenRC service installed and started successfully"
 }
+
+# Test mode: skip network calls and service management for CI testing
+if [ "${FIVENINES_TEST_MODE:-}" = "1" ]; then
+  print_warning "WARNING: Test mode enabled - skipping network checks and service management"
+fi
 
 # Main execution starts here
 print_banner
@@ -249,12 +250,12 @@ mkdir -p /etc/fivenines_agent
 # Save the client token in appropriate location
 if [ "$SYSTEM_TYPE" = "unraid" ]; then
   mkdir -p /boot/config/custom/fivenines_agent
-  echo -n "$1" | tee /boot/config/custom/fivenines_agent/TOKEN > /dev/null
+  printf '%s' "$1" | tee /boot/config/custom/fivenines_agent/TOKEN > /dev/null
   chown fivenines:fivenines /boot/config/custom/fivenines_agent/TOKEN
   chmod 600 /boot/config/custom/fivenines_agent/TOKEN
 else
   # Use standard location for other systems
-  echo -n "$1" | tee /etc/fivenines_agent/TOKEN > /dev/null
+  printf '%s' "$1" | tee /etc/fivenines_agent/TOKEN > /dev/null
   chown fivenines:fivenines /etc/fivenines_agent/TOKEN
   chmod 600 /etc/fivenines_agent/TOKEN
 fi
@@ -294,7 +295,9 @@ TARBALL_PATH="/tmp/${TARBALL_NAME}"
 AGENT_DIR="${INSTALL_DIR}/${BINARY_NAME}"
 AGENT_EXECUTABLE="${AGENT_DIR}/${BINARY_NAME}"
 
-if [ -n "${FIVENINES_AGENT_URL:-}" ]; then
+if [ "${FIVENINES_TEST_MODE:-}" = "1" ] && [ -f "$TARBALL_PATH" ]; then
+  print_warning "Using pre-placed tarball at $TARBALL_PATH (test mode)"
+elif [ -n "${FIVENINES_AGENT_URL:-}" ]; then
   print_warning "Using custom agent URL: $FIVENINES_AGENT_URL"
   wget -T 10 -q "$FIVENINES_AGENT_URL" -O "$TARBALL_PATH" || exit_with_contact "Failed to download from custom URL"
   print_success "Downloaded from custom URL"
@@ -336,32 +339,40 @@ fi
 print_success "Agent installed successfully at $AGENT_DIR"
 
 
-# Test connectivity
-echo "Testing connectivity..."
-for host in asia.fivenines.io eu.fivenines.io us.fivenines.io api.fivenines.io; do
-  if ping -c 1 -W 5 "$host" >/dev/null 2>&1; then
-    print_success "Connected to $host"
-  else
-    exit_with_contact "Ping to $host failed or timed out. Check your network connection."
-  fi
-done
-echo ""
+# Test connectivity (skip in test mode)
+if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
+  echo "Testing connectivity..."
+  for host in asia.fivenines.io eu.fivenines.io us.fivenines.io api.fivenines.io; do
+    if ping -c 1 -W 5 "$host" >/dev/null 2>&1; then
+      print_success "Connected to $host"
+    else
+      exit_with_contact "Ping to $host failed or timed out. Check your network connection."
+    fi
+  done
+  echo ""
+else
+  print_warning "Skipping connectivity test (test mode)"
+fi
 
-# Setup based on system type
-case "$SYSTEM_TYPE" in
-  "unraid")
-    setup_unraid "$1"
-    ;;
-  "openrc")
-    setup_openrc
-    ;;
-  "systemd")
-    setup_systemd
-    ;;
-  *)
-    exit_with_contact "Unsupported system type: $SYSTEM_TYPE. This script supports systemd, OpenRC, and UNRAID systems."
-    ;;
-esac
+# Setup based on system type (skip service management in test mode)
+if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
+  case "$SYSTEM_TYPE" in
+    "unraid")
+      setup_unraid "$1"
+      ;;
+    "openrc")
+      setup_openrc
+      ;;
+    "systemd")
+      setup_systemd
+      ;;
+    *)
+      exit_with_contact "Unsupported system type: $SYSTEM_TYPE. This script supports systemd, OpenRC, and UNRAID systems."
+      ;;
+  esac
+else
+  print_warning "Skipping service setup (test mode)"
+fi
 
 # Final output
 echo ""

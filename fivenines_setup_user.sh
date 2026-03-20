@@ -92,8 +92,8 @@ check_requirements() {
 }
 
 download_file() {
-    local url="$1"
-    local output="$2"
+    url="$1"
+    output="$2"
 
     if [ "$DOWNLOADER" = "wget" ]; then
         wget -q -T 10 "$url" -O "$output"
@@ -103,10 +103,10 @@ download_file() {
 }
 
 download_with_fallback() {
-    local filename="$1"
-    local output="$2"
-    local r2_url="${R2_BASE_URL}/${filename}"
-    local github_url="${GITHUB_RELEASES_URL}/${filename}"
+    filename="$1"
+    output="$2"
+    r2_url="${R2_BASE_URL}/${filename}"
+    github_url="${GITHUB_RELEASES_URL}/${filename}"
 
     # Try R2 first (IPv6 compatible)
     if download_file "$r2_url" "$output" 2>/dev/null; then
@@ -182,10 +182,10 @@ create_directories() {
 }
 
 save_token() {
-    local token="$1"
+    token="$1"
 
     echo "Saving token..."
-    echo -n "$token" > "$CONFIG_DIR/TOKEN"
+    printf '%s' "$token" > "$CONFIG_DIR/TOKEN"
     chmod 600 "$CONFIG_DIR/TOKEN"
     print_success "Token saved securely"
     echo ""
@@ -194,16 +194,18 @@ save_token() {
 download_agent() {
     echo "Downloading agent..."
 
-    local tarball_name="${BINARY_NAME}.tar.gz"
-    local tarball_path="/tmp/${tarball_name}"
+    tarball_name="${BINARY_NAME}.tar.gz"
+    tarball_path="/tmp/${tarball_name}"
 
     # Remove old installation if exists
     if [ -d "$INSTALL_DIR/$BINARY_NAME" ]; then
-        rm -rf "$INSTALL_DIR/$BINARY_NAME"
+        rm -rf "${INSTALL_DIR:?}/${BINARY_NAME:?}"
     fi
 
     # Use custom URL if provided, otherwise use fallback mechanism
-    if [ -n "${FIVENINES_AGENT_URL:-}" ]; then
+    if [ "${FIVENINES_TEST_MODE:-}" = "1" ] && [ -f "$tarball_path" ]; then
+        print_warning "Using pre-placed tarball at $tarball_path (test mode)"
+    elif [ -n "${FIVENINES_AGENT_URL:-}" ]; then
         print_warning "Using custom agent URL: $FIVENINES_AGENT_URL"
         download_file "$FIVENINES_AGENT_URL" "$tarball_path" || exit_with_error "Failed to download agent from custom URL"
         print_success "Downloaded from custom URL"
@@ -214,7 +216,7 @@ download_agent() {
     tar -xzf "$tarball_path" -C "$INSTALL_DIR" || exit_with_error "Failed to extract agent"
     print_success "Extracted to $INSTALL_DIR"
 
-    rm -f "$tarball_path"
+    rm -f "$tarball_path" 2>/dev/null || true
 
     # Make executable
     chmod +x "$INSTALL_DIR/$BINARY_NAME/$BINARY_NAME"
@@ -226,7 +228,7 @@ download_agent() {
 test_connectivity() {
     echo "Testing connectivity..."
 
-    local connected=false
+    connected=false
 
     for host in api.fivenines.io eu.fivenines.io us.fivenines.io; do
         if ping -c 1 -W 3 "$host" > /dev/null 2>&1; then
@@ -386,6 +388,11 @@ print_final_instructions() {
     echo ""
 }
 
+# Test mode: skip network calls and service management for CI testing
+if [ "${FIVENINES_TEST_MODE:-}" = "1" ]; then
+  print_warning "WARNING: Test mode enabled - skipping network checks and agent startup"
+fi
+
 # Main execution
 print_banner
 
@@ -408,10 +415,18 @@ check_requirements
 detect_architecture
 create_directories
 save_token "$TOKEN"
-test_connectivity
+if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
+  test_connectivity
+else
+  print_warning "Skipping connectivity test (test mode)"
+fi
 download_agent
 create_run_script
-start_agent
+if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
+  start_agent
+else
+  print_warning "Skipping agent startup (test mode)"
+fi
 print_final_instructions
 
 # Clean up script

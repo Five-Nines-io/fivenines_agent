@@ -290,7 +290,7 @@ PYI_BASE=(
 if [ -n "${SYNOLOGY:-}" ]; then
     PYI_EXTRA=(--exclude-module libvirt --exclude-module libvirtmod --exclude-module systemd_watchdog --exclude-module proxmoxer)
 else
-    PYI_EXTRA=(--hidden-import=libvirt --hidden-import=libvirtmod --hidden-import=proxmoxer.backends --hidden-import=proxmoxer.backends.https --add-binary "/usr/lib64/libtirpc.so.3:.")
+    PYI_EXTRA=(--hidden-import=libvirt --hidden-import=libvirtmod --hidden-import=proxmoxer.backends --hidden-import=proxmoxer.backends.https --hidden-import=pynvml --add-binary "/usr/lib64/libtirpc.so.3:.")
 fi
 
 LD_LIBRARY_PATH="/opt/python/cp39-cp39/lib:$LD_LIBRARY_PATH" poetry run pyinstaller \
