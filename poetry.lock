@@ -1561,6 +1561,18 @@ dev = ["abi3audit", "black", "check-manifest", "coverage", "packaging", "psleak"
 test = ["psleak", "pytest", "pytest-instafail", "pytest-xdist", "setuptools"]
 
 [[package]]
+name = "pyasn1"
+version = "0.6.3"
+description = "Pure-Python implementation of ASN.1 types and DER/BER/CER codecs (X.208)"
+optional = false
+python-versions = ">=3.8"
+groups = ["main"]
+files = [
+    {file = "pyasn1-0.6.3-py3-none-any.whl", hash = "sha256:a80184d120f0864a52a073acc6fc642847d0be408e7c7252f31390c0f4eadcde"},
+    {file = "pyasn1-0.6.3.tar.gz", hash = "sha256:697a8ecd6d98891189184ca1fa05d1bb00e2f84b5977c481452050549c8a72cf"},
+]
+
+[[package]]
 name = "pycparser"
 version = "2.23"
 description = "C parser in Python"
@@ -1655,6 +1667,58 @@ files = [
     {file = "pyproject_hooks-1.2.0-py3-none-any.whl", hash = "sha256:9e5c6bfa8dcc30091c74b0cf803c81fdd29d94f01992a7707bc97babb1141913"},
     {file = "pyproject_hooks-1.2.0.tar.gz", hash = "sha256:1e859bd5c40fae9448642dd871adf459e5e2084186e8d2c2a79a824c970da1f8"},
 ]
+
+[[package]]
+name = "pysnmp"
+version = "7.1.21"
+description = "A Python library for SNMP"
+optional = false
+python-versions = ">=3.9"
+groups = ["main"]
+markers = "python_version == \"3.9\""
+files = [
+    {file = "pysnmp-7.1.21-py3-none-any.whl", hash = "sha256:e3fed6eab479a4ec7baf8fa1583666ce46401cf1c3ce3c4e2b0be55e5d454c75"},
+    {file = "pysnmp-7.1.21.tar.gz", hash = "sha256:d5fa54cf2021af1c93a439eec66ce716fc8df425c55ecc7ed5bca9f35e8145b2"},
+]
+
+[package.dependencies]
+pyasn1 = ">=0.4.8,<0.5.0 || >0.5.0"
+
+[package.extras]
+dev = ["Sphinx (>=7.0.0,<8.0.0)", "bump2version (>=1.0.1)", "codecov (>=2.1.12)", "cryptography (>=44.0.1)", "doc8 (>=1.0.0)", "flake8 (>=7.0.0)", "furo (>=2023.1.1)", "jinja2 (>=3.1.6)", "pep8-naming (>=0.14.1)", "pre-commit (==2.21.0)", "pysmi (>=1.6.1)", "pytest (>=7.2.0)", "pytest-asyncio (>=0.21.1)", "pytest-codecov (>=0.4.0)", "pytest-cov (>=4.1.0)", "ruff (>=0.11.7)", "sphinx-copybutton (>=0.5.2)", "sphinx-notfound-page (>=1.0.0)", "sphinx-polyversion (>=1.0.0)", "sphinx-sitemap-lextudio (>=2.5.2)"]
+
+[[package]]
+name = "pysnmp"
+version = "7.1.22"
+description = "A Python library for SNMP"
+optional = false
+python-versions = ">=3.10"
+groups = ["main"]
+markers = "python_version >= \"3.10\""
+files = [
+    {file = "pysnmp-7.1.22-py3-none-any.whl", hash = "sha256:57e704a6ba2bbf571d16cd5dc08b89bb3fa0ebeb5f4f26b87fececad3b3de7a6"},
+    {file = "pysnmp-7.1.22.tar.gz", hash = "sha256:37ac595c7f0c1c00514505939b4dcf5b4fd5a9ffe51b0349f60bb640c11b0f77"},
+]
+
+[package.dependencies]
+pyasn1 = ">=0.4.8,<0.5.0 || >0.5.0"
+
+[package.extras]
+dev = ["Sphinx (>=7.0.0,<8.0.0)", "bump2version (>=1.0.1)", "codecov (>=2.1.12)", "cryptography (>=44.0.1)", "doc8 (>=1.0.0)", "flake8 (>=7.0.0)", "furo (>=2023.1.1)", "jinja2 (>=3.1.6)", "pep8-naming (>=0.14.1)", "pre-commit (==2.21.0)", "pysmi (>=1.6.1)", "pytest (>=7.2.0)", "pytest-asyncio (>=0.21.1)", "pytest-codecov (>=0.4.0)", "pytest-cov (>=4.1.0)", "ruff (>=0.11.7)", "sphinx-copybutton (>=0.5.2)", "sphinx-notfound-page (>=1.0.0)", "sphinx-polyversion (>=1.0.0)", "sphinx-sitemap-lextudio (>=2.5.2)"]
+
+[[package]]
+name = "pysnmp-sync-adapter"
+version = "1.0.8"
+description = "Lightweight Synchronous wrapper adapters for PySNMP AsyncIO HLAPI"
+optional = false
+python-versions = ">=3.7"
+groups = ["main"]
+files = [
+    {file = "pysnmp_sync_adapter-1.0.8.tar.gz", hash = "sha256:b8d77c30ec703ac6cc2c6f4f905ccb7218bcac6fd120f5f574af94ddaaf568f6"},
+]
+
+[package.dependencies]
+pysnmp = ">=7.0.0"
 
 [[package]]
 name = "pytest"
@@ -2414,4 +2478,4 @@ cffi = ["cffi (>=1.17,<2.0) ; platform_python_implementation != \"PyPy\" and pyt
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.9,<3.14"
-content-hash = "7e258a1ccfaa146e7f466a0f6f1a7c1b09a1498b8d7a4a40bd584ce4b0656a7d"
+content-hash = "7086bdb283a8d95fd49ec66b036020938437c48c911f9ef35d0ba6ff3a21a35c"
