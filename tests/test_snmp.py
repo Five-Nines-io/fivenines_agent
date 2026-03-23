@@ -489,10 +489,7 @@ class TestPollAll:
                 "fivenines_agent.snmp.ThreadPoolExecutor"
             ) as mock_executor_cls:
                 mock_executor = MagicMock()
-                mock_executor_cls.return_value.__enter__ = MagicMock(
-                    return_value=mock_executor
-                )
-                mock_executor_cls.return_value.__exit__ = MagicMock(return_value=False)
+                mock_executor_cls.return_value = mock_executor
 
                 mock_future = MagicMock()
                 mock_future.result.side_effect = FuturesTimeoutError()

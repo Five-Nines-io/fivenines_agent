@@ -207,7 +207,8 @@ class SNMPCollector:
         workers = min(len(due_targets), MAX_WORKERS)
 
         try:
-            with ThreadPoolExecutor(max_workers=workers) as executor:
+            executor = ThreadPoolExecutor(max_workers=workers)
+            try:
                 futures = {
                     executor.submit(
                         self._poll_device, target, sessions[target["device_id"]]
@@ -256,6 +257,10 @@ class SNMPCollector:
 
                     # Update last poll time regardless of outcome
                     SNMPCollector._last_poll_times[device_id] = time.monotonic()
+            finally:
+                # Don't wait for stuck workers — pysnmp timeout is the
+                # primary mechanism; this is the safety net.
+                executor.shutdown(wait=False)
         except Exception as e:
             log("SNMP ThreadPoolExecutor error: {}".format(e), "error")
 
@@ -434,6 +439,7 @@ class SNMPCollector:
             dict with sys_name, sys_descr, sys_uptime or None on error
         """
         from pysnmp.hlapi.v3arch.asyncio import (
+            ContextData,
             ObjectIdentity,
             ObjectType,
             SnmpEngine,
@@ -445,6 +451,7 @@ class SNMPCollector:
                 engine,
                 auth,
                 transport,
+                ContextData(),
                 ObjectType(ObjectIdentity(OID_SYS_NAME)),
                 ObjectType(ObjectIdentity(OID_SYS_DESCR)),
                 ObjectType(ObjectIdentity(OID_SYS_UPTIME)),
@@ -488,6 +495,7 @@ class SNMPCollector:
             list of interface dicts or None on error
         """
         from pysnmp.hlapi.v3arch.asyncio import (
+            ContextData,
             ObjectIdentity,
             ObjectType,
             SnmpEngine,
@@ -496,8 +504,10 @@ class SNMPCollector:
         try:
             engine = SnmpEngine()
             interfaces = {}
+            ctx = ContextData()
 
             # Walk ifTable for basic info (ifIndex, ifType, ifAdminStatus, ifOperStatus)
+            iftable_error = None
             for oid_prefix, field_name, converter in [
                 (OID_IF_INDEX, "if_index", int),
                 (OID_IF_TYPE, "if_type", int),
@@ -508,9 +518,16 @@ class SNMPCollector:
                     engine,
                     auth,
                     transport,
+                    ctx,
                     ObjectType(ObjectIdentity(oid_prefix)),
                 ):
-                    if error_indication or error_status:
+                    if error_indication:
+                        iftable_error = str(error_indication)
+                        break
+                    if error_status:
+                        iftable_error = "SNMP error: {}".format(
+                            error_status.prettyPrint()
+                        )
                         break
                     for oid, val in var_binds:
                         # Extract ifIndex from OID suffix
@@ -524,6 +541,10 @@ class SNMPCollector:
                         except (ValueError, TypeError):
                             pass
 
+            # If ifTable walk failed entirely, raise so _poll_device surfaces it
+            if iftable_error and not interfaces:
+                raise Exception("IF-MIB walk failed: {}".format(iftable_error))
+
             # Walk ifXTable for extended info (ifName, ifAlias, ifHighSpeed)
             for oid_prefix, field_name, converter in [
                 (OID_IF_NAME, "if_name", str),
@@ -534,6 +555,7 @@ class SNMPCollector:
                     engine,
                     auth,
                     transport,
+                    ctx,
                     ObjectType(ObjectIdentity(oid_prefix)),
                 ):
                     if error_indication or error_status:
@@ -573,12 +595,14 @@ class SNMPCollector:
             tuple: (list of counter dicts, hc_counters: bool)
         """
         from pysnmp.hlapi.v3arch.asyncio import (
+            ContextData,
             ObjectIdentity,
             ObjectType,
             SnmpEngine,
         )
 
         engine = SnmpEngine()
+        ctx = ContextData()
         counters = {idx: {"if_index": idx} for idx in if_indexes}
         hc_counters = False
 
@@ -589,6 +613,7 @@ class SNMPCollector:
                 engine,
                 auth,
                 transport,
+                ctx,
                 ObjectType(ObjectIdentity(OID_IF_HC_IN_OCTETS)),
             ):
                 if error_indication or error_status:
@@ -617,6 +642,7 @@ class SNMPCollector:
                     engine,
                     auth,
                     transport,
+                    ctx,
                     ObjectType(ObjectIdentity(OID_IF_HC_OUT_OCTETS)),
                 ):
                     if error_indication or error_status:
@@ -639,6 +665,7 @@ class SNMPCollector:
                         engine,
                         auth,
                         transport,
+                        ctx,
                         ObjectType(ObjectIdentity(oid_prefix)),
                     ):
                         if error_indication or error_status:
@@ -669,6 +696,7 @@ class SNMPCollector:
                     engine,
                     auth,
                     transport,
+                    ctx,
                     ObjectType(ObjectIdentity(oid_prefix)),
                 ):
                     if error_indication or error_status:
