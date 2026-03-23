@@ -390,6 +390,7 @@ class SNMPCollector:
         """Async implementation of device polling.
 
         All SNMP operations run under a single event loop here.
+        Walks each table only once and extracts all fields in a single pass.
         """
         from pysnmp.hlapi.v3arch.asyncio import (
             ContextData,
@@ -413,7 +414,6 @@ class SNMPCollector:
                 if err_ind or err_st:
                     yield err_ind, err_st, err_idx, var_binds
                     return
-                # Check if OIDs are still within our subtree
                 filtered = []
                 out_of_subtree = False
                 for oid, val in var_binds:
@@ -439,22 +439,16 @@ class SNMPCollector:
             if system is not None:
                 result["system"] = system
 
-        # Poll interfaces
+        # Poll interfaces: single pass over ifTable + ifXTable
         if "if_table" in capabilities:
-            interfaces = await self._async_poll_interfaces(
-                engine, auth, transport, ctx, _subtree_walk, ObjectIdentity, ObjectType
+            ifaces, counters, hc = await self._async_poll_all_interfaces(
+                engine, auth, transport, ctx, _subtree_walk,
+                ObjectIdentity, ObjectType
             )
-            if interfaces is not None:
-                result["interfaces"] = interfaces
-
-                if_indexes = [iface["if_index"] for iface in interfaces]
-                if if_indexes:
-                    counters, hc = await self._async_poll_counters(
-                        engine, auth, transport, ctx, _subtree_walk,
-                        ObjectIdentity, ObjectType, if_indexes
-                    )
-                    result["interface_metrics"] = counters
-                    result["hc_counters"] = hc
+            if ifaces is not None:
+                result["interfaces"] = ifaces
+                result["interface_metrics"] = counters
+                result["hc_counters"] = hc
 
         return result
 
@@ -499,44 +493,55 @@ class SNMPCollector:
 
         return result
 
-    async def _async_poll_interfaces(
-        self, engine, auth, transport, ctx, walk_cmd, ObjectIdentity, ObjectType
+    async def _async_poll_all_interfaces(
+        self, engine, auth, transport, ctx, walk_cmd,
+        ObjectIdentity, ObjectType
     ):
-        """Poll interface table metadata (ifTable + ifXTable).
+        """Poll all interface data in two walks: ifTable once, ifXTable once.
 
-        Uses single walks of the entire ifTable and ifXTable subtrees
-        instead of per-column walks (19 walks -> 2 walks).
+        Extracts metadata (type, status) AND counters from each walk,
+        avoiding the previous approach of walking each table twice.
+
+        Returns:
+            tuple: (interfaces_list, counters_list, hc_counters_bool)
         """
         interfaces = {}
+        counters = {}
+        hc_counters = False
 
-        # Map ifTable column OIDs to field names and converters
-        # OID format: 1.3.6.1.2.1.2.2.1.<column>.<ifIndex>
+        # --- Single walk of ifTable ---
+        # Extracts metadata + 32-bit counters in one pass
         IF_TABLE_PREFIX = "1.3.6.1.2.1.2.2.1"
-        iftable_columns = {
-            "1": ("if_index", int),
-            "3": ("if_type", int),
-            "7": ("if_admin_status", lambda v: max(0, int(v) - 1)),
-            "8": ("if_oper_status", lambda v: max(0, int(v) - 1)),
+        iftable_fields = {
+            # Metadata
+            "1": ("meta", "if_index", int),
+            "3": ("meta", "if_type", int),
+            "7": ("meta", "if_admin_status", lambda v: max(0, int(v) - 1)),
+            "8": ("meta", "if_oper_status", lambda v: max(0, int(v) - 1)),
+            # Counters (32-bit)
+            "10": ("counter", "bytes_in", int),
+            "11": ("counter", "packets_in", int),
+            "13": ("counter", "discards_in", int),
+            "14": ("counter", "errors_in", int),
+            "16": ("counter", "bytes_out", int),
+            "17": ("counter", "packets_out", int),
+            "19": ("counter", "discards_out", int),
+            "20": ("counter", "errors_out", int),
         }
 
-        # Single walk of entire ifTable
         iftable_error = None
-        async for error_indication, error_status, error_index, var_binds in walk_cmd(
+        async for err_ind, err_st, err_idx, var_binds in walk_cmd(
             engine, auth, transport, ctx,
             ObjectType(ObjectIdentity(IF_TABLE_PREFIX)), IF_TABLE_PREFIX,
         ):
-            if error_indication:
-                iftable_error = str(error_indication)
+            if err_ind:
+                iftable_error = str(err_ind)
                 break
-            if error_status:
-                iftable_error = "SNMP error: {}".format(
-                    error_status.prettyPrint()
-                )
+            if err_st:
+                iftable_error = "SNMP error: {}".format(err_st.prettyPrint())
                 break
             for oid, val in var_binds:
                 oid_str = str(oid)
-                # Parse column and ifIndex from OID
-                # e.g. 1.3.6.1.2.1.2.2.1.3.1 -> column=3, if_index=1
                 suffix = oid_str[len(IF_TABLE_PREFIX) + 1:]
                 parts = suffix.split(".", 1)
                 if len(parts) != 2:
@@ -546,83 +551,41 @@ class SNMPCollector:
                     if_index = int(if_index_str)
                 except (ValueError, TypeError):
                     continue
-                if column in iftable_columns:
-                    field_name, converter = iftable_columns[column]
+                if column not in iftable_fields:
+                    continue
+                bucket, field_name, converter = iftable_fields[column]
+                try:
+                    value = converter(val)
+                except (ValueError, TypeError):
+                    continue
+                if bucket == "meta":
                     if if_index not in interfaces:
                         interfaces[if_index] = {"if_index": if_index}
-                    try:
-                        interfaces[if_index][field_name] = converter(val)
-                    except (ValueError, TypeError):
-                        pass
+                    interfaces[if_index][field_name] = value
+                else:
+                    if if_index not in counters:
+                        counters[if_index] = {"if_index": if_index}
+                    counters[if_index][field_name] = value
 
         if iftable_error:
             raise Exception("IF-MIB walk failed: {}".format(iftable_error))
 
-        # Single walk of entire ifXTable (may not be supported)
-        # OID format: 1.3.6.1.2.1.31.1.1.1.<column>.<ifIndex>
+        # --- Single walk of ifXTable ---
+        # Extracts names, speed, HC counters, and broadcast in one pass
         IF_XTABLE_PREFIX = "1.3.6.1.2.1.31.1.1.1"
-        ifxtable_columns = {
-            "1": ("if_name", str),
-            "18": ("if_alias", str),
-            "15": ("if_speed", lambda v: int(v) * 1000000),
+        ifxtable_fields = {
+            # Metadata
+            "1": ("meta", "if_name", str),
+            "18": ("meta", "if_alias", str),
+            "15": ("meta", "if_speed", lambda v: int(v) * 1000000),
+            # HC counters (64-bit)
+            "6": ("hc", "bytes_in", int),
+            "10": ("hc", "bytes_out", int),
+            # Broadcast
+            "3": ("counter", "broadcast_in", int),
+            "5": ("counter", "broadcast_out", int),
         }
 
-        async for error_indication, error_status, error_index, var_binds in walk_cmd(
-            engine, auth, transport, ctx,
-            ObjectType(ObjectIdentity(IF_XTABLE_PREFIX)), IF_XTABLE_PREFIX,
-        ):
-            if error_indication or error_status:
-                break
-            for oid, val in var_binds:
-                oid_str = str(oid)
-                suffix = oid_str[len(IF_XTABLE_PREFIX) + 1:]
-                parts = suffix.split(".", 1)
-                if len(parts) != 2:
-                    continue
-                column, if_index_str = parts
-                try:
-                    if_index = int(if_index_str)
-                except (ValueError, TypeError):
-                    continue
-                if column in ifxtable_columns and if_index in interfaces:
-                    field_name, converter = ifxtable_columns[column]
-                    try:
-                        interfaces[if_index][field_name] = converter(val)
-                    except (ValueError, TypeError):
-                        pass
-
-        # Fill defaults for missing ifXTable fields
-        for iface in interfaces.values():
-            iface.setdefault("if_name", "")
-            iface.setdefault("if_alias", "")
-            iface.setdefault("if_speed", 0)
-
-        return list(interfaces.values())
-
-    async def _async_poll_counters(
-        self, engine, auth, transport, ctx, walk_cmd,
-        ObjectIdentity, ObjectType, if_indexes
-    ):
-        """Poll interface counters, preferring 64-bit HC counters.
-
-        Tries a single walk of ifXTable for HC counters first.
-        Falls back to a single walk of ifTable for all 32-bit counters.
-        This is 1-2 walks instead of 12+ per-column walks.
-        """
-        counters = {idx: {"if_index": idx} for idx in if_indexes}
-        hc_counters = False
-
-        # Map ifXTable columns for HC counters + broadcast
-        # OID: 1.3.6.1.2.1.31.1.1.1.<column>.<ifIndex>
-        IF_XTABLE_PREFIX = "1.3.6.1.2.1.31.1.1.1"
-        hc_columns = {
-            "6": "bytes_in",       # ifHCInOctets
-            "10": "bytes_out",     # ifHCOutOctets
-            "3": "broadcast_in",   # ifInBroadcastPkts
-            "5": "broadcast_out",  # ifOutBroadcastPkts (corrected from spec: actually column 5)
-        }
-
-        # Try single walk of ifXTable for HC counters
         hc_data = {}
         hc_supported = True
         try:
@@ -648,61 +611,43 @@ class SNMPCollector:
                         if_index = int(if_index_str)
                     except (ValueError, TypeError):
                         continue
-                    if column in hc_columns and if_index in counters:
+                    if column not in ifxtable_fields:
+                        continue
+                    bucket, field_name, converter = ifxtable_fields[column]
+                    try:
+                        value = converter(val)
+                    except (ValueError, TypeError):
+                        continue
+                    if bucket == "meta" and if_index in interfaces:
+                        interfaces[if_index][field_name] = value
+                    elif bucket == "hc":
                         hc_data.setdefault(if_index, {})
-                        hc_data[if_index][hc_columns[column]] = int(val)
+                        hc_data[if_index][field_name] = value
+                    elif bucket == "counter" and if_index in counters:
+                        counters[if_index][field_name] = value
                 if not hc_supported:
                     break
         except Exception:
             hc_supported = False
 
+        # Apply HC counters (override 32-bit bytes_in/bytes_out)
         if hc_supported and hc_data:
             hc_counters = True
             for idx, fields in hc_data.items():
-                counters[idx].update(fields)
+                if idx in counters:
+                    counters[idx].update(fields)
 
-        # Single walk of ifTable for remaining counters (and bytes if no HC)
-        # OID: 1.3.6.1.2.1.2.2.1.<column>.<ifIndex>
-        IF_TABLE_PREFIX = "1.3.6.1.2.1.2.2.1"
-        iftable_counter_columns = {
-            "11": "packets_in",    # ifInUcastPkts
-            "13": "discards_in",   # ifInDiscards
-            "14": "errors_in",     # ifInErrors
-            "17": "packets_out",   # ifOutUcastPkts
-            "19": "discards_out",  # ifOutDiscards
-            "20": "errors_out",    # ifOutErrors
-        }
-        if not hc_counters:
-            iftable_counter_columns["10"] = "bytes_in"   # ifInOctets
-            iftable_counter_columns["16"] = "bytes_out"  # ifOutOctets
+        # Fill defaults for missing fields
+        for iface in interfaces.values():
+            iface.setdefault("if_name", "")
+            iface.setdefault("if_alias", "")
+            iface.setdefault("if_speed", 0)
 
-        try:
-            async for err_ind, err_st, err_idx, var_binds in walk_cmd(
-                engine, auth, transport, ctx,
-                ObjectType(ObjectIdentity(IF_TABLE_PREFIX)), IF_TABLE_PREFIX,
-            ):
-                if err_ind or err_st:
-                    break
-                for oid, val in var_binds:
-                    oid_str = str(oid)
-                    suffix = oid_str[len(IF_TABLE_PREFIX) + 1:]
-                    parts = suffix.split(".", 1)
-                    if len(parts) != 2:
-                        continue
-                    column, if_index_str = parts
-                    try:
-                        if_index = int(if_index_str)
-                    except (ValueError, TypeError):
-                        continue
-                    if column in iftable_counter_columns and if_index in counters:
-                        try:
-                            counters[if_index][iftable_counter_columns[column]] = int(val)
-                        except (ValueError, TypeError):
-                            pass
-        except Exception:
-            pass
+        # Ensure counters exist for all discovered interfaces
+        for if_index in interfaces:
+            if if_index not in counters:
+                counters[if_index] = {"if_index": if_index}
 
-        # Fill defaults
         for idx in counters:
             counters[idx].setdefault("bytes_in", 0)
             counters[idx].setdefault("bytes_out", 0)
@@ -715,4 +660,4 @@ class SNMPCollector:
             counters[idx].setdefault("broadcast_in", 0)
             counters[idx].setdefault("broadcast_out", 0)
 
-        return (list(counters.values()), hc_counters)
+        return (list(interfaces.values()), list(counters.values()), hc_counters)

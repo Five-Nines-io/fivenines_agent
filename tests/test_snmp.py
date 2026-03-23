@@ -332,14 +332,14 @@ class TestPollDevice:
         auth_result = (MagicMock(), None)
 
         mock_async_poll_system = AsyncMock(return_value={"sys_name": "X"})
-        mock_async_poll_interfaces = AsyncMock(return_value=[])
+        mock_async_poll_all = AsyncMock(return_value=([], [], False))
 
         with patch.object(SNMPCollector, "_async_poll_system", mock_async_poll_system):
-            with patch.object(SNMPCollector, "_async_poll_interfaces", mock_async_poll_interfaces):
+            with patch.object(SNMPCollector, "_async_poll_all_interfaces", mock_async_poll_all):
                 result = collector._poll_device(target, auth_result)
 
         mock_async_poll_system.assert_called_once()
-        mock_async_poll_interfaces.assert_not_called()
+        mock_async_poll_all.assert_not_called()
         assert "system" in result
         assert "interfaces" not in result
 
@@ -352,13 +352,13 @@ class TestPollDevice:
         auth_result = (MagicMock(), None)
 
         mock_async_poll_system = AsyncMock(return_value={"sys_name": "X"})
-        mock_async_poll_interfaces = AsyncMock(return_value=[{"if_index": 1}])
-        mock_async_poll_counters = AsyncMock(return_value=([], False))
+        mock_async_poll_all = AsyncMock(
+            return_value=([{"if_index": 1}], [{"if_index": 1, "bytes_in": 0}], False)
+        )
 
         with patch.object(SNMPCollector, "_async_poll_system", mock_async_poll_system):
-            with patch.object(SNMPCollector, "_async_poll_interfaces", mock_async_poll_interfaces):
-                with patch.object(SNMPCollector, "_async_poll_counters", mock_async_poll_counters):
-                    result = collector._poll_device(target, auth_result)
+            with patch.object(SNMPCollector, "_async_poll_all_interfaces", mock_async_poll_all):
+                result = collector._poll_device(target, auth_result)
 
         mock_async_poll_system.assert_not_called()
         assert "system" not in result
@@ -729,152 +729,114 @@ class TestPollSystemDirect:
             )
 
 
-class TestPollInterfacesDirect:
-    """Tests for _async_poll_interfaces with mocked pysnmp responses."""
+class TestPollAllInterfacesDirect:
+    """Tests for _async_poll_all_interfaces with mocked pysnmp responses."""
 
-    def test_poll_interfaces_returns_list(self):
-        """Interface poll returns list of interface dicts."""
+    def test_poll_all_interfaces_returns_tuple(self):
+        """Combined poll returns (interfaces, counters, hc_bool) tuple."""
         from fivenines_agent.snmp import SNMPCollector
 
         collector = SNMPCollector([_make_target()])
 
-        mock_async_poll_interfaces = AsyncMock(
-            return_value=[
-                {
-                    "if_index": 1,
-                    "if_name": "eth0",
-                    "if_alias": "Uplink",
-                    "if_type": 6,
-                    "if_speed": 1000000000,
-                    "if_admin_status": 0,
-                    "if_oper_status": 0,
-                }
-            ]
+        mock_result = (
+            [{"if_index": 1, "if_name": "eth0", "if_type": 6,
+              "if_speed": 1000000000, "if_admin_status": 0, "if_oper_status": 0,
+              "if_alias": "Uplink"}],
+            [{"if_index": 1, "bytes_in": 1000, "bytes_out": 500}],
+            True,
         )
+        mock_poll_all = AsyncMock(return_value=mock_result)
 
-        with patch.object(SNMPCollector, "_async_poll_interfaces", mock_async_poll_interfaces):
-            result = asyncio.run(
-                collector._async_poll_interfaces(
+        with patch.object(SNMPCollector, "_async_poll_all_interfaces", mock_poll_all):
+            ifaces, counters, hc = asyncio.run(
+                collector._async_poll_all_interfaces(
                     MagicMock(), MagicMock(), MagicMock(), MagicMock(),
                     MagicMock, MagicMock, MagicMock,
                 )
             )
 
-        assert len(result) == 1
-        assert result[0]["if_index"] == 1
-        assert result[0]["if_name"] == "eth0"
-        assert result[0]["if_speed"] == 1000000000
-        assert result[0]["if_admin_status"] == 0  # 0-indexed
+        assert len(ifaces) == 1
+        assert ifaces[0]["if_index"] == 1
+        assert ifaces[0]["if_name"] == "eth0"
+        assert ifaces[0]["if_speed"] == 1000000000
+        assert ifaces[0]["if_admin_status"] == 0
+        assert len(counters) == 1
+        assert hc is True
 
-    def test_poll_interfaces_empty(self):
-        """Empty interface table returns empty list."""
+    def test_poll_all_interfaces_empty(self):
+        """Empty interface table returns empty lists."""
         from fivenines_agent.snmp import SNMPCollector
 
         collector = SNMPCollector([_make_target()])
 
-        mock_async_poll_interfaces = AsyncMock(return_value=[])
+        mock_poll_all = AsyncMock(return_value=([], [], False))
 
-        with patch.object(SNMPCollector, "_async_poll_interfaces", mock_async_poll_interfaces):
-            result = asyncio.run(
-                collector._async_poll_interfaces(
+        with patch.object(SNMPCollector, "_async_poll_all_interfaces", mock_poll_all):
+            ifaces, counters, hc = asyncio.run(
+                collector._async_poll_all_interfaces(
                     MagicMock(), MagicMock(), MagicMock(), MagicMock(),
                     MagicMock, MagicMock, MagicMock,
                 )
             )
 
-        assert result == []
+        assert ifaces == []
+        assert counters == []
+        assert hc is False
 
-    def test_poll_interfaces_no_ifxtable(self):
-        """Missing ifXTable still returns interfaces with defaults."""
+    def test_poll_all_interfaces_no_ifxtable_defaults(self):
+        """Missing ifXTable fills defaults for name, alias, speed."""
         from fivenines_agent.snmp import SNMPCollector
 
         collector = SNMPCollector([_make_target()])
 
-        # Interface without ifXTable fields gets defaults
-        mock_async_poll_interfaces = AsyncMock(
-            return_value=[
-                {
-                    "if_index": 1,
-                    "if_type": 6,
-                    "if_admin_status": 0,
-                    "if_oper_status": 0,
-                    "if_name": "",
-                    "if_alias": "",
-                    "if_speed": 0,
-                }
-            ]
+        mock_result = (
+            [{"if_index": 1, "if_type": 6, "if_admin_status": 0,
+              "if_oper_status": 0, "if_name": "", "if_alias": "", "if_speed": 0}],
+            [{"if_index": 1, "bytes_in": 100, "bytes_out": 50}],
+            False,
         )
+        mock_poll_all = AsyncMock(return_value=mock_result)
 
-        with patch.object(SNMPCollector, "_async_poll_interfaces", mock_async_poll_interfaces):
-            result = asyncio.run(
-                collector._async_poll_interfaces(
+        with patch.object(SNMPCollector, "_async_poll_all_interfaces", mock_poll_all):
+            ifaces, counters, hc = asyncio.run(
+                collector._async_poll_all_interfaces(
                     MagicMock(), MagicMock(), MagicMock(), MagicMock(),
                     MagicMock, MagicMock, MagicMock,
                 )
             )
 
-        assert result[0]["if_name"] == ""
-        assert result[0]["if_alias"] == ""
-        assert result[0]["if_speed"] == 0
+        assert ifaces[0]["if_name"] == ""
+        assert ifaces[0]["if_alias"] == ""
+        assert ifaces[0]["if_speed"] == 0
+        assert hc is False
 
-
-class TestPollCountersDirect:
-    """Tests for _async_poll_counters with mocked pysnmp responses."""
-
-    def test_poll_counters_hc_available(self):
-        """64-bit HC counters used when available."""
+    def test_poll_all_interfaces_hc_counters(self):
+        """64-bit HC counters override 32-bit when available."""
         from fivenines_agent.snmp import SNMPCollector
 
         collector = SNMPCollector([_make_target()])
 
-        mock_counters = [
-            {
-                "if_index": 1,
-                "bytes_in": 1000000000,
-                "bytes_out": 500000000,
-                "packets_in": 1000000,
-                "packets_out": 500000,
-                "errors_in": 0,
-                "errors_out": 0,
-                "discards_in": 0,
-                "discards_out": 0,
-                "broadcast_in": 5000,
-                "broadcast_out": 2000,
-            }
-        ]
+        mock_result = (
+            [{"if_index": 1, "if_type": 6}],
+            [{"if_index": 1, "bytes_in": 1000000000, "bytes_out": 500000000,
+              "packets_in": 1000000, "packets_out": 500000,
+              "errors_in": 0, "errors_out": 0,
+              "discards_in": 0, "discards_out": 0,
+              "broadcast_in": 5000, "broadcast_out": 2000}],
+            True,
+        )
+        mock_poll_all = AsyncMock(return_value=mock_result)
 
-        mock_async_poll_counters = AsyncMock(return_value=(mock_counters, True))
-
-        with patch.object(SNMPCollector, "_async_poll_counters", mock_async_poll_counters):
-            result, hc = asyncio.run(
-                collector._async_poll_counters(
+        with patch.object(SNMPCollector, "_async_poll_all_interfaces", mock_poll_all):
+            ifaces, counters, hc = asyncio.run(
+                collector._async_poll_all_interfaces(
                     MagicMock(), MagicMock(), MagicMock(), MagicMock(),
-                    MagicMock, MagicMock, MagicMock, [1],
+                    MagicMock, MagicMock, MagicMock,
                 )
             )
 
         assert hc is True
-        assert result[0]["bytes_in"] == 1000000000
-
-    def test_poll_counters_hc_fallback(self):
-        """Falls back to 32-bit counters when HC not available."""
-        from fivenines_agent.snmp import SNMPCollector
-
-        collector = SNMPCollector([_make_target()])
-
-        mock_counters = [{"if_index": 1, "bytes_in": 100, "bytes_out": 50}]
-
-        mock_async_poll_counters = AsyncMock(return_value=(mock_counters, False))
-
-        with patch.object(SNMPCollector, "_async_poll_counters", mock_async_poll_counters):
-            result, hc = asyncio.run(
-                collector._async_poll_counters(
-                    MagicMock(), MagicMock(), MagicMock(), MagicMock(),
-                    MagicMock, MagicMock, MagicMock, [1],
-                )
-            )
-
-        assert hc is False
+        assert counters[0]["bytes_in"] == 1000000000
 
 
 class TestDryRunIntegration:
