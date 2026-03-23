@@ -502,33 +502,52 @@ class SNMPCollector:
     async def _async_poll_interfaces(
         self, engine, auth, transport, ctx, walk_cmd, ObjectIdentity, ObjectType
     ):
-        """Poll interface table metadata (ifTable + ifXTable)."""
+        """Poll interface table metadata (ifTable + ifXTable).
+
+        Uses single walks of the entire ifTable and ifXTable subtrees
+        instead of per-column walks (19 walks -> 2 walks).
+        """
         interfaces = {}
 
-        # Walk ifTable for basic info
+        # Map ifTable column OIDs to field names and converters
+        # OID format: 1.3.6.1.2.1.2.2.1.<column>.<ifIndex>
+        IF_TABLE_PREFIX = "1.3.6.1.2.1.2.2.1"
+        iftable_columns = {
+            "1": ("if_index", int),
+            "3": ("if_type", int),
+            "7": ("if_admin_status", lambda v: max(0, int(v) - 1)),
+            "8": ("if_oper_status", lambda v: max(0, int(v) - 1)),
+        }
+
+        # Single walk of entire ifTable
         iftable_error = None
-        for oid_prefix, field_name, converter in [
-            (OID_IF_INDEX, "if_index", int),
-            (OID_IF_TYPE, "if_type", int),
-            (OID_IF_ADMIN_STATUS, "if_admin_status", lambda v: max(0, int(v) - 1)),
-            (OID_IF_OPER_STATUS, "if_oper_status", lambda v: max(0, int(v) - 1)),
-        ]:
-            async for error_indication, error_status, error_index, var_binds in walk_cmd(
-                engine, auth, transport, ctx,
-                ObjectType(ObjectIdentity(oid_prefix)), oid_prefix,
-            ):
-                if error_indication:
-                    iftable_error = str(error_indication)
-                    break
-                if error_status:
-                    iftable_error = "SNMP error: {}".format(
-                        error_status.prettyPrint()
-                    )
-                    break
-                for oid, val in var_binds:
-                    oid_str = str(oid)
-                    parts = oid_str.split(".")
-                    if_index = int(parts[-1])
+        async for error_indication, error_status, error_index, var_binds in walk_cmd(
+            engine, auth, transport, ctx,
+            ObjectType(ObjectIdentity(IF_TABLE_PREFIX)), IF_TABLE_PREFIX,
+        ):
+            if error_indication:
+                iftable_error = str(error_indication)
+                break
+            if error_status:
+                iftable_error = "SNMP error: {}".format(
+                    error_status.prettyPrint()
+                )
+                break
+            for oid, val in var_binds:
+                oid_str = str(oid)
+                # Parse column and ifIndex from OID
+                # e.g. 1.3.6.1.2.1.2.2.1.3.1 -> column=3, if_index=1
+                suffix = oid_str[len(IF_TABLE_PREFIX) + 1:]
+                parts = suffix.split(".", 1)
+                if len(parts) != 2:
+                    continue
+                column, if_index_str = parts
+                try:
+                    if_index = int(if_index_str)
+                except (ValueError, TypeError):
+                    continue
+                if column in iftable_columns:
+                    field_name, converter = iftable_columns[column]
                     if if_index not in interfaces:
                         interfaces[if_index] = {"if_index": if_index}
                     try:
@@ -536,33 +555,41 @@ class SNMPCollector:
                     except (ValueError, TypeError):
                         pass
 
-        # If ifTable walk had any error, raise to surface it.
-        # Partial data from interrupted walks is unreliable.
         if iftable_error:
             raise Exception("IF-MIB walk failed: {}".format(iftable_error))
 
-        # Walk ifXTable for extended info (ifName, ifAlias, ifHighSpeed)
-        for oid_prefix, field_name, converter in [
-            (OID_IF_NAME, "if_name", str),
-            (OID_IF_ALIAS, "if_alias", str),
-            (OID_IF_HIGH_SPEED, "if_speed", lambda v: int(v) * 1000000),
-        ]:
-            async for error_indication, error_status, error_index, var_binds in walk_cmd(
-                engine, auth, transport, ctx,
-                ObjectType(ObjectIdentity(oid_prefix)), oid_prefix,
-            ):
-                if error_indication or error_status:
-                    # ifXTable may not be supported, that's OK
-                    break
-                for oid, val in var_binds:
-                    oid_str = str(oid)
-                    parts = oid_str.split(".")
-                    if_index = int(parts[-1])
-                    if if_index in interfaces:
-                        try:
-                            interfaces[if_index][field_name] = converter(val)
-                        except (ValueError, TypeError):
-                            pass
+        # Single walk of entire ifXTable (may not be supported)
+        # OID format: 1.3.6.1.2.1.31.1.1.1.<column>.<ifIndex>
+        IF_XTABLE_PREFIX = "1.3.6.1.2.1.31.1.1.1"
+        ifxtable_columns = {
+            "1": ("if_name", str),
+            "18": ("if_alias", str),
+            "15": ("if_speed", lambda v: int(v) * 1000000),
+        }
+
+        async for error_indication, error_status, error_index, var_binds in walk_cmd(
+            engine, auth, transport, ctx,
+            ObjectType(ObjectIdentity(IF_XTABLE_PREFIX)), IF_XTABLE_PREFIX,
+        ):
+            if error_indication or error_status:
+                break
+            for oid, val in var_binds:
+                oid_str = str(oid)
+                suffix = oid_str[len(IF_XTABLE_PREFIX) + 1:]
+                parts = suffix.split(".", 1)
+                if len(parts) != 2:
+                    continue
+                column, if_index_str = parts
+                try:
+                    if_index = int(if_index_str)
+                except (ValueError, TypeError):
+                    continue
+                if column in ifxtable_columns and if_index in interfaces:
+                    field_name, converter = ifxtable_columns[column]
+                    try:
+                        interfaces[if_index][field_name] = converter(val)
+                    except (ValueError, TypeError):
+                        pass
 
         # Fill defaults for missing ifXTable fields
         for iface in interfaces.values():
@@ -576,79 +603,104 @@ class SNMPCollector:
         self, engine, auth, transport, ctx, walk_cmd,
         ObjectIdentity, ObjectType, if_indexes
     ):
-        """Poll interface counters, preferring 64-bit HC counters."""
+        """Poll interface counters, preferring 64-bit HC counters.
+
+        Tries a single walk of ifXTable for HC counters first.
+        Falls back to a single walk of ifTable for all 32-bit counters.
+        This is 1-2 walks instead of 12+ per-column walks.
+        """
         counters = {idx: {"if_index": idx} for idx in if_indexes}
         hc_counters = False
 
-        # Helper to walk an OID and collect values by ifIndex.
-        # Returns None on error or unsupported OID (discards partial data).
-        async def _walk_oid(oid_prefix):
-            data = {}
-            had_error = False
-            try:
-                async for err_ind, err_st, err_idx, var_binds in walk_cmd(
-                    engine, auth, transport, ctx,
-                    ObjectType(ObjectIdentity(oid_prefix)), oid_prefix,
-                ):
-                    if err_ind or err_st:
-                        had_error = True
+        # Map ifXTable columns for HC counters + broadcast
+        # OID: 1.3.6.1.2.1.31.1.1.1.<column>.<ifIndex>
+        IF_XTABLE_PREFIX = "1.3.6.1.2.1.31.1.1.1"
+        hc_columns = {
+            "6": "bytes_in",       # ifHCInOctets
+            "10": "bytes_out",     # ifHCOutOctets
+            "3": "broadcast_in",   # ifInBroadcastPkts
+            "5": "broadcast_out",  # ifOutBroadcastPkts (corrected from spec: actually column 5)
+        }
+
+        # Try single walk of ifXTable for HC counters
+        hc_data = {}
+        hc_supported = True
+        try:
+            async for err_ind, err_st, err_idx, var_binds in walk_cmd(
+                engine, auth, transport, ctx,
+                ObjectType(ObjectIdentity(IF_XTABLE_PREFIX)), IF_XTABLE_PREFIX,
+            ):
+                if err_ind or err_st:
+                    hc_supported = False
+                    break
+                for oid, val in var_binds:
+                    oid_str = str(oid)
+                    val_str = str(val)
+                    if "noSuch" in val_str:
+                        hc_supported = False
                         break
-                    for oid, val in var_binds:
-                        parts = str(oid).split(".")
-                        if_index = int(parts[-1])
-                        val_str = str(val)
-                        if "noSuch" in val_str:
-                            return None  # OID not supported
-                        data[if_index] = int(val)
-            except Exception:
-                had_error = True
-            # Discard partial data from interrupted walks
-            if had_error:
-                return None
-            return data if data else None
+                    suffix = oid_str[len(IF_XTABLE_PREFIX) + 1:]
+                    parts = suffix.split(".", 1)
+                    if len(parts) != 2:
+                        continue
+                    column, if_index_str = parts
+                    try:
+                        if_index = int(if_index_str)
+                    except (ValueError, TypeError):
+                        continue
+                    if column in hc_columns and if_index in counters:
+                        hc_data.setdefault(if_index, {})
+                        hc_data[if_index][hc_columns[column]] = int(val)
+                if not hc_supported:
+                    break
+        except Exception:
+            hc_supported = False
 
-        # Try 64-bit HC counters first
-        hc_in = await _walk_oid(OID_IF_HC_IN_OCTETS)
-        if hc_in:
+        if hc_supported and hc_data:
             hc_counters = True
-            for idx, val in hc_in.items():
-                if idx in counters:
-                    counters[idx]["bytes_in"] = val
-            hc_out = await _walk_oid(OID_IF_HC_OUT_OCTETS)
-            if hc_out:
-                for idx, val in hc_out.items():
-                    if idx in counters:
-                        counters[idx]["bytes_out"] = val
-        else:
-            # Fallback to 32-bit counters
-            for oid_prefix, field in [
-                (OID_IF_IN_OCTETS, "bytes_in"),
-                (OID_IF_OUT_OCTETS, "bytes_out"),
-            ]:
-                data = await _walk_oid(oid_prefix)
-                if data:
-                    for idx, val in data.items():
-                        if idx in counters:
-                            counters[idx][field] = val
+            for idx, fields in hc_data.items():
+                counters[idx].update(fields)
 
-        # Poll remaining counter OIDs (always 32-bit)
-        counter_oids = [
-            (OID_IF_IN_UCAST_PKTS, "packets_in"),
-            (OID_IF_OUT_UCAST_PKTS, "packets_out"),
-            (OID_IF_IN_ERRORS, "errors_in"),
-            (OID_IF_OUT_ERRORS, "errors_out"),
-            (OID_IF_IN_DISCARDS, "discards_in"),
-            (OID_IF_OUT_DISCARDS, "discards_out"),
-            (OID_IF_IN_BROADCAST_PKTS, "broadcast_in"),
-            (OID_IF_OUT_BROADCAST_PKTS, "broadcast_out"),
-        ]
+        # Single walk of ifTable for remaining counters (and bytes if no HC)
+        # OID: 1.3.6.1.2.1.2.2.1.<column>.<ifIndex>
+        IF_TABLE_PREFIX = "1.3.6.1.2.1.2.2.1"
+        iftable_counter_columns = {
+            "11": "packets_in",    # ifInUcastPkts
+            "13": "discards_in",   # ifInDiscards
+            "14": "errors_in",     # ifInErrors
+            "17": "packets_out",   # ifOutUcastPkts
+            "19": "discards_out",  # ifOutDiscards
+            "20": "errors_out",    # ifOutErrors
+        }
+        if not hc_counters:
+            iftable_counter_columns["10"] = "bytes_in"   # ifInOctets
+            iftable_counter_columns["16"] = "bytes_out"  # ifOutOctets
 
-        for oid_prefix, field in counter_oids:
-            data = await _walk_oid(oid_prefix)
-            if data:
-                for idx, val in data.items():
-                    if idx in counters:
-                        counters[idx][field] = val
+        try:
+            async for err_ind, err_st, err_idx, var_binds in walk_cmd(
+                engine, auth, transport, ctx,
+                ObjectType(ObjectIdentity(IF_TABLE_PREFIX)), IF_TABLE_PREFIX,
+            ):
+                if err_ind or err_st:
+                    break
+                for oid, val in var_binds:
+                    oid_str = str(oid)
+                    suffix = oid_str[len(IF_TABLE_PREFIX) + 1:]
+                    parts = suffix.split(".", 1)
+                    if len(parts) != 2:
+                        continue
+                    column, if_index_str = parts
+                    try:
+                        if_index = int(if_index_str)
+                    except (ValueError, TypeError):
+                        continue
+                    if column in iftable_counter_columns and if_index in counters:
+                        try:
+                            counters[if_index][iftable_counter_columns[column]] = int(val)
+                        except (ValueError, TypeError):
+                            pass
+        except Exception:
+            pass
 
         # Fill defaults
         for idx in counters:
