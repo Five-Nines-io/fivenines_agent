@@ -360,9 +360,30 @@ class SNMPCollector:
         auth, transport = session
 
         try:
-            return asyncio.run(
-                self._async_poll_device(device_id, target, auth, transport)
+            # Wrap in wait_for so the entire device poll is bounded.
+            # pysnmp's own UDP timeout handles normal cases; this catches
+            # hangs from library bugs or deadlocks.
+            async def _bounded_poll():
+                return await asyncio.wait_for(
+                    self._async_poll_device(device_id, target, auth, transport),
+                    timeout=EXECUTOR_TIMEOUT,
+                )
+
+            return asyncio.run(_bounded_poll())
+        except asyncio.TimeoutError:
+            log(
+                "SNMP async timeout for device {}".format(device_id),
+                "error",
             )
+            return {
+                "device_id": device_id,
+                "error": {
+                    "type": "timeout",
+                    "message": "SNMP poll timed out after {}s".format(
+                        EXECUTOR_TIMEOUT
+                    ),
+                },
+            }
         except Exception as e:
             error_type = "unknown"
             message = str(e)
