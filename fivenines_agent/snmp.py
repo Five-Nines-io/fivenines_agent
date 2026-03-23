@@ -139,27 +139,37 @@ class SNMPCollector:
 
     def __init__(self, targets):
         self.targets = targets
-        # Instance state for interval tracking
+        # Class-level state for interval tracking (persists across instances)
         if not hasattr(SNMPCollector, "_last_poll_times"):
             SNMPCollector._last_poll_times = {}
+        if not hasattr(SNMPCollector, "_last_results"):
+            SNMPCollector._last_results = {}
 
     def poll_all(self):
         """Poll all due SNMP targets concurrently.
 
         Returns:
             dict: {"devices": [device_dict, ...]}
+                  Includes cached results for not-yet-due devices.
         """
-        # Prune stale poll times (devices no longer in targets)
+        # Prune stale state (devices no longer in targets)
         current_ids = {t["device_id"] for t in self.targets}
-        stale_poll_ids = set(SNMPCollector._last_poll_times.keys()) - current_ids
-        for device_id in stale_poll_ids:
-            del SNMPCollector._last_poll_times[device_id]
+        stale_ids = set(SNMPCollector._last_poll_times.keys()) - current_ids
+        for device_id in stale_ids:
+            SNMPCollector._last_poll_times.pop(device_id, None)
+            SNMPCollector._last_results.pop(device_id, None)
 
         # Filter devices that are due for polling
         due_targets = [t for t in self.targets if self._is_device_due(t)]
 
         if not due_targets:
-            return {"devices": []}
+            # Return cached results for not-yet-due devices
+            cached = [
+                SNMPCollector._last_results[t["device_id"]]
+                for t in self.targets
+                if t["device_id"] in SNMPCollector._last_results
+            ]
+            return {"devices": cached}
 
         # Pre-build auth data in main thread (no event loop needed).
         # Transport is created inside asyncio.run() in _poll_device
@@ -188,6 +198,7 @@ class SNMPCollector:
                     target = futures[future]
                     device_id = target["device_id"]
                     remaining = max(0.1, batch_deadline - time.monotonic())
+                    result = None
                     try:
                         result = future.result(timeout=remaining)
                         devices.append(result)
@@ -224,14 +235,23 @@ class SNMPCollector:
                             }
                         )
 
-                    # Update last poll time regardless of outcome
+                    # Update last poll time and cache successful results
                     SNMPCollector._last_poll_times[device_id] = time.monotonic()
+                    if result and result.get("error") is None:
+                        SNMPCollector._last_results[device_id] = result
             finally:
                 # Don't wait for stuck workers - pysnmp timeout is the
                 # primary mechanism; this is the safety net.
                 executor.shutdown(wait=False)
         except Exception as e:
             log("SNMP ThreadPoolExecutor error: {}".format(e), "error")
+
+        # Include cached results for not-yet-due devices
+        polled_ids = {t["device_id"] for t in due_targets}
+        for target in self.targets:
+            did = target["device_id"]
+            if did not in polled_ids and did in SNMPCollector._last_results:
+                devices.append(SNMPCollector._last_results[did])
 
         return {"devices": devices}
 
@@ -397,34 +417,45 @@ class SNMPCollector:
             ObjectIdentity,
             ObjectType,
             SnmpEngine,
+            bulk_cmd,
             get_cmd,
-            walk_cmd,
         )
 
         async def _subtree_walk(engine, auth, transport, ctx, obj_type, prefix):
-            """Walk an OID subtree, stopping when OIDs leave the prefix.
+            """Walk an OID subtree using GetBulk for efficiency.
 
-            pysnmp v7's walk_cmd does not stop at subtree boundaries -
-            it walks the entire MIB. This wrapper checks each returned
-            OID and stops when it no longer starts with the prefix.
+            Uses bulk_cmd (GetBulk) with maxRepetitions=25 to fetch
+            many OIDs per round trip instead of one-at-a-time GetNext.
+            Stops when OIDs leave the requested prefix subtree.
             """
-            async for err_ind, err_st, err_idx, var_binds in walk_cmd(
-                engine, auth, transport, ctx, obj_type,
-            ):
+            current_oid = obj_type
+            while True:
+                err_ind, err_st, err_idx, var_binds = await bulk_cmd(
+                    engine, auth, transport, ctx,
+                    0, 25,  # nonRepeaters=0, maxRepetitions=25
+                    current_oid,
+                )
                 if err_ind or err_st:
                     yield err_ind, err_st, err_idx, var_binds
                     return
+                if not var_binds:
+                    return
                 filtered = []
+                last_oid = None
                 out_of_subtree = False
                 for oid, val in var_binds:
-                    if str(oid).startswith(prefix + "."):
+                    oid_str = str(oid)
+                    if oid_str.startswith(prefix + "."):
                         filtered.append((oid, val))
+                        last_oid = oid
                     else:
                         out_of_subtree = True
                 if filtered:
-                    yield err_ind, err_st, err_idx, filtered
-                if out_of_subtree:
+                    yield None, None, None, filtered
+                if out_of_subtree or last_oid is None:
                     return
+                # Continue from last OID
+                current_oid = ObjectType(ObjectIdentity(str(last_oid)))
 
         capabilities = target.get("capabilities", ["system", "if_table"])
         engine = SnmpEngine()
@@ -594,14 +625,16 @@ class SNMPCollector:
                 ObjectType(ObjectIdentity(IF_XTABLE_PREFIX)), IF_XTABLE_PREFIX,
             ):
                 if err_ind or err_st:
-                    hc_supported = False
                     break
                 for oid, val in var_binds:
                     oid_str = str(oid)
                     val_str = str(val)
+                    # noSuch means this specific column is unsupported;
+                    # disable HC counters but keep walking for metadata
+                    # (ifName, ifAlias, ifHighSpeed may still be present)
                     if "noSuch" in val_str:
                         hc_supported = False
-                        break
+                        continue
                     suffix = oid_str[len(IF_XTABLE_PREFIX) + 1:]
                     parts = suffix.split(".", 1)
                     if len(parts) != 2:
@@ -620,13 +653,11 @@ class SNMPCollector:
                         continue
                     if bucket == "meta" and if_index in interfaces:
                         interfaces[if_index][field_name] = value
-                    elif bucket == "hc":
+                    elif bucket == "hc" and hc_supported:
                         hc_data.setdefault(if_index, {})
                         hc_data[if_index][field_name] = value
                     elif bucket == "counter" and if_index in counters:
                         counters[if_index][field_name] = value
-                if not hc_supported:
-                    break
         except Exception:
             hc_supported = False
 

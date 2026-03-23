@@ -66,6 +66,8 @@ def _reset_collector_state():
     snmp_mod._collector = None
     if hasattr(snmp_mod.SNMPCollector, "_last_poll_times"):
         snmp_mod.SNMPCollector._last_poll_times = {}
+    if hasattr(snmp_mod.SNMPCollector, "_last_results"):
+        snmp_mod.SNMPCollector._last_results = {}
 
 
 @pytest.fixture(autouse=True)
@@ -417,16 +419,31 @@ class TestPollDevice:
 class TestPollAll:
     """Tests for poll_all orchestration."""
 
-    def test_poll_all_no_due_devices(self):
-        """Returns empty devices list when nothing is due."""
+    def test_poll_all_no_due_devices_no_cache(self):
+        """Returns empty devices list when nothing is due and no cache."""
         from fivenines_agent.snmp import SNMPCollector
 
         target = _make_target()
         SNMPCollector._last_poll_times = {"dev-1": time.monotonic()}
+        SNMPCollector._last_results = {}
         collector = SNMPCollector([target])
 
         result = collector.poll_all()
         assert result == {"devices": []}
+
+    def test_poll_all_no_due_devices_returns_cached(self):
+        """Returns cached results when device is not due."""
+        from fivenines_agent.snmp import SNMPCollector
+
+        target = _make_target()
+        cached = {"device_id": "dev-1", "system": {"sys_name": "Cached"}}
+        SNMPCollector._last_poll_times = {"dev-1": time.monotonic()}
+        SNMPCollector._last_results = {"dev-1": cached}
+        collector = SNMPCollector([target])
+
+        result = collector.poll_all()
+        assert len(result["devices"]) == 1
+        assert result["devices"][0]["system"]["sys_name"] == "Cached"
 
     def test_poll_all_multiple_devices(self):
         """Polls multiple devices and aggregates results."""
