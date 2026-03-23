@@ -422,7 +422,67 @@ class SNMPCollector:
             result["interface_metrics"] = counters
             result["hc_counters"] = hc
 
+        custom_oids = target.get("custom_oids", [])
+        if custom_oids:
+            custom, error = self._poll_custom_oids(base_args, custom_oids)
+            if error:
+                log(
+                    "SNMP custom OID poll failed for {}: {}".format(
+                        device_id, error.get("message", "")
+                    ),
+                    "error",
+                )
+                # Non-fatal: include partial result with custom error
+                result["custom_metrics_error"] = error
+            else:
+                result["custom_metrics"] = custom
+
         return result
+
+    def _poll_custom_oids(self, base_args, custom_oids):
+        """Get custom OIDs via snmpget.
+
+        Args:
+            base_args: CLI args for auth/version
+            custom_oids: list of {"name": str, "oid": str, "type": str}
+                type is "gauge", "counter", or "string"
+
+        Returns:
+            tuple: (metrics_list, error_dict_or_None)
+        """
+        oids = [entry["oid"] for entry in custom_oids]
+        args = base_args + oids
+        stdout, error = _run_snmp_cmd("snmpget", args, SNMP_TIMEOUT + 5)
+        if error:
+            return None, error
+
+        # Build OID -> entry lookup
+        oid_map = {entry["oid"]: entry for entry in custom_oids}
+
+        metrics = []
+        for line in stdout.splitlines():
+            parsed = _parse_snmp_line(line)
+            if not parsed or parsed[1] is None:
+                continue
+            oid, val = parsed
+            entry = oid_map.get(oid)
+            if not entry:
+                continue
+            metric = {"name": entry["name"], "oid": oid}
+            oid_type = entry.get("type", "gauge")
+            if oid_type == "string":
+                metric["value"] = val
+            else:
+                try:
+                    metric["value"] = int(val)
+                except (ValueError, TypeError):
+                    try:
+                        metric["value"] = float(val)
+                    except (ValueError, TypeError):
+                        metric["value"] = val
+            metrics.append(metric)
+
+        return metrics, None
 
     def _poll_system(self, base_args):
         """Get system info via snmpget.

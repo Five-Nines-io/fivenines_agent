@@ -1181,6 +1181,157 @@ class TestEdgeCases:
         )
         assert len(interfaces) == 1
 
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_custom_oids_success(self, mock_cmd):
+        """Custom OIDs are polled and returned."""
+        custom_output = (
+            '.1.3.6.1.4.1.9.9.109.1.1.1.1.8.1 = Gauge32: 42\n'
+            '.1.3.6.1.4.1.9.9.48.1.1.1.5.1 = Gauge32: 1048576\n'
+        )
+        mock_cmd.side_effect = [
+            (SYSTEM_OUTPUT, None),
+            (IFTABLE_OUTPUT, None),
+            (IFXTABLE_OUTPUT, None),
+            (custom_output, None),
+        ]
+        target = _make_target(
+            custom_oids=[
+                {
+                    "name": "cpu_usage",
+                    "oid": "1.3.6.1.4.1.9.9.109.1.1.1.1.8.1",
+                    "type": "gauge",
+                },
+                {
+                    "name": "memory_free",
+                    "oid": "1.3.6.1.4.1.9.9.48.1.1.1.5.1",
+                    "type": "gauge",
+                },
+            ]
+        )
+        collector = SNMPCollector([target])
+        result = collector._poll_device(target)
+        assert "custom_metrics" in result
+        assert len(result["custom_metrics"]) == 2
+        cpu = next(m for m in result["custom_metrics"]
+                   if m["name"] == "cpu_usage")
+        assert cpu["value"] == 42
+        mem = next(m for m in result["custom_metrics"]
+                   if m["name"] == "memory_free")
+        assert mem["value"] == 1048576
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_custom_oids_string_type(self, mock_cmd):
+        """String-type custom OIDs return string values."""
+        custom_output = (
+            '.1.3.6.1.4.1.9.9.1.0 = STRING: "IOS 15.2"\n'
+        )
+        mock_cmd.return_value = (custom_output, None)
+        collector = SNMPCollector([_make_target()])
+        metrics, error = collector._poll_custom_oids(
+            ["-v2c", "-c", "public", "host"],
+            [{"name": "firmware", "oid": "1.3.6.1.4.1.9.9.1.0",
+              "type": "string"}],
+        )
+        assert error is None
+        assert metrics[0]["value"] == "IOS 15.2"
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_custom_oids_error_nonfatal(self, mock_cmd):
+        """Custom OID errors don't fail the whole device poll."""
+        mock_cmd.side_effect = [
+            (SYSTEM_OUTPUT, None),
+            (IFTABLE_OUTPUT, None),
+            (IFXTABLE_OUTPUT, None),
+            (None, {"type": "timeout", "message": "No Response"}),
+        ]
+        target = _make_target(
+            custom_oids=[
+                {"name": "cpu", "oid": "1.3.6.1.4.1.9.1.0",
+                 "type": "gauge"},
+            ]
+        )
+        collector = SNMPCollector([target])
+        result = collector._poll_device(target)
+        assert "error" not in result  # device poll succeeds
+        assert "custom_metrics_error" in result
+        assert result["custom_metrics_error"]["type"] == "timeout"
+        assert "system" in result  # other data still present
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_custom_oids_empty_list(self, mock_cmd):
+        """Empty custom_oids list should not trigger extra snmpget."""
+        mock_cmd.side_effect = [
+            (SYSTEM_OUTPUT, None),
+            (IFTABLE_OUTPUT, None),
+            (IFXTABLE_OUTPUT, None),
+        ]
+        target = _make_target(custom_oids=[])
+        collector = SNMPCollector([target])
+        result = collector._poll_device(target)
+        assert "custom_metrics" not in result
+        assert mock_cmd.call_count == 3  # system + ifTable + ifXTable
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_custom_oids_nosuch_skipped(self, mock_cmd):
+        """OIDs returning noSuch should be skipped."""
+        custom_output = (
+            ".1.3.6.1.4.1.9.1.0 = No Such Object\n"
+            ".1.3.6.1.4.1.9.2.0 = Gauge32: 99\n"
+        )
+        mock_cmd.return_value = (custom_output, None)
+        collector = SNMPCollector([_make_target()])
+        metrics, error = collector._poll_custom_oids(
+            [],
+            [
+                {"name": "missing", "oid": "1.3.6.1.4.1.9.1.0",
+                 "type": "gauge"},
+                {"name": "present", "oid": "1.3.6.1.4.1.9.2.0",
+                 "type": "gauge"},
+            ],
+        )
+        assert error is None
+        assert len(metrics) == 1
+        assert metrics[0]["name"] == "present"
+        assert metrics[0]["value"] == 99
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_custom_oids_float_value(self, mock_cmd):
+        """Non-integer numeric values should parse as float."""
+        custom_output = '.1.3.6.1.4.1.9.1.0 = STRING: "42.5"\n'
+        mock_cmd.return_value = (custom_output, None)
+        collector = SNMPCollector([_make_target()])
+        metrics, error = collector._poll_custom_oids(
+            [],
+            [{"name": "temp", "oid": "1.3.6.1.4.1.9.1.0",
+              "type": "gauge"}],
+        )
+        assert metrics[0]["value"] == 42.5
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_custom_oids_default_type_gauge(self, mock_cmd):
+        """Missing type field defaults to gauge (numeric)."""
+        custom_output = '.1.3.6.1.4.1.9.1.0 = Gauge32: 77\n'
+        mock_cmd.return_value = (custom_output, None)
+        collector = SNMPCollector([_make_target()])
+        metrics, error = collector._poll_custom_oids(
+            [],
+            [{"name": "val", "oid": "1.3.6.1.4.1.9.1.0"}],
+        )
+        assert metrics[0]["value"] == 77
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_custom_oids_unparseable_value(self, mock_cmd):
+        """Non-numeric gauge values fall back to string."""
+        custom_output = '.1.3.6.1.4.1.9.1.0 = STRING: "not_a_number"\n'
+        mock_cmd.return_value = (custom_output, None)
+        collector = SNMPCollector([_make_target()])
+        metrics, error = collector._poll_custom_oids(
+            [],
+            [{"name": "val", "oid": "1.3.6.1.4.1.9.1.0",
+              "type": "gauge"}],
+        )
+        assert metrics[0]["value"] == "not_a_number"
+
     def test_parse_table_nosuch_in_middle(self):
         """noSuch in middle of walk should disable HC but keep parsing."""
         output = (
