@@ -306,8 +306,11 @@ class SNMPCollector:
             ip = target["ip"]
             port = target.get("port", 161)
 
-            transport = UdpTransportTarget(
-                (ip, port), timeout=SNMP_TIMEOUT, retries=SNMP_RETRIES
+            # pysnmp v7 uses an async factory method for UdpTransportTarget
+            transport = asyncio.run(
+                UdpTransportTarget.create(
+                    (ip, port), timeout=SNMP_TIMEOUT, retries=SNMP_RETRIES
+                )
             )
 
             if version == "v2c":

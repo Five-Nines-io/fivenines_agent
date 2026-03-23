@@ -12,10 +12,20 @@ import pytest
 
 
 # Mock pysnmp before importing snmp module
+_mock_pysnmp_asyncio = MagicMock()
+
+
+# Make UdpTransportTarget.create() return a coroutine (for asyncio.run)
+async def _mock_create(*args, **kwargs):
+    return MagicMock()
+
+
+_mock_pysnmp_asyncio.UdpTransportTarget.create = _mock_create
+
 sys.modules.setdefault("pysnmp", MagicMock())
 sys.modules.setdefault("pysnmp.hlapi", MagicMock())
 sys.modules.setdefault("pysnmp.hlapi.v3arch", MagicMock())
-sys.modules.setdefault("pysnmp.hlapi.v3arch.asyncio", MagicMock())
+sys.modules.setdefault("pysnmp.hlapi.v3arch.asyncio", _mock_pysnmp_asyncio)
 
 
 def _make_target(
