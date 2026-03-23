@@ -400,6 +400,32 @@ class SNMPCollector:
             walk_cmd,
         )
 
+        async def _subtree_walk(engine, auth, transport, ctx, obj_type, prefix):
+            """Walk an OID subtree, stopping when OIDs leave the prefix.
+
+            pysnmp v7's walk_cmd does not stop at subtree boundaries -
+            it walks the entire MIB. This wrapper checks each returned
+            OID and stops when it no longer starts with the prefix.
+            """
+            async for err_ind, err_st, err_idx, var_binds in walk_cmd(
+                engine, auth, transport, ctx, obj_type,
+            ):
+                if err_ind or err_st:
+                    yield err_ind, err_st, err_idx, var_binds
+                    return
+                # Check if OIDs are still within our subtree
+                filtered = []
+                out_of_subtree = False
+                for oid, val in var_binds:
+                    if str(oid).startswith(prefix + "."):
+                        filtered.append((oid, val))
+                    else:
+                        out_of_subtree = True
+                if filtered:
+                    yield err_ind, err_st, err_idx, filtered
+                if out_of_subtree:
+                    return
+
         capabilities = target.get("capabilities", ["system", "if_table"])
         engine = SnmpEngine()
         ctx = ContextData()
@@ -416,7 +442,7 @@ class SNMPCollector:
         # Poll interfaces
         if "if_table" in capabilities:
             interfaces = await self._async_poll_interfaces(
-                engine, auth, transport, ctx, walk_cmd, ObjectIdentity, ObjectType
+                engine, auth, transport, ctx, _subtree_walk, ObjectIdentity, ObjectType
             )
             if interfaces is not None:
                 result["interfaces"] = interfaces
@@ -424,7 +450,7 @@ class SNMPCollector:
                 if_indexes = [iface["if_index"] for iface in interfaces]
                 if if_indexes:
                     counters, hc = await self._async_poll_counters(
-                        engine, auth, transport, ctx, walk_cmd,
+                        engine, auth, transport, ctx, _subtree_walk,
                         ObjectIdentity, ObjectType, if_indexes
                     )
                     result["interface_metrics"] = counters
@@ -487,9 +513,9 @@ class SNMPCollector:
             (OID_IF_ADMIN_STATUS, "if_admin_status", lambda v: max(0, int(v) - 1)),
             (OID_IF_OPER_STATUS, "if_oper_status", lambda v: max(0, int(v) - 1)),
         ]:
-            async for error_indication, error_status, error_index, var_binds in walk_cmd(
+            async for error_indication, error_status, error_index, var_binds in _subtree_walk(
                 engine, auth, transport, ctx,
-                ObjectType(ObjectIdentity(oid_prefix)),
+                ObjectType(ObjectIdentity(oid_prefix)), oid_prefix,
             ):
                 if error_indication:
                     iftable_error = str(error_indication)
@@ -521,9 +547,9 @@ class SNMPCollector:
             (OID_IF_ALIAS, "if_alias", str),
             (OID_IF_HIGH_SPEED, "if_speed", lambda v: int(v) * 1000000),
         ]:
-            async for error_indication, error_status, error_index, var_binds in walk_cmd(
+            async for error_indication, error_status, error_index, var_binds in _subtree_walk(
                 engine, auth, transport, ctx,
-                ObjectType(ObjectIdentity(oid_prefix)),
+                ObjectType(ObjectIdentity(oid_prefix)), oid_prefix,
             ):
                 if error_indication or error_status:
                     # ifXTable may not be supported, that's OK
@@ -560,9 +586,9 @@ class SNMPCollector:
             data = {}
             had_error = False
             try:
-                async for err_ind, err_st, err_idx, var_binds in walk_cmd(
+                async for err_ind, err_st, err_idx, var_binds in _subtree_walk(
                     engine, auth, transport, ctx,
-                    ObjectType(ObjectIdentity(oid_prefix)),
+                    ObjectType(ObjectIdentity(oid_prefix)), oid_prefix,
                 ):
                     if err_ind or err_st:
                         had_error = True
