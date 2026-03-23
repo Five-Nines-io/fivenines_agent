@@ -114,6 +114,7 @@ The agent works without sudo, but these features will be unavailable (this is al
 | QEMU/KVM VMs | `libvirt` group membership |
 | ZFS pools | ZFS delegation or permissions |
 | NVIDIA GPU metrics | NVIDIA driver + pynvml library |
+| SNMP device polling | `net-snmp` tools (`snmpget`, `snmpbulkwalk`) |
 
 ### Capabilities by Permission Level
 
@@ -199,10 +200,52 @@ When the agent starts, it displays a banner showing which features are available
     [X] Fail2Ban (requires: sudo fail2ban-client)
     [X] Packages
 
+  Networking:
+    [OK] Snmp
+
   [!] Some features unavailable. See: https://docs.fivenines.io/agent/permissions
 
 ============================================================
 ```
+
+## SNMP Network Device Monitoring
+
+The agent can poll network devices (switches, routers, firewalls, printers) via SNMP when configured from the fivenines dashboard.
+
+### Requirements
+
+Install `net-snmp` tools on the agent host:
+
+```bash
+# Debian/Ubuntu
+sudo apt install snmp
+
+# RHEL/Rocky/CentOS
+sudo yum install net-snmp-utils
+
+# Alpine
+sudo apk add net-snmp-tools
+```
+
+### Supported Protocols
+
+- **SNMPv2c** - Community string authentication
+- **SNMPv3** - USM with auth (MD5/SHA) and privacy (DES/AES)
+
+### Collected Metrics
+
+**Per device:** hostname, description, uptime
+
+**Per interface:** name, type, admin/oper status, speed, traffic (bytes/packets in/out), errors, discards, broadcast counts. Prefers 64-bit high-capacity counters when available, falls back to 32-bit.
+
+**Custom OIDs:** The server can send vendor-specific OIDs (CPU, memory, temperature, etc.) based on the device model detected via `sysDescr`. No agent-side configuration needed.
+
+### How It Works
+
+1. Add SNMP devices in the fivenines dashboard (IP + credentials)
+2. The server sends `snmp_targets` to the agent via `sync_config`
+3. The agent polls devices concurrently using `snmpget`/`snmpbulkwalk`
+4. Per-device polling intervals are configurable from the dashboard
 
 ## Application Integrations
 
