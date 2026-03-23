@@ -67,8 +67,8 @@ class PermissionProbe:
             "proxmox": self._can_access_proxmox(),
             # Package listing - for security scanning
             "packages": self._can_list_packages(),
-            # SNMP polling - needs pysnmp library
-            "snmp": self._can_import_pysnmp(),
+            # SNMP polling - needs net-snmp CLI tools
+            "snmp": self._has_snmpget(),
         }
 
         # Log any capability changes (only after first probe)
@@ -351,16 +351,14 @@ class PermissionProbe:
             return True
         return False
 
-    def _can_import_pysnmp(self):
-        """Check if pysnmp library is available."""
-        try:
-            import pysnmp  # noqa: F401
-
-            log("_can_import_pysnmp: pysnmp is installed", "debug")
-            return True
-        except ImportError:
-            log("_can_import_pysnmp: pysnmp not installed", "debug")
-            return False
+    def _has_snmpget(self):
+        """Check if net-snmp CLI tools are available."""
+        found = shutil.which("snmpget") is not None
+        log(
+            "_has_snmpget: {}".format("found" if found else "not found"),
+            "debug",
+        )
+        return found
 
     def _can_list_packages(self):
         """Check if a supported package manager is available."""
@@ -460,7 +458,7 @@ def print_capabilities_banner():
                 elif cap in ["temperatures", "fans"]:
                     hint = " (no accessible sensors)"
                 elif cap == "snmp":
-                    hint = " (requires: pysnmp)"
+                    hint = " (requires: net-snmp)"
 
             print(f"    {icon} {name}{hint}")
         print("")

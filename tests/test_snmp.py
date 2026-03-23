@@ -1,34 +1,33 @@
-"""Tests for SNMP network device polling collector."""
+"""Tests for SNMP network device polling collector (subprocess-based)."""
 
-import asyncio
-import sys
+import subprocess
 import time
-from concurrent.futures import TimeoutError as FuturesTimeoutError
 from io import StringIO
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from fivenines_agent.snmp import (
+    EXECUTOR_TIMEOUT,
+    IF_TABLE_PREFIX,
+    IF_XTABLE_PREFIX,
+    IFTABLE_COLUMNS,
+    IFXTABLE_COLUMNS,
+    MAX_WORKERS,
+    OID_SYS_DESCR,
+    OID_SYS_NAME,
+    OID_SYS_UPTIME,
+    SNMP_RETRIES,
+    SNMP_TIMEOUT,
+    SNMPCollector,
+    _parse_snmp_line,
+    _print_diagnostics,
+    _run_snmp_cmd,
+    snmp_metrics,
+)
 
-# Mock pysnmp before importing snmp module
-_mock_pysnmp_asyncio = MagicMock()
 
-
-# Make UdpTransportTarget.create() return a coroutine (for asyncio.run)
-async def _mock_create(*args, **kwargs):
-    return MagicMock()
-
-
-_mock_pysnmp_asyncio.UdpTransportTarget.create = _mock_create
-
-# Ensure get_cmd and walk_cmd are available as async callables
-_mock_pysnmp_asyncio.get_cmd = AsyncMock()
-_mock_pysnmp_asyncio.walk_cmd = MagicMock()
-
-sys.modules.setdefault("pysnmp", MagicMock())
-sys.modules.setdefault("pysnmp.hlapi", MagicMock())
-sys.modules.setdefault("pysnmp.hlapi.v3arch", MagicMock())
-sys.modules.setdefault("pysnmp.hlapi.v3arch.asyncio", _mock_pysnmp_asyncio)
+# --- Helper fixtures ---
 
 
 def _make_target(
@@ -38,487 +37,844 @@ def _make_target(
     community="public",
     interval=60,
     capabilities=None,
+    port=161,
+    **kwargs,
 ):
-    """Helper to create a target config dict."""
+    """Create a target dict matching sync_config format."""
     target = {
         "device_id": device_id,
         "ip": ip,
         "version": version,
         "interval": interval,
         "capabilities": capabilities or ["system", "if_table"],
+        "port": port,
     }
     if version == "v2c":
         target["community"] = community
-    elif version == "v3":
-        target["username"] = "snmpuser"
-        target["security_level"] = "auth_priv"
-        target["auth_protocol"] = "sha"
-        target["auth_password"] = "authpass"
-        target["priv_protocol"] = "aes"
-        target["priv_password"] = "privpass"
+    target.update(kwargs)
     return target
 
 
-def _reset_collector_state():
-    """Reset module-level collector state between tests."""
-    import fivenines_agent.snmp as snmp_mod
+def _make_v3_target(
+    device_id="dev-v3",
+    security_level="auth_priv",
+    **kwargs,
+):
+    """Create an SNMPv3 target."""
+    defaults = {
+        "ip": "192.168.1.20",
+        "version": "v3",
+        "interval": 60,
+        "capabilities": ["system", "if_table"],
+        "username": "snmpuser",
+        "security_level": security_level,
+        "auth_protocol": "sha",
+        "auth_password": "authpass123",
+        "priv_protocol": "aes",
+        "priv_password": "privpass123",
+    }
+    defaults.update(kwargs)
+    defaults["device_id"] = device_id
+    return defaults
 
-    snmp_mod._collector = None
-    if hasattr(snmp_mod.SNMPCollector, "_last_poll_times"):
-        snmp_mod.SNMPCollector._last_poll_times = {}
-    if hasattr(snmp_mod.SNMPCollector, "_last_results"):
-        snmp_mod.SNMPCollector._last_results = {}
+
+# Sample CLI outputs matching real device responses
+SYSTEM_OUTPUT = """\
+.1.3.6.1.2.1.1.5.0 = STRING: "CoreSwitch1"
+.1.3.6.1.2.1.1.1.0 = STRING: "Cisco IOS 15.2"
+.1.3.6.1.2.1.1.3.0 = Timeticks: (8640000) 1:00:00:00.00
+"""
+
+IFTABLE_OUTPUT = """\
+.1.3.6.1.2.1.2.2.1.1.1 = INTEGER: 1
+.1.3.6.1.2.1.2.2.1.1.2 = INTEGER: 2
+.1.3.6.1.2.1.2.2.1.3.1 = INTEGER: 6
+.1.3.6.1.2.1.2.2.1.3.2 = INTEGER: 6
+.1.3.6.1.2.1.2.2.1.7.1 = INTEGER: 1
+.1.3.6.1.2.1.2.2.1.7.2 = INTEGER: 2
+.1.3.6.1.2.1.2.2.1.8.1 = INTEGER: 1
+.1.3.6.1.2.1.2.2.1.8.2 = INTEGER: 2
+.1.3.6.1.2.1.2.2.1.10.1 = Counter32: 1000000
+.1.3.6.1.2.1.2.2.1.10.2 = Counter32: 2000000
+.1.3.6.1.2.1.2.2.1.11.1 = Counter32: 5000
+.1.3.6.1.2.1.2.2.1.11.2 = Counter32: 6000
+.1.3.6.1.2.1.2.2.1.13.1 = Counter32: 10
+.1.3.6.1.2.1.2.2.1.13.2 = Counter32: 20
+.1.3.6.1.2.1.2.2.1.14.1 = Counter32: 0
+.1.3.6.1.2.1.2.2.1.14.2 = Counter32: 1
+.1.3.6.1.2.1.2.2.1.16.1 = Counter32: 500000
+.1.3.6.1.2.1.2.2.1.16.2 = Counter32: 600000
+.1.3.6.1.2.1.2.2.1.17.1 = Counter32: 4000
+.1.3.6.1.2.1.2.2.1.17.2 = Counter32: 4500
+.1.3.6.1.2.1.2.2.1.19.1 = Counter32: 5
+.1.3.6.1.2.1.2.2.1.19.2 = Counter32: 8
+.1.3.6.1.2.1.2.2.1.20.1 = Counter32: 0
+.1.3.6.1.2.1.2.2.1.20.2 = Counter32: 2
+"""
+
+IFXTABLE_OUTPUT = """\
+.1.3.6.1.2.1.31.1.1.1.1.1 = STRING: "GigabitEthernet0/1"
+.1.3.6.1.2.1.31.1.1.1.1.2 = STRING: "GigabitEthernet0/2"
+.1.3.6.1.2.1.31.1.1.1.3.1 = Counter32: 100
+.1.3.6.1.2.1.31.1.1.1.3.2 = Counter32: 200
+.1.3.6.1.2.1.31.1.1.1.5.1 = Counter32: 50
+.1.3.6.1.2.1.31.1.1.1.5.2 = Counter32: 60
+.1.3.6.1.2.1.31.1.1.1.6.1 = Counter64: 9000000000
+.1.3.6.1.2.1.31.1.1.1.6.2 = Counter64: 8000000000
+.1.3.6.1.2.1.31.1.1.1.10.1 = Counter64: 7000000000
+.1.3.6.1.2.1.31.1.1.1.10.2 = Counter64: 6000000000
+.1.3.6.1.2.1.31.1.1.1.15.1 = Gauge32: 1000
+.1.3.6.1.2.1.31.1.1.1.15.2 = Gauge32: 1000
+.1.3.6.1.2.1.31.1.1.1.18.1 = STRING: "Uplink"
+.1.3.6.1.2.1.31.1.1.1.18.2 = STRING: "Server"
+"""
+
+IFXTABLE_NO_SUPPORT = """\
+.1.3.6.1.2.1.31.1.1.1.1 = No Such Object available on this agent at this OID
+"""
+
+PRINTER_IFTABLE = """\
+.1.3.6.1.2.1.2.2.1.1.1 = INTEGER: 1
+.1.3.6.1.2.1.2.2.1.3.1 = INTEGER: 6
+.1.3.6.1.2.1.2.2.1.7.1 = INTEGER: 1
+.1.3.6.1.2.1.2.2.1.8.1 = INTEGER: 1
+.1.3.6.1.2.1.2.2.1.10.1 = Counter32: 7010736
+.1.3.6.1.2.1.2.2.1.11.1 = Counter32: 43630
+.1.3.6.1.2.1.2.2.1.13.1 = Counter32: 2386
+.1.3.6.1.2.1.2.2.1.14.1 = Counter32: 0
+.1.3.6.1.2.1.2.2.1.16.1 = Counter32: 3870844
+.1.3.6.1.2.1.2.2.1.17.1 = Counter32: 31479
+.1.3.6.1.2.1.2.2.1.19.1 = Counter32: 0
+.1.3.6.1.2.1.2.2.1.20.1 = Counter32: 0
+"""
 
 
 @pytest.fixture(autouse=True)
-def reset_state():
-    """Reset collector state before each test."""
-    _reset_collector_state()
+def _reset_collector_state():
+    """Reset class-level state between tests."""
+    SNMPCollector._last_poll_times = {}
+    SNMPCollector._last_results = {}
     yield
-    _reset_collector_state()
+    SNMPCollector._last_poll_times = {}
+    SNMPCollector._last_results = {}
 
 
-class TestSnmpMetricsEntryPoint:
-    """Tests for the snmp_metrics() module entry function."""
+def _mock_run(stdout="", stderr="", returncode=0):
+    """Create a mock subprocess.CompletedProcess."""
+    result = MagicMock(spec=subprocess.CompletedProcess)
+    result.stdout = stdout
+    result.stderr = stderr
+    result.returncode = returncode
+    return result
 
-    def test_returns_none_when_pysnmp_import_fails(self):
-        """When pysnmp is not installed, return None."""
-        import fivenines_agent.snmp as snmp_mod
 
-        with patch.dict(sys.modules, {"pysnmp": None}):
-            with patch("builtins.__import__", side_effect=ImportError("no pysnmp")):
-                # Need to test the actual import failure path
-                pass
+# ================================================================
+# Tests for _parse_snmp_line()
+# ================================================================
 
-        # Simpler approach: patch the import inside snmp_metrics
-        original_import = __builtins__.__import__ if hasattr(__builtins__, "__import__") else __import__
 
-        def mock_import(name, *args, **kwargs):
-            if name == "pysnmp":
-                raise ImportError("no pysnmp")
-            if name == "pysnmp_sync_adapter":
-                raise ImportError("no pysnmp_sync_adapter")
-            return original_import(name, *args, **kwargs)
+class TestParseSnmpLine:
+    def test_string_value(self):
+        line = '.1.3.6.1.2.1.1.5.0 = STRING: "EPSONCD1062"'
+        assert _parse_snmp_line(line) == ("1.3.6.1.2.1.1.5.0", "EPSONCD1062")
 
-        with patch("builtins.__import__", side_effect=mock_import):
-            result = snmp_mod.snmp_metrics([_make_target()])
+    def test_integer_value(self):
+        line = ".1.3.6.1.2.1.2.2.1.1.1 = INTEGER: 1"
+        assert _parse_snmp_line(line) == ("1.3.6.1.2.1.2.2.1.1.1", "1")
+
+    def test_counter32(self):
+        line = ".1.3.6.1.2.1.2.2.1.10.1 = Counter32: 7010736"
+        assert _parse_snmp_line(line) == (
+            "1.3.6.1.2.1.2.2.1.10.1", "7010736"
+        )
+
+    def test_counter64(self):
+        line = ".1.3.6.1.2.1.31.1.1.1.6.1 = Counter64: 9000000000"
+        assert _parse_snmp_line(line) == (
+            "1.3.6.1.2.1.31.1.1.1.6.1", "9000000000"
+        )
+
+    def test_gauge32(self):
+        line = ".1.3.6.1.2.1.2.2.1.5.1 = Gauge32: 0"
+        assert _parse_snmp_line(line) == ("1.3.6.1.2.1.2.2.1.5.1", "0")
+
+    def test_timeticks(self):
+        line = ".1.3.6.1.2.1.1.3.0 = Timeticks: (1491600) 4:08:36.00"
+        assert _parse_snmp_line(line) == ("1.3.6.1.2.1.1.3.0", "1491600")
+
+    def test_no_such_object(self):
+        line = (
+            ".1.3.6.1.2.1.31.1.1.1.1 = "
+            "No Such Object available on this agent at this OID"
+        )
+        oid, val = _parse_snmp_line(line)
+        assert oid == "1.3.6.1.2.1.31.1.1.1.1"
+        assert val is None
+
+    def test_no_more_variables(self):
+        line = ".1.3.6.1.2.1.2.2.1.22.1 = No more variables left in this MIB"
+        oid, val = _parse_snmp_line(line)
+        assert val is None
+
+    def test_empty_line(self):
+        assert _parse_snmp_line("") is None
+
+    def test_no_equals(self):
+        assert _parse_snmp_line("some random text") is None
+
+    def test_whitespace_handling(self):
+        line = "  .1.3.6.1.2.1.1.5.0 = STRING: \"test\"  "
+        assert _parse_snmp_line(line) == ("1.3.6.1.2.1.1.5.0", "test")
+
+    def test_value_without_type_prefix(self):
+        line = ".1.3.6.1.2.1.1.5.0 = test_value"
+        assert _parse_snmp_line(line) == ("1.3.6.1.2.1.1.5.0", "test_value")
+
+    def test_hex_string(self):
+        line = ".1.3.6.1.2.1.2.2.1.6.1 = Hex-STRING: 64 C6 D2 CD 10 62"
+        oid, val = _parse_snmp_line(line)
+        assert oid == "1.3.6.1.2.1.2.2.1.6.1"
+        assert val == "64 C6 D2 CD 10 62"
+
+
+# ================================================================
+# Tests for _run_snmp_cmd()
+# ================================================================
+
+
+class TestRunSnmpCmd:
+    @patch("fivenines_agent.snmp.get_clean_env")
+    @patch("fivenines_agent.snmp.subprocess.run")
+    def test_success(self, mock_run, mock_env):
+        mock_env.return_value = {}
+        mock_run.return_value = _mock_run(stdout="output\n")
+        stdout, error = _run_snmp_cmd("snmpget", ["-v2c", "host"], 10)
+        assert stdout == "output\n"
+        assert error is None
+        mock_run.assert_called_once()
+
+    @patch("fivenines_agent.snmp.get_clean_env")
+    @patch("fivenines_agent.snmp.subprocess.run")
+    def test_timeout_in_stderr(self, mock_run, mock_env):
+        mock_env.return_value = {}
+        mock_run.return_value = _mock_run(
+            returncode=1, stderr="Timeout: No Response from host"
+        )
+        stdout, error = _run_snmp_cmd("snmpget", [], 10)
+        assert stdout is None
+        assert error["type"] == "timeout"
+
+    @patch("fivenines_agent.snmp.get_clean_env")
+    @patch("fivenines_agent.snmp.subprocess.run")
+    def test_auth_error(self, mock_run, mock_env):
+        mock_env.return_value = {}
+        mock_run.return_value = _mock_run(
+            returncode=1, stderr="Authentication failure"
+        )
+        stdout, error = _run_snmp_cmd("snmpget", [], 10)
+        assert error["type"] == "auth_error"
+
+    @patch("fivenines_agent.snmp.get_clean_env")
+    @patch("fivenines_agent.snmp.subprocess.run")
+    def test_unknown_user(self, mock_run, mock_env):
+        mock_env.return_value = {}
+        mock_run.return_value = _mock_run(
+            returncode=1, stderr="Unknown user name"
+        )
+        stdout, error = _run_snmp_cmd("snmpget", [], 10)
+        assert error["type"] == "auth_error"
+
+    @patch("fivenines_agent.snmp.get_clean_env")
+    @patch("fivenines_agent.snmp.subprocess.run")
+    def test_generic_snmp_error(self, mock_run, mock_env):
+        mock_env.return_value = {}
+        mock_run.return_value = _mock_run(
+            returncode=1, stderr="Some SNMP error"
+        )
+        stdout, error = _run_snmp_cmd("snmpget", [], 10)
+        assert error["type"] == "snmp_error"
+
+    @patch("fivenines_agent.snmp.get_clean_env")
+    @patch("fivenines_agent.snmp.subprocess.run")
+    def test_subprocess_timeout(self, mock_run, mock_env):
+        mock_env.return_value = {}
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd="snmpget", timeout=10)
+        stdout, error = _run_snmp_cmd("snmpget", [], 10)
+        assert error["type"] == "timeout"
+        assert "timed out" in error["message"]
+
+    @patch("fivenines_agent.snmp.get_clean_env")
+    @patch("fivenines_agent.snmp.subprocess.run")
+    def test_unexpected_exception(self, mock_run, mock_env):
+        mock_env.return_value = {}
+        mock_run.side_effect = OSError("file not found")
+        stdout, error = _run_snmp_cmd("snmpget", [], 10)
+        assert error["type"] == "unknown"
+        assert "file not found" in error["message"]
+
+    @patch("fivenines_agent.snmp.get_clean_env")
+    @patch("fivenines_agent.snmp.subprocess.run")
+    def test_no_response_stderr(self, mock_run, mock_env):
+        mock_env.return_value = {}
+        mock_run.return_value = _mock_run(
+            returncode=2, stderr="No Response from 192.168.1.10"
+        )
+        stdout, error = _run_snmp_cmd("snmpget", [], 10)
+        assert error["type"] == "timeout"
+
+    @patch("fivenines_agent.snmp.get_clean_env")
+    @patch("fivenines_agent.snmp.subprocess.run")
+    def test_usm_error(self, mock_run, mock_env):
+        mock_env.return_value = {}
+        mock_run.return_value = _mock_run(
+            returncode=1, stderr="USM error: wrong credentials"
+        )
+        stdout, error = _run_snmp_cmd("snmpget", [], 10)
+        assert error["type"] == "auth_error"
+
+
+# ================================================================
+# Tests for snmp_metrics() entry point
+# ================================================================
+
+
+class TestSnmpMetrics:
+    @patch("fivenines_agent.snmp.shutil.which")
+    def test_no_snmpget_returns_none(self, mock_which):
+        mock_which.return_value = None
+        result = snmp_metrics([_make_target()])
         assert result is None
 
-    def test_returns_none_for_empty_targets(self):
-        """Empty targets list returns None."""
-        import fivenines_agent.snmp as snmp_mod
-
-        result = snmp_mod.snmp_metrics([])
+    @patch("fivenines_agent.snmp.shutil.which")
+    def test_empty_targets_returns_none(self, mock_which):
+        mock_which.return_value = "/usr/bin/snmpget"
+        result = snmp_metrics([])
         assert result is None
 
-    def test_creates_collector_and_polls(self):
-        """Verifies collector is created and poll_all is called."""
-        import fivenines_agent.snmp as snmp_mod
+    @patch("fivenines_agent.snmp.shutil.which")
+    def test_none_targets_returns_none(self, mock_which):
+        mock_which.return_value = "/usr/bin/snmpget"
+        result = snmp_metrics(None)
+        assert result is None
 
-        targets = [_make_target()]
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    @patch("fivenines_agent.snmp.shutil.which")
+    def test_successful_poll(self, mock_which, mock_cmd):
+        mock_which.return_value = "/usr/bin/snmpget"
+        mock_cmd.side_effect = [
+            (SYSTEM_OUTPUT, None),
+            (IFTABLE_OUTPUT, None),
+            (IFXTABLE_OUTPUT, None),
+        ]
+        result = snmp_metrics([_make_target()])
+        assert result is not None
+        assert len(result["devices"]) == 1
+        dev = result["devices"][0]
+        assert dev["device_id"] == "dev-1"
+        assert dev["system"]["sys_name"] == "CoreSwitch1"
+        assert len(dev["interfaces"]) == 2
+        assert len(dev["interface_metrics"]) == 2
+        assert dev["hc_counters"] is True
 
-        with patch.object(
-            snmp_mod.SNMPCollector, "poll_all", return_value={"devices": []}
-        ):
-            result = snmp_mod.snmp_metrics(targets)
-
-        assert result == {"devices": []}
-        assert snmp_mod._collector is not None
-
-    def test_singleton_collector_recreated_each_call(self):
-        """Collector is recreated each call with fresh targets."""
-        import fivenines_agent.snmp as snmp_mod
-
-        targets1 = [_make_target(device_id="dev-1")]
-        targets2 = [_make_target(device_id="dev-2")]
-
-        with patch.object(
-            snmp_mod.SNMPCollector, "poll_all", return_value={"devices": []}
-        ):
-            snmp_mod.snmp_metrics(targets1)
-            c1 = snmp_mod._collector
-            snmp_mod.snmp_metrics(targets2)
-            c2 = snmp_mod._collector
-
-        assert c1 is not c2
-
-
-class TestSNMPCollectorIntervalTracking:
-    """Tests for per-device interval tracking."""
-
-    def test_first_poll_is_always_due(self):
-        """First poll for a device is always due (no prior timestamp)."""
-        from fivenines_agent.snmp import SNMPCollector
-
-        collector = SNMPCollector([_make_target()])
-        assert collector._is_device_due(_make_target()) is True
-
-    def test_device_not_due_within_interval(self):
-        """Device polled recently should not be due."""
-        from fivenines_agent.snmp import SNMPCollector
-
-        collector = SNMPCollector([_make_target()])
-        SNMPCollector._last_poll_times["dev-1"] = time.monotonic()
-        assert collector._is_device_due(_make_target(interval=60)) is False
-
-    def test_device_due_after_interval(self):
-        """Device past its interval should be due."""
-        from fivenines_agent.snmp import SNMPCollector
-
-        collector = SNMPCollector([_make_target()])
-        SNMPCollector._last_poll_times["dev-1"] = time.monotonic() - 120
-        assert collector._is_device_due(_make_target(interval=60)) is True
-
-    def test_timestamp_updated_after_poll(self):
-        """Last poll timestamp is updated after polling."""
-        from fivenines_agent.snmp import SNMPCollector
-
-        collector = SNMPCollector([_make_target()])
-
-        with patch.object(collector, "_build_auth", return_value=(MagicMock(), None)):
-            with patch.object(collector, "_poll_device", return_value={"device_id": "dev-1"}):
-                collector.poll_all()
-
-        assert "dev-1" in SNMPCollector._last_poll_times
-        assert SNMPCollector._last_poll_times["dev-1"] > 0
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    @patch("fivenines_agent.snmp.shutil.which")
+    def test_dry_run_prints_diagnostics(self, mock_which, mock_cmd, capsys):
+        mock_which.return_value = "/usr/bin/snmpget"
+        mock_cmd.side_effect = [
+            (SYSTEM_OUTPUT, None),
+            (IFTABLE_OUTPUT, None),
+            (IFXTABLE_OUTPUT, None),
+        ]
+        with patch("fivenines_agent.snmp.dry_run", return_value=True):
+            snmp_metrics([_make_target()])
+        captured = capsys.readouterr()
+        assert "SNMP Targets:" in captured.out
+        assert "CoreSwitch1" in captured.out
 
 
-class TestStalePollTimesPruned:
-    """Tests for pruning stale poll times."""
-
-    def test_stale_poll_times_pruned(self):
-        """Poll times for removed devices are pruned."""
-        from fivenines_agent.snmp import SNMPCollector
-
-        SNMPCollector._last_poll_times = {"dev-removed": 0}
-
-        target = _make_target(device_id="dev-current")
-        collector = SNMPCollector(targets=[target])
-
-        with patch.object(collector, "_build_auth", return_value=(MagicMock(), None)):
-            with patch.object(collector, "_poll_device", return_value={"device_id": "dev-current"}):
-                collector.poll_all()
-
-        assert "dev-removed" not in SNMPCollector._last_poll_times
+# ================================================================
+# Tests for SNMPCollector._build_base_args()
+# ================================================================
 
 
-class TestBuildAuth:
-    """Tests for auth data construction."""
-
-    def test_build_auth_v2c(self):
-        """SNMPv2c auth uses CommunityData."""
-        from fivenines_agent.snmp import SNMPCollector
-
-        target = _make_target(version="v2c", community="mycomm")
-        collector = SNMPCollector([target])
-        result = collector._build_auth(target)
-
-        assert result[0] is not None  # auth_data
-        assert result[1] is None  # no error
-
-    def test_build_auth_v3_auth_priv(self):
-        """SNMPv3 with auth+priv uses UsmUserData."""
-        from fivenines_agent.snmp import SNMPCollector
-
-        target = _make_target(version="v3")
-        collector = SNMPCollector([target])
-        result = collector._build_auth(target)
-
-        assert result[0] is not None
-        assert result[1] is None
-
-    def test_build_auth_v3_auth_no_priv(self):
-        """SNMPv3 with auth_no_priv."""
-        from fivenines_agent.snmp import SNMPCollector
-
-        target = _make_target(version="v3")
-        target["security_level"] = "auth_no_priv"
-        collector = SNMPCollector([target])
-        result = collector._build_auth(target)
-
-        assert result[0] is not None
-        assert result[1] is None
-
-    def test_build_auth_v3_no_auth(self):
-        """SNMPv3 with no_auth_no_priv."""
-        from fivenines_agent.snmp import SNMPCollector
-
-        target = _make_target(version="v3")
-        target["security_level"] = "no_auth_no_priv"
-        collector = SNMPCollector([target])
-        result = collector._build_auth(target)
-
-        assert result[0] is not None
-        assert result[1] is None
-
-    def test_build_auth_invalid_version(self):
-        """Invalid SNMP version returns error tuple."""
-        from fivenines_agent.snmp import SNMPCollector
-
+class TestBuildBaseArgs:
+    def test_v2c_default(self):
         target = _make_target()
-        target["version"] = "v99"
         collector = SNMPCollector([target])
-        result = collector._build_auth(target)
+        args, error = collector._build_base_args(target)
+        assert error is None
+        assert "-v2c" in args
+        assert "-c" in args
+        idx = args.index("-c")
+        assert args[idx + 1] == "public"
+        assert "192.168.1.10" in args
+        assert "-On" in args
 
-        assert result[0] is None
-        assert result[1]["type"] == "unknown"
-        assert "Unsupported SNMP version" in result[1]["message"]
+    def test_v2c_custom_community(self):
+        target = _make_target(community="secret")
+        collector = SNMPCollector([target])
+        args, _ = collector._build_base_args(target)
+        idx = args.index("-c")
+        assert args[idx + 1] == "secret"
 
-    def test_build_auth_missing_username_v3(self):
-        """Missing v3 username returns error tuple."""
-        from fivenines_agent.snmp import SNMPCollector
+    def test_v2c_custom_port(self):
+        target = _make_target(port=1161)
+        collector = SNMPCollector([target])
+        args, _ = collector._build_base_args(target)
+        assert "192.168.1.10:1161" in args
 
-        target = _make_target(version="v3")
+    def test_v2c_default_port(self):
+        target = _make_target(port=161)
+        collector = SNMPCollector([target])
+        args, _ = collector._build_base_args(target)
+        assert "192.168.1.10" in args
+        assert "192.168.1.10:161" not in args
+
+    def test_v3_auth_priv(self):
+        target = _make_v3_target(security_level="auth_priv")
+        collector = SNMPCollector([target])
+        args, error = collector._build_base_args(target)
+        assert error is None
+        assert "-v3" in args
+        assert "-l" in args
+        idx = args.index("-l")
+        assert args[idx + 1] == "authPriv"
+        assert "-u" in args
+        idx = args.index("-u")
+        assert args[idx + 1] == "snmpuser"
+        assert "-a" in args
+        assert "-A" in args
+        assert "-x" in args
+        assert "-X" in args
+
+    def test_v3_auth_no_priv(self):
+        target = _make_v3_target(security_level="auth_no_priv")
+        collector = SNMPCollector([target])
+        args, _ = collector._build_base_args(target)
+        assert "-a" in args
+        assert "-A" in args
+        assert "-x" not in args
+        assert "-X" not in args
+
+    def test_v3_no_auth_no_priv(self):
+        target = _make_v3_target(security_level="no_auth_no_priv")
+        collector = SNMPCollector([target])
+        args, _ = collector._build_base_args(target)
+        assert "-a" not in args
+        assert "-x" not in args
+
+    def test_v3_missing_username(self):
+        target = _make_v3_target()
         del target["username"]
         collector = SNMPCollector([target])
-        result = collector._build_auth(target)
+        args, error = collector._build_base_args(target)
+        assert args is None
+        assert error["type"] == "unknown"
+        assert "username" in error["message"].lower()
 
-        assert result[0] is None
-        assert result[1]["type"] == "unknown"
+    def test_v3_md5_des(self):
+        target = _make_v3_target(
+            auth_protocol="md5", priv_protocol="des"
+        )
+        collector = SNMPCollector([target])
+        args, _ = collector._build_base_args(target)
+        idx_a = args.index("-a")
+        assert args[idx_a + 1] == "MD5"
+        idx_x = args.index("-x")
+        assert args[idx_x + 1] == "DES"
+
+    def test_unsupported_version(self):
+        target = _make_target(version="v1")
+        collector = SNMPCollector([target])
+        args, error = collector._build_base_args(target)
+        assert args is None
+        assert error["type"] == "unknown"
+        assert "v1" in error["message"]
+
+    def test_timeout_and_retries(self):
+        target = _make_target()
+        collector = SNMPCollector([target])
+        args, _ = collector._build_base_args(target)
+        idx_t = args.index("-t")
+        assert args[idx_t + 1] == str(SNMP_TIMEOUT)
+        idx_r = args.index("-r")
+        assert args[idx_r + 1] == str(SNMP_RETRIES)
+
+
+# ================================================================
+# Tests for SNMPCollector._poll_system()
+# ================================================================
+
+
+class TestPollSystem:
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_success(self, mock_cmd):
+        mock_cmd.return_value = (SYSTEM_OUTPUT, None)
+        collector = SNMPCollector([_make_target()])
+        system, error = collector._poll_system(["-v2c", "-c", "public", "host"])
+        assert error is None
+        assert system["sys_name"] == "CoreSwitch1"
+        assert system["sys_descr"] == "Cisco IOS 15.2"
+        assert system["sys_uptime"] == 86400000  # 8640000 * 10
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_timeout_error(self, mock_cmd):
+        mock_cmd.return_value = (
+            None, {"type": "timeout", "message": "No Response"}
+        )
+        collector = SNMPCollector([_make_target()])
+        system, error = collector._poll_system([])
+        assert system is None
+        assert error["type"] == "timeout"
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_empty_output(self, mock_cmd):
+        mock_cmd.return_value = ("", None)
+        collector = SNMPCollector([_make_target()])
+        system, error = collector._poll_system([])
+        assert error is None
+        assert system == {}
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_invalid_uptime(self, mock_cmd):
+        output = '.1.3.6.1.2.1.1.3.0 = STRING: "not_a_number"\n'
+        mock_cmd.return_value = (output, None)
+        collector = SNMPCollector([_make_target()])
+        system, error = collector._poll_system([])
+        assert error is None
+        assert system["sys_uptime"] == 0
+
+
+# ================================================================
+# Tests for SNMPCollector._poll_interfaces()
+# ================================================================
+
+
+class TestPollInterfaces:
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_full_switch(self, mock_cmd):
+        """Switch with ifTable + ifXTable + HC counters."""
+        mock_cmd.side_effect = [
+            (IFTABLE_OUTPUT, None),
+            (IFXTABLE_OUTPUT, None),
+        ]
+        collector = SNMPCollector([_make_target()])
+        ifaces, counters, hc, error = collector._poll_interfaces(
+            ["-v2c", "-c", "public", "host"]
+        )
+        assert error is None
+        assert len(ifaces) == 2
+        assert len(counters) == 2
+        assert hc is True
+
+        # Check interface metadata
+        iface1 = next(i for i in ifaces if i["if_index"] == 1)
+        assert iface1["if_type"] == 6
+        assert iface1["if_admin_status"] == 0  # 1-indexed -> 0-indexed
+        assert iface1["if_oper_status"] == 0
+        assert iface1["if_name"] == "GigabitEthernet0/1"
+        assert iface1["if_alias"] == "Uplink"
+        assert iface1["if_speed"] == 1000000000  # 1000 * 1M
+
+        iface2 = next(i for i in ifaces if i["if_index"] == 2)
+        assert iface2["if_admin_status"] == 1  # down (2-1=1)
+
+        # Check counters with HC override
+        c1 = next(c for c in counters if c["if_index"] == 1)
+        assert c1["bytes_in"] == 9000000000  # HC override
+        assert c1["bytes_out"] == 7000000000  # HC override
+        assert c1["packets_in"] == 5000
+        assert c1["broadcast_in"] == 100
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_printer_no_ifxtable(self, mock_cmd):
+        """Printer with only ifTable (no ifXTable support)."""
+        mock_cmd.side_effect = [
+            (PRINTER_IFTABLE, None),
+            (IFXTABLE_NO_SUPPORT, None),
+        ]
+        collector = SNMPCollector([_make_target()])
+        ifaces, counters, hc, error = collector._poll_interfaces([])
+        assert error is None
+        assert len(ifaces) == 1
+        assert hc is False
+
+        iface = ifaces[0]
+        assert iface["if_index"] == 1
+        assert iface["if_name"] == ""  # default
+        assert iface["if_alias"] == ""  # default
+        assert iface["if_speed"] == 0  # default
+
+        c = counters[0]
+        assert c["bytes_in"] == 7010736  # 32-bit, no HC
+        assert c["bytes_out"] == 3870844
+        assert c["discards_in"] == 2386
+        assert c["broadcast_in"] == 0  # default
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_iftable_error(self, mock_cmd):
+        mock_cmd.return_value = (
+            None, {"type": "timeout", "message": "No Response"}
+        )
+        collector = SNMPCollector([_make_target()])
+        ifaces, counters, hc, error = collector._poll_interfaces([])
+        assert ifaces is None
+        assert error["type"] == "timeout"
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_ifxtable_error_nonfatal(self, mock_cmd):
+        """ifXTable errors should not fail the whole poll."""
+        mock_cmd.side_effect = [
+            (PRINTER_IFTABLE, None),
+            (None, {"type": "timeout", "message": "timed out"}),
+        ]
+        collector = SNMPCollector([_make_target()])
+        ifaces, counters, hc, error = collector._poll_interfaces([])
+        assert error is None
+        assert len(ifaces) == 1
+        assert hc is False
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_empty_iftable(self, mock_cmd):
+        mock_cmd.side_effect = [("", None), ("", None)]
+        collector = SNMPCollector([_make_target()])
+        ifaces, counters, hc, error = collector._poll_interfaces([])
+        assert error is None
+        assert ifaces == []
+        assert counters == []
+        assert hc is False
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_oids_outside_prefix_filtered(self, mock_cmd):
+        """OIDs from another subtree should be ignored."""
+        mixed_output = (
+            ".1.3.6.1.2.1.2.2.1.1.1 = INTEGER: 1\n"
+            ".1.3.6.1.2.1.43.5.1.1.1.1 = INTEGER: 32\n"  # printer MIB
+        )
+        mock_cmd.side_effect = [(mixed_output, None), ("", None)]
+        collector = SNMPCollector([_make_target()])
+        ifaces, counters, hc, error = collector._poll_interfaces([])
+        assert len(ifaces) == 1
+        assert ifaces[0]["if_index"] == 1
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_counter_defaults(self, mock_cmd):
+        """All counter fields should default to 0."""
+        minimal = ".1.3.6.1.2.1.2.2.1.1.1 = INTEGER: 1\n"
+        mock_cmd.side_effect = [(minimal, None), ("", None)]
+        collector = SNMPCollector([_make_target()])
+        ifaces, counters, hc, error = collector._poll_interfaces([])
+        c = counters[0]
+        for field in (
+            "bytes_in", "bytes_out", "packets_in", "packets_out",
+            "errors_in", "errors_out", "discards_in", "discards_out",
+            "broadcast_in", "broadcast_out",
+        ):
+            assert c[field] == 0
+
+
+# ================================================================
+# Tests for SNMPCollector._poll_device()
+# ================================================================
 
 
 class TestPollDevice:
-    """Tests for per-device polling."""
-
-    def test_poll_device_with_auth_error(self):
-        """Device with auth build error returns error dict."""
-        from fivenines_agent.snmp import SNMPCollector
-
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_successful_poll(self, mock_cmd):
+        mock_cmd.side_effect = [
+            (SYSTEM_OUTPUT, None),
+            (IFTABLE_OUTPUT, None),
+            (IFXTABLE_OUTPUT, None),
+        ]
         target = _make_target()
         collector = SNMPCollector([target])
-        auth_result = (None, {"type": "unknown", "message": "bad config"})
-
-        result = collector._poll_device(target, auth_result)
-
+        result = collector._poll_device(target)
         assert result["device_id"] == "dev-1"
-        assert result["error"]["type"] == "unknown"
+        assert "system" in result
+        assert "interfaces" in result
+        assert "interface_metrics" in result
+        assert "error" not in result
 
-    def test_poll_device_success_with_system_and_interfaces(self):
-        """Successful poll returns system, interfaces, and counters."""
-        from fivenines_agent.snmp import SNMPCollector
-
-        target = _make_target()
-        collector = SNMPCollector([target])
-        auth_result = (MagicMock(), None)
-
-        mock_system = {"sys_name": "Switch1", "sys_descr": "Test", "sys_uptime": 86400000}
-        mock_interfaces = [{"if_index": 1, "if_name": "eth0"}]
-        mock_counters = ([{"if_index": 1, "bytes_in": 100}], True)
-
-        mock_async_result = {
-            "device_id": "dev-1",
-            "system": mock_system,
-            "interfaces": mock_interfaces,
-            "interface_metrics": mock_counters[0],
-            "hc_counters": mock_counters[1],
-        }
-
-        with patch.object(
-            SNMPCollector, "_async_poll_device",
-            new=AsyncMock(return_value=mock_async_result),
-        ):
-            result = collector._poll_device(target, auth_result)
-
-        assert result["device_id"] == "dev-1"
-        assert result["system"] == mock_system
-        assert result["interfaces"] == mock_interfaces
-        assert result["interface_metrics"] == mock_counters[0]
-        assert result["hc_counters"] is True
-
-    def test_poll_device_respects_capabilities_system_only(self):
-        """Only polls system when capabilities=[system]."""
-        from fivenines_agent.snmp import SNMPCollector
-
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_system_only(self, mock_cmd):
+        mock_cmd.return_value = (SYSTEM_OUTPUT, None)
         target = _make_target(capabilities=["system"])
         collector = SNMPCollector([target])
-        auth_result = (MagicMock(), None)
-
-        mock_async_poll_system = AsyncMock(return_value={"sys_name": "X"})
-        mock_async_poll_all = AsyncMock(return_value=([], [], False))
-
-        with patch.object(SNMPCollector, "_async_poll_system", mock_async_poll_system):
-            with patch.object(SNMPCollector, "_async_poll_all_interfaces", mock_async_poll_all):
-                result = collector._poll_device(target, auth_result)
-
-        mock_async_poll_system.assert_called_once()
-        mock_async_poll_all.assert_not_called()
+        result = collector._poll_device(target)
         assert "system" in result
         assert "interfaces" not in result
 
-    def test_poll_device_respects_capabilities_if_table_only(self):
-        """Only polls interfaces when capabilities=[if_table]."""
-        from fivenines_agent.snmp import SNMPCollector
-
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_if_table_only(self, mock_cmd):
+        mock_cmd.side_effect = [
+            (IFTABLE_OUTPUT, None),
+            (IFXTABLE_OUTPUT, None),
+        ]
         target = _make_target(capabilities=["if_table"])
         collector = SNMPCollector([target])
-        auth_result = (MagicMock(), None)
-
-        mock_async_poll_system = AsyncMock(return_value={"sys_name": "X"})
-        mock_async_poll_all = AsyncMock(
-            return_value=([{"if_index": 1}], [{"if_index": 1, "bytes_in": 0}], False)
-        )
-
-        with patch.object(SNMPCollector, "_async_poll_system", mock_async_poll_system):
-            with patch.object(SNMPCollector, "_async_poll_all_interfaces", mock_async_poll_all):
-                result = collector._poll_device(target, auth_result)
-
-        mock_async_poll_system.assert_not_called()
+        result = collector._poll_device(target)
         assert "system" not in result
         assert "interfaces" in result
 
-    def test_poll_device_timeout_error(self):
-        """Timeout exception produces timeout error dict."""
-        from fivenines_agent.snmp import SNMPCollector
+    def test_unsupported_version_error(self):
+        target = _make_target(version="v1")
+        collector = SNMPCollector([target])
+        result = collector._poll_device(target)
+        assert result["error"]["type"] == "unknown"
+        assert "v1" in result["error"]["message"]
 
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_system_error_returns_error(self, mock_cmd):
+        mock_cmd.return_value = (
+            None, {"type": "timeout", "message": "No Response"}
+        )
         target = _make_target()
         collector = SNMPCollector([target])
-        auth_result = (MagicMock(), None)
-
-        with patch.object(
-            SNMPCollector, "_async_poll_device",
-            new=AsyncMock(side_effect=Exception("Request timed out")),
-        ):
-            result = collector._poll_device(target, auth_result)
-
+        result = collector._poll_device(target)
         assert result["error"]["type"] == "timeout"
 
-    def test_poll_device_auth_error(self):
-        """Auth exception produces auth_error dict."""
-        from fivenines_agent.snmp import SNMPCollector
 
-        target = _make_target()
-        collector = SNMPCollector([target])
-        auth_result = (MagicMock(), None)
-
-        with patch.object(
-            SNMPCollector, "_async_poll_device",
-            new=AsyncMock(side_effect=Exception("USM auth failure")),
-        ):
-            result = collector._poll_device(target, auth_result)
-
-        assert result["error"]["type"] == "auth_error"
-
-    def test_poll_device_unknown_error(self):
-        """Unknown exception produces unknown error dict."""
-        from fivenines_agent.snmp import SNMPCollector
-
-        target = _make_target()
-        collector = SNMPCollector([target])
-        auth_result = (MagicMock(), None)
-
-        with patch.object(
-            SNMPCollector, "_async_poll_device",
-            new=AsyncMock(side_effect=Exception("Unexpected failure occurred")),
-        ):
-            result = collector._poll_device(target, auth_result)
-
-        assert result["error"]["type"] == "unknown"
-        assert "Unexpected failure occurred" in result["error"]["message"]
+# ================================================================
+# Tests for SNMPCollector.poll_all()
+# ================================================================
 
 
 class TestPollAll:
-    """Tests for poll_all orchestration."""
-
-    def test_poll_all_no_due_devices_no_cache(self):
-        """Returns empty devices list when nothing is due and no cache."""
-        from fivenines_agent.snmp import SNMPCollector
-
-        target = _make_target()
-        SNMPCollector._last_poll_times = {"dev-1": time.monotonic()}
-        SNMPCollector._last_results = {}
-        collector = SNMPCollector([target])
-
-        result = collector.poll_all()
-        assert result == {"devices": []}
-
-    def test_poll_all_no_due_devices_returns_cached(self):
-        """Returns cached results when device is not due."""
-        from fivenines_agent.snmp import SNMPCollector
-
-        target = _make_target()
-        cached = {"device_id": "dev-1", "system": {"sys_name": "Cached"}}
-        SNMPCollector._last_poll_times = {"dev-1": time.monotonic()}
-        SNMPCollector._last_results = {"dev-1": cached}
-        collector = SNMPCollector([target])
-
-        result = collector.poll_all()
-        assert len(result["devices"]) == 1
-        assert result["devices"][0]["system"]["sys_name"] == "Cached"
-
-    def test_poll_all_multiple_devices(self):
-        """Polls multiple devices and aggregates results."""
-        from fivenines_agent.snmp import SNMPCollector
-
-        targets = [
-            _make_target(device_id="dev-1", ip="10.0.0.1"),
-            _make_target(device_id="dev-2", ip="10.0.0.2"),
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_single_device(self, mock_cmd):
+        mock_cmd.side_effect = [
+            (SYSTEM_OUTPUT, None),
+            (IFTABLE_OUTPUT, None),
+            (IFXTABLE_OUTPUT, None),
         ]
-        collector = SNMPCollector(targets)
+        collector = SNMPCollector([_make_target()])
+        result = collector.poll_all()
+        assert len(result["devices"]) == 1
 
-        with patch.object(collector, "_build_auth", return_value=(MagicMock(), None)):
-            with patch.object(
-                collector,
-                "_poll_device",
-                side_effect=[
-                    {"device_id": "dev-1", "system": {"sys_name": "A"}},
-                    {"device_id": "dev-2", "system": {"sys_name": "B"}},
-                ],
-            ):
-                result = collector.poll_all()
-
-        assert len(result["devices"]) == 2
-
-    def test_poll_all_handles_executor_timeout(self):
-        """Executor timeout produces error dict for timed-out device."""
-        from fivenines_agent.snmp import SNMPCollector
-
-        target = _make_target()
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_device_not_due(self, mock_cmd):
+        """Devices not yet due for polling should return cached results."""
+        mock_cmd.side_effect = [
+            (SYSTEM_OUTPUT, None),
+            (IFTABLE_OUTPUT, None),
+            (IFXTABLE_OUTPUT, None),
+        ]
+        target = _make_target(interval=3600)
         collector = SNMPCollector([target])
 
-        with patch.object(collector, "_build_auth", return_value=(MagicMock(), None)):
-            with patch(
-                "fivenines_agent.snmp.ThreadPoolExecutor"
-            ) as mock_executor_cls:
-                mock_executor = MagicMock()
-                mock_executor_cls.return_value = mock_executor
+        # First poll - should actually poll
+        result1 = collector.poll_all()
+        assert len(result1["devices"]) == 1
 
-                mock_future = MagicMock()
-                mock_future.result.side_effect = FuturesTimeoutError()
-                mock_executor.submit.return_value = mock_future
+        # Second poll - should return cached
+        collector2 = SNMPCollector([target])
+        result2 = collector2.poll_all()
+        assert len(result2["devices"]) == 1
+        assert result2["devices"][0]["device_id"] == "dev-1"
 
-                result = collector.poll_all()
-
+    def test_all_cached_no_due(self):
+        """When no devices are due, return cached results only."""
+        SNMPCollector._last_poll_times["dev-1"] = time.monotonic()
+        SNMPCollector._last_results["dev-1"] = {
+            "device_id": "dev-1",
+            "system": {"sys_name": "cached"},
+        }
+        target = _make_target(interval=3600)
+        collector = SNMPCollector([target])
+        result = collector.poll_all()
         assert len(result["devices"]) == 1
+        assert result["devices"][0]["system"]["sys_name"] == "cached"
+
+    def test_stale_devices_pruned(self):
+        """Devices no longer in targets should be removed from cache."""
+        SNMPCollector._last_poll_times["old-device"] = time.monotonic()
+        SNMPCollector._last_results["old-device"] = {
+            "device_id": "old-device"
+        }
+        target = _make_target(device_id="new-device")
+        # Force it to be due
+        SNMPCollector._last_poll_times["new-device"] = 0
+
+        with patch("fivenines_agent.snmp._run_snmp_cmd") as mock_cmd:
+            mock_cmd.side_effect = [
+                (SYSTEM_OUTPUT, None),
+                (IFTABLE_OUTPUT, None),
+                (IFXTABLE_OUTPUT, None),
+            ]
+            collector = SNMPCollector([target])
+            collector.poll_all()
+
+        assert "old-device" not in SNMPCollector._last_poll_times
+        assert "old-device" not in SNMPCollector._last_results
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_mixed_due_and_cached(self, mock_cmd):
+        """Poll due devices and include cached results for not-due ones."""
+        mock_cmd.side_effect = [
+            (SYSTEM_OUTPUT, None),
+            (IFTABLE_OUTPUT, None),
+            (IFXTABLE_OUTPUT, None),
+        ]
+        # dev-1 is cached and not due
+        SNMPCollector._last_poll_times["dev-1"] = time.monotonic()
+        SNMPCollector._last_results["dev-1"] = {
+            "device_id": "dev-1",
+            "system": {"sys_name": "cached"},
+        }
+        # dev-2 is due
+        target1 = _make_target(device_id="dev-1", interval=3600)
+        target2 = _make_target(device_id="dev-2", interval=60)
+
+        collector = SNMPCollector([target1, target2])
+        result = collector.poll_all()
+        assert len(result["devices"]) == 2
+        ids = {d["device_id"] for d in result["devices"]}
+        assert ids == {"dev-1", "dev-2"}
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_error_device_not_cached(self, mock_cmd):
+        """Failed polls should not be cached."""
+        mock_cmd.return_value = (
+            None, {"type": "timeout", "message": "No Response"}
+        )
+        target = _make_target()
+        collector = SNMPCollector([target])
+        result = collector.poll_all()
         assert result["devices"][0]["error"]["type"] == "timeout"
+        assert "dev-1" not in SNMPCollector._last_results
 
 
-class TestAdminOperStatusMapping:
-    """Tests for SNMP status value 0-indexing."""
-
-    def test_status_mapping_1_to_0(self):
-        """SNMP 1 (up) maps to 0."""
-        assert max(0, 1 - 1) == 0
-
-    def test_status_mapping_2_to_1(self):
-        """SNMP 2 (down) maps to 1."""
-        assert max(0, 2 - 1) == 1
-
-    def test_status_mapping_3_to_2(self):
-        """SNMP 3 (testing) maps to 2."""
-        assert max(0, 3 - 1) == 2
-
-    def test_status_mapping_zero_safety(self):
-        """Unexpected SNMP 0 clamps to 0."""
-        assert max(0, 0 - 1) == 0
+# ================================================================
+# Tests for _is_device_due()
+# ================================================================
 
 
-class TestDryRunDiagnostics:
-    """Tests for dry-run diagnostic output."""
+class TestIsDeviceDue:
+    def test_never_polled(self):
+        target = _make_target()
+        collector = SNMPCollector([target])
+        assert collector._is_device_due(target) is True
 
-    def test_diagnostics_printed_for_ok_device(self):
-        """OK device shows in diagnostic table."""
-        from fivenines_agent.snmp import _print_diagnostics
+    def test_recently_polled(self):
+        target = _make_target(interval=3600)
+        SNMPCollector._last_poll_times["dev-1"] = time.monotonic()
+        collector = SNMPCollector([target])
+        assert collector._is_device_due(target) is False
 
+    def test_interval_elapsed(self):
+        target = _make_target(interval=60)
+        SNMPCollector._last_poll_times["dev-1"] = time.monotonic() - 61
+        collector = SNMPCollector([target])
+        assert collector._is_device_due(target) is True
+
+
+# ================================================================
+# Tests for _print_diagnostics()
+# ================================================================
+
+
+class TestPrintDiagnostics:
+    def test_successful_device(self, capsys):
         devices = [
             {
                 "device_id": "dev-1",
@@ -526,413 +882,321 @@ class TestDryRunDiagnostics:
                 "interfaces": [{"if_index": 1}, {"if_index": 2}],
             }
         ]
+        _print_diagnostics(devices)
+        out = capsys.readouterr().out
+        assert "SNMP Targets:" in out
+        assert "Switch1" in out
+        assert "2 interfaces" in out
+        assert "OK" in out
 
-        captured = StringIO()
-        with patch("sys.stdout", captured):
-            _print_diagnostics(devices)
-
-        output = captured.getvalue()
-        assert "Switch1" in output
-        assert "2 interfaces" in output
-        assert "OK" in output
-
-    def test_diagnostics_printed_for_error_device(self):
-        """Error device shows error type in diagnostic table."""
-        from fivenines_agent.snmp import _print_diagnostics
-
+    def test_timeout_device(self, capsys):
         devices = [
             {
                 "device_id": "dev-1",
-                "error": {"type": "timeout", "message": "timed out"},
+                "error": {"type": "timeout", "message": "No Response"},
             }
         ]
+        _print_diagnostics(devices)
+        out = capsys.readouterr().out
+        assert "TIMEOUT" in out
 
-        captured = StringIO()
-        with patch("sys.stdout", captured):
-            _print_diagnostics(devices)
-
-        output = captured.getvalue()
-        assert "TIMEOUT" in output
-
-
-class TestPermissionsSnmp:
-    """Tests for SNMP capability in permissions."""
-
-    def test_pysnmp_available(self):
-        """Banner shows available when pysnmp is importable."""
-        from fivenines_agent.permissions import PermissionProbe
-
-        probe = PermissionProbe()
-        # pysnmp is mocked in sys.modules, so it should be importable
-        assert probe._can_import_pysnmp() is True
-
-    def test_pysnmp_unavailable(self):
-        """Returns False when pysnmp import fails."""
-        from fivenines_agent.permissions import PermissionProbe
-
-        probe = PermissionProbe()
-
-        with patch.dict(sys.modules, {"pysnmp": None}):
-            # Force ImportError
-            original_import = __import__
-
-            def mock_import(name, *args, **kwargs):
-                if name == "pysnmp":
-                    raise ImportError("no pysnmp")
-                return original_import(name, *args, **kwargs)
-
-            with patch("builtins.__import__", side_effect=mock_import):
-                assert probe._can_import_pysnmp() is False
-
-
-class TestAgentSnmpDispatch:
-    """Tests for SNMP dispatch in agent.py."""
-
-    def test_snmp_dispatch_with_targets(self):
-        """snmp_metrics is called when snmp_targets present in config."""
-        # This tests the integration point in agent.py
-        # We verify the dispatch logic without running the full agent
-        config = {"snmp_targets": [_make_target()], "enabled": True}
-
-        # The key assertion: when snmp_targets is non-empty and truthy,
-        # snmp_metrics should be called
-        assert len(config.get("snmp_targets", [])) > 0
-
-    def test_snmp_dispatch_without_targets(self):
-        """snmp_metrics is NOT called when snmp_targets absent."""
-        config = {"enabled": True}
-        assert len(config.get("snmp_targets", [])) == 0
-
-    def test_snmp_dispatch_empty_targets(self):
-        """snmp_metrics is NOT called when snmp_targets is empty list."""
-        config = {"snmp_targets": [], "enabled": True}
-        targets = config.get("snmp_targets", [])
-        assert not targets  # empty list is falsy
-
-
-class TestNoCredentialsInLogs:
-    """Tests that credentials never appear in log output."""
-
-    def test_log_calls_exclude_passwords(self):
-        """Verify log calls don't include community strings or passwords."""
-        from fivenines_agent.snmp import SNMPCollector
-
-        target = _make_target(version="v3")
-        collector = SNMPCollector([target])
-        auth_result = (MagicMock(), None)
-
-        with patch("fivenines_agent.snmp.log") as mock_log:
-            with patch.object(
-                SNMPCollector, "_async_poll_device",
-                new=AsyncMock(side_effect=Exception("test error")),
-            ):
-                collector._poll_device(target, auth_result)
-
-        # Check all log calls
-        for call_args in mock_log.call_args_list:
-            msg = call_args[0][0]
-            assert "authpass" not in msg
-            assert "privpass" not in msg
-            assert "snmpuser" not in msg.lower() or "device" in msg.lower()
-
-
-def _make_oid(oid_str):
-    """Create a mock OID object that converts to string correctly."""
-    oid = MagicMock()
-    oid.__str__ = MagicMock(return_value=oid_str)
-    return oid
-
-
-def _make_val(value):
-    """Create a mock SNMP value that converts to string and int correctly."""
-    val = MagicMock()
-    val.__str__ = MagicMock(return_value=str(value))
-    val.__int__ = MagicMock(return_value=int(value) if isinstance(value, (int, float)) else 0)
-    return val
-
-
-def _make_str_val(value):
-    """Create a mock SNMP value for string values."""
-    val = MagicMock()
-    val.__str__ = MagicMock(return_value=str(value))
-    return val
-
-
-def _fake_object_identity(oid_str):
-    """Fake ObjectIdentity that just returns a plain object (not a Mock)."""
-    return oid_str
-
-
-def _fake_object_type(*args):
-    """Fake ObjectType that just returns a plain object (not a Mock)."""
-    return args
-
-
-class TestPollSystemDirect:
-    """Tests for _async_poll_system with mocked pysnmp responses."""
-
-    def test_poll_system_success(self):
-        """Successful system poll returns correct dict."""
-        from fivenines_agent.snmp import SNMPCollector, OID_SYS_NAME, OID_SYS_DESCR, OID_SYS_UPTIME
-
-        collector = SNMPCollector([_make_target()])
-
-        var_binds = [
-            (_make_oid(OID_SYS_NAME), _make_str_val("CoreSwitch1")),
-            (_make_oid(OID_SYS_DESCR), _make_str_val("Cisco IOS 15.2")),
-            (_make_oid(OID_SYS_UPTIME), _make_val(8640000)),  # centiseconds
+    def test_auth_error_device(self, capsys):
+        devices = [
+            {
+                "device_id": "dev-1",
+                "error": {"type": "auth_error", "message": "bad creds"},
+            }
         ]
+        _print_diagnostics(devices)
+        out = capsys.readouterr().out
+        assert "AUTH ERROR" in out
 
-        mock_get_cmd = AsyncMock(return_value=(None, None, None, var_binds))
+    def test_generic_error(self, capsys):
+        devices = [
+            {
+                "device_id": "dev-1",
+                "error": {"type": "unknown", "message": "something broke"},
+            }
+        ]
+        _print_diagnostics(devices)
+        out = capsys.readouterr().out
+        assert "UNKNOWN" in out
 
-        result = asyncio.run(
-            collector._async_poll_system(
-                MagicMock(),  # engine
-                MagicMock(),  # auth
-                MagicMock(),  # transport
-                MagicMock(),  # ctx
-                mock_get_cmd,
-                _fake_object_identity,
-                _fake_object_type,
-            )
-        )
 
-        assert result["sys_name"] == "CoreSwitch1"
-        assert result["sys_descr"] == "Cisco IOS 15.2"
-        assert result["sys_uptime"] == 86400000
+# ================================================================
+# Tests for _parse_table()
+# ================================================================
 
-    def test_poll_system_error_indication(self):
-        """Error indication raises exception."""
-        from fivenines_agent.snmp import SNMPCollector
 
+class TestParseTable:
+    def test_iftable_parsing(self):
         collector = SNMPCollector([_make_target()])
-
-        mock_get_cmd = AsyncMock(
-            return_value=("requestTimedOut", None, None, [])
+        interfaces = {}
+        counters = {}
+        hc_supported = collector._parse_table(
+            IFTABLE_OUTPUT, IF_TABLE_PREFIX, IFTABLE_COLUMNS,
+            interfaces, counters, None
         )
+        assert hc_supported is True
+        assert 1 in interfaces
+        assert 2 in interfaces
+        assert interfaces[1]["if_type"] == 6
+        assert counters[1]["bytes_in"] == 1000000
+        assert counters[2]["bytes_out"] == 600000
 
-        with pytest.raises(Exception, match="requestTimedOut"):
-            asyncio.run(
-                collector._async_poll_system(
-                    MagicMock(), MagicMock(), MagicMock(), MagicMock(),
-                    mock_get_cmd, _fake_object_identity, _fake_object_type,
-                )
-            )
-
-    def test_poll_system_error_status(self):
-        """SNMP error status raises exception."""
-        from fivenines_agent.snmp import SNMPCollector
-
+    def test_ifxtable_parsing(self):
         collector = SNMPCollector([_make_target()])
-
-        mock_error_status = MagicMock()
-        mock_error_status.prettyPrint.return_value = "noAccess"
-        mock_error_status.__bool__ = MagicMock(return_value=True)
-
-        mock_oid = MagicMock()
-        mock_oid.__str__ = MagicMock(return_value="1.3.6.1.2.1.1.5.0")
-        var_binds = [(mock_oid, MagicMock())]
-
-        mock_get_cmd = AsyncMock(
-            return_value=(None, mock_error_status, 1, var_binds)
+        interfaces = {1: {"if_index": 1}, 2: {"if_index": 2}}
+        counters = {1: {"if_index": 1}, 2: {"if_index": 2}}
+        hc_data = {}
+        hc_supported = collector._parse_table(
+            IFXTABLE_OUTPUT, IF_XTABLE_PREFIX, IFXTABLE_COLUMNS,
+            interfaces, counters, hc_data
         )
+        assert hc_supported is True
+        assert interfaces[1]["if_name"] == "GigabitEthernet0/1"
+        assert interfaces[1]["if_speed"] == 1000000000
+        assert hc_data[1]["bytes_in"] == 9000000000
+        assert counters[1]["broadcast_in"] == 100
 
-        with pytest.raises(Exception, match="SNMP error"):
-            asyncio.run(
-                collector._async_poll_system(
-                    MagicMock(), MagicMock(), MagicMock(), MagicMock(),
-                    mock_get_cmd, _fake_object_identity, _fake_object_type,
-                )
-            )
-
-
-class TestPollAllInterfacesDirect:
-    """Tests for _async_poll_all_interfaces with mocked pysnmp responses."""
-
-    def test_poll_all_interfaces_returns_tuple(self):
-        """Combined poll returns (interfaces, counters, hc_bool) tuple."""
-        from fivenines_agent.snmp import SNMPCollector
-
+    def test_nosuch_disables_hc(self):
         collector = SNMPCollector([_make_target()])
-
-        mock_result = (
-            [{"if_index": 1, "if_name": "eth0", "if_type": 6,
-              "if_speed": 1000000000, "if_admin_status": 0, "if_oper_status": 0,
-              "if_alias": "Uplink"}],
-            [{"if_index": 1, "bytes_in": 1000, "bytes_out": 500}],
-            True,
+        interfaces = {}
+        counters = {}
+        hc_data = {}
+        hc_supported = collector._parse_table(
+            IFXTABLE_NO_SUPPORT, IF_XTABLE_PREFIX, IFXTABLE_COLUMNS,
+            interfaces, counters, hc_data
         )
-        mock_poll_all = AsyncMock(return_value=mock_result)
+        assert hc_supported is False
+        assert len(hc_data) == 0
 
-        with patch.object(SNMPCollector, "_async_poll_all_interfaces", mock_poll_all):
-            ifaces, counters, hc = asyncio.run(
-                collector._async_poll_all_interfaces(
-                    MagicMock(), MagicMock(), MagicMock(), MagicMock(),
-                    MagicMock, MagicMock, MagicMock,
-                )
-            )
-
-        assert len(ifaces) == 1
-        assert ifaces[0]["if_index"] == 1
-        assert ifaces[0]["if_name"] == "eth0"
-        assert ifaces[0]["if_speed"] == 1000000000
-        assert ifaces[0]["if_admin_status"] == 0
-        assert len(counters) == 1
-        assert hc is True
-
-    def test_poll_all_interfaces_empty(self):
-        """Empty interface table returns empty lists."""
-        from fivenines_agent.snmp import SNMPCollector
-
+    def test_malformed_suffix_skipped(self):
+        bad_output = ".1.3.6.1.2.1.2.2.1 = INTEGER: 1\n"
         collector = SNMPCollector([_make_target()])
-
-        mock_poll_all = AsyncMock(return_value=([], [], False))
-
-        with patch.object(SNMPCollector, "_async_poll_all_interfaces", mock_poll_all):
-            ifaces, counters, hc = asyncio.run(
-                collector._async_poll_all_interfaces(
-                    MagicMock(), MagicMock(), MagicMock(), MagicMock(),
-                    MagicMock, MagicMock, MagicMock,
-                )
-            )
-
-        assert ifaces == []
-        assert counters == []
-        assert hc is False
-
-    def test_poll_all_interfaces_no_ifxtable_defaults(self):
-        """Missing ifXTable fills defaults for name, alias, speed."""
-        from fivenines_agent.snmp import SNMPCollector
-
-        collector = SNMPCollector([_make_target()])
-
-        mock_result = (
-            [{"if_index": 1, "if_type": 6, "if_admin_status": 0,
-              "if_oper_status": 0, "if_name": "", "if_alias": "", "if_speed": 0}],
-            [{"if_index": 1, "bytes_in": 100, "bytes_out": 50}],
-            False,
+        interfaces = {}
+        counters = {}
+        collector._parse_table(
+            bad_output, IF_TABLE_PREFIX, IFTABLE_COLUMNS,
+            interfaces, counters, None
         )
-        mock_poll_all = AsyncMock(return_value=mock_result)
+        assert len(interfaces) == 0
 
-        with patch.object(SNMPCollector, "_async_poll_all_interfaces", mock_poll_all):
-            ifaces, counters, hc = asyncio.run(
-                collector._async_poll_all_interfaces(
-                    MagicMock(), MagicMock(), MagicMock(), MagicMock(),
-                    MagicMock, MagicMock, MagicMock,
-                )
-            )
-
-        assert ifaces[0]["if_name"] == ""
-        assert ifaces[0]["if_alias"] == ""
-        assert ifaces[0]["if_speed"] == 0
-        assert hc is False
-
-    def test_poll_all_interfaces_hc_counters(self):
-        """64-bit HC counters override 32-bit when available."""
-        from fivenines_agent.snmp import SNMPCollector
-
+    def test_unknown_column_skipped(self):
+        output = ".1.3.6.1.2.1.2.2.1.99.1 = INTEGER: 42\n"
         collector = SNMPCollector([_make_target()])
-
-        mock_result = (
-            [{"if_index": 1, "if_type": 6}],
-            [{"if_index": 1, "bytes_in": 1000000000, "bytes_out": 500000000,
-              "packets_in": 1000000, "packets_out": 500000,
-              "errors_in": 0, "errors_out": 0,
-              "discards_in": 0, "discards_out": 0,
-              "broadcast_in": 5000, "broadcast_out": 2000}],
-            True,
+        interfaces = {}
+        counters = {}
+        collector._parse_table(
+            output, IF_TABLE_PREFIX, IFTABLE_COLUMNS,
+            interfaces, counters, None
         )
-        mock_poll_all = AsyncMock(return_value=mock_result)
+        assert len(interfaces) == 0
+        assert len(counters) == 0
 
-        with patch.object(SNMPCollector, "_async_poll_all_interfaces", mock_poll_all):
-            ifaces, counters, hc = asyncio.run(
-                collector._async_poll_all_interfaces(
-                    MagicMock(), MagicMock(), MagicMock(), MagicMock(),
-                    MagicMock, MagicMock, MagicMock,
-                )
-            )
+    def test_invalid_value_skipped(self):
+        output = ".1.3.6.1.2.1.2.2.1.10.1 = STRING: \"not_a_number\"\n"
+        collector = SNMPCollector([_make_target()])
+        interfaces = {}
+        counters = {}
+        collector._parse_table(
+            output, IF_TABLE_PREFIX, IFTABLE_COLUMNS,
+            interfaces, counters, None
+        )
+        assert len(counters) == 0
 
-        assert hc is True
-        assert counters[0]["bytes_in"] == 1000000000
+    def test_hc_data_none_skips_hc(self):
+        """When hc_data is None, HC bucket entries are ignored."""
+        collector = SNMPCollector([_make_target()])
+        interfaces = {1: {"if_index": 1}}
+        counters = {1: {"if_index": 1}}
+        collector._parse_table(
+            IFXTABLE_OUTPUT, IF_XTABLE_PREFIX, IFXTABLE_COLUMNS,
+            interfaces, counters, None  # hc_data=None
+        )
+        # HC fields should not appear in counters
+        assert "bytes_in" not in counters[1] or counters[1]["bytes_in"] != 9000000000
 
 
-class TestDryRunIntegration:
-    """Tests for dry-run mode integration."""
+# ================================================================
+# Tests for constants and configuration
+# ================================================================
 
-    def test_snmp_metrics_prints_diagnostics_in_dry_run(self):
-        """Dry-run mode prints diagnostic table."""
+
+class TestConstants:
+    def test_iftable_columns_complete(self):
+        """All expected ifTable columns are mapped."""
+        expected = {"1", "3", "7", "8", "10", "11", "13", "14",
+                    "16", "17", "19", "20"}
+        assert set(IFTABLE_COLUMNS.keys()) == expected
+
+    def test_ifxtable_columns_complete(self):
+        """All expected ifXTable columns are mapped."""
+        expected = {"1", "3", "5", "6", "10", "15", "18"}
+        assert set(IFXTABLE_COLUMNS.keys()) == expected
+
+    def test_admin_status_conversion(self):
+        """Admin/oper status should be 0-indexed (subtract 1)."""
+        converter = IFTABLE_COLUMNS["7"][2]
+        assert converter("1") == 0  # up
+        assert converter("2") == 1  # down
+        assert converter("3") == 2  # testing
+
+    def test_if_speed_conversion(self):
+        """ifHighSpeed is in Mbps, convert to bps."""
+        converter = IFXTABLE_COLUMNS["15"][2]
+        assert converter("1000") == 1000000000
+        assert converter("100") == 100000000
+
+    def test_settings(self):
+        assert SNMP_TIMEOUT == 5
+        assert SNMP_RETRIES == 1
+        assert EXECUTOR_TIMEOUT == 30
+        assert MAX_WORKERS == 10
+
+
+# ================================================================
+# Tests for edge cases (coverage gaps)
+# ================================================================
+
+
+class TestEdgeCases:
+    def test_init_creates_class_attrs(self):
+        """First SNMPCollector creates class-level dicts."""
+        # Remove class attrs to test the hasattr branches
+        if hasattr(SNMPCollector, "_last_poll_times"):
+            del SNMPCollector._last_poll_times
+        if hasattr(SNMPCollector, "_last_results"):
+            del SNMPCollector._last_results
+        collector = SNMPCollector([_make_target()])
+        assert hasattr(SNMPCollector, "_last_poll_times")
+        assert hasattr(SNMPCollector, "_last_results")
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_executor_timeout(self, mock_cmd):
+        """Executor timeout when _poll_device takes too long."""
         import fivenines_agent.snmp as snmp_mod
 
-        targets = [_make_target()]
-        mock_result = {
-            "devices": [
-                {
-                    "device_id": "dev-1",
-                    "system": {"sys_name": "TestSwitch"},
-                    "interfaces": [{"if_index": 1}],
-                }
-            ]
-        }
+        original_timeout = snmp_mod.EXECUTOR_TIMEOUT
+        snmp_mod.EXECUTOR_TIMEOUT = 0.01  # Force immediate timeout
 
-        with patch.object(snmp_mod.SNMPCollector, "poll_all", return_value=mock_result):
-            with patch("fivenines_agent.snmp.dry_run", return_value=True):
-                captured = StringIO()
-                with patch("sys.stdout", captured):
-                    snmp_mod.snmp_metrics(targets)
+        def slow_poll(*args, **kwargs):
+            import time
+            time.sleep(1)
+            return {"device_id": "dev-1"}
 
-        output = captured.getvalue()
-        assert "SNMP Targets:" in output
-        assert "TestSwitch" in output
+        target = _make_target()
+        collector = SNMPCollector([target])
+        with patch.object(collector, "_poll_device", side_effect=slow_poll):
+            result = collector.poll_all()
 
-    def test_snmp_metrics_no_diagnostics_when_not_dry_run(self):
-        """No diagnostic output in normal mode."""
-        import fivenines_agent.snmp as snmp_mod
+        snmp_mod.EXECUTOR_TIMEOUT = original_timeout
+        assert len(result["devices"]) == 1
+        assert result["devices"][0]["error"]["type"] == "timeout"
+        assert "Executor timeout" in result["devices"][0]["error"]["message"]
 
-        targets = [_make_target()]
-        mock_result = {"devices": [{"device_id": "dev-1"}]}
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_executor_unexpected_exception(self, mock_cmd):
+        """Unexpected exception from _poll_device."""
+        target = _make_target()
+        collector = SNMPCollector([target])
+        with patch.object(
+            collector, "_poll_device",
+            side_effect=RuntimeError("boom")
+        ):
+            result = collector.poll_all()
+        assert result["devices"][0]["error"]["type"] == "unknown"
+        assert "boom" in result["devices"][0]["error"]["message"]
 
-        with patch.object(snmp_mod.SNMPCollector, "poll_all", return_value=mock_result):
-            with patch("fivenines_agent.snmp.dry_run", return_value=False):
-                with patch("fivenines_agent.snmp._print_diagnostics") as mock_diag:
-                    snmp_mod.snmp_metrics(targets)
+    @patch("fivenines_agent.snmp.ThreadPoolExecutor")
+    def test_executor_creation_failure(self, mock_executor_cls):
+        """ThreadPoolExecutor constructor raises."""
+        mock_executor_cls.side_effect = RuntimeError("no threads")
+        target = _make_target()
+        collector = SNMPCollector([target])
+        result = collector.poll_all()
+        assert result["devices"] == []
 
-        mock_diag.assert_not_called()
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_poll_device_interface_error(self, mock_cmd):
+        """Interface poll error returns error dict."""
+        mock_cmd.side_effect = [
+            (SYSTEM_OUTPUT, None),
+            (None, {"type": "timeout", "message": "No Response"}),
+        ]
+        target = _make_target()
+        collector = SNMPCollector([target])
+        result = collector._poll_device(target)
+        assert result["error"]["type"] == "timeout"
 
+    def test_parse_table_invalid_if_index(self):
+        """Non-numeric ifIndex should be skipped."""
+        output = ".1.3.6.1.2.1.2.2.1.1.abc = INTEGER: 1\n"
+        collector = SNMPCollector([_make_target()])
+        interfaces = {}
+        counters = {}
+        collector._parse_table(
+            output, IF_TABLE_PREFIX, IFTABLE_COLUMNS,
+            interfaces, counters, None
+        )
+        assert len(interfaces) == 0
 
-class TestSysUptimeConversion:
-    """Tests for sysUptime centisecond to millisecond conversion."""
+    def test_parse_table_oid_outside_prefix(self):
+        """OIDs not starting with prefix should be skipped."""
+        output = ".1.3.6.1.2.1.99.1.1.1 = INTEGER: 42\n"
+        collector = SNMPCollector([_make_target()])
+        interfaces = {}
+        counters = {}
+        collector._parse_table(
+            output, IF_TABLE_PREFIX, IFTABLE_COLUMNS,
+            interfaces, counters, None
+        )
+        assert len(interfaces) == 0
 
-    def test_uptime_centiseconds_to_ms(self):
-        """sysUptime centiseconds * 10 = milliseconds."""
-        # 86400 seconds = 1 day
-        # In centiseconds: 8640000
-        # In milliseconds: 86400000
-        centiseconds = 8640000
-        ms = centiseconds * 10
-        assert ms == 86400000
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_poll_system_nosuch_lines_skipped(self, mock_cmd):
+        """noSuch lines in system output should be skipped."""
+        output = (
+            '.1.3.6.1.2.1.1.5.0 = STRING: "Switch"\n'
+            ".1.3.6.1.2.1.1.1.0 = No Such Object\n"
+            ".1.3.6.1.2.1.1.3.0 = Timeticks: (100) 0:00:01.00\n"
+        )
+        mock_cmd.return_value = (output, None)
+        collector = SNMPCollector([_make_target()])
+        system, error = collector._poll_system([])
+        assert error is None
+        assert system["sys_name"] == "Switch"
+        assert "sys_descr" not in system
+        assert system["sys_uptime"] == 1000
 
-    def test_uptime_zero(self):
-        """Zero uptime is zero."""
-        assert 0 * 10 == 0
+    def test_parse_table_empty_lines_skipped(self):
+        """Empty lines in walk output should be skipped."""
+        output = "\n.1.3.6.1.2.1.2.2.1.1.1 = INTEGER: 1\n\n"
+        collector = SNMPCollector([_make_target()])
+        interfaces = {}
+        counters = {}
+        collector._parse_table(
+            output, IF_TABLE_PREFIX, IFTABLE_COLUMNS,
+            interfaces, counters, None
+        )
+        assert len(interfaces) == 1
 
-
-class TestIfHighSpeedConversion:
-    """Tests for ifHighSpeed Mbps to bps conversion."""
-
-    def test_1gbps(self):
-        """1 Gbps = 1000 Mbps raw = 1000000000 bps."""
-        raw_mbps = 1000
-        bps = raw_mbps * 1000000
-        assert bps == 1000000000
-
-    def test_10gbps(self):
-        """10 Gbps = 10000 Mbps raw = 10000000000 bps."""
-        raw_mbps = 10000
-        bps = raw_mbps * 1000000
-        assert bps == 10000000000
-
-    def test_100mbps(self):
-        """100 Mbps = 100 raw = 100000000 bps."""
-        raw_mbps = 100
-        bps = raw_mbps * 1000000
-        assert bps == 100000000
+    def test_parse_table_nosuch_in_middle(self):
+        """noSuch in middle of walk should disable HC but keep parsing."""
+        output = (
+            ".1.3.6.1.2.1.31.1.1.1.1.1 = STRING: \"eth0\"\n"
+            ".1.3.6.1.2.1.31.1.1.1.6.1 = No Such Object\n"
+            ".1.3.6.1.2.1.31.1.1.1.18.1 = STRING: \"Uplink\"\n"
+        )
+        collector = SNMPCollector([_make_target()])
+        interfaces = {1: {"if_index": 1}}
+        counters = {}
+        hc_data = {}
+        hc_supported = collector._parse_table(
+            output, IF_XTABLE_PREFIX, IFXTABLE_COLUMNS,
+            interfaces, counters, hc_data
+        )
+        assert hc_supported is False
+        assert interfaces[1]["if_name"] == "eth0"
+        assert interfaces[1]["if_alias"] == "Uplink"
+        assert len(hc_data) == 0
