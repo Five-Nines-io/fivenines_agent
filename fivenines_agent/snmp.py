@@ -258,7 +258,7 @@ class SNMPCollector:
                     # Update last poll time regardless of outcome
                     SNMPCollector._last_poll_times[device_id] = time.monotonic()
             finally:
-                # Don't wait for stuck workers — pysnmp timeout is the
+                # Don't wait for stuck workers - pysnmp timeout is the
                 # primary mechanism; this is the safety net.
                 executor.shutdown(wait=False)
         except Exception as e:
