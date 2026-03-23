@@ -1,8 +1,6 @@
 """Tests for SNMP network device polling collector."""
 
 import asyncio
-import hashlib
-import json
 import sys
 import time
 from concurrent.futures import TimeoutError as FuturesTimeoutError
@@ -68,8 +66,6 @@ def _reset_collector_state():
     snmp_mod._collector = None
     if hasattr(snmp_mod.SNMPCollector, "_last_poll_times"):
         snmp_mod.SNMPCollector._last_poll_times = {}
-    if hasattr(snmp_mod.SNMPCollector, "_session_cache"):
-        snmp_mod.SNMPCollector._session_cache = {}
 
 
 @pytest.fixture(autouse=True)
@@ -177,7 +173,7 @@ class TestSNMPCollectorIntervalTracking:
 
         collector = SNMPCollector([_make_target()])
 
-        with patch.object(collector, "_build_session", return_value=(MagicMock(), MagicMock())):
+        with patch.object(collector, "_build_auth", return_value=(MagicMock(), None)):
             with patch.object(collector, "_poll_device", return_value={"device_id": "dev-1"}):
                 collector.poll_all()
 
@@ -185,151 +181,95 @@ class TestSNMPCollectorIntervalTracking:
         assert SNMPCollector._last_poll_times["dev-1"] > 0
 
 
-class TestSNMPCollectorSessionCache:
-    """Tests for session caching."""
+class TestStalePollTimesPruned:
+    """Tests for pruning stale poll times."""
 
-    def test_session_cache_stores_session(self):
-        """Built sessions are cached by device_id."""
+    def test_stale_poll_times_pruned(self):
+        """Poll times for removed devices are pruned."""
         from fivenines_agent.snmp import SNMPCollector
 
-        target = _make_target()
-        collector = SNMPCollector([target])
-
-        mock_auth = MagicMock()
-        mock_transport = MagicMock()
-
-        with patch("fivenines_agent.snmp.SNMPCollector._build_session") as mock_build:
-            mock_build.return_value = (mock_auth, mock_transport)
-            with patch.object(collector, "_poll_device", return_value={"device_id": "dev-1"}):
-                collector.poll_all()
-
-        # Session should have been built
-        mock_build.assert_called_once_with(target)
-
-    def test_session_cache_hit(self):
-        """Cached session is reused when config hash matches."""
-        from fivenines_agent.snmp import SNMPCollector
-
-        target = _make_target()
-        config_hash = hashlib.sha256(
-            json.dumps(target, sort_keys=True).encode()
-        ).hexdigest()
-
-        mock_auth = MagicMock()
-        mock_transport = MagicMock()
-
-        SNMPCollector._session_cache = {
-            "dev-1": (mock_auth, mock_transport, config_hash)
-        }
-
-        collector = SNMPCollector([target])
-        result = collector._build_session(target)
-
-        assert result == (mock_auth, mock_transport)
-
-    def test_session_cache_invalidate_on_config_change(self):
-        """Session is rebuilt when config hash changes."""
-        from fivenines_agent.snmp import SNMPCollector
-
-        target = _make_target()
-        SNMPCollector._session_cache = {
-            "dev-1": (MagicMock(), MagicMock(), "old-hash")
-        }
-
-        collector = SNMPCollector([target])
-        result = collector._build_session(target)
-
-        # Should return new session (not the old cached one)
-        assert result is not None
-
-    def test_stale_sessions_pruned(self):
-        """Sessions for removed devices are pruned."""
-        from fivenines_agent.snmp import SNMPCollector
-
-        SNMPCollector._session_cache = {
-            "dev-removed": (MagicMock(), MagicMock(), "hash"),
-        }
         SNMPCollector._last_poll_times = {"dev-removed": 0}
 
         target = _make_target(device_id="dev-current")
         collector = SNMPCollector(targets=[target])
 
-        with patch.object(collector, "_build_session", return_value=(MagicMock(), MagicMock())):
+        with patch.object(collector, "_build_auth", return_value=(MagicMock(), None)):
             with patch.object(collector, "_poll_device", return_value={"device_id": "dev-current"}):
                 collector.poll_all()
 
-        assert "dev-removed" not in SNMPCollector._session_cache
         assert "dev-removed" not in SNMPCollector._last_poll_times
 
 
-class TestBuildSession:
-    """Tests for session construction."""
+class TestBuildAuth:
+    """Tests for auth data construction."""
 
-    def test_build_session_v2c(self):
-        """SNMPv2c session uses CommunityData."""
+    def test_build_auth_v2c(self):
+        """SNMPv2c auth uses CommunityData."""
         from fivenines_agent.snmp import SNMPCollector
 
         target = _make_target(version="v2c", community="mycomm")
         collector = SNMPCollector([target])
-        result = collector._build_session(target)
+        result = collector._build_auth(target)
 
         assert result[0] is not None  # auth_data
-        assert result[1] is not None  # transport
+        assert result[1] is None  # no error
 
-    def test_build_session_v3_auth_priv(self):
+    def test_build_auth_v3_auth_priv(self):
         """SNMPv3 with auth+priv uses UsmUserData."""
         from fivenines_agent.snmp import SNMPCollector
 
         target = _make_target(version="v3")
         collector = SNMPCollector([target])
-        result = collector._build_session(target)
+        result = collector._build_auth(target)
 
         assert result[0] is not None
-        assert result[1] is not None
+        assert result[1] is None
 
-    def test_build_session_v3_auth_no_priv(self):
+    def test_build_auth_v3_auth_no_priv(self):
         """SNMPv3 with auth_no_priv."""
         from fivenines_agent.snmp import SNMPCollector
 
         target = _make_target(version="v3")
         target["security_level"] = "auth_no_priv"
         collector = SNMPCollector([target])
-        result = collector._build_session(target)
+        result = collector._build_auth(target)
 
         assert result[0] is not None
+        assert result[1] is None
 
-    def test_build_session_v3_no_auth(self):
+    def test_build_auth_v3_no_auth(self):
         """SNMPv3 with no_auth_no_priv."""
         from fivenines_agent.snmp import SNMPCollector
 
         target = _make_target(version="v3")
         target["security_level"] = "no_auth_no_priv"
         collector = SNMPCollector([target])
-        result = collector._build_session(target)
+        result = collector._build_auth(target)
 
         assert result[0] is not None
+        assert result[1] is None
 
-    def test_build_session_invalid_version(self):
+    def test_build_auth_invalid_version(self):
         """Invalid SNMP version returns error tuple."""
         from fivenines_agent.snmp import SNMPCollector
 
         target = _make_target()
         target["version"] = "v99"
         collector = SNMPCollector([target])
-        result = collector._build_session(target)
+        result = collector._build_auth(target)
 
         assert result[0] is None
         assert result[1]["type"] == "unknown"
         assert "Unsupported SNMP version" in result[1]["message"]
 
-    def test_build_session_missing_username_v3(self):
+    def test_build_auth_missing_username_v3(self):
         """Missing v3 username returns error tuple."""
         from fivenines_agent.snmp import SNMPCollector
 
         target = _make_target(version="v3")
         del target["username"]
         collector = SNMPCollector([target])
-        result = collector._build_session(target)
+        result = collector._build_auth(target)
 
         assert result[0] is None
         assert result[1]["type"] == "unknown"
@@ -338,15 +278,15 @@ class TestBuildSession:
 class TestPollDevice:
     """Tests for per-device polling."""
 
-    def test_poll_device_with_session_error(self):
-        """Device with session build error returns error dict."""
+    def test_poll_device_with_auth_error(self):
+        """Device with auth build error returns error dict."""
         from fivenines_agent.snmp import SNMPCollector
 
         target = _make_target()
         collector = SNMPCollector([target])
-        session = (None, {"type": "unknown", "message": "bad config"})
+        auth_result = (None, {"type": "unknown", "message": "bad config"})
 
-        result = collector._poll_device(target, session)
+        result = collector._poll_device(target, auth_result)
 
         assert result["device_id"] == "dev-1"
         assert result["error"]["type"] == "unknown"
@@ -357,7 +297,7 @@ class TestPollDevice:
 
         target = _make_target()
         collector = SNMPCollector([target])
-        session = (MagicMock(), MagicMock())
+        auth_result = (MagicMock(), None)
 
         mock_system = {"sys_name": "Switch1", "sys_descr": "Test", "sys_uptime": 86400000}
         mock_interfaces = [{"if_index": 1, "if_name": "eth0"}]
@@ -375,7 +315,7 @@ class TestPollDevice:
             SNMPCollector, "_async_poll_device",
             new=AsyncMock(return_value=mock_async_result),
         ):
-            result = collector._poll_device(target, session)
+            result = collector._poll_device(target, auth_result)
 
         assert result["device_id"] == "dev-1"
         assert result["system"] == mock_system
@@ -389,14 +329,14 @@ class TestPollDevice:
 
         target = _make_target(capabilities=["system"])
         collector = SNMPCollector([target])
-        session = (MagicMock(), MagicMock())
+        auth_result = (MagicMock(), None)
 
         mock_async_poll_system = AsyncMock(return_value={"sys_name": "X"})
         mock_async_poll_interfaces = AsyncMock(return_value=[])
 
         with patch.object(SNMPCollector, "_async_poll_system", mock_async_poll_system):
             with patch.object(SNMPCollector, "_async_poll_interfaces", mock_async_poll_interfaces):
-                result = collector._poll_device(target, session)
+                result = collector._poll_device(target, auth_result)
 
         mock_async_poll_system.assert_called_once()
         mock_async_poll_interfaces.assert_not_called()
@@ -409,7 +349,7 @@ class TestPollDevice:
 
         target = _make_target(capabilities=["if_table"])
         collector = SNMPCollector([target])
-        session = (MagicMock(), MagicMock())
+        auth_result = (MagicMock(), None)
 
         mock_async_poll_system = AsyncMock(return_value={"sys_name": "X"})
         mock_async_poll_interfaces = AsyncMock(return_value=[{"if_index": 1}])
@@ -418,7 +358,7 @@ class TestPollDevice:
         with patch.object(SNMPCollector, "_async_poll_system", mock_async_poll_system):
             with patch.object(SNMPCollector, "_async_poll_interfaces", mock_async_poll_interfaces):
                 with patch.object(SNMPCollector, "_async_poll_counters", mock_async_poll_counters):
-                    result = collector._poll_device(target, session)
+                    result = collector._poll_device(target, auth_result)
 
         mock_async_poll_system.assert_not_called()
         assert "system" not in result
@@ -430,13 +370,13 @@ class TestPollDevice:
 
         target = _make_target()
         collector = SNMPCollector([target])
-        session = (MagicMock(), MagicMock())
+        auth_result = (MagicMock(), None)
 
         with patch.object(
             SNMPCollector, "_async_poll_device",
             new=AsyncMock(side_effect=Exception("Request timed out")),
         ):
-            result = collector._poll_device(target, session)
+            result = collector._poll_device(target, auth_result)
 
         assert result["error"]["type"] == "timeout"
 
@@ -446,13 +386,13 @@ class TestPollDevice:
 
         target = _make_target()
         collector = SNMPCollector([target])
-        session = (MagicMock(), MagicMock())
+        auth_result = (MagicMock(), None)
 
         with patch.object(
             SNMPCollector, "_async_poll_device",
             new=AsyncMock(side_effect=Exception("USM auth failure")),
         ):
-            result = collector._poll_device(target, session)
+            result = collector._poll_device(target, auth_result)
 
         assert result["error"]["type"] == "auth_error"
 
@@ -462,13 +402,13 @@ class TestPollDevice:
 
         target = _make_target()
         collector = SNMPCollector([target])
-        session = (MagicMock(), MagicMock())
+        auth_result = (MagicMock(), None)
 
         with patch.object(
             SNMPCollector, "_async_poll_device",
             new=AsyncMock(side_effect=Exception("Unexpected failure occurred")),
         ):
-            result = collector._poll_device(target, session)
+            result = collector._poll_device(target, auth_result)
 
         assert result["error"]["type"] == "unknown"
         assert "Unexpected failure occurred" in result["error"]["message"]
@@ -498,7 +438,7 @@ class TestPollAll:
         ]
         collector = SNMPCollector(targets)
 
-        with patch.object(collector, "_build_session", return_value=(MagicMock(), MagicMock())):
+        with patch.object(collector, "_build_auth", return_value=(MagicMock(), None)):
             with patch.object(
                 collector,
                 "_poll_device",
@@ -518,7 +458,7 @@ class TestPollAll:
         target = _make_target()
         collector = SNMPCollector([target])
 
-        with patch.object(collector, "_build_session", return_value=(MagicMock(), MagicMock())):
+        with patch.object(collector, "_build_auth", return_value=(MagicMock(), None)):
             with patch(
                 "fivenines_agent.snmp.ThreadPoolExecutor"
             ) as mock_executor_cls:
@@ -662,14 +602,14 @@ class TestNoCredentialsInLogs:
 
         target = _make_target(version="v3")
         collector = SNMPCollector([target])
-        session = (MagicMock(), MagicMock())
+        auth_result = (MagicMock(), None)
 
         with patch("fivenines_agent.snmp.log") as mock_log:
             with patch.object(
                 SNMPCollector, "_async_poll_device",
                 new=AsyncMock(side_effect=Exception("test error")),
             ):
-                collector._poll_device(target, session)
+                collector._poll_device(target, auth_result)
 
         # Check all log calls
         for call_args in mock_log.call_args_list:

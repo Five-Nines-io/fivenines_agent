@@ -25,8 +25,6 @@ All mutations happen in the main thread before/after executor.map().
 """
 
 import asyncio
-import hashlib
-import json
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
@@ -141,11 +139,9 @@ class SNMPCollector:
 
     def __init__(self, targets):
         self.targets = targets
-        # Instance state for session caching and interval tracking
+        # Instance state for interval tracking
         if not hasattr(SNMPCollector, "_last_poll_times"):
             SNMPCollector._last_poll_times = {}
-        if not hasattr(SNMPCollector, "_session_cache"):
-            SNMPCollector._session_cache = {}
 
     def poll_all(self):
         """Poll all due SNMP targets concurrently.
@@ -153,13 +149,8 @@ class SNMPCollector:
         Returns:
             dict: {"devices": [device_dict, ...]}
         """
-        # Prune stale session cache entries (devices no longer in targets)
+        # Prune stale poll times (devices no longer in targets)
         current_ids = {t["device_id"] for t in self.targets}
-        stale_ids = set(SNMPCollector._session_cache.keys()) - current_ids
-        for device_id in stale_ids:
-            del SNMPCollector._session_cache[device_id]
-
-        # Also prune stale poll times
         stale_poll_ids = set(SNMPCollector._last_poll_times.keys()) - current_ids
         for device_id in stale_poll_ids:
             del SNMPCollector._last_poll_times[device_id]
@@ -170,10 +161,13 @@ class SNMPCollector:
         if not due_targets:
             return {"devices": []}
 
-        # Pre-build sessions in main thread (thread safety)
-        sessions = {}
+        # Pre-build auth data in main thread (no event loop needed).
+        # Transport is created inside asyncio.run() in _poll_device
+        # because UdpTransportTarget binds to the event loop that
+        # creates it -- it cannot survive loop destruction.
+        auth_data = {}
         for target in due_targets:
-            sessions[target["device_id"]] = self._build_session(target)
+            auth_data[target["device_id"]] = self._build_auth(target)
 
         # Poll devices concurrently with a single batch-wide deadline
         devices = []
@@ -185,7 +179,7 @@ class SNMPCollector:
             try:
                 futures = {
                     executor.submit(
-                        self._poll_device, target, sessions[target["device_id"]]
+                        self._poll_device, target, auth_data[target["device_id"]]
                     ): target
                     for target in due_targets
                 }
@@ -248,16 +242,14 @@ class SNMPCollector:
         last_poll = SNMPCollector._last_poll_times.get(device_id, 0)
         return (time.monotonic() - last_poll) >= interval
 
-    def _build_session(self, target):
-        """Build or retrieve a cached SNMP session.
+    def _build_auth(self, target):
+        """Build SNMP auth data (sync, no event loop needed).
 
         Returns:
-            tuple: (auth_data, transport_target) for pysnmp hlapi calls,
-                   or (None, error_dict) on failure
+            tuple: (auth_data, target_config) or (None, error_dict)
         """
         from pysnmp.hlapi.v3arch.asyncio import (
             CommunityData,
-            UdpTransportTarget,
             UsmUserData,
             usmAesCfb128Protocol,
             usmDESPrivProtocol,
@@ -265,28 +257,8 @@ class SNMPCollector:
             usmHMACSHAAuthProtocol,
         )
 
-        device_id = target["device_id"]
-        config_hash = hashlib.sha256(
-            json.dumps(target, sort_keys=True).encode()
-        ).hexdigest()
-
-        # Check cache
-        cached = SNMPCollector._session_cache.get(device_id)
-        if cached and cached[2] == config_hash:
-            return (cached[0], cached[1])
-
-        # Build new session
         try:
             version = target.get("version", "v2c")
-            ip = target["ip"]
-            port = target.get("port", 161)
-
-            # pysnmp v7 uses an async factory method for UdpTransportTarget
-            transport = asyncio.run(
-                UdpTransportTarget.create(
-                    (ip, port), timeout=SNMP_TIMEOUT, retries=SNMP_RETRIES
-                )
-            )
 
             if version == "v2c":
                 community = target.get("community", "public")
@@ -326,9 +298,7 @@ class SNMPCollector:
                     },
                 )
 
-            # Cache the session
-            SNMPCollector._session_cache[device_id] = (auth, transport, config_hash)
-            return (auth, transport)
+            return (auth, None)
 
         except KeyError as e:
             return (
@@ -347,25 +317,33 @@ class SNMPCollector:
                 },
             )
 
-    def _poll_device(self, target, session):
+    def _poll_device(self, target, auth_result):
         """Poll a single SNMP device. Runs in a worker thread.
 
         Wraps the entire async poll in a single asyncio.run() so all
-        SNMP operations share one event loop (required by pysnmp v7).
+        SNMP operations (including transport creation) share one event
+        loop. pysnmp v7's UdpTransportTarget binds to the loop that
+        creates it and cannot survive loop destruction.
         """
         device_id = target["device_id"]
 
-        # Check for session build error
-        if session[0] is None:
-            return {"device_id": device_id, "error": session[1]}
+        # Check for auth build error
+        if auth_result[0] is None:
+            return {"device_id": device_id, "error": auth_result[1]}
 
-        auth, transport = session
+        auth = auth_result[0]
 
         try:
-            # Wrap in wait_for so the entire device poll is bounded.
-            # pysnmp's own UDP timeout handles normal cases; this catches
-            # hangs from library bugs or deadlocks.
             async def _bounded_poll():
+                from pysnmp.hlapi.v3arch.asyncio import UdpTransportTarget
+
+                # Create transport inside the event loop so it binds
+                # to the same loop used for all SNMP operations.
+                ip = target.get("ip", "127.0.0.1")
+                port = target.get("port", 161)
+                transport = await UdpTransportTarget.create(
+                    (ip, port), timeout=SNMP_TIMEOUT, retries=SNMP_RETRIES
+                )
                 return await asyncio.wait_for(
                     self._async_poll_device(device_id, target, auth, transport),
                     timeout=EXECUTOR_TIMEOUT,
