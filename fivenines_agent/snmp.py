@@ -32,26 +32,23 @@ from fivenines_agent.debug import log
 from fivenines_agent.env import dry_run
 
 
-def _run_sync(coro):
-    """Run an async coroutine synchronously. Thread-safe."""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            loop = asyncio.new_event_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-    return loop.run_until_complete(coro)
+def _get_cmd_sync(*args, **kwargs):
+    """Synchronous wrapper for pysnmp's async get_cmd.
 
-
-def __get_cmd_sync(*args, **kwargs):
-    """Synchronous wrapper for pysnmp's async get_cmd."""
+    Uses asyncio.run() which creates a fresh event loop per call,
+    runs the coroutine, and closes the loop. Safe to call from
+    ThreadPoolExecutor worker threads.
+    """
     from pysnmp.hlapi.v3arch.asyncio import get_cmd
 
-    return _run_sync(get_cmd(*args, **kwargs))
+    return asyncio.run(get_cmd(*args, **kwargs))
 
 
-def __walk_cmd_sync(*args, **kwargs):
-    """Synchronous wrapper for pysnmp's async walk_cmd (async generator)."""
+def _walk_cmd_sync(*args, **kwargs):
+    """Synchronous wrapper for pysnmp's async walk_cmd (async generator).
+
+    Collects all results from the async generator into a list.
+    """
     from pysnmp.hlapi.v3arch.asyncio import walk_cmd
 
     async def _collect():
@@ -60,7 +57,7 @@ def __walk_cmd_sync(*args, **kwargs):
             results.append(item)
         return results
 
-    return _run_sync(_collect())
+    return asyncio.run(_collect())
 
 # Module-level singleton
 _collector = None
