@@ -175,9 +175,10 @@ class SNMPCollector:
         for target in due_targets:
             sessions[target["device_id"]] = self._build_session(target)
 
-        # Poll devices concurrently
+        # Poll devices concurrently with a single batch-wide deadline
         devices = []
         workers = min(len(due_targets), MAX_WORKERS)
+        batch_deadline = time.monotonic() + EXECUTOR_TIMEOUT
 
         try:
             executor = ThreadPoolExecutor(max_workers=workers)
@@ -192,8 +193,9 @@ class SNMPCollector:
                 for future in futures:
                     target = futures[future]
                     device_id = target["device_id"]
+                    remaining = max(0.1, batch_deadline - time.monotonic())
                     try:
-                        result = future.result(timeout=EXECUTOR_TIMEOUT)
+                        result = future.result(timeout=remaining)
                         devices.append(result)
                     except FuturesTimeoutError:
                         log(
@@ -530,8 +532,9 @@ class SNMPCollector:
                     except (ValueError, TypeError):
                         pass
 
-        # If ifTable walk failed entirely, raise so caller surfaces it
-        if iftable_error and not interfaces:
+        # If ifTable walk had any error, raise to surface it.
+        # Partial data from interrupted walks is unreliable.
+        if iftable_error:
             raise Exception("IF-MIB walk failed: {}".format(iftable_error))
 
         # Walk ifXTable for extended info (ifName, ifAlias, ifHighSpeed)
@@ -573,15 +576,18 @@ class SNMPCollector:
         counters = {idx: {"if_index": idx} for idx in if_indexes}
         hc_counters = False
 
-        # Helper to walk an OID and collect values by ifIndex
+        # Helper to walk an OID and collect values by ifIndex.
+        # Returns None on error or unsupported OID (discards partial data).
         async def _walk_oid(oid_prefix):
             data = {}
+            had_error = False
             try:
                 async for err_ind, err_st, err_idx, var_binds in walk_cmd(
                     engine, auth, transport, ctx,
                     ObjectType(ObjectIdentity(oid_prefix)),
                 ):
                     if err_ind or err_st:
+                        had_error = True
                         break
                     for oid, val in var_binds:
                         parts = str(oid).split(".")
@@ -591,7 +597,10 @@ class SNMPCollector:
                             return None  # OID not supported
                         data[if_index] = int(val)
             except Exception:
-                pass
+                had_error = True
+            # Discard partial data from interrupted walks
+            if had_error:
+                return None
             return data if data else None
 
         # Try 64-bit HC counters first
