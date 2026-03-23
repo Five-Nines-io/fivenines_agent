@@ -22,6 +22,7 @@ Thread safety: _session_cache is read-only within worker threads.
 All mutations happen in the main thread before/after executor.map().
 """
 
+import asyncio
 import hashlib
 import json
 import time
@@ -29,6 +30,37 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 
 from fivenines_agent.debug import log
 from fivenines_agent.env import dry_run
+
+
+def _run_sync(coro):
+    """Run an async coroutine synchronously. Thread-safe."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            loop = asyncio.new_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+    return loop.run_until_complete(coro)
+
+
+def __get_cmd_sync(*args, **kwargs):
+    """Synchronous wrapper for pysnmp's async get_cmd."""
+    from pysnmp.hlapi.v3arch.asyncio import get_cmd
+
+    return _run_sync(get_cmd(*args, **kwargs))
+
+
+def __walk_cmd_sync(*args, **kwargs):
+    """Synchronous wrapper for pysnmp's async walk_cmd (async generator)."""
+    from pysnmp.hlapi.v3arch.asyncio import walk_cmd
+
+    async def _collect():
+        results = []
+        async for item in walk_cmd(*args, **kwargs):
+            results.append(item)
+        return results
+
+    return _run_sync(_collect())
 
 # Module-level singleton
 _collector = None
@@ -83,10 +115,6 @@ def snmp_metrics(targets):
     """
     try:
         import pysnmp  # noqa: F401
-        from pysnmp_sync_adapter import (  # noqa: F401
-            get_cmd_sync,
-            walk_cmd_sync,
-        )
     except ImportError:
         log("pysnmp not installed, skipping SNMP polling", "error")
         return None
@@ -413,11 +441,10 @@ class SNMPCollector:
             ObjectType,
             SnmpEngine,
         )
-        from pysnmp_sync_adapter import get_cmd_sync
 
         try:
             engine = SnmpEngine()
-            error_indication, error_status, error_index, var_binds = get_cmd_sync(
+            error_indication, error_status, error_index, var_binds = _get_cmd_sync(
                 engine,
                 auth,
                 transport,
@@ -468,7 +495,6 @@ class SNMPCollector:
             ObjectType,
             SnmpEngine,
         )
-        from pysnmp_sync_adapter import walk_cmd_sync
 
         try:
             engine = SnmpEngine()
@@ -481,7 +507,7 @@ class SNMPCollector:
                 (OID_IF_ADMIN_STATUS, "if_admin_status", lambda v: max(0, int(v) - 1)),
                 (OID_IF_OPER_STATUS, "if_oper_status", lambda v: max(0, int(v) - 1)),
             ]:
-                for error_indication, error_status, error_index, var_binds in walk_cmd_sync(
+                for error_indication, error_status, error_index, var_binds in _walk_cmd_sync(
                     engine,
                     auth,
                     transport,
@@ -507,7 +533,7 @@ class SNMPCollector:
                 (OID_IF_ALIAS, "if_alias", str),
                 (OID_IF_HIGH_SPEED, "if_speed", lambda v: int(v) * 1000000),
             ]:
-                for error_indication, error_status, error_index, var_binds in walk_cmd_sync(
+                for error_indication, error_status, error_index, var_binds in _walk_cmd_sync(
                     engine,
                     auth,
                     transport,
@@ -554,7 +580,6 @@ class SNMPCollector:
             ObjectType,
             SnmpEngine,
         )
-        from pysnmp_sync_adapter import walk_cmd_sync
 
         engine = SnmpEngine()
         counters = {idx: {"if_index": idx} for idx in if_indexes}
@@ -563,7 +588,7 @@ class SNMPCollector:
         # Try 64-bit HC counters first
         hc_data = {}
         try:
-            for error_indication, error_status, error_index, var_binds in walk_cmd_sync(
+            for error_indication, error_status, error_index, var_binds in _walk_cmd_sync(
                 engine,
                 auth,
                 transport,
@@ -591,7 +616,7 @@ class SNMPCollector:
 
             # Get HC out octets
             try:
-                for error_indication, error_status, error_index, var_binds in walk_cmd_sync(
+                for error_indication, error_status, error_index, var_binds in _walk_cmd_sync(
                     engine,
                     auth,
                     transport,
@@ -613,7 +638,7 @@ class SNMPCollector:
                 (OID_IF_OUT_OCTETS, "bytes_out"),
             ]:
                 try:
-                    for error_indication, error_status, error_index, var_binds in walk_cmd_sync(
+                    for error_indication, error_status, error_index, var_binds in _walk_cmd_sync(
                         engine,
                         auth,
                         transport,
@@ -643,7 +668,7 @@ class SNMPCollector:
 
         for oid_prefix, field in counter_oids:
             try:
-                for error_indication, error_status, error_index, var_binds in walk_cmd_sync(
+                for error_indication, error_status, error_index, var_binds in _walk_cmd_sync(
                     engine,
                     auth,
                     transport,

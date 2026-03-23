@@ -16,7 +16,6 @@ sys.modules.setdefault("pysnmp", MagicMock())
 sys.modules.setdefault("pysnmp.hlapi", MagicMock())
 sys.modules.setdefault("pysnmp.hlapi.v3arch", MagicMock())
 sys.modules.setdefault("pysnmp.hlapi.v3arch.asyncio", MagicMock())
-sys.modules.setdefault("pysnmp_sync_adapter", MagicMock())
 
 
 def _make_target(

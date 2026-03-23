@@ -1707,20 +1707,6 @@ pyasn1 = ">=0.4.8,<0.5.0 || >0.5.0"
 dev = ["Sphinx (>=7.0.0,<8.0.0)", "bump2version (>=1.0.1)", "codecov (>=2.1.12)", "cryptography (>=44.0.1)", "doc8 (>=1.0.0)", "flake8 (>=7.0.0)", "furo (>=2023.1.1)", "jinja2 (>=3.1.6)", "pep8-naming (>=0.14.1)", "pre-commit (==2.21.0)", "pysmi (>=1.6.1)", "pytest (>=7.2.0)", "pytest-asyncio (>=0.21.1)", "pytest-codecov (>=0.4.0)", "pytest-cov (>=4.1.0)", "ruff (>=0.11.7)", "sphinx-copybutton (>=0.5.2)", "sphinx-notfound-page (>=1.0.0)", "sphinx-polyversion (>=1.0.0)", "sphinx-sitemap-lextudio (>=2.5.2)"]
 
 [[package]]
-name = "pysnmp-sync-adapter"
-version = "1.0.8"
-description = "Lightweight Synchronous wrapper adapters for PySNMP AsyncIO HLAPI"
-optional = false
-python-versions = ">=3.7"
-groups = ["main"]
-files = [
-    {file = "pysnmp_sync_adapter-1.0.8.tar.gz", hash = "sha256:b8d77c30ec703ac6cc2c6f4f905ccb7218bcac6fd120f5f574af94ddaaf568f6"},
-]
-
-[package.dependencies]
-pysnmp = ">=7.0.0"
-
-[[package]]
 name = "pytest"
 version = "7.4.4"
 description = "pytest: simple powerful testing with Python"
@@ -2478,4 +2464,4 @@ cffi = ["cffi (>=1.17,<2.0) ; platform_python_implementation != \"PyPy\" and pyt
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.9,<3.14"
-content-hash = "7086bdb283a8d95fd49ec66b036020938437c48c911f9ef35d0ba6ff3a21a35c"
+content-hash = "6939bcc6d48fe2d2fbc616ab5c6e005e53b620d9c8ccab75ea23d16b48f8084f"
