@@ -13,6 +13,9 @@ psutil = "^7.2.1"
 certifi = "^2024.12.14"
 docker = "^7.1.0"
 dnspython = "^2.7"
+requests = "^2.31.0"
+pysnmp = "^7.1"
+pysnmp-sync-adapter = "^1.0"
 
 [tool.poetry.group.virtualization]
 optional = true
