@@ -13,6 +13,8 @@ Architecture:
        +---> Pre-build sessions (main thread)
        +---> Filter due devices (_is_device_due)
        +---> ThreadPoolExecutor.map(_poll_device, ...)  (concurrent)
+       |         each thread runs asyncio.run(_async_poll_device(...))
+       |         so all SNMP ops share one event loop per device
        +---> Aggregate results into {"devices": [...]}
        |
        v
@@ -31,33 +33,6 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeou
 from fivenines_agent.debug import log
 from fivenines_agent.env import dry_run
 
-
-def _get_cmd_sync(*args, **kwargs):
-    """Synchronous wrapper for pysnmp's async get_cmd.
-
-    Uses asyncio.run() which creates a fresh event loop per call,
-    runs the coroutine, and closes the loop. Safe to call from
-    ThreadPoolExecutor worker threads.
-    """
-    from pysnmp.hlapi.v3arch.asyncio import get_cmd
-
-    return asyncio.run(get_cmd(*args, **kwargs))
-
-
-def _walk_cmd_sync(*args, **kwargs):
-    """Synchronous wrapper for pysnmp's async walk_cmd (async generator).
-
-    Collects all results from the async generator into a list.
-    """
-    from pysnmp.hlapi.v3arch.asyncio import walk_cmd
-
-    async def _collect():
-        results = []
-        async for item in walk_cmd(*args, **kwargs):
-            results.append(item)
-        return results
-
-    return asyncio.run(_collect())
 
 # Module-level singleton
 _collector = None
@@ -136,7 +111,6 @@ def _print_diagnostics(devices):
     print("SNMP Targets:")
     for dev in devices:
         device_id = dev.get("device_id", "?")
-        ip = device_id  # We don't have IP in result, use device_id
         error = dev.get("error")
         if error:
             status = error.get("type", "ERROR").upper()
@@ -150,10 +124,9 @@ def _print_diagnostics(devices):
             sys_name = sys_info.get("sys_name", "-") or "-"
             ifaces = dev.get("interfaces", [])
             iface_count = len(ifaces)
-            version = "?"
             print(
-                "  {}  {}  {}  {} interfaces  OK".format(
-                    device_id[:20], version, sys_name[:20], iface_count
+                "  {}  {}  {} interfaces  OK".format(
+                    device_id[:20], sys_name[:20], iface_count
                 )
             )
     print("")
@@ -375,47 +348,21 @@ class SNMPCollector:
     def _poll_device(self, target, session):
         """Poll a single SNMP device. Runs in a worker thread.
 
-        Args:
-            target: device config dict from snmp_targets
-            session: tuple of (auth_data, transport_target) or (None, error_dict)
-
-        Returns:
-            dict: device metrics or error dict
+        Wraps the entire async poll in a single asyncio.run() so all
+        SNMP operations share one event loop (required by pysnmp v7).
         """
         device_id = target["device_id"]
-        capabilities = target.get("capabilities", ["system", "if_table"])
 
         # Check for session build error
         if session[0] is None:
             return {"device_id": device_id, "error": session[1]}
 
         auth, transport = session
-        result = {"device_id": device_id}
 
         try:
-            # Poll system info if capability is enabled
-            if "system" in capabilities:
-                system = self._poll_system(auth, transport)
-                if system is not None:
-                    result["system"] = system
-
-            # Poll interfaces if capability is enabled
-            if "if_table" in capabilities:
-                interfaces = self._poll_interfaces(auth, transport)
-                if interfaces is not None:
-                    result["interfaces"] = interfaces
-
-                    # Poll counters for discovered interfaces
-                    if_indexes = [iface["if_index"] for iface in interfaces]
-                    if if_indexes:
-                        counters, hc = self._poll_counters(
-                            auth, transport, if_indexes
-                        )
-                        result["interface_metrics"] = counters
-                        result["hc_counters"] = hc
-
-            return result
-
+            return asyncio.run(
+                self._async_poll_device(device_id, target, auth, transport)
+            )
         except Exception as e:
             error_type = "unknown"
             message = str(e)
@@ -433,253 +380,222 @@ class SNMPCollector:
                 "SNMP poll error for device {}: {}".format(device_id, e),
                 "error",
             )
-            return {"device_id": device_id, "error": {"type": error_type, "message": message}}
+            return {
+                "device_id": device_id,
+                "error": {"type": error_type, "message": message},
+            }
 
-    def _poll_system(self, auth, transport):
-        """Poll system info OIDs (sysName, sysDescr, sysUptime).
+    async def _async_poll_device(self, device_id, target, auth, transport):
+        """Async implementation of device polling.
 
-        Returns:
-            dict with sys_name, sys_descr, sys_uptime or None on error
+        All SNMP operations run under a single event loop here.
         """
         from pysnmp.hlapi.v3arch.asyncio import (
             ContextData,
             ObjectIdentity,
             ObjectType,
             SnmpEngine,
+            get_cmd,
+            walk_cmd,
         )
 
-        try:
-            engine = SnmpEngine()
-            error_indication, error_status, error_index, var_binds = _get_cmd_sync(
-                engine,
-                auth,
-                transport,
-                ContextData(),
-                ObjectType(ObjectIdentity(OID_SYS_NAME)),
-                ObjectType(ObjectIdentity(OID_SYS_DESCR)),
-                ObjectType(ObjectIdentity(OID_SYS_UPTIME)),
-            )
-
-            if error_indication:
-                raise Exception(str(error_indication))
-            if error_status:
-                raise Exception(
-                    "SNMP error: {} at {}".format(
-                        error_status.prettyPrint(),
-                        error_index and var_binds[int(error_index) - 1][0] or "?",
-                    )
-                )
-
-            result = {}
-            for oid, val in var_binds:
-                oid_str = str(oid)
-                val_str = str(val)
-                if OID_SYS_NAME in oid_str:
-                    result["sys_name"] = val_str
-                elif OID_SYS_DESCR in oid_str:
-                    result["sys_descr"] = val_str
-                elif OID_SYS_UPTIME in oid_str:
-                    # sysUptime is in centiseconds, convert to ms
-                    try:
-                        result["sys_uptime"] = int(val) * 10
-                    except (ValueError, TypeError):
-                        result["sys_uptime"] = 0
-
-            return result
-
-        except Exception as e:
-            log("SNMP system poll error: {}".format(e), "error")
-            raise
-
-    def _poll_interfaces(self, auth, transport):
-        """Poll interface table metadata (ifTable + ifXTable).
-
-        Returns:
-            list of interface dicts or None on error
-        """
-        from pysnmp.hlapi.v3arch.asyncio import (
-            ContextData,
-            ObjectIdentity,
-            ObjectType,
-            SnmpEngine,
-        )
-
-        try:
-            engine = SnmpEngine()
-            interfaces = {}
-            ctx = ContextData()
-
-            # Walk ifTable for basic info (ifIndex, ifType, ifAdminStatus, ifOperStatus)
-            iftable_error = None
-            for oid_prefix, field_name, converter in [
-                (OID_IF_INDEX, "if_index", int),
-                (OID_IF_TYPE, "if_type", int),
-                (OID_IF_ADMIN_STATUS, "if_admin_status", lambda v: max(0, int(v) - 1)),
-                (OID_IF_OPER_STATUS, "if_oper_status", lambda v: max(0, int(v) - 1)),
-            ]:
-                for error_indication, error_status, error_index, var_binds in _walk_cmd_sync(
-                    engine,
-                    auth,
-                    transport,
-                    ctx,
-                    ObjectType(ObjectIdentity(oid_prefix)),
-                ):
-                    if error_indication:
-                        iftable_error = str(error_indication)
-                        break
-                    if error_status:
-                        iftable_error = "SNMP error: {}".format(
-                            error_status.prettyPrint()
-                        )
-                        break
-                    for oid, val in var_binds:
-                        # Extract ifIndex from OID suffix
-                        oid_str = str(oid)
-                        parts = oid_str.split(".")
-                        if_index = int(parts[-1])
-                        if if_index not in interfaces:
-                            interfaces[if_index] = {"if_index": if_index}
-                        try:
-                            interfaces[if_index][field_name] = converter(val)
-                        except (ValueError, TypeError):
-                            pass
-
-            # If ifTable walk failed entirely, raise so _poll_device surfaces it
-            if iftable_error and not interfaces:
-                raise Exception("IF-MIB walk failed: {}".format(iftable_error))
-
-            # Walk ifXTable for extended info (ifName, ifAlias, ifHighSpeed)
-            for oid_prefix, field_name, converter in [
-                (OID_IF_NAME, "if_name", str),
-                (OID_IF_ALIAS, "if_alias", str),
-                (OID_IF_HIGH_SPEED, "if_speed", lambda v: int(v) * 1000000),
-            ]:
-                for error_indication, error_status, error_index, var_binds in _walk_cmd_sync(
-                    engine,
-                    auth,
-                    transport,
-                    ctx,
-                    ObjectType(ObjectIdentity(oid_prefix)),
-                ):
-                    if error_indication or error_status:
-                        # ifXTable may not be supported, that's OK
-                        break
-                    for oid, val in var_binds:
-                        oid_str = str(oid)
-                        parts = oid_str.split(".")
-                        if_index = int(parts[-1])
-                        if if_index in interfaces:
-                            try:
-                                interfaces[if_index][field_name] = converter(val)
-                            except (ValueError, TypeError):
-                                pass
-
-            # Fill defaults for missing ifXTable fields
-            for iface in interfaces.values():
-                iface.setdefault("if_name", "")
-                iface.setdefault("if_alias", "")
-                iface.setdefault("if_speed", 0)
-
-            return list(interfaces.values())
-
-        except Exception as e:
-            log("SNMP interface poll error: {}".format(e), "error")
-            raise
-
-    def _poll_counters(self, auth, transport, if_indexes):
-        """Poll interface counters, preferring 64-bit HC counters.
-
-        Args:
-            auth: SNMP auth data
-            transport: SNMP transport target
-            if_indexes: list of interface indexes to poll
-
-        Returns:
-            tuple: (list of counter dicts, hc_counters: bool)
-        """
-        from pysnmp.hlapi.v3arch.asyncio import (
-            ContextData,
-            ObjectIdentity,
-            ObjectType,
-            SnmpEngine,
-        )
-
+        capabilities = target.get("capabilities", ["system", "if_table"])
         engine = SnmpEngine()
         ctx = ContextData()
-        counters = {idx: {"if_index": idx} for idx in if_indexes}
-        hc_counters = False
+        result = {"device_id": device_id}
 
-        # Try 64-bit HC counters first
-        hc_data = {}
-        try:
-            for error_indication, error_status, error_index, var_binds in _walk_cmd_sync(
-                engine,
-                auth,
-                transport,
-                ctx,
-                ObjectType(ObjectIdentity(OID_IF_HC_IN_OCTETS)),
+        # Poll system info
+        if "system" in capabilities:
+            system = await self._async_poll_system(
+                engine, auth, transport, ctx, get_cmd, ObjectIdentity, ObjectType
+            )
+            if system is not None:
+                result["system"] = system
+
+        # Poll interfaces
+        if "if_table" in capabilities:
+            interfaces = await self._async_poll_interfaces(
+                engine, auth, transport, ctx, walk_cmd, ObjectIdentity, ObjectType
+            )
+            if interfaces is not None:
+                result["interfaces"] = interfaces
+
+                if_indexes = [iface["if_index"] for iface in interfaces]
+                if if_indexes:
+                    counters, hc = await self._async_poll_counters(
+                        engine, auth, transport, ctx, walk_cmd,
+                        ObjectIdentity, ObjectType, if_indexes
+                    )
+                    result["interface_metrics"] = counters
+                    result["hc_counters"] = hc
+
+        return result
+
+    async def _async_poll_system(
+        self, engine, auth, transport, ctx, get_cmd, ObjectIdentity, ObjectType
+    ):
+        """Poll system info OIDs (sysName, sysDescr, sysUptime)."""
+        error_indication, error_status, error_index, var_binds = await get_cmd(
+            engine,
+            auth,
+            transport,
+            ctx,
+            ObjectType(ObjectIdentity(OID_SYS_NAME)),
+            ObjectType(ObjectIdentity(OID_SYS_DESCR)),
+            ObjectType(ObjectIdentity(OID_SYS_UPTIME)),
+        )
+
+        if error_indication:
+            raise Exception(str(error_indication))
+        if error_status:
+            raise Exception(
+                "SNMP error: {} at {}".format(
+                    error_status.prettyPrint(),
+                    error_index and var_binds[int(error_index) - 1][0] or "?",
+                )
+            )
+
+        result = {}
+        for oid, val in var_binds:
+            oid_str = str(oid)
+            val_str = str(val)
+            if OID_SYS_NAME in oid_str:
+                result["sys_name"] = val_str
+            elif OID_SYS_DESCR in oid_str:
+                result["sys_descr"] = val_str
+            elif OID_SYS_UPTIME in oid_str:
+                # sysUptime is in centiseconds, convert to ms
+                try:
+                    result["sys_uptime"] = int(val) * 10
+                except (ValueError, TypeError):
+                    result["sys_uptime"] = 0
+
+        return result
+
+    async def _async_poll_interfaces(
+        self, engine, auth, transport, ctx, walk_cmd, ObjectIdentity, ObjectType
+    ):
+        """Poll interface table metadata (ifTable + ifXTable)."""
+        interfaces = {}
+
+        # Walk ifTable for basic info
+        iftable_error = None
+        for oid_prefix, field_name, converter in [
+            (OID_IF_INDEX, "if_index", int),
+            (OID_IF_TYPE, "if_type", int),
+            (OID_IF_ADMIN_STATUS, "if_admin_status", lambda v: max(0, int(v) - 1)),
+            (OID_IF_OPER_STATUS, "if_oper_status", lambda v: max(0, int(v) - 1)),
+        ]:
+            async for error_indication, error_status, error_index, var_binds in walk_cmd(
+                engine, auth, transport, ctx,
+                ObjectType(ObjectIdentity(oid_prefix)),
             ):
-                if error_indication or error_status:
+                if error_indication:
+                    iftable_error = str(error_indication)
+                    break
+                if error_status:
+                    iftable_error = "SNMP error: {}".format(
+                        error_status.prettyPrint()
+                    )
                     break
                 for oid, val in var_binds:
                     oid_str = str(oid)
                     parts = oid_str.split(".")
                     if_index = int(parts[-1])
-                    val_str = str(val)
-                    # Check for noSuchObject/noSuchInstance
-                    if "noSuch" in val_str:
-                        break
-                    hc_data[if_index] = int(val)
-        except Exception:
-            pass
+                    if if_index not in interfaces:
+                        interfaces[if_index] = {"if_index": if_index}
+                    try:
+                        interfaces[if_index][field_name] = converter(val)
+                    except (ValueError, TypeError):
+                        pass
 
-        if hc_data:
-            hc_counters = True
-            for idx, val in hc_data.items():
-                if idx in counters:
-                    counters[idx]["bytes_in"] = val
+        # If ifTable walk failed entirely, raise so caller surfaces it
+        if iftable_error and not interfaces:
+            raise Exception("IF-MIB walk failed: {}".format(iftable_error))
 
-            # Get HC out octets
+        # Walk ifXTable for extended info (ifName, ifAlias, ifHighSpeed)
+        for oid_prefix, field_name, converter in [
+            (OID_IF_NAME, "if_name", str),
+            (OID_IF_ALIAS, "if_alias", str),
+            (OID_IF_HIGH_SPEED, "if_speed", lambda v: int(v) * 1000000),
+        ]:
+            async for error_indication, error_status, error_index, var_binds in walk_cmd(
+                engine, auth, transport, ctx,
+                ObjectType(ObjectIdentity(oid_prefix)),
+            ):
+                if error_indication or error_status:
+                    # ifXTable may not be supported, that's OK
+                    break
+                for oid, val in var_binds:
+                    oid_str = str(oid)
+                    parts = oid_str.split(".")
+                    if_index = int(parts[-1])
+                    if if_index in interfaces:
+                        try:
+                            interfaces[if_index][field_name] = converter(val)
+                        except (ValueError, TypeError):
+                            pass
+
+        # Fill defaults for missing ifXTable fields
+        for iface in interfaces.values():
+            iface.setdefault("if_name", "")
+            iface.setdefault("if_alias", "")
+            iface.setdefault("if_speed", 0)
+
+        return list(interfaces.values())
+
+    async def _async_poll_counters(
+        self, engine, auth, transport, ctx, walk_cmd,
+        ObjectIdentity, ObjectType, if_indexes
+    ):
+        """Poll interface counters, preferring 64-bit HC counters."""
+        counters = {idx: {"if_index": idx} for idx in if_indexes}
+        hc_counters = False
+
+        # Helper to walk an OID and collect values by ifIndex
+        async def _walk_oid(oid_prefix):
+            data = {}
             try:
-                for error_indication, error_status, error_index, var_binds in _walk_cmd_sync(
-                    engine,
-                    auth,
-                    transport,
-                    ctx,
-                    ObjectType(ObjectIdentity(OID_IF_HC_OUT_OCTETS)),
+                async for err_ind, err_st, err_idx, var_binds in walk_cmd(
+                    engine, auth, transport, ctx,
+                    ObjectType(ObjectIdentity(oid_prefix)),
                 ):
-                    if error_indication or error_status:
+                    if err_ind or err_st:
                         break
                     for oid, val in var_binds:
                         parts = str(oid).split(".")
                         if_index = int(parts[-1])
-                        if if_index in counters:
-                            counters[if_index]["bytes_out"] = int(val)
+                        val_str = str(val)
+                        if "noSuch" in val_str:
+                            return None  # OID not supported
+                        data[if_index] = int(val)
             except Exception:
                 pass
+            return data if data else None
+
+        # Try 64-bit HC counters first
+        hc_in = await _walk_oid(OID_IF_HC_IN_OCTETS)
+        if hc_in:
+            hc_counters = True
+            for idx, val in hc_in.items():
+                if idx in counters:
+                    counters[idx]["bytes_in"] = val
+            hc_out = await _walk_oid(OID_IF_HC_OUT_OCTETS)
+            if hc_out:
+                for idx, val in hc_out.items():
+                    if idx in counters:
+                        counters[idx]["bytes_out"] = val
         else:
             # Fallback to 32-bit counters
             for oid_prefix, field in [
                 (OID_IF_IN_OCTETS, "bytes_in"),
                 (OID_IF_OUT_OCTETS, "bytes_out"),
             ]:
-                try:
-                    for error_indication, error_status, error_index, var_binds in _walk_cmd_sync(
-                        engine,
-                        auth,
-                        transport,
-                        ctx,
-                        ObjectType(ObjectIdentity(oid_prefix)),
-                    ):
-                        if error_indication or error_status:
-                            break
-                        for oid, val in var_binds:
-                            parts = str(oid).split(".")
-                            if_index = int(parts[-1])
-                            if if_index in counters:
-                                counters[if_index][field] = int(val)
-                except Exception:
-                    pass
+                data = await _walk_oid(oid_prefix)
+                if data:
+                    for idx, val in data.items():
+                        if idx in counters:
+                            counters[idx][field] = val
 
         # Poll remaining counter OIDs (always 32-bit)
         counter_oids = [
@@ -694,25 +610,13 @@ class SNMPCollector:
         ]
 
         for oid_prefix, field in counter_oids:
-            try:
-                for error_indication, error_status, error_index, var_binds in _walk_cmd_sync(
-                    engine,
-                    auth,
-                    transport,
-                    ctx,
-                    ObjectType(ObjectIdentity(oid_prefix)),
-                ):
-                    if error_indication or error_status:
-                        break
-                    for oid, val in var_binds:
-                        parts = str(oid).split(".")
-                        if_index = int(parts[-1])
-                        if if_index in counters:
-                            counters[if_index][field] = int(val)
-            except Exception:
-                pass
+            data = await _walk_oid(oid_prefix)
+            if data:
+                for idx, val in data.items():
+                    if idx in counters:
+                        counters[idx][field] = val
 
-        # Add admin/oper status to counters and fill defaults
+        # Fill defaults
         for idx in counters:
             counters[idx].setdefault("bytes_in", 0)
             counters[idx].setdefault("bytes_out", 0)
@@ -725,7 +629,4 @@ class SNMPCollector:
             counters[idx].setdefault("broadcast_in", 0)
             counters[idx].setdefault("broadcast_out", 0)
 
-        # Add if_name from interfaces for reference
-        result = list(counters.values())
-
-        return (result, hc_counters)
+        return (list(counters.values()), hc_counters)

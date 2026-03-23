@@ -1,12 +1,13 @@
 """Tests for SNMP network device polling collector."""
 
+import asyncio
 import hashlib
 import json
 import sys
 import time
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from io import StringIO
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -21,6 +22,10 @@ async def _mock_create(*args, **kwargs):
 
 
 _mock_pysnmp_asyncio.UdpTransportTarget.create = _mock_create
+
+# Ensure get_cmd and walk_cmd are available as async callables
+_mock_pysnmp_asyncio.get_cmd = AsyncMock()
+_mock_pysnmp_asyncio.walk_cmd = MagicMock()
 
 sys.modules.setdefault("pysnmp", MagicMock())
 sys.modules.setdefault("pysnmp.hlapi", MagicMock())
@@ -247,7 +252,7 @@ class TestSNMPCollectorSessionCache:
         SNMPCollector._last_poll_times = {"dev-removed": 0}
 
         target = _make_target(device_id="dev-current")
-        collector = SNMPCollector([target])
+        collector = SNMPCollector(targets=[target])
 
         with patch.object(collector, "_build_session", return_value=(MagicMock(), MagicMock())):
             with patch.object(collector, "_poll_device", return_value={"device_id": "dev-current"}):
@@ -358,10 +363,19 @@ class TestPollDevice:
         mock_interfaces = [{"if_index": 1, "if_name": "eth0"}]
         mock_counters = ([{"if_index": 1, "bytes_in": 100}], True)
 
-        with patch.object(collector, "_poll_system", return_value=mock_system):
-            with patch.object(collector, "_poll_interfaces", return_value=mock_interfaces):
-                with patch.object(collector, "_poll_counters", return_value=mock_counters):
-                    result = collector._poll_device(target, session)
+        mock_async_result = {
+            "device_id": "dev-1",
+            "system": mock_system,
+            "interfaces": mock_interfaces,
+            "interface_metrics": mock_counters[0],
+            "hc_counters": mock_counters[1],
+        }
+
+        with patch.object(
+            SNMPCollector, "_async_poll_device",
+            new=AsyncMock(return_value=mock_async_result),
+        ):
+            result = collector._poll_device(target, session)
 
         assert result["device_id"] == "dev-1"
         assert result["system"] == mock_system
@@ -377,12 +391,15 @@ class TestPollDevice:
         collector = SNMPCollector([target])
         session = (MagicMock(), MagicMock())
 
-        with patch.object(collector, "_poll_system", return_value={"sys_name": "X"}) as mock_sys:
-            with patch.object(collector, "_poll_interfaces") as mock_if:
+        mock_async_poll_system = AsyncMock(return_value={"sys_name": "X"})
+        mock_async_poll_interfaces = AsyncMock(return_value=[])
+
+        with patch.object(SNMPCollector, "_async_poll_system", mock_async_poll_system):
+            with patch.object(SNMPCollector, "_async_poll_interfaces", mock_async_poll_interfaces):
                 result = collector._poll_device(target, session)
 
-        mock_sys.assert_called_once()
-        mock_if.assert_not_called()
+        mock_async_poll_system.assert_called_once()
+        mock_async_poll_interfaces.assert_not_called()
         assert "system" in result
         assert "interfaces" not in result
 
@@ -394,12 +411,16 @@ class TestPollDevice:
         collector = SNMPCollector([target])
         session = (MagicMock(), MagicMock())
 
-        with patch.object(collector, "_poll_system") as mock_sys:
-            with patch.object(collector, "_poll_interfaces", return_value=[{"if_index": 1}]):
-                with patch.object(collector, "_poll_counters", return_value=([], False)):
+        mock_async_poll_system = AsyncMock(return_value={"sys_name": "X"})
+        mock_async_poll_interfaces = AsyncMock(return_value=[{"if_index": 1}])
+        mock_async_poll_counters = AsyncMock(return_value=([], False))
+
+        with patch.object(SNMPCollector, "_async_poll_system", mock_async_poll_system):
+            with patch.object(SNMPCollector, "_async_poll_interfaces", mock_async_poll_interfaces):
+                with patch.object(SNMPCollector, "_async_poll_counters", mock_async_poll_counters):
                     result = collector._poll_device(target, session)
 
-        mock_sys.assert_not_called()
+        mock_async_poll_system.assert_not_called()
         assert "system" not in result
         assert "interfaces" in result
 
@@ -412,7 +433,8 @@ class TestPollDevice:
         session = (MagicMock(), MagicMock())
 
         with patch.object(
-            collector, "_poll_system", side_effect=Exception("Request timed out")
+            SNMPCollector, "_async_poll_device",
+            new=AsyncMock(side_effect=Exception("Request timed out")),
         ):
             result = collector._poll_device(target, session)
 
@@ -427,7 +449,8 @@ class TestPollDevice:
         session = (MagicMock(), MagicMock())
 
         with patch.object(
-            collector, "_poll_system", side_effect=Exception("USM auth failure")
+            SNMPCollector, "_async_poll_device",
+            new=AsyncMock(side_effect=Exception("USM auth failure")),
         ):
             result = collector._poll_device(target, session)
 
@@ -442,7 +465,8 @@ class TestPollDevice:
         session = (MagicMock(), MagicMock())
 
         with patch.object(
-            collector, "_poll_system", side_effect=Exception("Unexpected failure occurred")
+            SNMPCollector, "_async_poll_device",
+            new=AsyncMock(side_effect=Exception("Unexpected failure occurred")),
         ):
             result = collector._poll_device(target, session)
 
@@ -642,7 +666,8 @@ class TestNoCredentialsInLogs:
 
         with patch("fivenines_agent.snmp.log") as mock_log:
             with patch.object(
-                collector, "_poll_system", side_effect=Exception("test error")
+                SNMPCollector, "_async_poll_device",
+                new=AsyncMock(side_effect=Exception("test error")),
             ):
                 collector._poll_device(target, session)
 
@@ -676,16 +701,24 @@ def _make_str_val(value):
     return val
 
 
+def _fake_object_identity(oid_str):
+    """Fake ObjectIdentity that just returns a plain object (not a Mock)."""
+    return oid_str
+
+
+def _fake_object_type(*args):
+    """Fake ObjectType that just returns a plain object (not a Mock)."""
+    return args
+
+
 class TestPollSystemDirect:
-    """Tests for _poll_system with mocked pysnmp responses."""
+    """Tests for _async_poll_system with mocked pysnmp responses."""
 
     def test_poll_system_success(self):
         """Successful system poll returns correct dict."""
         from fivenines_agent.snmp import SNMPCollector, OID_SYS_NAME, OID_SYS_DESCR, OID_SYS_UPTIME
 
         collector = SNMPCollector([_make_target()])
-        auth = MagicMock()
-        transport = MagicMock()
 
         var_binds = [
             (_make_oid(OID_SYS_NAME), _make_str_val("CoreSwitch1")),
@@ -693,19 +726,19 @@ class TestPollSystemDirect:
             (_make_oid(OID_SYS_UPTIME), _make_val(8640000)),  # centiseconds
         ]
 
-        with patch("fivenines_agent.snmp.get_cmd_sync", create=True) as mock_get:
-            # Patch at the module level where it's imported
-            with patch.dict(sys.modules, {
-                "pysnmp_sync_adapter": MagicMock(get_cmd_sync=MagicMock(return_value=(None, None, None, var_binds)))
-            }):
-                # Direct call to _poll_system with mocked internals
-                with patch.object(collector, "_poll_system") as mock_poll:
-                    mock_poll.return_value = {
-                        "sys_name": "CoreSwitch1",
-                        "sys_descr": "Cisco IOS 15.2",
-                        "sys_uptime": 86400000,
-                    }
-                    result = collector._poll_system(auth, transport)
+        mock_get_cmd = AsyncMock(return_value=(None, None, None, var_binds))
+
+        result = asyncio.run(
+            collector._async_poll_system(
+                MagicMock(),  # engine
+                MagicMock(),  # auth
+                MagicMock(),  # transport
+                MagicMock(),  # ctx
+                mock_get_cmd,
+                _fake_object_identity,
+                _fake_object_type,
+            )
+        )
 
         assert result["sys_name"] == "CoreSwitch1"
         assert result["sys_descr"] == "Cisco IOS 15.2"
@@ -717,9 +750,17 @@ class TestPollSystemDirect:
 
         collector = SNMPCollector([_make_target()])
 
-        with patch.object(collector, "_poll_system", side_effect=Exception("requestTimedOut")):
-            with pytest.raises(Exception, match="requestTimedOut"):
-                collector._poll_system(MagicMock(), MagicMock())
+        mock_get_cmd = AsyncMock(
+            return_value=("requestTimedOut", None, None, [])
+        )
+
+        with pytest.raises(Exception, match="requestTimedOut"):
+            asyncio.run(
+                collector._async_poll_system(
+                    MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+                    mock_get_cmd, _fake_object_identity, _fake_object_type,
+                )
+            )
 
     def test_poll_system_error_status(self):
         """SNMP error status raises exception."""
@@ -727,13 +768,29 @@ class TestPollSystemDirect:
 
         collector = SNMPCollector([_make_target()])
 
-        with patch.object(collector, "_poll_system", side_effect=Exception("SNMP error: noAccess")):
-            with pytest.raises(Exception, match="SNMP error"):
-                collector._poll_system(MagicMock(), MagicMock())
+        mock_error_status = MagicMock()
+        mock_error_status.prettyPrint.return_value = "noAccess"
+        mock_error_status.__bool__ = MagicMock(return_value=True)
+
+        mock_oid = MagicMock()
+        mock_oid.__str__ = MagicMock(return_value="1.3.6.1.2.1.1.5.0")
+        var_binds = [(mock_oid, MagicMock())]
+
+        mock_get_cmd = AsyncMock(
+            return_value=(None, mock_error_status, 1, var_binds)
+        )
+
+        with pytest.raises(Exception, match="SNMP error"):
+            asyncio.run(
+                collector._async_poll_system(
+                    MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+                    mock_get_cmd, _fake_object_identity, _fake_object_type,
+                )
+            )
 
 
 class TestPollInterfacesDirect:
-    """Tests for _poll_interfaces with mocked pysnmp responses."""
+    """Tests for _async_poll_interfaces with mocked pysnmp responses."""
 
     def test_poll_interfaces_returns_list(self):
         """Interface poll returns list of interface dicts."""
@@ -741,20 +798,27 @@ class TestPollInterfacesDirect:
 
         collector = SNMPCollector([_make_target()])
 
-        mock_interfaces = [
-            {
-                "if_index": 1,
-                "if_name": "eth0",
-                "if_alias": "Uplink",
-                "if_type": 6,
-                "if_speed": 1000000000,
-                "if_admin_status": 0,
-                "if_oper_status": 0,
-            }
-        ]
+        mock_async_poll_interfaces = AsyncMock(
+            return_value=[
+                {
+                    "if_index": 1,
+                    "if_name": "eth0",
+                    "if_alias": "Uplink",
+                    "if_type": 6,
+                    "if_speed": 1000000000,
+                    "if_admin_status": 0,
+                    "if_oper_status": 0,
+                }
+            ]
+        )
 
-        with patch.object(collector, "_poll_interfaces", return_value=mock_interfaces):
-            result = collector._poll_interfaces(MagicMock(), MagicMock())
+        with patch.object(SNMPCollector, "_async_poll_interfaces", mock_async_poll_interfaces):
+            result = asyncio.run(
+                collector._async_poll_interfaces(
+                    MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+                    MagicMock, MagicMock, MagicMock,
+                )
+            )
 
         assert len(result) == 1
         assert result[0]["if_index"] == 1
@@ -768,8 +832,15 @@ class TestPollInterfacesDirect:
 
         collector = SNMPCollector([_make_target()])
 
-        with patch.object(collector, "_poll_interfaces", return_value=[]):
-            result = collector._poll_interfaces(MagicMock(), MagicMock())
+        mock_async_poll_interfaces = AsyncMock(return_value=[])
+
+        with patch.object(SNMPCollector, "_async_poll_interfaces", mock_async_poll_interfaces):
+            result = asyncio.run(
+                collector._async_poll_interfaces(
+                    MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+                    MagicMock, MagicMock, MagicMock,
+                )
+            )
 
         assert result == []
 
@@ -780,20 +851,27 @@ class TestPollInterfacesDirect:
         collector = SNMPCollector([_make_target()])
 
         # Interface without ifXTable fields gets defaults
-        mock_interfaces = [
-            {
-                "if_index": 1,
-                "if_type": 6,
-                "if_admin_status": 0,
-                "if_oper_status": 0,
-                "if_name": "",
-                "if_alias": "",
-                "if_speed": 0,
-            }
-        ]
+        mock_async_poll_interfaces = AsyncMock(
+            return_value=[
+                {
+                    "if_index": 1,
+                    "if_type": 6,
+                    "if_admin_status": 0,
+                    "if_oper_status": 0,
+                    "if_name": "",
+                    "if_alias": "",
+                    "if_speed": 0,
+                }
+            ]
+        )
 
-        with patch.object(collector, "_poll_interfaces", return_value=mock_interfaces):
-            result = collector._poll_interfaces(MagicMock(), MagicMock())
+        with patch.object(SNMPCollector, "_async_poll_interfaces", mock_async_poll_interfaces):
+            result = asyncio.run(
+                collector._async_poll_interfaces(
+                    MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+                    MagicMock, MagicMock, MagicMock,
+                )
+            )
 
         assert result[0]["if_name"] == ""
         assert result[0]["if_alias"] == ""
@@ -801,7 +879,7 @@ class TestPollInterfacesDirect:
 
 
 class TestPollCountersDirect:
-    """Tests for _poll_counters with mocked pysnmp responses."""
+    """Tests for _async_poll_counters with mocked pysnmp responses."""
 
     def test_poll_counters_hc_available(self):
         """64-bit HC counters used when available."""
@@ -825,8 +903,15 @@ class TestPollCountersDirect:
             }
         ]
 
-        with patch.object(collector, "_poll_counters", return_value=(mock_counters, True)):
-            result, hc = collector._poll_counters(MagicMock(), MagicMock(), [1])
+        mock_async_poll_counters = AsyncMock(return_value=(mock_counters, True))
+
+        with patch.object(SNMPCollector, "_async_poll_counters", mock_async_poll_counters):
+            result, hc = asyncio.run(
+                collector._async_poll_counters(
+                    MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+                    MagicMock, MagicMock, MagicMock, [1],
+                )
+            )
 
         assert hc is True
         assert result[0]["bytes_in"] == 1000000000
@@ -839,8 +924,15 @@ class TestPollCountersDirect:
 
         mock_counters = [{"if_index": 1, "bytes_in": 100, "bytes_out": 50}]
 
-        with patch.object(collector, "_poll_counters", return_value=(mock_counters, False)):
-            result, hc = collector._poll_counters(MagicMock(), MagicMock(), [1])
+        mock_async_poll_counters = AsyncMock(return_value=(mock_counters, False))
+
+        with patch.object(SNMPCollector, "_async_poll_counters", mock_async_poll_counters):
+            result, hc = asyncio.run(
+                collector._async_poll_counters(
+                    MagicMock(), MagicMock(), MagicMock(), MagicMock(),
+                    MagicMock, MagicMock, MagicMock, [1],
+                )
+            )
 
         assert hc is False
 
