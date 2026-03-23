@@ -513,7 +513,7 @@ class SNMPCollector:
             (OID_IF_ADMIN_STATUS, "if_admin_status", lambda v: max(0, int(v) - 1)),
             (OID_IF_OPER_STATUS, "if_oper_status", lambda v: max(0, int(v) - 1)),
         ]:
-            async for error_indication, error_status, error_index, var_binds in _subtree_walk(
+            async for error_indication, error_status, error_index, var_binds in walk_cmd(
                 engine, auth, transport, ctx,
                 ObjectType(ObjectIdentity(oid_prefix)), oid_prefix,
             ):
@@ -547,7 +547,7 @@ class SNMPCollector:
             (OID_IF_ALIAS, "if_alias", str),
             (OID_IF_HIGH_SPEED, "if_speed", lambda v: int(v) * 1000000),
         ]:
-            async for error_indication, error_status, error_index, var_binds in _subtree_walk(
+            async for error_indication, error_status, error_index, var_binds in walk_cmd(
                 engine, auth, transport, ctx,
                 ObjectType(ObjectIdentity(oid_prefix)), oid_prefix,
             ):
