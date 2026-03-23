@@ -155,6 +155,13 @@ class Agent:
             data["ipv4"] = self._collect("ipv4", get_ip, ipv6=False)
         if self.config.get("ipv6"):
             data["ipv6"] = self._collect("ipv6", get_ip, ipv6=True)
+        snmp_targets = self.config.get("snmp_targets", [])
+        if snmp_targets:
+            from fivenines_agent.snmp import snmp_metrics
+
+            data["snmp_metrics"] = self._collect(
+                "snmp_metrics", snmp_metrics, snmp_targets
+            )
 
     def _collect(self, name, fn, *args, **kwargs):
         start = time.monotonic()

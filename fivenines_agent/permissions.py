@@ -67,6 +67,8 @@ class PermissionProbe:
             "proxmox": self._can_access_proxmox(),
             # Package listing - for security scanning
             "packages": self._can_list_packages(),
+            # SNMP polling - needs net-snmp CLI tools
+            "snmp": self._has_snmpget(),
         }
 
         # Log any capability changes (only after first probe)
@@ -349,6 +351,15 @@ class PermissionProbe:
             return True
         return False
 
+    def _has_snmpget(self):
+        """Check if net-snmp CLI tools are available."""
+        found = shutil.which("snmpget") is not None
+        log(
+            "_has_snmpget: {}".format("found" if found else "not found"),
+            "debug",
+        )
+        return found
+
     def _can_list_packages(self):
         """Check if a supported package manager is available."""
         for cmd in ("dpkg-query", "rpm", "apk", "pacman", "synopkg"):
@@ -408,6 +419,7 @@ def print_capabilities_banner():
     storage = ["smart_storage", "raid_storage", "zfs"]
     services = ["docker", "qemu", "proxmox"]
     security = ["fail2ban", "packages"]
+    networking = ["snmp"]
 
     print("")
     print("=" * 60)
@@ -445,6 +457,8 @@ def print_capabilities_banner():
                     hint = " (requires: NVIDIA driver)"
                 elif cap in ["temperatures", "fans"]:
                     hint = " (no accessible sensors)"
+                elif cap == "snmp":
+                    hint = " (requires: net-snmp)"
 
             print(f"    {icon} {name}{hint}")
         print("")
@@ -454,6 +468,7 @@ def print_capabilities_banner():
     print_section("Storage", storage)
     print_section("Services", services)
     print_section("Security", security)
+    print_section("Networking", networking)
 
     unavailable = probe.get_unavailable()
     if unavailable:

@@ -10,9 +10,11 @@ on:
       - 'fix/**'
     tags:
       - 'v*'
-  pull_request:
-    branches: [main, master]
   workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
 
 env:
   REGISTRY: ghcr.io
@@ -623,10 +625,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
-      - name: Download all artifacts
+      - name: Download build artifacts
         uses: actions/download-artifact@v5
         with:
           path: artifacts
+          pattern: fivenines-agent-*
+          merge-multiple: false
 
       - name: Generate release tag name
         id: release_info
@@ -739,10 +743,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
-      - name: Download all artifacts
+      - name: Download build artifacts
         uses: actions/download-artifact@v5
         with:
           path: artifacts
+          pattern: fivenines-agent-*
+          merge-multiple: false
 
       - name: Prepare release assets
         run: |
@@ -784,10 +790,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
 
-      - name: Download all artifacts
+      - name: Download build artifacts
         uses: actions/download-artifact@v5
         with:
           path: artifacts
+          pattern: fivenines-agent-*
+          merge-multiple: false
 
       - name: Prepare files for R2
         run: |

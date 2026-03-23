@@ -100,7 +100,7 @@ Each metric collector is a separate module that exports functions to collect spe
 - **Storage**: `smart_storage.py` (requires sudo smartctl), `raid_storage.py` (requires sudo mdadm), `zfs.py`
 - **Services**: `docker.py`, `qemu.py`, `proxmox.py`, `caddy.py`, `nginx.py`, `postgresql.py`, `redis.py`
 - **Security**: `fail2ban.py` (requires sudo fail2ban-client)
-- **Network/connectivity**: `ip.py` (public IPv4/IPv6 via ip.fivenines.io with 60s cache), `ping.py` (TCP latency)
+- **Network/connectivity**: `ip.py` (public IPv4/IPv6 via ip.fivenines.io with 60s cache), `ping.py` (TCP latency), `snmp.py` (SNMP device polling via net-snmp CLI tools)
 - **Security scanning**: `packages.py` (installed packages via dpkg/rpm/apk/pacman with hash-based delta sync)
 
 Collectors use the `@debug` decorator from `debug.py` to log execution time and results.
