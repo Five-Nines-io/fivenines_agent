@@ -586,7 +586,7 @@ class SNMPCollector:
             data = {}
             had_error = False
             try:
-                async for err_ind, err_st, err_idx, var_binds in _subtree_walk(
+                async for err_ind, err_st, err_idx, var_binds in walk_cmd(
                     engine, auth, transport, ctx,
                     ObjectType(ObjectIdentity(oid_prefix)), oid_prefix,
                 ):
