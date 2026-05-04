@@ -115,6 +115,8 @@ The agent works without sudo, but these features will be unavailable (this is al
 | ZFS pools | ZFS delegation or permissions |
 | NVIDIA GPU metrics | NVIDIA driver + pynvml library |
 | SNMP device polling | `net-snmp` tools (`snmpget`, `snmpbulkwalk`) |
+| systemd unit metrics | `systemd` init system (`systemctl`, `journalctl`) |
+| Per-unit cgroup metrics | cgroup v1 or v2 mounted at `/sys/fs/cgroup` |
 
 ### Capabilities by Permission Level
 

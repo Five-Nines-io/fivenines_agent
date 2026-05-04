@@ -25,6 +25,7 @@ from fivenines_agent.smart_storage import (
     smart_storage_health,
     smart_storage_identification,
 )
+from fivenines_agent.systemd import systemd_metrics
 from fivenines_agent.temperatures import temperatures
 
 
@@ -80,6 +81,7 @@ COLLECTORS = [
     ("caddy", [("caddy", caddy_metrics, True)]),
     ("postgresql", [("postgresql", postgresql_metrics, True)]),
     ("proxmox", [("proxmox", proxmox_metrics, True)]),
+    ("systemd", [("systemd", systemd_metrics, True)]),
 ]
 
 

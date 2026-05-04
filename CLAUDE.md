@@ -98,10 +98,11 @@ Each metric collector is a separate module that exports functions to collect spe
 
 - **Core metrics** (always enabled): `cpu.py`, `memory.py`, `load_average.py`, `io.py`, `network.py`, `partitions.py`, `files.py`, `ports.py`, `processes.py`, `temperatures.py`, `fans.py`
 - **Storage**: `smart_storage.py` (requires sudo smartctl), `raid_storage.py` (requires sudo mdadm), `zfs.py`
-- **Services**: `docker.py`, `qemu.py`, `proxmox.py`, `caddy.py`, `nginx.py`, `postgresql.py`, `redis.py`
+- **Services**: `docker.py`, `qemu.py`, `proxmox.py`, `caddy.py`, `nginx.py`, `postgresql.py`, `redis.py`, `systemd.py` (per-unit health + inventory delta-sync, requires systemctl/journalctl)
 - **Security**: `fail2ban.py` (requires sudo fail2ban-client)
 - **Network/connectivity**: `ip.py` (public IPv4/IPv6 via ip.fivenines.io with 60s cache), `ping.py` (TCP latency), `snmp.py` (SNMP device polling via net-snmp CLI tools)
 - **Security scanning**: `packages.py` (installed packages via dpkg/rpm/apk/pacman with hash-based delta sync)
+- **Kernel surfaces**: `cgroup.py` (v1/v2 hierarchy detection + safe per-unit metric reads, used by `systemd.py`)
 
 Collectors use the `@debug` decorator from `debug.py` to log execution time and results.
 

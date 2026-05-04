@@ -4,6 +4,7 @@ import sys
 import threading
 from unittest.mock import MagicMock, patch
 
+
 # Mock libvirt before any fivenines_agent imports that transitively need it
 sys.modules.setdefault("libvirt", MagicMock())
 
@@ -300,3 +301,123 @@ def test_packages_sync_telemetry_captures_logged_error(
     assert "duration_ms" in entry
     assert "errors" in entry
     assert "Packages synchronization failed, will retry" in entry["errors"]
+
+
+# --- _systemd_inventory_sync_with_telemetry ---
+
+
+def _make_agent_with_systemd_state():
+    agent = make_agent()
+    agent._systemd_force_resend = False
+    return agent
+
+
+@patch("fivenines_agent.agent.systemd_inventory_sync")
+def test_systemd_inventory_sync_telemetry_early_return(mock_sync):
+    """Telemetry recorded even when systemd_inventory_sync is a no-op."""
+    agent = _make_agent_with_systemd_state()
+    agent.config = {"enabled": True}
+
+    agent._systemd_inventory_sync_with_telemetry()
+
+    assert "systemd_inventory_sync" in agent._telemetry
+    entry = agent._telemetry["systemd_inventory_sync"]
+    assert "duration_ms" in entry
+    assert "errors" not in entry
+    mock_sync.assert_called_once()
+
+
+@patch("fivenines_agent.agent.systemd_inventory_sync")
+def test_systemd_inventory_sync_telemetry_consumes_force_flag(mock_sync):
+    """force_resend flag is consumed (reset to False) after one sync call."""
+    agent = _make_agent_with_systemd_state()
+    agent.config = {"enabled": True, "systemd": {"scan": True}}
+    agent._systemd_force_resend = True
+
+    agent._systemd_inventory_sync_with_telemetry()
+
+    # The flag must be cleared so the next tick does not re-force
+    assert agent._systemd_force_resend is False
+    # And the sync was called with force_resend=True
+    args, kwargs = mock_sync.call_args
+    assert kwargs.get("force_resend") is True
+
+
+@patch("fivenines_agent.agent.systemd_inventory_sync")
+def test_systemd_inventory_sync_telemetry_on_exception(mock_sync):
+    """Telemetry with errors recorded when exception occurs."""
+    agent = _make_agent_with_systemd_state()
+    agent.config = {"enabled": True, "systemd": {"scan": True}}
+    mock_sync.side_effect = RuntimeError("snapshot blew up")
+
+    agent._systemd_inventory_sync_with_telemetry()
+
+    entry = agent._telemetry["systemd_inventory_sync"]
+    assert "duration_ms" in entry
+    assert "errors" in entry
+    assert "snapshot blew up" in entry["errors"]
+
+
+@patch("fivenines_agent.agent.systemd_inventory_sync")
+def test_systemd_inventory_sync_telemetry_captures_logged_error(mock_sync):
+    """Errors logged inside systemd_inventory_sync end up in telemetry."""
+    agent = _make_agent_with_systemd_state()
+    agent.config = {"enabled": True, "systemd": {"scan": True}}
+
+    def fake_sync(_config, _send_fn, force_resend=False):
+        log("systemd inventory send failed, will retry", "error")
+
+    mock_sync.side_effect = fake_sync
+
+    agent._systemd_inventory_sync_with_telemetry()
+
+    entry = agent._telemetry["systemd_inventory_sync"]
+    assert "errors" in entry
+    assert "systemd inventory send failed, will retry" in entry["errors"]
+
+
+# --- _handle_permission_refresh: SIGHUP forces inventory resend ---
+
+
+@patch("fivenines_agent.agent.print_capabilities_banner")
+@patch("fivenines_agent.agent.force_inventory_resend")
+def test_handle_permission_refresh_sets_force_flag_on_sighup(
+    mock_force, mock_banner
+):
+    """SIGHUP triggers permission refresh AND marks systemd inventory for resend."""
+    from fivenines_agent.agent import refresh_permissions_event
+
+    agent = make_agent()
+    agent._systemd_force_resend = False
+    agent.permissions = MagicMock()
+    agent.permissions.get_all.return_value = {"systemd": True}
+    agent.static_data = {}
+    refresh_permissions_event.set()
+
+    try:
+        agent._handle_permission_refresh()
+    finally:
+        refresh_permissions_event.clear()
+
+    mock_force.assert_called_once()
+    assert agent._systemd_force_resend is True
+    assert refresh_permissions_event.is_set() is False
+
+
+@patch("fivenines_agent.agent.force_inventory_resend")
+def test_handle_permission_refresh_periodic_does_not_force_resend(mock_force):
+    """Periodic 5-min re-probe must NOT force inventory resend (only SIGHUP does)."""
+    from fivenines_agent.agent import refresh_permissions_event
+
+    agent = make_agent()
+    agent._systemd_force_resend = False
+    agent.permissions = MagicMock()
+    agent.permissions.refresh_if_needed.return_value = True
+    agent.permissions.get_all.return_value = {"systemd": True}
+    agent.static_data = {}
+    refresh_permissions_event.clear()
+
+    agent._handle_permission_refresh()
+
+    mock_force.assert_not_called()
+    assert agent._systemd_force_resend is False

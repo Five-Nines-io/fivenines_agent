@@ -69,6 +69,10 @@ class PermissionProbe:
             "packages": self._can_list_packages(),
             # SNMP polling - needs net-snmp CLI tools
             "snmp": self._has_snmpget(),
+            # systemd unit collection
+            "systemd": self._can_probe_systemd(),
+            # cgroup hierarchy: "v1", "v2", or None
+            "cgroup": self._detect_cgroup_hierarchy(),
         }
 
         # Log any capability changes (only after first probe)
@@ -369,6 +373,52 @@ class PermissionProbe:
         log("_can_list_packages: no supported package manager found", "debug")
         return False
 
+    def _can_probe_systemd(self):
+        """Check if systemd is the active init system and systemctl is usable.
+
+        Returns True only when:
+          * /run/systemd/system exists (systemd booted this host)
+          * systemctl is in PATH and `systemctl --version` exits cleanly
+        Returns False on Alpine (OpenRC), bare containers without their own
+        systemd, and macOS dev environments.
+        """
+        if not os.path.isdir("/run/systemd/system"):
+            log("_can_probe_systemd: /run/systemd/system not present", "debug")
+            return False
+        if not shutil.which("systemctl"):
+            log("_can_probe_systemd: systemctl not in PATH", "debug")
+            return False
+        try:
+            result = subprocess.run(
+                ["systemctl", "--version"],
+                capture_output=True,
+                timeout=5,
+                env=get_clean_env(),
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log(f"_can_probe_systemd: systemctl --version failed: {e}", "debug")
+            return False
+        if result.returncode != 0:
+            log("_can_probe_systemd: systemctl --version returned non-zero", "debug")
+            return False
+        log("_can_probe_systemd: -> AVAILABLE", "debug")
+        return True
+
+    def _detect_cgroup_hierarchy(self):
+        """Detect cgroup hierarchy version. Returns 'v1', 'v2', or None.
+
+        Reads /sys/fs/cgroup directly so this works whether or not systemd is
+        installed (some hosts run cgroups without systemd).
+        """
+        if os.path.exists("/sys/fs/cgroup/cgroup.controllers"):
+            log("_detect_cgroup_hierarchy: -> v2", "debug")
+            return "v2"
+        if os.path.isdir("/sys/fs/cgroup/memory"):
+            log("_detect_cgroup_hierarchy: -> v1", "debug")
+            return "v1"
+        log("_detect_cgroup_hierarchy: no cgroup hierarchy found", "debug")
+        return None
+
     def get(self, capability, default=False):
         """Get a specific capability status."""
         return self.capabilities.get(capability, default)
@@ -415,9 +465,9 @@ def print_capabilities_banner():
         "ports",
         "processes",
     ]
-    hardware = ["temperatures", "fans", "nvidia_gpu"]
+    hardware = ["temperatures", "fans", "nvidia_gpu", "cgroup"]
     storage = ["smart_storage", "raid_storage", "zfs"]
-    services = ["docker", "qemu", "proxmox"]
+    services = ["docker", "qemu", "proxmox", "systemd"]
     security = ["fail2ban", "packages"]
     networking = ["snmp"]
 
@@ -433,6 +483,10 @@ def print_capabilities_banner():
             status = caps.get(cap, False)
             icon = "[+]" if status else "[-]"
             name = cap.replace("_", " ").title()
+
+            # cgroup is tri-state: "v1", "v2", or None (not bool)
+            if cap == "cgroup" and status:
+                name = f"Cgroup {status}"
 
             # Add hints for unavailable features
             hint = ""
@@ -459,6 +513,10 @@ def print_capabilities_banner():
                     hint = " (no accessible sensors)"
                 elif cap == "snmp":
                     hint = " (requires: net-snmp)"
+                elif cap == "systemd":
+                    hint = " (requires: systemd init system)"
+                elif cap == "cgroup":
+                    hint = " (no /sys/fs/cgroup hierarchy found)"
 
             print(f"    {icon} {name}{hint}")
         print("")

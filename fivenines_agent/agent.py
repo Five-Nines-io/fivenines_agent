@@ -11,6 +11,7 @@ from threading import Event
 import psutil
 from dotenv import load_dotenv
 
+
 try:
     import systemd_watchdog
 except ImportError:
@@ -28,6 +29,7 @@ from fivenines_agent.permissions import get_permissions, print_capabilities_bann
 from fivenines_agent.ping import tcp_ping
 from fivenines_agent.synchronization_queue import SynchronizationQueue
 from fivenines_agent.synchronizer import Synchronizer
+from fivenines_agent.systemd import force_inventory_resend, systemd_inventory_sync
 
 
 CONFIG_DIR = config_dir()
@@ -80,6 +82,10 @@ class Agent:
         self.synchronizer = Synchronizer(self.token, self.queue, self.static_data)
         self.synchronizer.start()
 
+        # Set to True after SIGHUP so the next systemd_inventory_sync resends
+        # the full snapshot regardless of hash equality.
+        self._systemd_force_resend = False
+
     def _load_file(self, filename):
         try:
             path = os.path.join(CONFIG_DIR, filename)
@@ -118,6 +124,7 @@ class Agent:
                 self._collect_metrics(data)
 
                 self._packages_sync_with_telemetry()
+                self._systemd_inventory_sync_with_telemetry()
                 data["_telemetry"] = self._telemetry
 
                 # Running time and enqueue
@@ -202,12 +209,44 @@ class Agent:
             entry["errors"] = errors
         self._telemetry["packages_sync"] = entry
 
+    def _systemd_inventory_sync_with_telemetry(self):
+        ps_start = time.monotonic()
+        start_log_capture()
+        force = self._systemd_force_resend
+        self._systemd_force_resend = False
+        try:
+            systemd_inventory_sync(
+                self.config,
+                self.synchronizer.send_systemd_inventory,
+                force_resend=force,
+            )
+        except Exception as e:
+            errors = stop_log_capture()
+            errors.append(str(e))
+            duration_ms = round((time.monotonic() - ps_start) * 1000, 2)
+            self._telemetry["systemd_inventory_sync"] = {
+                "duration_ms": duration_ms,
+                "errors": errors,
+            }
+            log(f"Error in systemd_inventory_sync: {e}", "error")
+            return
+        errors = stop_log_capture()
+        duration_ms = round((time.monotonic() - ps_start) * 1000, 2)
+        entry = {"duration_ms": duration_ms}
+        if errors:
+            entry["errors"] = errors
+        self._telemetry["systemd_inventory_sync"] = entry
+
     def _handle_permission_refresh(self):
         if refresh_permissions_event.is_set():
             refresh_permissions_event.clear()
             self.permissions.force_refresh()
             self.static_data["capabilities"] = self.permissions.get_all()
             print_capabilities_banner()
+            # Permission refresh = orient agent. Reset systemd inventory hash so
+            # the next sync resends a fresh snapshot even if nothing changed.
+            force_inventory_resend()
+            self._systemd_force_resend = True
         elif self.permissions.refresh_if_needed():
             self.static_data["capabilities"] = self.permissions.get_all()
 
