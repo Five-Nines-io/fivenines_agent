@@ -13,7 +13,7 @@ from fivenines_agent.debug import debug, log
 
 try:
     from proxmoxer import ProxmoxAPI
-except ImportError:
+except ImportError:  # pragma: no cover
     ProxmoxAPI = None  # type: ignore[assignment, misc]
 
 
@@ -192,10 +192,10 @@ class ProxmoxCollector:
                     node_data = {
                         'name': node_name,
                         'status': node_info.get('status', 'unknown'),
-                        'cpu_usage': node_info.get('cpu', 0),
-                        'memory_used': node_info.get('mem', 0),
-                        'memory_total': node_info.get('maxmem', 0),
-                        'uptime': node_status.get('uptime', 0),
+                        'cpu_usage': node_info.get('cpu') or 0,
+                        'memory_used': node_info.get('mem') or 0,
+                        'memory_total': node_info.get('maxmem') or 0,
+                        'uptime': node_status.get('uptime') or 0,
                         'vms_running': vms_running,
                         'lxc_running': lxc_running
                     }
@@ -221,7 +221,10 @@ class ProxmoxCollector:
                     continue
 
                 try:
-                    qemu_list = self.proxmox.nodes(node_name).qemu.get()
+                    # full=1 makes Proxmox query each VM's QEMU monitor for
+                    # diskread/diskwrite. Without it those fields are null.
+                    # ~3ms per running VM extra.
+                    qemu_list = self.proxmox.nodes(node_name).qemu.get(full=1)
 
                     for vm in qemu_list:
                         vmid = vm.get('vmid')
@@ -233,14 +236,14 @@ class ProxmoxCollector:
                             'name': vm.get('name', f'vm-{vmid}'),
                             'node': node_name,
                             'status': vm.get('status', 'unknown'),
-                            'cpu_usage': vm.get('cpu', 0),
-                            'memory_used': vm.get('mem', 0),
-                            'memory_max': vm.get('maxmem', 0),
-                            'disk_read': vm.get('diskread', 0),
-                            'disk_write': vm.get('diskwrite', 0),
-                            'net_in': vm.get('netin', 0),
-                            'net_out': vm.get('netout', 0),
-                            'uptime': vm.get('uptime', 0)
+                            'cpu_usage': vm.get('cpu') or 0,
+                            'memory_used': vm.get('mem') or 0,
+                            'memory_max': vm.get('maxmem') or 0,
+                            'disk_read': vm.get('diskread') or 0,
+                            'disk_write': vm.get('diskwrite') or 0,
+                            'net_in': vm.get('netin') or 0,
+                            'net_out': vm.get('netout') or 0,
+                            'uptime': vm.get('uptime') or 0
                         }
                         vms.append(vm_data)
 
@@ -276,14 +279,14 @@ class ProxmoxCollector:
                             'name': ct.get('name', f'ct-{vmid}'),
                             'node': node_name,
                             'status': ct.get('status', 'unknown'),
-                            'cpu_usage': ct.get('cpu', 0),
-                            'memory_used': ct.get('mem', 0),
-                            'memory_max': ct.get('maxmem', 0),
-                            'disk_read': ct.get('diskread', 0),
-                            'disk_write': ct.get('diskwrite', 0),
-                            'net_in': ct.get('netin', 0),
-                            'net_out': ct.get('netout', 0),
-                            'uptime': ct.get('uptime', 0)
+                            'cpu_usage': ct.get('cpu') or 0,
+                            'memory_used': ct.get('mem') or 0,
+                            'memory_max': ct.get('maxmem') or 0,
+                            'disk_read': ct.get('diskread') or 0,
+                            'disk_write': ct.get('diskwrite') or 0,
+                            'net_in': ct.get('netin') or 0,
+                            'net_out': ct.get('netout') or 0,
+                            'uptime': ct.get('uptime') or 0
                         }
                         containers.append(ct_data)
 
@@ -318,9 +321,9 @@ class ProxmoxCollector:
                             'name': storage_name,
                             'node': node_name,
                             'type': storage.get('type', 'unknown'),
-                            'total': storage.get('total', 0),
-                            'used': storage.get('used', 0),
-                            'available': storage.get('avail', 0),
+                            'total': storage.get('total') or 0,
+                            'used': storage.get('used') or 0,
+                            'available': storage.get('avail') or 0,
                             'active': storage.get('active', 0) == 1
                         }
                         storage_pools.append(storage_data)
