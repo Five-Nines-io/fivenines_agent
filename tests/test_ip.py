@@ -132,3 +132,135 @@ def test_get_ip_generic_exception(mock_conn_cls):
 
     result = get_ip(ipv6=False)
     assert result is None
+
+
+# --- Negative cache (issue #42) ---
+
+
+@patch("fivenines_agent.ip.CustomHTTPSConnection")
+def test_negative_cache_suppresses_retry_after_connection_error(mock_conn_cls):
+    """First failure attempts and logs; subsequent calls within TTL return None silently."""
+    _reset_caches()
+    mock_conn_cls.return_value.request.side_effect = ConnectionError(
+        "Network is unreachable"
+    )
+
+    with patch("fivenines_agent.ip.log") as mock_log:
+        first = get_ip(ipv6=True)
+        second = get_ip(ipv6=True)
+        third = get_ip(ipv6=True)
+
+    assert first is None
+    assert second is None
+    assert third is None
+    # Only one HTTP attempt; the cache absorbs the others.
+    assert mock_conn_cls.call_count == 1
+    # And only one error log line, not three.
+    error_logs = [c for c in mock_log.call_args_list if c.args[1] == "error"]
+    assert len(error_logs) == 1
+
+
+@patch("fivenines_agent.ip.CustomHTTPSConnection")
+def test_negative_cache_suppresses_retry_after_generic_exception(mock_conn_cls):
+    """Generic exceptions also populate the negative cache."""
+    _reset_caches()
+    mock_conn_cls.return_value.request.side_effect = Exception("something broke")
+
+    get_ip(ipv6=False)
+    get_ip(ipv6=False)
+
+    assert mock_conn_cls.call_count == 1
+
+
+@patch("fivenines_agent.ip.CustomHTTPSConnection")
+def test_negative_cache_suppresses_retry_after_http_non_200(mock_conn_cls):
+    """HTTP non-200 responses populate the negative cache."""
+    _reset_caches()
+    mock_conn = MagicMock()
+    mock_response = MagicMock()
+    mock_response.status = 503
+    mock_response.read.return_value = b"unavailable"
+    mock_conn.getresponse.return_value = mock_response
+    mock_conn_cls.return_value = mock_conn
+
+    get_ip(ipv6=False)
+    get_ip(ipv6=False)
+
+    assert mock_conn_cls.call_count == 1
+
+
+@patch("fivenines_agent.ip.CustomHTTPSConnection")
+def test_negative_cache_expires(mock_conn_cls):
+    """After NEGATIVE_CACHE_TTL elapses, a new attempt is made."""
+    _reset_caches()
+    mock_conn_cls.return_value.request.side_effect = ConnectionError("unreachable")
+
+    get_ip(ipv6=True)
+    # Force the negative cache to expire (TTL is 300s; jump back 400s).
+    ip_module._ip_v6_cache["timestamp"] = time.time() - 400
+
+    get_ip(ipv6=True)
+    assert mock_conn_cls.call_count == 2
+
+
+@patch("fivenines_agent.ip.CustomHTTPSConnection")
+def test_negative_cache_per_family(mock_conn_cls):
+    """An IPv6 failure does not poison the IPv4 cache."""
+    _reset_caches()
+
+    # IPv6 fails, populates negative cache.
+    mock_conn_cls.return_value.request.side_effect = ConnectionError("v6 unreachable")
+    assert get_ip(ipv6=True) is None
+
+    # IPv4 path is independent and should still be attempted.
+    mock_conn_cls.reset_mock()
+    mock_conn_cls.return_value.request.side_effect = None
+    mock_response = MagicMock()
+    mock_response.status = 200
+    mock_response.read.return_value = b"1.2.3.4\n"
+    mock_conn_cls.return_value.getresponse.return_value = mock_response
+
+    assert get_ip(ipv6=False) == "1.2.3.4"
+
+
+@patch("fivenines_agent.ip.CustomHTTPSConnection")
+def test_negative_cache_clears_on_recovery(mock_conn_cls):
+    """When connectivity recovers after the TTL, the new IP is cached."""
+    _reset_caches()
+    # First call: fails.
+    mock_conn_cls.return_value.request.side_effect = ConnectionError("unreachable")
+    assert get_ip(ipv6=True) is None
+    assert ip_module._ip_v6_cache["ip"] is None
+
+    # Force the negative cache to expire.
+    ip_module._ip_v6_cache["timestamp"] = time.time() - 400
+
+    # Second call: succeeds.
+    mock_conn_cls.return_value.request.side_effect = None
+    mock_response = MagicMock()
+    mock_response.status = 200
+    mock_response.read.return_value = b"::1\n"
+    mock_conn_cls.return_value.getresponse.return_value = mock_response
+
+    assert get_ip(ipv6=True) == "::1"
+    assert ip_module._ip_v6_cache["ip"] == "::1"
+
+
+@patch("fivenines_agent.ip.CustomHTTPSConnection")
+def test_negative_cache_does_not_log_on_cache_hit(mock_conn_cls):
+    """A cache hit should produce zero error logs (the noise fix)."""
+    _reset_caches()
+    mock_conn_cls.return_value.request.side_effect = ConnectionError("unreachable")
+
+    # Prime the negative cache (one attempt, one error log).
+    get_ip(ipv6=True)
+
+    # Subsequent calls hit the cache and must be completely silent.
+    with patch("fivenines_agent.ip.log") as mock_log:
+        for _ in range(60):  # simulate one hour of ticks
+            get_ip(ipv6=True)
+
+    error_logs = [c for c in mock_log.call_args_list if c.args[1] == "error"]
+    assert error_logs == []
+    # No additional HTTP attempts.
+    assert mock_conn_cls.call_count == 1

@@ -11,6 +11,12 @@ from fivenines_agent.debug import debug, log
 _ip_v4_cache = { "timestamp": 0, "ip": None }
 _ip_v6_cache = { "timestamp": 0, "ip": None }
 
+# Cache TTLs. The negative cache deliberately runs longer than the positive
+# cache (and longer than the default tick interval) so a host with no IPv6
+# does not log the same connection error every tick. See issue #42.
+POSITIVE_CACHE_TTL = 60
+NEGATIVE_CACHE_TTL = 300
+
 class CustomHTTPSConnection(http.client.HTTPSConnection):
     def __init__(self, host, port=None, ipv6=False, timeout=5, **kwargs):
         super().__init__(host, port, timeout=timeout, **kwargs)
@@ -49,14 +55,17 @@ class CustomHTTPSConnection(http.client.HTTPSConnection):
 @debug('get_ip')
 def get_ip(ipv6=False):
     now = time.time()
+    cache = _ip_v6_cache if ipv6 else _ip_v4_cache
+    age = now - cache["timestamp"]
 
-    if ipv6:
-        if now - _ip_v6_cache["timestamp"] < 60:
-            return _ip_v6_cache["ip"]
-    else:
-        if now - _ip_v4_cache["timestamp"] < 60:
-            return _ip_v4_cache["ip"]
+    # Positive cache: short TTL, return the previously-fetched IP.
+    if cache["ip"] is not None and age < POSITIVE_CACHE_TTL:
+        return cache["ip"]
+    # Negative cache: longer TTL, suppress retry storms on broken connectivity.
+    if cache["ip"] is None and cache["timestamp"] > 0 and age < NEGATIVE_CACHE_TTL:
+        return None
 
+    conn = None
     try:
         ssl_context = ssl.create_default_context(cafile=certifi.where())
 
@@ -70,20 +79,25 @@ def get_ip(ipv6=False):
 
         if response.status == 200:
             ip = body.strip()
-            cache = _ip_v6_cache if ipv6 else _ip_v4_cache
             cache["timestamp"] = now
             cache["ip"] = ip
             return ip
 
+        cache["timestamp"] = now
+        cache["ip"] = None
         return None
     except ConnectionError as e:
         # Log the error and optionally retry or handle IPv4 fallback
         log(f"Unexpected error occurred: {e}", 'error')
+        cache["timestamp"] = now
+        cache["ip"] = None
         return None
 
     except Exception as e:
         log(f"Unexpected error occurred: {e}", 'error')
         traceback.print_exc(file=sys.stderr)
+        cache["timestamp"] = now
+        cache["ip"] = None
         return None
     finally:
         if conn:
