@@ -35,12 +35,12 @@ def test_get_ip_v6_success(mock_conn_cls):
     mock_conn = MagicMock()
     mock_response = MagicMock()
     mock_response.status = 200
-    mock_response.read.return_value = b"::1\n"
+    mock_response.read.return_value = b"2001:4860:4860::8888\n"
     mock_conn.getresponse.return_value = mock_response
     mock_conn_cls.return_value = mock_conn
 
     result = get_ip(ipv6=True)
-    assert result == "::1"
+    assert result == "2001:4860:4860::8888"
 
 
 @patch("fivenines_agent.ip.CustomHTTPSConnection")
@@ -70,15 +70,15 @@ def test_get_ip_v6_caches_result(mock_conn_cls):
     mock_conn = MagicMock()
     mock_response = MagicMock()
     mock_response.status = 200
-    mock_response.read.return_value = b"::1\n"
+    mock_response.read.return_value = b"2001:4860:4860::8888\n"
     mock_conn.getresponse.return_value = mock_response
     mock_conn_cls.return_value = mock_conn
 
     result1 = get_ip(ipv6=True)
     result2 = get_ip(ipv6=True)
 
-    assert result1 == "::1"
-    assert result2 == "::1"
+    assert result1 == "2001:4860:4860::8888"
+    assert result2 == "2001:4860:4860::8888"
     assert mock_conn_cls.call_count == 1
 
 
@@ -299,11 +299,11 @@ def test_recovery_after_long_failure_streak(mock_conn_cls):
     mock_conn_cls.return_value.request.side_effect = None
     mock_response = MagicMock()
     mock_response.status = 200
-    mock_response.read.return_value = b"::1\n"
+    mock_response.read.return_value = b"2001:4860:4860::8888\n"
     mock_conn_cls.return_value.getresponse.return_value = mock_response
     ip_module._ip_v6_cache["timestamp"] = time.monotonic() - 400
 
-    assert get_ip(ipv6=True) == "::1"
+    assert get_ip(ipv6=True) == "2001:4860:4860::8888"
     assert ip_module._ip_v6_cache["failures"] == 0
 
 
@@ -342,7 +342,10 @@ def test_validate_ip_accepts_valid_ipv4():
 
 
 def test_validate_ip_accepts_valid_ipv6():
-    assert ip_module._validate_ip("2001:db8::1\n", ipv6=True) == "2001:db8::1"
+    assert (
+        ip_module._validate_ip("2001:4860:4860::8888\n", ipv6=True)
+        == "2001:4860:4860::8888"
+    )
 
 
 def test_validate_ip_rejects_empty_body():
@@ -403,7 +406,7 @@ def test_get_ip_wrong_family_response_does_not_cache(mock_conn_cls):
     mock_conn = MagicMock()
     mock_response = MagicMock()
     mock_response.status = 200
-    mock_response.read.return_value = b"::1\n"
+    mock_response.read.return_value = b"2001:4860:4860::8888\n"
     mock_conn.getresponse.return_value = mock_response
     mock_conn_cls.return_value = mock_conn
 
@@ -435,6 +438,119 @@ def test_invalid_response_does_not_reset_failure_counter(mock_conn_cls):
 
 
 # --- Monotonic clock ---
+
+
+# --- Public-IP filter ---
+
+
+def test_validate_ip_rejects_loopback_v4():
+    assert ip_module._validate_ip("127.0.0.1", ipv6=False) is None
+
+
+def test_validate_ip_rejects_loopback_v6():
+    assert ip_module._validate_ip("::1", ipv6=True) is None
+
+
+def test_validate_ip_rejects_rfc1918_private():
+    assert ip_module._validate_ip("10.0.0.1", ipv6=False) is None
+    assert ip_module._validate_ip("172.16.0.1", ipv6=False) is None
+    assert ip_module._validate_ip("192.168.1.1", ipv6=False) is None
+
+
+def test_validate_ip_rejects_cgnat():
+    """CGNAT (100.64.0.0/10) is private per RFC 6598."""
+    assert ip_module._validate_ip("100.64.0.1", ipv6=False) is None
+
+
+def test_validate_ip_rejects_link_local_v4():
+    assert ip_module._validate_ip("169.254.1.1", ipv6=False) is None
+
+
+def test_validate_ip_rejects_link_local_v6():
+    assert ip_module._validate_ip("fe80::1", ipv6=True) is None
+
+
+def test_validate_ip_rejects_ipv6_unique_local():
+    """fc00::/7 ULA is private."""
+    assert ip_module._validate_ip("fc00::1", ipv6=True) is None
+
+
+def test_validate_ip_rejects_multicast():
+    assert ip_module._validate_ip("224.0.0.1", ipv6=False) is None
+
+
+def test_validate_ip_rejects_unspecified():
+    assert ip_module._validate_ip("0.0.0.0", ipv6=False) is None
+    assert ip_module._validate_ip("::", ipv6=True) is None
+
+
+def test_validate_ip_rejects_ipv4_mapped_ipv6():
+    """::ffff:1.2.3.4 is an IPv4 in v6 clothing; reject when v6 was requested."""
+    assert ip_module._validate_ip("::ffff:1.2.3.4", ipv6=True) is None
+
+
+def test_validate_ip_accepts_real_public_v4():
+    assert ip_module._validate_ip("1.1.1.1", ipv6=False) == "1.1.1.1"
+    assert ip_module._validate_ip("8.8.8.8", ipv6=False) == "8.8.8.8"
+
+
+def test_validate_ip_accepts_real_public_v6():
+    assert (
+        ip_module._validate_ip("2001:4860:4860::8888", ipv6=True)
+        == "2001:4860:4860::8888"
+    )
+
+
+# --- Body read cap ---
+
+
+@patch("fivenines_agent.ip.CustomHTTPSConnection")
+def test_response_read_is_size_capped(mock_conn_cls):
+    """response.read() must be called with a byte cap, not unbounded."""
+    _reset_caches()
+    mock_conn = MagicMock()
+    mock_response = MagicMock()
+    mock_response.status = 200
+    mock_response.read.return_value = b"1.2.3.4\n"
+    mock_conn.getresponse.return_value = mock_response
+    mock_conn_cls.return_value = mock_conn
+
+    get_ip(ipv6=False)
+
+    # Verify the read was bounded; no call should be read() with no args.
+    for call in mock_response.read.call_args_list:
+        args, kwargs = call
+        assert (
+            len(args) == 1 or "amt" in kwargs or "size" in kwargs
+        ), "response.read() must be called with a size limit"
+        size = args[0] if args else (kwargs.get("amt") or kwargs.get("size"))
+        assert size <= 1024, f"read cap is too generous: {size}"
+
+
+@patch("fivenines_agent.ip.CustomHTTPSConnection")
+def test_oversized_response_body_is_rejected(mock_conn_cls):
+    """A multi-megabyte body cannot be cached. Read is capped, validation rejects garbage."""
+    _reset_caches()
+    mock_conn = MagicMock()
+    mock_response = MagicMock()
+    mock_response.status = 200
+    # Even if the upstream sends a huge body, response.read(N) returns at most N bytes.
+    # Simulate by returning the capped slice.
+
+    def capped_read(size=None):
+        full = b"X" * (10 * 1024 * 1024) + b"1.2.3.4"
+        return full[: size if size else len(full)]
+
+    mock_response.read.side_effect = capped_read
+    mock_conn.getresponse.return_value = mock_response
+    mock_conn_cls.return_value = mock_conn
+
+    assert get_ip(ipv6=False) is None
+    assert ip_module._ip_v4_cache["ip"] is None
+    assert ip_module._ip_v4_cache["failures"] == 1
+
+
+# --- Clock rollback ---
 
 
 @patch("fivenines_agent.ip.CustomHTTPSConnection")

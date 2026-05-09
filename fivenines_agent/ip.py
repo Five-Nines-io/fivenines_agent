@@ -40,8 +40,30 @@ def _negative_backoff(failures):
     return NEGATIVE_BACKOFF_SCHEDULE[idx]
 
 
+def _is_public_ip(parsed):
+    """True if the address is a globally routable public IP.
+
+    Rejects loopback, private (RFC1918 / ULA / CGNAT), link-local, multicast,
+    reserved, unspecified, and IPv4-mapped IPv6 addresses. ip.fivenines.io
+    returning any of these means the upstream is misconfigured (or hostile);
+    we should not cache that as the host's "public IP".
+
+    Uses ipaddress.is_global as the primary discriminator (it correctly
+    flags CGNAT, ULA, loopback, doc-prefix, etc as non-global) and adds
+    explicit multicast and IPv4-mapped-IPv6 rejections that is_global
+    misses.
+    """
+    if not parsed.is_global:
+        return False
+    if parsed.is_multicast:
+        return False
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed.ipv4_mapped is not None:
+        return False
+    return True
+
+
 def _validate_ip(body, ipv6):
-    """Return body if it parses as the expected family; otherwise None."""
+    """Return body if it parses as a public address of the expected family."""
     if not body:
         return None
     candidate = body.strip()[:MAX_RESPONSE_BODY]
@@ -51,6 +73,8 @@ def _validate_ip(body, ipv6):
         return None
     expected_version = 6 if ipv6 else 4
     if parsed.version != expected_version:
+        return None
+    if not _is_public_ip(parsed):
         return None
     return candidate
 
@@ -125,7 +149,10 @@ def get_ip(ipv6=False):
         conn = CustomHTTPSConnection("ip.fivenines.io", ipv6=ipv6, context=ssl_context)
         conn.request("GET", "")
         response = conn.getresponse()
-        body = response.read().decode("utf-8")
+        # Cap the read so a misbehaving (or hostile) upstream cannot force
+        # unbounded memory use or log amplification. Validation will reject
+        # anything longer than MAX_RESPONSE_BODY anyway.
+        body = response.read(MAX_RESPONSE_BODY * 4).decode("utf-8", errors="ignore")
 
         log(f"Status: {response.status}, Reason: {response.reason}", "debug")
         log(f"Response body: {body}", "debug")
