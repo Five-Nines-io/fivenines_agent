@@ -104,16 +104,26 @@ def test_get_ip_cache_expired(mock_conn_cls):
 
 @patch("fivenines_agent.ip.CustomHTTPSConnection")
 def test_get_ip_http_error(mock_conn_cls):
+    """A non-200 response returns None and emits an error log so the failure
+    surfaces in telemetry on the FIRST uncached attempt, not just after the
+    second consecutive failure."""
     _reset_caches()
     mock_conn = MagicMock()
     mock_response = MagicMock()
-    mock_response.status = 500
+    mock_response.status = 503
+    mock_response.reason = "Service Unavailable"
     mock_response.read.return_value = b"error"
     mock_conn.getresponse.return_value = mock_response
     mock_conn_cls.return_value = mock_conn
 
-    result = get_ip(ipv6=False)
+    with patch("fivenines_agent.ip.log") as mock_log:
+        result = get_ip(ipv6=False)
+
     assert result is None
+    error_logs = [c for c in mock_log.call_args_list if c.args[1] == "error"]
+    assert len(error_logs) == 1
+    assert "503" in error_logs[0].args[0]
+    assert "Service Unavailable" in error_logs[0].args[0]
 
 
 @patch("fivenines_agent.ip.CustomHTTPSConnection")

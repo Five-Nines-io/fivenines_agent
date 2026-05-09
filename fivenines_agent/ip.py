@@ -211,6 +211,13 @@ def get_ip(ipv6=False):
             cache["failures"] = 0
             return ip
 
+        # Non-200 responses (503, 429, 404, etc) need to surface in telemetry
+        # too. Without this the first uncached failure looks like a clean
+        # sample with no errors attached.
+        log(
+            f"ip.fivenines.io returned HTTP {response.status} {response.reason}",
+            "error",
+        )
         _record_failure(cache)
         return None
     except ConnectionError as e:
