@@ -127,6 +127,59 @@ def test_get_ip_http_error(mock_conn_cls):
 
 
 @patch("fivenines_agent.ip.CustomHTTPSConnection")
+def test_http_error_with_html_body_logs_status_not_body(mock_conn_cls):
+    """A 503 with a large HTML error page must log HTTP status, not "oversized body".
+
+    Real-world error responses are commonly multi-KB HTML pages. The status
+    check must happen BEFORE body length/encoding checks so operators see
+    the actual HTTP failure, not a generic body validation error.
+    """
+    _reset_caches()
+    mock_conn = MagicMock()
+    mock_response = MagicMock()
+    mock_response.status = 503
+    mock_response.reason = "Service Unavailable"
+    mock_response.read.return_value = (
+        b"<html><body>Service Unavailable</body></html>" * 50
+    )
+    mock_conn.getresponse.return_value = mock_response
+    mock_conn_cls.return_value = mock_conn
+
+    with patch("fivenines_agent.ip.log") as mock_log:
+        result = get_ip(ipv6=False)
+
+    assert result is None
+    error_logs = [c for c in mock_log.call_args_list if c.args[1] == "error"]
+    assert len(error_logs) == 1
+    assert "503" in error_logs[0].args[0]
+    # The log must NOT be the generic "oversized body" or "non-UTF-8 body".
+    assert "oversized body" not in error_logs[0].args[0]
+    assert "non-UTF-8" not in error_logs[0].args[0]
+
+
+@patch("fivenines_agent.ip.CustomHTTPSConnection")
+def test_http_error_with_non_utf8_body_logs_status_not_body(mock_conn_cls):
+    """A 502 with a non-UTF-8 body must still log the HTTP status."""
+    _reset_caches()
+    mock_conn = MagicMock()
+    mock_response = MagicMock()
+    mock_response.status = 502
+    mock_response.reason = "Bad Gateway"
+    mock_response.read.return_value = b"\xff\xfe\xff garbage"
+    mock_conn.getresponse.return_value = mock_response
+    mock_conn_cls.return_value = mock_conn
+
+    with patch("fivenines_agent.ip.log") as mock_log:
+        result = get_ip(ipv6=False)
+
+    assert result is None
+    error_logs = [c for c in mock_log.call_args_list if c.args[1] == "error"]
+    assert len(error_logs) == 1
+    assert "502" in error_logs[0].args[0]
+    assert "non-UTF-8" not in error_logs[0].args[0]
+
+
+@patch("fivenines_agent.ip.CustomHTTPSConnection")
 def test_get_ip_connection_error(mock_conn_cls):
     _reset_caches()
     mock_conn_cls.return_value.request.side_effect = ConnectionError("refused")

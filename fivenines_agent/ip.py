@@ -170,10 +170,24 @@ def get_ip(ipv6=False):
         conn = CustomHTTPSConnection("ip.fivenines.io", ipv6=ipv6, context=ssl_context)
         conn.request("GET", "")
         response = conn.getresponse()
-        # Cap the read so a misbehaving (or hostile) upstream cannot force
-        # unbounded memory use or log amplification. Reading past the cap is
-        # how we detect oversized bodies (otherwise a 1MB body would just look
-        # like a 64-byte body via silent truncation).
+        log(f"Status: {response.status}, Reason: {response.reason}", "debug")
+
+        # Status check FIRST so non-200 responses (503/429/404 with HTML
+        # error pages, often >64 bytes and possibly non-UTF-8) surface as
+        # the actual HTTP status rather than as a generic "oversized body"
+        # or "non-UTF-8 body" error.
+        if response.status != 200:
+            log(
+                f"ip.fivenines.io returned HTTP {response.status} {response.reason}",
+                "error",
+            )
+            _record_failure(cache)
+            return None
+
+        # 200: validate the body. Cap the read so a misbehaving upstream
+        # cannot force unbounded memory use or log amplification. Reading
+        # past the cap is how we detect oversized bodies (otherwise a 1MB
+        # body would just look like a 64-byte body via silent truncation).
         raw = response.read(MAX_RESPONSE_BODY * 4)
         if len(raw) > MAX_RESPONSE_BODY:
             log(
@@ -193,33 +207,21 @@ def get_ip(ipv6=False):
             _record_failure(cache)
             return None
 
-        log(f"Status: {response.status}, Reason: {response.reason}", "debug")
         log(f"Response body: {body}", "debug")
 
-        if response.status == 200:
-            ip = _validate_ip(body, ipv6=ipv6)
-            if ip is None:
-                family = "IPv6" if ipv6 else "IPv4"
-                log(
-                    f"ip.fivenines.io returned non-{family} body: {body[:64]!r}",
-                    "error",
-                )
-                _record_failure(cache)
-                return None
-            cache["timestamp"] = _now()
-            cache["ip"] = ip
-            cache["failures"] = 0
-            return ip
-
-        # Non-200 responses (503, 429, 404, etc) need to surface in telemetry
-        # too. Without this the first uncached failure looks like a clean
-        # sample with no errors attached.
-        log(
-            f"ip.fivenines.io returned HTTP {response.status} {response.reason}",
-            "error",
-        )
-        _record_failure(cache)
-        return None
+        ip = _validate_ip(body, ipv6=ipv6)
+        if ip is None:
+            family = "IPv6" if ipv6 else "IPv4"
+            log(
+                f"ip.fivenines.io returned non-{family} body: {body[:64]!r}",
+                "error",
+            )
+            _record_failure(cache)
+            return None
+        cache["timestamp"] = _now()
+        cache["ip"] = ip
+        cache["failures"] = 0
+        return ip
     except ConnectionError as e:
         log(f"Unexpected error occurred: {e}", "error")
         _record_failure(cache)
