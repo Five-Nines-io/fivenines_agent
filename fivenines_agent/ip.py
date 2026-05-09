@@ -1,4 +1,5 @@
 import http.client
+import ipaddress
 import socket
 import ssl
 import sys
@@ -10,6 +11,8 @@ import certifi
 from fivenines_agent.debug import debug, log
 from fivenines_agent.dns_resolver import DNSResolver
 
+# Cache timestamps are monotonic seconds (not wall-clock) so suspend, NTP
+# rollback, or VM restore cannot suppress retries past the stated cap.
 _ip_v4_cache = {"timestamp": 0, "ip": None, "failures": 0}
 _ip_v6_cache = {"timestamp": 0, "ip": None, "failures": 0}
 
@@ -24,6 +27,10 @@ POSITIVE_CACHE_TTL = 60
 # (no IPv6, no driver) stops spamming the journal. See issue #42.
 NEGATIVE_BACKOFF_SCHEDULE = (60, 120, 240, 300)
 
+# Maximum length of a response body we will attempt to parse as an IP.
+# IPv6 addresses fit in ~45 chars; anything longer is HTML or junk.
+MAX_RESPONSE_BODY = 64
+
 
 def _negative_backoff(failures):
     """How long to suppress retries given the consecutive failure count."""
@@ -31,6 +38,21 @@ def _negative_backoff(failures):
         return 0
     idx = min(failures - 2, len(NEGATIVE_BACKOFF_SCHEDULE) - 1)
     return NEGATIVE_BACKOFF_SCHEDULE[idx]
+
+
+def _validate_ip(body, ipv6):
+    """Return body if it parses as the expected family; otherwise None."""
+    if not body:
+        return None
+    candidate = body.strip()[:MAX_RESPONSE_BODY]
+    try:
+        parsed = ipaddress.ip_address(candidate)
+    except ValueError:
+        return None
+    expected_version = 6 if ipv6 else 4
+    if parsed.version != expected_version:
+        return None
+    return candidate
 
 
 class CustomHTTPSConnection(http.client.HTTPSConnection):
@@ -73,17 +95,17 @@ class CustomHTTPSConnection(http.client.HTTPSConnection):
         )
 
 
-def _record_failure(cache, now):
-    cache["timestamp"] = now
+def _record_failure(cache):
+    """Stamp the cache as failed at the current monotonic time."""
+    cache["timestamp"] = time.monotonic()
     cache["ip"] = None
     cache["failures"] = cache.get("failures", 0) + 1
 
 
 @debug("get_ip")
 def get_ip(ipv6=False):
-    now = time.time()
     cache = _ip_v6_cache if ipv6 else _ip_v4_cache
-    age = now - cache["timestamp"]
+    age = time.monotonic() - cache["timestamp"]
 
     # Positive cache: short TTL, return the previously-fetched IP.
     if cache["ip"] is not None and age < POSITIVE_CACHE_TTL:
@@ -109,23 +131,31 @@ def get_ip(ipv6=False):
         log(f"Response body: {body}", "debug")
 
         if response.status == 200:
-            ip = body.strip()
-            cache["timestamp"] = now
+            ip = _validate_ip(body, ipv6=ipv6)
+            if ip is None:
+                family = "IPv6" if ipv6 else "IPv4"
+                log(
+                    f"ip.fivenines.io returned non-{family} body: {body[:64]!r}",
+                    "error",
+                )
+                _record_failure(cache)
+                return None
+            cache["timestamp"] = time.monotonic()
             cache["ip"] = ip
             cache["failures"] = 0
             return ip
 
-        _record_failure(cache, now)
+        _record_failure(cache)
         return None
     except ConnectionError as e:
         log(f"Unexpected error occurred: {e}", "error")
-        _record_failure(cache, now)
+        _record_failure(cache)
         return None
 
     except Exception as e:
         log(f"Unexpected error occurred: {e}", "error")
         traceback.print_exc(file=sys.stderr)
-        _record_failure(cache, now)
+        _record_failure(cache)
         return None
     finally:
         if conn:
