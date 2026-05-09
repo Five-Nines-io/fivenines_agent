@@ -11,10 +11,21 @@ import certifi
 from fivenines_agent.debug import debug, log
 from fivenines_agent.dns_resolver import DNSResolver
 
-# Cache timestamps are monotonic seconds (not wall-clock) so suspend, NTP
-# rollback, or VM restore cannot suppress retries past the stated cap.
+# Cache timestamps use CLOCK_BOOTTIME on Linux (counts suspended time) so
+# NTP rollback, suspend, and VM restore all advance the clock as expected.
+# Falls back to time.monotonic() on platforms without CLOCK_BOOTTIME, which
+# is correct for NTP rollback and VM restore but not for suspend.
 _ip_v4_cache = {"timestamp": 0, "ip": None, "failures": 0}
 _ip_v6_cache = {"timestamp": 0, "ip": None, "failures": 0}
+
+
+def _now():
+    """Monotonic seconds; counts suspend on Linux via CLOCK_BOOTTIME."""
+    try:
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+    except (AttributeError, OSError):
+        return time.monotonic()
+
 
 # Positive cache: short TTL, just deduplicates calls within a single tick.
 POSITIVE_CACHE_TTL = 60
@@ -131,7 +142,7 @@ class CustomHTTPSConnection(http.client.HTTPSConnection):
 
 def _record_failure(cache):
     """Stamp the cache as failed at the current monotonic time."""
-    cache["timestamp"] = time.monotonic()
+    cache["timestamp"] = _now()
     cache["ip"] = None
     cache["failures"] = cache.get("failures", 0) + 1
 
@@ -139,7 +150,7 @@ def _record_failure(cache):
 @debug("get_ip")
 def get_ip(ipv6=False):
     cache = _ip_v6_cache if ipv6 else _ip_v4_cache
-    age = time.monotonic() - cache["timestamp"]
+    age = _now() - cache["timestamp"]
 
     # Positive cache: short TTL, return the previously-fetched IP.
     if cache["ip"] is not None and age < POSITIVE_CACHE_TTL:
@@ -195,7 +206,7 @@ def get_ip(ipv6=False):
                 )
                 _record_failure(cache)
                 return None
-            cache["timestamp"] = time.monotonic()
+            cache["timestamp"] = _now()
             cache["ip"] = ip
             cache["failures"] = 0
             return ip

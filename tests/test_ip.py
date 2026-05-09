@@ -96,7 +96,7 @@ def test_get_ip_cache_expired(mock_conn_cls):
     # First call populates the cache
     get_ip(ipv6=False)
     # Expire the cache
-    ip_module._ip_v4_cache["timestamp"] = time.monotonic() - 120
+    ip_module._ip_v4_cache["timestamp"] = ip_module._now() - 120
 
     get_ip(ipv6=False)
     assert mock_conn_cls.call_count == 2
@@ -170,6 +170,28 @@ def test_second_consecutive_failure_caches_for_60s(mock_conn_cls):
     assert [c for c in mock_log.call_args_list if c.args[1] == "error"] == []
 
 
+def test_now_returns_monotonic_seconds():
+    """_now() returns a monotonically-increasing float (seconds since some fixed point)."""
+    a = ip_module._now()
+    b = ip_module._now()
+    assert isinstance(a, float)
+    assert b >= a
+
+
+def test_now_falls_back_when_clock_boottime_attribute_missing():
+    """On platforms without CLOCK_BOOTTIME, _now() falls back to time.monotonic()."""
+    with patch.object(time, "clock_gettime", side_effect=AttributeError):
+        result = ip_module._now()
+    assert isinstance(result, float)
+
+
+def test_now_falls_back_when_clock_boottime_syscall_unsupported():
+    """On platforms where clock_gettime(CLOCK_BOOTTIME) fails, _now() falls back."""
+    with patch.object(time, "clock_gettime", side_effect=OSError("EINVAL")):
+        result = ip_module._now()
+    assert isinstance(result, float)
+
+
 def test_negative_backoff_schedule():
     """The backoff schedule starts at 0, then 60, 120, 240, 300, capped."""
     assert ip_module._negative_backoff(0) == 0
@@ -194,13 +216,13 @@ def test_backoff_grows_with_consecutive_failures(mock_conn_cls):
     assert ip_module._ip_v6_cache["failures"] == 2
 
     # Skip past the 60s window and retry: 3rd failure caches for 120s.
-    ip_module._ip_v6_cache["timestamp"] = time.monotonic() - 70
+    ip_module._ip_v6_cache["timestamp"] = ip_module._now() - 70
     get_ip(ipv6=True)
     assert ip_module._ip_v6_cache["failures"] == 3
     assert ip_module._negative_backoff(3) == 120
 
     # Skip past the 120s window: 4th caches for 240s.
-    ip_module._ip_v6_cache["timestamp"] = time.monotonic() - 130
+    ip_module._ip_v6_cache["timestamp"] = ip_module._now() - 130
     get_ip(ipv6=True)
     assert ip_module._ip_v6_cache["failures"] == 4
     assert ip_module._negative_backoff(4) == 240
@@ -217,7 +239,7 @@ def test_success_resets_failure_counter(mock_conn_cls):
     assert ip_module._ip_v4_cache["failures"] == 2
 
     # Skip past the cache window and switch the mock to success.
-    ip_module._ip_v4_cache["timestamp"] = time.monotonic() - 70
+    ip_module._ip_v4_cache["timestamp"] = ip_module._now() - 70
     mock_conn_cls.return_value.request.side_effect = None
     mock_response = MagicMock()
     mock_response.status = 200
@@ -291,7 +313,7 @@ def test_recovery_after_long_failure_streak(mock_conn_cls):
     # Force a long streak.
     for _ in range(5):
         get_ip(ipv6=True)
-        ip_module._ip_v6_cache["timestamp"] = time.monotonic() - 400
+        ip_module._ip_v6_cache["timestamp"] = ip_module._now() - 400
 
     assert ip_module._ip_v6_cache["failures"] >= 2
 
@@ -301,7 +323,7 @@ def test_recovery_after_long_failure_streak(mock_conn_cls):
     mock_response.status = 200
     mock_response.read.return_value = b"2001:4860:4860::8888\n"
     mock_conn_cls.return_value.getresponse.return_value = mock_response
-    ip_module._ip_v6_cache["timestamp"] = time.monotonic() - 400
+    ip_module._ip_v6_cache["timestamp"] = ip_module._now() - 400
 
     assert get_ip(ipv6=True) == "2001:4860:4860::8888"
     assert ip_module._ip_v6_cache["failures"] == 0
@@ -651,7 +673,7 @@ def test_clock_rollback_does_not_extend_suppression(mock_conn_cls):
 
     # Force the timestamp >300s in the past on the monotonic clock. Any
     # cap-respecting implementation should attempt again.
-    ip_module._ip_v6_cache["timestamp"] = time.monotonic() - 1000
+    ip_module._ip_v6_cache["timestamp"] = ip_module._now() - 1000
 
     get_ip(ipv6=True)
     assert mock_conn_cls.call_count == attempts_so_far + 1
