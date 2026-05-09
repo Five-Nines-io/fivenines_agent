@@ -73,6 +73,7 @@ class Agent:
             "uname": platform.uname()._asdict(),
             "boot_time": psutil.boot_time(),
             "capabilities": self.permissions.get_all(),
+            "capability_reasons": self.permissions.get_reasons(),
             "user_context": get_user_context(CONFIG_DIR),
         }
 
@@ -178,9 +179,11 @@ class Agent:
             refresh_permissions_event.clear()
             self.permissions.force_refresh()
             self.static_data["capabilities"] = self.permissions.get_all()
+            self.static_data["capability_reasons"] = self.permissions.get_reasons()
             print_capabilities_banner()
         elif self.permissions.refresh_if_needed():
             self.static_data["capabilities"] = self.permissions.get_all()
+            self.static_data["capability_reasons"] = self.permissions.get_reasons()
 
     def _wait_interval(self, running_time):
         log(f"Running time: {running_time:.3f}s", "debug")
