@@ -65,11 +65,14 @@ def _is_public_ip(parsed):
 def _validate_ip(body, ipv6):
     """Return body if it parses as a public address of the expected family.
 
-    Length is checked on the raw body BEFORE stripping, so a hostile or
-    broken upstream cannot smuggle a valid-looking IP inside whitespace
-    padding ("1.2.3.4" + " " * 500 strips to a valid IP).
+    Length is checked on the encoded BYTE length (not character count) so
+    multibyte Unicode whitespace cannot smuggle a valid-looking IP through
+    .strip() ("1.2.3.4" + " " * 57 is 64 chars but 178 bytes). The
+    check happens before .strip() so trailing/leading padding is also caught.
     """
-    if not body or len(body) > MAX_RESPONSE_BODY:
+    if not body:
+        return None
+    if len(body.encode("utf-8", errors="replace")) > MAX_RESPONSE_BODY:
         return None
     candidate = body.strip()
     if not candidate:
@@ -157,9 +160,18 @@ def get_ip(ipv6=False):
         conn.request("GET", "")
         response = conn.getresponse()
         # Cap the read so a misbehaving (or hostile) upstream cannot force
-        # unbounded memory use or log amplification. Strict UTF-8 decode so
-        # non-UTF-8 bytes are not silently dropped to forge a valid-looking IP.
+        # unbounded memory use or log amplification. Reading past the cap is
+        # how we detect oversized bodies (otherwise a 1MB body would just look
+        # like a 64-byte body via silent truncation).
         raw = response.read(MAX_RESPONSE_BODY * 4)
+        if len(raw) > MAX_RESPONSE_BODY:
+            log(
+                f"ip.fivenines.io returned oversized body ({len(raw)} bytes)",
+                "error",
+            )
+            _record_failure(cache)
+            return None
+        # Strict UTF-8 decode so non-UTF-8 bytes are not silently dropped.
         try:
             body = raw.decode("utf-8")
         except UnicodeDecodeError:

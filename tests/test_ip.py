@@ -393,6 +393,41 @@ def test_validate_ip_rejects_leading_whitespace_padding():
     assert ip_module._validate_ip(body, ipv6=False) is None
 
 
+def test_validate_ip_rejects_multibyte_whitespace_padding():
+    """Multibyte Unicode whitespace counts as 1 char but 3+ bytes.
+
+    `"1.2.3.4" + "\\u2003" * 57` is 64 chars (under the char-cap) but 178
+    bytes (over the byte-cap). str.strip() removes U+2003 EM SPACE, so the
+    naive char-length check would let this through.
+    """
+    body = "1.2.3.4" + " " * 57
+    assert len(body) == 64  # passes char count
+    assert len(body.encode("utf-8")) > 64  # fails byte count
+    assert ip_module._validate_ip(body, ipv6=False) is None
+
+
+@patch("fivenines_agent.ip.CustomHTTPSConnection")
+def test_get_ip_rejects_oversized_response_at_caller(mock_conn_cls):
+    """The caller must reject oversized raw bodies before decode/validate."""
+    _reset_caches()
+    mock_conn = MagicMock()
+    mock_response = MagicMock()
+    mock_response.status = 200
+    # 200 bytes is over MAX_RESPONSE_BODY (64) but under the read cap (256).
+    mock_response.read.return_value = b"1.2.3.4" + b" " * 200
+    mock_conn.getresponse.return_value = mock_response
+    mock_conn_cls.return_value = mock_conn
+
+    with patch("fivenines_agent.ip.log") as mock_log:
+        result = get_ip(ipv6=False)
+
+    assert result is None
+    assert ip_module._ip_v4_cache["ip"] is None
+    assert ip_module._ip_v4_cache["failures"] == 1
+    error_logs = [c for c in mock_log.call_args_list if c.args[1] == "error"]
+    assert any("oversized body" in c.args[0] for c in error_logs)
+
+
 @patch("fivenines_agent.ip.CustomHTTPSConnection")
 def test_get_ip_rejects_non_utf8_body(mock_conn_cls):
     """Non-UTF-8 bytes are surfaced as failures, not silently dropped.
