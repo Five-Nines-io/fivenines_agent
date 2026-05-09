@@ -10,6 +10,10 @@ try:
 except ImportError:
     HAS_NVML = False
 
+# Process-wide flag: ensures the "pynvml not installed" notice is emitted
+# only once per agent process, not on every collection tick.
+_import_logged = False
+
 
 def _safe(fn, *args):
     """Call an NVML function, returning None on any error."""
@@ -42,7 +46,11 @@ def _collect_processes(handle):
 @debug("nvidia_gpu")
 def gpu_metrics():
     """Collect metrics for all NVIDIA GPUs."""
+    global _import_logged
     if not HAS_NVML:
+        if not _import_logged:
+            _import_logged = True
+            log("pynvml not installed; NVIDIA GPU collection disabled", "info")
         return None
 
     try:
@@ -98,8 +106,8 @@ def gpu_metrics():
                         "processes": _collect_processes(handle),
                     }
                 )
-            except Exception:
-                log(f"gpu: error collecting GPU {i}", "error")
+            except Exception as e:
+                log(f"gpu: error collecting GPU {i}: {e!r}", "error")
         return gpus
     except Exception:
         return None

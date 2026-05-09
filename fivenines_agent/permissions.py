@@ -18,6 +18,25 @@ REPROBE_INTERVAL = 300
 # Max chars for stdout/stderr in debug logs
 DEBUG_OUTPUT_LIMIT = 500
 
+# Short, operator-friendly hint for each capability when it is unavailable.
+# Used in both the startup banner and the info-level log emitted on initial
+# probe / state flips. The deeper diagnostic (specific exception, missing
+# binary, etc.) is in each probe method's debug-level log.
+CAPABILITY_HINTS = {
+    "smart_storage": "requires sudo smartctl",
+    "raid_storage": "requires sudo mdadm",
+    "docker": "requires docker group",
+    "qemu": "requires libvirt group",
+    "proxmox": "requires Proxmox VE host",
+    "fail2ban": "requires sudo fail2ban-client",
+    "packages": "requires dpkg-query, rpm, apk, pacman, or synopkg",
+    "zfs": "requires zfs permissions",
+    "nvidia_gpu": "requires NVIDIA driver",
+    "temperatures": "no accessible sensors",
+    "fans": "no accessible sensors",
+    "snmp": "requires net-snmp",
+}
+
 
 class PermissionProbe:
     """
@@ -71,15 +90,32 @@ class PermissionProbe:
             "snmp": self._has_snmpget(),
         }
 
-        # Log any capability changes (only after first probe)
-        if old_capabilities:
+        if not old_capabilities:
+            # Initial probe: surface unavailable capabilities + reason at info
+            # level so operators see WHY a capability is missing without having
+            # to drop to LOG_LEVEL=debug. The detailed exception, if any, is
+            # already in the probe method's debug log.
+            for cap, available in self.capabilities.items():
+                if available:
+                    continue
+                hint = CAPABILITY_HINTS.get(cap)
+                if hint:
+                    log(f"Capability '{cap}' unavailable: {hint}", "info")
+        else:
+            # Subsequent probes: log only state flips, augmenting unavailability
+            # transitions with the same hint operators saw at startup.
             for cap, available in self.capabilities.items():
                 old_value = old_capabilities.get(cap)
-                if old_value is not None and old_value != available:
-                    if available:
-                        log(f"Capability '{cap}' is now AVAILABLE", "info")
-                    else:
-                        log(f"Capability '{cap}' is now UNAVAILABLE", "info")
+                if old_value is None or old_value == available:
+                    continue
+                if available:
+                    log(f"Capability '{cap}' is now AVAILABLE", "info")
+                else:
+                    hint = CAPABILITY_HINTS.get(cap)
+                    msg = f"Capability '{cap}' is now UNAVAILABLE"
+                    if hint:
+                        msg += f": {hint}"
+                    log(msg, "info")
 
         return self.capabilities
 
@@ -434,31 +470,9 @@ def print_capabilities_banner():
             icon = "[+]" if status else "[-]"
             name = cap.replace("_", " ").title()
 
-            # Add hints for unavailable features
             hint = ""
-            if not status:
-                if cap == "smart_storage":
-                    hint = " (requires: sudo smartctl)"
-                elif cap == "raid_storage":
-                    hint = " (requires: sudo mdadm)"
-                elif cap == "docker":
-                    hint = " (requires: docker group)"
-                elif cap == "qemu":
-                    hint = " (requires: libvirt group)"
-                elif cap == "proxmox":
-                    hint = " (requires: Proxmox VE host)"
-                elif cap == "fail2ban":
-                    hint = " (requires: sudo fail2ban-client)"
-                elif cap == "packages":
-                    hint = " (requires: dpkg-query, rpm, apk, pacman, or synopkg)"
-                elif cap == "zfs":
-                    hint = " (requires: zfs permissions)"
-                elif cap == "nvidia_gpu":
-                    hint = " (requires: NVIDIA driver)"
-                elif cap in ["temperatures", "fans"]:
-                    hint = " (no accessible sensors)"
-                elif cap == "snmp":
-                    hint = " (requires: net-snmp)"
+            if not status and cap in CAPABILITY_HINTS:
+                hint = f" ({CAPABILITY_HINTS[cap]})"
 
             print(f"    {icon} {name}{hint}")
         print("")
