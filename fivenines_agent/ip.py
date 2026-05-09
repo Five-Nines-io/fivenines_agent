@@ -63,10 +63,17 @@ def _is_public_ip(parsed):
 
 
 def _validate_ip(body, ipv6):
-    """Return body if it parses as a public address of the expected family."""
-    if not body:
+    """Return body if it parses as a public address of the expected family.
+
+    Length is checked on the raw body BEFORE stripping, so a hostile or
+    broken upstream cannot smuggle a valid-looking IP inside whitespace
+    padding ("1.2.3.4" + " " * 500 strips to a valid IP).
+    """
+    if not body or len(body) > MAX_RESPONSE_BODY:
         return None
-    candidate = body.strip()[:MAX_RESPONSE_BODY]
+    candidate = body.strip()
+    if not candidate:
+        return None
     try:
         parsed = ipaddress.ip_address(candidate)
     except ValueError:
@@ -150,9 +157,18 @@ def get_ip(ipv6=False):
         conn.request("GET", "")
         response = conn.getresponse()
         # Cap the read so a misbehaving (or hostile) upstream cannot force
-        # unbounded memory use or log amplification. Validation will reject
-        # anything longer than MAX_RESPONSE_BODY anyway.
-        body = response.read(MAX_RESPONSE_BODY * 4).decode("utf-8", errors="ignore")
+        # unbounded memory use or log amplification. Strict UTF-8 decode so
+        # non-UTF-8 bytes are not silently dropped to forge a valid-looking IP.
+        raw = response.read(MAX_RESPONSE_BODY * 4)
+        try:
+            body = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            log(
+                f"ip.fivenines.io returned non-UTF-8 body ({len(raw)} bytes)",
+                "error",
+            )
+            _record_failure(cache)
+            return None
 
         log(f"Status: {response.status}, Reason: {response.reason}", "debug")
         log(f"Response body: {body}", "debug")

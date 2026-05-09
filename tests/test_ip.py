@@ -377,6 +377,48 @@ def test_validate_ip_rejects_oversized_body():
     assert ip_module._validate_ip(body, ipv6=False) is None
 
 
+def test_validate_ip_rejects_whitespace_padded_oversized_body():
+    """A valid IP padded with 500 spaces of whitespace is still rejected.
+
+    The raw body length check must happen BEFORE stripping; otherwise
+    body.strip() reduces the input to a valid IP and the cap is bypassed.
+    """
+    body = "1.2.3.4" + " " * 500
+    assert ip_module._validate_ip(body, ipv6=False) is None
+
+
+def test_validate_ip_rejects_leading_whitespace_padding():
+    """Same hole, leading whitespace edition."""
+    body = " " * 500 + "1.2.3.4"
+    assert ip_module._validate_ip(body, ipv6=False) is None
+
+
+@patch("fivenines_agent.ip.CustomHTTPSConnection")
+def test_get_ip_rejects_non_utf8_body(mock_conn_cls):
+    """Non-UTF-8 bytes are surfaced as failures, not silently dropped.
+
+    `b'1.2.3.4\\xff'.decode('utf-8', errors='ignore')` would yield '1.2.3.4'
+    and look like a valid IP. The strict decode + explicit error path here
+    is what stops a hostile upstream from smuggling that.
+    """
+    _reset_caches()
+    mock_conn = MagicMock()
+    mock_response = MagicMock()
+    mock_response.status = 200
+    mock_response.read.return_value = b"1.2.3.4\xff"
+    mock_conn.getresponse.return_value = mock_response
+    mock_conn_cls.return_value = mock_conn
+
+    with patch("fivenines_agent.ip.log") as mock_log:
+        result = get_ip(ipv6=False)
+
+    assert result is None
+    assert ip_module._ip_v4_cache["ip"] is None
+    assert ip_module._ip_v4_cache["failures"] == 1
+    error_logs = [c for c in mock_log.call_args_list if c.args[1] == "error"]
+    assert any("non-UTF-8" in c.args[0] for c in error_logs)
+
+
 @patch("fivenines_agent.ip.CustomHTTPSConnection")
 def test_get_ip_invalid_response_body_does_not_cache(mock_conn_cls):
     """A 200 response with garbage body counts as a failure, not a value to cache."""
