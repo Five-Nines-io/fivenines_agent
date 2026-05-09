@@ -163,9 +163,15 @@ class TestGpuWithNvml:
         nvml.nvmlDeviceGetHandleByIndex.side_effect = Exception("bad index")
 
         gpu_mod = self._import_gpu()
-        result = gpu_mod.gpu_metrics()
+        with patch.object(gpu_mod, "log") as mock_log:
+            result = gpu_mod.gpu_metrics()
 
         assert result == []
+        # Per-GPU error log must include the exception detail (B1).
+        error_calls = [c for c in mock_log.call_args_list if c.args[1] == "error"]
+        assert len(error_calls) == 1
+        assert "bad index" in error_calls[0].args[0]
+        assert "GPU 0" in error_calls[0].args[0]
 
     def test_nvml_shutdown_called_on_exception(self):
         """nvmlShutdown is called even when nvmlDeviceGetCount raises."""
@@ -302,3 +308,26 @@ class TestGpuWithoutNvml:
 
         assert gpu_mod.HAS_NVML is False
         assert gpu_mod.gpu_metrics() is None
+
+    def test_no_pynvml_logs_info_once(self):
+        """Missing pynvml emits a single info-level notice on first call."""
+        import builtins
+
+        real_import = builtins.__import__
+
+        def fake_import(name, *args, **kwargs):
+            if name == "pynvml":
+                raise ImportError("No module named 'pynvml'")
+            return real_import(name, *args, **kwargs)
+
+        with patch.object(builtins, "__import__", side_effect=fake_import):
+            gpu_mod = importlib.import_module("fivenines_agent.gpu")
+
+        with patch.object(gpu_mod, "log") as mock_log:
+            assert gpu_mod.gpu_metrics() is None
+            assert gpu_mod.gpu_metrics() is None
+            assert gpu_mod.gpu_metrics() is None
+
+        info_calls = [c for c in mock_log.call_args_list if c.args[1] == "info"]
+        assert len(info_calls) == 1
+        assert "pynvml not installed" in info_calls[0].args[0]
