@@ -400,7 +400,7 @@ def test_validate_ip_rejects_multibyte_whitespace_padding():
     bytes (over the byte-cap). str.strip() removes U+2003 EM SPACE, so the
     naive char-length check would let this through.
     """
-    body = "1.2.3.4" + " " * 57
+    body = "1.2.3.4" + "\u2003" * 57
     assert len(body) == 64  # passes char count
     assert len(body.encode("utf-8")) > 64  # fails byte count
     assert ip_module._validate_ip(body, ipv6=False) is None

@@ -67,7 +67,7 @@ def _validate_ip(body, ipv6):
 
     Length is checked on the encoded BYTE length (not character count) so
     multibyte Unicode whitespace cannot smuggle a valid-looking IP through
-    .strip() ("1.2.3.4" + " " * 57 is 64 chars but 178 bytes). The
+    .strip() ("1.2.3.4" + "\u2003" * 57 is 64 chars but 178 bytes). The
     check happens before .strip() so trailing/leading padding is also caught.
     """
     if not body:
