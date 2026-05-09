@@ -46,8 +46,32 @@ class PermissionProbe:
 
     def __init__(self):
         self.capabilities = {}
+        # Maps capability name -> short reason string for the most recent
+        # False result. Probe methods record their failure cause via
+        # _set_reason(); _probe() captures it into this dict and clears it
+        # when the capability flips back to True.
+        self._capability_reasons = {}
+        self._current_reason = None
         self._last_probe_time = 0
         self._probe_all()
+
+    def _set_reason(self, msg):
+        """Called by probe methods on a False-return path to record why."""
+        self._current_reason = msg
+
+    def _probe(self, cap_name, probe_callable, *args):
+        """Run a probe method and capture its failure reason if any.
+
+        Probes run sequentially in _probe_all, so the single-slot
+        _current_reason register is safe.
+        """
+        self._current_reason = None
+        result = probe_callable(*args)
+        if result:
+            self._capability_reasons.pop(cap_name, None)
+        elif self._current_reason:
+            self._capability_reasons[cap_name] = self._current_reason
+        return result
 
     def _probe_all(self):
         """Probe all capabilities and cache results."""
@@ -56,54 +80,51 @@ class PermissionProbe:
 
         self.capabilities = {
             # Core metrics - always available via /proc
-            "cpu": self._can_read("/proc/stat"),
-            "memory": self._can_read("/proc/meminfo"),
-            "load_average": self._can_read("/proc/loadavg"),
-            "io": self._can_read("/proc/diskstats"),
-            "network": self._can_read("/proc/net/dev"),
-            "partitions": self._can_read("/proc/mounts"),
-            "file_handles": self._can_read("/proc/sys/fs/file-nr"),
-            "ports": self._can_read("/proc/net/tcp"),
+            "cpu": self._probe("cpu", self._can_read, "/proc/stat"),
+            "memory": self._probe("memory", self._can_read, "/proc/meminfo"),
+            "load_average": self._probe("load_average", self._can_read, "/proc/loadavg"),
+            "io": self._probe("io", self._can_read, "/proc/diskstats"),
+            "network": self._probe("network", self._can_read, "/proc/net/dev"),
+            "partitions": self._probe("partitions", self._can_read, "/proc/mounts"),
+            "file_handles": self._probe("file_handles", self._can_read, "/proc/sys/fs/file-nr"),
+            "ports": self._probe("ports", self._can_read, "/proc/net/tcp"),
             # Processes - works but may have limited visibility
-            "processes": self._can_read("/proc/self/stat"),
+            "processes": self._probe("processes", self._can_read, "/proc/self/stat"),
             # Hardware sensors - may or may not work without root
-            "temperatures": self._can_access_hwmon(),
-            "fans": self._can_access_hwmon(),
+            "temperatures": self._probe("temperatures", self._can_access_hwmon),
+            "fans": self._probe("fans", self._can_access_hwmon),
             # NVIDIA GPU
-            "nvidia_gpu": self._can_access_gpu(),
+            "nvidia_gpu": self._probe("nvidia_gpu", self._can_access_gpu),
             # Storage requiring sudo
-            "smart_storage": self._can_run_sudo("smartctl", "--version"),
-            "raid_storage": self._can_run_sudo("mdadm", "--version"),
+            "smart_storage": self._probe("smart_storage", self._can_run_sudo, "smartctl", "--version"),
+            "raid_storage": self._probe("raid_storage", self._can_run_sudo, "mdadm", "--version"),
             # Security - requires sudo
-            "fail2ban": self._can_run_sudo("fail2ban-client", "status"),
+            "fail2ban": self._probe("fail2ban", self._can_run_sudo, "fail2ban-client", "status"),
             # ZFS - doesn't need sudo but needs permissions or delegation
-            "zfs": self._can_run_zfs(),
+            "zfs": self._probe("zfs", self._can_run_zfs),
             # Docker - needs docker group membership
-            "docker": self._can_access_docker(),
+            "docker": self._probe("docker", self._can_access_docker),
             # QEMU/libvirt - needs libvirt group membership
-            "qemu": self._can_access_libvirt(),
+            "qemu": self._probe("qemu", self._can_access_libvirt),
             # Proxmox VE - needs API access or local node
-            "proxmox": self._can_access_proxmox(),
+            "proxmox": self._probe("proxmox", self._can_access_proxmox),
             # Package listing - for security scanning
-            "packages": self._can_list_packages(),
+            "packages": self._probe("packages", self._can_list_packages),
             # SNMP polling - needs net-snmp CLI tools
-            "snmp": self._has_snmpget(),
+            "snmp": self._probe("snmp", self._has_snmpget),
         }
 
         if not old_capabilities:
-            # Initial probe: surface unavailable capabilities + reason at info
-            # level so operators see WHY a capability is missing without having
-            # to drop to LOG_LEVEL=debug. The detailed exception, if any, is
-            # already in the probe method's debug log.
+            # Initial probe: surface every unavailable capability at info level
+            # so operators see WHY at default LOG_LEVEL. Format:
+            #   Capability 'X' unavailable: <hint> (<probe-method reason>)
             for cap, available in self.capabilities.items():
                 if available:
                     continue
-                hint = CAPABILITY_HINTS.get(cap)
-                if hint:
-                    log(f"Capability '{cap}' unavailable: {hint}", "info")
+                log(self._format_unavailable(cap, "unavailable"), "info")
         else:
-            # Subsequent probes: log only state flips, augmenting unavailability
-            # transitions with the same hint operators saw at startup.
+            # Subsequent probes: log only state flips. Unavailability transitions
+            # carry the same hint+reason payload as the initial probe.
             for cap, available in self.capabilities.items():
                 old_value = old_capabilities.get(cap)
                 if old_value is None or old_value == available:
@@ -111,13 +132,20 @@ class PermissionProbe:
                 if available:
                     log(f"Capability '{cap}' is now AVAILABLE", "info")
                 else:
-                    hint = CAPABILITY_HINTS.get(cap)
-                    msg = f"Capability '{cap}' is now UNAVAILABLE"
-                    if hint:
-                        msg += f": {hint}"
-                    log(msg, "info")
+                    log(self._format_unavailable(cap, "is now UNAVAILABLE"), "info")
 
         return self.capabilities
+
+    def _format_unavailable(self, cap, verb):
+        """Build the operator-facing log line for an unavailable capability."""
+        msg = f"Capability '{cap}' {verb}"
+        hint = CAPABILITY_HINTS.get(cap)
+        if hint:
+            msg += f": {hint}"
+        reason = self._capability_reasons.get(cap)
+        if reason:
+            msg += f" ({reason})"
+        return msg
 
     def refresh_if_needed(self):
         """Re-probe capabilities if enough time has passed."""
@@ -139,6 +167,7 @@ class PermissionProbe:
             exists = os.path.exists(path)
             if not exists:
                 log(f"_can_read: '{path}' does not exist", "debug")
+                self._set_reason(f"{path} does not exist")
                 return False
 
             readable = os.access(path, os.R_OK)
@@ -146,9 +175,12 @@ class PermissionProbe:
                 f"_can_read: '{path}' -> {'READABLE' if readable else 'NOT READABLE'}",
                 "debug",
             )
+            if not readable:
+                self._set_reason(f"{path} is not readable")
             return readable
         except Exception as e:
             log(f"_can_read: '{path}' exception: {type(e).__name__}: {e}", "debug")
+            self._set_reason(f"{path}: {type(e).__name__}: {e}")
             return False
 
     def _can_run_sudo(self, cmd, *args):
@@ -162,6 +194,7 @@ class PermissionProbe:
 
         if not cmd_path:
             log(f"_can_run_sudo: '{cmd}' not found in PATH", "debug")
+            self._set_reason(f"{cmd} not found in PATH")
             return False
 
         log(f"_can_run_sudo: '{cmd}' found at {cmd_path}", "debug")
@@ -191,12 +224,17 @@ class PermissionProbe:
                 f"_can_run_sudo: '{cmd}' -> {'AVAILABLE' if success else 'UNAVAILABLE'}",
                 "debug",
             )
+            if not success:
+                detail = stderr.splitlines()[0] if stderr else f"returncode {result.returncode}"
+                self._set_reason(f"sudo -n {cmd}: {detail}")
             return success
         except subprocess.TimeoutExpired:
             log(f"_can_run_sudo: '{cmd}' timed out after 5s", "debug")
+            self._set_reason(f"sudo -n {cmd} timed out after 5s")
             return False
         except Exception as e:
             log(f"_can_run_sudo: '{cmd}' exception: {type(e).__name__}: {e}", "debug")
+            self._set_reason(f"sudo -n {cmd}: {type(e).__name__}: {e}")
             return False
 
     def _can_access_hwmon(self):
@@ -206,6 +244,7 @@ class PermissionProbe:
 
         if not os.path.exists(hwmon_path):
             log(f"_can_access_hwmon: {hwmon_path} does not exist", "debug")
+            self._set_reason(f"{hwmon_path} does not exist")
             return False
 
         try:
@@ -253,9 +292,11 @@ class PermissionProbe:
             log(
                 "_can_access_hwmon: -> UNAVAILABLE (no readable sensors found)", "debug"
             )
+            self._set_reason(f"no readable sensors under {hwmon_path}")
             return False
         except Exception as e:
             log(f"_can_access_hwmon: exception: {type(e).__name__}: {e}", "debug")
+            self._set_reason(f"{hwmon_path}: {type(e).__name__}: {e}")
             return False
 
     def _can_access_gpu(self):
@@ -264,12 +305,14 @@ class PermissionProbe:
             import pynvml
         except ImportError:
             log("_can_access_gpu: pynvml not installed", "debug")
+            self._set_reason("pynvml not installed")
             return False
 
         try:
             pynvml.nvmlInit()
         except Exception as e:
             log(f"_can_access_gpu: nvmlInit failed: {e}", "debug")
+            self._set_reason(f"nvmlInit failed: {e}")
             return False
 
         try:
@@ -280,9 +323,12 @@ class PermissionProbe:
                 f"{'AVAILABLE' if available else 'UNAVAILABLE'}",
                 "debug",
             )
+            if not available:
+                self._set_reason("0 GPUs detected")
             return available
         except Exception as e:
             log(f"_can_access_gpu: exception: {type(e).__name__}: {e}", "debug")
+            self._set_reason(f"{type(e).__name__}: {e}")
             return False
         finally:
             pynvml.nvmlShutdown()
@@ -292,6 +338,7 @@ class PermissionProbe:
         zpool_path = shutil.which("zpool")
         if not zpool_path:
             log("_can_run_zfs: 'zpool' not found in PATH", "debug")
+            self._set_reason("zpool not found in PATH")
             return False
 
         log(f"_can_run_zfs: 'zpool' found at {zpool_path}", "debug")
@@ -324,12 +371,16 @@ class PermissionProbe:
                 return True
 
             log("_can_run_zfs: -> UNAVAILABLE", "debug")
+            detail = stderr.splitlines()[0] if stderr else f"returncode {result.returncode}"
+            self._set_reason(f"zpool list: {detail}")
             return False
         except subprocess.TimeoutExpired:
             log("_can_run_zfs: timed out after 5s", "debug")
+            self._set_reason("zpool list timed out after 5s")
             return False
         except Exception as e:
             log(f"_can_run_zfs: exception: {type(e).__name__}: {e}", "debug")
+            self._set_reason(f"zpool list: {type(e).__name__}: {e}")
             return False
 
     def _can_access_docker(self):
@@ -339,6 +390,7 @@ class PermissionProbe:
 
         if not os.path.exists(docker_socket):
             log(f"_can_access_docker: {docker_socket} does not exist", "debug")
+            self._set_reason(f"{docker_socket} does not exist")
             return False
 
         readable = os.access(docker_socket, os.R_OK)
@@ -350,6 +402,10 @@ class PermissionProbe:
             f"_can_access_docker: -> {'AVAILABLE' if accessible else 'UNAVAILABLE'}",
             "debug",
         )
+        if not accessible:
+            self._set_reason(
+                f"{docker_socket} not accessible (readable={readable}, writable={writable})"
+            )
         return accessible
 
     def _can_access_libvirt(self):
@@ -374,6 +430,7 @@ class PermissionProbe:
                 return True
 
         log("_can_access_libvirt: -> UNAVAILABLE (no accessible sockets)", "debug")
+        self._set_reason(f"no readable libvirt socket at {' or '.join(socket_paths)}")
         return False
 
     def _can_access_proxmox(self):
@@ -385,6 +442,7 @@ class PermissionProbe:
         # Also check for pvesh command (Proxmox shell)
         if shutil.which("pvesh"):
             return True
+        self._set_reason("/etc/pve missing and pvesh not in PATH")
         return False
 
     def _has_snmpget(self):
@@ -394,6 +452,8 @@ class PermissionProbe:
             "_has_snmpget: {}".format("found" if found else "not found"),
             "debug",
         )
+        if not found:
+            self._set_reason("snmpget not found in PATH")
         return found
 
     def _can_list_packages(self):
@@ -403,6 +463,7 @@ class PermissionProbe:
                 log(f"_can_list_packages: found '{cmd}'", "debug")
                 return True
         log("_can_list_packages: no supported package manager found", "debug")
+        self._set_reason("no supported package manager (dpkg-query, rpm, apk, pacman, synopkg)")
         return False
 
     def get(self, capability, default=False):
@@ -412,6 +473,16 @@ class PermissionProbe:
     def get_all(self):
         """Get all capability statuses."""
         return self.capabilities.copy()
+
+    def get_reasons(self):
+        """Return {capability: reason} for capabilities currently unavailable.
+
+        Reason is a short string captured by the probe method (e.g.,
+        "nvmlInit failed: NVML Shared Library Not Found"). Sent to the
+        backend in static_data so dashboards can show per-host failure
+        reasons without an SSH session.
+        """
+        return self._capability_reasons.copy()
 
     def get_unavailable(self):
         """Get list of unavailable capabilities."""
