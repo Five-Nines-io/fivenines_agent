@@ -341,8 +341,11 @@ def _parse_journalctl_failed(stdout):
 def _parse_reverse_deps(stdout):
     """Parse `systemctl list-dependencies --reverse` indented tree output.
 
-    First line is the unit being queried; subsequent indented lines are the
-    dependents. Returns deduplicated list of dependent unit names.
+    First line is the unit being queried; subsequent indented lines are
+    prefixed with Unicode box-drawing characters (U+251C, U+2502, U+2500,
+    U+2514) plus spaces. Strip everything before the first ASCII alphanumeric
+    character to land on the unit name. Returns deduplicated list of
+    dependent unit names.
     """
     if not stdout:
         return []
@@ -351,8 +354,9 @@ def _parse_reverse_deps(stdout):
     lines = stdout.splitlines()
     # Skip first line (the unit being queried)
     for line in lines[1:]:
-        # Strip tree drawing characters and whitespace
-        cleaned = line.lstrip(" ├│─└").strip()
+        # Drop the tree-prefix: anything that is not an ASCII letter, digit,
+        # or underscore. systemd unit names always begin with [A-Za-z0-9_].
+        cleaned = re.sub(r"^[^A-Za-z0-9_]+", "", line).strip()
         if not cleaned:
             continue
         # Some entries include an active marker bullet; take first whitespace-token

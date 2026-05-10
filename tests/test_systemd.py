@@ -419,12 +419,15 @@ def test_parse_journalctl_blank_lines_skipped():
 # ============================================================
 
 
-REVERSE_DEPS_OUTPUT = """\
-nginx.service
-├─multi-user.target
-│ └─graphical.target
-└─cloudflare-tunnel.service
-"""
+# systemctl list-dependencies --reverse uses Unicode box-drawing characters
+# in its tree output (U+251C, U+2500, U+2502, U+2514). CLAUDE.md mandates
+# ASCII-only source files, so the runtime string is built from \u escapes.
+REVERSE_DEPS_OUTPUT = (
+    "nginx.service\n"
+    "\u251c\u2500multi-user.target\n"
+    "\u2502 \u2514\u2500graphical.target\n"
+    "\u2514\u2500cloudflare-tunnel.service\n"
+)
 
 
 def test_parse_reverse_deps_happy():
@@ -450,13 +453,13 @@ def test_parse_reverse_deps_only_root_unit():
 
 
 def test_parse_reverse_deps_dedup():
-    output = "nginx.service\n" "├─multi-user.target\n" "│ └─multi-user.target\n"
+    output = "nginx.service\n" "\u251c\u2500multi-user.target\n" "\u2502 \u2514\u2500multi-user.target\n"
     deps = _parse_reverse_deps(output)
     assert deps == ["multi-user.target"]
 
 
 def test_parse_reverse_deps_skip_blank_branch_lines():
-    output = "nginx.service\n  \n└─multi-user.target\n"
+    output = "nginx.service\n  \n\u2514\u2500multi-user.target\n"
     assert _parse_reverse_deps(output) == ["multi-user.target"]
 
 
@@ -524,7 +527,7 @@ def test_parse_exec_property_record_without_path_skipped():
 
 
 def test_exec_argv_re_terminates_at_semicolon():
-    """argv[]=value ; next-field — value should not include the semicolon."""
+    """argv[]=value ; next-field -- value should not include the semicolon."""
     m = EXEC_ARGV_RE.search("argv[]=foo bar ; next=x")
     assert m
     assert m.group(1) == "foo bar"
