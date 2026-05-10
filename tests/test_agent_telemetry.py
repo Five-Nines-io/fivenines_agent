@@ -4,7 +4,6 @@ import sys
 import threading
 from unittest.mock import MagicMock, patch
 
-
 # Mock libvirt before any fivenines_agent imports that transitively need it
 sys.modules.setdefault("libvirt", MagicMock())
 
@@ -306,9 +305,13 @@ def test_packages_sync_telemetry_captures_logged_error(
 # --- _systemd_inventory_sync_with_telemetry ---
 
 
-def _make_agent_with_systemd_state():
+def _make_agent_with_systemd_state(systemd_capable=True):
     agent = make_agent()
     agent._systemd_force_resend = False
+    # Capability probe is checked before each tick's inventory sync. Default
+    # to a systemd-capable host so existing tests do not have to set it.
+    agent.permissions = MagicMock()
+    agent.permissions.get.return_value = systemd_capable
     return agent
 
 
@@ -325,6 +328,22 @@ def test_systemd_inventory_sync_telemetry_early_return(mock_sync):
     assert "duration_ms" in entry
     assert "errors" not in entry
     mock_sync.assert_called_once()
+
+
+@patch("fivenines_agent.agent.systemd_inventory_sync")
+def test_systemd_inventory_sync_skipped_when_systemd_capability_false(mock_sync):
+    """On a host where systemd capability is False (Alpine OpenRC, bare
+    container without its own systemd), the agent must NOT pay subprocess
+    cost on every tick."""
+    agent = _make_agent_with_systemd_state(systemd_capable=False)
+    agent.config = {"enabled": True, "systemd": {"scan": True}}
+
+    agent._systemd_inventory_sync_with_telemetry()
+
+    mock_sync.assert_not_called()
+    # No telemetry entry recorded - we exited before _collect was invoked
+    assert "systemd_inventory_sync" not in agent._telemetry
+    agent.permissions.get.assert_called_once_with("systemd")
 
 
 @patch("fivenines_agent.agent.systemd_inventory_sync")
@@ -381,9 +400,7 @@ def test_systemd_inventory_sync_telemetry_captures_logged_error(mock_sync):
 
 @patch("fivenines_agent.agent.print_capabilities_banner")
 @patch("fivenines_agent.agent.force_inventory_resend")
-def test_handle_permission_refresh_sets_force_flag_on_sighup(
-    mock_force, mock_banner
-):
+def test_handle_permission_refresh_sets_force_flag_on_sighup(mock_force, mock_banner):
     """SIGHUP triggers permission refresh AND marks systemd inventory for resend."""
     from fivenines_agent.agent import refresh_permissions_event
 

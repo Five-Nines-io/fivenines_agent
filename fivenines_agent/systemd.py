@@ -763,10 +763,22 @@ def systemd_metrics(unit_types=DEFAULT_UNIT_TYPES, **_kwargs):
 
 
 def systemd_inventory_sync(config, send_fn, force_resend=False):
-    """Inventory snapshot push. Called from agent.py per tick (analogous to packages_sync)."""
+    """Inventory snapshot push. Called from agent.py per tick (analogous to packages_sync).
+
+    Reads unit_types from config["systemd"] so the inventory snapshot stays
+    consistent with the per-tick metrics scope and the module-level singleton
+    is not churned every tick when metrics + inventory disagree on which unit
+    types to enumerate.
+    """
     if not shutil.which("systemctl"):
         return
-    _get_collector().inventory_sync(config, send_fn, force_resend=force_resend)
+    systemd_config = config.get("systemd")
+    unit_types = DEFAULT_UNIT_TYPES
+    if isinstance(systemd_config, dict):
+        unit_types = systemd_config.get("unit_types", DEFAULT_UNIT_TYPES)
+    _get_collector(unit_types=unit_types).inventory_sync(
+        config, send_fn, force_resend=force_resend
+    )
 
 
 def force_inventory_resend():

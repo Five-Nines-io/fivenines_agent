@@ -22,13 +22,40 @@ CGROUP_ROOT = "/sys/fs/cgroup"
 # Module-level cache - cleared by reset_cache() in tests
 _cached_hierarchy = None
 _cached_hierarchy_set = False
+_cached_v1_cpu_controller = None
+_cached_v1_cpu_controller_set = False
 
 
 def reset_cache():
     """Reset the cached hierarchy detection. Used in tests."""
     global _cached_hierarchy, _cached_hierarchy_set
+    global _cached_v1_cpu_controller, _cached_v1_cpu_controller_set
     _cached_hierarchy = None
     _cached_hierarchy_set = False
+    _cached_v1_cpu_controller = None
+    _cached_v1_cpu_controller_set = False
+
+
+def _v1_cpu_controller():
+    """Detect the v1 controller mount that exposes cpuacct.usage.
+
+    Older kernels mount cpuacct as its own controller at
+    /sys/fs/cgroup/cpuacct/. CentOS 7 / RHEL 7 (and most modern v1 systems)
+    mount it combined with cpu at /sys/fs/cgroup/cpu,cpuacct/. Detect once
+    at first call and cache the result.
+
+    Returns the controller name to pass to unit_path, or None if neither
+    mount exists.
+    """
+    global _cached_v1_cpu_controller, _cached_v1_cpu_controller_set
+    if _cached_v1_cpu_controller_set:
+        return _cached_v1_cpu_controller
+    for candidate in ("cpuacct", "cpu,cpuacct"):
+        if os.path.isdir(os.path.join(CGROUP_ROOT, candidate)):
+            _cached_v1_cpu_controller = candidate
+            break
+    _cached_v1_cpu_controller_set = True
+    return _cached_v1_cpu_controller
 
 
 def detect_hierarchy():
@@ -159,9 +186,12 @@ def read_cpu_usec(unit_name, hierarchy):
         path = os.path.join(unit_path(unit_name, "v2"), "cpu.stat")
         return _parse_kv_field(_read_text(path), "usage_usec")
     if hierarchy == "v1":
+        controller = _v1_cpu_controller()
+        if controller is None:
+            return None
         # cpuacct.usage is in nanoseconds; convert to microseconds
         path = os.path.join(
-            unit_path(unit_name, "v1", controller="cpuacct"),
+            unit_path(unit_name, "v1", controller=controller),
             "cpuacct.usage",
         )
         ns = _parse_int(_read_text(path))

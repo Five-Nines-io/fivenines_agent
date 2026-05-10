@@ -1250,13 +1250,43 @@ def test_systemd_inventory_sync_delegates_to_collector():
     ):
         with patch(
             "fivenines_agent.systemd._get_collector", return_value=fake_collector
-        ):
+        ) as mock_get:
             systemd_inventory_sync(
                 {"systemd": {"scan": True}}, "send_fn", force_resend=True
             )
+    mock_get.assert_called_once_with(unit_types=DEFAULT_UNIT_TYPES)
     fake_collector.inventory_sync.assert_called_once_with(
         {"systemd": {"scan": True}}, "send_fn", force_resend=True
     )
+
+
+def test_systemd_inventory_sync_passes_unit_types_from_config():
+    """Inventory sync must use the same unit_types as the metrics path so the
+    module-level singleton does not get recreated every tick when config
+    overrides the default scope."""
+    fake_collector = MagicMock()
+    config = {"systemd": {"scan": True, "unit_types": "service"}}
+    with patch(
+        "fivenines_agent.systemd.shutil.which", return_value="/usr/bin/systemctl"
+    ):
+        with patch(
+            "fivenines_agent.systemd._get_collector", return_value=fake_collector
+        ) as mock_get:
+            systemd_inventory_sync(config, "send_fn")
+    mock_get.assert_called_once_with(unit_types="service")
+
+
+def test_systemd_inventory_sync_falls_back_to_default_when_config_not_dict():
+    """Bool / truthy non-dict config still works via DEFAULT_UNIT_TYPES."""
+    fake_collector = MagicMock()
+    with patch(
+        "fivenines_agent.systemd.shutil.which", return_value="/usr/bin/systemctl"
+    ):
+        with patch(
+            "fivenines_agent.systemd._get_collector", return_value=fake_collector
+        ) as mock_get:
+            systemd_inventory_sync({"systemd": True}, "send_fn")
+    mock_get.assert_called_once_with(unit_types=DEFAULT_UNIT_TYPES)
 
 
 def test_force_inventory_resend_clears_local_hash():

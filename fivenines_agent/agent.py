@@ -11,7 +11,6 @@ from threading import Event
 import psutil
 from dotenv import load_dotenv
 
-
 try:
     import systemd_watchdog
 except ImportError:
@@ -30,7 +29,6 @@ from fivenines_agent.ping import tcp_ping
 from fivenines_agent.synchronization_queue import SynchronizationQueue
 from fivenines_agent.synchronizer import Synchronizer
 from fivenines_agent.systemd import force_inventory_resend, systemd_inventory_sync
-
 
 CONFIG_DIR = config_dir()
 load_dotenv(dotenv_path=env_file())
@@ -149,13 +147,15 @@ class Agent:
     def _collect_metrics(self, data):
         # Core metrics (always enabled)
         data["load_average"] = self._collect("load_average", load_average)
-        data["file_handles_used"] = self._collect("file_handles_used", file_handles_used)
-        data["file_handles_limit"] = self._collect("file_handles_limit", file_handles_limit)
+        data["file_handles_used"] = self._collect(
+            "file_handles_used", file_handles_used
+        )
+        data["file_handles_limit"] = self._collect(
+            "file_handles_limit", file_handles_limit
+        )
 
         # Conditional metrics via registry, gated by capability where available
-        collect_metrics(
-            self.config, data, self._telemetry, self.permissions.get_all()
-        )
+        collect_metrics(self.config, data, self._telemetry, self.permissions.get_all())
 
         # Special-case collectors (unique dispatch patterns)
         if self.config.get("ping"):
@@ -182,6 +182,13 @@ class Agent:
         )
 
     def _systemd_inventory_sync_with_telemetry(self):
+        # Skip when the host is not systemd-managed. Mirrors the capability
+        # gate the metrics registry already applies via _is_capability_gated.
+        # Without this, containers where systemctl exists but the host wasn't
+        # booted by systemd would pay subprocess cost on every tick only to
+        # fail at list-units.
+        if not self.permissions.get("systemd"):
+            return
         # Consume the SIGHUP-triggered force flag once per tick. The reset
         # has to happen before _collect() in case sync raises - we still
         # want the next tick to fall back to hash-equality comparison.

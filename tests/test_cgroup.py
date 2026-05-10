@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, mock_open, patch
 import pytest
 
 from fivenines_agent.cgroup import (
+    _v1_cpu_controller,
     detect_hierarchy,
     read_cpu_usec,
     read_inception_id,
@@ -187,23 +188,91 @@ def test_read_cpu_usec_v2_unparseable():
 
 def test_read_cpu_usec_v1_converts_ns_to_usec():
     """v1 cpuacct.usage is nanoseconds; we want microseconds."""
-    with patch("builtins.open", mock_open(read_data="5000000000\n")):
-        # 5_000_000_000 ns -> 5_000_000 us
-        assert read_cpu_usec("nginx.service", "v1") == 5000000
+    with patch("fivenines_agent.cgroup._v1_cpu_controller", return_value="cpuacct"):
+        with patch("builtins.open", mock_open(read_data="5000000000\n")):
+            # 5_000_000_000 ns -> 5_000_000 us
+            assert read_cpu_usec("nginx.service", "v1") == 5000000
+
+
+def test_read_cpu_usec_v1_combined_mount():
+    """CentOS 7 uses the combined cpu,cpuacct mount; cpu_usec must still resolve."""
+    captured = {}
+
+    def fake_open(path, *args, **kwargs):
+        captured["path"] = path
+        return mock_open(read_data="3000000000\n").return_value
+
+    with patch("fivenines_agent.cgroup._v1_cpu_controller", return_value="cpu,cpuacct"):
+        with patch("builtins.open", side_effect=fake_open):
+            assert read_cpu_usec("nginx.service", "v1") == 3000000
+    assert "/sys/fs/cgroup/cpu,cpuacct/system.slice/nginx.service" in captured["path"]
+
+
+def test_read_cpu_usec_v1_no_cpu_controller():
+    """No cpuacct or cpu,cpuacct mount -> returns None without trying to read."""
+    with patch("fivenines_agent.cgroup._v1_cpu_controller", return_value=None):
+        with patch("builtins.open") as mock_o:
+            assert read_cpu_usec("nginx.service", "v1") is None
+        mock_o.assert_not_called()
 
 
 def test_read_cpu_usec_v1_missing_file():
-    with patch("builtins.open", side_effect=FileNotFoundError):
-        assert read_cpu_usec("nginx.service", "v1") is None
+    with patch("fivenines_agent.cgroup._v1_cpu_controller", return_value="cpuacct"):
+        with patch("builtins.open", side_effect=FileNotFoundError):
+            assert read_cpu_usec("nginx.service", "v1") is None
 
 
 def test_read_cpu_usec_v1_invalid():
-    with patch("builtins.open", mock_open(read_data="garbage\n")):
-        assert read_cpu_usec("nginx.service", "v1") is None
+    with patch("fivenines_agent.cgroup._v1_cpu_controller", return_value="cpuacct"):
+        with patch("builtins.open", mock_open(read_data="garbage\n")):
+            assert read_cpu_usec("nginx.service", "v1") is None
 
 
 def test_read_cpu_usec_unsupported_hierarchy():
     assert read_cpu_usec("nginx.service", None) is None
+
+
+# --- _v1_cpu_controller (combined-mount detection) ---
+
+
+def test_v1_cpu_controller_separate_mount():
+    """Older kernels mount cpuacct on its own."""
+    with patch(
+        "fivenines_agent.cgroup.os.path.isdir",
+        side_effect=lambda p: p.endswith("/cpuacct"),
+    ):
+        assert _v1_cpu_controller() == "cpuacct"
+
+
+def test_v1_cpu_controller_combined_mount():
+    """CentOS 7 / RHEL 7: cpuacct lives under cpu,cpuacct."""
+
+    def fake_isdir(p):
+        return p.endswith("/cpu,cpuacct")
+
+    with patch("fivenines_agent.cgroup.os.path.isdir", side_effect=fake_isdir):
+        assert _v1_cpu_controller() == "cpu,cpuacct"
+
+
+def test_v1_cpu_controller_neither_mount_returns_none():
+    with patch("fivenines_agent.cgroup.os.path.isdir", return_value=False):
+        assert _v1_cpu_controller() is None
+
+
+def test_v1_cpu_controller_caches_result():
+    """Detection runs once; subsequent calls hit the cache."""
+    with patch("fivenines_agent.cgroup.os.path.isdir", return_value=True) as mock_isdir:
+        first = _v1_cpu_controller()
+        second = _v1_cpu_controller()
+    assert first == second == "cpuacct"
+    # Only the first probe touches the filesystem
+    assert mock_isdir.call_count == 1
+
+
+def test_v1_cpu_controller_prefers_separate_when_both_present():
+    """If both mounts exist (rare), pick the canonical 'cpuacct' name."""
+    with patch("fivenines_agent.cgroup.os.path.isdir", return_value=True):
+        assert _v1_cpu_controller() == "cpuacct"
 
 
 # --- read_oom_kill_count ---
@@ -325,9 +394,10 @@ def test_read_unit_resources_v1_no_oom():
             return mock_open(read_data="3000000000\n").return_value
         raise FileNotFoundError
 
-    with patch("builtins.open", side_effect=fake_open):
-        with patch("fivenines_agent.cgroup.os.stat", return_value=fake_stat):
-            result = read_unit_resources("nginx.service", "v1")
+    with patch("fivenines_agent.cgroup._v1_cpu_controller", return_value="cpuacct"):
+        with patch("builtins.open", side_effect=fake_open):
+            with patch("fivenines_agent.cgroup.os.stat", return_value=fake_stat):
+                result = read_unit_resources("nginx.service", "v1")
     assert result == {
         "memory_current": 2048,
         "cpu_usec": 3000000,
