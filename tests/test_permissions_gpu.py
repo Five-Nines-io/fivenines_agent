@@ -39,7 +39,7 @@ def test_can_access_gpu_zero_devices(mock_probe):
 
 @patch.object(PermissionProbe, "_probe_all")
 def test_can_access_gpu_init_fails(mock_probe):
-    """nvmlInit failure returns False."""
+    """nvmlInit failure returns False and records the reason."""
     probe = PermissionProbe.__new__(PermissionProbe)
     probe.capabilities = {}
 
@@ -48,11 +48,12 @@ def test_can_access_gpu_init_fails(mock_probe):
 
     with patch.dict(sys.modules, {"pynvml": mock_nvml}):
         assert probe._can_access_gpu() is False
+        assert probe._current_reason == "nvmlInit failed: driver not loaded"
 
 
 @patch.object(PermissionProbe, "_probe_all")
 def test_can_access_gpu_no_pynvml(mock_probe):
-    """pynvml not installed returns False."""
+    """pynvml not installed returns False and records the reason."""
     probe = PermissionProbe.__new__(PermissionProbe)
     probe.capabilities = {}
 
@@ -70,6 +71,7 @@ def test_can_access_gpu_no_pynvml(mock_probe):
 
         with patch.object(builtins, "__import__", side_effect=fake_import):
             assert probe._can_access_gpu() is False
+            assert probe._current_reason == "pynvml not installed"
     finally:
         if saved is not None:
             sys.modules["pynvml"] = saved

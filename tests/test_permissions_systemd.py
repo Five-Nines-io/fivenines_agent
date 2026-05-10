@@ -182,7 +182,7 @@ def test_banner_systemd_in_services_section_when_available():
 
 def test_banner_systemd_unavailable_hint():
     output = _print_banner_with_capabilities(_full_caps(systemd=False))
-    assert "[-] Systemd (requires: systemd init system)" in output
+    assert "[-] Systemd (requires systemd init system)" in output
 
 
 def test_banner_cgroup_v2_renders_with_version_in_name():

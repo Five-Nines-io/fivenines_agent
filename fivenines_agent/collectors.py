@@ -85,48 +85,88 @@ COLLECTORS = [
 ]
 
 
+# Some config keys do not exactly match the capability key produced by the
+# permission probe. Override here for those cases. Keys absent from this
+# mapping fall back to the config key itself as the capability key.
+CAPABILITY_KEY_OVERRIDES = {
+    "smart_storage_health": "smart_storage",
+    "raid_storage_health": "raid_storage",
+}
+
+# Tracks (config_key, capability_value) pairs that have already been logged
+# as skipped this process, to avoid per-tick log spam.
+_logged_capability_skips = set()
+
+
+def _capability_key_for(config_key):
+    return CAPABILITY_KEY_OVERRIDES.get(config_key, config_key)
+
+
+def _is_capability_gated(config_key, permissions):
+    """Return True if collection should be skipped due to a False capability."""
+    if not permissions:
+        return False
+    cap_key = _capability_key_for(config_key)
+    if cap_key not in permissions:
+        return False
+    return not permissions[cap_key]
+
+
+def _log_capability_skip_once(config_key):
+    if config_key in _logged_capability_skips:
+        return
+    _logged_capability_skips.add(config_key)
+    log(f"Skipping '{config_key}' collection: capability unavailable", "info")
+
+
 def _collect_with_telemetry(name, fn, telemetry, *args, **kwargs):
-    """Wrap a collector call with timing and log capture for telemetry."""
+    """Wrap a collector call with timing and log capture for telemetry.
+
+    When *telemetry* is None, runs the collector without capture/timing.
+    """
     start = time.monotonic()
-    start_log_capture()
+    capture = telemetry is not None
+    if capture:
+        start_log_capture()
     try:
         result = fn(*args, **kwargs)
+    except Exception as e:
+        if capture:
+            errors = stop_log_capture()
+            errors.append(str(e))
+            duration_ms = round((time.monotonic() - start) * 1000, 2)
+            telemetry[name] = {"duration_ms": duration_ms, "errors": errors}
+        log(f"Error collecting {name}: {e}", "error")
+        return None
+
+    if capture:
         duration_ms = round((time.monotonic() - start) * 1000, 2)
         errors = stop_log_capture()
         entry = {"duration_ms": duration_ms}
         if errors:
             entry["errors"] = errors
         telemetry[name] = entry
-        return result
-    except Exception as e:
-        errors = stop_log_capture()
-        errors.append(str(e))
-        duration_ms = round((time.monotonic() - start) * 1000, 2)
-        telemetry[name] = {"duration_ms": duration_ms, "errors": errors}
-        log(f"Error collecting {name}: {e}", "error")
-        return None
+    return result
 
 
-def collect_metrics(config, data, telemetry=None):
+def collect_metrics(config, data, telemetry=None, permissions=None):
     """Run all registered collectors based on config flags.
 
     Mutates *data* in place, adding one key per collected metric.
     When *telemetry* is not None, each collector is wrapped with timing
-    and log capture.
+    and log capture. When *permissions* is provided, collectors whose
+    matching capability is False are skipped (logged once per process).
     """
     for config_key, collectors in COLLECTORS:
         config_value = config.get(config_key)
         if not config_value:
+            continue
+        if _is_capability_gated(config_key, permissions):
+            _log_capability_skip_once(config_key)
             continue
         for data_key, fn, pass_kwargs in collectors:
             if pass_kwargs and isinstance(config_value, dict):
                 kw = config_value
             else:
                 kw = {}
-            if telemetry is not None:
-                data[data_key] = _collect_with_telemetry(data_key, fn, telemetry, **kw)
-            else:
-                if kw:
-                    data[data_key] = fn(**kw)
-                else:
-                    data[data_key] = fn()
+            data[data_key] = _collect_with_telemetry(data_key, fn, telemetry, **kw)

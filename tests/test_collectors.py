@@ -204,3 +204,124 @@ def test_collect_metrics_without_telemetry_unchanged():
 
     mock_fn.assert_called_once_with()
     assert data == {"metric": 42}
+
+
+# --- Capability gating ---
+
+
+def _reset_skip_log():
+    from fivenines_agent.collectors import _logged_capability_skips
+
+    _logged_capability_skips.clear()
+
+
+def test_capability_false_skips_collector():
+    """When capability is False, the collector is not invoked."""
+    _reset_skip_log()
+    mock_fn = MagicMock(return_value="data")
+    registry = [("nvidia_gpu", [("nvidia_gpu", mock_fn, False)])]
+    config = {"nvidia_gpu": True}
+    permissions = {"nvidia_gpu": False}
+    data = {}
+    telemetry = {}
+
+    with patch("fivenines_agent.collectors.COLLECTORS", registry):
+        collect_metrics(config, data, telemetry, permissions)
+
+    mock_fn.assert_not_called()
+    assert data == {}
+    assert "nvidia_gpu" not in telemetry
+
+
+def test_capability_true_invokes_collector():
+    """When capability is True, the collector runs normally."""
+    _reset_skip_log()
+    mock_fn = MagicMock(return_value="data")
+    registry = [("nvidia_gpu", [("nvidia_gpu", mock_fn, False)])]
+    config = {"nvidia_gpu": True}
+    permissions = {"nvidia_gpu": True}
+    data = {}
+
+    with patch("fivenines_agent.collectors.COLLECTORS", registry):
+        collect_metrics(config, data, permissions=permissions)
+
+    mock_fn.assert_called_once()
+    assert data == {"nvidia_gpu": "data"}
+
+
+def test_capability_missing_does_not_gate():
+    """When the capability key is absent from the dict, no gating happens."""
+    _reset_skip_log()
+    mock_fn = MagicMock(return_value="ok")
+    registry = [("redis", [("redis", mock_fn, False)])]
+    config = {"redis": True}
+    permissions = {"cpu": True}  # 'redis' absent
+    data = {}
+
+    with patch("fivenines_agent.collectors.COLLECTORS", registry):
+        collect_metrics(config, data, permissions=permissions)
+
+    mock_fn.assert_called_once()
+    assert data == {"redis": "ok"}
+
+
+def test_capability_overrides_smart_storage():
+    """smart_storage_health config gates on smart_storage capability."""
+    _reset_skip_log()
+    mock_fn = MagicMock(return_value="x")
+    registry = [("smart_storage_health", [("smart_storage_health", mock_fn, False)])]
+    config = {"smart_storage_health": True}
+    permissions = {"smart_storage": False}
+    data = {}
+
+    with patch("fivenines_agent.collectors.COLLECTORS", registry):
+        collect_metrics(config, data, permissions=permissions)
+
+    mock_fn.assert_not_called()
+
+
+def test_capability_overrides_raid_storage():
+    """raid_storage_health config gates on raid_storage capability."""
+    _reset_skip_log()
+    mock_fn = MagicMock(return_value="x")
+    registry = [("raid_storage_health", [("raid_storage_health", mock_fn, False)])]
+    config = {"raid_storage_health": True}
+    permissions = {"raid_storage": False}
+    data = {}
+
+    with patch("fivenines_agent.collectors.COLLECTORS", registry):
+        collect_metrics(config, data, permissions=permissions)
+
+    mock_fn.assert_not_called()
+
+
+def test_skip_logged_only_once_per_process():
+    """Subsequent skipped invocations do not re-log."""
+    _reset_skip_log()
+    mock_fn = MagicMock(return_value="x")
+    registry = [("nvidia_gpu", [("nvidia_gpu", mock_fn, False)])]
+    config = {"nvidia_gpu": True}
+    permissions = {"nvidia_gpu": False}
+
+    with patch("fivenines_agent.collectors.COLLECTORS", registry):
+        with patch("fivenines_agent.collectors.log") as mock_log:
+            collect_metrics(config, {}, permissions=permissions)
+            collect_metrics(config, {}, permissions=permissions)
+            collect_metrics(config, {}, permissions=permissions)
+
+    skip_calls = [c for c in mock_log.call_args_list if "Skipping" in c.args[0]]
+    assert len(skip_calls) == 1
+
+
+def test_no_permissions_no_gating():
+    """When permissions is None, capability gating is bypassed."""
+    _reset_skip_log()
+    mock_fn = MagicMock(return_value="x")
+    registry = [("nvidia_gpu", [("nvidia_gpu", mock_fn, False)])]
+    config = {"nvidia_gpu": True}
+    data = {}
+
+    with patch("fivenines_agent.collectors.COLLECTORS", registry):
+        collect_metrics(config, data)
+
+    mock_fn.assert_called_once()
