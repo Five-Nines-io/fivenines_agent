@@ -19,6 +19,7 @@ from fivenines_agent.postgresql import postgresql_metrics
 from fivenines_agent.processes import processes
 from fivenines_agent.proxmox import proxmox_metrics
 from fivenines_agent.qemu import qemu_metrics
+from fivenines_agent.quota import quota_metrics
 from fivenines_agent.raid_storage import raid_storage_health
 from fivenines_agent.redis import redis_metrics
 from fivenines_agent.smart_storage import (
@@ -80,6 +81,7 @@ COLLECTORS = [
     ("caddy", [("caddy", caddy_metrics, True)]),
     ("postgresql", [("postgresql", postgresql_metrics, True)]),
     ("proxmox", [("proxmox", proxmox_metrics, True)]),
+    ("quota", [("quota", quota_metrics, False)]),
 ]
 
 

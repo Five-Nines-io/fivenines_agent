@@ -35,6 +35,7 @@ def test_registry_has_expected_config_keys():
         "caddy",
         "postgresql",
         "proxmox",
+        "quota",
     ]
     assert config_keys == expected
 

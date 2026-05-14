@@ -16,6 +16,7 @@ _PROBE_METHODS = (
     "_can_access_proxmox",
     "_can_list_packages",
     "_has_snmpget",
+    "_can_run_quota",
 )
 
 _ALL_TRUE_CAPS = {
@@ -40,6 +41,7 @@ _ALL_TRUE_CAPS = {
     "proxmox": True,
     "packages": True,
     "snmp": True,
+    "quota": True,
 }
 
 

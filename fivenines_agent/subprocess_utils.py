@@ -37,6 +37,18 @@ def get_clean_env() -> dict:
     return env
 
 
+def get_clean_env_c_locale() -> dict:
+    """Return a sanitized environment with ``LC_ALL=C`` forced.
+
+    Extends ``get_clean_env()`` for commands that use gettext-localized
+    output (e.g. quota-tools).  Pinning ``LC_ALL=C`` guarantees stable
+    English output that the parser can rely on.
+    """
+    env = get_clean_env()
+    env["LC_ALL"] = "C"
+    return env
+
+
 def run_command(
     cmd: List[str],
     timeout: Optional[int] = None,
