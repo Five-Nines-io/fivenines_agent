@@ -32,39 +32,53 @@ $ntAccount = New-Object System.Security.Principal.NTAccount($accountName)
 $sid = $ntAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
 Write-Host ("Service account {0} (resolved as {1}) -> SID {2}" -f $ServiceAccount, $accountName, $sid)
 
-# Read current security descriptor.
-$systemSecurity = Get-WmiObject -Namespace $Namespace -Class __SystemSecurity -ErrorAction Stop
-$getResult = $systemSecurity.GetSecurityDescriptor()
+# Read the current namespace security descriptor.
+# __SystemSecurity is a singleton; "__SystemSecurity=@" is the canonical
+# WMI path for the singleton instance (Invoke-WmiMethod can't be given the
+# class itself - it needs the instance).
+$secPath = "__SystemSecurity=@"
+$getResult = Invoke-WmiMethod `
+    -Namespace $Namespace `
+    -Path $secPath `
+    -Name GetSecurityDescriptor `
+    -ErrorAction Stop
 if ($getResult.ReturnValue -ne 0) {
     throw ("GetSecurityDescriptor failed: ReturnValue={0}" -f $getResult.ReturnValue)
 }
 $sd = $getResult.Descriptor
 
-# Build the ACE.
+# Build a new ACE granting the service account read access.
 $WBEM_ENABLE         = 0x1
 $WBEM_METHOD_EXECUTE = 0x2
 $WBEM_REMOTE_ENABLE  = 0x20
 $ACCESS_ALLOWED      = 0
 $CONTAINER_INHERIT   = 0x2
 
-$acePath = [WMIClass]("\\.\" + $Namespace + ":__ACE")
-$ace = $acePath.CreateInstance()
+# [wmiclass] needs "<namespace>:<class>" - the namespace already contains
+# the necessary backslashes and PowerShell double-quoted strings keep them
+# literal.
+$aceClass = [wmiclass]"$($Namespace):__ACE"
+$ace = $aceClass.CreateInstance()
 $ace.AccessMask = $WBEM_ENABLE -bor $WBEM_METHOD_EXECUTE -bor $WBEM_REMOTE_ENABLE
 $ace.AceType    = $ACCESS_ALLOWED
 $ace.AceFlags   = $CONTAINER_INHERIT
 
-$trusteePath = [WMIClass]("\\.\" + $Namespace + ":__Trustee")
-$trustee = $trusteePath.CreateInstance()
-$trustee.Name = $ServiceAccount
+$trusteeClass = [wmiclass]"$($Namespace):__Trustee"
+$trustee = $trusteeClass.CreateInstance()
+$trustee.Name = $accountName
 $trustee.SidString = $sid
 $ace.Trustee = $trustee
 
-# Append to DACL.
+# Append to the DACL and write back.
 $dacl = @($sd.DACL) + $ace
 $sd.DACL = $dacl
 
-# Write back.
-$setResult = $systemSecurity.SetSecurityDescriptor($sd)
+$setResult = Invoke-WmiMethod `
+    -Namespace $Namespace `
+    -Path $secPath `
+    -Name SetSecurityDescriptor `
+    -ArgumentList $sd `
+    -ErrorAction Stop
 if ($setResult.ReturnValue -ne 0) {
     throw ("SetSecurityDescriptor failed: ReturnValue={0}" -f $setResult.ReturnValue)
 }
