@@ -503,6 +503,20 @@ def test_get_packages_windows_registry_skips_entries_without_displayname():
     assert [p["name"] for p in packages] == ["Real App"]
 
 
+def test_get_packages_windows_registry_skips_entries_with_empty_displayname():
+    """DisplayName present but empty string (some installer-leftover entries do this)."""
+    fake = _make_fake_winreg({
+        "WOW6432Node": [],
+        "Microsoft\\Windows\\CurrentVersion\\Uninstall": [
+            ("Real", {"DisplayName": "Real App", "DisplayVersion": "1.0"}),
+            ("Empty", {"DisplayName": "", "DisplayVersion": "1.0"}),
+        ],
+    })
+    with patch.dict("sys.modules", {"winreg": fake}):
+        packages = _get_packages_windows_registry()
+    assert [p["name"] for p in packages] == ["Real App"]
+
+
 def test_get_packages_windows_registry_missing_displayversion_returns_empty_string():
     fake = _make_fake_winreg({
         "WOW6432Node": [],
