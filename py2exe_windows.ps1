@@ -5,52 +5,48 @@
 #
 # Output:  .\dist\windows\fivenines-agent-windows-<arch>\
 #
-# The Windows build is far simpler than py2exe.sh (the Linux manylinux
-# build). PyInstaller runs natively on Windows: no libpython rebuild, no
-# libcrypt or libtirpc bundling. The virtualization Poetry group (libvirt,
-# systemd-watchdog, proxmoxer, pynvml) is explicitly excluded - libvirt does
-# not build on Windows, and the other three are Linux-only. The windows
-# group (pywin32, wmi) is included so the disk-health and software-inventory
-# collectors have what they need at runtime.
+# Uses the runner's Python directly (no extra venv layer - GitHub's
+# windows-latest python from actions/setup-python is already isolated).
+# The virtualization Poetry group (libvirt, systemd-watchdog, proxmoxer,
+# pynvml) is excluded - libvirt does not build on Windows and the rest are
+# Linux-only. The windows group (pywin32, wmi) is included so the
+# disk-health and software-inventory collectors have what they need at
+# runtime. The dev group (pyinstaller) is included by default since
+# Poetry includes non-optional groups unless --without is passed.
 
 $ErrorActionPreference = "Stop"
 
-$TARGET_ARCH = $env:TARGET_ARCH
-if (-not $TARGET_ARCH) { $TARGET_ARCH = "amd64" }
-
+$TARGET_ARCH = if ($env:TARGET_ARCH) { $env:TARGET_ARCH } else { "amd64" }
 $BINARY_NAME = "fivenines-agent-windows-$TARGET_ARCH"
 
 Write-Host "=== Python Environment Check ==="
 python --version
 python -m pip --version
 
-# Create a fresh venv for the build (kept separate from the dev venv).
-Write-Host "Creating build virtual environment"
-python -m venv .venv-build --clear
+Write-Host "=== Installing build prerequisites ==="
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install "poetry==2.2.1"
 
-$pythonExe = ".\.venv-build\Scripts\python.exe"
-$poetryExe = ".\.venv-build\Scripts\poetry.exe"
-$pyinstallerExe = ".\.venv-build\Scripts\pyinstaller.exe"
-
-& $pythonExe -m pip install --upgrade pip setuptools wheel
-& $pythonExe -m pip install "poetry==2.2.1"
-
-Write-Host "=== Installing Windows dependency group (virtualization excluded) ==="
-& $poetryExe config virtualenvs.create false
-& $poetryExe cache clear --all . 2>$null
-& $poetryExe config installer.max-workers 1
-& $poetryExe install --no-interaction --without virtualization --with windows
+Write-Host "=== Installing project dependencies (windows + dev, virtualization excluded) ==="
+# Scoped to this command so we don't mutate the runner's global poetry config.
+$env:POETRY_VIRTUALENVS_CREATE = "false"
+poetry install --no-interaction --without virtualization --with windows
+if ($LASTEXITCODE -ne 0) { Write-Error "poetry install failed"; exit 1 }
 
 # Defensive: confirm the excluded groups are not importable.
 $forbidden = @("libvirt", "systemd_watchdog", "proxmoxer")
 foreach ($mod in $forbidden) {
-    $check = & $pythonExe -c "import $mod" 2>&1
+    $check = python -c "import $mod" 2>&1
     if ($LASTEXITCODE -eq 0) {
         Write-Warning "Unexpected: $mod is importable. It should not be on Windows."
     } else {
         Write-Host "Confirmed: $mod not importable (expected)."
     }
 }
+
+Write-Host "=== Verifying PyInstaller is importable ==="
+python -c "import PyInstaller; print('PyInstaller', PyInstaller.__version__)"
+if ($LASTEXITCODE -ne 0) { Write-Error "PyInstaller not importable"; exit 1 }
 
 Write-Host "=== Building Executable ==="
 $buildDir = ".\build"
@@ -81,7 +77,7 @@ $pyInstallerArgs = @(
     ".\py2exe_entrypoint.py"
 )
 
-& $pyinstallerExe @pyInstallerArgs
+python -m PyInstaller @pyInstallerArgs
 if ($LASTEXITCODE -ne 0) {
     Write-Error "PyInstaller failed with exit code $LASTEXITCODE"
     exit 1
