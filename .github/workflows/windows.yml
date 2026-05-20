@@ -200,6 +200,7 @@ jobs:
 
       - name: Install MSI silently
         shell: pwsh
+        timeout-minutes: 5
         run: |
           $token = "ci-smoke-token-" + (Get-Random)
           $msiArgs = "/i fivenines-agent.msi TOKEN=$token SERVICEACCOUNT=$env:SERVICEACCOUNT SERVICEACCOUNTPASSWORD=$env:SERVICEACCOUNTPASSWORD /qn /l*v install.log"

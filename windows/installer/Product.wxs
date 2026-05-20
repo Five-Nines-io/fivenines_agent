@@ -99,9 +99,16 @@
                         ErrorControl="normal"
                         Vital="yes" />
 
+        <!-- Intentionally NO Start="install": the deferred custom actions
+             (WriteTokenAcl, DelegateWmi) run AFTER InstallServices, so if
+             we asked the SCM to start the service here, the agent would
+             try to read TOKEN before it has been written and exit
+             immediately - WinSW would then restart-loop and the MSI would
+             hang waiting for the service to reach Running. The smoke job
+             (or a real-world operator) starts the service explicitly after
+             the install completes. -->
         <ServiceControl Id="ControlAgentService"
                         Name="fivenines-agent"
-                        Start="install"
                         Stop="both"
                         Remove="uninstall"
                         Wait="yes" />
