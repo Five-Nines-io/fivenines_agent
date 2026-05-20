@@ -116,14 +116,14 @@
 
       <Component Id="SetTokenAclScript">
         <File Id="SetTokenAclPs1"
-              Source="windows\installer\SetTokenFileAcl.ps1"
+              Source="SetTokenFileAcl.ps1"
               Name="SetTokenFileAcl.ps1"
               KeyPath="yes" />
       </Component>
 
       <Component Id="DelegateWmiScript">
         <File Id="DelegateWmiPs1"
-              Source="windows\installer\DelegateWmiStorageNamespace.ps1"
+              Source="DelegateWmiStorageNamespace.ps1"
               Name="DelegateWmiStorageNamespace.ps1"
               KeyPath="yes" />
       </Component>
