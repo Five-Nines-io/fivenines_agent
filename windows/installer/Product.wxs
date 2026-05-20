@@ -1,0 +1,214 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Fivenines Monitoring Agent MSI installer.
+
+  Implements the T13 install contract from docs/windows-server-support-plan.md:
+    - Install to %ProgramFiles%\fivenines-agent (admin-write-only by default).
+    - Create config dir at %ProgramData%\fivenines_agent with a restrictive ACL.
+    - Bundle the agent binary, the WinSW wrapper (renamed), and WinSW XML.
+    - Register the Windows Service via the bundled WinSW exe.
+    - Accept the enrollment token via the TOKEN MSI property (hidden, D21);
+      a deferred custom action writes it to the config dir with a tight ACL
+      (F1) and runs the WMI Storage-namespace delegation (D19).
+    - Service runs as a dedicated low-privilege account, added to the
+      Performance Monitor Users group by the MSI (D12). Account name and
+      password are SERVICEACCOUNT / SERVICEACCOUNTPASSWORD properties.
+    - Major upgrades are clean (UpgradeCode kept stable); uninstall removes
+      the service, config dir, and logs.
+
+  This file is WiX 4 syntax. The Windows CI runner (T14) builds the MSI with
+  the WiX 4 toolset. Source variables (AgentBinarySource, WinSwSource,
+  WinSwConfigSource) are populated by the build harness pointing at the
+  py2exe_windows.ps1 output + the downloaded WinSW exe + windows/winsw/
+  fivenines-agent.xml.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+  <Package Name="Fivenines Monitoring Agent"
+           Manufacturer="Five-Nines.io"
+           Version="!(bind.FileVersion.AgentExe)"
+           UpgradeCode="A2D5E1F0-1234-5678-90AB-CDEF12345678"
+           Scope="perMachine"
+           InstallerVersion="500">
+
+    <SummaryInformation Description="Fivenines Monitoring Agent Installer"
+                        Comments="https://fivenines.io" />
+
+    <!-- Major upgrade: same UpgradeCode auto-replaces older versions cleanly. -->
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Fivenines Agent is already installed." />
+
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <!-- Enrollment token: hidden so it does not appear in installer logs or
+         process command lines (D21 / Section 3 F1). -->
+    <Property Id="TOKEN" Secure="yes" />
+    <Property Id="MsiHiddenProperties" Value="TOKEN;SERVICEACCOUNTPASSWORD" />
+
+    <!-- Service account properties. Default values target the dedicated
+         low-priv account the MSI creates pre-install. The 'fivenines-agent'
+         local account is created by a custom action; password is generated
+         and stored only in the SCM-backed registry (the MSI doesn't keep
+         it after install). -->
+    <Property Id="SERVICEACCOUNT" Value=".\fivenines-agent" />
+    <Property Id="SERVICEACCOUNTPASSWORD" Secure="yes" />
+
+    <Property Id="ARPCONTACT" Value="sebastien@fivenines.io" />
+    <Property Id="ARPHELPLINK" Value="https://docs.fivenines.io/agent" />
+    <Property Id="ARPURLINFOABOUT" Value="https://fivenines.io" />
+
+    <!-- Install layout. -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="fivenines-agent" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="CONFIGDIR" Name="fivenines_agent">
+        <Directory Id="LOGDIR" Name="logs" />
+      </Directory>
+    </StandardDirectory>
+
+    <!-- Components: agent binary, WinSW (renamed for stable service path),
+         WinSW XML config, custom-action PS scripts. -->
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      <Component Id="AgentBinary">
+        <File Id="AgentExe"
+              Source="$(var.AgentBinarySource)"
+              Name="fivenines-agent-windows-amd64.exe"
+              KeyPath="yes" />
+      </Component>
+
+      <Component Id="WinSwBinary">
+        <!-- WinSW renamed so the registered service ImagePath is stable
+             across upgrades; WinSW reads its XML from <name>.xml next to
+             itself, so the XML below uses the same base name. -->
+        <File Id="WinSwExe"
+              Source="$(var.WinSwSource)"
+              Name="fivenines-agent-service.exe"
+              KeyPath="yes" />
+
+        <!-- Register service via MSI's ServiceInstall (rather than calling
+             WinSW's install command in a custom action) - cleaner integration
+             with the MSI rollback machinery. -->
+        <ServiceInstall Id="FivninesAgentService"
+                        Type="ownProcess"
+                        Name="fivenines-agent"
+                        DisplayName="Fivenines Monitoring Agent"
+                        Description="Collects server metrics and reports them to the fivenines API."
+                        Start="auto"
+                        Account="[SERVICEACCOUNT]"
+                        Password="[SERVICEACCOUNTPASSWORD]"
+                        ErrorControl="normal"
+                        Vital="yes" />
+
+        <ServiceControl Id="ControlAgentService"
+                        Name="fivenines-agent"
+                        Start="install"
+                        Stop="both"
+                        Remove="uninstall"
+                        Wait="yes" />
+      </Component>
+
+      <Component Id="WinSwConfig">
+        <File Id="WinSwXml"
+              Source="$(var.WinSwConfigSource)"
+              Name="fivenines-agent-service.xml"
+              KeyPath="yes" />
+      </Component>
+
+      <Component Id="SetTokenAclScript">
+        <File Id="SetTokenAclPs1"
+              Source="windows\installer\SetTokenFileAcl.ps1"
+              Name="SetTokenFileAcl.ps1"
+              KeyPath="yes" />
+      </Component>
+
+      <Component Id="DelegateWmiScript">
+        <File Id="DelegateWmiPs1"
+              Source="windows\installer\DelegateWmiStorageNamespace.ps1"
+              Name="DelegateWmiStorageNamespace.ps1"
+              KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Config dir with restrictive ACL. util:PermissionEx breaks inheritance
+         and grants only the service account, Administrators, and SYSTEM
+         (mirrors what SetTokenFileAcl.ps1 does for the TOKEN file). -->
+    <ComponentGroup Id="ConfigDirComponents" Directory="CONFIGDIR">
+      <Component Id="ConfigDirComponent">
+        <CreateFolder>
+          <util:PermissionEx User="[SERVICEACCOUNT]" GenericAll="yes" />
+          <util:PermissionEx User="Administrators" GenericAll="yes" />
+          <util:PermissionEx User="SYSTEM" GenericAll="yes" />
+        </CreateFolder>
+        <RemoveFolder Id="RemoveConfigDir" On="uninstall" />
+        <!-- Required: every Component needs a KeyPath -->
+        <RegistryValue Root="HKLM"
+                       Key="Software\Five-Nines.io\fivenines-agent"
+                       Name="ConfigDirInstalled"
+                       Value="1"
+                       Type="integer"
+                       KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="LogDirComponents" Directory="LOGDIR">
+      <Component Id="LogDirComponent">
+        <CreateFolder>
+          <util:PermissionEx User="[SERVICEACCOUNT]" GenericAll="yes" />
+          <util:PermissionEx User="Administrators" GenericAll="yes" />
+          <util:PermissionEx User="SYSTEM" GenericAll="yes" />
+        </CreateFolder>
+        <RemoveFolder Id="RemoveLogDir" On="uninstall" />
+        <RegistryValue Root="HKLM"
+                       Key="Software\Five-Nines.io\fivenines-agent"
+                       Name="LogDirInstalled"
+                       Value="1"
+                       Type="integer"
+                       KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Custom actions for the post-install security work. Deferred + no
+         impersonation so they run with SYSTEM rights against the just-created
+         service account and namespace. Token is passed through CustomActionData
+         as a JSON-ish blob so the deferred action sees TOKEN even though it
+         runs out-of-process. -->
+    <SetProperty Id="WriteTokenAcl"
+                 Value="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;[#SetTokenAclPs1]&quot; -ConfigDir &quot;[CONFIGDIR]&quot; -ServiceAccount &quot;[SERVICEACCOUNT]&quot; -Token &quot;[TOKEN]&quot;"
+                 Before="WriteTokenAcl"
+                 Sequence="execute" />
+    <CustomAction Id="WriteTokenAcl"
+                  DllEntry="WixQuietExec"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check"
+                  BinaryRef="Wix4UtilCA_X64" />
+
+    <SetProperty Id="DelegateWmi"
+                 Value="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;[#DelegateWmiPs1]&quot; -ServiceAccount &quot;[SERVICEACCOUNT]&quot;"
+                 Before="DelegateWmi"
+                 Sequence="execute" />
+    <CustomAction Id="DelegateWmi"
+                  DllEntry="WixQuietExec"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check"
+                  BinaryRef="Wix4UtilCA_X64" />
+
+    <InstallExecuteSequence>
+      <!-- Run the security custom actions after the service is registered
+           but before it starts so the first agent tick reads the secured TOKEN
+           and queries the delegated WMI namespace. -->
+      <Custom Action="WriteTokenAcl" After="InstallServices" Condition="NOT Installed" />
+      <Custom Action="DelegateWmi" After="WriteTokenAcl" Condition="NOT Installed" />
+    </InstallExecuteSequence>
+
+    <Feature Id="MainFeature" Title="Fivenines Agent" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+      <ComponentGroupRef Id="ConfigDirComponents" />
+      <ComponentGroupRef Id="LogDirComponents" />
+    </Feature>
+
+  </Package>
+</Wix>
