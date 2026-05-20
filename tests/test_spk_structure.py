@@ -34,8 +34,11 @@ def fake_binary(tmp_path):
         binary = binary_dir / "fivenines-agent"
         binary.write_text("#!/bin/sh\necho fake-agent")
         binary.chmod(0o755)
-        # Simulate a shared library alongside the binary
-        (binary_dir / "libpython3.9.so").write_text("fake-lib")
+        # Simulate a shared library alongside the binary.
+        # Name is intentionally version-agnostic: the SPK test verifies that
+        # any non-binary file in the dist dir gets packaged, not which Python
+        # minor the real build bundles.
+        (binary_dir / "libstub.so").write_text("fake-lib")
     return tmp_path
 
 
@@ -111,7 +114,7 @@ def test_build_spk_package_tgz_contains_binary(fake_binary):
             members = [m.name for m in pkg.getmembers()]
         assert "./bin/fivenines-agent" in members
         # Shared libs should also be included
-        assert "./bin/libpython3.9.so" in members
+        assert "./bin/libstub.so" in members
         # Logrotate config must be inside package.tgz (target/conf/)
         assert "./conf/logrotate.conf" in members
     finally:
