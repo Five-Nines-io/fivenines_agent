@@ -48,7 +48,12 @@
          low-priv account the MSI creates pre-install. The 'fivenines-agent'
          local account is created by a custom action; the password is
          supplied by the deployment tool and is Hidden in logs. -->
-    <Property Id="SERVICEACCOUNT" Value=".\fivenines-agent" />
+    <!-- Default to COMPUTERNAME\fivenines-agent. WiX's Wix4ExecSecureObjects
+         custom action (which processes util:PermissionEx entries) resolves
+         users via Win32 LookupAccountName, which rejects the .\Username
+         dot-prefix on some Windows configurations. The COMPUTERNAME prefix
+         is what Microsoft documents as portable for local-machine accounts. -->
+    <Property Id="SERVICEACCOUNT" Value="[ComputerName]\fivenines-agent" />
     <Property Id="SERVICEACCOUNTPASSWORD" Secure="yes" Hidden="yes" />
 
     <Property Id="ARPCONTACT" Value="sebastien@fivenines.io" />

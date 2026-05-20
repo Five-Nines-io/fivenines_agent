@@ -195,8 +195,12 @@ jobs:
 
           $sid = (New-Object System.Security.Principal.NTAccount("fivenines-agent")).Translate([System.Security.Principal.SecurityIdentifier]).Value
           Write-Host "Service account SID: $sid"
-          "SERVICEACCOUNT=.\fivenines-agent" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
-          "SERVICEACCOUNTPASSWORD=$passwd"   | Out-File -Append -Encoding ascii $env:GITHUB_ENV
+          # Use the COMPUTERNAME\Username form rather than .\Username so WiX's
+          # Wix4ExecSecureObjects custom action (which processes util:PermissionEx
+          # entries via the Win32 LookupAccountName API) can resolve the SID.
+          # The .\ prefix is rejected by LookupAccountName on this runner image.
+          "SERVICEACCOUNT=$env:COMPUTERNAME\fivenines-agent" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
+          "SERVICEACCOUNTPASSWORD=$passwd"                   | Out-File -Append -Encoding ascii $env:GITHUB_ENV
 
       - name: Install MSI silently
         shell: pwsh
