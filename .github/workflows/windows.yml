@@ -176,96 +176,50 @@ jobs:
           name: fivenines-agent-msi
           path: .
 
-      - name: Pre-create service account (D12 low-priv + Performance Monitor Users)
-        shell: pwsh
-        run: |
-          # Generate a 24-character random password. Using New-LocalUser
-          # rather than `net user` so the legacy "longer than 14 characters"
-          # interactive prompt doesn't block on a non-tty CI runner.
-          $passwd = -join ((33..126) | Get-Random -Count 24 | ForEach-Object { [char]$_ })
-          # Mask the generated password from any subsequent log lines.
-          Write-Host "::add-mask::$passwd"
-          $securePwd = ConvertTo-SecureString $passwd -AsPlainText -Force
-
-          New-LocalUser -Name "fivenines-agent" `
-              -Password $securePwd `
-              -PasswordNeverExpires `
-              -UserMayNotChangePassword `
-              -AccountNeverExpires `
-              -Description "Fivenines agent service account (CI smoke)" `
-              -ErrorAction Stop
-
-          Add-LocalGroupMember `
-              -Group "Performance Monitor Users" `
-              -Member "fivenines-agent" `
-              -ErrorAction Stop
-
-          # Add to BUILTIN\Users so the account inherits the default Read &
-          # Execute ACE on %ProgramFiles%. Without this membership the service
-          # process can't load its own python311.dll out of the install dir
-          # (LoadLibrary returns "The specified module could not be found",
-          # surfaced by PyInstaller as PYI-8860). New-LocalUser does NOT add
-          # to Users implicitly; legacy `net user /add` did, which masked
-          # this requirement on older runners.
-          Add-LocalGroupMember `
-              -Group "Users" `
-              -Member "fivenines-agent" `
-              -ErrorAction Stop
-
-          $sid = (New-Object System.Security.Principal.NTAccount("fivenines-agent")).Translate([System.Security.Principal.SecurityIdentifier]).Value
-          Write-Host "Service account SID: $sid"
-
-          # Grant SeServiceLogonRight ("Log on as a service") via secedit. SCM
-          # refuses to start any service under an account that lacks this
-          # privilege - that's what produced "Cannot start service" with a
-          # generic error and no Event Log entry. MSI ServiceInstall used to
-          # grant this implicitly; on Windows Server 2025 it does not.
-          $tmpCfg = Join-Path $env:TEMP "secpolicy.cfg"
-          $tmpDb  = Join-Path $env:TEMP "secpolicy.sdb"
-          secedit /export /cfg $tmpCfg /areas USER_RIGHTS /quiet | Out-Null
-          $content = Get-Content $tmpCfg
-          $found = $false
-          for ($i = 0; $i -lt $content.Length; $i++) {
-              if ($content[$i] -match '^SeServiceLogonRight\s*=') {
-                  if ($content[$i] -notmatch [regex]::Escape("*$sid")) {
-                      $content[$i] = $content[$i].TrimEnd() + ",*$sid"
-                  }
-                  $found = $true
-                  break
-              }
-          }
-          if (-not $found) {
-              $appended = @()
-              foreach ($line in $content) {
-                  $appended += $line
-                  if ($line -match '^\[Privilege Rights\]') {
-                      $appended += "SeServiceLogonRight = *$sid"
-                  }
-              }
-              $content = $appended
-          }
-          $content | Set-Content -Encoding ascii $tmpCfg
-          secedit /configure /db $tmpDb /cfg $tmpCfg /areas USER_RIGHTS /quiet | Out-Null
-          Remove-Item $tmpCfg, $tmpDb -ErrorAction SilentlyContinue
-          Write-Host "Granted SeServiceLogonRight to fivenines-agent"
-
-          # Use the COMPUTERNAME\Username form rather than .\Username so WiX's
-          # Wix4ExecSecureObjects custom action (which processes util:PermissionEx
-          # entries via the Win32 LookupAccountName API) can resolve the SID.
-          # The .\ prefix is rejected by LookupAccountName on this runner image.
-          "SERVICEACCOUNT=$env:COMPUTERNAME\fivenines-agent" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
-          "SERVICEACCOUNTPASSWORD=$passwd"                   | Out-File -Append -Encoding ascii $env:GITHUB_ENV
-
-      - name: Install MSI silently
+      - name: Install MSI silently (fresh-install path - MSI provisions the account)
         shell: pwsh
         timeout-minutes: 5
         run: |
+          # Real-customer fresh-install scenario: pass only TOKEN. The MSI's
+          # CreateServiceAccount CA creates fivenines-agent locally, generates
+          # a random password, joins it to Performance Monitor Users + Users,
+          # grants SeServiceLogonRight, and flips the service to it.
           $token = "ci-smoke-token-" + (Get-Random)
-          $msiArgs = "/i fivenines-agent.msi TOKEN=$token SERVICEACCOUNT=$env:SERVICEACCOUNT SERVICEACCOUNTPASSWORD=$env:SERVICEACCOUNTPASSWORD /qn /l*v install.log"
+          $msiArgs = "/i fivenines-agent.msi TOKEN=$token /qn /l*v install.log"
           $p = Start-Process msiexec -ArgumentList $msiArgs -Wait -PassThru
           if ($p.ExitCode -ne 0) {
             Write-Host "msiexec exit code: $($p.ExitCode)"
             Get-Content install.log -Tail 200
+            exit 1
+          }
+
+      - name: Verify service account was provisioned by the MSI
+        shell: pwsh
+        run: |
+          $u = Get-LocalUser -Name "fivenines-agent" -ErrorAction SilentlyContinue
+          if (-not $u) {
+            Write-Error "MSI did not create the 'fivenines-agent' local account"
+            exit 1
+          }
+          Write-Host "Account created: $($u.Name) (Enabled=$($u.Enabled))"
+
+          $groups = @("Performance Monitor Users", "Users")
+          foreach ($g in $groups) {
+            $member = Get-LocalGroupMember -Group $g -ErrorAction SilentlyContinue |
+                      Where-Object { $_.Name -match "fivenines-agent" }
+            if (-not $member) {
+              Write-Error "fivenines-agent is not a member of '$g'"
+              exit 1
+            }
+            Write-Host "Group membership OK: $g"
+          }
+
+          # Confirm the service is configured to log in as the dedicated account,
+          # not LocalSystem (the placeholder).
+          $svcAccount = (Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'").StartName
+          Write-Host "Service runs as: $svcAccount"
+          if ($svcAccount -notmatch "fivenines-agent") {
+            Write-Error "Service is not running under the dedicated account"
             exit 1
           }
 

@@ -110,15 +110,23 @@
 
         <!-- Register service via MSI's ServiceInstall (rather than calling
              WinSW's install command in a custom action) - cleaner integration
-             with the MSI rollback machinery. -->
+             with the MSI rollback machinery.
+
+             We intentionally do NOT set Account/Password here. The service
+             is registered with LocalSystem as a placeholder; immediately
+             after InstallServices, the CreateServiceAccount custom action
+             provisions the dedicated low-priv account (auto-generating a
+             random password if the deployer didn't supply one) and runs
+             'sc.exe config' to flip the service to that account. The window
+             during which the service is configured as LocalSystem is bounded
+             by a single MSI execute pass and we don't auto-start, so the
+             service never actually runs as LocalSystem. -->
         <ServiceInstall Id="FivninesAgentService"
                         Type="ownProcess"
                         Name="fivenines-agent"
                         DisplayName="Fivenines Monitoring Agent"
                         Description="Collects server metrics and reports them to the fivenines API."
                         Start="auto"
-                        Account="[SERVICEACCOUNT]"
-                        Password="[SERVICEACCOUNTPASSWORD]"
                         ErrorControl="normal"
                         Vital="yes" />
 
@@ -157,15 +165,27 @@
               Name="DelegateWmiStorageNamespace.ps1"
               KeyPath="yes" />
       </Component>
+
+      <Component Id="CreateServiceAccountScript">
+        <File Id="CreateServiceAccountPs1"
+              Source="CreateServiceAccount.ps1"
+              Name="CreateServiceAccount.ps1"
+              KeyPath="yes" />
+      </Component>
     </ComponentGroup>
 
-    <!-- Config dir with restrictive ACL. util:PermissionEx breaks inheritance
-         and grants only the service account, Administrators, and SYSTEM
-         (mirrors what SetTokenFileAcl.ps1 does for the TOKEN file). -->
+    <!-- Config + log dirs with a restrictive ACL: only well-known principals
+         (Administrators, SYSTEM) here, because util:PermissionEx runs during
+         InstallFiles - that's BEFORE CreateServiceAccount has provisioned
+         [SERVICEACCOUNT] and therefore before LookupAccountName can resolve
+         it. The service account's grant is added afterwards by
+         CreateServiceAccount.ps1 via icacls. util:PermissionEx replaces the
+         inherited ProgramData ACL (which would otherwise give BUILTIN\Users
+         read access), so even if our CA were to fail we don't degrade to a
+         world-listable config dir. -->
     <ComponentGroup Id="ConfigDirComponents" Directory="CONFIGDIR">
       <Component Id="ConfigDirComponent">
         <CreateFolder>
-          <util:PermissionEx User="[SERVICEACCOUNT]" GenericAll="yes" />
           <util:PermissionEx User="Administrators" GenericAll="yes" />
           <util:PermissionEx User="SYSTEM" GenericAll="yes" />
         </CreateFolder>
@@ -183,7 +203,6 @@
     <ComponentGroup Id="LogDirComponents" Directory="LOGDIR">
       <Component Id="LogDirComponent">
         <CreateFolder>
-          <util:PermissionEx User="[SERVICEACCOUNT]" GenericAll="yes" />
           <util:PermissionEx User="Administrators" GenericAll="yes" />
           <util:PermissionEx User="SYSTEM" GenericAll="yes" />
         </CreateFolder>
@@ -214,6 +233,21 @@
          append '.' so the value resolves to "...\fivenines_agent\." (closing
          quote is preceded by '.', not '\'). The PS script accepts the trailing
          '\.' just fine - it joins TOKEN onto it normally. -->
+    <!-- Provision the dedicated service account (creates it + random password
+         if needed, group memberships, SeServiceLogonRight, sc.exe config flip)
+         immediately after InstallServices. Must run BEFORE WriteTokenAcl and
+         DelegateWmi since those both look up [SERVICEACCOUNT]'s SID. -->
+    <SetProperty Id="CreateServiceAccount"
+                 Value="&quot;powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -File &quot;[#CreateServiceAccountPs1]&quot; -ServiceAccount &quot;[SERVICEACCOUNT]&quot; -Password &quot;[SERVICEACCOUNTPASSWORD]&quot;"
+                 Before="CreateServiceAccount"
+                 Sequence="execute" />
+    <CustomAction Id="CreateServiceAccount"
+                  DllEntry="WixQuietExec"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check"
+                  BinaryRef="Wix4UtilCA_X64" />
+
     <SetProperty Id="WriteTokenAcl"
                  Value="&quot;powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -File &quot;[#SetTokenAclPs1]&quot; -ConfigDir &quot;[CONFIGDIR].&quot; -ServiceAccount &quot;[SERVICEACCOUNT]&quot; -Token &quot;[TOKEN]&quot;"
                  Before="WriteTokenAcl"
@@ -237,10 +271,19 @@
                   BinaryRef="Wix4UtilCA_X64" />
 
     <InstallExecuteSequence>
-      <!-- Run the security custom actions after the service is registered
-           but before it starts so the first agent tick reads the secured TOKEN
-           and queries the delegated WMI namespace. -->
-      <Custom Action="WriteTokenAcl" After="InstallServices" Condition="NOT Installed" />
+      <!-- Sequence the post-install CAs:
+             1. CreateServiceAccount: provision the dedicated low-priv account
+                (or validate an operator-supplied one) and flip the service
+                from the LocalSystem placeholder to that account.
+             2. WriteTokenAcl: write TOKEN under the config dir with an ACL
+                that grants only the (now-existing) service account + admins
+                + SYSTEM.
+             3. DelegateWmi: grant the service account read on the WMI Storage
+                namespace so the disk-health collector works without admin.
+           All three run after InstallServices and before the MSI hands back
+           control. The service is not auto-started during install. -->
+      <Custom Action="CreateServiceAccount" After="InstallServices" Condition="NOT Installed" />
+      <Custom Action="WriteTokenAcl" After="CreateServiceAccount" Condition="NOT Installed" />
       <Custom Action="DelegateWmi" After="WriteTokenAcl" Condition="NOT Installed" />
     </InstallExecuteSequence>
 
