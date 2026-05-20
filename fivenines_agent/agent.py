@@ -51,7 +51,10 @@ def _on_sighup(signum, frame):
 def setup_signals():
     signal.signal(signal.SIGTERM, _on_exit_signal)
     signal.signal(signal.SIGINT, _on_exit_signal)
-    signal.signal(signal.SIGHUP, _on_sighup)
+    # SIGHUP is Linux-only; on Windows the agent relies on the 5-minute
+    # auto-reprobe in PermissionProbe.refresh_if_needed (D9).
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, _on_sighup)
 
 
 class Agent:
