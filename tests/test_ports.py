@@ -164,8 +164,13 @@ def test_listening_ports_skips_conn_without_laddr():
 
 
 def test_listening_ports_skips_unknown_proto():
-    """Non-inet families (e.g. AF_UNIX) are filtered out."""
-    weird = _conn(socket.AF_UNIX, socket.SOCK_STREAM, "/tmp/sock", 0, psutil.CONN_LISTEN)
+    """Non-inet families are filtered out.
+
+    Uses a sentinel integer family value rather than socket.AF_UNIX so the
+    test runs on Windows builds where AF_UNIX isn't exposed by the stdlib
+    socket module.
+    """
+    weird = _conn(999, socket.SOCK_STREAM, "/tmp/sock", 0, psutil.CONN_LISTEN)
     with patch("fivenines_agent.ports.psutil.net_connections", return_value=[weird]):
         assert listening_ports() == []
 

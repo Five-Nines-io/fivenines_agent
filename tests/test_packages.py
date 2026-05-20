@@ -4,6 +4,8 @@ import hashlib
 import subprocess
 from unittest.mock import MagicMock, mock_open, patch
 
+import pytest
+
 from fivenines_agent.packages import (
     _get_packages_apk,
     _get_packages_dpkg,
@@ -16,6 +18,16 @@ from fivenines_agent.packages import (
     get_packages_hash,
     packages_available,
 )
+
+
+@pytest.fixture(autouse=True)
+def _default_to_linux_packages_path():
+    """Existing tests exercise the Linux package-manager dispatch; force
+    is_windows=False by default so they run identically on Windows CI.
+    Windows-specific tests explicitly override via @patch decorator (decorator
+    wins inside the test body)."""
+    with patch("fivenines_agent.packages.is_windows", return_value=False):
+        yield
 
 
 # --- packages_available ---

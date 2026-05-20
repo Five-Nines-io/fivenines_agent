@@ -3,7 +3,18 @@
 from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from fivenines_agent.permissions import CAPABILITY_HINTS, PermissionProbe
+
+
+@pytest.fixture(autouse=True)
+def _default_to_linux_probe():
+    """Existing tests exercise the Linux capability probe; force
+    is_windows=False by default so they run identically on Windows CI.
+    Windows-specific tests explicitly override via @patch (decorator wins)."""
+    with patch("fivenines_agent.permissions.is_windows", return_value=False):
+        yield
 
 _PROBE_METHODS = (
     "_can_read",

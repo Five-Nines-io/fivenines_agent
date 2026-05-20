@@ -3,12 +3,25 @@
 import os
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from fivenines_agent.env import (
     config_dir,
     get_user_context,
     is_windows,
     os_family,
 )
+
+
+@pytest.fixture(autouse=True)
+def _default_to_linux_env_path():
+    """Force is_windows=False by default so existing Linux-shape tests for
+    get_user_context (and similar) run identically on Windows CI. Tests that
+    exercise the Windows branch explicitly override via @patch (decorator
+    wins inside the test body). Tests that exercise the is_windows function
+    itself should test os_family() directly, which is not patched here."""
+    with patch("fivenines_agent.env.is_windows", return_value=False):
+        yield
 
 
 def test_get_user_context_returns_dict():
@@ -80,14 +93,11 @@ def test_os_family_is_lowercase():
     assert isinstance(result, str) and result
 
 
-def test_is_windows_false_on_this_host():
-    # Test host is macOS or a Linux CI runner, never Windows.
-    assert is_windows() is False
-
-
 @patch("fivenines_agent.env.platform.system", return_value="Windows")
-def test_is_windows_true_when_platform_is_windows(mock_sys):
-    assert is_windows() is True
+def test_os_family_returns_windows_when_platform_is_windows(mock_sys):
+    # is_windows() is autouse-patched in this file, so test the underlying
+    # os_family() directly. is_windows() is defined as `os_family() == 'windows'`
+    # so this is the meaningful check.
     assert os_family() == "windows"
 
 
@@ -123,9 +133,16 @@ def test_config_dir_windows_missing_programdata():
 
 
 def test_get_user_context_windows_admin_check_unavailable():
-    # On a non-Windows host, ctypes.windll raises AttributeError -> is_admin False.
+    """When ctypes.windll IsUserAnAdmin raises, is_admin is False.
+
+    Mock ctypes to raise deterministically so the test exercises the failure
+    path on both non-Windows hosts (where ctypes.windll genuinely doesn't
+    exist) and on Windows CI (where it does and the runner is admin)."""
+    fake_ctypes = MagicMock()
+    fake_ctypes.windll.shell32.IsUserAnAdmin.side_effect = AttributeError("windll unavailable")
     with patch("fivenines_agent.env.is_windows", return_value=True), \
-         patch("getpass.getuser", return_value="Administrator"):
+         patch("getpass.getuser", return_value="Administrator"), \
+         patch.dict("sys.modules", {"ctypes": fake_ctypes}):
         result = get_user_context(r"C:\ProgramData\fivenines_agent")
     assert result["username"] == "Administrator"
     assert result["os_family"] == "windows"
