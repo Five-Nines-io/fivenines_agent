@@ -18,7 +18,7 @@
 
   This file is WiX 4 syntax. The Windows CI runner (T14) builds the MSI with
   the WiX 4 toolset. Source variables:
-    AgentBinarySource = the PyInstaller --onedir OUTPUT DIRECTORY
+    AgentBinarySource = the PyInstaller onedir OUTPUT DIRECTORY
                         (e.g. dist/windows/fivenines-agent-windows-amd64/).
                         The MSI ships the .exe AND the _internal/ subdir
                         (python311.dll, base_library.zip, all bundled DLLs).
@@ -87,7 +87,7 @@
               KeyPath="yes" />
       </Component>
 
-      <!-- Harvest the full PyInstaller --onedir payload (_internal\) so the
+      <!-- Harvest the full PyInstaller onedir payload (_internal\) so the
            bootloader can find python311.dll + base_library.zip + all the
            hidden-import DLLs. Without this the exe starts and immediately
            fails with PYI-ERROR "Failed to load Python DLL ... The specified
