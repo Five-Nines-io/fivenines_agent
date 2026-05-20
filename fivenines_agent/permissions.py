@@ -8,7 +8,10 @@ import shutil
 import subprocess
 import time
 
+import psutil
+
 from fivenines_agent.debug import log
+from fivenines_agent.env import is_windows
 from fivenines_agent.subprocess_utils import get_clean_env
 
 
@@ -35,7 +38,28 @@ CAPABILITY_HINTS = {
     "temperatures": "no accessible sensors",
     "fans": "no accessible sensors",
     "snmp": "requires net-snmp",
+    "disk_health": "requires WMI Storage namespace access",
+    "software_inventory": "requires Uninstall registry key access",
 }
+
+# Banner group layout per OS. Each entry is (section title, [capability keys]).
+LINUX_BANNER_GROUPS = [
+    ("Core Metrics", ["cpu", "memory", "load_average", "io", "network",
+                      "partitions", "file_handles", "ports", "processes"]),
+    ("Hardware Sensors", ["temperatures", "fans", "nvidia_gpu"]),
+    ("Storage", ["smart_storage", "raid_storage", "zfs"]),
+    ("Services", ["docker", "qemu", "proxmox"]),
+    ("Security", ["fail2ban", "packages"]),
+    ("Networking", ["snmp"]),
+]
+
+WINDOWS_BANNER_GROUPS = [
+    ("Core Metrics", ["cpu", "memory", "load_average", "io", "network",
+                      "partitions", "file_handles", "ports", "processes"]),
+    ("Hardware Sensors", ["temperatures", "fans", "nvidia_gpu"]),
+    ("Storage", ["disk_health"]),
+    ("Inventory", ["software_inventory"]),
+]
 
 
 class PermissionProbe:
@@ -74,11 +98,45 @@ class PermissionProbe:
         return result
 
     def _probe_all(self):
-        """Probe all capabilities and cache results."""
+        """Probe all capabilities and cache results.
+
+        Branches once on OS family. The Linux probe reports its existing
+        capability set; the Windows probe reports a Windows-tailored set
+        (D13 - the backend handles the different shape).
+        """
         self._last_probe_time = time.time()
         old_capabilities = self.capabilities.copy()
 
-        self.capabilities = {
+        if is_windows():
+            self.capabilities = self._build_windows_capabilities()
+        else:
+            self.capabilities = self._build_linux_capabilities()
+
+        if not old_capabilities:
+            # Initial probe: surface every unavailable capability at info level
+            # so operators see WHY at default LOG_LEVEL. Format:
+            #   Capability 'X' unavailable: <hint> (<probe-method reason>)
+            for cap, available in self.capabilities.items():
+                if available:
+                    continue
+                log(self._format_unavailable(cap, "unavailable"), "info")
+        else:
+            # Subsequent probes: log only state flips. Unavailability transitions
+            # carry the same hint+reason payload as the initial probe.
+            for cap, available in self.capabilities.items():
+                old_value = old_capabilities.get(cap)
+                if old_value is None or old_value == available:
+                    continue
+                if available:
+                    log(f"Capability '{cap}' is now AVAILABLE", "info")
+                else:
+                    log(self._format_unavailable(cap, "is now UNAVAILABLE"), "info")
+
+        return self.capabilities
+
+    def _build_linux_capabilities(self):
+        """Linux capability set: /proc, /sys, sudo, sockets, package managers."""
+        return {
             # Core metrics - always available via /proc
             "cpu": self._probe("cpu", self._can_read, "/proc/stat"),
             "memory": self._probe("memory", self._can_read, "/proc/meminfo"),
@@ -114,27 +172,36 @@ class PermissionProbe:
             "snmp": self._probe("snmp", self._has_snmpget),
         }
 
-        if not old_capabilities:
-            # Initial probe: surface every unavailable capability at info level
-            # so operators see WHY at default LOG_LEVEL. Format:
-            #   Capability 'X' unavailable: <hint> (<probe-method reason>)
-            for cap, available in self.capabilities.items():
-                if available:
-                    continue
-                log(self._format_unavailable(cap, "unavailable"), "info")
-        else:
-            # Subsequent probes: log only state flips. Unavailability transitions
-            # carry the same hint+reason payload as the initial probe.
-            for cap, available in self.capabilities.items():
-                old_value = old_capabilities.get(cap)
-                if old_value is None or old_value == available:
-                    continue
-                if available:
-                    log(f"Capability '{cap}' is now AVAILABLE", "info")
-                else:
-                    log(self._format_unavailable(cap, "is now UNAVAILABLE"), "info")
+    def _build_windows_capabilities(self):
+        """Windows-tailored capability set (D13).
 
-        return self.capabilities
+        Core metrics report True unconditionally - psutil works on Windows.
+        Linux-only capabilities (raid_storage, zfs, fail2ban, proxmox, qemu,
+        smart_storage via smartctl, packages via dpkg/rpm) are omitted: D13
+        sends a Windows-shaped payload rather than Linux keys marked N/A.
+        Windows-native entries: disk_health (WMI Storage), software_inventory
+        (registry Uninstall key).
+        """
+        return {
+            # Core metrics - psutil handles these cross-platform
+            "cpu": True,
+            "memory": True,
+            "load_average": True,
+            "io": True,
+            "network": True,
+            "partitions": True,
+            "file_handles": True,
+            "ports": True,
+            "processes": True,
+            # Hardware sensors - psutil reports if any are exposed
+            "temperatures": self._probe("temperatures", self._can_query_psutil_sensors, "temperatures"),
+            "fans": self._probe("fans", self._can_query_psutil_sensors, "fans"),
+            "nvidia_gpu": self._probe("nvidia_gpu", self._can_access_gpu),
+            # Windows-native: WMI MSFT_PhysicalDisk + reliability counters
+            "disk_health": self._probe("disk_health", self._can_query_wmi_storage),
+            # Windows-native: registry Uninstall key (classic Win32 installed programs)
+            "software_inventory": self._probe("software_inventory", self._can_read_uninstall_registry),
+        }
 
     def _format_unavailable(self, cap, verb):
         """Build the operator-facing log line for an unavailable capability."""
@@ -466,6 +533,62 @@ class PermissionProbe:
         self._set_reason("no supported package manager (dpkg-query, rpm, apk, pacman, synopkg)")
         return False
 
+    def _can_query_psutil_sensors(self, kind):
+        """Probe psutil hardware-sensor support on Windows.
+
+        kind is 'temperatures' or 'fans'. psutil docs list these as Linux/FreeBSD
+        only - on Windows the attribute typically does not exist or returns
+        empty. Treat 'method exists and returns at least one sensor' as True.
+        """
+        attr = f"sensors_{kind}"
+        try:
+            method = getattr(psutil, attr)
+        except AttributeError as e:
+            self._set_reason(f"psutil.{attr} unavailable: {e}")
+            return False
+        try:
+            data = method()
+        except (OSError, NotImplementedError) as e:
+            self._set_reason(f"psutil.{attr} call failed: {e}")
+            return False
+        if data:
+            return True
+        self._set_reason(f"psutil.{attr} reported no sensors")
+        return False
+
+    def _can_query_wmi_storage(self):
+        """Probe whether WMI Storage namespace queries are likely to work.
+
+        Light check: the wmi package must import (pywin32 + wmi installed).
+        The actual disk-health collector runs subprocess-isolated and handles
+        WMI runtime errors there (D11). Hung/wedged WMI is the collector's
+        problem, not the probe's.
+        """
+        try:
+            import wmi  # type: ignore[import-not-found]  # noqa: F401
+        except ImportError as e:
+            self._set_reason(f"wmi package not installed: {e}")
+            return False
+        return True
+
+    def _can_read_uninstall_registry(self):
+        """Probe whether the Windows Uninstall registry key opens read-only."""
+        try:
+            import winreg  # type: ignore[import-not-found]
+        except ImportError as e:
+            self._set_reason(f"winreg unavailable: {e}")
+            return False
+        try:
+            key = winreg.OpenKey(  # type: ignore[attr-defined]
+                winreg.HKEY_LOCAL_MACHINE,  # type: ignore[attr-defined]
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+            )
+            winreg.CloseKey(key)  # type: ignore[attr-defined]
+            return True
+        except OSError as e:
+            self._set_reason(f"Uninstall registry key unreadable: {e}")
+            return False
+
     def get(self, capability, default=False):
         """Get a specific capability status."""
         return self.capabilities.get(capability, default)
@@ -510,23 +633,8 @@ def print_capabilities_banner():
     probe = get_permissions()
     caps = probe.get_all()
 
-    # Group capabilities for display
-    core_metrics = [
-        "cpu",
-        "memory",
-        "load_average",
-        "io",
-        "network",
-        "partitions",
-        "file_handles",
-        "ports",
-        "processes",
-    ]
-    hardware = ["temperatures", "fans", "nvidia_gpu"]
-    storage = ["smart_storage", "raid_storage", "zfs"]
-    services = ["docker", "qemu", "proxmox"]
-    security = ["fail2ban", "packages"]
-    networking = ["snmp"]
+    groups = WINDOWS_BANNER_GROUPS if is_windows() else LINUX_BANNER_GROUPS
+    core_metrics = groups[0][1]  # first group is always Core Metrics
 
     print("")
     print("=" * 60)
@@ -548,12 +656,8 @@ def print_capabilities_banner():
             print(f"    {icon} {name}{hint}")
         print("")
 
-    print_section("Core Metrics", core_metrics)
-    print_section("Hardware Sensors", hardware)
-    print_section("Storage", storage)
-    print_section("Services", services)
-    print_section("Security", security)
-    print_section("Networking", networking)
+    for title, caps_list in groups:
+        print_section(title, caps_list)
 
     unavailable = probe.get_unavailable()
     if unavailable:

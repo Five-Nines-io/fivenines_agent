@@ -1,7 +1,7 @@
 """Tests for PermissionProbe initial-probe and flip logging."""
 
 from contextlib import ExitStack
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from fivenines_agent.permissions import CAPABILITY_HINTS, PermissionProbe
 
@@ -16,6 +16,9 @@ _PROBE_METHODS = (
     "_can_access_proxmox",
     "_can_list_packages",
     "_has_snmpget",
+    "_can_query_psutil_sensors",
+    "_can_query_wmi_storage",
+    "_can_read_uninstall_registry",
 )
 
 _ALL_TRUE_CAPS = {
@@ -115,13 +118,17 @@ def test_flip_to_available_logs_without_hint():
 
 
 def test_capability_hints_keys_are_known_capabilities():
-    """Every hint key must correspond to a capability produced by _probe_all."""
+    """Every hint key must correspond to a capability in some OS probe."""
     with _patched_probe({"default": True}):
         probe = PermissionProbe()
+        linux_keys = set(probe._build_linux_capabilities().keys())
+        with patch("fivenines_agent.permissions.is_windows", return_value=True):
+            windows_keys = set(probe._build_windows_capabilities().keys())
+    all_keys = linux_keys | windows_keys
 
     for hint_key in CAPABILITY_HINTS:
         assert (
-            hint_key in probe.capabilities
+            hint_key in all_keys
         ), f"hint {hint_key!r} has no matching capability"
 
 
@@ -245,3 +252,136 @@ def test_unavailable_log_without_reason_omits_parens():
     docker_msg = next(m for m in info_msgs if "docker" in m and "unavailable" in m)
     # Patched probe returns False without calling _set_reason -> no parens.
     assert docker_msg.endswith("docker group")
+
+
+# ----- T2: Windows-tailored capability set, banner, and probe methods -----
+
+
+@patch("fivenines_agent.permissions.is_windows", return_value=True)
+def test_build_windows_capabilities_has_windows_shape(mock_iw):
+    """Windows probe omits Linux-only keys and includes Windows-native keys."""
+    with _patched_probe({"default": True}):
+        probe = PermissionProbe()
+
+    # Linux-only keys are absent (D13 - the payload is Windows-shaped).
+    for absent in ("raid_storage", "zfs", "fail2ban", "proxmox", "qemu",
+                   "smart_storage", "packages", "snmp", "docker"):
+        assert absent not in probe.capabilities, \
+            f"Linux-only key {absent!r} leaked into Windows capability set"
+
+    # Windows-native entries are present.
+    assert "disk_health" in probe.capabilities
+    assert "software_inventory" in probe.capabilities
+
+    # Core metrics are unconditionally True on Windows (psutil works).
+    for core in ("cpu", "memory", "load_average", "io", "network",
+                 "partitions", "file_handles", "ports", "processes"):
+        assert probe.capabilities[core] is True
+
+
+def test_can_query_psutil_sensors_returns_true_when_data():
+    probe = _new_probe_with({})
+    with patch("fivenines_agent.permissions.psutil") as fake_psutil:
+        fake_psutil.sensors_temperatures = MagicMock(
+            return_value={"coretemp": [object()]}
+        )
+        assert probe._can_query_psutil_sensors("temperatures") is True
+
+
+def test_can_query_psutil_sensors_returns_false_when_empty():
+    probe = _new_probe_with({})
+    with patch("fivenines_agent.permissions.psutil") as fake_psutil:
+        fake_psutil.sensors_temperatures = MagicMock(return_value={})
+        assert probe._can_query_psutil_sensors("temperatures") is False
+
+
+def test_can_query_psutil_sensors_attribute_missing():
+    """Windows psutil typically lacks sensors_fans; probe handles AttributeError."""
+    probe = _new_probe_with({})
+    fake_psutil = MagicMock(spec=[])  # no attributes at all
+    with patch("fivenines_agent.permissions.psutil", fake_psutil):
+        assert probe._can_query_psutil_sensors("fans") is False
+
+
+def test_can_query_psutil_sensors_raises_oserror():
+    probe = _new_probe_with({})
+    with patch("fivenines_agent.permissions.psutil") as fake_psutil:
+        fake_psutil.sensors_temperatures = MagicMock(side_effect=OSError("boom"))
+        assert probe._can_query_psutil_sensors("temperatures") is False
+
+
+def test_can_query_wmi_storage_present():
+    probe = _new_probe_with({})
+    with patch.dict("sys.modules", {"wmi": MagicMock()}):
+        assert probe._can_query_wmi_storage() is True
+
+
+def test_can_query_wmi_storage_absent():
+    """wmi package not installed -> probe is False with a reason."""
+    probe = _new_probe_with({})
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "wmi":
+            raise ImportError("not installed")
+        return real_import(name, *args, **kwargs)
+
+    with patch.object(builtins, "__import__", fake_import):
+        assert probe._can_query_wmi_storage() is False
+    assert "wmi package not installed" in probe._capability_reasons.get(
+        "_current", probe._current_reason or ""
+    )
+
+
+def test_can_read_uninstall_registry_success():
+    probe = _new_probe_with({})
+    fake_winreg = MagicMock()
+    fake_winreg.HKEY_LOCAL_MACHINE = "HKLM"
+    fake_winreg.OpenKey.return_value = "key-handle"
+    with patch.dict("sys.modules", {"winreg": fake_winreg}):
+        assert probe._can_read_uninstall_registry() is True
+    fake_winreg.OpenKey.assert_called_once()
+    fake_winreg.CloseKey.assert_called_once_with("key-handle")
+
+
+def test_can_read_uninstall_registry_missing_winreg():
+    """winreg unimportable on non-Windows -> probe False."""
+    probe = _new_probe_with({})
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "winreg":
+            raise ImportError("not on this OS")
+        return real_import(name, *args, **kwargs)
+
+    with patch.object(builtins, "__import__", fake_import):
+        assert probe._can_read_uninstall_registry() is False
+
+
+def test_can_read_uninstall_registry_openkey_oserror():
+    probe = _new_probe_with({})
+    fake_winreg = MagicMock()
+    fake_winreg.HKEY_LOCAL_MACHINE = "HKLM"
+    fake_winreg.OpenKey.side_effect = OSError("access denied")
+    with patch.dict("sys.modules", {"winreg": fake_winreg}):
+        assert probe._can_read_uninstall_registry() is False
+
+
+def test_banner_uses_windows_groups(capsys):
+    """On Windows, the banner shows Windows groupings (no Services/Security/Networking)."""
+    import fivenines_agent.permissions as perm
+    original_probe = perm._probe
+    perm._probe = None  # force fresh singleton inside the Windows mock
+    try:
+        with patch("fivenines_agent.permissions.is_windows", return_value=True), \
+             _patched_probe({"default": True}):
+            perm.print_capabilities_banner()
+    finally:
+        perm._probe = original_probe
+    out = capsys.readouterr().out
+    assert "Inventory" in out  # Windows-only banner section
+    assert "Disk Health" in out  # Windows-only capability
+    assert "Services" not in out  # Linux services section absent
+    assert "Fail2Ban" not in out  # Linux-only capability absent
