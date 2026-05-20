@@ -1,9 +1,14 @@
 """Tests for env module functions including get_user_context."""
 
 import os
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from fivenines_agent.env import get_user_context
+from fivenines_agent.env import (
+    config_dir,
+    get_user_context,
+    is_windows,
+    os_family,
+)
 
 
 def test_get_user_context_returns_dict():
@@ -64,3 +69,86 @@ def test_get_user_context_unknown_group(mock_grp):
     assert result["groupname"] == str(os.getgid())
     # groups list should also fall back to numeric strings
     assert all(isinstance(g, str) for g in result["groups"])
+
+
+# ----- T1: OS helpers, OS-aware config_dir, Windows user context -----
+
+
+def test_os_family_is_lowercase():
+    result = os_family()
+    assert result == result.lower()
+    assert isinstance(result, str) and result
+
+
+def test_is_windows_false_on_this_host():
+    # Test host is macOS or a Linux CI runner, never Windows.
+    assert is_windows() is False
+
+
+@patch("fivenines_agent.env.platform.system", return_value="Windows")
+def test_is_windows_true_when_platform_is_windows(mock_sys):
+    assert is_windows() is True
+    assert os_family() == "windows"
+
+
+def test_config_dir_linux_default():
+    with patch.dict(os.environ, {}, clear=False), \
+         patch("fivenines_agent.env.is_windows", return_value=False):
+        os.environ.pop("CONFIG_DIR", None)
+        assert config_dir() == "/etc/fivenines_agent"
+
+
+def test_config_dir_env_override_wins():
+    with patch.dict(os.environ, {"CONFIG_DIR": "/custom/path"}):
+        assert config_dir() == "/custom/path"
+
+
+def test_config_dir_windows_default():
+    with patch.dict(os.environ, {"ProgramData": r"C:\ProgramData"}, clear=False), \
+         patch("fivenines_agent.env.is_windows", return_value=True):
+        os.environ.pop("CONFIG_DIR", None)
+        result = config_dir()
+    assert "fivenines_agent" in result
+    assert "ProgramData" in result
+
+
+def test_config_dir_windows_missing_programdata():
+    with patch.dict(os.environ, {}, clear=False), \
+         patch("fivenines_agent.env.is_windows", return_value=True):
+        os.environ.pop("CONFIG_DIR", None)
+        os.environ.pop("ProgramData", None)
+        result = config_dir()
+    assert "fivenines_agent" in result
+    assert "ProgramData" in result  # falls back to C:\\ProgramData
+
+
+def test_get_user_context_windows_admin_check_unavailable():
+    # On a non-Windows host, ctypes.windll raises AttributeError -> is_admin False.
+    with patch("fivenines_agent.env.is_windows", return_value=True), \
+         patch("getpass.getuser", return_value="Administrator"):
+        result = get_user_context(r"C:\ProgramData\fivenines_agent")
+    assert result["username"] == "Administrator"
+    assert result["os_family"] == "windows"
+    assert result["is_admin"] is False
+    assert result["is_root"] is False
+    assert result["is_user_install"] is False
+    assert result["config_dir"] == r"C:\ProgramData\fivenines_agent"
+
+
+def test_get_user_context_windows_admin_check_succeeds():
+    fake_ctypes = MagicMock()
+    fake_ctypes.windll.shell32.IsUserAnAdmin.return_value = 1
+    with patch("fivenines_agent.env.is_windows", return_value=True), \
+         patch("getpass.getuser", return_value="admin"), \
+         patch.dict("sys.modules", {"ctypes": fake_ctypes}):
+        result = get_user_context(r"C:\ProgramData\fivenines_agent")
+    assert result["is_admin"] is True
+    assert result["is_root"] is True
+
+
+def test_get_user_context_windows_getuser_fallback():
+    with patch("fivenines_agent.env.is_windows", return_value=True), \
+         patch("getpass.getuser", side_effect=OSError("no user")), \
+         patch.dict(os.environ, {"USERNAME": "envuser"}, clear=False):
+        result = get_user_context(r"C:\x")
+    assert result["username"] == "envuser"
