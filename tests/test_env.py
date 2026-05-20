@@ -1,6 +1,7 @@
 """Tests for env module functions including get_user_context."""
 
 import os
+import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -24,6 +25,17 @@ def _default_to_linux_env_path():
         yield
 
 
+# Tests asserting the Linux/POSIX get_user_context shape (uid/euid/gid,
+# pwd.getpwuid, grp.getgrgid). Cannot run on Windows because os.getuid
+# itself does not exist there - the Windows branch (_windows_user_context)
+# is exercised by the explicit Windows test functions below.
+linux_user_context_only = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Test asserts Linux/POSIX get_user_context shape; Windows uses _windows_user_context",
+)
+
+
+@linux_user_context_only
 def test_get_user_context_returns_dict():
     result = get_user_context("/opt/fivenines")
     assert isinstance(result, dict)
@@ -39,12 +51,14 @@ def test_get_user_context_returns_dict():
     assert "home_dir" in result
 
 
+@linux_user_context_only
 def test_get_user_context_system_install():
     result = get_user_context("/opt/fivenines")
     assert result["config_dir"] == "/opt/fivenines"
     assert result["is_user_install"] is False
 
 
+@linux_user_context_only
 def test_get_user_context_user_install():
     home = os.path.expanduser("~")
     cfg_dir = os.path.join(home, ".local/fivenines")
@@ -52,6 +66,7 @@ def test_get_user_context_user_install():
     assert result["is_user_install"] is True
 
 
+@linux_user_context_only
 def test_get_user_context_current_user():
     result = get_user_context("/opt/fivenines")
     assert result["uid"] == os.getuid()
@@ -60,6 +75,7 @@ def test_get_user_context_current_user():
     assert result["is_root"] == (os.getuid() == 0)
 
 
+@linux_user_context_only
 @patch("fivenines_agent.env.os.getuid", side_effect=OSError("mocked"))
 def test_get_user_context_error_fallback(mock_uid):
     result = get_user_context("/opt/fivenines")
@@ -70,12 +86,14 @@ def test_get_user_context_error_fallback(mock_uid):
     }
 
 
+@linux_user_context_only
 @patch("fivenines_agent.env.pwd.getpwuid", side_effect=KeyError("no user"))
 def test_get_user_context_unknown_username(mock_pw):
     result = get_user_context("/opt/fivenines")
     assert result["username"] == str(os.getuid())
 
 
+@linux_user_context_only
 @patch("fivenines_agent.env.grp.getgrgid", side_effect=KeyError("no group"))
 def test_get_user_context_unknown_group(mock_grp):
     result = get_user_context("/opt/fivenines")
