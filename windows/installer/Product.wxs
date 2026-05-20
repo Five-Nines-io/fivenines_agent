@@ -32,26 +32,24 @@
            Scope="perMachine"
            InstallerVersion="500">
 
-    <SummaryInformation Description="Fivenines Monitoring Agent Installer"
-                        Comments="https://fivenines.io" />
+    <SummaryInformation Description="Fivenines Monitoring Agent Installer" />
 
     <!-- Major upgrade: same UpgradeCode auto-replaces older versions cleanly. -->
     <MajorUpgrade DowngradeErrorMessage="A newer version of Fivenines Agent is already installed." />
 
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
-    <!-- Enrollment token: hidden so it does not appear in installer logs or
-         process command lines (D21 / Section 3 F1). -->
-    <Property Id="TOKEN" Secure="yes" />
-    <Property Id="MsiHiddenProperties" Value="TOKEN;SERVICEACCOUNTPASSWORD" />
+    <!-- Enrollment token: Hidden="yes" keeps it out of installer logs;
+         Secure="yes" lets it be passed through to deferred custom actions
+         (D21 / Section 3 F1). -->
+    <Property Id="TOKEN" Secure="yes" Hidden="yes" />
 
-    <!-- Service account properties. Default values target the dedicated
+    <!-- Service account properties. Default value targets the dedicated
          low-priv account the MSI creates pre-install. The 'fivenines-agent'
-         local account is created by a custom action; password is generated
-         and stored only in the SCM-backed registry (the MSI doesn't keep
-         it after install). -->
+         local account is created by a custom action; the password is
+         supplied by the deployment tool and is Hidden in logs. -->
     <Property Id="SERVICEACCOUNT" Value=".\fivenines-agent" />
-    <Property Id="SERVICEACCOUNTPASSWORD" Secure="yes" />
+    <Property Id="SERVICEACCOUNTPASSWORD" Secure="yes" Hidden="yes" />
 
     <Property Id="ARPCONTACT" Value="sebastien@fivenines.io" />
     <Property Id="ARPHELPLINK" Value="https://docs.fivenines.io/agent" />
