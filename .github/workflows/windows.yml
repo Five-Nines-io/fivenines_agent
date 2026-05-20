@@ -141,9 +141,13 @@ jobs:
         shell: pwsh
         working-directory: windows/installer
         run: |
+          # AgentBinarySource = the full PyInstaller --onedir output DIR, not
+          # just the .exe. The WXS harvests _internal\ from this dir via a
+          # Files element; shipping only the exe leaves python311.dll behind
+          # and the service fails to start with PYI "module could not be found".
           wix build .\Product.wxs `
             -ext WixToolset.Util.wixext `
-            -d "AgentBinarySource=..\..\dist\windows\fivenines-agent-windows-amd64\fivenines-agent-windows-amd64.exe" `
+            -d "AgentBinarySource=..\..\dist\windows\fivenines-agent-windows-amd64" `
             -d "WinSwSource=..\..\dist\windows\WinSW.NET4.exe" `
             -d "WinSwConfigSource=..\winsw\fivenines-agent.xml" `
             -arch x64 `
@@ -262,45 +266,18 @@ jobs:
             exit 1
           }
 
-      - name: Diagnostics - install dir contents + service-account access
+      - name: Sanity check - install dir has the PyInstaller payload
         shell: pwsh
         run: |
           $installDir = "C:\Program Files\fivenines-agent"
-          Write-Host "=== Install dir top-level ==="
-          Get-ChildItem $installDir | Format-Table Mode, Length, Name
-          Write-Host "=== _internal directory listing (first 50 entries) ==="
-          Get-ChildItem (Join-Path $installDir "_internal") | Select-Object -First 50 | Format-Table Mode, Length, Name
-          Write-Host "=== VC++ runtime presence ==="
-          $vcruntimes = @("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "ucrtbase.dll")
-          foreach ($d in $vcruntimes) {
-            $hits = Get-ChildItem $installDir -Recurse -Filter $d -ErrorAction SilentlyContinue |
-                    Select-Object -ExpandProperty FullName
-            if ($hits) {
-              Write-Host ("  {0}: {1}" -f $d, ($hits -join "; "))
-            } else {
-              Write-Host ("  {0}: MISSING from install dir" -f $d)
-            }
-          }
-          Write-Host "=== python311.dll resolved? ==="
           $pythonDll = Join-Path $installDir "_internal\python311.dll"
-          if (Test-Path $pythonDll) {
-            Write-Host ("  Found: {0}" -f $pythonDll)
-            $acl = Get-Acl $pythonDll
-            Write-Host "  Principals on python311.dll:"
-            $acl.Access | ForEach-Object {
-              Write-Host ("    {0} -> {1}" -f $_.IdentityReference, $_.FileSystemRights)
-            }
-          } else {
-            Write-Host "  MISSING"
+          if (-not (Test-Path $pythonDll)) {
+            Write-Host "Install dir contents:"
+            Get-ChildItem $installDir -Recurse -Depth 1 | Format-Table Mode, Length, Name
+            Write-Error "python311.dll missing - MSI did not bundle the PyInstaller _internal\ payload"
+            exit 1
           }
-          Write-Host "=== service-account effective access via icacls ==="
-          icacls "$installDir" /verify 2>&1 | Select-Object -First 5
-          Write-Host "=== fivenines-agent group memberships ==="
-          Get-LocalGroup | ForEach-Object {
-            $members = Get-LocalGroupMember -Group $_.Name -ErrorAction SilentlyContinue |
-                       Where-Object { $_.Name -match "fivenines-agent" }
-            if ($members) { Write-Host ("  member of: {0}" -f $_.Name) }
-          }
+          Write-Host "OK: $pythonDll present"
 
       - name: Verify service is registered and running
         shell: pwsh

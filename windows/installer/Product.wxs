@@ -17,10 +17,15 @@
       the service, config dir, and logs.
 
   This file is WiX 4 syntax. The Windows CI runner (T14) builds the MSI with
-  the WiX 4 toolset. Source variables (AgentBinarySource, WinSwSource,
-  WinSwConfigSource) are populated by the build harness pointing at the
-  py2exe_windows.ps1 output + the downloaded WinSW exe + windows/winsw/
-  fivenines-agent.xml.
+  the WiX 4 toolset. Source variables:
+    AgentBinarySource = the PyInstaller --onedir OUTPUT DIRECTORY
+                        (e.g. dist/windows/fivenines-agent-windows-amd64/).
+                        The MSI ships the .exe AND the _internal/ subdir
+                        (python311.dll, base_library.zip, all bundled DLLs).
+                        Shipping only the .exe yields PYI-ERROR at start:
+                        "Failed to load Python DLL ... module could not be found".
+    WinSwSource       = path to the WinSW.NET4.exe download.
+    WinSwConfigSource = path to windows/winsw/fivenines-agent.xml.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
@@ -71,15 +76,28 @@
       </Directory>
     </StandardDirectory>
 
-    <!-- Components: agent binary, WinSW (renamed for stable service path),
-         WinSW XML config, custom-action PS scripts. -->
+    <!-- Components: agent binary + the entire PyInstaller _internal/ payload,
+         WinSW (renamed for stable service path), WinSW XML config, custom-
+         action PS scripts. -->
     <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
       <Component Id="AgentBinary">
         <File Id="AgentExe"
-              Source="$(var.AgentBinarySource)"
+              Source="$(var.AgentBinarySource)\fivenines-agent-windows-amd64.exe"
               Name="fivenines-agent-windows-amd64.exe"
               KeyPath="yes" />
       </Component>
+
+      <!-- Harvest the full PyInstaller --onedir payload (_internal\) so the
+           bootloader can find python311.dll + base_library.zip + all the
+           hidden-import DLLs. Without this the exe starts and immediately
+           fails with PYI-ERROR "Failed to load Python DLL ... The specified
+           module could not be found", which is actually a missing-payload
+           problem - the file does exist relative to the install dir, but
+           its dependencies in _internal\ don't because we didn't ship them.
+           Files Subdirectory places the harvested entries under
+           INSTALLFOLDER\_internal\ to match the on-disk layout. -->
+      <Files Subdirectory="_internal" Include="$(var.AgentBinarySource)\_internal\**" />
+
 
       <Component Id="WinSwBinary">
         <!-- WinSW renamed so the registered service ImagePath is stable
