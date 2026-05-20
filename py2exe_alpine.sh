@@ -42,7 +42,7 @@ python -c "import libvirt; print('libvirt-python imported successfully, version:
 # Install Poetry and project dependencies
 #
 echo "=== Installing Poetry and Dependencies ==="
-python -m pip install poetry==2.2.1
+python -m pip install poetry==2.4.1
 
 # Configure Poetry for current venv
 poetry config virtualenvs.create false

@@ -48,6 +48,31 @@ For Synology NAS devices running DSM 7 and higher, the agent is distributed as a
 
 > **Note:** To comply with Synology DSM 7's strict security policies, the agent runs as a dedicated low-privilege system user (`sc-fivenines-agent`), not as `root`. Because it cannot use `sudo`, deep system hardware telemetry (like SMART disk health, RAID mapping, and raw `sysfs` temperature sensors) may be gracefully disabled depending on your NAS model permissions. QEMU and Proxmox metrics are also excluded from the Synology build.
 
+### Cloning VMs or building golden images
+
+The agent keeps two per-machine files in its config directory
+(`/etc/fivenines_agent` by default): the per-host `TOKEN` and `MACHINE_ID`, a
+stable identifier the backend uses to recognize a machine across
+re-enrollments. If the agent is installed **and started** before a VM template
+or golden image is captured, both files are baked into the image and every
+clone inherits them, so the backend treats all the clones as one host and
+merges their metrics.
+
+The reliable approach is to install and enroll the agent **after** cloning
+(via cloud-init, a provisioning script, or by hand), so each machine gets its
+own identity.
+
+If the agent must be present in the image, remove its per-machine state before
+capturing the template so each clone regenerates it on first start:
+
+```bash
+sudo rm -f /etc/fivenines_agent/TOKEN /etc/fivenines_agent/MACHINE_ID
+```
+
+Use `~/.config/fivenines_agent` for a user-level install or
+`/boot/config/custom/fivenines_agent` on UNRAID. Each clone then needs the
+agent re-enrolled with a fresh token.
+
 ## Update
 
 ### Standard Update (with sudo/root)

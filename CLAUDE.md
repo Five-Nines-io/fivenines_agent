@@ -128,7 +128,7 @@ User context is collected and sent with metrics to help the backend understand p
 
 ## Code Style
 
-- Python 3.9+ required (compatible with 3.9-3.13)
+- Python 3.10+ required (compatible with 3.10-3.13)
 - Code must pass: isort (black profile), black, flake8 (ignore W503, E501), mypy, bandit (skip B608)
 - **ASCII-only characters in codebase** - do not use non-ASCII characters (enforced since v1.4.0)
 - Test coverage must be 100%
@@ -181,7 +181,7 @@ Key dependencies:
 The `py2exe.sh` script creates a standalone Linux binary:
 1. Sets up cross-compilation environment for target architecture (amd64/arm64)
 2. Creates virtualenv and installs dependencies
-3. Builds `libpython3.9.so` from source for PyInstaller compatibility
+3. Builds `libpython3.10.so` from source for PyInstaller compatibility
 4. Bundles all dependencies including libvirt 6.10.0, libcrypt, libtirpc
 5. Creates onedir distribution with all shared libraries included
 6. Output: `./dist/linux/fivenines-agent-linux-*/`

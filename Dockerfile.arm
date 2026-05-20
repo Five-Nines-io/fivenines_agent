@@ -42,9 +42,9 @@ RUN cd /tmp && \
 # Install libvirt 6.10.0 from source (has cgroup V2 and RSS support, still CentOS 7 compatible)
 RUN cd /tmp && \
     echo "Building libvirt 6.10.0 with cgroup V2 and RSS support..." && \
-    # Use Python 3.9 from manylinux and install Meson and Ninja build system
-    /opt/python/cp39-cp39/bin/python3.9 -m pip install meson ninja docutils && \
-    export PATH="/opt/python/cp39-cp39/bin:$PATH" && \
+    # Use Python 3.10 from manylinux and install Meson and Ninja build system
+    /opt/python/cp310-cp310/bin/python3.10 -m pip install meson ninja docutils && \
+    export PATH="/opt/python/cp310-cp310/bin:$PATH" && \
     wget https://libvirt.org/sources/libvirt-6.10.0.tar.xz && \
     tar xf libvirt-6.10.0.tar.xz && \
     cd libvirt-6.10.0 && \
@@ -75,7 +75,7 @@ RUN cd /tmp && \
 RUN echo "Setting up Python from manylinux2014..." && \
     PYTHON_PATH="" && \
     # Try different Python versions in order of preference for this base
-    for version in cp39 cp38 cp37; do \
+    for version in cp310 cp311 cp312; do \
         for pydir in /opt/python/${version}*; do \
             if [ -d "$pydir" ] && [ -f "$pydir/bin/python" ]; then \
                 PYTHON_PATH="$pydir"; \
