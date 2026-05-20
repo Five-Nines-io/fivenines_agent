@@ -185,7 +185,7 @@ jobs:
               -PasswordNeverExpires `
               -UserMayNotChangePassword `
               -AccountNeverExpires `
-              -Description "Fivenines monitoring agent service account (CI smoke)" `
+              -Description "Fivenines agent service account (CI smoke)" `
               -ErrorAction Stop
 
           Add-LocalGroupMember `
