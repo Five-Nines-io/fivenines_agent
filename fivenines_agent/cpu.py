@@ -1,7 +1,10 @@
-import psutil
 import os
-import platform
+
+import psutil
+
 from fivenines_agent.debug import debug
+from fivenines_agent.env import os_family
+
 
 @debug('cpu_data')
 def cpu_data():
@@ -16,28 +19,40 @@ def cpu_data():
 
     return cores_usage
 
+
 @debug('cpu_usage')
 def cpu_usage():
     return psutil.cpu_times(percpu=True)
 
+
 @debug('cpu_model')
 def cpu_model():
     cpu_model = '-'
-    operating_system = platform.system()
+    family = os_family()
 
     try:
-        if operating_system == 'Linux':
+        if family == 'linux':
             with open('/proc/cpuinfo', 'r') as f:
                 for line in f:
                     if line.startswith('model name'):
-                        cpu_model =  line.split(':')[1].strip()
-        elif operating_system == 'Darwin':
-                with os.popen('/usr/sbin/sysctl -n machdep.cpu.brand_string') as f:
-                    cpu_model = f.read().strip()
+                        cpu_model = line.split(':')[1].strip()
+        elif family == 'darwin':
+            with os.popen('/usr/sbin/sysctl -n machdep.cpu.brand_string') as f:
+                cpu_model = f.read().strip()
+        elif family == 'windows':
+            # platform.processor() reads PROCESSOR_IDENTIFIER from the
+            # Windows registry; a WMI Win32_Processor.Name lookup would give
+            # a friendlier marketing name but at the cost of pulling pywin32
+            # into the cpu collector. Phase 2 candidate if needed.
+            import platform
+            value = platform.processor()
+            if value:
+                cpu_model = value
     except FileNotFoundError:
         pass
 
     return cpu_model
+
 
 @debug('cpu_count')
 def cpu_count():
