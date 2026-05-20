@@ -31,7 +31,10 @@ concurrency:
 env:
   PYTHON_VERSION: '3.11'
   POETRY_VERSION: '2.2.1'
-  WIX_VERSION: '4.0.4'
+  # WiX 5+ - need the <Files> harvesting element, which WiX 4 does not have.
+  # Pinned to a stable 5.x so the schema we author against stays predictable;
+  # WiX 6/7 introduce further changes (e.g. some default behavior shifts).
+  WIX_VERSION: '5.0.2'
   # WinSW v2 (.NET Framework 4 - in-box on Server 2019/2022/2025 + Win 10/11)
   WINSW_VERSION: '2.12.0'
   WINSW_URL: 'https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW.NET4.exe'
