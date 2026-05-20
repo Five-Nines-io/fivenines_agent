@@ -765,6 +765,19 @@ jobs:
         id: version
         run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
+      - name: Verify tag matches pyproject.toml and cli.py versions
+        run: |
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          FILE_VERSION=$(grep '^version = ' pyproject.toml | head -1 | cut -d'"' -f2)
+          CLI_VERSION=$(grep "^VERSION = " fivenines_agent/cli.py | head -1 | cut -d"'" -f2)
+          echo "Tag version:        $TAG_VERSION"
+          echo "pyproject.toml:     $FILE_VERSION"
+          echo "fivenines_agent/cli.py: $CLI_VERSION"
+          if [ "$TAG_VERSION" != "$FILE_VERSION" ] || [ "$TAG_VERSION" != "$CLI_VERSION" ]; then
+            echo "::error::Tag v$TAG_VERSION disagrees with pyproject.toml ($FILE_VERSION) or fivenines_agent/cli.py ($CLI_VERSION). Bump the version stamps before tagging."
+            exit 1
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
