@@ -9,7 +9,7 @@ import subprocess
 import time
 
 from fivenines_agent.debug import log
-from fivenines_agent.subprocess_utils import get_clean_env
+from fivenines_agent.subprocess_utils import get_clean_env, get_clean_env_c_locale
 
 
 # Re-probe interval in seconds (5 minutes)
@@ -35,6 +35,7 @@ CAPABILITY_HINTS = {
     "temperatures": "no accessible sensors",
     "fans": "no accessible sensors",
     "snmp": "requires net-snmp",
+    "quota": "requires Linux quota-tools",
 }
 
 
@@ -112,6 +113,8 @@ class PermissionProbe:
             "packages": self._probe("packages", self._can_list_packages),
             # SNMP polling - needs net-snmp CLI tools
             "snmp": self._probe("snmp", self._has_snmpget),
+            # Disk quotas - needs quota-tools
+            "quota": self._probe("quota", self._can_run_quota),
         }
 
         if not old_capabilities:
@@ -456,6 +459,48 @@ class PermissionProbe:
             self._set_reason("snmpget not found in PATH")
         return found
 
+    def _can_run_quota(self):
+        """Check if Linux quota-tools is installed and produces parseable output.
+
+        quota returns 0 (under limits) or nonzero (over quota OR error).
+        We parse stdout regardless of return code -- a nonzero exit with valid
+        stdout means quotas are exceeded, not broken.  Only treat it as
+        unavailable if the binary is missing, times out, or stdout is empty
+        with nonzero exit.
+        """
+        quota_path = shutil.which("quota")
+        if not quota_path:
+            self._set_reason("quota not found in PATH")
+            return False
+        try:
+            result = subprocess.run(
+                ["quota", "-ugw"],
+                capture_output=True,
+                timeout=5,
+                env=get_clean_env_c_locale(),
+            )
+            stdout = result.stdout.decode("utf-8", errors="ignore").strip()
+            if stdout:
+                return True
+            if result.returncode == 0:
+                return True
+            stderr = result.stderr.decode("utf-8", errors="ignore").strip()
+            detail = (
+                stderr.splitlines()[0]
+                if stderr
+                else "returncode {}".format(result.returncode)
+            )
+            self._set_reason("quota -ugw: {}".format(detail))
+            return False
+        except subprocess.TimeoutExpired:
+            self._set_reason("quota -ugw timed out after 5s (dead NFS mount?)")
+            return False
+        except Exception as e:
+            self._set_reason(
+                "quota -ugw: {}: {}".format(type(e).__name__, e)
+            )
+            return False
+
     def _can_list_packages(self):
         """Check if a supported package manager is available."""
         for cmd in ("dpkg-query", "rpm", "apk", "pacman", "synopkg"):
@@ -523,7 +568,7 @@ def print_capabilities_banner():
         "processes",
     ]
     hardware = ["temperatures", "fans", "nvidia_gpu"]
-    storage = ["smart_storage", "raid_storage", "zfs"]
+    storage = ["smart_storage", "raid_storage", "zfs", "quota"]
     services = ["docker", "qemu", "proxmox"]
     security = ["fail2ban", "packages"]
     networking = ["snmp"]
