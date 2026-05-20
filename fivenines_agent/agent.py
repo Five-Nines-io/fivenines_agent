@@ -19,8 +19,8 @@ except ImportError:
 from fivenines_agent.cli import VERSION
 from fivenines_agent.collectors import _collect_with_telemetry, collect_metrics
 from fivenines_agent.debug import log
-from fivenines_agent.env import config_dir, dry_run, env_file, get_user_context
-from fivenines_agent.files import file_handles_limit, file_handles_used
+from fivenines_agent.env import config_dir, dry_run, env_file, get_user_context, is_windows
+from fivenines_agent.files import file_handles_limit, file_handles_used, handle_count
 from fivenines_agent.ip import get_ip
 from fivenines_agent.load_average import load_average
 from fivenines_agent.packages import packages_sync
@@ -145,8 +145,7 @@ class Agent:
     def _collect_metrics(self, data):
         # Core metrics (always enabled)
         data["load_average"] = self._collect("load_average", load_average)
-        data["file_handles_used"] = self._collect("file_handles_used", file_handles_used)
-        data["file_handles_limit"] = self._collect("file_handles_limit", file_handles_limit)
+        self._collect_file_handles(data)
 
         # Conditional metrics via registry, gated by capability where available
         collect_metrics(
@@ -168,6 +167,20 @@ class Agent:
             data["snmp_metrics"] = self._collect(
                 "snmp_metrics", snmp_metrics, snmp_targets
             )
+
+    def _collect_file_handles(self, data):
+        """Emit file-handle metrics under OS-appropriate keys (D2/D10).
+
+        Linux reports used/limit pairs derived from /proc/sys/fs/file-nr.
+        Windows has no equivalent; instead it reports the total kernel handle
+        count under its own key so the backend does not conflate the two
+        semantically distinct metrics.
+        """
+        if is_windows():
+            data["handle_count"] = self._collect("handle_count", handle_count)
+        else:
+            data["file_handles_used"] = self._collect("file_handles_used", file_handles_used)
+            data["file_handles_limit"] = self._collect("file_handles_limit", file_handles_limit)
 
     def _collect(self, name, fn, *args, **kwargs):
         return _collect_with_telemetry(name, fn, self._telemetry, *args, **kwargs)
