@@ -111,7 +111,7 @@ python -m pip install --upgrade pip setuptools wheel
 # Install Poetry and dependencies
 #
 echo "=== Installing Poetry and Dependencies ==="
-python -m pip install poetry==2.2.1 || {
+python -m pip install poetry==2.4.1 || {
     echo "Failed to install Poetry. Exiting."
     exit 1
 }
@@ -164,26 +164,26 @@ poetry export --without-hashes -o requirements.txt || {
 }
 
 #
-# Build libpython3.9.so from source for PyInstaller
+# Build libpython3.10.so from source for PyInstaller
 #
-echo "=== Building libpython3.9.so from source ==="
+echo "=== Building libpython3.10.so from source ==="
 
-PYTHON_LIB_DIR="/opt/python/cp39-cp39/lib"
-LIBPYTHON_PATH="$PYTHON_LIB_DIR/libpython3.9.so"
+PYTHON_LIB_DIR="/opt/python/cp310-cp310/lib"
+LIBPYTHON_PATH="$PYTHON_LIB_DIR/libpython3.10.so"
 
 if [ ! -f "$LIBPYTHON_PATH" ]; then
-    echo "Building Python 3.9.23 shared library from source..."
+    echo "Building Python 3.10.18 shared library from source..."
 
     cd /tmp
 
-    # Download Python 3.9.23 source
-    if ! wget -q --timeout=30 "https://www.python.org/ftp/python/3.9.23/Python-3.9.23.tgz"; then
+    # Download Python 3.10.18 source
+    if ! wget -q --timeout=30 "https://www.python.org/ftp/python/3.10.18/Python-3.10.18.tgz"; then
         echo "Failed to download Python source"
         exit 1
     fi
 
-    tar xzf Python-3.9.23.tgz
-    cd Python-3.9.23
+    tar xzf Python-3.10.18.tgz
+    cd Python-3.10.18
 
     # Configure for shared library build - minimal configuration
     echo "Configuring Python build for shared library..."
@@ -204,20 +204,20 @@ if [ ! -f "$LIBPYTHON_PATH" ]; then
 
     # Build only the shared library target
     echo "Building shared library (this may take a few minutes)..."
-    make libpython3.9.so -j$(nproc) || {
+    make libpython3.10.so -j$(nproc) || {
         echo "Failed to build shared library"
         exit 1
     }
 
     # Verify the shared library was created and check its dependencies
-    if [ -f "libpython3.9.so" ]; then
-        echo "Successfully built libpython3.9.so"
+    if [ -f "libpython3.10.so" ]; then
+        echo "Successfully built libpython3.10.so"
         echo "Checking shared library dependencies:"
-        ldd libpython3.9.so || echo "ldd check failed"
+        ldd libpython3.10.so || echo "ldd check failed"
 
         # Check if it depends on libcrypt.so.2
-        if ldd libpython3.9.so | grep -q "libcrypt.so.2"; then
-            echo "WARNING: libpython3.9.so depends on libcrypt.so.2"
+        if ldd libpython3.10.so | grep -q "libcrypt.so.2"; then
+            echo "WARNING: libpython3.10.so depends on libcrypt.so.2"
             echo "Available libcrypt libraries:"
             find /lib64 /usr/lib64 -name "libcrypt*" 2>/dev/null || echo "No libcrypt found"
 
@@ -229,13 +229,13 @@ if [ ! -f "$LIBPYTHON_PATH" ]; then
         fi
 
         # Copy to the expected location
-        cp libpython3.9.so "$LIBPYTHON_PATH"
+        cp libpython3.10.so "$LIBPYTHON_PATH"
 
         # Create versioned symlink
-        ln -sf libpython3.9.so "$PYTHON_LIB_DIR/libpython3.9.so.1.0"
+        ln -sf libpython3.10.so "$PYTHON_LIB_DIR/libpython3.10.so.1.0"
 
         echo "Installed shared library:"
-        ls -la "$PYTHON_LIB_DIR"/libpython3.9.so*
+        ls -la "$PYTHON_LIB_DIR"/libpython3.10.so*
         file "$LIBPYTHON_PATH"
 
     else
@@ -245,16 +245,16 @@ if [ ! -f "$LIBPYTHON_PATH" ]; then
 
     # Clean up
     cd /workspace
-    rm -rf /tmp/Python-3.9.23*
+    rm -rf /tmp/Python-3.10.18*
 
     # Update library cache
     echo "$PYTHON_LIB_DIR" > /etc/ld.so.conf.d/python-shared.conf
     ldconfig
 
-    echo "libpython3.9.so ready for PyInstaller"
+    echo "libpython3.10.so ready for PyInstaller"
 
 else
-    echo "libpython3.9.so already exists"
+    echo "libpython3.10.so already exists"
 fi
 
 #
@@ -269,7 +269,7 @@ if [ -z "${SYNOLOGY:-}" ]; then
     python -c "import libvirt; print('libvirt module path:', libvirt.__file__); print('libvirt version:', libvirt.getVersion())"
 fi
 
-PYTHON_LIB=$(find /opt/python/cp39-cp39/lib -name "libpython3.9.so*" -type f | head -1)
+PYTHON_LIB=$(find /opt/python/cp310-cp310/lib -name "libpython3.10.so*" -type f | head -1)
 if [ -z "$PYTHON_LIB" ]; then
     echo "Python shared library not found after build attempt"
     exit 1
@@ -293,7 +293,7 @@ else
     PYI_EXTRA=(--hidden-import=libvirt --hidden-import=libvirtmod --hidden-import=proxmoxer.backends --hidden-import=proxmoxer.backends.https --hidden-import=pynvml --add-binary "/usr/lib64/libtirpc.so.3:.")
 fi
 
-LD_LIBRARY_PATH="/opt/python/cp39-cp39/lib:$LD_LIBRARY_PATH" poetry run pyinstaller \
+LD_LIBRARY_PATH="/opt/python/cp310-cp310/lib:$LD_LIBRARY_PATH" poetry run pyinstaller \
     "${PYI_BASE[@]}" "${PYI_EXTRA[@]}" ./py2exe_entrypoint.py || {
     echo "PyInstaller failed. Exiting."
     exit 1
