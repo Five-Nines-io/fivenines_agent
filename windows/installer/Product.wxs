@@ -172,8 +172,13 @@
          service account and namespace. Token is passed through CustomActionData
          as a JSON-ish blob so the deferred action sees TOKEN even though it
          runs out-of-process. -->
+    <!-- WixQuietExec requires the command string to start with a QUOTED
+         application name (per the WiX 4 docs). The deferred custom action
+         pattern reads the CustomActionData (set by the matching SetProperty
+         above) as its command line; the SetProperty's Id MUST match the
+         CustomAction Id so the runtime can find the value. -->
     <SetProperty Id="WriteTokenAcl"
-                 Value="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;[#SetTokenAclPs1]&quot; -ConfigDir &quot;[CONFIGDIR]&quot; -ServiceAccount &quot;[SERVICEACCOUNT]&quot; -Token &quot;[TOKEN]&quot;"
+                 Value="&quot;powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -File &quot;[#SetTokenAclPs1]&quot; -ConfigDir &quot;[CONFIGDIR]&quot; -ServiceAccount &quot;[SERVICEACCOUNT]&quot; -Token &quot;[TOKEN]&quot;"
                  Before="WriteTokenAcl"
                  Sequence="execute" />
     <CustomAction Id="WriteTokenAcl"
@@ -184,7 +189,7 @@
                   BinaryRef="Wix4UtilCA_X64" />
 
     <SetProperty Id="DelegateWmi"
-                 Value="powershell.exe -NoProfile -ExecutionPolicy Bypass -File &quot;[#DelegateWmiPs1]&quot; -ServiceAccount &quot;[SERVICEACCOUNT]&quot;"
+                 Value="&quot;powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -File &quot;[#DelegateWmiPs1]&quot; -ServiceAccount &quot;[SERVICEACCOUNT]&quot;"
                  Before="DelegateWmi"
                  Sequence="execute" />
     <CustomAction Id="DelegateWmi"
