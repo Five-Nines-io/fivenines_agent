@@ -172,13 +172,27 @@ jobs:
       - name: Pre-create service account (D12 low-priv + Performance Monitor Users)
         shell: pwsh
         run: |
+          # Generate a 24-character random password. Using New-LocalUser
+          # rather than `net user` so the legacy "longer than 14 characters"
+          # interactive prompt doesn't block on a non-tty CI runner.
           $passwd = -join ((33..126) | Get-Random -Count 24 | ForEach-Object { [char]$_ })
-          net user fivenines-agent "$passwd" /add /passwordchg:no /expires:never
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          net localgroup "Performance Monitor Users" fivenines-agent /add
-          if ($LASTEXITCODE -ne 0) { exit 1 }
-          # Grant the "Log on as a service" right (required for any service account).
-          # ntrights.exe is not on stock runners; use secedit instead.
+          # Mask the generated password from any subsequent log lines.
+          Write-Host "::add-mask::$passwd"
+          $securePwd = ConvertTo-SecureString $passwd -AsPlainText -Force
+
+          New-LocalUser -Name "fivenines-agent" `
+              -Password $securePwd `
+              -PasswordNeverExpires `
+              -UserMayNotChangePassword `
+              -AccountNeverExpires `
+              -Description "Fivenines monitoring agent service account (CI smoke)" `
+              -ErrorAction Stop
+
+          Add-LocalGroupMember `
+              -Group "Performance Monitor Users" `
+              -Member "fivenines-agent" `
+              -ErrorAction Stop
+
           $sid = (New-Object System.Security.Principal.NTAccount("fivenines-agent")).Translate([System.Security.Principal.SecurityIdentifier]).Value
           Write-Host "Service account SID: $sid"
           "SERVICEACCOUNT=.\fivenines-agent" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
@@ -251,7 +265,7 @@ jobs:
       - name: Cleanup service account
         if: always()
         shell: pwsh
-        run: net user fivenines-agent /delete
+        run: Remove-LocalUser -Name "fivenines-agent" -ErrorAction SilentlyContinue
 
       - name: Upload install/uninstall logs (on failure or always)
         if: always()
