@@ -49,17 +49,30 @@
          (D21 / Section 3 F1). -->
     <Property Id="TOKEN" Secure="yes" Hidden="yes" />
 
-    <!-- Service account properties. Default value targets the dedicated
-         low-priv account the MSI creates pre-install. The 'fivenines-agent'
-         local account is created by a custom action; the password is
-         supplied by the deployment tool and is Hidden in logs. -->
-    <!-- Default to COMPUTERNAME\fivenines-agent. WiX's Wix4ExecSecureObjects
-         custom action (which processes util:PermissionEx entries) resolves
-         users via Win32 LookupAccountName, which rejects the .\Username
-         dot-prefix on some Windows configurations. The COMPUTERNAME prefix
-         is what Microsoft documents as portable for local-machine accounts. -->
-    <Property Id="SERVICEACCOUNT" Value="[ComputerName]\fivenines-agent" />
+    <!-- Service account properties. The MSI's CreateServiceAccount CA
+         provisions [ComputerName]\fivenines-agent (creating it if absent,
+         generating a random password). Operators with config-management
+         tooling can pre-stage an account and pass SERVICEACCOUNT +
+         SERVICEACCOUNTPASSWORD on the msiexec command line to override.
+         SERVICEACCOUNT default is left empty; the SetProperty action below
+         resolves [ComputerName] into a concrete machine\name string before
+         any CustomActionData propagation. Property-table defaults are NOT
+         recursively formatted - storing "[ComputerName]\fivenines-agent"
+         as the default yields a literal value that gets passed through to
+         deferred CAs as the unresolved bracket-token, breaking SID lookups
+         in our PowerShell scripts. -->
+    <Property Id="SERVICEACCOUNT" />
     <Property Id="SERVICEACCOUNTPASSWORD" Secure="yes" Hidden="yes" />
+
+    <!-- Resolve [ComputerName] before any CA reads SERVICEACCOUNT.
+         Sequence="both" so this runs in InstallUI and InstallExecute alike;
+         Before="CostFinalize" puts it ahead of the CustomActionData-building
+         SetProperty actions for CreateServiceAccount/WriteTokenAcl/DelegateWmi. -->
+    <SetProperty Id="SERVICEACCOUNT"
+                 Value="[ComputerName]\fivenines-agent"
+                 Before="CostFinalize"
+                 Sequence="both"
+                 Condition="NOT SERVICEACCOUNT" />
 
     <Property Id="ARPCONTACT" Value="sebastien@fivenines.io" />
     <Property Id="ARPHELPLINK" Value="https://docs.fivenines.io/agent" />
