@@ -193,6 +193,18 @@ jobs:
               -Member "fivenines-agent" `
               -ErrorAction Stop
 
+          # Add to BUILTIN\Users so the account inherits the default Read &
+          # Execute ACE on %ProgramFiles%. Without this membership the service
+          # process can't load its own python311.dll out of the install dir
+          # (LoadLibrary returns "The specified module could not be found",
+          # surfaced by PyInstaller as PYI-8860). New-LocalUser does NOT add
+          # to Users implicitly; legacy `net user /add` did, which masked
+          # this requirement on older runners.
+          Add-LocalGroupMember `
+              -Group "Users" `
+              -Member "fivenines-agent" `
+              -ErrorAction Stop
+
           $sid = (New-Object System.Security.Principal.NTAccount("fivenines-agent")).Translate([System.Security.Principal.SecurityIdentifier]).Value
           Write-Host "Service account SID: $sid"
 
