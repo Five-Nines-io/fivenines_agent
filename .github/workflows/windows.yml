@@ -195,6 +195,41 @@ jobs:
 
           $sid = (New-Object System.Security.Principal.NTAccount("fivenines-agent")).Translate([System.Security.Principal.SecurityIdentifier]).Value
           Write-Host "Service account SID: $sid"
+
+          # Grant SeServiceLogonRight ("Log on as a service") via secedit. SCM
+          # refuses to start any service under an account that lacks this
+          # privilege - that's what produced "Cannot start service" with a
+          # generic error and no Event Log entry. MSI ServiceInstall used to
+          # grant this implicitly; on Windows Server 2025 it does not.
+          $tmpCfg = Join-Path $env:TEMP "secpolicy.cfg"
+          $tmpDb  = Join-Path $env:TEMP "secpolicy.sdb"
+          secedit /export /cfg $tmpCfg /areas USER_RIGHTS /quiet | Out-Null
+          $content = Get-Content $tmpCfg
+          $found = $false
+          for ($i = 0; $i -lt $content.Length; $i++) {
+              if ($content[$i] -match '^SeServiceLogonRight\s*=') {
+                  if ($content[$i] -notmatch [regex]::Escape("*$sid")) {
+                      $content[$i] = $content[$i].TrimEnd() + ",*$sid"
+                  }
+                  $found = $true
+                  break
+              }
+          }
+          if (-not $found) {
+              $appended = @()
+              foreach ($line in $content) {
+                  $appended += $line
+                  if ($line -match '^\[Privilege Rights\]') {
+                      $appended += "SeServiceLogonRight = *$sid"
+                  }
+              }
+              $content = $appended
+          }
+          $content | Set-Content -Encoding ascii $tmpCfg
+          secedit /configure /db $tmpDb /cfg $tmpCfg /areas USER_RIGHTS /quiet | Out-Null
+          Remove-Item $tmpCfg, $tmpDb -ErrorAction SilentlyContinue
+          Write-Host "Granted SeServiceLogonRight to fivenines-agent"
+
           # Use the COMPUTERNAME\Username form rather than .\Username so WiX's
           # Wix4ExecSecureObjects custom action (which processes util:PermissionEx
           # entries via the Win32 LookupAccountName API) can resolve the SID.
@@ -221,13 +256,33 @@ jobs:
           $svc = Get-Service -Name "fivenines-agent" -ErrorAction Stop
           Write-Host "Service status: $($svc.Status)"
           if ($svc.Status -ne "Running") {
-            Start-Service -Name "fivenines-agent"
+            try {
+              Start-Service -Name "fivenines-agent" -ErrorAction Stop
+            } catch {
+              Write-Host "Start-Service threw: $_"
+            }
             Start-Sleep -Seconds 5
             $svc = Get-Service -Name "fivenines-agent"
+            Write-Host "Service status after start attempt: $($svc.Status)"
           }
           if ($svc.Status -ne "Running") {
+            Write-Host "=== Recent System events ==="
+            Get-WinEvent -LogName System -MaxEvents 15 -ErrorAction SilentlyContinue |
+              Where-Object { $_.ProviderName -match "Service Control Manager|fivenines" } |
+              Format-List TimeCreated, ProviderName, LevelDisplayName, Message
+            Write-Host "=== Recent Application events ==="
+            Get-WinEvent -LogName Application -MaxEvents 30 -ErrorAction SilentlyContinue |
+              Format-List TimeCreated, ProviderName, LevelDisplayName, Message
+            $logDir = Join-Path $env:ProgramData "fivenines_agent\logs"
+            if (Test-Path $logDir) {
+              Write-Host "=== WinSW log directory ==="
+              Get-ChildItem $logDir | Format-Table
+              Get-ChildItem $logDir | ForEach-Object {
+                Write-Host "--- $($_.Name) ---"
+                Get-Content $_.FullName -Tail 50
+              }
+            }
             Write-Error "Service did not reach Running state"
-            Get-WinEvent -LogName Application -MaxEvents 20 | Format-List
             exit 1
           }
 
