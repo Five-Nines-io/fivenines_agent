@@ -54,7 +54,10 @@ $distDir  = ".\dist\windows"
 New-Item -ItemType Directory -Force -Path $buildDir, $distDir | Out-Null
 
 $pyInstallerArgs = @(
-    "--strip",
+    # NB: --strip is intentionally omitted on Windows. PyInstaller's --strip
+    # invokes GNU strip on every bundled binary; that corrupts the embedded
+    # Python DLL on Windows and the resulting exe fails with
+    # "LoadLibrary: Invalid access to memory location" at first run.
     "--optimize=2",
     "--exclude-module", "tkinter",
     "--exclude-module", "unittest",
