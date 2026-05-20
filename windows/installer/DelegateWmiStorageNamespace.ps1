@@ -22,9 +22,15 @@ $Namespace = "root\Microsoft\Windows\Storage"
 
 # Resolve the service account to a SID. Translate raises if the account
 # does not exist - fail loudly here rather than silently writing a broken ACE.
-$ntAccount = New-Object System.Security.Principal.NTAccount($ServiceAccount)
+# Normalize ".\name" -> "name": NTAccount can't always resolve the dot-prefix
+# even though MSI uses it as the local-machine convention.
+$accountName = $ServiceAccount
+if ($accountName.StartsWith('.\')) {
+    $accountName = $accountName.Substring(2)
+}
+$ntAccount = New-Object System.Security.Principal.NTAccount($accountName)
 $sid = $ntAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
-Write-Host ("Service account {0} -> SID {1}" -f $ServiceAccount, $sid)
+Write-Host ("Service account {0} (resolved as {1}) -> SID {2}" -f $ServiceAccount, $accountName, $sid)
 
 # Read current security descriptor.
 $systemSecurity = Get-WmiObject -Namespace $Namespace -Class __SystemSecurity -ErrorAction Stop

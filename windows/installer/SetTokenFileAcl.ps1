@@ -36,14 +36,24 @@ $acl.SetAccessRuleProtection($true, $false)  # protect=true, preserve=false
 $fullControl = [System.Security.AccessControl.FileSystemRights]::FullControl
 $allow = [System.Security.AccessControl.AccessControlType]::Allow
 
+function Resolve-LocalAccount {
+    param([string]$Name)
+    # ".\name" is the MSI convention but System.Security.Principal.NTAccount
+    # rejects the dot-prefix on some Windows configurations - normalize to the
+    # bare username so NTAccount falls back to the local machine.
+    if ($Name.StartsWith('.\')) { return $Name.Substring(2) }
+    return $Name
+}
+
 $principals = @($ServiceAccount, "BUILTIN\Administrators", "NT AUTHORITY\SYSTEM")
 foreach ($id in $principals) {
+    $normalized = Resolve-LocalAccount $id
     try {
-        $sid = New-Object System.Security.Principal.NTAccount($id)
+        $sid = New-Object System.Security.Principal.NTAccount($normalized)
         $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, $fullControl, $allow)
         $acl.AddAccessRule($rule)
     } catch {
-        Write-Warning ("Could not grant FullControl to {0}: {1}" -f $id, $_)
+        Write-Warning ("Could not grant FullControl to {0} (resolved as {1}): {2}" -f $id, $normalized, $_)
     }
 }
 
