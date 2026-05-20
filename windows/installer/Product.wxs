@@ -184,8 +184,15 @@
          pattern reads the CustomActionData (set by the matching SetProperty
          above) as its command line; the SetProperty's Id MUST match the
          CustomAction Id so the runtime can find the value. -->
+    <!-- [CONFIGDIR] expands to a path ending in '\'. Quoting "...\fivenines_agent\"
+         would close with `\"`, which Windows command-line parsing treats as an
+         escaped quote - PowerShell then sees malformed args, drops to its REPL,
+         and hangs waiting for stdin. The standard WixQuietExec recipe is to
+         append '.' so the value resolves to "...\fivenines_agent\." (closing
+         quote is preceded by '.', not '\'). The PS script accepts the trailing
+         '\.' just fine - it joins TOKEN onto it normally. -->
     <SetProperty Id="WriteTokenAcl"
-                 Value="&quot;powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -File &quot;[#SetTokenAclPs1]&quot; -ConfigDir &quot;[CONFIGDIR]&quot; -ServiceAccount &quot;[SERVICEACCOUNT]&quot; -Token &quot;[TOKEN]&quot;"
+                 Value="&quot;powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -File &quot;[#SetTokenAclPs1]&quot; -ConfigDir &quot;[CONFIGDIR].&quot; -ServiceAccount &quot;[SERVICEACCOUNT]&quot; -Token &quot;[TOKEN]&quot;"
                  Before="WriteTokenAcl"
                  Sequence="execute" />
     <CustomAction Id="WriteTokenAcl"
