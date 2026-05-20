@@ -24,6 +24,17 @@ libvirt-python = "^11.6.0"
 proxmoxer = "^2.1.0"
 pynvml = "^12.0.0"
 
+[tool.poetry.group.windows]
+optional = true
+
+[tool.poetry.group.windows.dependencies]
+# Windows-only dependencies. The Windows PyInstaller build (py2exe_windows.ps1)
+# pulls this group via --with windows and explicitly excludes the
+# virtualization group, which carries libvirt-python (does not build on
+# Windows) and systemd-watchdog (Linux-only).
+pywin32 = "*"
+wmi = "*"
+
 [tool.poetry.scripts]
 fivenines_agent = "fivenines_agent.__main__:start"
 
