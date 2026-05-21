@@ -10,11 +10,16 @@
 #   * If the account does not exist and no Password is supplied, we generate
 #     a cryptographically strong random password (24 bytes / ~192 bits, URL-
 #     safe base64) and create the account with it.
-#   * If the account exists, Password is required - we have no way to read
-#     an existing account's password, and registering the service with the
-#     wrong one would silently break Start-Service. Tools that pre-provision
-#     accounts (Ansible/Chef/etc.) should pass SERVICEACCOUNTPASSWORD on the
-#     msiexec command line; everyone else just lets the MSI do the work.
+#   * If the account exists AND has the MSI-managed Description tag we set
+#     on creation, this is an upgrade / reinstall: generate a fresh random
+#     password and update the existing account via Set-LocalUser. The old
+#     password lived only in the LSA secret of the just-removed service;
+#     the new ServiceInstall about to run receives our new password via
+#     sc.exe config. Operator workflow: no SERVICEACCOUNTPASSWORD needed.
+#   * If the account exists with a DIFFERENT Description (or none), it
+#     was created by something outside the MSI - Ansible, Chef, or a
+#     hand-rolled provisioning step. Require Password explicitly so we
+#     don't silently clobber operator-managed credentials.
 #   * Membership in 'Performance Monitor Users' is required for the PDH-based
 #     handle-count metric (files.py win32pdh path); 'Users' is required so the
 #     account inherits the default Read+Execute ACE on %ProgramFiles% and can
@@ -41,26 +46,46 @@ if ($bareName.Contains('\')) {
     $bareName = $parts[1]
 }
 
-$exists = $null -ne (Get-LocalUser -Name $bareName -ErrorAction SilentlyContinue)
+$MSI_MANAGED_DESCRIPTION = "Fivenines monitoring agent service account"
 
-if ($exists) {
-    if ([string]::IsNullOrEmpty($Password)) {
-        throw ("Local account '{0}' already exists but SERVICEACCOUNTPASSWORD was not passed to msiexec. Re-run with SERVICEACCOUNTPASSWORD=<the account's actual password> so the service can be registered correctly." -f $bareName)
+function New-RandomPassword {
+    # URL-safe base64 - sc.exe is fine with [A-Za-z0-9_-], but the standard
+    # '/' and '+' characters can trip up command-line parsing in tools that
+    # see the password later (e.g. log scrapers).
+    $bytes = New-Object byte[] 24
+    $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+        $rng.GetBytes($bytes)
+    } finally {
+        $rng.Dispose()
     }
-    Write-Host ("Account '{0}' already exists; using provided password." -f $bareName)
+    return [System.Convert]::ToBase64String($bytes).Replace('/', '_').Replace('+', '-').Replace('=', '')
+}
+
+$existing = Get-LocalUser -Name $bareName -ErrorAction SilentlyContinue
+
+if ($existing) {
+    if ([string]::IsNullOrEmpty($Password)) {
+        # No password supplied. Two sub-cases:
+        #   a) MSI-managed account from a previous install (upgrade path) -
+        #      rotate freely. The old password is gone with the old service.
+        #   b) Operator-managed account (Ansible/Chef/etc.) - refuse, because
+        #      we don't want to silently clobber credentials the operator
+        #      may have stored in their config-management system.
+        $isMsiManaged = $existing.Description -eq $MSI_MANAGED_DESCRIPTION
+        if (-not $isMsiManaged) {
+            throw ("Local account '{0}' exists but is not MSI-managed (Description={1}). Re-run with SERVICEACCOUNTPASSWORD=<the account's actual password> so the service can be registered correctly without changing the existing credentials." -f $bareName, $existing.Description)
+        }
+        $Password = New-RandomPassword
+        $securePwd = ConvertTo-SecureString $Password -AsPlainText -Force
+        Set-LocalUser -Name $bareName -Password $securePwd -ErrorAction Stop
+        Write-Host ("Rotated password on MSI-managed account '{0}' (upgrade path)." -f $bareName)
+    } else {
+        Write-Host ("Account '{0}' already exists; using provided password." -f $bareName)
+    }
 } else {
     if ([string]::IsNullOrEmpty($Password)) {
-        $bytes = New-Object byte[] 24
-        $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
-        try {
-            $rng.GetBytes($bytes)
-        } finally {
-            $rng.Dispose()
-        }
-        # URL-safe base64 - sc.exe is fine with [A-Za-z0-9_-], but the standard
-        # '/' and '+' characters can trip up command-line parsing in tools that
-        # see the password later (e.g. log scrapers).
-        $Password = [System.Convert]::ToBase64String($bytes).Replace('/', '_').Replace('+', '-').Replace('=', '')
+        $Password = New-RandomPassword
     }
     $securePwd = ConvertTo-SecureString $Password -AsPlainText -Force
     New-LocalUser -Name $bareName `
@@ -68,7 +93,7 @@ if ($exists) {
         -PasswordNeverExpires `
         -UserMayNotChangePassword `
         -AccountNeverExpires `
-        -Description "Fivenines monitoring agent service account" `
+        -Description $MSI_MANAGED_DESCRIPTION `
         -ErrorAction Stop | Out-Null
     Write-Host ("Created local account '{0}'." -f $bareName)
 }

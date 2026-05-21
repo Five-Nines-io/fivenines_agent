@@ -786,6 +786,17 @@ jobs:
             FIVENINES_AGENT_URL="https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-linux-amd64.tar.gz" bash fivenines_update_user.sh
             ```
 
+            ### Quick Install - Windows (run from elevated PowerShell)
+            ```powershell
+            # Fresh install
+            iwr https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines_setup.ps1 -OutFile setup.ps1
+            .\setup.ps1 -Token <enrollment-token>
+
+            # Update an existing install
+            iwr https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines_update.ps1 -OutFile update.ps1
+            .\update.ps1
+            ```
+
             ### Download URLs
             ```
             # AMD64 (glibc)
@@ -918,6 +929,11 @@ jobs:
           cp fivenines_uninstall.sh r2-upload/latest/
           cp fivenines_uninstall_user.sh r2-upload/latest/
 
+          # Windows install/update/uninstall PowerShell bootstrap scripts
+          cp fivenines_setup.ps1 r2-upload/latest/
+          cp fivenines_update.ps1 r2-upload/latest/
+          cp fivenines_uninstall.ps1 r2-upload/latest/
+
           ls -la r2-upload/latest/
 
       - name: Install rclone
@@ -953,6 +969,9 @@ jobs:
           echo "  - https://releases.fivenines.io/latest/fivenines-agent-alpine-arm64.tar.gz"
           for spk in r2-upload/latest/*.spk; do echo "  - https://releases.fivenines.io/latest/$(basename $spk)"; done
           echo "  - https://releases.fivenines.io/latest/fivenines-agent-windows-amd64.msi"
+          echo "  - https://releases.fivenines.io/latest/fivenines_setup.ps1"
+          echo "  - https://releases.fivenines.io/latest/fivenines_update.ps1"
+          echo "  - https://releases.fivenines.io/latest/fivenines_uninstall.ps1"
           echo "  - https://releases.fivenines.io/latest/fivenines-agent.service"
           echo "  - https://releases.fivenines.io/latest/fivenines-agent.openrc"
           echo "  - https://releases.fivenines.io/latest/fivenines_script.sh"
