@@ -185,6 +185,97 @@ Format of each entry:
 
 ---
 
+## 14. Package security scanner on Windows: registry-sourced, incomplete by design
+
+- **Decision (2026-05-21).** The Windows agent participates in the existing
+  package security scan flow (`/packages` endpoint), but the data shape
+  and coverage differ enough from Linux that the backend's CVE-matching
+  logic needs Windows-specific handling. No agent-side change planned;
+  this is a backend coordination + Phase 2 follow-up item.
+- **What the agent ships on Windows.**
+  - Source: `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall`
+    plus the `WOW6432Node` redirect (32-bit apps on 64-bit Windows).
+  - Per entry: `{name: <DisplayName>, version: <DisplayVersion>}`
+  - Entries with no `DisplayName` are skipped (mostly system updates and
+    hidden components - see below).
+  - `distro` field set to `"windows:<release>"` (e.g. `"windows:2025server"`).
+  - Same delta-by-hash mechanism as Linux: SHA256 of the sorted list,
+    only re-shipped when changed.
+- **What the agent DOES NOT ship on Windows (gaps).**
+  1. **Windows OS updates / hotfixes.** KB articles (e.g. `KB5043076`)
+     are installed via the Servicing Stack, not via the Uninstall
+     registry. They're queryable via `Get-HotFix` / `wmic qfe` / WMI
+     `Win32_QuickFixEngineering`. Half of Windows-relevant CVEs are in
+     the OS itself, so without these the scanner has a big blind spot.
+     **Phase 2 candidate** - already noted in TODOS.md alongside the
+     other Windows-native collectors.
+  2. **MSU bundles and feature-on-demand packages.** Same story - not
+     in the Uninstall hive.
+  3. **System-bundled software with inconsistent registration.**
+     .NET Framework versions, PowerShell, IIS modules - some have
+     Uninstall entries, some live in their own registry trees, some
+     report version only via WMI. Coverage is best-effort.
+  4. **Per-user installs (HKCU).** We only read HKLM. User-scope
+     installs from a non-service-account user won't appear. For the
+     monitoring agent this is correct - service accounts shouldn't
+     see other users' software - but it's a gap relative to the
+     "everything installed" intuition.
+- **Naming and versioning differences vs Linux.**
+  - **Linux**: package-manager names (`openssl`, `libc6`, `nginx-full`)
+    with distro-specific version strings that include backport patch
+    levels (`1.1.1f-1ubuntu2.20`). CPE matching is mature - distro
+    package names map cleanly to known CPE patterns and security
+    advisories are published per-distro.
+  - **Windows**: vendor display names (`Microsoft Edge`,
+    `Google Chrome`, `7-Zip 24.07 (x64 edition)`,
+    `Python 3.11.9 (64-bit)`). Version strings are whatever the
+    installer wrote to `DisplayVersion` and follow no convention -
+    semver, dates, hashes, or empty. There's no Windows equivalent
+    of "Debian backports patches into the upstream version string" -
+    a Chrome at version `124.0.6367.61` is just that, no
+    distro-patch suffix.
+- **Backend TODO.**
+  - **Accept the Windows payload without choking on the differences.**
+    Display names will contain spaces, parentheses, version numbers,
+    architecture markers (`(x64 edition)`, `(32-bit)`), and free-form
+    vendor branding. Version strings may be empty.
+  - **CVE-matching strategy: fuzzy CPE on Windows.** The backend's
+    current CPE matcher (presumably built for Linux package names) will
+    not work directly. Options:
+    1. **Curated mapping table.** Maintain a list of `(display_name_pattern,
+       vendor, product)` mappings for the top ~500 Windows applications.
+       E.g. regex `^Google Chrome$` → `(google, chrome)`. This is the
+       NVD CPE Dictionary approach. Slow to maintain but accurate.
+    2. **Vendor parsing heuristics.** Strip trailing architecture
+       markers, parenthesized notes, and version numbers from the
+       DisplayName; lowercase; tokenize. Match against CPE dictionary.
+       Faster to bootstrap but more false positives.
+    3. **Hybrid.** Curated mappings for the top-N, heuristic for the
+       rest, surface "unmatched" packages in the UI so operators can
+       contribute mappings.
+
+    Recommend hybrid. Maintaining a `windows-cpe-mappings.json` file in
+    the backend repo is small enough to be tractable.
+  - **Surface a "Windows OS updates not tracked" disclaimer** on the
+    security tab for Windows hosts, until Phase 2 ships the
+    `Get-HotFix`-equivalent collector. Operators will reasonably expect
+    the scanner to know about missing Windows Updates.
+  - **`distro` matching:** `"windows:<release>"` strings should be
+    treated as a single "platform: Windows" bucket for advisory
+    lookups - there's no Windows equivalent of per-distro security
+    advisories (Microsoft publishes per-product CVEs that apply across
+    Windows versions, not per-OS-version advisories the way Debian/RHEL
+    do).
+  - **UI considerations.**
+    - Show package counts side-by-side: a Windows host might report
+      150-300 packages where a Debian host reports 1,500-3,000. That's
+      expected, not a "scan failure".
+    - If you display vendor names, parse them out of DisplayName for
+      a cleaner list - "Microsoft Edge" reads better than the full
+      DisplayName which might be "Microsoft Edge".
+
+---
+
 ## 13. Memory + swap fields are platform-specific
 
 - **Decision (2026-05-21).** No agent change. The `memory` and `swap`
