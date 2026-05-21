@@ -185,6 +185,43 @@ Format of each entry:
 
 ---
 
+## 10. "KERNEL" card on the dashboard is misleading on Windows
+
+- **Decision (2026-05-21).** No agent-side change - the payload already
+  carries the right data. This is purely a dashboard relabeling /
+  rerouting problem to call out.
+- **Context.** The dashboard currently shows a card labelled "KERNEL" with
+  value `uname.release`. On Linux that's the kernel version, e.g.
+  `6.5.0-21-generic`. On Windows it's `"10"` — the NT kernel major version
+  — because Microsoft has frozen the NT kernel at 10 since 2015. Windows
+  10, 11, Server 2019/2022/2025 all report NT 10. So `KERNEL: 10` is
+  technically correct and almost useless to the operator.
+- **Agent change.** None. The agent sends:
+  - `uname.system` = `"Windows"` (OS family marker)
+  - `uname.release` = `"10"` (NT kernel major)
+  - `uname.version` = e.g. `"10.0.26100"` (NT full build - this is the
+    useful number; 26100 is Server 2025, 22631 is Win11 23H2, etc.)
+  - `uname.machine` = `"AMD64"`
+  - `user_context.os_family` = `"windows"`
+  - `packages.distro` = e.g. `"windows:Microsoft Windows Server 2025"`
+    (constructed in `packages.py::get_distro()` from `platform.win32_ver()`)
+- **Backend TODO.** On a host where `uname.system == "Windows"` (or
+  equivalently `user_context.os_family == "windows"`), do **one** of:
+  1. Hide the "Kernel" card entirely. The NT kernel version isn't useful
+     to most Windows operators - they care about the Windows product
+     version, which is shown on the OS card (if there is one).
+  2. Repurpose the card: change the label to "Windows build" and show
+     `uname.version` (e.g. `10.0.26100`) instead of `uname.release`
+     (`10`). The build number uniquely identifies the Windows release
+     channel (Server 2025 = 26100, Win11 23H2 = 22631, ...).
+  3. Combine both into a single "OS" card that reads from `packages.distro`
+     stripped of the `windows:` prefix (e.g. "Microsoft Windows Server 2025").
+
+  Either way: on Linux, behavior is unchanged - keep showing the real
+  kernel version from `uname.release`.
+
+---
+
 ## 9. PID 0 ("System Idle Process") filtered from processes payload
 
 - **Decision (2026-05-21).** The processes collector drops PID 0
