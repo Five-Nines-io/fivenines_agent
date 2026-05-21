@@ -38,8 +38,9 @@ env:
   # WinSW v2 (.NET Framework 4 - in-box on Server 2019/2022/2025 + Win 10/11)
   WINSW_VERSION: '2.12.0'
   WINSW_URL: 'https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW.NET4.exe'
-  # TODO: pin and verify the SHA256 on the first green run, then enforce here.
-  WINSW_SHA256: 'TBD-PIN-ON-FIRST-GREEN'
+  # SHA256 of WinSW.NET4.exe v2.12.0 published binary. Verified against the
+  # GitHub release artifact via multiple consecutive green CI runs.
+  WINSW_SHA256: '923111C7142B3DC783A3C722B19B8A21BCB78222D7A136AC33F0CA8A29F4CB66'
 
 jobs:
   test-windows:
@@ -128,8 +129,7 @@ jobs:
           Invoke-WebRequest -Uri "${{ env.WINSW_URL }}" -OutFile $dst
           $hash = (Get-FileHash $dst -Algorithm SHA256).Hash
           Write-Host "Downloaded WinSW v${{ env.WINSW_VERSION }} - SHA256: $hash"
-          # TODO: when WINSW_SHA256 is no longer TBD, enforce: exit 1 on mismatch.
-          if ("${{ env.WINSW_SHA256 }}" -ne "TBD-PIN-ON-FIRST-GREEN" -and $hash -ne "${{ env.WINSW_SHA256 }}") {
+          if ($hash -ne "${{ env.WINSW_SHA256 }}") {
             Write-Error "WinSW SHA256 mismatch: expected ${{ env.WINSW_SHA256 }}, got $hash"
             exit 1
           }
@@ -139,6 +139,15 @@ jobs:
         run: |
           dotnet tool install --global wix --version "${{ env.WIX_VERSION }}"
           wix extension add --global "WixToolset.Util.wixext/${{ env.WIX_VERSION }}"
+
+      - name: Read agent version from pyproject.toml
+        id: version
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path pyproject.toml -Pattern '^version\s*=\s*"([^"]+)"' |
+                      ForEach-Object { $_.Matches[0].Groups[1].Value })
+          Write-Host "Agent version: $version"
+          "version=$version" | Out-File -Append -Encoding ascii $env:GITHUB_OUTPUT
 
       - name: Build MSI
         shell: pwsh
@@ -150,6 +159,7 @@ jobs:
           # and the service fails to start with PYI "module could not be found".
           wix build .\Product.wxs `
             -ext WixToolset.Util.wixext `
+            -d "Version=${{ steps.version.outputs.version }}" `
             -d "AgentBinarySource=..\..\dist\windows\fivenines-agent-windows-amd64" `
             -d "WinSwSource=..\..\dist\windows\WinSW.NET4.exe" `
             -d "WinSwConfigSource=..\winsw\fivenines-agent.xml" `

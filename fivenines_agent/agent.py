@@ -39,6 +39,31 @@ exit_event = Event()
 refresh_permissions_event = Event()
 
 
+# Permissive config used only in --dry-run so every collector that has the
+# capability runs, without contacting the API. The keys mirror what the server
+# would normally return for a fully-enabled install. Adding a new collector?
+# Add its config_key here so dry-run actually exercises it.
+_DRY_RUN_CONFIG = {
+    "enabled": True,
+    "interval": 60,
+    "request_options": {"timeout": 5, "retry": 3, "retry_interval": 5},
+    "cpu": True,
+    "memory": True,
+    "network": True,
+    "partitions": True,
+    "io": True,
+    "processes": True,
+    "ports": True,
+    "temperatures": True,
+    "fans": True,
+    "nvidia_gpu": True,
+    "smart_storage_health": True,
+    "raid_storage_health": True,
+    "fail2ban": True,
+    "disk_health": True,
+}
+
+
 def _on_exit_signal(signum, frame):
     exit_event.set()
 
@@ -81,8 +106,17 @@ class Agent:
         }
 
         self.queue = SynchronizationQueue(maxsize=100)
-        self.synchronizer = Synchronizer(self.token, self.queue, self.static_data)
-        self.synchronizer.start()
+        if dry_run():
+            # Skip the synchronizer entirely. The synchronizer is a non-daemon
+            # Thread that fetches config from the API at startup and would
+            # otherwise block --dry-run on retries (especially with an invalid
+            # token), preventing the main loop from ever reaching the
+            # exit_event.set() at the end of the first collection tick. We use
+            # _DRY_RUN_CONFIG so every collector that has the capability runs.
+            self.synchronizer = None
+        else:
+            self.synchronizer = Synchronizer(self.token, self.queue, self.static_data)
+            self.synchronizer.start()
 
     def _load_file(self, filename):
         try:
@@ -107,12 +141,16 @@ class Agent:
                     wd.notify()
                 self._handle_permission_refresh()
 
-                # Refresh config if disabled
-                self.config = self.synchronizer.get_config()
-                if not self.config.get("enabled", False):
-                    self.queue.put({"get_config": True, **self.static_data})
-                    exit_event.wait(25)
-                    continue
+                # Refresh config if disabled. In --dry-run we use a static
+                # permissive config so we never contact the API.
+                if self.synchronizer is None:
+                    self.config = _DRY_RUN_CONFIG
+                else:
+                    self.config = self.synchronizer.get_config()
+                    if not self.config.get("enabled", False):
+                        self.queue.put({"get_config": True, **self.static_data})
+                        exit_event.wait(25)
+                        continue
 
                 data = self.static_data.copy()
                 data["ts"] = time.time()
@@ -186,6 +224,10 @@ class Agent:
         return _collect_with_telemetry(name, fn, self._telemetry, *args, **kwargs)
 
     def _packages_sync_with_telemetry(self):
+        # packages_sync POSTs to /packages, which we skip in --dry-run since
+        # there's no synchronizer to dispatch through.
+        if self.synchronizer is None:
+            return
         self._collect(
             "packages_sync", packages_sync, self.config, self.synchronizer.send_packages
         )
@@ -211,7 +253,8 @@ class Agent:
     def _cleanup(self):
         log("fivenines agent shutting down. Please wait...")
         self.queue.clear()
-        self.synchronizer.stop()
-        self.queue.put(None)
-        self.synchronizer.join()
+        if self.synchronizer is not None:
+            self.synchronizer.stop()
+            self.queue.put(None)
+            self.synchronizer.join()
         sys.exit(0)

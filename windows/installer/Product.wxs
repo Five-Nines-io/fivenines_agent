@@ -16,8 +16,14 @@
     - Major upgrades are clean (UpgradeCode kept stable); uninstall removes
       the service, config dir, and logs.
 
-  This file is WiX 4 syntax. The Windows CI runner (T14) builds the MSI with
-  the WiX 4 toolset. Source variables:
+  This file is WiX 5 syntax. The Windows CI runner (T14) builds the MSI with
+  the WiX 5 toolset. Source variables:
+    Version           = the agent version (from pyproject.toml). MSI's Package
+                        Version drives the ARP DisplayVersion and the
+                        MajorUpgrade comparison; binding !(bind.FileVersion)
+                        against the PyInstaller bootloader yields an empty
+                        string because the frozen exe has no Win32 version
+                        resource.
     AgentBinarySource = the PyInstaller onedir OUTPUT DIRECTORY
                         (e.g. dist/windows/fivenines-agent-windows-amd64/).
                         The MSI ships the .exe AND the _internal/ subdir
@@ -32,7 +38,7 @@
 
   <Package Name="Fivenines Monitoring Agent"
            Manufacturer="Five-Nines.io"
-           Version="!(bind.FileVersion.AgentExe)"
+           Version="$(var.Version)"
            UpgradeCode="A2D5E1F0-1234-5678-90AB-CDEF12345678"
            Scope="perMachine"
            InstallerVersion="500">
