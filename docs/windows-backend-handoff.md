@@ -116,7 +116,23 @@ Format of each entry:
   with a 5-second timeout to prevent WMI hangs from blocking collection.
 - **Agent change.** `fivenines_agent/disk_health_windows.py`. Registered
   in `collectors.py::COLLECTORS` under the `disk_health` config key.
+- **Auto-enable in backend config (no UI toggle).** Unlike Linux SMART
+  (which needs `sudo smartctl`, per-host operator setup, and is therefore
+  shown as a beta opt-in checkbox on the "Storage Health" settings card),
+  `disk_health` on Windows uses WMI APIs built into the OS (Server 2012+,
+  Win 8+) AND our MSI grants the necessary namespace read permission to
+  the service account automatically via the `DelegateWmiStorageNamespace.ps1`
+  custom action. There is no operator setup. The backend should therefore
+  set `disk_health: true` in the config response unconditionally for any
+  host whose payload reports `capabilities.disk_health == true`.
+  **Do not add a Windows toggle to the Storage Health UI section** — it
+  would be a checkbox that does nothing meaningful (everything Windows
+  needs is granted at install time). Same logic applies to
+  `software_inventory`: enable when capability is true, no UI toggle.
 - **Backend TODO.**
+  - In the per-host config builder, when responding to `/collect` for a
+    Windows host: if `capabilities.disk_health == true`, include
+    `disk_health: true` in the config. Same for `software_inventory`.
   - Accept a `disk_health` array in Windows payloads. Each entry contains
     fields like `friendly_name`, `health_status`, `operational_status`,
     `media_type`, `bus_type`, `serial_number`, `size_bytes`, plus
@@ -127,6 +143,8 @@ Format of each entry:
     attributes — `wear` (percentage) is closest to SMART
     "Wear Leveling Count", `temperature` is a direct number, but
     SMART-specific attributes like raw read error rate don't exist.
+  - On Windows-host pages, hide the "Storage Health" settings card
+    (SMART / RAID checkboxes) entirely — that card is Linux-only.
 
 ---
 
