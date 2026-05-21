@@ -185,6 +185,86 @@ Format of each entry:
 
 ---
 
+## 13. Memory + swap fields are platform-specific
+
+- **Decision (2026-05-21).** No agent change. The `memory` and `swap`
+  collectors ship `psutil.virtual_memory()._asdict()` and
+  `psutil.swap_memory()._asdict()` as-is. The set of keys varies by
+  platform; backend needs to know what to expect on Windows vs Linux
+  vs macOS.
+- **Context.** Agent payload includes two memory-related sections:
+  - `memory` — physical RAM stats (bytes for all size fields, percent
+    for `percent`).
+  - `swap` — swap/pagefile stats.
+
+### `memory` field availability
+
+| Field | Linux | macOS | Windows | Meaning |
+|---|---|---|---|---|
+| `total` | yes | yes | yes | total physical memory (excl. swap), bytes |
+| `available` | yes | yes | yes | memory that can be handed to processes **without swapping**. **This is the cross-platform "actual free memory" signal** - rely on this, not on `free` |
+| `percent` | yes | yes | yes | `(total - available) / total * 100` |
+| `used` | yes | yes | yes | informational only; computed differently per platform; `total - free` does **not** necessarily equal `used` |
+| `free` | yes | yes | yes | truly free (zeroed) pages. **Not** the same as "available" - on Linux/BSD, file cache counts as free-able but is not in `free`. On Windows, `free` and `available` are equal. |
+| `active` | yes (UNIX) | yes | - | currently in use or recently used (still in RAM) |
+| `inactive` | yes (UNIX) | yes | - | marked as not used |
+| `buffers` | yes (Linux, BSD) | - | - | cache for FS metadata |
+| `cached` | yes (Linux, BSD) | - | - | general page cache |
+| `shared` | yes (Linux, BSD; psutil >= 4.2.0) | - | - | memory shared between processes |
+| `slab` | yes (Linux; psutil >= 5.4.4) | - | - | kernel slab cache |
+| `wired` | - | yes (macOS, BSD) | - | memory pinned in RAM, never swapped |
+
+Important quirks:
+- `used + available` does **not** necessarily equal `total`. There are
+  hidden buckets per OS (kernel reservations, page tables, etc.).
+- On Windows, `available == free` (they're the same number from
+  `GlobalMemoryStatusEx`).
+- On Linux, `available` is the kernel's `MemAvailable` from `/proc/meminfo`,
+  which accounts for reclaimable file cache. This is what every modern
+  Linux tool (`free -h`, `top`, etc.) shows as "available".
+
+### `swap` field availability
+
+| Field | Linux | macOS | Windows | Meaning |
+|---|---|---|---|---|
+| `total` | yes | yes | yes | total swap/pagefile size in bytes |
+| `used` | yes | yes | yes | swap currently in use, bytes |
+| `free` | yes | yes | yes | swap currently free, bytes |
+| `percent` | yes | yes | yes | utilization 0-100 |
+| `sin` | yes | yes | always `0` | bytes swapped **in** from disk (cumulative since boot) |
+| `sout` | yes | yes | always `0` | bytes swapped **out** to disk (cumulative since boot) |
+
+Quirks:
+- **Windows: `sin` and `sout` are always `0`.** psutil doesn't have a
+  way to extract swap-in/swap-out rates from the Windows kernel. Don't
+  build a "swap rate" alert on Windows - the values are not meaningful.
+  Use `percent` and `used` deltas instead.
+- On Linux/macOS, `sin`/`sout` are cumulative counters - the backend
+  computes the rate by differencing two samples.
+- Windows "swap" is the pagefile (`pagefile.sys`). It's normal for
+  Windows to use the pagefile even when there's free RAM, because the
+  Windows memory manager preemptively pages out cold pages. `swap.used
+  > 0` is not necessarily a memory-pressure signal on Windows the way
+  it would be on Linux.
+
+- **Backend TODO.**
+  - For the "Memory" donut/usage chart, use `memory.percent` (cross-
+    platform, correctly computed by psutil from `available`).
+  - For the breakdown ("used vs cached vs free"), branch by OS:
+    - Linux: stack `used` / `buffers` / `cached` / `free`. Add `shared`
+      and `slab` if you want a more detailed view.
+    - macOS: stack `active` / `inactive` / `wired` / `free`.
+    - Windows: only two meaningful buckets - `used` and `free`. Don't
+      try to fabricate cache visibility on Windows.
+  - For swap charts: show `percent` always. Hide swap-rate charts
+    (`sin`/`sout` derivatives) on Windows hosts since the values are
+    pinned to 0.
+  - For "swap pressure" alerts: only fire on Linux/macOS. On Windows,
+    base any equivalent alert on memory `available` and `percent`
+    instead.
+
+---
+
 ## 12. CPU times fields are platform-specific (Linux has `iowait`/`steal`/etc., Windows has `interrupt`/`dpc`)
 
 - **Decision (2026-05-21).** No agent change. The `cpu` collector ships
