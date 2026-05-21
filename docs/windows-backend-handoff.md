@@ -185,6 +185,43 @@ Format of each entry:
 
 ---
 
+## 11. Top CPU per-process % is per-core, not system-wide
+
+- **Decision (2026-05-21).** No agent change. The agent ships
+  `cpu_percent` as psutil returns it natively, which for per-process
+  values is **percent of a single core** (range 0 to `cpu_count * 100`).
+  This is the same on Linux and Windows; not a Windows-specific issue,
+  but surfaced while validating the dashboard against the new Windows
+  host.
+- **Context.** On the dashboard today:
+  - "CPU Usage" card uses `psutil.cpu_percent()` (system-wide, 0-100%).
+  - "Top CPU" rows use per-process `cpu_percent` (per-core, can exceed
+    100% if the process is multi-threaded across cores).
+  These are different units, so on a 4-core box you can see "CPU Usage
+  5%" while "fivenines-agent" reads 11.4% in Top CPU. Math checks out
+  (11.4 / 4 ≈ 2.85% of total system), but operators read the two
+  numbers as if they were comparable.
+- **Agent change.** Intentionally none. Keeping raw per-core values
+  preserves a useful signal — a process reading 600% on an 8-core box
+  is occupying 6 cores fully, which is more informative than just
+  "75% of total". The backend can derive normalized values if it wants.
+- **Backend TODO.**
+  - Choose one of these UI patterns and apply consistently:
+    1. **Normalize to system-wide.** Divide each `cpu_percent` by
+       `cpu_count` (which the agent already reports under the `cpu`
+       collector). Cap at 100%. Then the Top CPU row matches the donut.
+       Loses the "this process saturates N cores" signal.
+    2. **Label the unit.** Keep the per-core value but tag it visually
+       (e.g. `11.4% / 4 cores` or `2.85% system`). Preserves the signal
+       but takes more screen space.
+    3. **Two columns.** Show both `% per-core` and `% system` in the
+       Top CPU table. Most explicit but heaviest UI.
+  - Recommendation: option 1 (normalize). Casual users will be confused
+    by raw per-core %, and power users can dig into `View metrics →` for
+    the unnormalized data.
+
+---
+
 ## 10. "KERNEL" card on the dashboard is misleading on Windows
 
 - **Decision (2026-05-21).** No agent-side change - the payload already
