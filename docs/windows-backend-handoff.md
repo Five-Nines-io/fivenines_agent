@@ -207,8 +207,7 @@ Format of each entry:
      registry. They're queryable via `Get-HotFix` / `wmic qfe` / WMI
      `Win32_QuickFixEngineering`. Half of Windows-relevant CVEs are in
      the OS itself, so without these the scanner has a big blind spot.
-     **Phase 2 candidate** - already noted in TODOS.md alongside the
-     other Windows-native collectors.
+     **Tracked in [issue #61](https://github.com/Five-Nines-io/fivenines_agent/issues/61).**
   2. **MSU bundles and feature-on-demand packages.** Same story - not
      in the Uninstall hive.
   3. **System-bundled software with inconsistent registration.**
