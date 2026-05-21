@@ -185,6 +185,60 @@ Format of each entry:
 
 ---
 
+## 12. CPU times fields are platform-specific (Linux has `iowait`/`steal`/etc., Windows has `interrupt`/`dpc`)
+
+- **Decision (2026-05-21).** No agent change. The `cpu` collector ships
+  whatever fields `psutil.cpu_times_percent()` and `psutil.cpu_times()`
+  return for the current platform. The set of fields differs per OS,
+  which the backend needs to be aware of when reading the payload.
+- **Context.** The `cpu` collector emits two per-core arrays:
+  - `cpu_times_percent` (per-core, expressed as **% of that core's
+    time**, sums to ~100 per core). Used for charts of "where is the
+    CPU spending time" - user vs system vs idle vs platform-specific
+    buckets.
+  - `cpu_times` (per-core, expressed as **seconds since boot**). The
+    cumulative counter; useful if the backend wants to compute its own
+    deltas at a different time granularity than the agent's interval.
+
+  Both come from psutil and inherit psutil's named-tuple shape, which
+  varies by platform.
+- **Field availability (from psutil docs):**
+
+  | Field | Linux | macOS | Windows | Meaning |
+  |---|---|---|---|---|
+  | `user` | yes | yes | yes | normal processes in user mode (Linux also includes guest time here) |
+  | `system` | yes | yes | yes | processes executing in kernel mode |
+  | `idle` | yes | yes | yes | doing nothing |
+  | `nice` | yes | yes | - | niced processes in user mode (Linux also includes guest_nice here) |
+  | `iowait` | yes | - | - | waiting for I/O (NOT counted in idle on Linux) |
+  | `irq` | yes (& BSD) | - | - | servicing hardware interrupts |
+  | `softirq` | yes | - | - | servicing software interrupts |
+  | `steal` | yes (>=2.6.11) | - | - | other OSes running in a virtualized env (KVM/Xen guest indicator) |
+  | `guest` | yes (>=2.6.24) | - | - | running a virtual CPU for guest OSes |
+  | `guest_nice` | yes (>=3.2.0) | - | - | running a niced virtual CPU for guest OSes |
+  | `interrupt` | - | - | yes | servicing hardware interrupts (Windows-side equivalent of `irq`) |
+  | `dpc` | - | - | yes | servicing Deferred Procedure Calls (interrupts at a lower priority than standard interrupts) |
+
+- **Backend TODO.**
+  - Accept the union of all possible field names in the per-core payload
+    dicts. Missing fields = field doesn't apply to this OS.
+  - For the per-core "CPU breakdown" chart:
+    - Cross-platform bars: `user`, `system`, `idle`.
+    - On Linux, additionally show `iowait`, `irq`, `softirq`, `steal`,
+      `guest`. `steal` is particularly valuable on cloud VMs - it's
+      the "noisy neighbor" indicator.
+    - On Windows, additionally show `interrupt` and `dpc`. High `dpc`
+      is the Windows-side equivalent signal of high `softirq` on
+      Linux - usually a driver problem (often network or storage).
+    - On macOS, only `user`/`system`/`idle`/`nice` are populated.
+  - Field semantics differ subtly between OSes (Linux folds guest time
+    into user, Windows reports interrupts as `interrupt` not `irq`,
+    etc.). If you display a "% in kernel" rollup, decide whether to
+    include the platform-specific kernel-time buckets and apply the
+    same rule per OS.
+
+---
+
 ## 11. Top CPU per-process % is per-core, not system-wide
 
 - **Decision (2026-05-21).** No agent change. The agent ships
