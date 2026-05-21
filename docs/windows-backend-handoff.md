@@ -185,6 +185,27 @@ Format of each entry:
 
 ---
 
+## 9. PID 0 ("System Idle Process") filtered from processes payload
+
+- **Decision (2026-05-21).** The processes collector drops PID 0
+  unconditionally. On Windows that pseudo-entry is "System Idle Process",
+  which represents CPU time the cores spent doing *nothing* and routinely
+  reports ~(cpu_count * 100)% CPU. Including it in the payload made it
+  dominate every "Top CPU" view on the dashboard - inverse of useful. On
+  Linux PID 0 is the kernel scheduler and not exposed via /proc, so the
+  filter is a no-op there.
+- **Agent change.** `fivenines_agent/processes.py` skips `proc.pid == 0`
+  before calling `as_dict()`. Test in `tests/test_processes.py`.
+- **Backend TODO.**
+  - No payload-shape change - the field still arrives as a list of
+    process dicts, just without PID 0 for Windows hosts.
+  - If the dashboard had any defensive code to skip "System Idle Process"
+    client-side, it can be removed (we now ship clean data).
+  - If you want a top-line "system idle %" metric on Windows, derive it
+    from `100 - cpu_usage` rather than from a process row.
+
+---
+
 ## 8. MSI installer download URL (post-publication)
 
 - **Decision.** Windows installer is published as a single MSI:
