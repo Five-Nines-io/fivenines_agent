@@ -20,31 +20,67 @@ Format of each entry:
 
 When the backend responds to `/collect` for a host whose payload reports
 `uname.system == "Windows"` (or equivalently `user_context.os_family ==
-"windows"`), the config dict MUST include the Windows-native collectors
-as `true`:
+"windows"`), the config dict differs from the Linux defaults in three ways:
+
+**1. Always set `disk_health: true`.**
 
 ```jsonc
 {
   // ... usual cross-platform flags (cpu, memory, network, ports, ...) ...
-  "disk_health": true,         // ALWAYS true for Windows hosts
-  "software_inventory": true   // ALWAYS true for Windows hosts
+  "disk_health": true   // ALWAYS true for Windows hosts
 }
 ```
 
-These are **always** safe to enable: the Windows agent has the OS-built-in
-APIs (WMI + registry) to satisfy them, the MSI grants the necessary ACLs
-at install time, and there's no operator setup. Without `disk_health: true`
-the agent has the capability (`capabilities.disk_health == true`) but
-never invokes the collector, leaving the dashboard's storage view empty.
-Same for `software_inventory`. See entries #4 and #5 for the payload
-shapes the collectors produce.
+The Windows agent has the OS-built-in WMI APIs to satisfy this, and the MSI
+grants the necessary namespace ACL to the service account at install time.
+There's no operator setup. Without this key, the agent has the capability
+(`capabilities.disk_health == true`) but never invokes the collector,
+leaving the dashboard's storage view empty for Windows hosts. See entry #4
+for the payload shape the collector produces.
 
-Linux-only config flags (`smart_storage_health`, `raid_storage_health`,
-`fail2ban`, `qemu`, `proxmox`, `packages`) should be **omitted** from
-the response for Windows hosts. Sending them as `true` is currently
-harmless (the agent's Linux collectors fail gracefully on Windows and
-return empty arrays) but adds noise to the verbose log and wastes a few
-ms per tick. See entry #3 for the full mapping.
+**2. `packages.scan` is cross-platform — send it the same way as Linux.**
+
+The `packages` security-scan flow works on Windows too. The agent dispatches
+internally: Linux uses dpkg/rpm/apk/pacman; Windows reads `HKLM\...\Uninstall`
+via `_get_packages_windows_registry()`. Same `/packages` endpoint, same
+delta-by-hash mechanism. So when the backend wants the host inventoried,
+it sends the usual:
+
+```jsonc
+{
+  "packages": {
+    "scan": true,
+    "last_package_hash": "<sha256>"   // same as Linux
+  }
+}
+```
+
+`capabilities.software_inventory == true` is the Windows-side capability
+indicator (mirrors `capabilities.packages` on Linux); it is **not** a
+config gate the agent reads. Don't send `software_inventory: true` in
+the config — it's a no-op. See entry #5 for naming/version differences
+and entry #14 for the broader CVE-matching guidance.
+
+**3. Omit Linux-only config flags entirely.**
+
+These collectors don't exist on Windows. The backend should not send them
+in the config response, AND the dashboard settings UI should not show
+their toggles when viewing a Windows host:
+
+| Config key | What it does | Hide in UI on Windows? |
+|---|---|---|
+| `smart_storage_health` | Linux SMART via `sudo smartctl` | yes — show `disk_health` info instead |
+| `raid_storage_health` | Linux software RAID via `mdadm` | yes — Windows has no mdadm equivalent worth surfacing |
+| `fail2ban` | Linux fail2ban-client | yes — Windows uses Windows Defender / Event Log (Phase 2) |
+| `qemu` | Linux libvirt/QEMU | yes — Windows uses Hyper-V (Phase 2) |
+| `proxmox` | Proxmox VE (Linux-only product) | yes |
+| `zfs` | ZFS pool monitoring (Linux/BSD) | yes |
+
+Sending them as `true` to a Windows host is currently harmless (the
+collectors fail gracefully, return empty arrays) but adds noise to the
+verbose log and wastes a few ms per tick. The dashboard hiding is more
+important than the config omission — operators viewing the host's
+settings page should not see options that won't do anything.
 
 ---
 
@@ -159,12 +195,13 @@ ms per tick. See entry #3 for the full mapping.
   host whose payload reports `capabilities.disk_health == true`.
   **Do not add a Windows toggle to the Storage Health UI section** — it
   would be a checkbox that does nothing meaningful (everything Windows
-  needs is granted at install time). Same logic applies to
-  `software_inventory`: enable when capability is true, no UI toggle.
+  needs is granted at install time).
 - **Backend TODO.**
   - In the per-host config builder, when responding to `/collect` for a
     Windows host: if `capabilities.disk_health == true`, include
-    `disk_health: true` in the config. Same for `software_inventory`.
+    `disk_health: true` in the config. (Software inventory is handled
+    via the existing cross-platform `packages.scan` config — see entry
+    #5 and the quick-rule section at the top.)
   - Accept a `disk_health` array in Windows payloads. Each entry contains
     fields like `friendly_name`, `health_status`, `operational_status`,
     `media_type`, `bus_type`, `serial_number`, `size_bytes`, plus
@@ -185,12 +222,30 @@ ms per tick. See entry #3 for the full mapping.
 - **Decision.** Windows uses the registry's `Uninstall` keys
   (`HKLM\Software\Microsoft\Windows\CurrentVersion\Uninstall` and the
   `WOW6432Node` variant) as the source of installed software, instead of
-  dpkg/rpm/apk/pacman.
+  dpkg/rpm/apk/pacman. Same `/packages` endpoint, same delta-by-hash flow
+  as Linux — the agent dispatches per-OS internally.
 - **Agent change.** `packages.py::_get_packages_windows_registry()`,
   dispatched from `get_installed_packages()` when `is_windows()`.
   `get_distro()` returns `"windows:<release>"` on Windows
   (e.g. `"windows:Windows Server 2025"`).
+- **Capability flag vs config gate (important).** The agent exposes two
+  parallel capability keys to describe the same scanning flow:
+  - On **Linux**: `capabilities.packages == true` when dpkg/rpm/apk/pacman
+    is reachable.
+  - On **Windows**: `capabilities.software_inventory == true` when
+    `HKLM\...\Uninstall` is readable.
+
+  These are **descriptive flags read by the dashboard** to decide what to
+  show on the capabilities banner — they are **NOT** config gates the
+  agent reads to decide whether to run. The actual scanning flow is gated
+  by the **cross-platform** `config.packages.scan` key. Sending
+  `config.software_inventory: true` is a no-op (the agent's
+  `packages_sync` function only checks `config.packages.scan`).
 - **Backend TODO.**
+  - To trigger an inventory on a Windows host: include the standard
+    `packages: { scan: true, last_package_hash: ... }` block in the
+    config response, exactly the way you do for Linux hosts. The agent
+    handles the OS dispatch.
   - Accept `distro` strings of the form `"windows:<release>"`. The release
     string comes from `platform.win32_ver()` and isn't sanitized further,
     so handle both common names ("Windows Server 2025", "11") and unusual
