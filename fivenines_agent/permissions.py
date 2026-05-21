@@ -54,7 +54,10 @@ LINUX_BANNER_GROUPS = [
 ]
 
 WINDOWS_BANNER_GROUPS = [
-    ("Core Metrics", ["cpu", "memory", "load_average", "io", "network",
+    # No load_average - Windows has no native equivalent and psutil's
+    # CPU-sampling emulation drops to zero on idle systems, which is more
+    # misleading than helpful. We omit the metric entirely on Windows.
+    ("Core Metrics", ["cpu", "memory", "io", "network",
                       "partitions", "file_handles", "ports", "processes"]),
     ("Hardware Sensors", ["temperatures", "fans", "nvidia_gpu"]),
     ("Storage", ["disk_health"]),
@@ -183,10 +186,14 @@ class PermissionProbe:
         (registry Uninstall key).
         """
         return {
-            # Core metrics - psutil handles these cross-platform
+            # Core metrics - psutil handles these cross-platform.
+            # load_average is intentionally absent: Windows has no equivalent
+            # (no D-state, no real load avg in the kernel), and psutil's
+            # emulation samples CPU activity only and reads zero on idle
+            # systems. Omit rather than ship misleading data (D13 - send a
+            # Windows-shaped payload rather than Linux keys marked N/A).
             "cpu": True,
             "memory": True,
-            "load_average": True,
             "io": True,
             "network": True,
             "partitions": True,

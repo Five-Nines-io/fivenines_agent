@@ -181,8 +181,12 @@ class Agent:
             self._cleanup()
 
     def _collect_metrics(self, data):
-        # Core metrics (always enabled)
-        data["load_average"] = self._collect("load_average", load_average)
+        # Core metrics (always enabled). load_average is Linux-only - psutil's
+        # Windows emulation drops to zero on idle systems and resets on
+        # process restart, so we omit the key entirely on Windows rather
+        # than ship a value that's more misleading than informative.
+        if not is_windows():
+            data["load_average"] = self._collect("load_average", load_average)
         self._collect_file_handles(data)
 
         # Conditional metrics via registry, gated by capability where available

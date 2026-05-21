@@ -285,9 +285,12 @@ def test_build_windows_capabilities_has_windows_shape(mock_iw):
     assert "software_inventory" in probe.capabilities
 
     # Core metrics are unconditionally True on Windows (psutil works).
-    for core in ("cpu", "memory", "load_average", "io", "network",
+    # load_average is intentionally absent on Windows - see comment in
+    # _build_windows_capabilities.
+    for core in ("cpu", "memory", "io", "network",
                  "partitions", "file_handles", "ports", "processes"):
         assert probe.capabilities[core] is True
+    assert "load_average" not in probe.capabilities
 
 
 def test_can_query_psutil_sensors_returns_true_when_data():
