@@ -16,6 +16,38 @@ Format of each entry:
 
 ---
 
+## Quick rule: config response shape for Windows hosts
+
+When the backend responds to `/collect` for a host whose payload reports
+`uname.system == "Windows"` (or equivalently `user_context.os_family ==
+"windows"`), the config dict MUST include the Windows-native collectors
+as `true`:
+
+```jsonc
+{
+  // ... usual cross-platform flags (cpu, memory, network, ports, ...) ...
+  "disk_health": true,         // ALWAYS true for Windows hosts
+  "software_inventory": true   // ALWAYS true for Windows hosts
+}
+```
+
+These are **always** safe to enable: the Windows agent has the OS-built-in
+APIs (WMI + registry) to satisfy them, the MSI grants the necessary ACLs
+at install time, and there's no operator setup. Without `disk_health: true`
+the agent has the capability (`capabilities.disk_health == true`) but
+never invokes the collector, leaving the dashboard's storage view empty.
+Same for `software_inventory`. See entries #4 and #5 for the payload
+shapes the collectors produce.
+
+Linux-only config flags (`smart_storage_health`, `raid_storage_health`,
+`fail2ban`, `qemu`, `proxmox`, `packages`) should be **omitted** from
+the response for Windows hosts. Sending them as `true` is currently
+harmless (the agent's Linux collectors fail gracefully on Windows and
+return empty arrays) but adds noise to the verbose log and wastes a few
+ms per tick. See entry #3 for the full mapping.
+
+---
+
 ## 1. `load_average` is omitted on Windows payloads
 
 - **Decision (2026-05-21).** Drop `load_average` entirely from Windows
