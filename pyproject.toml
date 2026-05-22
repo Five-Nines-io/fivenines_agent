@@ -34,8 +34,15 @@ optional = true
 # pulls this group via --with windows and explicitly excludes the
 # virtualization group, which carries libvirt-python (does not build on
 # Windows) and systemd-watchdog (Linux-only).
-pywin32 = "*"
-wmi = "*"
+#
+# The sys_platform == "win32" marker is belt-and-suspenders: even though
+# this group is optional, Poetry's lockfile resolution can still pull
+# pywin32 into the dep tree on Linux when the resolver evaluates the
+# windows group's edges. The marker makes the package non-applicable on
+# Linux/macOS regardless of group install state, so 'poetry install' on
+# Linux never tries to fetch the Windows-only wheel.
+pywin32 = { version = "*", markers = "sys_platform == 'win32'" }
+wmi = { version = "*", markers = "sys_platform == 'win32'" }
 
 [tool.poetry.scripts]
 fivenines_agent = "fivenines_agent.__main__:start"

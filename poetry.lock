@@ -1474,6 +1474,7 @@ description = "Python for Window Extensions"
 optional = false
 python-versions = "*"
 groups = ["main", "windows"]
+markers = "sys_platform == \"win32\""
 files = [
     {file = "pywin32-311-cp310-cp310-win32.whl", hash = "sha256:d03ff496d2a0cd4a5893504789d4a15399133fe82517455e78bad62efbb7f0a3"},
     {file = "pywin32-311-cp310-cp310-win_amd64.whl", hash = "sha256:797c2772017851984b97180b0bebe4b620bb86328e8a884bb626156295a63b3b"},
@@ -1842,6 +1843,7 @@ description = "Windows Management Instrumentation"
 optional = false
 python-versions = "*"
 groups = ["windows"]
+markers = "sys_platform == \"win32\""
 files = [
     {file = "WMI-1.5.1-py2.py3-none-any.whl", hash = "sha256:1d6b085e5c445141c475476000b661f60fff1aaa19f76bf82b7abb92e0ff4942"},
     {file = "WMI-1.5.1.tar.gz", hash = "sha256:b6a6be5711b1b6c8d55bda7a8befd75c48c12b770b9d227d31c1737dbf0d40a6"},
@@ -2060,4 +2062,4 @@ cffi = ["cffi (>=1.17,<2.0) ; platform_python_implementation != \"PyPy\" and pyt
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.14"
-content-hash = "829eff688add49996aa908c2d3a1a2b47343a78c71e2c5e7c5b93a05654d3cfe"
+content-hash = "6261d332590c09bfd040096d70ead268bb783d0368877e5d8af36a32542697e2"
