@@ -290,6 +290,48 @@ settings page should not see options that won't do anything.
 
 ---
 
+## 15. Service-monitoring toggles (Docker / Redis / Postgres / Nginx / Caddy) are cross-platform — keep them visible on Windows hosts
+
+- **Decision (2026-05-22).** No agent change. These five collectors talk
+  to services over TCP/HTTP (or in Docker's case a local named pipe),
+  not via OS-specific APIs, so they work on Windows just like Linux. The
+  dashboard's settings page should keep their toggles visible for
+  Windows hosts.
+- **Context.** The "Virtualization & Containers / Databases / Web Servers"
+  section of the per-host settings page exposes toggles for `docker`,
+  `redis`, `postgresql`, `nginx`, and `caddy`. On Windows, each of them:
+  - `redis` / `postgresql` — pure TCP. The agent's `redis-py` /
+    `psycopg2` (or equivalent) just connect to the configured host:port,
+    same as Linux. Targets are usually remote so locality doesn't matter.
+  - `nginx` — HTTP `stub_status` endpoint. Nginx also has Windows builds
+    if the operator wants to monitor a local instance, but the typical
+    case is monitoring a remote nginx in front of the Windows host's
+    apps.
+  - `caddy` — HTTP admin API. Caddy is a Go binary, runs natively on
+    Windows; the Windows agent monitoring a local Caddy works out of
+    the box.
+  - `docker` — `docker.from_env()` (from docker-py) auto-detects the
+    Windows named pipe `\\.\pipe\docker_engine` when Docker Desktop is
+    running. Our `docker.py::get_docker_client` uses this entrypoint
+    unchanged. If the operator configures a remote Docker socket URL
+    (e.g. via TCP), that also works.
+- **Backend TODO.**
+  - **Do NOT hide these toggles on Windows hosts.** Unlike the Linux-only
+    options listed in the quick-rule section (`smart_storage_health`,
+    `raid_storage_health`, `fail2ban`, `qemu`, `proxmox`, `zfs`), these
+    five apply to Windows hosts too. Keep them in the settings UI.
+  - Send the same `config.docker` / `config.redis` / `config.postgresql`
+    / `config.nginx` / `config.caddy` shapes as you do for Linux. The
+    agent doesn't branch on OS for any of these — same code path runs.
+  - **Optional polish:** the Windows capability probe currently omits a
+    `docker` key (Linux has `_can_access_docker` that checks the socket).
+    Adding an equivalent Windows probe would let the dashboard show a
+    "Docker detected" hint on hosts where Docker Desktop is running.
+    Not blocking — just a nicer UX. Tracked as a low-priority follow-up
+    on the agent side.
+
+---
+
 ## 14. Package security scanner on Windows: registry-sourced, incomplete by design
 
 - **Decision (2026-05-21).** The Windows agent participates in the existing
