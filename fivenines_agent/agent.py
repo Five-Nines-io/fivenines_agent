@@ -23,6 +23,7 @@ from fivenines_agent.env import config_dir, dry_run, env_file, get_user_context,
 from fivenines_agent.files import file_handles_limit, file_handles_used, handle_count
 from fivenines_agent.ip import get_ip
 from fivenines_agent.load_average import load_average
+from fivenines_agent.machine_id import get_machine_id
 from fivenines_agent.packages import packages_sync
 from fivenines_agent.permissions import get_permissions, print_capabilities_banner
 from fivenines_agent.ping import tcp_ping
@@ -103,6 +104,7 @@ class Agent:
             "capabilities": self.permissions.get_all(),
             "capability_reasons": self.permissions.get_reasons(),
             "user_context": get_user_context(CONFIG_DIR),
+            "machine_id": get_machine_id(),
         }
 
         self.queue = SynchronizationQueue(maxsize=100)
