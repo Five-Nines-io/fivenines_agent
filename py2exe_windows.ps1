@@ -39,15 +39,21 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host "=== Installing project dependencies (windows + dev, virtualization excluded) ==="
-# Scoped to this command so we don't mutate the runner's global poetry config.
-$env:POETRY_VIRTUALENVS_CREATE = "false"
+# Use a project-local venv (.venv in CWD) rather than the runner's global
+# Python. Running 'poetry install' against the global Python triggers a
+# 'pip uninstall poetry' on Windows whenever deps shift in a way that
+# conflicts with poetry's own pins (idna, urllib3, etc.) - and that uninstall
+# fails with WinError 32 because poetry.exe is locked by the running process.
+# A venv isolates the project's deps from poetry's runtime, so the self-
+# uninstall path never fires.
+poetry config virtualenvs.in-project true
 poetry install --no-interaction --without virtualization --with windows
 if ($LASTEXITCODE -ne 0) { Write-Error "poetry install failed"; exit 1 }
 
 # Defensive: confirm the excluded groups are not importable.
 $forbidden = @("libvirt", "systemd_watchdog", "proxmoxer")
 foreach ($mod in $forbidden) {
-    $check = python -c "import $mod" 2>&1
+    $check = poetry run python -c "import $mod" 2>&1
     if ($LASTEXITCODE -eq 0) {
         Write-Warning "Unexpected: $mod is importable. It should not be on Windows."
     } else {
@@ -56,7 +62,7 @@ foreach ($mod in $forbidden) {
 }
 
 Write-Host "=== Verifying PyInstaller is importable ==="
-python -c "import PyInstaller; print('PyInstaller', PyInstaller.__version__)"
+poetry run python -c "import PyInstaller; print('PyInstaller', PyInstaller.__version__)"
 if ($LASTEXITCODE -ne 0) { Write-Error "PyInstaller not importable"; exit 1 }
 
 Write-Host "=== Building Executable ==="
@@ -91,7 +97,7 @@ $pyInstallerArgs = @(
     ".\py2exe_entrypoint.py"
 )
 
-python -m PyInstaller @pyInstallerArgs
+poetry run python -m PyInstaller @pyInstallerArgs
 if ($LASTEXITCODE -ne 0) {
     Write-Error "PyInstaller failed with exit code $LASTEXITCODE"
     exit 1
