@@ -25,7 +25,18 @@ python -m pip --version
 
 Write-Host "=== Installing build prerequisites ==="
 python -m pip install --upgrade pip setuptools wheel
-python -m pip install "poetry==2.2.1"
+
+# Poetry is installed by the CI workflow's separate "Install Poetry" step
+# (.github/workflows/windows.yml + build-release.yml). Re-installing it here
+# breaks on Windows when the existing poetry.exe is locked by the running
+# Python process (pip's uninstall step fails with WinError 32 "process
+# cannot access the file"). Anyone running this script outside CI must
+# pre-install poetry (any 2.x is fine).
+poetry --version
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "poetry is not on PATH. Install it before running this script (e.g. 'pip install poetry==2.2.1')."
+    exit 1
+}
 
 Write-Host "=== Installing project dependencies (windows + dev, virtualization excluded) ==="
 # Scoped to this command so we don't mutate the runner's global poetry config.
