@@ -32,3 +32,5 @@ RHEL 10 generation regressions block releases.
 - **Effort:** S (human) / S (CC)
 - **Depends on:** Rocky Linux 10 GA release
 - **Files:** `.github/workflows/build-release.yml` (remove `allow_failure: "1"` from rockylinux:10 entry)
+
+

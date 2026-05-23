@@ -4,17 +4,30 @@ import hashlib
 import subprocess
 from unittest.mock import MagicMock, mock_open, patch
 
+import pytest
+
 from fivenines_agent.packages import (
     _get_packages_apk,
     _get_packages_dpkg,
     _get_packages_pacman,
     _get_packages_rpm,
     _get_packages_synopkg,
+    _get_packages_windows_registry,
     get_distro,
     get_installed_packages,
     get_packages_hash,
     packages_available,
 )
+
+
+@pytest.fixture(autouse=True)
+def _default_to_linux_packages_path():
+    """Existing tests exercise the Linux package-manager dispatch; force
+    is_windows=False by default so they run identically on Windows CI.
+    Windows-specific tests explicitly override via @patch decorator (decorator
+    wins inside the test body)."""
+    with patch("fivenines_agent.packages.is_windows", return_value=False):
+        yield
 
 
 # --- packages_available ---
@@ -398,3 +411,181 @@ def test_get_packages_hash_empty():
 def test_get_packages_hash_deterministic():
     packages = [{"name": "a", "version": "1"}, {"name": "b", "version": "2"}]
     assert get_packages_hash(packages) == get_packages_hash(packages)
+
+
+# --- T9: Windows registry-based software inventory ---
+
+
+@patch("fivenines_agent.packages.is_windows", return_value=True)
+def test_packages_available_windows_returns_true(mock_iw):
+    assert packages_available() is True
+
+
+@patch("fivenines_agent.packages.is_windows", return_value=True)
+def test_get_distro_windows_returns_release(mock_iw):
+    with patch("platform.release", return_value="10"):
+        assert get_distro() == "windows:10"
+
+
+@patch("fivenines_agent.packages.is_windows", return_value=True)
+def test_get_distro_windows_empty_release_returns_plain_windows(mock_iw):
+    with patch("platform.release", return_value=""):
+        assert get_distro() == "windows"
+
+
+@patch("fivenines_agent.packages.is_windows", return_value=True)
+def test_get_distro_windows_handles_release_exception(mock_iw):
+    with patch("platform.release", side_effect=OSError("nope")):
+        assert get_distro() == "windows"
+
+
+def _make_fake_winreg(roots_to_entries):
+    """Build a fake winreg module.
+
+    *roots_to_entries* is a dict from subkey-path-substring to list of
+    (subkey_name, {value_name: value}) tuples. None as the value list means
+    'opening this root raises OSError'.
+    """
+    fake = MagicMock()
+    fake.HKEY_LOCAL_MACHINE = "HKLM"
+
+    def open_key(arg1, arg2):
+        if arg1 == "HKLM":
+            for key_sub, entries in roots_to_entries.items():
+                if key_sub in arg2:
+                    if entries is None:
+                        raise OSError(f"cannot open {arg2}")
+                    h = MagicMock(name=f"root:{arg2}")
+                    h._entries = entries
+                    return h
+            # Default: opening unknown root path raises
+            raise OSError(f"unknown path {arg2}")
+        # Sub-key open: arg1 is a root, arg2 is a sub-key name
+        if arg2 == "__BROKEN_SUB__":
+            raise OSError("broken sub")
+        for name, vals in arg1._entries:
+            if name == arg2:
+                sub = MagicMock(name=f"sub:{arg2}")
+                sub._values = vals
+                return sub
+        raise OSError(f"sub missing: {arg2}")
+
+    def enum_key(handle, index):
+        if index >= len(handle._entries):
+            raise OSError("no more entries")
+        return handle._entries[index][0]
+
+    def query_value(handle, value_name):
+        if value_name not in handle._values:
+            raise OSError(f"missing value {value_name}")
+        return (handle._values[value_name], 1)
+
+    fake.OpenKey.side_effect = open_key
+    fake.EnumKey.side_effect = enum_key
+    fake.QueryValueEx.side_effect = query_value
+    fake.CloseKey = MagicMock()
+    return fake
+
+
+def test_get_packages_windows_registry_reads_both_views():
+    """Both the 64-bit and 32-bit registry views contribute."""
+    fake = _make_fake_winreg({
+        "WOW6432Node": [("OldApp", {"DisplayName": "Legacy 32-bit App", "DisplayVersion": "1.0"})],
+        "Microsoft\\Windows\\CurrentVersion\\Uninstall": [
+            ("Firefox", {"DisplayName": "Mozilla Firefox", "DisplayVersion": "123.0"}),
+            ("Chrome", {"DisplayName": "Google Chrome", "DisplayVersion": "120.0"}),
+        ],
+    })
+    with patch.dict("sys.modules", {"winreg": fake}):
+        packages = _get_packages_windows_registry()
+    names = sorted(p["name"] for p in packages)
+    assert names == ["Google Chrome", "Legacy 32-bit App", "Mozilla Firefox"]
+
+
+def test_get_packages_windows_registry_skips_entries_without_displayname():
+    fake = _make_fake_winreg({
+        "WOW6432Node": [],
+        "Microsoft\\Windows\\CurrentVersion\\Uninstall": [
+            ("Real", {"DisplayName": "Real App", "DisplayVersion": "1.0"}),
+            ("Update_KB123", {}),
+        ],
+    })
+    with patch.dict("sys.modules", {"winreg": fake}):
+        packages = _get_packages_windows_registry()
+    assert [p["name"] for p in packages] == ["Real App"]
+
+
+def test_get_packages_windows_registry_skips_entries_with_empty_displayname():
+    """DisplayName present but empty string (some installer-leftover entries do this)."""
+    fake = _make_fake_winreg({
+        "WOW6432Node": [],
+        "Microsoft\\Windows\\CurrentVersion\\Uninstall": [
+            ("Real", {"DisplayName": "Real App", "DisplayVersion": "1.0"}),
+            ("Empty", {"DisplayName": "", "DisplayVersion": "1.0"}),
+        ],
+    })
+    with patch.dict("sys.modules", {"winreg": fake}):
+        packages = _get_packages_windows_registry()
+    assert [p["name"] for p in packages] == ["Real App"]
+
+
+def test_get_packages_windows_registry_missing_displayversion_returns_empty_string():
+    fake = _make_fake_winreg({
+        "WOW6432Node": [],
+        "Microsoft\\Windows\\CurrentVersion\\Uninstall": [
+            ("NoVersion", {"DisplayName": "Versionless App"}),
+        ],
+    })
+    with patch.dict("sys.modules", {"winreg": fake}):
+        packages = _get_packages_windows_registry()
+    assert packages == [{"name": "Versionless App", "version": ""}]
+
+
+def test_get_packages_windows_registry_returns_empty_when_winreg_missing():
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "winreg":
+            raise ImportError("not on this OS")
+        return real_import(name, *args, **kwargs)
+
+    with patch.object(builtins, "__import__", fake_import):
+        assert _get_packages_windows_registry() == []
+
+
+def test_get_packages_windows_registry_one_root_unreachable():
+    """If WOW6432Node fails to open, the 64-bit view still contributes."""
+    fake = _make_fake_winreg({
+        "WOW6432Node": None,  # raises on open
+        "Microsoft\\Windows\\CurrentVersion\\Uninstall": [
+            ("Firefox", {"DisplayName": "Mozilla Firefox", "DisplayVersion": "123.0"}),
+        ],
+    })
+    with patch.dict("sys.modules", {"winreg": fake}):
+        packages = _get_packages_windows_registry()
+    assert packages == [{"name": "Mozilla Firefox", "version": "123.0"}]
+
+
+def test_get_packages_windows_registry_unreadable_subkey_does_not_abort():
+    fake = _make_fake_winreg({
+        "WOW6432Node": [],
+        "Microsoft\\Windows\\CurrentVersion\\Uninstall": [
+            ("__BROKEN_SUB__", {}),  # OpenKey raises OSError
+            ("Good", {"DisplayName": "Good Entry", "DisplayVersion": "2.0"}),
+        ],
+    })
+    with patch.dict("sys.modules", {"winreg": fake}):
+        packages = _get_packages_windows_registry()
+    assert [p["name"] for p in packages] == ["Good Entry"]
+
+
+@patch("fivenines_agent.packages.is_windows", return_value=True)
+def test_get_installed_packages_windows_dispatches_to_registry(mock_iw):
+    with patch(
+        "fivenines_agent.packages._get_packages_windows_registry",
+        return_value=[{"name": "B App", "version": "1"}, {"name": "A App", "version": "2"}],
+    ):
+        result = get_installed_packages()
+    # Sorted by name.
+    assert [p["name"] for p in result] == ["A App", "B App"]

@@ -6,12 +6,19 @@ import shutil
 import subprocess
 
 from fivenines_agent.debug import debug, log
-from fivenines_agent.env import dry_run
+from fivenines_agent.env import dry_run, is_windows
 from fivenines_agent.subprocess_utils import get_clean_env
 
 
 def packages_available():
-    """Check if a supported package manager is available."""
+    """Check if a supported package source is available.
+
+    On Windows the Uninstall registry is always reachable in principle (the
+    permissions probe verifies actual read access at startup), so we treat
+    the source as available here.
+    """
+    if is_windows():
+        return True
     for cmd in ("dpkg-query", "rpm", "apk", "pacman", "synopkg"):
         if shutil.which(cmd):
             return True
@@ -19,7 +26,21 @@ def packages_available():
 
 
 def get_distro():
-    """Read /etc/os-release and return 'id:version_id' (e.g. 'debian:13')."""
+    """Return a short OS identifier suitable for the packages payload.
+
+    Linux/Synology: reads /etc/os-release and returns 'id:version_id'
+    (e.g. 'debian:13'). Windows: returns 'windows:<release>' using
+    platform.release() (e.g. 'windows:10', 'windows:2022server').
+    """
+    if is_windows():
+        try:
+            import platform
+            release = platform.release() or ""
+            release = release.lower().strip()
+            return f"windows:{release}" if release else "windows"
+        except Exception as e:
+            log(f"Error reading Windows release: {e}", "error")
+            return "windows"
     try:
         fields = {}
         with open("/etc/os-release", "r") as f:
@@ -156,11 +177,67 @@ def _get_packages_synopkg():
     return packages
 
 
+def _get_packages_windows_registry():
+    """Read installed programs from the Windows Uninstall registry keys.
+
+    Reads both the 64-bit view (HKLM\\SOFTWARE\\...) and the 32-bit redirect
+    view (HKLM\\SOFTWARE\\WOW6432Node\\...) so 32-bit apps on 64-bit Windows
+    are not missed. Entries with no DisplayName (typically system updates and
+    hidden components) are skipped.
+    """
+    try:
+        import winreg  # type: ignore[import-not-found]
+    except ImportError:
+        return []
+
+    packages = []
+    uninstall_paths = (
+        r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+    )
+    for subkey_path in uninstall_paths:
+        try:
+            root = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, subkey_path)  # type: ignore[attr-defined]
+        except OSError:
+            continue
+        try:
+            i = 0
+            while True:
+                try:
+                    sub_name = winreg.EnumKey(root, i)  # type: ignore[attr-defined]
+                except OSError:
+                    break
+                i += 1
+                try:
+                    sub = winreg.OpenKey(root, sub_name)  # type: ignore[attr-defined]
+                except OSError:
+                    continue
+                try:
+                    try:
+                        name = winreg.QueryValueEx(sub, "DisplayName")[0]  # type: ignore[attr-defined]
+                    except OSError:
+                        continue
+                    if not name:
+                        continue
+                    try:
+                        version = winreg.QueryValueEx(sub, "DisplayVersion")[0]  # type: ignore[attr-defined]
+                    except OSError:
+                        version = ""
+                    packages.append({"name": str(name), "version": str(version or "")})
+                finally:
+                    winreg.CloseKey(sub)  # type: ignore[attr-defined]
+        finally:
+            winreg.CloseKey(root)  # type: ignore[attr-defined]
+    return packages
+
+
 @debug("get_installed_packages")
 def get_installed_packages():
-    """Detect package manager and return sorted list of installed packages."""
+    """Detect the package source and return a sorted list of installed packages."""
     try:
-        if shutil.which("dpkg-query"):
+        if is_windows():
+            packages = _get_packages_windows_registry()
+        elif shutil.which("dpkg-query"):
             packages = _get_packages_dpkg()
         elif shutil.which("rpm"):
             packages = _get_packages_rpm()
