@@ -76,6 +76,13 @@ if ($proc.ExitCode -ne 0) {
 }
 
 Write-Host "Starting service..."
+# Brief pause so the MSI's StartAgentService custom action (sc.exe start)
+# has fully settled in the SCM before we issue Start-Service here. Without
+# it, Start-Service can race the still-completing service reconfiguration
+# from CreateServiceAccount.ps1 and throw "service cannot accept control
+# messages at this time". Start-Service is idempotent against a service
+# already transitioning to Running, so this redundant call is safe.
+Start-Sleep -Seconds 2
 Start-Service -Name "fivenines-agent" -ErrorAction Stop
 Start-Sleep -Seconds 3
 

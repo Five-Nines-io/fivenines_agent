@@ -49,4 +49,16 @@
   <onfailure action="restart" delay="30 sec"/>
   <onfailure action="restart" delay="60 sec"/>
   <resetfailure>1 hour</resetfailure>
+
+  <!-- Stop semantics. WinSW's default Ctrl+C signaling requires the child
+       to share an interactive console, which a Windows Service never has -
+       Python's signal.signal(SIGINT, ...) handler in agent.py never fires.
+       After stoptimeout WinSW calls TerminateProcess on the child, but
+       PyInstaller's onedir layout runs the agent as a bootloader + Python
+       interpreter pair: killing the bootloader alone leaves the interpreter
+       orphaned (Get-Service Stopped, Get-Process still alive). Setting
+       stopparentprocessfirst=true reverses the order so the bootloader dies
+       first, which forces the Python interpreter to exit too. -->
+  <stoptimeout>10 sec</stoptimeout>
+  <stopparentprocessfirst>true</stopparentprocessfirst>
 </service>
