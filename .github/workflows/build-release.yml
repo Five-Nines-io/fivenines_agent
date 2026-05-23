@@ -394,6 +394,32 @@ jobs:
             -arch x64 `
             -o fivenines-agent-windows-amd64.msi
 
+      # Sign the MSI with Azure Trusted Signing. Skipped when the secrets
+      # are not configured (e.g. on PR runs from forks, or before the
+      # initial Azure setup is complete). Once secrets are present the step
+      # runs and the uploaded artifact carries a SmartScreen-trusted
+      # signature - no more "Windows protected your PC" warning on
+      # customer downloads.
+      - name: Sign MSI with Azure Trusted Signing
+        if: env.AZURE_TENANT_ID != '' && env.AZURE_CLIENT_ID != '' && env.AZURE_CLIENT_SECRET != ''
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        uses: azure/trusted-signing-action@v0.5.1
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
+          certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
+          files-folder: windows/installer
+          files-folder-filter: msi
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
       - name: Upload Windows MSI
         uses: actions/upload-artifact@v5
         with:
