@@ -2,7 +2,6 @@
 <!--
   Fivenines Monitoring Agent MSI installer.
 
-  Implements the T13 install contract from docs/windows-server-support-plan.md:
     - Install to %ProgramFiles%\fivenines-agent (admin-write-only by default).
     - Create config dir at %ProgramData%\fivenines_agent with a restrictive ACL.
     - Bundle the agent binary, the WinSW wrapper (renamed), and WinSW XML.

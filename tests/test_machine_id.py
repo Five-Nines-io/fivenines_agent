@@ -72,8 +72,7 @@ def test_read_persisted_id_returns_none_on_os_error(tmp_path):
         "Windows os.chmod does not honor POSIX granular modes; "
         "the agent's actual file protection on Windows comes from the "
         "MSI's util:PermissionEx on the config dir (Admin + SYSTEM + "
-        "service account only), not from chmod. See "
-        "docs/windows-backend-handoff.md entry #7."
+        "service account only), not from chmod."
     ),
 )
 def test_persist_id_writes_file_owner_only(tmp_path):

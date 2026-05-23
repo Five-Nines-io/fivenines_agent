@@ -1,7 +1,6 @@
 # MSI installer
 
 This directory builds the Windows MSI installer for the fivenines agent.
-Implements the install contract from `docs/windows-server-support-plan.md`:
 
 - Install location: `%ProgramFiles%\fivenines-agent\` (admin-write-only).
 - Config dir: `%ProgramData%\fivenines_agent\` with a restrictive ACL.
