@@ -33,15 +33,4 @@ RHEL 10 generation regressions block releases.
 - **Depends on:** Rocky Linux 10 GA release
 - **Files:** `.github/workflows/build-release.yml` (remove `allow_failure: "1"` from rockylinux:10 entry)
 
-## P2: Windows-native service collectors (Phase 2)
-
-After Windows Server support ships, add native Windows collectors that parallel
-the existing Linux service integrations: Event Log (security signal, parallels
-fail2ban), IIS (parallels nginx/caddy), MSSQL (parallels postgresql), Hyper-V
-(parallels qemu/proxmox), and Microsoft Defender status. Each plugs into the
-collector registry with its own Windows capability probe. Customer-pull-driven.
-
-- **Effort:** L (human) / M (CC)
-- **Depends on:** Windows Server support shipping first (see `docs/windows-server-support-plan.md`)
-- **Files:** new collector modules, `collectors.py`, `permissions.py`
 
