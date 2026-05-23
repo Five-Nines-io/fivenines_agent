@@ -97,8 +97,11 @@ if ($proc.ExitCode -ne 0) {
     exit $proc.ExitCode
 }
 
-# After a MajorUpgrade the service is registered but not started. Start it
-# explicitly so the operator can verify the update without an extra step.
+# After a MajorUpgrade the MSI's StartAgentService CA has already kicked
+# the new service via sc.exe start. Pause briefly so SCM has settled, then
+# Start-Service as an idempotent safety net (no-op if already Running, or
+# kicks it if the MSI's start was lost to a race with reconfiguration).
+Start-Sleep -Seconds 2
 Start-Service -Name "fivenines-agent" -ErrorAction Stop
 Start-Sleep -Seconds 3
 $svc = Get-Service -Name "fivenines-agent"

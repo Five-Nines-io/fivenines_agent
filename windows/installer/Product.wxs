@@ -150,12 +150,13 @@
 
         <!-- Intentionally NO Start="install": the deferred custom actions
              (WriteTokenAcl, DelegateWmi) run AFTER InstallServices, so if
-             we asked the SCM to start the service here, the agent would
-             try to read TOKEN before it has been written and exit
-             immediately - WinSW would then restart-loop and the MSI would
-             hang waiting for the service to reach Running. The smoke job
-             (or a real-world operator) starts the service explicitly after
-             the install completes. -->
+             we asked the SCM to start the service here via the standard
+             StartServices action, the agent would try to read TOKEN before
+             it has been written and exit immediately - WinSW would then
+             restart-loop and the MSI would hang waiting for Running. The
+             StartAgentService custom action below is sequenced after
+             DelegateWmi (TOKEN written, WMI delegated) and uses sc.exe
+             which is fire-and-forget so the MSI never hangs. -->
         <ServiceControl Id="ControlAgentService"
                         Name="fivenines-agent"
                         Stop="both"
@@ -288,6 +289,23 @@
                   Return="check"
                   BinaryRef="Wix4UtilCA_X64" />
 
+    <!-- Start the service after TOKEN write and WMI delegation are done.
+         sc.exe start returns as soon as the SCM accepts the start request
+         (fire-and-forget), so a crash-looping agent cannot hang the MSI.
+         Return="ignore" so a transient start failure does not roll back a
+         successful install - the operator can Start-Service manually and
+         see WinSW logs. -->
+    <SetProperty Id="StartAgentService"
+                 Value="&quot;sc.exe&quot; start fivenines-agent"
+                 Before="StartAgentService"
+                 Sequence="execute" />
+    <CustomAction Id="StartAgentService"
+                  DllEntry="WixQuietExec"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="ignore"
+                  BinaryRef="Wix4UtilCA_X64" />
+
     <InstallExecuteSequence>
       <!-- Sequence the post-install CAs:
              1. CreateServiceAccount: provision the dedicated low-priv account
@@ -298,11 +316,14 @@
                 + SYSTEM.
              3. DelegateWmi: grant the service account read on the WMI Storage
                 namespace so the disk-health collector works without admin.
-           All three run after InstallServices and before the MSI hands back
-           control. The service is not auto-started during install. -->
+             4. StartAgentService: now that the service account, TOKEN, and
+                WMI delegation are all in place, kick the service. Bootstraps
+                (fivenines_setup.ps1, fivenines_update.ps1) still call
+                Start-Service afterwards for idempotency. -->
       <Custom Action="CreateServiceAccount" After="InstallServices" Condition="NOT Installed" />
       <Custom Action="WriteTokenAcl" After="CreateServiceAccount" Condition="NOT Installed" />
       <Custom Action="DelegateWmi" After="WriteTokenAcl" Condition="NOT Installed" />
+      <Custom Action="StartAgentService" After="DelegateWmi" Condition="NOT Installed" />
     </InstallExecuteSequence>
 
     <Feature Id="MainFeature" Title="Fivenines Agent" Level="1">
