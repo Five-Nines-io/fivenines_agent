@@ -17,7 +17,12 @@ except ImportError:
     systemd_watchdog = None
 
 from fivenines_agent.cli import VERSION
-from fivenines_agent.collectors import _collect_with_telemetry, collect_metrics
+from fivenines_agent.collectors import (
+    COLLECTORS,
+    _capability_key_for,
+    _collect_with_telemetry,
+    collect_metrics,
+)
 from fivenines_agent.debug import log
 from fivenines_agent.env import config_dir, dry_run, env_file, get_user_context, is_windows
 from fivenines_agent.files import file_handles_limit, file_handles_used, handle_count
@@ -38,6 +43,11 @@ load_dotenv(dotenv_path=env_file())
 exit_event = Event()
 # Event to signal permission refresh needed
 refresh_permissions_event = Event()
+
+# Sentinel for "no permissions_recheck_token observed yet", so the first
+# observation (including a real token already set when the agent restarts)
+# only baselines and does not fire a spurious reprobe.
+_RECHECK_UNSET = object()
 
 
 # Permissive config used only in --dry-run so every collector that has the
@@ -77,8 +87,8 @@ def _on_sighup(signum, frame):
 def setup_signals():
     signal.signal(signal.SIGTERM, _on_exit_signal)
     signal.signal(signal.SIGINT, _on_exit_signal)
-    # SIGHUP is Linux-only; on Windows the agent relies on the 5-minute
-    # auto-reprobe in PermissionProbe.refresh_if_needed (D9).
+    # SIGHUP is Linux-only; on Windows the agent relies on the periodic
+    # auto-reprobe in PermissionProbe.refresh_due (D9).
     if hasattr(signal, "SIGHUP"):
         signal.signal(signal.SIGHUP, _on_sighup)
 
@@ -96,6 +106,9 @@ class Agent:
         # Load token
         self._load_file("TOKEN")
 
+        # Last permissions_recheck_token acted on (see _recheck_token_changed).
+        self._last_recheck_token = _RECHECK_UNSET
+
         # Static info sent with every request
         self.static_data = {
             "version": VERSION,
@@ -103,6 +116,7 @@ class Agent:
             "boot_time": psutil.boot_time(),
             "capabilities": self.permissions.get_all(),
             "capability_reasons": self.permissions.get_reasons(),
+            "pending_capabilities": [],
             "user_context": get_user_context(CONFIG_DIR),
             "machine_id": get_machine_id(),
         }
@@ -141,14 +155,20 @@ class Agent:
             while not exit_event.is_set():
                 if wd is not None:
                     wd.notify()
-                self._handle_permission_refresh()
+                self._handle_sighup_refresh()
 
                 # Refresh config if disabled. In --dry-run we use a static
                 # permissive config so we never contact the API.
                 if self.synchronizer is None:
                     self.config = _DRY_RUN_CONFIG
+                    self._apply_config_driven_refresh(self.config)
                 else:
                     self.config = self.synchronizer.get_config()
+                    # Run config-driven permission refresh in BOTH the enabled
+                    # and the disabled branch so the on-demand recheck token and
+                    # fast gap detection work for not-yet-enabled onboarding
+                    # hosts too.
+                    self._apply_config_driven_refresh(self.config)
                     if not self.config.get("enabled", False):
                         self.queue.put({"get_config": True, **self.static_data})
                         exit_event.wait(25)
@@ -238,20 +258,97 @@ class Agent:
             "packages_sync", packages_sync, self.config, self.synchronizer.send_packages
         )
 
-    def _handle_permission_refresh(self):
+    def _handle_sighup_refresh(self):
+        """SIGHUP-triggered full reprobe. Kept at the top of the loop (needs no
+        config) so it stays responsive even when the backend is unreachable."""
         if refresh_permissions_event.is_set():
             refresh_permissions_event.clear()
             self.permissions.force_refresh()
             self.static_data["capabilities"] = self.permissions.get_all()
             self.static_data["capability_reasons"] = self.permissions.get_reasons()
             print_capabilities_banner()
-        elif self.permissions.refresh_if_needed():
-            self.static_data["capabilities"] = self.permissions.get_all()
-            self.static_data["capability_reasons"] = self.permissions.get_reasons()
+
+    def _apply_config_driven_refresh(self, config):
+        """Run config-driven permission refresh for this tick, then republish
+        capability state for the next payload.
+
+        - On-demand: a changed permissions_recheck_token forces a full reprobe.
+        - Otherwise: full probe every REPROBE_INTERVAL plus a cheap selective
+          gap re-probe (only enabled-but-missing capabilities) on the throttle
+          cadence (default: every tick).
+        """
+        if self._recheck_token_changed(config.get("permissions_recheck_token")):
+            self.permissions.force_refresh()
+        else:
+            interval = self._collection_interval(config)
+            gap_interval = self._gap_probe_interval(config, interval)
+            pending = self._pending_capabilities(config)
+            self.permissions.refresh_due(pending, gap_interval)
+        self.static_data["capabilities"] = self.permissions.get_all()
+        self.static_data["capability_reasons"] = self.permissions.get_reasons()
+        self.static_data["pending_capabilities"] = self._pending_capabilities(config)
+
+    def _recheck_token_changed(self, token):
+        """Nonce state machine for the on-demand "re-detect now" button.
+
+        The first observation only baselines (even a non-null token already set
+        when the agent restarts), so a restart never triggers a spurious
+        reprobe. A null/absent token resets the baseline. Only a transition to a
+        different non-null value fires.
+        """
+        last = self._last_recheck_token
+        if last is _RECHECK_UNSET:
+            self._last_recheck_token = token
+            return False
+        if token is None:
+            self._last_recheck_token = None
+            return False
+        if token != last:
+            self._last_recheck_token = token
+            return True
+        return False
+
+    def _collection_interval(self, config):
+        """Collection interval, clamped: a low warmup value (e.g. 5s) is allowed,
+        but 0/negative/non-numeric falls back to 60s to avoid a tight loop."""
+        interval = config.get("interval", 60)
+        if isinstance(interval, bool) or not isinstance(interval, (int, float)):
+            return 60
+        if interval <= 0:
+            return 60
+        return interval
+
+    def _gap_probe_interval(self, config, interval):
+        """Seconds between selective gap re-probes. Default 0 = every tick;
+        permissions_recheck_interval can only THROTTLE (floored at the
+        collection interval, since the probe runs once per tick) and is capped
+        at 3600."""
+        raw = config.get("permissions_recheck_interval")
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+            return 0
+        return max(interval, min(raw, 3600))
+
+    def _pending_capabilities(self, config):
+        """Capabilities the operator enabled (config flag truthy) that are
+        currently probed False. Drives the selective gap re-probe and is sent in
+        the payload for the dashboard "pending + reason" view. Reuses the
+        collectors config-key <-> capability-key mapping so the override
+        (smart_storage_health -> smart_storage) lives in one place."""
+        caps = self.permissions.get_all()
+        pending = []
+        for config_key, _collectors in COLLECTORS:
+            if not config.get(config_key):
+                continue
+            cap_key = _capability_key_for(config_key)
+            if cap_key in caps and not caps[cap_key]:
+                pending.append(cap_key)
+        if config.get("snmp_targets") and caps.get("snmp") is False:
+            pending.append("snmp")
+        return list(dict.fromkeys(pending))
 
     def _wait_interval(self, running_time):
         log(f"Running time: {running_time:.3f}s", "debug")
-        interval = self.config.get("interval", 60)
+        interval = self._collection_interval(self.config)
         sleep_time = max(interval - running_time, 0.1)
         log(f"Sleeping time: {sleep_time * 1000:.0f} ms", "debug")
         exit_event.wait(sleep_time)

@@ -25,7 +25,8 @@ def make_dry_run_agent():
     agent.synchronizer = None
     agent.permissions = MagicMock()
     agent.permissions.get_all.return_value = {}
-    agent.permissions.refresh_if_needed.return_value = False
+    agent.permissions.refresh_due.return_value = False
+    agent._last_recheck_token = agent_module._RECHECK_UNSET
     agent.queue = MagicMock()
     agent.static_data = {"version": "test"}
     agent._telemetry = {}
