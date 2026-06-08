@@ -344,6 +344,15 @@ class Agent:
                 pending.append(cap_key)
         if config.get("snmp_targets") and caps.get("snmp") is False:
             pending.append("snmp")
+        # packages is not in COLLECTORS - scanning is gated by packages.scan
+        # (a nested dict), mirroring packages_sync's own guard.
+        pkg_cfg = config.get("packages")
+        if (
+            isinstance(pkg_cfg, dict)
+            and pkg_cfg.get("scan")
+            and caps.get("packages") is False
+        ):
+            pending.append("packages")
         return list(dict.fromkeys(pending))
 
     def _wait_interval(self, running_time):

@@ -154,6 +154,26 @@ def test_pending_snmp_not_added_when_available():
     assert agent._pending_capabilities({"snmp_targets": [{"host": "h"}]}) == []
 
 
+def test_pending_includes_packages_scan():
+    agent = _agent({"packages": False})
+    assert agent._pending_capabilities({"packages": {"scan": True}}) == ["packages"]
+
+
+def test_pending_packages_not_added_when_available():
+    agent = _agent({"packages": True})
+    assert agent._pending_capabilities({"packages": {"scan": True}}) == []
+
+
+def test_pending_packages_not_added_when_scan_off():
+    agent = _agent({"packages": False})
+    assert agent._pending_capabilities({"packages": {"scan": False}}) == []
+
+
+def test_pending_packages_ignores_non_dict_config():
+    agent = _agent({"packages": False})
+    assert agent._pending_capabilities({"packages": True}) == []
+
+
 # --- _apply_config_driven_refresh ---
 
 

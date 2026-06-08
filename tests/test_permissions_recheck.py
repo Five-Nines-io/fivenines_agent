@@ -182,6 +182,33 @@ def test_libvirt_probe_swallows_close_error():
     conn.close.assert_called_once()
 
 
+def test_libvirt_probe_single_flight_skips_when_previous_hung():
+    """If a previous probe worker is still hung, don't spawn another (caps the
+    leaked-thread count at one for a wedged libvirt stack)."""
+    probe = _probe_obj({})
+    hung = MagicMock()
+    hung.is_alive.return_value = True
+    probe._libvirt_probe_thread = hung
+    fake_libvirt = MagicMock()
+    with patch.dict("sys.modules", {"libvirt": fake_libvirt}):
+        assert probe._can_access_libvirt() is False
+    fake_libvirt.openReadOnly.assert_not_called()
+    assert (
+        probe._current_reason == "libvirt probe still running (previous attempt hung)"
+    )
+
+
+def test_libvirt_probe_clears_thread_handle_on_success():
+    """A completed probe clears the in-flight handle so the next probe can run."""
+    probe = _probe_obj({})
+    probe._libvirt_probe_thread = None
+    fake_libvirt = MagicMock()
+    fake_libvirt.openReadOnly.return_value = MagicMock()
+    with patch.dict("sys.modules", {"libvirt": fake_libvirt}):
+        assert probe._can_access_libvirt() is True
+    assert probe._libvirt_probe_thread is None
+
+
 def test_libvirt_probe_times_out():
     probe = _probe_obj({})
     release = threading.Event()

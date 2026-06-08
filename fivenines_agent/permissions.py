@@ -90,6 +90,9 @@ class PermissionProbe:
         self._current_reason = None
         self._last_probe_time = 0
         self._last_gap_probe_time = 0
+        # Tracks an in-flight libvirt probe worker so a wedged libvirt stack
+        # cannot leak one stuck thread per re-probe (see _can_access_libvirt).
+        self._libvirt_probe_thread = None
         self._probe_all()
 
     def _set_reason(self, msg):
@@ -581,6 +584,16 @@ class PermissionProbe:
             self._set_reason("libvirt module not available")
             return False
 
+        # Single-flight: refresh_due re-probes a pending qemu capability every
+        # tick, so if a previous openReadOnly is still hung past its timeout,
+        # don't spawn another worker on top of it. This caps leaked threads at
+        # one for a genuinely wedged libvirt stack instead of one per tick.
+        prev = getattr(self, "_libvirt_probe_thread", None)
+        if prev is not None and prev.is_alive():
+            log("_can_access_libvirt: previous probe still running; skipping", "debug")
+            self._set_reason("libvirt probe still running (previous attempt hung)")
+            return False
+
         result = {}
 
         def attempt():
@@ -600,12 +613,14 @@ class PermissionProbe:
                         pass
 
         worker = threading.Thread(target=attempt, daemon=True)
+        self._libvirt_probe_thread = worker
         worker.start()
         worker.join(LIBVIRT_PROBE_TIMEOUT)
         if worker.is_alive():
             log("_can_access_libvirt: probe timed out", "debug")
             self._set_reason("libvirt probe timed out")
             return False
+        self._libvirt_probe_thread = None
         if result.get("ok"):
             log("_can_access_libvirt: -> AVAILABLE (openReadOnly)", "debug")
             return True
