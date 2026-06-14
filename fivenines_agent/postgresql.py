@@ -81,15 +81,23 @@ def _split_pgpass_line(line):
     return fields if len(fields) == 5 else None
 
 
+def _default_pgpass_path():
+    """The platform default password file when PGPASSFILE is unset (libpq).
+
+    Windows uses %APPDATA%\\postgresql\\pgpass.conf; elsewhere it is ~/.pgpass.
+    """
+    if os.name == "nt":
+        return os.path.join(os.environ.get("APPDATA", ""), "postgresql", "pgpass.conf")
+    return os.path.join(os.path.expanduser("~"), ".pgpass")
+
+
 def _pgpass_lookup(host, port, database, user):
-    """Return the password from ~/.pgpass (or PGPASSFILE) matching the target.
+    """Return the password from the pgpass file matching the target.
 
     Mirrors libpq: each field supports a '*' wildcard, the file is ignored when
     it is group/world accessible (non-Windows), and the first match wins.
     """
-    path = os.environ.get("PGPASSFILE") or os.path.join(
-        os.path.expanduser("~"), ".pgpass"
-    )
+    path = os.environ.get("PGPASSFILE") or _default_pgpass_path()
     try:
         mode = os.stat(path).st_mode
     except OSError:
@@ -120,10 +128,12 @@ def _pgpass_lookup(host, port, database, user):
 def _resolve_password(host, port, database, user, password):
     """Resolve the password the way the previous psql/libpq path did.
 
-    Order: explicit config password, then PGPASSWORD, then ~/.pgpass. Returns
+    Order: explicit config password, then PGPASSWORD, then the pgpass file.
+    A blank (falsy) configured password is treated as "unset" and falls back to
+    ambient credentials, matching the old `if password:` psql behavior. Returns
     None for peer/trust auth (no password anywhere).
     """
-    if password is not None:
+    if password:
         return password
     env_password = os.environ.get("PGPASSWORD")
     if env_password:

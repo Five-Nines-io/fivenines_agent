@@ -19,6 +19,7 @@ from pg8000.exceptions import DatabaseError, InterfaceError
 
 from fivenines_agent.postgresql import (
     _connect,
+    _default_pgpass_path,
     _error_category,
     _get_connection_stats,
     _get_database_sizes,
@@ -637,6 +638,26 @@ def test_resolve_password_socket_host_matches_localhost_entry(monkeypatch, tmp_p
     pgpass = _write_pgpass(tmp_path, "localhost:5432:db:u:sockpw\n")
     monkeypatch.setenv("PGPASSFILE", pgpass)
     assert _resolve_password("/var/run/postgresql", 5432, "db", "u", None) == "sockpw"
+
+
+def test_resolve_password_blank_config_falls_back_to_env(monkeypatch):
+    """A blank configured password is treated as unset (old `if password:`)."""
+    monkeypatch.setenv("PGPASSWORD", "env-secret")
+    assert _resolve_password("h", 5432, "db", "u", "") == "env-secret"
+
+
+def test_default_pgpass_path_posix(monkeypatch):
+    monkeypatch.setattr(os, "name", "posix")
+    assert _default_pgpass_path().endswith(".pgpass")
+
+
+def test_default_pgpass_path_windows(monkeypatch):
+    """Windows defaults to %APPDATA%\\postgresql\\pgpass.conf, like libpq."""
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setenv("APPDATA", "APPDATA_DIR")
+    assert _default_pgpass_path() == os.path.join(
+        "APPDATA_DIR", "postgresql", "pgpass.conf"
+    )
 
 
 def test_pgpass_lookup_wildcards_match(monkeypatch, tmp_path):
