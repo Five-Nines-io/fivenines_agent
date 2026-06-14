@@ -50,6 +50,11 @@ CONNECT_TIMEOUT = 5
 STATEMENT_TIMEOUT_MS = 5000
 
 
+def _is_socket_host(host):
+    """True when host is a Unix socket directory path (psql-style)."""
+    return isinstance(host, str) and host.startswith("/")
+
+
 def _split_pgpass_line(line):
     """Split a .pgpass line into its 5 fields, honoring backslash escapes.
 
@@ -123,7 +128,11 @@ def _resolve_password(host, port, database, user, password):
     env_password = os.environ.get("PGPASSWORD")
     if env_password:
         return env_password
-    return _pgpass_lookup(host, port, database, user)
+    # libpq matches .pgpass on "localhost" for local Unix-socket connections,
+    # not the socket directory path. Mirror that so an existing local-socket
+    # setup with a "localhost:5432:..." .pgpass entry keeps authenticating.
+    lookup_host = "localhost" if _is_socket_host(host) else host
+    return _pgpass_lookup(lookup_host, port, database, user)
 
 
 def _connect(host, port, user, password, database):
@@ -135,7 +144,7 @@ def _connect(host, port, user, password, database):
         "timeout": CONNECT_TIMEOUT,
         "startup_params": {"statement_timeout": str(STATEMENT_TIMEOUT_MS)},
     }
-    if isinstance(host, str) and host.startswith("/"):
+    if _is_socket_host(host):
         # psql-style socket directory -> pg8000 socket file path.
         params["unix_sock"] = "{}/.s.PGSQL.{}".format(host.rstrip("/"), int(port))
     else:
@@ -165,17 +174,21 @@ def _error_category(exc):
 
 
 def _query(cursor, sql):
-    """Run a read-only query on the shared cursor; degrade to None on failure.
+    """Run a read-only query on the shared cursor.
 
-    A per-query failure (most often a per-view privilege denial) is logged and
-    surfaced as None so the caller drops only that one section. autocommit is
-    enabled on the connection, so the failure does not poison later queries.
+    A server-side error (the monitoring role lacks privilege on this view, or
+    the query hit statement_timeout) degrades only this section to None and is
+    logged at debug -- the session is alive, so the rest of the payload is
+    still collected and reachable stays True. Transport/session errors (the
+    connection dropped, a protocol failure) are NOT swallowed here: they
+    propagate to postgresql_metrics()'s outer handler, which reports
+    reachable: False instead of false-healthy partial data.
     """
     try:
         cursor.execute(sql)
         return cursor.fetchall()
-    except Exception as e:
-        log(f"PostgreSQL query failed: {e}", "error")
+    except DatabaseError as e:
+        log(f"PostgreSQL query degraded (server error): {e}", "debug")
         return None
 
 

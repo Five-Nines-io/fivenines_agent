@@ -187,10 +187,19 @@ def test_query_returns_rows_on_success():
     cur.execute.assert_called_once_with("SELECT 1")
 
 
-def test_query_returns_none_on_failure():
+def test_query_degrades_server_error_to_none():
+    """A server-side error (e.g. privilege denial) degrades that section."""
     cur = MagicMock()
-    cur.execute.side_effect = RuntimeError("permission denied")
+    cur.execute.side_effect = DatabaseError({"C": "42501", "M": "permission denied"})
     assert _query(cur, "SELECT 1") is None
+
+
+def test_query_propagates_transport_error():
+    """A transport/session error is NOT swallowed -> it bubbles to the caller."""
+    cur = MagicMock()
+    cur.execute.side_effect = InterfaceError("connection dropped")
+    with pytest.raises(InterfaceError):
+        _query(cur, "SELECT 1")
 
 
 # ---------------------------------------------------------------------------
@@ -210,9 +219,9 @@ def test_get_version_none_when_empty():
     assert _get_version(cursor_returning([])) is None
 
 
-def test_get_version_none_when_query_fails():
+def test_get_version_none_when_server_error():
     cur = MagicMock()
-    cur.execute.side_effect = RuntimeError("boom")
+    cur.execute.side_effect = DatabaseError({"C": "57014", "M": "canceling statement"})
     assert _get_version(cur) is None
 
 
@@ -327,9 +336,9 @@ def test_database_sizes_skips_null_name():
 # ---------------------------------------------------------------------------
 
 
-def test_replication_lag_none_when_query_fails():
+def test_replication_lag_none_when_server_error():
     cur = MagicMock()
-    cur.execute.side_effect = RuntimeError("boom")
+    cur.execute.side_effect = DatabaseError({"C": "42501", "M": "denied"})
     assert _get_replication_lag(cur) is None
 
 
@@ -510,6 +519,16 @@ def test_metrics_inner_exception_is_unreachable():
     assert result == {"reachable": False, "error": "error"}
 
 
+def test_metrics_transport_error_after_version_is_unreachable():
+    """A transport error mid-collection bubbles to reachable: False, not a
+    false-healthy partial payload (version probe already succeeded)."""
+    with patch(f"{PG}._connect", return_value=fake_conn()), patch(
+        f"{PG}._get_version", return_value="16.2"
+    ), patch(f"{PG}._get_connection_stats", side_effect=InterfaceError("dropped")):
+        result = postgresql_metrics()
+    assert result == {"reachable": False, "error": "error"}
+
+
 def test_metrics_closes_connection_on_success():
     conn = fake_conn()
     run_metrics(conn, _get_version="16.2")
@@ -610,6 +629,14 @@ def test_resolve_password_falls_back_to_pgpass(monkeypatch, tmp_path):
     pgpass = _write_pgpass(tmp_path, "h:5432:db:u:pgpass-secret\n")
     monkeypatch.setenv("PGPASSFILE", pgpass)
     assert _resolve_password("h", 5432, "db", "u", None) == "pgpass-secret"
+
+
+def test_resolve_password_socket_host_matches_localhost_entry(monkeypatch, tmp_path):
+    """A Unix-socket host resolves .pgpass via 'localhost' (libpq behavior),
+    not the literal socket directory path."""
+    pgpass = _write_pgpass(tmp_path, "localhost:5432:db:u:sockpw\n")
+    monkeypatch.setenv("PGPASSFILE", pgpass)
+    assert _resolve_password("/var/run/postgresql", 5432, "db", "u", None) == "sockpw"
 
 
 def test_pgpass_lookup_wildcards_match(monkeypatch, tmp_path):
