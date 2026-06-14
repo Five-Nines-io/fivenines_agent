@@ -1,3 +1,4 @@
+import os
 import socket
 
 import pg8000.dbapi
@@ -30,10 +31,16 @@ from fivenines_agent.debug import debug, log
 #
 # Failure contract:
 #   connect / auth / timeout fails --> {"reachable": False, "error": <category>}
-#   connected                      --> {"reachable": True, <metrics...>}
-#   Once connected, a single query that fails (e.g. the monitoring role lacks
-#   privilege on one view) only drops THAT section; reachable stays True and
-#   the rest of the payload is still returned (autocommit isolates queries).
+#   connected + version probe OK   --> {"reachable": True, <metrics...>}
+#   The no-privilege `SHOW server_version` probe is the liveness gate: if it
+#   fails after connect (session dropped or unusable), report reachable: False
+#   instead of a false-healthy empty payload. Once it succeeds, a privileged
+#   view that fails (e.g. the monitoring role lacks rights) only drops THAT
+#   section; reachable stays True (autocommit isolates queries).
+#
+# Password discovery mirrors the previous psql/libpq behavior so existing
+# installs keep working: explicit config password, then PGPASSWORD, then a
+# ~/.pgpass / PGPASSFILE lookup. (pg_service.conf / PGSERVICE is not handled.)
 
 # Bounds connection establishment so a dead host cannot stall the loop.
 CONNECT_TIMEOUT = 5
@@ -43,12 +50,88 @@ CONNECT_TIMEOUT = 5
 STATEMENT_TIMEOUT_MS = 5000
 
 
+def _split_pgpass_line(line):
+    """Split a .pgpass line into its 5 fields, honoring backslash escapes.
+
+    Returns [host, port, database, user, password], or None when the line does
+    not have exactly five colon-separated fields.
+    """
+    fields = []
+    current = []
+    i = 0
+    while i < len(line):
+        char = line[i]
+        if char == "\\" and i + 1 < len(line):
+            current.append(line[i + 1])
+            i += 2
+            continue
+        if char == ":":
+            fields.append("".join(current))
+            current = []
+            i += 1
+            continue
+        current.append(char)
+        i += 1
+    fields.append("".join(current))
+    return fields if len(fields) == 5 else None
+
+
+def _pgpass_lookup(host, port, database, user):
+    """Return the password from ~/.pgpass (or PGPASSFILE) matching the target.
+
+    Mirrors libpq: each field supports a '*' wildcard, the file is ignored when
+    it is group/world accessible (non-Windows), and the first match wins.
+    """
+    path = os.environ.get("PGPASSFILE") or os.path.join(
+        os.path.expanduser("~"), ".pgpass"
+    )
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        return None
+    if os.name != "nt" and (mode & 0o077):
+        # libpq refuses a .pgpass that group or others can access.
+        return None
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return None
+
+    target = [str(host), str(port), str(database), str(user)]
+    for raw in lines:
+        line = raw.rstrip("\n")
+        if not line or line.lstrip().startswith("#"):
+            continue
+        entry = _split_pgpass_line(line)
+        if entry is None:
+            continue
+        patterns = entry[:4]
+        if all(p == "*" or p == t for p, t in zip(patterns, target)):
+            return entry[4]
+    return None
+
+
+def _resolve_password(host, port, database, user, password):
+    """Resolve the password the way the previous psql/libpq path did.
+
+    Order: explicit config password, then PGPASSWORD, then ~/.pgpass. Returns
+    None for peer/trust auth (no password anywhere).
+    """
+    if password is not None:
+        return password
+    env_password = os.environ.get("PGPASSWORD")
+    if env_password:
+        return env_password
+    return _pgpass_lookup(host, port, database, user)
+
+
 def _connect(host, port, user, password, database):
     """Open a pg8000 connection, routing path-like hosts to a unix socket."""
     params = {
         "user": user,
         "database": database,
-        "password": password,
+        "password": _resolve_password(host, port, database, user, password),
         "timeout": CONNECT_TIMEOUT,
         "startup_params": {"statement_timeout": str(STATEMENT_TIMEOUT_MS)},
     }
@@ -257,11 +340,16 @@ def postgresql_metrics(
         # view drops only its own section instead of aborting the rest.
         conn.autocommit = True
         cursor = conn.cursor()
-        metrics: dict = {"reachable": True}
 
+        # Liveness gate: SHOW server_version needs no privilege, so if it fails
+        # the session is not usable (dropped after connect, broken setup) -- not
+        # a per-view privilege denial. Report unreachable instead of a
+        # false-healthy empty payload.
         version = _get_version(cursor)
-        if version is not None:
-            metrics["version"] = version
+        if version is None:
+            return {"reachable": False, "error": "error"}
+
+        metrics: dict = {"reachable": True, "version": version}
 
         conn_stats = _get_connection_stats(cursor)
         if conn_stats:
@@ -298,8 +386,9 @@ def postgresql_metrics(
 
         return metrics
     except Exception as e:
+        # Connected but the session could not be queried at all -- not healthy.
         log(f"Error collecting PostgreSQL metrics: {e}", "error")
-        return {"reachable": True, "error": "error"}
+        return {"reachable": False, "error": "error"}
     finally:
         try:
             conn.close()

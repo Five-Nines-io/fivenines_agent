@@ -9,10 +9,12 @@ No real PostgreSQL is needed. The opt-in integration test that exercises a real
 socket lives in test_postgresql_integration.py.
 """
 
+import os
 import socket
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
+import pytest
 from pg8000.exceptions import DatabaseError, InterfaceError
 
 from fivenines_agent.postgresql import (
@@ -24,12 +26,26 @@ from fivenines_agent.postgresql import (
     _get_locks_count,
     _get_replication_lag,
     _get_version,
+    _pgpass_lookup,
     _query,
+    _resolve_password,
+    _split_pgpass_line,
     postgresql_metrics,
 )
 
 
 PG = "fivenines_agent.postgresql"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_pg_credentials(monkeypatch, tmp_path):
+    """Keep _resolve_password deterministic: no PGPASSWORD, no readable .pgpass.
+
+    Credential-discovery tests opt back in by setting PGPASSWORD / PGPASSFILE
+    themselves; everything else sees "no password available".
+    """
+    monkeypatch.delenv("PGPASSWORD", raising=False)
+    monkeypatch.setenv("PGPASSFILE", str(tmp_path / "does-not-exist.pgpass"))
 
 
 def cursor_returning(*fetch_results):
@@ -459,10 +475,20 @@ def test_metrics_replica_sets_lag_and_flag():
     assert result["is_replica"] is True
 
 
-def test_metrics_all_sections_empty_omits_keys():
-    """Empty/None helper returns -> only reachable + is_replica present."""
-    result = run_metrics(fake_conn())
-    assert result == {"reachable": True, "is_replica": False}
+def test_metrics_version_probe_failure_is_unreachable():
+    """P1: connect ok but the no-privilege version probe fails -> unreachable.
+
+    Guards against a false-healthy {"reachable": True} with no metrics when the
+    session drops or breaks immediately after connect.
+    """
+    result = run_metrics(fake_conn())  # _get_version defaults to None
+    assert result == {"reachable": False, "error": "error"}
+
+
+def test_metrics_connected_version_only_omits_empty_sections():
+    """Version ok but every privileged view empty -> reachable, partial payload."""
+    result = run_metrics(fake_conn(), _get_version="16.2")
+    assert result == {"reachable": True, "version": "16.2", "is_replica": False}
 
 
 def test_metrics_cache_ratio_zero_blocks_is_100():
@@ -474,14 +500,14 @@ def test_metrics_cache_ratio_zero_blocks_is_100():
         "blks_hit": 0,
         "blks_read": 0,
     }
-    result = run_metrics(fake_conn(), _get_database_stats=[db])
+    result = run_metrics(fake_conn(), _get_version="16.2", _get_database_stats=[db])
     assert result["cache_hit_ratio"] == 100.0
 
 
-def test_metrics_inner_exception_returns_reachable_with_error():
-    """Connected but a catastrophic processing error -> reachable True + error."""
+def test_metrics_inner_exception_is_unreachable():
+    """P1: connected but the session cannot be queried at all -> unreachable."""
     result = run_metrics(fake_conn(cursor_raises=True))
-    assert result == {"reachable": True, "error": "error"}
+    assert result == {"reachable": False, "error": "error"}
 
 
 def test_metrics_closes_connection_on_success():
@@ -530,3 +556,106 @@ def test_regression_previous_version_socket_dir_config_still_connects():
     assert result["reachable"] is True
     assert conn.call_args.kwargs["unix_sock"] == "/var/run/postgresql/.s.PGSQL.5432"
     assert conn.call_args.kwargs["password"] is None
+
+
+# ---------------------------------------------------------------------------
+# Password discovery (P2): config -> PGPASSWORD -> ~/.pgpass / PGPASSFILE.
+# Restores the libpq behavior the previous psql collector relied on, so an
+# install with credentials in .pgpass keeps working after the upgrade.
+# ---------------------------------------------------------------------------
+
+
+def _write_pgpass(tmp_path, content, mode=0o600):
+    path = tmp_path / "pgpass"
+    path.write_text(content)
+    os.chmod(path, mode)
+    return str(path)
+
+
+def test_split_pgpass_line_basic():
+    assert _split_pgpass_line("h:5432:db:user:pw") == ["h", "5432", "db", "user", "pw"]
+
+
+def test_split_pgpass_line_unescapes_colon_and_backslash():
+    # password "p:a\\ss" written as p\:a\\ss
+    assert _split_pgpass_line("h:5432:db:user:p\\:a\\\\ss") == [
+        "h",
+        "5432",
+        "db",
+        "user",
+        "p:a\\ss",
+    ]
+
+
+def test_split_pgpass_line_wrong_field_count_returns_none():
+    assert _split_pgpass_line("only:three:fields") is None
+
+
+def test_resolve_password_explicit_config_wins(monkeypatch):
+    monkeypatch.setenv("PGPASSWORD", "from-env")
+    assert _resolve_password("h", 5432, "db", "u", "from-config") == "from-config"
+
+
+def test_resolve_password_uses_pgpassword_env(monkeypatch):
+    monkeypatch.setenv("PGPASSWORD", "env-secret")
+    assert _resolve_password("h", 5432, "db", "u", None) == "env-secret"
+
+
+def test_resolve_password_none_when_nothing_available():
+    # autouse fixture cleared PGPASSWORD and pointed PGPASSFILE at a missing file
+    assert _resolve_password("h", 5432, "db", "u", None) is None
+
+
+def test_resolve_password_falls_back_to_pgpass(monkeypatch, tmp_path):
+    pgpass = _write_pgpass(tmp_path, "h:5432:db:u:pgpass-secret\n")
+    monkeypatch.setenv("PGPASSFILE", pgpass)
+    assert _resolve_password("h", 5432, "db", "u", None) == "pgpass-secret"
+
+
+def test_pgpass_lookup_wildcards_match(monkeypatch, tmp_path):
+    monkeypatch.setenv("PGPASSFILE", _write_pgpass(tmp_path, "*:*:*:*:wild\n"))
+    assert _pgpass_lookup("anyhost", 5432, "anydb", "anyuser") == "wild"
+
+
+def test_pgpass_lookup_first_match_wins_and_skips_noise(monkeypatch, tmp_path):
+    content = (
+        "# a comment\n"
+        "\n"
+        "malformed:line\n"
+        "other:5432:db:u:nope\n"
+        "h:5432:db:u:right\n"
+        "h:5432:db:u:later\n"
+    )
+    monkeypatch.setenv("PGPASSFILE", _write_pgpass(tmp_path, content))
+    assert _pgpass_lookup("h", 5432, "db", "u") == "right"
+
+
+def test_pgpass_lookup_no_match_returns_none(monkeypatch, tmp_path):
+    monkeypatch.setenv("PGPASSFILE", _write_pgpass(tmp_path, "other:1:x:y:pw\n"))
+    assert _pgpass_lookup("h", 5432, "db", "u") is None
+
+
+def test_pgpass_lookup_empty_password_field(monkeypatch, tmp_path):
+    monkeypatch.setenv("PGPASSFILE", _write_pgpass(tmp_path, "*:*:*:*:\n"))
+    assert _pgpass_lookup("h", 5432, "db", "u") == ""
+
+
+def test_pgpass_lookup_missing_file_returns_none(monkeypatch, tmp_path):
+    monkeypatch.setenv("PGPASSFILE", str(tmp_path / "nope.pgpass"))
+    assert _pgpass_lookup("h", 5432, "db", "u") is None
+
+
+def test_pgpass_lookup_ignored_when_group_or_world_accessible(monkeypatch, tmp_path):
+    # libpq refuses a .pgpass that is not private (0600).
+    pgpass = _write_pgpass(tmp_path, "*:*:*:*:secret\n", mode=0o640)
+    monkeypatch.setenv("PGPASSFILE", pgpass)
+    assert _pgpass_lookup("h", 5432, "db", "u") is None
+
+
+def test_pgpass_lookup_unreadable_path_returns_none(monkeypatch, tmp_path):
+    # A directory at the .pgpass path: stat succeeds, open raises -> None.
+    d = tmp_path / "pgpass_dir"
+    d.mkdir()
+    os.chmod(d, 0o700)
+    monkeypatch.setenv("PGPASSFILE", str(d))
+    assert _pgpass_lookup("h", 5432, "db", "u") is None
