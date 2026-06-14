@@ -122,6 +122,23 @@ def test_refresh_due_gap_throttled_not_due():
     assert probe.capabilities["qemu"] is False
 
 
+def test_probe_all_resets_gap_probe_timer():
+    # A full probe must reset the gap-probe clock so a force_refresh / startup /
+    # SIGHUP full probe does not leave the next tick re-probing the same caps.
+    probe = _probe_obj({}, last_probe_time=0, last_gap_probe_time=0)
+    with patch.object(probe, "_build_linux_capabilities", return_value={"cpu": True}):
+        probe._probe_all()
+    assert probe._last_gap_probe_time == probe._last_probe_time
+    assert probe._last_gap_probe_time > 0
+
+
+def test_force_refresh_resets_gap_probe_timer():
+    probe = _probe_obj({}, last_probe_time=0, last_gap_probe_time=0)
+    with patch.object(probe, "_build_linux_capabilities", return_value={"cpu": True}):
+        probe.force_refresh()
+    assert probe._last_gap_probe_time == probe._last_probe_time > 0
+
+
 # --- _can_access_libvirt (openReadOnly + hard timeout) ---
 
 

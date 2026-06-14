@@ -126,6 +126,21 @@ def test_gap_interval_rejects_zero_negative_bool_and_nonint():
     assert agent._gap_probe_interval({"permissions_recheck_interval": "x"}, 60) == 0
 
 
+def test_gap_interval_accepts_float():
+    # A float permissions_recheck_interval (e.g. 300.0 from JSON) must throttle,
+    # not silently fall back to every-tick; consistent with _collection_interval.
+    assert (
+        _agent()._gap_probe_interval({"permissions_recheck_interval": 300.0}, 60)
+        == 300.0
+    )
+
+
+def test_gap_interval_float_floored_at_interval():
+    assert (
+        _agent()._gap_probe_interval({"permissions_recheck_interval": 30.0}, 60) == 60
+    )
+
+
 # --- _pending_capabilities ---
 
 
@@ -174,6 +189,20 @@ def test_pending_packages_ignores_non_dict_config():
     assert agent._pending_capabilities({"packages": True}) == []
 
 
+def test_pending_includes_software_inventory_for_windows_packages_scan():
+    # On Windows the package scan reads the Uninstall registry (software_inventory
+    # cap); there is no 'packages' cap in the Windows capability set.
+    agent = _agent({"software_inventory": False})
+    assert agent._pending_capabilities({"packages": {"scan": True}}) == [
+        "software_inventory"
+    ]
+
+
+def test_pending_software_inventory_not_added_when_available():
+    agent = _agent({"software_inventory": True})
+    assert agent._pending_capabilities({"packages": {"scan": True}}) == []
+
+
 # --- _apply_config_driven_refresh ---
 
 
@@ -197,6 +226,27 @@ def test_apply_no_token_runs_gap_refresh_and_publishes_state():
         "qemu": "libvirt probe timed out"
     }
     assert agent.static_data["pending_capabilities"] == ["qemu"]
+
+
+def test_apply_recomputes_pending_only_when_gap_probe_flips():
+    # refresh_due flips qemu available -> pending must be recomputed so the
+    # payload reflects the post-probe state (empty), not the stale pre-probe set.
+    agent = _agent()
+    state = {"flipped": False}
+
+    def fake_get_all():
+        return {"qemu": True} if state["flipped"] else {"qemu": False}
+
+    def fake_refresh_due(pending, gap_interval):
+        state["flipped"] = True
+        return True
+
+    agent.permissions.get_all.side_effect = fake_get_all
+    agent.permissions.refresh_due.side_effect = fake_refresh_due
+
+    agent._apply_config_driven_refresh({"interval": 60, "qemu": True})
+
+    assert agent.static_data["pending_capabilities"] == []
 
 
 # --- _wait_interval (uses the clamped collection interval) ---

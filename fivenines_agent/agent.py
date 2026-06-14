@@ -264,8 +264,9 @@ class Agent:
         if refresh_permissions_event.is_set():
             refresh_permissions_event.clear()
             self.permissions.force_refresh()
-            self.static_data["capabilities"] = self.permissions.get_all()
-            self.static_data["capability_reasons"] = self.permissions.get_reasons()
+            # capabilities/reasons/pending are republished by
+            # _apply_config_driven_refresh, which always runs later this same
+            # tick (both loop branches), so we don't write static_data here.
             print_capabilities_banner()
 
     def _apply_config_driven_refresh(self, config):
@@ -279,14 +280,19 @@ class Agent:
         """
         if self._recheck_token_changed(config.get("permissions_recheck_token")):
             self.permissions.force_refresh()
+            pending = self._pending_capabilities(config)
         else:
             interval = self._collection_interval(config)
             gap_interval = self._gap_probe_interval(config, interval)
             pending = self._pending_capabilities(config)
-            self.permissions.refresh_due(pending, gap_interval)
+            # Recompute only when the gap probe actually flipped a capability;
+            # otherwise the pre-probe set is still current, avoiding a second
+            # get_all() copy + COLLECTORS scan every tick.
+            if self.permissions.refresh_due(pending, gap_interval):
+                pending = self._pending_capabilities(config)
         self.static_data["capabilities"] = self.permissions.get_all()
         self.static_data["capability_reasons"] = self.permissions.get_reasons()
-        self.static_data["pending_capabilities"] = self._pending_capabilities(config)
+        self.static_data["pending_capabilities"] = pending
 
     def _recheck_token_changed(self, token):
         """Nonce state machine for the on-demand "re-detect now" button.
@@ -324,7 +330,7 @@ class Agent:
         collection interval, since the probe runs once per tick) and is capped
         at 3600."""
         raw = config.get("permissions_recheck_interval")
-        if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or raw <= 0:
             return 0
         return max(interval, min(raw, 3600))
 
@@ -342,17 +348,20 @@ class Agent:
             cap_key = _capability_key_for(config_key)
             if cap_key in caps and not caps[cap_key]:
                 pending.append(cap_key)
-        if config.get("snmp_targets") and caps.get("snmp") is False:
+        # snmp and packages live outside COLLECTORS; use the same
+        # present-and-falsy test as the COLLECTORS loop above (an absent cap on
+        # this OS is not pending).
+        if config.get("snmp_targets") and "snmp" in caps and not caps["snmp"]:
             pending.append("snmp")
-        # packages is not in COLLECTORS - scanning is gated by packages.scan
-        # (a nested dict), mirroring packages_sync's own guard.
+        # packages.scan (nested dict, mirroring packages_sync's guard) reads a
+        # package manager on Linux (the 'packages' cap) and the Uninstall
+        # registry on Windows (the 'software_inventory' cap); surface whichever
+        # gating cap is present-and-False on this host.
         pkg_cfg = config.get("packages")
-        if (
-            isinstance(pkg_cfg, dict)
-            and pkg_cfg.get("scan")
-            and caps.get("packages") is False
-        ):
-            pending.append("packages")
+        if isinstance(pkg_cfg, dict) and pkg_cfg.get("scan"):
+            for pkg_cap in ("packages", "software_inventory"):
+                if pkg_cap in caps and not caps[pkg_cap]:
+                    pending.append(pkg_cap)
         return list(dict.fromkeys(pending))
 
     def _wait_interval(self, running_time):

@@ -121,6 +121,10 @@ class PermissionProbe:
         (D13 - the backend handles the different shape).
         """
         self._last_probe_time = time.time()
+        # A full probe also satisfies the selective gap-probe clock: a
+        # force_refresh / startup / SIGHUP full probe must not leave the next
+        # tick re-probing the same caps (the gap branch reads this timer).
+        self._last_gap_probe_time = self._last_probe_time
         old_capabilities = self.capabilities.copy()
 
         if is_windows():
@@ -143,10 +147,7 @@ class PermissionProbe:
                 old_value = old_capabilities.get(cap)
                 if old_value is None or old_value == available:
                     continue
-                if available:
-                    log(f"Capability '{cap}' is now AVAILABLE", "info")
-                else:
-                    log(self._format_unavailable(cap, "is now UNAVAILABLE"), "info")
+                self._log_capability_flip(cap, available)
 
         return self.capabilities
 
@@ -260,6 +261,14 @@ class PermissionProbe:
             msg += f" ({reason})"
         return msg
 
+    def _log_capability_flip(self, name, available):
+        """Emit the info-level state-flip log shared by the full probe and the
+        selective gap probe (single source of the wording/level)."""
+        if available:
+            log(f"Capability '{name}' is now AVAILABLE", "info")
+        else:
+            log(self._format_unavailable(name, "is now UNAVAILABLE"), "info")
+
     def _reprobe_capabilities(self, only):
         """Re-probe only the named capabilities (cheap selective gap probe).
 
@@ -279,13 +288,10 @@ class PermissionProbe:
             self.capabilities[name] = new_value
             if old_value != new_value:
                 flipped = True
-                if new_value:
-                    log(f"Capability '{name}' is now AVAILABLE", "info")
-                else:
-                    log(self._format_unavailable(name, "is now UNAVAILABLE"), "info")
+                self._log_capability_flip(name, new_value)
         return flipped
 
-    def refresh_due(self, gap_capabilities=(), gap_interval=0):
+    def refresh_due(self, gap_capabilities=(), gap_interval: float = 0):
         """Run timed re-probes; return True if any capability flipped.
 
         - Full probe of every capability every REPROBE_INTERVAL (regressions and
@@ -302,8 +308,7 @@ class PermissionProbe:
         if now - self._last_probe_time >= REPROBE_INTERVAL:
             log("Re-probing capabilities...", "debug")
             old = self.capabilities.copy()
-            self._probe_all()
-            self._last_gap_probe_time = now
+            self._probe_all()  # also resets _last_gap_probe_time
             return old != self.capabilities
         if gap_capabilities and now - self._last_gap_probe_time >= gap_interval:
             self._last_gap_probe_time = now
