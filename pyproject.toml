@@ -14,6 +14,11 @@ certifi = "^2024.12.14"
 docker = "^7.1.0"
 dnspython = "^2.7"
 requests = "^2.33.0"
+# Pure-Python PostgreSQL driver for the postgresql collector. Chosen over
+# psycopg (C extension + libpq) because it bundles into the PyInstaller binary
+# on both glibc and musl with no shared-library handling. Pulls scramp +
+# python-dateutil transitively (locked in poetry.lock, no security floor).
+pg8000 = "^1.31.5"
 # Security floor: GHSA-pq67-6m6q-mj2v (decompression bomb), GHSA-48p4-8xcf-vxj5 (header leak across origins). Brought in transitively by requests/docker; pinned here so future lock regenerations cannot drop below the patched line.
 urllib3 = "^2.7.0"
 

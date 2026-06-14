@@ -103,7 +103,9 @@ PYINSTALLER_ARGS="--strip \
     --hidden-import=libvirt \
     --hidden-import=libvirtmod \
     --hidden-import=proxmoxer.backends \
-    --hidden-import=proxmoxer.backends.https"
+    --hidden-import=proxmoxer.backends.https \
+    --hidden-import=scramp \
+    --hidden-import=dateutil.parser"
 
 if [ -n "$PYTHON_LIB" ] && [ -f "$PYTHON_LIB" ]; then
     echo "Adding Python shared library: $PYTHON_LIB"

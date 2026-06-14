@@ -88,6 +88,8 @@ $pyInstallerArgs = @(
     "--exclude-module", "proxmoxer",
     "--hidden-import", "win32timezone",
     "--hidden-import", "wmi",
+    "--hidden-import", "scramp",
+    "--hidden-import", "dateutil.parser",
     "--noconfirm",
     "--onedir",
     "--name", $BINARY_NAME,
