@@ -818,7 +818,10 @@ def test_pgpass_lookup_missing_file_returns_none(monkeypatch, tmp_path):
 
 
 def test_pgpass_lookup_ignored_when_group_or_world_accessible(monkeypatch, tmp_path):
-    # libpq refuses a .pgpass that is not private (0600).
+    # libpq refuses a .pgpass that is not private (0600) -- but only on POSIX.
+    # Force os.name so the check is exercised regardless of the CI platform
+    # (on Windows the code intentionally skips it, like libpq).
+    monkeypatch.setattr(os, "name", "posix")
     pgpass = _write_pgpass(tmp_path, "*:*:*:*:secret\n", mode=0o640)
     monkeypatch.setenv("PGPASSFILE", pgpass)
     assert _pgpass_lookup("h", 5432, "db", "u") is None
