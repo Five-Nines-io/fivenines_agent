@@ -1,5 +1,6 @@
 import os
 import socket
+import ssl
 
 import pg8000.dbapi
 from pg8000.exceptions import DatabaseError, InterfaceError
@@ -13,7 +14,8 @@ from fivenines_agent.debug import debug, log
 # driver). No `psql` binary is required on the host, so a PostgreSQL running
 # inside a Docker container is reachable over its published TCP port.
 #
-# Metrics collected (one connection per tick, six read-only queries):
+# Metrics collected (one connection per tick, six read-only queries; a replica
+# adds a seventh query for replication lag):
 #   - server version
 #   - connection counts by state (active, idle, idle in transaction, ...)
 #   - per-database statistics (transactions, cache hit ratio, tuples, ...)
@@ -41,18 +43,56 @@ from fivenines_agent.debug import debug, log
 # Password discovery mirrors the previous psql/libpq behavior so existing
 # installs keep working: explicit config password, then PGPASSWORD, then a
 # ~/.pgpass / PGPASSFILE lookup. (pg_service.conf / PGSERVICE is not handled.)
+# TLS follows PGSSLMODE / PGSSLROOTCERT (see _ssl_context).
 
-# Bounds connection establishment so a dead host cannot stall the loop.
-CONNECT_TIMEOUT = 5
-
-# Server-side per-query cap, sent as a startup parameter so it protects EVERY
-# query including the first, with no extra round-trip (vs a post-connect SET).
+# Server-side per-query cap (ms). Sent as a startup parameter so it protects
+# EVERY query including the first, with no extra round-trip. We keep it in the
+# StartupMessage rather than a post-connect `SET` because a `SET` in autocommit
+# mode does not persist across statements behind a transaction pooler, and
+# monitoring through a transaction pooler is atypical anyway (it breaks the
+# session-scoped pg_stat_* views this collector reads).
 STATEMENT_TIMEOUT_MS = 5000
+
+# The socket read timeout must EXCEED statement_timeout: a slow query should be
+# cancelled server-side (a clean, degradable DatabaseError) before the socket
+# read times out (an InterfaceError that would flip the whole tick to
+# unreachable). It also bounds connection establishment so a dead host cannot
+# stall the loop.
+SOCKET_TIMEOUT = 10
 
 
 def _is_socket_host(host):
     """True when host is a Unix socket directory path (psql-style)."""
     return isinstance(host, str) and host.startswith("/")
+
+
+def _ssl_context(host):
+    """Return the pg8000 ssl_context for the configured PGSSLMODE.
+
+    Restores the TLS posture the old psql/libpq path honored via env:
+      disable                -> False (no TLS)
+      require                -> TLS required, certificate NOT verified
+      verify-ca              -> TLS required, certificate verified (no hostname)
+      verify-full            -> TLS required, certificate + hostname verified
+      prefer/allow/unset     -> None (pg8000 default: opportunistic, unverified)
+    PGSSLROOTCERT selects the CA bundle for the verify-* modes. TLS is never
+    used over a local Unix socket (libpq behavior), regardless of PGSSLMODE.
+    """
+    if _is_socket_host(host):
+        return False
+    mode = os.environ.get("PGSSLMODE")
+    if mode == "disable":
+        return False
+    if mode == "require":
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+    if mode in ("verify-ca", "verify-full"):
+        ctx = ssl.create_default_context(cafile=os.environ.get("PGSSLROOTCERT") or None)
+        ctx.check_hostname = mode == "verify-full"
+        return ctx
+    return None
 
 
 def _split_pgpass_line(line):
@@ -113,7 +153,10 @@ def _pgpass_lookup(host, port, database, user):
 
     target = [str(host), str(port), str(database), str(user)]
     for raw in lines:
-        line = raw.rstrip("\n")
+        # rstrip CR as well as LF: a Windows pgpass.conf (and the standard
+        # %APPDATA% location) is CRLF, and a trailing \r would corrupt the
+        # password field.
+        line = raw.rstrip("\r\n")
         if not line or line.lstrip().startswith("#"):
             continue
         entry = _split_pgpass_line(line)
@@ -147,19 +190,25 @@ def _resolve_password(host, port, database, user, password):
 
 def _connect(host, port, user, password, database):
     """Open a pg8000 connection, routing path-like hosts to a unix socket."""
+    try:
+        port_num = int(port)
+    except (TypeError, ValueError):
+        # A socket config may legitimately omit the port; fall back to default.
+        port_num = 5432
     params = {
         "user": user,
         "database": database,
-        "password": _resolve_password(host, port, database, user, password),
-        "timeout": CONNECT_TIMEOUT,
+        "password": _resolve_password(host, port_num, database, user, password),
+        "ssl_context": _ssl_context(host),
+        "timeout": SOCKET_TIMEOUT,
         "startup_params": {"statement_timeout": str(STATEMENT_TIMEOUT_MS)},
     }
     if _is_socket_host(host):
         # psql-style socket directory -> pg8000 socket file path.
-        params["unix_sock"] = "{}/.s.PGSQL.{}".format(host.rstrip("/"), int(port))
+        params["unix_sock"] = "{}/.s.PGSQL.{}".format(host.rstrip("/"), port_num)
     else:
         params["host"] = host
-        params["port"] = int(port)
+        params["port"] = port_num
     return pg8000.dbapi.connect(**params)
 
 
@@ -179,6 +228,11 @@ def _error_category(exc):
     if isinstance(cause, socket.gaierror):
         return "unreachable"
     if isinstance(exc, InterfaceError):
+        # pg8000 raises InterfaceError (not DatabaseError) when the server
+        # requires a password none was provided, or for an unsupported auth
+        # method -- every such message contains "authentication".
+        if "authentication" in str(exc).lower():
+            return "auth_failed"
         return "unreachable"
     return "error"
 
@@ -206,7 +260,9 @@ def _get_version(cursor):
     """Return the PostgreSQL server version string (e.g. '16.2')."""
     rows = _query(cursor, "SHOW server_version;")
     if rows:
-        return str(rows[0][0]).split()[0]
+        parts = str(rows[0][0]).split()
+        if parts:
+            return parts[0]
     return None
 
 
@@ -299,12 +355,23 @@ def _get_database_sizes(cursor):
     return sizes
 
 
-def _get_replication_lag(cursor):
-    """Return replication lag in seconds for a replica, else None."""
-    rows = _query(cursor, "SELECT pg_is_in_recovery();")
-    if not rows or not rows[0][0]:
-        return None
+def _get_replication(cursor):
+    """Return (is_replica, lag_seconds).
 
+    is_replica is derived from pg_is_in_recovery() ALONE, independent of the lag
+    value, so a replica whose lag is not yet available (NULL, e.g. just after
+    start) is still reported as a replica rather than misclassified as a
+    primary. is_replica is None when pg_is_in_recovery() could not be read
+    (query denied/failed) -- distinct from False (a confirmed primary).
+    lag_seconds is None on a primary or when a replica's lag is unavailable.
+    """
+    rows = _query(cursor, "SELECT pg_is_in_recovery();")
+    if not rows:
+        return None, None
+    if not rows[0][0]:
+        return False, None
+
+    lag = None
     lag_rows = _query(
         cursor,
         "SELECT CASE "
@@ -314,10 +381,10 @@ def _get_replication_lag(cursor):
     )
     if lag_rows and lag_rows[0][0] is not None:
         try:
-            return float(lag_rows[0][0])
+            lag = float(lag_rows[0][0])
         except (ValueError, TypeError):
-            return None
-    return None
+            lag = None
+    return True, lag
 
 
 def _get_locks_count(cursor):
@@ -333,9 +400,30 @@ def _get_locks_count(cursor):
     return locks
 
 
+def _failure(exc):
+    """Build the unreachable payload for an exception.
+
+    The category comes from _error_category; for the generic "error" catch-all
+    a short human-readable error_detail is attached (the contract's optional
+    field) since the category alone is not descriptive there.
+    """
+    category = _error_category(exc)
+    result = {"reachable": False, "error": category}
+    if category == "error":
+        detail = str(exc).strip()
+        if detail:
+            result["error_detail"] = detail[:200]
+    return result
+
+
 @debug("postgresql_metrics")
 def postgresql_metrics(
-    host="localhost", port=5432, user="postgres", password=None, database="postgres"
+    host="localhost",
+    port=5432,
+    user="postgres",
+    password=None,
+    database="postgres",
+    **_kwargs,
 ):
     """Collect metrics from PostgreSQL over a direct socket connection.
 
@@ -345,6 +433,8 @@ def postgresql_metrics(
         user: PostgreSQL user (default: postgres).
         password: password, or None for peer/trust auth.
         database: database to connect to (default: postgres).
+        **_kwargs: extra config keys are ignored (forward-compatible with the
+            backend adding connection options the agent does not yet know).
 
     Returns:
         dict: {"reachable": True, <metrics...>} when connected (metric sections
@@ -354,9 +444,8 @@ def postgresql_metrics(
     try:
         conn = _connect(host, port, user, password, database)
     except Exception as e:
-        category = _error_category(e)
-        log(f"Cannot connect to PostgreSQL ({category}): {e}", "debug")
-        return {"reachable": False, "error": category}
+        log(f"Cannot connect to PostgreSQL: {e}", "debug")
+        return _failure(e)
 
     try:
         # Read-only collection: autocommit isolates each query so a denied
@@ -396,12 +485,11 @@ def postgresql_metrics(
             metrics["database_sizes"] = sizes
             metrics["total_size"] = sum(sizes.values())
 
-        replication_lag = _get_replication_lag(cursor)
+        is_replica, replication_lag = _get_replication(cursor)
+        if is_replica is not None:
+            metrics["is_replica"] = is_replica
         if replication_lag is not None:
             metrics["replication_lag_seconds"] = replication_lag
-            metrics["is_replica"] = True
-        else:
-            metrics["is_replica"] = False
 
         locks = _get_locks_count(cursor)
         if locks:
@@ -409,9 +497,11 @@ def postgresql_metrics(
 
         return metrics
     except Exception as e:
-        # Connected but the session could not be queried at all -- not healthy.
+        # A transport/session error reached here (a degradable per-view error
+        # would have been swallowed in _query). The session is not usable;
+        # report unreachable with the specific category, not a flat "error".
         log(f"Error collecting PostgreSQL metrics: {e}", "error")
-        return {"reachable": False, "error": "error"}
+        return _failure(e)
     finally:
         try:
             conn.close()

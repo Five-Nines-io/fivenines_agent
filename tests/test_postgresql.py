@@ -11,6 +11,7 @@ socket lives in test_postgresql_integration.py.
 
 import os
 import socket
+import ssl
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
@@ -25,12 +26,13 @@ from fivenines_agent.postgresql import (
     _get_database_sizes,
     _get_database_stats,
     _get_locks_count,
-    _get_replication_lag,
+    _get_replication,
     _get_version,
     _pgpass_lookup,
     _query,
     _resolve_password,
     _split_pgpass_line,
+    _ssl_context,
     postgresql_metrics,
 )
 
@@ -40,12 +42,14 @@ PG = "fivenines_agent.postgresql"
 
 @pytest.fixture(autouse=True)
 def _isolate_pg_credentials(monkeypatch, tmp_path):
-    """Keep _resolve_password deterministic: no PGPASSWORD, no readable .pgpass.
+    """Keep credential/TLS resolution deterministic across tests.
 
-    Credential-discovery tests opt back in by setting PGPASSWORD / PGPASSFILE
-    themselves; everything else sees "no password available".
+    No PGPASSWORD, no readable .pgpass, no PGSSLMODE/PGSSLROOTCERT. Tests that
+    exercise those paths opt back in by setting the env themselves.
     """
     monkeypatch.delenv("PGPASSWORD", raising=False)
+    monkeypatch.delenv("PGSSLMODE", raising=False)
+    monkeypatch.delenv("PGSSLROOTCERT", raising=False)
     monkeypatch.setenv("PGPASSFILE", str(tmp_path / "does-not-exist.pgpass"))
 
 
@@ -80,13 +84,27 @@ def test_connect_tcp_passes_host_and_port():
         assert kwargs["database"] == "appdb"
 
 
-def test_connect_sets_connect_and_statement_timeout():
-    """connect_timeout + statement_timeout (startup param) are always set."""
+def test_connect_socket_timeout_exceeds_statement_timeout():
+    """The socket timeout (10s) must exceed statement_timeout (5000ms) so the
+    server cancels a slow query before the socket read times out."""
     with patch(f"{PG}.pg8000.dbapi.connect") as conn:
         _connect("localhost", 5432, "postgres", None, "postgres")
         kwargs = conn.call_args.kwargs
-        assert kwargs["timeout"] == 5
-        assert kwargs["startup_params"] == {"statement_timeout": "5000"}
+        assert kwargs["timeout"] == 10
+        assert (
+            int(kwargs["startup_params"]["statement_timeout"])
+            < kwargs["timeout"] * 1000
+        )
+
+
+def test_connect_safe_port_defaults_when_unparseable():
+    """A null/empty port (valid for a socket config) falls back to 5432."""
+    with patch(f"{PG}.pg8000.dbapi.connect") as conn:
+        _connect("localhost", None, "postgres", None, "postgres")
+        assert conn.call_args.kwargs["port"] == 5432
+    with patch(f"{PG}.pg8000.dbapi.connect") as conn:
+        _connect("/var/run/postgresql", "", "postgres", None, "postgres")
+        assert conn.call_args.kwargs["unix_sock"] == "/var/run/postgresql/.s.PGSQL.5432"
 
 
 def test_connect_path_like_host_routes_to_unix_socket():
@@ -112,6 +130,58 @@ def test_connect_non_string_host_uses_tcp():
         _connect(None, 5432, "postgres", None, "postgres")
         assert "unix_sock" not in conn.call_args.kwargs
         assert conn.call_args.kwargs["host"] is None
+
+
+def test_connect_forwards_ssl_context(monkeypatch):
+    """PGSSLMODE drives the ssl_context passed to pg8000."""
+    monkeypatch.setenv("PGSSLMODE", "require")
+    with patch(f"{PG}.pg8000.dbapi.connect") as conn:
+        _connect("db.example.com", 5432, "postgres", None, "postgres")
+        assert isinstance(conn.call_args.kwargs["ssl_context"], ssl.SSLContext)
+
+
+# ---------------------------------------------------------------------------
+# _ssl_context: PGSSLMODE / PGSSLROOTCERT parity (#2)
+# ---------------------------------------------------------------------------
+
+
+def test_ssl_context_default_is_none():
+    """No PGSSLMODE -> None (pg8000 default: opportunistic, unverified)."""
+    assert _ssl_context("db.example.com") is None
+
+
+def test_ssl_context_socket_host_disables_tls():
+    """TLS is never used on a local Unix socket."""
+    assert _ssl_context("/var/run/postgresql") is False
+
+
+def test_ssl_context_disable(monkeypatch):
+    monkeypatch.setenv("PGSSLMODE", "disable")
+    assert _ssl_context("h") is False
+
+
+def test_ssl_context_require_does_not_verify(monkeypatch):
+    monkeypatch.setenv("PGSSLMODE", "require")
+    ctx = _ssl_context("h")
+    assert isinstance(ctx, ssl.SSLContext)
+    assert ctx.verify_mode == ssl.CERT_NONE
+    assert ctx.check_hostname is False
+
+
+def test_ssl_context_verify_ca_checks_cert_not_hostname(monkeypatch):
+    monkeypatch.setenv("PGSSLMODE", "verify-ca")
+    ctx = _ssl_context("h")
+    assert isinstance(ctx, ssl.SSLContext)
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+    assert ctx.check_hostname is False
+
+
+def test_ssl_context_verify_full_checks_cert_and_hostname(monkeypatch):
+    monkeypatch.setenv("PGSSLMODE", "verify-full")
+    ctx = _ssl_context("h")
+    assert isinstance(ctx, ssl.SSLContext)
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+    assert ctx.check_hostname is True
 
 
 # ---------------------------------------------------------------------------
@@ -172,6 +242,15 @@ def test_error_category_interface_error_unknown_cause():
     assert _error_category(InterfaceError("x")) == "unreachable"
 
 
+def test_error_category_interface_error_auth_message_is_auth_failed():
+    """pg8000 raises InterfaceError (not DatabaseError) when a password is
+    required but none was provided -- classify it as auth_failed."""
+    exc = InterfaceError(
+        "server requesting password authentication, but no password was provided"
+    )
+    assert _error_category(exc) == "auth_failed"
+
+
 def test_error_category_unknown_exception():
     """Any other exception type maps to the generic 'error'."""
     assert _error_category(ValueError("boom")) == "error"
@@ -218,6 +297,11 @@ def test_get_version_strips_suffix():
 
 def test_get_version_none_when_empty():
     assert _get_version(cursor_returning([])) is None
+
+
+def test_get_version_none_when_blank_value():
+    """A blank server_version value does not raise IndexError -> None."""
+    assert _get_version(cursor_returning([("   ",)])) is None
 
 
 def test_get_version_none_when_server_error():
@@ -333,46 +417,47 @@ def test_database_sizes_skips_null_name():
 
 
 # ---------------------------------------------------------------------------
-# _get_replication_lag
+# _get_replication -> (is_replica, lag_seconds)
 # ---------------------------------------------------------------------------
 
 
-def test_replication_lag_none_when_server_error():
+def test_replication_undetermined_when_recovery_query_denied():
+    """pg_is_in_recovery() denied/failed -> (None, None), NOT (False, ...)."""
     cur = MagicMock()
     cur.execute.side_effect = DatabaseError({"C": "42501", "M": "denied"})
-    assert _get_replication_lag(cur) is None
+    assert _get_replication(cur) == (None, None)
 
 
-def test_replication_lag_primary_returns_none():
-    """pg_is_in_recovery() False -> primary -> None."""
-    assert _get_replication_lag(cursor_returning([(False,)])) is None
+def test_replication_primary():
+    """pg_is_in_recovery() False -> (False, None)."""
+    assert _get_replication(cursor_returning([(False,)])) == (False, None)
 
 
-def test_replication_lag_replica_returns_seconds():
+def test_replication_replica_with_lag():
     cur = cursor_returning([(True,)], [(1.5,)])
-    assert _get_replication_lag(cur) == 1.5
+    assert _get_replication(cur) == (True, 1.5)
 
 
-def test_replication_lag_replica_caught_up_is_zero():
+def test_replication_replica_caught_up_lag_zero():
     cur = cursor_returning([(True,)], [(0,)])
-    assert _get_replication_lag(cur) == 0.0
+    assert _get_replication(cur) == (True, 0.0)
 
 
-def test_replication_lag_null_replay_returns_none():
-    """Replica whose lag expression is NULL -> None."""
+def test_replication_replica_null_lag_still_marks_replica():
+    """A replica whose lag is NULL (e.g. just started) is still is_replica=True
+    -- the bug was reporting it as a primary."""
     cur = cursor_returning([(True,)], [(None,)])
-    assert _get_replication_lag(cur) is None
+    assert _get_replication(cur) == (True, None)
 
 
-def test_replication_lag_empty_lag_rows_returns_none():
+def test_replication_replica_empty_lag_rows():
     cur = cursor_returning([(True,)], [])
-    assert _get_replication_lag(cur) is None
+    assert _get_replication(cur) == (True, None)
 
 
-def test_replication_lag_unparseable_value_returns_none():
-    """A non-numeric lag value is swallowed to None."""
+def test_replication_replica_unparseable_lag():
     cur = cursor_returning([(True,)], [("not-a-number",)])
-    assert _get_replication_lag(cur) is None
+    assert _get_replication(cur) == (True, None)
 
 
 # ---------------------------------------------------------------------------
@@ -417,7 +502,7 @@ def helpers_patched(**values):
         "_get_connection_stats": {},
         "_get_database_stats": [],
         "_get_database_sizes": {},
-        "_get_replication_lag": None,
+        "_get_replication": (False, None),
         "_get_locks_count": {},
     }
     defaults.update(values)
@@ -462,7 +547,7 @@ def test_metrics_happy_path_full_payload():
         _get_connection_stats={"active": 1, "total": 1},
         _get_database_stats=[db],
         _get_database_sizes={"app": 2048},
-        _get_replication_lag=None,
+        _get_replication=(False, None),
         _get_locks_count={"AccessShareLock": 1, "total": 1},
     )
     assert result["reachable"] is True
@@ -480,9 +565,29 @@ def test_metrics_happy_path_full_payload():
 
 
 def test_metrics_replica_sets_lag_and_flag():
-    result = run_metrics(fake_conn(), _get_version="16.2", _get_replication_lag=2.5)
+    result = run_metrics(fake_conn(), _get_version="16.2", _get_replication=(True, 2.5))
     assert result["replication_lag_seconds"] == 2.5
     assert result["is_replica"] is True
+
+
+def test_metrics_replica_null_lag_marks_replica_without_lag():
+    """#6: a replica with no lag yet is is_replica=True, lag key omitted (not a
+    primary)."""
+    result = run_metrics(
+        fake_conn(), _get_version="16.2", _get_replication=(True, None)
+    )
+    assert result["is_replica"] is True
+    assert "replication_lag_seconds" not in result
+
+
+def test_metrics_replication_undetermined_omits_is_replica():
+    """#6: when pg_is_in_recovery() is denied, is_replica is omitted entirely
+    rather than defaulted to False."""
+    result = run_metrics(
+        fake_conn(), _get_version="16.2", _get_replication=(None, None)
+    )
+    assert "is_replica" not in result
+    assert "replication_lag_seconds" not in result
 
 
 def test_metrics_version_probe_failure_is_unreachable():
@@ -514,20 +619,33 @@ def test_metrics_cache_ratio_zero_blocks_is_100():
     assert result["cache_hit_ratio"] == 100.0
 
 
-def test_metrics_inner_exception_is_unreachable():
-    """P1: connected but the session cannot be queried at all -> unreachable."""
+def test_metrics_inner_exception_is_unreachable_with_detail():
+    """P1+#13: a generic error after connect -> unreachable, with error_detail."""
     result = run_metrics(fake_conn(cursor_raises=True))
-    assert result == {"reachable": False, "error": "error"}
+    assert result == {
+        "reachable": False,
+        "error": "error",
+        "error_detail": "cursor boom",
+    }
 
 
 def test_metrics_transport_error_after_version_is_unreachable():
-    """A transport error mid-collection bubbles to reachable: False, not a
-    false-healthy partial payload (version probe already succeeded)."""
+    """#9: a transport error mid-collection bubbles to reachable: False with the
+    specific category (not a flat 'error'), and no false-healthy partial."""
     with patch(f"{PG}._connect", return_value=fake_conn()), patch(
         f"{PG}._get_version", return_value="16.2"
     ), patch(f"{PG}._get_connection_stats", side_effect=InterfaceError("dropped")):
         result = postgresql_metrics()
-    assert result == {"reachable": False, "error": "error"}
+    assert result == {"reachable": False, "error": "unreachable"}
+
+
+def test_metrics_tolerates_unknown_config_keys():
+    """#14: an unexpected backend config key is ignored, not a TypeError->None."""
+    with patch(f"{PG}._connect", return_value=fake_conn()), helpers_patched(
+        _get_version="16.2"
+    ):
+        result = postgresql_metrics(host="localhost", future_option="x")
+    assert result["reachable"] is True
 
 
 def test_metrics_closes_connection_on_success():
@@ -663,6 +781,12 @@ def test_default_pgpass_path_windows(monkeypatch):
 def test_pgpass_lookup_wildcards_match(monkeypatch, tmp_path):
     monkeypatch.setenv("PGPASSFILE", _write_pgpass(tmp_path, "*:*:*:*:wild\n"))
     assert _pgpass_lookup("anyhost", 5432, "anydb", "anyuser") == "wild"
+
+
+def test_pgpass_lookup_strips_crlf(monkeypatch, tmp_path):
+    """#3: a CRLF pgpass (Windows default) must not leave \\r on the password."""
+    monkeypatch.setenv("PGPASSFILE", _write_pgpass(tmp_path, "h:5432:db:u:secret\r\n"))
+    assert _pgpass_lookup("h", 5432, "db", "u") == "secret"
 
 
 def test_pgpass_lookup_first_match_wins_and_skips_noise(monkeypatch, tmp_path):

@@ -90,6 +90,8 @@ $pyInstallerArgs = @(
     "--hidden-import", "wmi",
     "--hidden-import", "scramp",
     "--hidden-import", "dateutil.parser",
+    "--copy-metadata", "pg8000",
+    "--copy-metadata", "scramp",
     "--noconfirm",
     "--onedir",
     "--name", $BINARY_NAME,
