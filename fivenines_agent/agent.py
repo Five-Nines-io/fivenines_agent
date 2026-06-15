@@ -29,7 +29,11 @@ from fivenines_agent.permissions import get_permissions, print_capabilities_bann
 from fivenines_agent.ping import tcp_ping
 from fivenines_agent.synchronization_queue import SynchronizationQueue
 from fivenines_agent.synchronizer import Synchronizer
-from fivenines_agent.systemd import force_inventory_resend, systemd_inventory_sync
+from fivenines_agent.systemd import (
+    force_inventory_resend,
+    refresh_runtime_caches,
+    systemd_inventory_sync,
+)
 
 CONFIG_DIR = config_dir()
 load_dotenv(dotenv_path=env_file())
@@ -211,8 +215,11 @@ class Agent:
             self.static_data["capabilities"] = self.permissions.get_all()
             self.static_data["capability_reasons"] = self.permissions.get_reasons()
             print_capabilities_banner()
-            # Permission refresh = orient agent. Reset systemd inventory hash so
-            # the next sync resends a fresh snapshot even if nothing changed.
+            # Permission refresh = orient agent. Re-detect host-level systemd
+            # state (cgroup hierarchy, version) in case it changed, and reset
+            # the inventory hash so the next sync resends a fresh snapshot even
+            # if nothing changed.
+            refresh_runtime_caches()
             force_inventory_resend()
             self._systemd_force_resend = True
         elif self.permissions.refresh_if_needed():

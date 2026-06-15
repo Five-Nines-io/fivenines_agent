@@ -47,6 +47,7 @@ import shutil
 import subprocess
 
 from fivenines_agent.cgroup import detect_hierarchy, read_unit_resources
+from fivenines_agent.cgroup import reset_cache as cgroup_reset_cache
 from fivenines_agent.debug import debug, log
 from fivenines_agent.env import dry_run
 from fivenines_agent.subprocess_utils import get_clean_env
@@ -68,21 +69,31 @@ JOURNAL_TAIL_LINES = 5
 # Failure signature LRU max size (per-host bound)
 FAILURE_SIG_MAX = 1024
 
-# Properties read for per-tick health
-HEALTH_PROPERTIES = (
+# Stable identity + drift fields. Present in BOTH the per-tick health payload
+# and the inventory snapshot. LoadState (loaded/masked/not-found) and
+# UnitFileState (enabled/disabled/masked) are drift signals that SHOULD move
+# the inventory hash, so they live here, not in VOLATILE_STATE_PROPERTIES.
+IDENTITY_PROPERTIES = (
     "Id",
     "LoadState",
+    "UnitFileState",
+)
+
+# Volatile runtime state. Changes on every restart/flap/timer-fire. Belongs in
+# the per-tick health payload ONLY -- never in the inventory hash, or the
+# delta-sync would resend the full inventory on routine operation.
+VOLATILE_STATE_PROPERTIES = (
     "ActiveState",
     "SubState",
     "Result",
     "NRestarts",
     "ActiveEnterTimestamp",
     "InactiveEnterTimestamp",
-    "UnitFileState",
 )
 
-# Properties read for inventory snapshot (in addition to HEALTH_PROPERTIES)
-INVENTORY_PROPERTIES = HEALTH_PROPERTIES + (
+# Config properties. Change only on admin action (edit/install/override). These
+# are what the inventory snapshot exists to capture.
+CONFIG_PROPERTIES = (
     "FragmentPath",
     "Restart",
     "ExecStart",
@@ -102,10 +113,26 @@ INVENTORY_PROPERTIES = HEALTH_PROPERTIES + (
     "OnCalendar",
 )
 
-# Top-level properties stripped from inventory hash because they mutate per
-# restart and would flap the delta-sync.
+# Properties fetched for per-tick health.
+HEALTH_PROPERTIES = IDENTITY_PROPERTIES + VOLATILE_STATE_PROPERTIES
+
+# Properties fetched for the inventory snapshot (config-only, hash-stable).
+INVENTORY_PROPERTIES = IDENTITY_PROPERTIES + CONFIG_PROPERTIES
+
+# Superset fetched in a single `systemctl show` when scan is enabled, so the
+# per-tick health AND the inventory snapshot share one subprocess per tick.
+# Health reads the volatile fields; inventory strips them (see
+# RUNTIME_FIELDS_TO_STRIP) so the canonical form is identical to a config-only
+# fetch.
+ALL_PROPERTIES = HEALTH_PROPERTIES + CONFIG_PROPERTIES
+
+# Top-level properties stripped from the inventory hash because they mutate per
+# restart and would flap the delta-sync. Includes VOLATILE_STATE_PROPERTIES so
+# that canonicalizing an ALL_PROPERTIES fetch yields the same hash as a
+# config-only fetch.
 RUNTIME_FIELDS_TO_STRIP = frozenset(
-    (
+    VOLATILE_STATE_PROPERTIES
+    + (
         "MainPID",
         "ControlPID",
         "ExecMainPID",
@@ -213,8 +240,11 @@ def _systemd_version():
         return None
     if result.returncode != 0:
         return None
-    # First line: "systemd 252 (252.4-1ubuntu3.1)" or "systemd 219"
-    first = result.stdout.strip().splitlines()[0] if result.stdout else ""
+    # First line: "systemd 252 (252.4-1ubuntu3.1)" or "systemd 219".
+    # Guard on the post-strip result, not raw stdout truthiness: whitespace-only
+    # output (e.g. a wrapper systemctl) is truthy but splitlines() to [].
+    lines = result.stdout.strip().splitlines() if result.stdout else []
+    first = lines[0] if lines else ""
     parts = first.split()
     if len(parts) >= 2 and parts[0] == "systemd":
         try:
@@ -255,7 +285,11 @@ def _run_subprocess(cmd, args, timeout):
             "type": "timeout",
             "message": f"{cmd} timed out after {timeout}s",
         }
-    except OSError as e:
+    except (OSError, ValueError) as e:
+        # ValueError covers UnicodeDecodeError from text=True decoding when a
+        # unit emits non-UTF-8 bytes (e.g. a Latin-1 ExecStart argv). Without
+        # this, one bad unit kills the entire systemd collection for the host
+        # instead of degrading. Mirrors snmp.py's broad subprocess guard.
         return None, {"type": "unknown", "message": str(e)}
     if result.returncode != 0:
         return None, {
@@ -436,8 +470,13 @@ class SystemdCollector:
     def __init__(
         self, unit_types=DEFAULT_UNIT_TYPES, journal_tail_lines=JOURNAL_TAIL_LINES
     ):
-        self.unit_types = unit_types
+        self.unit_types = _normalize_unit_types(unit_types)
         self.journal_tail_lines = journal_tail_lines
+        # When collect(scan=True) runs, it stashes (unit_names, raw_props) here
+        # so the inventory snapshot in the same tick reuses the single
+        # `systemctl show` instead of running its own. Consumed and cleared by
+        # snapshot_inventory(); None means "fetch fresh".
+        self._pending_inventory = None
         if SystemdCollector._version is None:
             SystemdCollector._version = _systemd_version()
         if SystemdCollector._hierarchy is None:
@@ -445,8 +484,21 @@ class SystemdCollector:
 
     # ---- Per-tick health ----
 
-    def collect(self):
+    def _empty_result(self, errors):
+        return {
+            "version": SystemdCollector._version,
+            "cgroup": SystemdCollector._hierarchy,
+            "units": [],
+            "drilldowns": {},
+            "errors": errors,
+        }
+
+    def collect(self, scan=False):
         """Collect per-tick health for all units.
+
+        When *scan* is True the inventory snapshot is enabled for this host, so
+        a single `systemctl show` fetches the superset (ALL_PROPERTIES) and the
+        raw output is stashed for snapshot_inventory() to reuse this tick.
 
         Returns a dict shape:
           {
@@ -459,37 +511,39 @@ class SystemdCollector:
         Returns None if systemctl is unavailable.
         """
         errors = []
+        # Drop any stash from a prior tick before this tick's fetch.
+        self._pending_inventory = None
 
         unit_names, error = self._list_units()
         if error:
             errors.append({"step": "list_units", **error})
-            return {
-                "version": SystemdCollector._version,
-                "cgroup": SystemdCollector._hierarchy,
-                "units": [],
-                "drilldowns": {},
-                "errors": errors,
-            }
+            return self._empty_result(errors)
 
         if not unit_names:
-            return {
-                "version": SystemdCollector._version,
-                "cgroup": SystemdCollector._hierarchy,
-                "units": [],
-                "drilldowns": {},
-                "errors": errors,
-            }
+            return self._empty_result(errors)
 
-        unit_props, error = self._show_bulk(unit_names, HEALTH_PROPERTIES)
+        properties = ALL_PROPERTIES if scan else HEALTH_PROPERTIES
+        unit_props, error = self._show_bulk(unit_names, properties)
         if error:
+            # A transient show failure must NOT blank every unit (which would
+            # misreport failed units as empty state) nor wipe the failure-
+            # signature debounce cache (every unit would look non-failed).
+            # Return no health this tick; the next tick recovers.
             errors.append({"step": "show_bulk", **error})
+            return self._empty_result(errors)
+
+        if scan:
+            self._pending_inventory = (unit_names, unit_props)
 
         units = []
         newly_failed = []
         for name in unit_names:
-            props = unit_props.get(name, {})
-            entry = self._build_health_entry(name, props)
-            units.append(entry)
+            props = unit_props.get(name)
+            if props is None:
+                # Unit vanished or was aliased between list-units and show.
+                # Skip rather than emit a blank entry that lies about its state.
+                continue
+            units.append(self._build_health_entry(name, props))
             if self._is_newly_failed(name, props):
                 newly_failed.append(name)
 
@@ -572,22 +626,26 @@ class SystemdCollector:
 
         A unit qualifies if its active_state == "failed" AND its
         (NRestarts, ActiveEnterTimestamp) signature differs from the cached one.
-        Bounds the cache at FAILURE_SIG_MAX entries (LRU-style).
+        Bounds the cache at FAILURE_SIG_MAX entries with true LRU eviction:
+        every access (insert OR re-confirm) moves the entry to the most-recent
+        end, so eviction targets the genuinely least-recently-seen unit, not
+        whichever failed first.
         """
+        sigs = SystemdCollector._last_failure_signatures
         if props.get("ActiveState") != "failed":
             # Drop from cache when no longer failed so a future failure re-drills.
-            SystemdCollector._last_failure_signatures.pop(name, None)
+            sigs.pop(name, None)
             return False
         sig = (props.get("NRestarts", "0"), props.get("ActiveEnterTimestamp", ""))
-        prev = SystemdCollector._last_failure_signatures.get(name)
+        prev = sigs.pop(name, None)  # pop+reinsert refreshes recency (dict order)
         if prev == sig:
+            sigs[name] = sig
             return False
-        SystemdCollector._last_failure_signatures[name] = sig
-        # Bound cache size
-        if len(SystemdCollector._last_failure_signatures) > FAILURE_SIG_MAX:
-            # Drop the oldest entry (Python 3.7+ dict insertion order)
-            oldest = next(iter(SystemdCollector._last_failure_signatures))
-            SystemdCollector._last_failure_signatures.pop(oldest, None)
+        sigs[name] = sig
+        # Bound cache size: evict the least-recently-seen entry.
+        if len(sigs) > FAILURE_SIG_MAX:
+            oldest = next(iter(sigs))
+            sigs.pop(oldest, None)
         return True
 
     # ---- Failure drilldown ----
@@ -665,16 +723,27 @@ class SystemdCollector:
         canonical (hash-stable) form, hash is the SHA-256, errors is a list.
         """
         errors = []
-        unit_names, error = self._list_units()
-        if error:
-            errors.append({"step": "list_units", **error})
-            return {}, None, errors
-        if not unit_names:
-            return {}, _canonical_inventory_hash({}), errors
 
-        raw_props, error = self._show_bulk(unit_names, INVENTORY_PROPERTIES)
-        if error:
-            errors.append({"step": "show_bulk_inventory", **error})
+        # Reuse this tick's shared fetch from collect(scan=True) when available,
+        # so health + inventory cost one list-units + one show per tick instead
+        # of two of each. canonicalizing the ALL_PROPERTIES output strips the
+        # volatile fields, yielding the same canonical form as a config-only
+        # fetch.
+        pending = self._pending_inventory
+        self._pending_inventory = None
+        if pending is not None:
+            _unit_names, raw_props = pending
+        else:
+            unit_names, error = self._list_units()
+            if error:
+                errors.append({"step": "list_units", **error})
+                return {}, None, errors
+            if not unit_names:
+                return {}, _canonical_inventory_hash({}), errors
+
+            raw_props, error = self._show_bulk(unit_names, INVENTORY_PROPERTIES)
+            if error:
+                errors.append({"step": "show_bulk_inventory", **error})
 
         # Canonicalize each unit (strip runtime, normalize Exec/list fields)
         canon_units = {
@@ -703,7 +772,12 @@ class SystemdCollector:
 
         server_hash = scan_config.get("last_inventory_hash")
         local_hash = SystemdCollector._last_local_inventory_hash
-        if not force_resend and h == server_hash and h == local_hash:
+        # OR, not AND: a confirmed local send (local_hash == h) suppresses
+        # repeats on its own, before the backend echoes the hash back via
+        # /collect. Under AND the local-hash dedup and force_inventory_resend
+        # were dead weight -- the agent resent every tick until the server
+        # round-tripped the hash.
+        if not force_resend and (h == server_hash or h == local_hash):
             log("systemd inventory unchanged, skipping", "debug")
             return
 
@@ -736,10 +810,40 @@ class SystemdCollector:
 _collector = None
 
 
+def _normalize_unit_types(value):
+    """Coerce unit_types config into the comma-separated string systemctl wants.
+
+    The backend may deliver unit_types as a JSON array (the natural shape for a
+    set of types); `--type=['service', 'timer']` would make systemctl exit
+    non-zero and silently disable the collector. Accept list/tuple and join.
+    """
+    if isinstance(value, (list, tuple)):
+        return ",".join(str(v) for v in value)
+    return value
+
+
+def _config_unit_types(config):
+    """Extract normalized unit_types from config, defaulting when absent."""
+    systemd_config = config.get("systemd")
+    if isinstance(systemd_config, dict):
+        return _normalize_unit_types(
+            systemd_config.get("unit_types", DEFAULT_UNIT_TYPES)
+        )
+    return DEFAULT_UNIT_TYPES
+
+
 def _get_collector(unit_types=DEFAULT_UNIT_TYPES):
-    """Return the cached SystemdCollector, creating it on first call."""
+    """Return the cached SystemdCollector, creating it on first call.
+
+    When unit_types changes, the failure-signature cache is cleared: it is
+    scoped to the previous unit set, and entries for units no longer enumerated
+    would otherwise never be popped (stale orphans toward the cap).
+    """
     global _collector
+    unit_types = _normalize_unit_types(unit_types)
     if _collector is None or _collector.unit_types != unit_types:
+        if _collector is not None:
+            SystemdCollector._last_failure_signatures = {}
         _collector = SystemdCollector(unit_types=unit_types)
     return _collector
 
@@ -755,15 +859,17 @@ def reset_collector():
 
 
 @debug("systemd_metrics")
-def systemd_metrics(unit_types=DEFAULT_UNIT_TYPES, **_kwargs):
+def systemd_metrics(unit_types=DEFAULT_UNIT_TYPES, scan=False, **_kwargs):
     """Per-tick collector entry point. Called from collectors registry.
 
-    Extra kwargs are accepted but ignored so future config keys can be added
-    server-side without breaking older agents.
+    The whole config["systemd"] dict is unpacked as kwargs, so `scan` arrives
+    here and is threaded into collect() to share one `systemctl show` with the
+    inventory snapshot this tick. Extra kwargs are accepted but ignored so new
+    server-side config keys do not break older agents.
     """
     if not shutil.which("systemctl"):
         return None
-    return _get_collector(unit_types=unit_types).collect()
+    return _get_collector(unit_types=unit_types).collect(scan=bool(scan))
 
 
 def systemd_inventory_sync(config, send_fn, force_resend=False):
@@ -776,11 +882,7 @@ def systemd_inventory_sync(config, send_fn, force_resend=False):
     """
     if not shutil.which("systemctl"):
         return
-    systemd_config = config.get("systemd")
-    unit_types = DEFAULT_UNIT_TYPES
-    if isinstance(systemd_config, dict):
-        unit_types = systemd_config.get("unit_types", DEFAULT_UNIT_TYPES)
-    _get_collector(unit_types=unit_types).inventory_sync(
+    _get_collector(unit_types=_config_unit_types(config)).inventory_sync(
         config, send_fn, force_resend=force_resend
     )
 
@@ -793,3 +895,17 @@ def force_inventory_resend():
     on the host.
     """
     SystemdCollector._last_local_inventory_hash = None
+
+
+def refresh_runtime_caches():
+    """Re-detect host-level systemd state after a permission/capability change.
+
+    The cgroup hierarchy and systemd version are detected once and cached for
+    the process lifetime. A host that gains a cgroup mount (e.g. early container
+    boot) would otherwise report cgroup=None and null per-unit memory/cpu
+    forever, even after permissions.py re-probes the capability. Called from
+    the agent on SIGHUP so the next tick reflects reality.
+    """
+    cgroup_reset_cache()
+    SystemdCollector._hierarchy = detect_hierarchy()
+    SystemdCollector._version = _systemd_version()

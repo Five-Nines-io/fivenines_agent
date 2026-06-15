@@ -8,19 +8,24 @@ import pytest
 
 from fivenines_agent import systemd
 from fivenines_agent.systemd import (
+    ALL_PROPERTIES,
     DEFAULT_UNIT_TYPES,
     EXEC_ARGV_RE,
     HEALTH_PROPERTIES,
+    IDENTITY_PROPERTIES,
     INVENTORY_PROPERTIES,
     LIST_VALUED_PROPERTIES,
     MAX_DRILLDOWN_WORKERS,
     MIN_SYSTEMD_VERSION_REVERSE_DEPS,
     RUNTIME_FIELDS_TO_STRIP,
+    VOLATILE_STATE_PROPERTIES,
     SystemdCollector,
     _canonical_inventory_hash,
     _canonicalize_unit,
+    _config_unit_types,
     _extract_exec_record,
     _normalize_property_for_hash,
+    _normalize_unit_types,
     _parse_exec_property,
     _parse_journalctl_failed,
     _parse_list_units,
@@ -29,6 +34,7 @@ from fivenines_agent.systemd import (
     _run_subprocess,
     _systemd_version,
     force_inventory_resend,
+    refresh_runtime_caches,
     reset_collector,
     systemd_inventory_sync,
     systemd_metrics,
@@ -53,8 +59,25 @@ def test_runtime_fields_strip_set_includes_main_pid():
     assert "ExecMainStartTimestamp" in RUNTIME_FIELDS_TO_STRIP
 
 
-def test_health_properties_subset_of_inventory():
-    assert set(HEALTH_PROPERTIES).issubset(set(INVENTORY_PROPERTIES))
+def test_identity_shared_by_health_and_inventory():
+    """Health and inventory both carry the identity/drift fields, but inventory
+    must NOT carry the volatile state fields (or the hash flaps on restart)."""
+    assert set(IDENTITY_PROPERTIES).issubset(set(HEALTH_PROPERTIES))
+    assert set(IDENTITY_PROPERTIES).issubset(set(INVENTORY_PROPERTIES))
+    # Volatile state belongs to health only, never inventory.
+    assert not set(VOLATILE_STATE_PROPERTIES) & set(INVENTORY_PROPERTIES)
+
+
+def test_all_properties_is_union_of_health_and_inventory():
+    """The single shared `show` fetch must cover both property sets."""
+    assert set(HEALTH_PROPERTIES).issubset(set(ALL_PROPERTIES))
+    assert set(INVENTORY_PROPERTIES).issubset(set(ALL_PROPERTIES))
+
+
+def test_volatile_state_fields_are_stripped_from_hash():
+    """Every volatile field must be in the strip set so an ALL_PROPERTIES fetch
+    canonicalizes to the same hash as a config-only fetch."""
+    assert set(VOLATILE_STATE_PROPERTIES).issubset(RUNTIME_FIELDS_TO_STRIP)
 
 
 def test_list_valued_properties_in_inventory():
@@ -453,7 +476,11 @@ def test_parse_reverse_deps_only_root_unit():
 
 
 def test_parse_reverse_deps_dedup():
-    output = "nginx.service\n" "\u251c\u2500multi-user.target\n" "\u2502 \u2514\u2500multi-user.target\n"
+    output = (
+        "nginx.service\n"
+        "\u251c\u2500multi-user.target\n"
+        "\u2502 \u2514\u2500multi-user.target\n"
+    )
     deps = _parse_reverse_deps(output)
     assert deps == ["multi-user.target"]
 
@@ -572,14 +599,22 @@ def test_canonicalize_unit_strips_runtime_fields():
         "ExecMainStartTimestamp": "Mon 2024-01-15",
         "InvocationID": "abc-def",
         "FragmentPath": "/etc/systemd/system/nginx.service",
+        # Volatile state fields: must NOT survive into the canonical form.
         "ActiveState": "active",
+        "NRestarts": "7",
+        "ActiveEnterTimestamp": "Mon 2024-01-15 10:00:00",
+        "SubState": "running",
     }
     canon = _canonicalize_unit(props)
     assert "MainPID" not in canon
     assert "ExecMainStartTimestamp" not in canon
     assert "InvocationID" not in canon
+    assert "ActiveState" not in canon
+    assert "NRestarts" not in canon
+    assert "ActiveEnterTimestamp" not in canon
+    assert "SubState" not in canon
     assert canon["FragmentPath"] == "/etc/systemd/system/nginx.service"
-    assert canon["ActiveState"] == "active"
+    assert canon["Id"] == "nginx.service"
 
 
 def test_canonical_inventory_hash_stable():
@@ -612,6 +647,14 @@ def test_canonical_inventory_hash_stable_across_restarts():
             "InvocationID": "old-invocation-id",
             "StateChangeTimestamp": "Mon 2024-01-15 10:00:00",
             "ActiveEnterTimestampMonotonic": "1000000",
+            # Volatile health state -- a real restart bumps these. They must
+            # NOT affect the hash. (This pair is what the original test missed.)
+            "ActiveState": "active",
+            "SubState": "running",
+            "Result": "success",
+            "NRestarts": "0",
+            "ActiveEnterTimestamp": "Mon 2024-01-15 10:00:00",
+            "InactiveEnterTimestamp": "",
             "After": "network.target multi-user.target",
         },
     }
@@ -627,6 +670,14 @@ def test_canonical_inventory_hash_stable_across_restarts():
             "InvocationID": "new-invocation-id",  # different invocation
             "StateChangeTimestamp": "Mon 2024-01-15 11:00:00",
             "ActiveEnterTimestampMonotonic": "2000000",
+            # Restart bumped NRestarts and the wall-clock enter timestamp, and
+            # the unit briefly went inactive. None of this is a config change.
+            "ActiveState": "active",
+            "SubState": "running",
+            "Result": "success",
+            "NRestarts": "1",
+            "ActiveEnterTimestamp": "Mon 2024-01-15 11:00:00",
+            "InactiveEnterTimestamp": "Mon 2024-01-15 10:59:59",
             "After": "network.target multi-user.target",
         },
     }
@@ -704,12 +755,11 @@ def test_collect_happy_path():
                     result = coll.collect()
     assert result["version"] == 252
     assert result["cgroup"] == "v2"
-    assert len(result["units"]) == 5
-    # Find the failed unit and check fields populated
-    fail = next(u for u in result["units"] if u["name"] == "broken.service")
-    # broken.service is in LIST_UNITS_OUTPUT but not in SHOW_BULK_TWO_UNITS,
-    # so its enriched fields are defaults
-    assert fail["active_state"] == ""
+    # SHOW_BULK_TWO_UNITS only has nginx + fail2ban; the other 3 list-units
+    # names are absent from the show output and are skipped (not blanked).
+    names = {u["name"] for u in result["units"]}
+    assert names == {"nginx.service", "fail2ban.service"}
+    assert "broken.service" not in names
     nginx = next(u for u in result["units"] if u["name"] == "nginx.service")
     assert nginx["active_state"] == "active"
     assert nginx["memory_current"] == 1000
@@ -741,7 +791,9 @@ def test_collect_no_units_returns_empty():
     assert result["errors"] == []
 
 
-def test_collect_show_bulk_error_logged_in_errors():
+def test_collect_show_bulk_error_returns_empty_not_blanks():
+    """A transient show failure must early-return (no blanked units), so failed
+    units are not misreported as empty state."""
     coll = _make_collector()
 
     def fake_run(args, timeout=None):
@@ -755,16 +807,44 @@ def test_collect_show_bulk_error_logged_in_errors():
         with patch("fivenines_agent.systemd.read_unit_resources", return_value={}):
             result = coll.collect()
     assert any(e["step"] == "show_bulk" for e in result["errors"])
-    # Units still returned with default-value entries
-    assert len(result["units"]) == 5
+    assert result["units"] == []
+    assert result["drilldowns"] == {}
+
+
+def test_collect_show_bulk_error_preserves_failure_cache():
+    """A show timeout must NOT wipe the failure-signature debounce cache (which
+    would re-drill every failed unit next tick)."""
+    coll = _make_collector()
+    # Seed a known failed-unit signature.
+    SystemdCollector._last_failure_signatures["fail2ban.service"] = ("3", "T1")
+
+    def fake_run(args, timeout=None):
+        if args[0] == "list-units":
+            return LIST_UNITS_OUTPUT, None
+        if args[0] == "show":
+            return None, {"type": "timeout", "message": "show timed out"}
+        return "", None
+
+    with patch("fivenines_agent.systemd._run_systemctl", side_effect=fake_run):
+        coll.collect()
+    assert SystemdCollector._last_failure_signatures.get("fail2ban.service") == (
+        "3",
+        "T1",
+    )
 
 
 def test_collect_invalid_unit_name_does_not_crash():
-    """If somehow an invalid unit name slips through list-units, log and continue."""
+    """If somehow an invalid unit name slips through list-units, the cgroup
+    path-traversal defense logs and continues rather than crashing collect()."""
     coll = _make_collector()
-    # Force list-units to return a bad name
+    # The bad name must be present in the show output so it reaches
+    # _build_health_entry (units absent from show are skipped earlier).
     with patch.object(coll, "_list_units", return_value=(["bad/name.service"], None)):
-        with patch.object(coll, "_show_bulk", return_value=({}, None)):
+        with patch.object(
+            coll,
+            "_show_bulk",
+            return_value=({"bad/name.service": {"Id": "bad/name.service"}}, None),
+        ):
             with patch(
                 "fivenines_agent.systemd.read_unit_resources",
                 side_effect=ValueError("invalid unit name"),
@@ -772,6 +852,7 @@ def test_collect_invalid_unit_name_does_not_crash():
                 with patch("fivenines_agent.systemd.log") as mock_log:
                     result = coll.collect()
     assert result["units"][0]["name"] == "bad/name.service"
+    assert result["units"][0]["memory_current"] is None
     assert any("invalid unit name" in str(c) for c in mock_log.call_args_list)
 
 
@@ -1129,6 +1210,31 @@ def test_inventory_sync_changed_sends():
     assert SystemdCollector._last_local_inventory_hash == "newhash"
 
 
+def test_inventory_sync_local_hash_only_suppresses_send():
+    """OR-gate (fix): a confirmed local send suppresses the next resend even
+    before the backend echoes the hash back (server_hash still None)."""
+    coll = _make_collector()
+    send_fn = MagicMock()
+    SystemdCollector._last_local_inventory_hash = "abc123"
+    with patch.object(coll, "snapshot_inventory", return_value=({}, "abc123", [])):
+        # server has not echoed the hash yet (last_inventory_hash absent)
+        coll.inventory_sync({"systemd": {"scan": True}}, send_fn)
+    send_fn.assert_not_called()
+
+
+def test_inventory_sync_server_hash_only_suppresses_send():
+    """OR-gate: server-echoed hash alone also suppresses, even if local was
+    cleared (e.g. by force_inventory_resend on a prior tick that then sent)."""
+    coll = _make_collector()
+    send_fn = MagicMock()
+    SystemdCollector._last_local_inventory_hash = None
+    with patch.object(coll, "snapshot_inventory", return_value=({}, "srv", [])):
+        coll.inventory_sync(
+            {"systemd": {"scan": True, "last_inventory_hash": "srv"}}, send_fn
+        )
+    send_fn.assert_not_called()
+
+
 def test_inventory_sync_includes_errors():
     coll = _make_collector()
     send_fn = MagicMock(return_value={"ok": True})
@@ -1316,3 +1422,277 @@ def test_reset_collector_clears_singleton_and_class_state():
     assert SystemdCollector._hierarchy is None
     assert SystemdCollector._last_local_inventory_hash is None
     assert SystemdCollector._last_failure_signatures == {}
+
+
+# ============================================================
+# Fixes: shared fetch, coercion, runtime refresh, LRU, decode
+# ============================================================
+
+
+SHOW_BULK_CONFIG = (
+    "Id=nginx.service\n"
+    "LoadState=loaded\n"
+    "ActiveState=active\n"
+    "SubState=running\n"
+    "NRestarts=0\n"
+    "UnitFileState=enabled\n"
+    "FragmentPath=/etc/systemd/system/nginx.service\n"
+)
+
+
+def test_collect_scan_stashes_for_inventory_reuse():
+    """collect(scan=True) fetches ALL_PROPERTIES once and stashes the raw output
+    so snapshot_inventory reuses it -- one list-units + one show for the tick."""
+    coll = _make_collector()
+    calls = []
+
+    def fake_run(args, timeout=None):
+        calls.append(args[0])
+        if args[0] == "list-units":
+            return "nginx.service loaded active running Web\n", None
+        if args[0] == "show":
+            return SHOW_BULK_CONFIG, None
+        return "", None
+
+    with patch("fivenines_agent.systemd._run_systemctl", side_effect=fake_run):
+        with patch("fivenines_agent.systemd.read_unit_resources", return_value={}):
+            with patch.object(coll, "_drilldown_failed_units", return_value={}):
+                health = coll.collect(scan=True)
+                # The show must have requested the superset.
+                show_call = [c for c in calls if c == "show"]
+                assert len(show_call) == 1
+                # Inventory in the same tick reuses the stash: no new subprocess.
+                calls_before = len(calls)
+                units, h, errors = coll.snapshot_inventory()
+    assert health["units"][0]["name"] == "nginx.service"
+    assert "nginx.service" in units
+    assert h is not None
+    assert errors == []
+    # snapshot_inventory ran zero additional systemctl calls (reused the stash).
+    assert len(calls) == calls_before
+
+
+def test_collect_scan_uses_all_properties():
+    """When scan is on, the show fetches ALL_PROPERTIES (health+config union)."""
+    coll = _make_collector()
+    captured = {}
+
+    def fake_show(unit_names, properties):
+        captured["properties"] = properties
+        return ({"nginx.service": {"Id": "nginx.service"}}, None)
+
+    with patch.object(coll, "_list_units", return_value=(["nginx.service"], None)):
+        with patch.object(coll, "_show_bulk", side_effect=fake_show):
+            with patch("fivenines_agent.systemd.read_unit_resources", return_value={}):
+                coll.collect(scan=True)
+    assert captured["properties"] == ALL_PROPERTIES
+
+
+def test_collect_no_scan_uses_health_properties_only():
+    """Health-only hosts must not pay the heavier inventory show."""
+    coll = _make_collector()
+    captured = {}
+
+    def fake_show(unit_names, properties):
+        captured["properties"] = properties
+        return ({"nginx.service": {"Id": "nginx.service"}}, None)
+
+    with patch.object(coll, "_list_units", return_value=(["nginx.service"], None)):
+        with patch.object(coll, "_show_bulk", side_effect=fake_show):
+            with patch("fivenines_agent.systemd.read_unit_resources", return_value={}):
+                coll.collect(scan=False)
+    assert captured["properties"] == HEALTH_PROPERTIES
+    assert coll._pending_inventory is None
+
+
+def test_snapshot_inventory_fetches_fresh_without_stash():
+    """When no shared fetch is pending, snapshot_inventory fetches its own
+    config-only show."""
+    coll = _make_collector()
+    captured = {}
+
+    def fake_show(unit_names, properties):
+        captured["properties"] = properties
+        return ({"nginx.service": {"Id": "nginx.service"}}, None)
+
+    with patch.object(coll, "_list_units", return_value=(["nginx.service"], None)):
+        with patch.object(coll, "_show_bulk", side_effect=fake_show):
+            units, h, errors = coll.snapshot_inventory()
+    assert captured["properties"] == INVENTORY_PROPERTIES
+    assert "nginx.service" in units
+
+
+def test_shared_and_fresh_inventory_hash_match():
+    """The hash from a reused ALL_PROPERTIES fetch equals the hash from a fresh
+    config-only fetch (volatile fields stripped either way)."""
+    raw_all = {
+        "nginx.service": {
+            "Id": "nginx.service",
+            "LoadState": "loaded",
+            "UnitFileState": "enabled",
+            "ActiveState": "active",
+            "NRestarts": "3",
+            "ActiveEnterTimestamp": "now",
+            "FragmentPath": "/etc/systemd/system/nginx.service",
+        }
+    }
+    raw_config = {
+        "nginx.service": {
+            "Id": "nginx.service",
+            "LoadState": "loaded",
+            "UnitFileState": "enabled",
+            "FragmentPath": "/etc/systemd/system/nginx.service",
+        }
+    }
+    assert _canonical_inventory_hash(raw_all) == _canonical_inventory_hash(raw_config)
+
+
+# ---- _normalize_unit_types / coercion (fix #7) ----
+
+
+def test_normalize_unit_types_string_passthrough():
+    assert _normalize_unit_types("service,timer") == "service,timer"
+
+
+def test_normalize_unit_types_list_joined():
+    assert _normalize_unit_types(["service", "timer", "socket"]) == (
+        "service,timer,socket"
+    )
+
+
+def test_normalize_unit_types_tuple_joined():
+    assert _normalize_unit_types(("service", "timer")) == "service,timer"
+
+
+def test_config_unit_types_coerces_list():
+    cfg = {"systemd": {"scan": True, "unit_types": ["service", "timer"]}}
+    assert _config_unit_types(cfg) == "service,timer"
+
+
+def test_config_unit_types_default_when_absent():
+    assert _config_unit_types({"systemd": {"scan": True}}) == DEFAULT_UNIT_TYPES
+    assert _config_unit_types({"systemd": True}) == DEFAULT_UNIT_TYPES
+
+
+def test_collector_init_normalizes_list_unit_types():
+    SystemdCollector._version = 252
+    SystemdCollector._hierarchy = "v2"
+    coll = SystemdCollector(unit_types=["service", "timer"])
+    assert coll.unit_types == "service,timer"
+
+
+def test_list_units_builds_valid_type_arg_from_list():
+    """A list unit_types must produce --type=service,timer, not a Python repr."""
+    SystemdCollector._version = 252
+    SystemdCollector._hierarchy = "v2"
+    coll = SystemdCollector(unit_types=["service", "timer"])
+    captured = {}
+
+    def fake_run(args, timeout=None):
+        captured["args"] = args
+        return "", None
+
+    with patch("fivenines_agent.systemd._run_systemctl", side_effect=fake_run):
+        coll._list_units()
+    assert "--type=service,timer" in captured["args"]
+
+
+# ---- unit_types change clears failure signatures (fix #11) ----
+
+
+def test_unit_types_change_clears_failure_signatures():
+    SystemdCollector._version = 252
+    SystemdCollector._hierarchy = "v2"
+    with patch(
+        "fivenines_agent.systemd.shutil.which", return_value="/usr/bin/systemctl"
+    ):
+        with patch.object(SystemdCollector, "collect", return_value={}):
+            systemd_metrics(unit_types="service,timer,socket")
+            SystemdCollector._last_failure_signatures["old.timer"] = ("1", "T1")
+            # Narrow the unit set -> new collector instance, stale sigs cleared.
+            systemd_metrics(unit_types="service")
+    assert "old.timer" not in SystemdCollector._last_failure_signatures
+
+
+# ---- refresh_runtime_caches (fix #9) ----
+
+
+def test_refresh_runtime_caches_redetects_hierarchy_and_version():
+    SystemdCollector._hierarchy = None
+    SystemdCollector._version = None
+    with patch("fivenines_agent.systemd.cgroup_reset_cache") as mock_reset:
+        with patch("fivenines_agent.systemd.detect_hierarchy", return_value="v2"):
+            with patch("fivenines_agent.systemd._systemd_version", return_value=252):
+                refresh_runtime_caches()
+    mock_reset.assert_called_once()
+    assert SystemdCollector._hierarchy == "v2"
+    assert SystemdCollector._version == 252
+
+
+# ---- LRU touch-on-access (fix #8) ----
+
+
+def test_failure_cache_lru_evicts_least_recently_seen():
+    """After the cache fills, re-confirming an old unit each tick keeps it; a
+    unit not seen for a while is the one evicted."""
+    coll = _make_collector()
+    sigs = SystemdCollector._last_failure_signatures
+    # Fill to the cap with distinct failed units.
+    for i in range(systemd.FAILURE_SIG_MAX):
+        coll._is_newly_failed(
+            f"u{i}.service",
+            {"ActiveState": "failed", "NRestarts": "1", "ActiveEnterTimestamp": "T"},
+        )
+    assert len(sigs) == systemd.FAILURE_SIG_MAX
+    # Touch u0 (re-confirm, unchanged) so it becomes most-recently-seen.
+    coll._is_newly_failed(
+        "u0.service",
+        {"ActiveState": "failed", "NRestarts": "1", "ActiveEnterTimestamp": "T"},
+    )
+    # Insert one new failure -> eviction of the least-recently-seen (u1, not u0).
+    coll._is_newly_failed(
+        "new.service",
+        {"ActiveState": "failed", "NRestarts": "1", "ActiveEnterTimestamp": "T"},
+    )
+    assert "u0.service" in sigs
+    assert "u1.service" not in sigs
+    assert "new.service" in sigs
+    assert len(sigs) == systemd.FAILURE_SIG_MAX
+
+
+def test_failure_cache_reconfirm_does_not_grow():
+    coll = _make_collector()
+    sigs = SystemdCollector._last_failure_signatures
+    props = {"ActiveState": "failed", "NRestarts": "1", "ActiveEnterTimestamp": "T"}
+    assert coll._is_newly_failed("a.service", props) is True
+    # Re-confirm same signature: no re-drill, no growth.
+    assert coll._is_newly_failed("a.service", props) is False
+    assert len(sigs) == 1
+
+
+# ---- UnicodeDecodeError handling (fix #2) ----
+
+
+def test_run_subprocess_unicode_decode_error_returns_error_dict():
+    """Non-UTF-8 child output must degrade to an error dict, not propagate."""
+    with patch("fivenines_agent.systemd.shutil.which", return_value="/bin/foo"):
+        with patch(
+            "fivenines_agent.systemd.subprocess.run",
+            side_effect=UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid"),
+        ):
+            stdout, error = _run_subprocess("foo", [], 5)
+    assert stdout is None
+    assert error["type"] == "unknown"
+
+
+# ---- whitespace-only version output (fix #6) ----
+
+
+def test_systemd_version_whitespace_only_stdout_returns_none():
+    """A wrapper systemctl returning whitespace must yield None, not IndexError."""
+    fake = MagicMock(returncode=0, stdout="\n   \n")
+    with patch(
+        "fivenines_agent.systemd.shutil.which", return_value="/usr/bin/systemctl"
+    ):
+        with patch("fivenines_agent.systemd.subprocess.run", return_value=fake):
+            assert _systemd_version() is None

@@ -398,10 +398,14 @@ def test_systemd_inventory_sync_telemetry_captures_logged_error(mock_sync):
 # --- _handle_permission_refresh: SIGHUP forces inventory resend ---
 
 
+@patch("fivenines_agent.agent.refresh_runtime_caches")
 @patch("fivenines_agent.agent.print_capabilities_banner")
 @patch("fivenines_agent.agent.force_inventory_resend")
-def test_handle_permission_refresh_sets_force_flag_on_sighup(mock_force, mock_banner):
-    """SIGHUP triggers permission refresh AND marks systemd inventory for resend."""
+def test_handle_permission_refresh_sets_force_flag_on_sighup(
+    mock_force, mock_banner, mock_refresh
+):
+    """SIGHUP triggers permission refresh, re-detects host systemd state, AND
+    marks systemd inventory for resend."""
     from fivenines_agent.agent import refresh_permissions_event
 
     agent = make_agent()
@@ -417,13 +421,18 @@ def test_handle_permission_refresh_sets_force_flag_on_sighup(mock_force, mock_ba
         refresh_permissions_event.clear()
 
     mock_force.assert_called_once()
+    mock_refresh.assert_called_once()
     assert agent._systemd_force_resend is True
     assert refresh_permissions_event.is_set() is False
 
 
+@patch("fivenines_agent.agent.refresh_runtime_caches")
 @patch("fivenines_agent.agent.force_inventory_resend")
-def test_handle_permission_refresh_periodic_does_not_force_resend(mock_force):
-    """Periodic 5-min re-probe must NOT force inventory resend (only SIGHUP does)."""
+def test_handle_permission_refresh_periodic_does_not_force_resend(
+    mock_force, mock_refresh
+):
+    """Periodic 5-min re-probe must NOT force inventory resend or re-detect
+    (only SIGHUP does)."""
     from fivenines_agent.agent import refresh_permissions_event
 
     agent = make_agent()
@@ -437,4 +446,5 @@ def test_handle_permission_refresh_periodic_does_not_force_resend(mock_force):
     agent._handle_permission_refresh()
 
     mock_force.assert_not_called()
+    mock_refresh.assert_not_called()
     assert agent._systemd_force_resend is False
