@@ -31,11 +31,20 @@ class TTLCache:
         # key -> (stored_at_monotonic, value)
         self._entries = {}
 
-    def get_or_compute(self, key, ttl, compute):
+    def get_or_compute(self, key, ttl, compute, store_if=None):
+        """Return the cached value for key if younger than ttl, else compute it.
+
+        store_if, when given, is a predicate on the freshly computed value: the
+        value is cached only when it returns True. Use it to avoid caching
+        failures, so a recovered resource is reported promptly instead of
+        serving a stale error for the rest of the TTL. When omitted, every
+        computed value is cached.
+        """
         now = time.monotonic()
         entry = self._entries.get(key)
         if entry is not None and (now - entry[0]) < ttl:
             return entry[1]
         value = compute()
-        self._entries[key] = (now, value)
+        if store_if is None or store_if(value):
+            self._entries[key] = (now, value)
         return value

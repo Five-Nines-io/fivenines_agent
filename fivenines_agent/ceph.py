@@ -49,7 +49,28 @@ def ceph_metrics(clusters=None):
     if not shutil.which("ceph"):
         log("ceph not found in PATH, skipping Ceph collection", "error")
         return None
-    return {"clusters": [_poll_cluster(cluster) for cluster in clusters]}
+
+    # Per-cluster isolation: one malformed entry or one unexpected field type
+    # must not blank every other cluster. The registry try/except wraps the
+    # whole collector, so without this loop a single raise would lose all
+    # clusters for the tick. Each cluster degrades to an error result instead.
+    # NOTE (v1.5): clusters are polled serially; a wedged mon costs up to
+    # SUBPROCESS_TIMEOUT per command. For many-cluster hosts, mirror snmp.py's
+    # ThreadPoolExecutor. Single/few-cluster hosts (the common case) are fine.
+    results = []
+    for cluster in clusters:
+        if not isinstance(cluster, dict):
+            log("ceph: ignoring non-dict cluster config: {!r}".format(cluster), "error")
+            continue
+        try:
+            results.append(_poll_cluster(cluster))
+        except Exception as e:
+            name = cluster.get("name", "ceph")
+            log("ceph: unexpected error polling cluster {}: {}".format(name, e), "error")
+            result = _empty_result(name)
+            result["collection"]["error"] = {"type": "unknown", "message": str(e)}
+            results.append(result)
+    return {"clusters": results}
 
 
 def _poll_cluster(cluster):
@@ -118,7 +139,15 @@ def _empty_result(name):
 
 
 def _base_args(cluster):
-    """Build the shared CLI args for auth/connection for one cluster."""
+    """Build the shared CLI args for auth/connection for one cluster.
+
+    Trust model: cluster config (name/conf/keyring/id) comes from the fivenines
+    backend, the same trusted control plane that supplies snmp communities,
+    redis/postgres credentials, etc. Values go into an argv LIST (no shell), so
+    there is no shell injection; a non-string value would raise and is caught by
+    the per-cluster guard in ceph_metrics. We do not allowlist paths -- that is
+    inconsistent with every other collector's trust of backend config.
+    """
     args = ["--connect-timeout", str(CONNECT_TIMEOUT)]
     name = cluster.get("name", "ceph")
     if name and name != "ceph":
@@ -144,8 +173,17 @@ def _base_args(cluster):
 
 
 def _run_ceph_cached(base, cmd, name):
+    # Cache successes only (store_if): caching an error would keep reporting a
+    # stale failure for the whole TTL after the cluster recovers. A persistently
+    # down cluster is re-tried every tick, which is what we want -- the
+    # subprocess timeout bounds the cost.
     key = (name, tuple(cmd))
-    return _cache.get_or_compute(key, CACHE_TTL, lambda: _run_ceph(base, cmd, name))
+    return _cache.get_or_compute(
+        key,
+        CACHE_TTL,
+        lambda: _run_ceph(base, cmd, name),
+        store_if=lambda result: result[1] is None,
+    )
 
 
 def _run_ceph(base, cmd, name):
@@ -221,7 +259,9 @@ def _parse_health(status):
 
 def _parse_mon(status):
     quorum = status.get("quorum")
-    monmap = status.get("monmap") or {}
+    monmap = status.get("monmap")
+    if not isinstance(monmap, dict):
+        monmap = {}
     mons = monmap.get("mons")
     total = len(mons) if isinstance(mons, list) else monmap.get("num_mons")
     in_quorum = len(quorum) if isinstance(quorum, list) else None
@@ -229,7 +269,9 @@ def _parse_mon(status):
 
 
 def _parse_osd(status):
-    osdmap = status.get("osdmap") or {}
+    osdmap = status.get("osdmap")
+    if not isinstance(osdmap, dict):
+        osdmap = {}
     # Older releases double-nest under osdmap.osdmap; newer flatten it.
     nested = osdmap.get("osdmap")
     inner = nested if isinstance(nested, dict) else osdmap
@@ -250,8 +292,13 @@ def _parse_pg(status):
     degraded = inactive = undersized = 0
     if isinstance(by_state, list):
         for entry in by_state:
-            name = (entry.get("state_name") or "").lower()
-            count = entry.get("count") or 0
+            if not isinstance(entry, dict):
+                continue
+            state_name = entry.get("state_name")
+            name = state_name.lower() if isinstance(state_name, str) else ""
+            count = entry.get("count")
+            if not isinstance(count, int):
+                count = 0
             if "degraded" in name:
                 degraded += count
             if "undersized" in name:

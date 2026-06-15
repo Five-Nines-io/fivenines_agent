@@ -348,3 +348,79 @@ def test_can_run_ceph_absent_sets_reason(monkeypatch):
     probe._current_reason = None
     assert probe._can_run_ceph() is False
     assert "not found" in probe._current_reason
+
+
+# --- per-cluster isolation ------------------------------------------------
+
+
+def test_metrics_skips_non_dict_cluster(clock):
+    with patch.object(ceph.shutil, "which", lambda _: "/usr/bin/ceph"), patch.object(
+        ceph, "_poll_cluster", lambda c: {"configured_name": c["name"]}
+    ):
+        out = ceph.ceph_metrics(clusters=["bad", {"name": "ok"}])
+    assert out == {"clusters": [{"configured_name": "ok"}]}
+
+
+def test_metrics_isolates_cluster_exception(clock):
+    def boom(c):
+        if c["name"] == "bad":
+            raise ValueError("kaboom")
+        return {"configured_name": c["name"]}
+
+    with patch.object(ceph.shutil, "which", lambda _: "/usr/bin/ceph"), patch.object(
+        ceph, "_poll_cluster", boom
+    ):
+        out = ceph.ceph_metrics(clusters=[{"name": "bad"}, {"name": "ok"}])
+
+    clusters = out["clusters"]
+    assert clusters[0]["configured_name"] == "bad"
+    assert clusters[0]["collection"]["error"]["type"] == "unknown"
+    assert clusters[1] == {"configured_name": "ok"}
+
+
+def test_run_ceph_cached_does_not_cache_errors(clock):
+    calls = []
+
+    def fake_run(base, cmd, name):
+        calls.append(tuple(cmd))
+        return (None, {"type": "unreachable", "message": "down"})
+
+    with patch.object(ceph, "_run_ceph", fake_run):
+        ceph._run_ceph_cached([], ["status"], "ceph")
+        clock.t += 1  # well inside CACHE_TTL
+        ceph._run_ceph_cached([], ["status"], "ceph")
+
+    assert calls == [("status",), ("status",)]  # error not cached -> retried
+
+
+# --- defensive parsing ----------------------------------------------------
+
+
+def test_parse_pg_ignores_bad_entries():
+    status = {
+        "pgmap": {
+            "num_pgs": 5,
+            "pgs_by_state": [
+                "notadict",
+                {"state_name": 123, "count": 2},  # non-str name -> "" -> inactive
+                {"state_name": "active+clean", "count": "x"},  # non-int count -> 0
+            ],
+        }
+    }
+    pg = ceph._parse_pg(status)
+    assert pg == {"total": 5, "degraded": 0, "inactive": 2, "undersized": 0}
+
+
+def test_parse_mon_non_dict_monmap():
+    assert ceph._parse_mon({"monmap": ["x"], "quorum": [0]}) == {
+        "in_quorum": 1,
+        "total": None,
+    }
+
+
+def test_parse_osd_non_dict_osdmap():
+    assert ceph._parse_osd({"osdmap": "weird"}) == {
+        "up": None,
+        "in": None,
+        "total": None,
+    }

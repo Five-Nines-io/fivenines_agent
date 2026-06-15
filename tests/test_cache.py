@@ -65,3 +65,34 @@ def test_distinct_keys_are_independent(monkeypatch):
     # Each key keeps its own value; neither overwrites the other.
     assert cache.get_or_compute("a", 60, lambda: "x") == "A"
     assert cache.get_or_compute("b", 60, lambda: "x") == "B"
+
+
+def test_store_if_false_skips_caching(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(cache_mod, "time", clock)
+    cache = cache_mod.TTLCache()
+    calls = []
+
+    def compute():
+        calls.append(1)
+        return "err"
+
+    # store_if False -> value never cached -> recomputed on every call
+    cache.get_or_compute("k", 60, compute, store_if=lambda v: False)
+    cache.get_or_compute("k", 60, compute, store_if=lambda v: False)
+    assert len(calls) == 2
+
+
+def test_store_if_true_caches(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(cache_mod, "time", clock)
+    cache = cache_mod.TTLCache()
+    calls = []
+
+    def compute():
+        calls.append(1)
+        return "ok"
+
+    cache.get_or_compute("k", 60, compute, store_if=lambda v: True)
+    cache.get_or_compute("k", 60, compute, store_if=lambda v: True)
+    assert len(calls) == 1
