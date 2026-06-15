@@ -1,20 +1,12 @@
-import subprocess
 import json
-import os
-import time
+import subprocess
 
+from fivenines_agent.cache import TTLCache
 from fivenines_agent.debug import debug, log
 from fivenines_agent.subprocess_utils import get_clean_env
 
-_health_storage_cache = {
-    "timestamp": 0,
-    "data": []
-}
 
-_identification_storage_cache = {
-    "timestamp": 0,
-    "data": []
-}
+_cache = TTLCache()
 
 # SMART attributes where normalized VALUE (0-100%) is more meaningful than RAW_VALUE
 # These typically represent wear/life percentages
@@ -513,18 +505,15 @@ def get_storage_identification(device):
 @debug('smart_storage_identification')
 def smart_storage_identification():
     """Collect storage identification for all storage devices.
-    Uses smartctl for all devices.
-    Cached for 60 seconds.
+    Uses smartctl for all devices. Cached for 10 minutes (identification only
+    changes on hotswapped drives).
     """
-    global _identification_storage_cache
-    now = time.time()
+    return _cache.get_or_compute(
+        "identification", 600, _compute_storage_identification
+    )
 
 
-    # Cache for 10 minutes as we don't need to update this too often
-    # This can change only for hotswapped drives
-    if now - _identification_storage_cache["timestamp"] < 600:
-        return _identification_storage_cache["data"]
-
+def _compute_storage_identification():
     # Get tool versions only if we have devices to process
     tool_versions = {
         "smartctl_version": get_smartctl_version() if smartctl_available() else None,
@@ -533,22 +522,19 @@ def smart_storage_identification():
 
     if tool_versions["smartctl_version"] is None:
         log("smartctl unavailable (not installed or no sudo permissions)", 'debug')
-        data = []
-    else:
-        devices = list_storage_devices()
-        if not devices:
-            log("No storage devices found", 'error')
-            data = []
-        else:
-            data = [get_storage_identification(dev) for dev in devices]
-            data = [d for d in data if d is not None]
-            for device_info in data:
-                device_info.update(tool_versions)
+        return []
 
-    _identification_storage_cache["timestamp"] = now
-    _identification_storage_cache["data"] = data
+    devices = list_storage_devices()
+    if not devices:
+        log("No storage devices found", 'error')
+        return []
 
+    data = [get_storage_identification(dev) for dev in devices]
+    data = [d for d in data if d is not None]
+    for device_info in data:
+        device_info.update(tool_versions)
     return data
+
 
 @debug('smart_storage_health')
 def smart_storage_health():
@@ -557,26 +543,19 @@ def smart_storage_health():
     Uses smartctl for all devices and enhances NVMe devices with nvme-cli when available.
     Cached for 60 seconds.
     """
-    global _health_storage_cache
-    now = time.time()
+    return _cache.get_or_compute("health", 60, _compute_storage_health)
 
-    if now - _health_storage_cache["timestamp"] < 60:
-        return _health_storage_cache["data"]
 
+def _compute_storage_health():
     if not smartctl_available():
         log("smartctl unavailable (not installed or no sudo permissions)", 'debug')
-        data = []
-    else:
-        devices = list_storage_devices()
-        if not devices:
-            log("No storage devices found", 'error')
-            data = []
-        else:
-            data = [get_storage_info(dev) for dev in devices]
-            # Remove None values and add tool versions
-            data = [d for d in data if d is not None]
+        return []
 
-    _health_storage_cache["timestamp"] = now
-    _health_storage_cache["data"] = data
+    devices = list_storage_devices()
+    if not devices:
+        log("No storage devices found", 'error')
+        return []
 
-    return data
+    data = [get_storage_info(dev) for dev in devices]
+    # Remove None values
+    return [d for d in data if d is not None]
