@@ -11,6 +11,7 @@ from threading import Event
 import psutil
 from dotenv import load_dotenv
 
+
 try:
     import systemd_watchdog
 except ImportError:
@@ -19,7 +20,13 @@ except ImportError:
 from fivenines_agent.cli import VERSION
 from fivenines_agent.collectors import _collect_with_telemetry, collect_metrics
 from fivenines_agent.debug import log
-from fivenines_agent.env import config_dir, dry_run, env_file, get_user_context, is_windows
+from fivenines_agent.env import (
+    config_dir,
+    dry_run,
+    env_file,
+    get_user_context,
+    is_windows,
+)
 from fivenines_agent.files import file_handles_limit, file_handles_used, handle_count
 from fivenines_agent.ip import get_ip
 from fivenines_agent.load_average import load_average
@@ -60,6 +67,7 @@ _DRY_RUN_CONFIG = {
     "nvidia_gpu": True,
     "smart_storage_health": True,
     "raid_storage_health": True,
+    "ceph": {"clusters": [{"name": "ceph"}]},
     "fail2ban": True,
     "disk_health": True,
 }
