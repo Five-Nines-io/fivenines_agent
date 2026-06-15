@@ -424,3 +424,69 @@ def test_parse_osd_non_dict_osdmap():
         "in": None,
         "total": None,
     }
+
+
+def test_parse_pg_non_dict_pgmap():
+    assert ceph._parse_pg({"pgmap": "weird"}) == {
+        "total": None,
+        "degraded": 0,
+        "inactive": 0,
+        "undersized": 0,
+    }
+
+
+def test_parse_pg_bool_count_is_zero():
+    status = {
+        "pgmap": {
+            "num_pgs": 1,
+            "pgs_by_state": [{"state_name": "degraded", "count": True}],
+        }
+    }
+    # bool is an int subclass; it must be rejected, not added as 1.
+    assert ceph._parse_pg(status)["degraded"] == 0
+
+
+def test_parse_capacity_non_dict_stats():
+    assert ceph._parse_capacity({"stats": "weird"}) == {
+        "total_bytes": None,
+        "used_bytes": None,
+        "avail_bytes": None,
+    }
+
+
+# --- top-level JSON shape + cache key (code-review fixes) ------------------
+
+
+def test_run_ceph_non_dict_json_is_parse_error():
+    for body in ("null", "[]", "42"):
+        proc = _FakeProc(0, body)
+        with patch.object(ceph.subprocess, "run", lambda *a, **k: proc):
+            out, err = ceph._run_ceph([], ["status"], "ceph")
+        assert out is None
+        assert err["type"] == "parse_error"
+
+
+def test_run_ceph_cached_keys_on_base_not_just_name(clock):
+    # Two clusters sharing name+cmd but different connection args (base) must
+    # NOT collide in the cache -- each computes its own result.
+    calls = []
+
+    def fake_run(base, cmd, name):
+        calls.append(tuple(base))
+        return ({"conf": base[-1]}, None)
+
+    with patch.object(ceph, "_run_ceph", fake_run):
+        a = ceph._run_ceph_cached(["-c", "a.conf"], ["status"], "ceph")
+        b = ceph._run_ceph_cached(["-c", "b.conf"], ["status"], "ceph")
+
+    assert calls == [("-c", "a.conf"), ("-c", "b.conf")]  # both ran, no collision
+    assert a == ({"conf": "a.conf"}, None)
+    assert b == ({"conf": "b.conf"}, None)
+
+
+def test_classify_error_auth_timeout_is_unreachable():
+    # mon hunting: "authenticate timed out" is an outage, not a keyring problem.
+    assert ceph._classify_error("monclient(hunting): authenticate timed out") == (
+        "unreachable"
+    )
+    assert ceph._classify_error("RADOS permission denied") == "auth_error"

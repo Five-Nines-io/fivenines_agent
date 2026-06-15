@@ -177,7 +177,14 @@ def _run_ceph_cached(base, cmd, name):
     # stale failure for the whole TTL after the cluster recovers. A persistently
     # down cluster is re-tried every tick, which is what we want -- the
     # subprocess timeout bounds the cost.
-    key = (name, tuple(cmd))
+    #
+    # Key on the connection identity (base carries conf/keyring/id/--cluster),
+    # NOT just name: two clusters that share a name -- or both omit it and
+    # default to "ceph" -- but point at different clusters must not collide and
+    # serve each other's cached status/fsid. base also changes when the backend
+    # re-points a cluster's conf/keyring/id, so a config change invalidates the
+    # entry instead of serving stale data for the TTL.
+    key = (tuple(base), tuple(cmd))
     return _cache.get_or_compute(
         key,
         CACHE_TTL,
@@ -215,22 +222,42 @@ def _run_ceph(base, cmd, name):
         return None, {"type": _classify_error(stderr), "message": stderr[:500]}
 
     try:
-        return json.loads(proc.stdout), None
+        parsed = json.loads(proc.stdout)
     except (ValueError, TypeError) as e:
         return None, {"type": "parse_error", "message": str(e)}
+    # json.loads accepts any valid JSON; a returncode-0 command that emits
+    # null / a list / a scalar would otherwise pass as "success" and crash the
+    # parsers' top-level .get(). Treat non-object output as a parse error so a
+    # responding-but-odd command degrades cleanly instead of blanking the
+    # cluster as an "unknown" error.
+    if not isinstance(parsed, dict):
+        return None, {
+            "type": "parse_error",
+            "message": "expected JSON object, got {}".format(type(parsed).__name__),
+        }
+    return parsed, None
 
 
 def _classify_error(stderr):
     low = stderr.lower()
-    if "auth" in low or "permission denied" in low or "access denied" in low:
-        return "auth_error"
+    # Connectivity first: a mon-hunting "authenticate timed out" is an outage,
+    # not a keyring problem, and must not be swallowed by an "auth" match.
     if (
         "connect" in low
         or "unreachable" in low
         or "no mon" in low
         or "timed out" in low
+        or "timeout" in low
     ):
         return "unreachable"
+    if (
+        "permission" in low
+        or "access denied" in low
+        or "eacces" in low
+        or "errno 13" in low
+        or "authentication error" in low
+    ):
+        return "auth_error"
     return "ceph_error"
 
 
@@ -287,7 +314,9 @@ def _parse_pg(status):
     active+undersized+degraded) count in every matching bucket -- overlap is
     expected. inactive == any PG whose state does not contain "active".
     """
-    pgmap = status.get("pgmap") or {}
+    pgmap = status.get("pgmap")
+    if not isinstance(pgmap, dict):
+        pgmap = {}
     by_state = pgmap.get("pgs_by_state")
     degraded = inactive = undersized = 0
     if isinstance(by_state, list):
@@ -297,7 +326,9 @@ def _parse_pg(status):
             state_name = entry.get("state_name")
             name = state_name.lower() if isinstance(state_name, str) else ""
             count = entry.get("count")
-            if not isinstance(count, int):
+            # bool is an int subclass; reject it so a JSON boolean count
+            # is not silently added as 0/1.
+            if not isinstance(count, int) or isinstance(count, bool):
                 count = 0
             if "degraded" in name:
                 degraded += count
@@ -314,7 +345,9 @@ def _parse_pg(status):
 
 
 def _parse_capacity(df):
-    stats = df.get("stats") or {}
+    stats = df.get("stats")
+    if not isinstance(stats, dict):
+        stats = {}
     used = stats.get("total_used_bytes")
     if used is None:
         used = stats.get("total_used_raw_bytes")
