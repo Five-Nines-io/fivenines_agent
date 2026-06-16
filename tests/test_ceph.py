@@ -490,3 +490,46 @@ def test_classify_error_auth_timeout_is_unreachable():
         "unreachable"
     )
     assert ceph._classify_error("RADOS permission denied") == "auth_error"
+
+
+# --- round 2 review fixes -------------------------------------------------
+
+
+def test_parse_host_osd_counts_skips_non_dict_node():
+    tree = {"nodes": ["osd.0", None, {"type": "host", "name": "h1", "children": [0]}]}
+    assert ceph._parse_host_osd_counts(tree) == [{"host": "h1", "osd_count": 1}]
+
+
+def test_base_args_coerces_mistyped_values_to_str():
+    args = ceph._base_args({"name": 123, "conf": ["/a"], "keyring": {"k": 1}, "id": 7})
+    # All coerced to str: no raise, and tuple(args) stays hashable for the key.
+    assert all(isinstance(a, str) for a in args)
+    assert hash(tuple(args))  # raises TypeError if any element is unhashable
+    assert args[args.index("--cluster") + 1] == "123"
+    assert args[args.index("--name") + 1] == "client.7"
+
+
+def test_base_args_empty_id_falls_back():
+    args = ceph._base_args({"name": "ceph", "id": ""})
+    assert args[args.index("--name") + 1] == "client.fivenines"
+
+
+def test_base_args_null_name_omits_cluster_flag():
+    assert "--cluster" not in ceph._base_args({"name": None})
+
+
+def test_poll_null_name_defaults_to_ceph(clock):
+    runner = _fake_cmd_runner({("status",): ({"fsid": "x"}, None)})
+    with patch.object(ceph, "_run_ceph_cached", runner):
+        r = ceph._poll_cluster({"name": None})
+    assert r["configured_name"] == "ceph"
+
+
+def test_metrics_tolerates_extra_config_keys(clock):
+    with patch.object(ceph.shutil, "which", lambda _: "/usr/bin/ceph"), patch.object(
+        ceph, "_poll_cluster", lambda c: {"configured_name": c["name"]}
+    ):
+        # Forward-compat: an unknown top-level config key must not crash/blank
+        # the collector (caught by **_).
+        out = ceph.ceph_metrics(clusters=[{"name": "a"}], poll_mode="fast")
+    assert out == {"clusters": [{"configured_name": "a"}]}

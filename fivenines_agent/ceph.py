@@ -35,11 +35,13 @@ CACHE_TTL = 30  # seconds, per (cluster, command)
 _cache = TTLCache()
 
 
-def ceph_metrics(clusters=None):
+def ceph_metrics(clusters=None, **_):
     """Poll all configured Ceph clusters.
 
     Entry point dispatched from COLLECTORS (pass_kwargs=True): the config dict
-    {"clusters": [...]} is unpacked, so this receives clusters=[...].
+    {"clusters": [...]} is unpacked, so this receives clusters=[...]. **_ absorbs
+    any future top-level config key so a forward-compatible backend addition
+    cannot crash (and blank) the whole collector on an older agent.
 
     Returns {"clusters": [<per-cluster dict>, ...]} or None when there is
     nothing to do.
@@ -65,7 +67,7 @@ def ceph_metrics(clusters=None):
         try:
             results.append(_poll_cluster(cluster))
         except Exception as e:
-            name = cluster.get("name", "ceph")
+            name = cluster.get("name") or "ceph"
             log("ceph: unexpected error polling cluster {}: {}".format(name, e), "error")
             result = _empty_result(name)
             result["collection"]["error"] = {"type": "unknown", "message": str(e)}
@@ -80,7 +82,7 @@ def _poll_cluster(cluster):
     a failure leaves their *_ok False and value None without making the whole
     cluster unreachable.
     """
-    name = cluster.get("name", "ceph")
+    name = cluster.get("name") or "ceph"
     base = _base_args(cluster)
     result = _empty_result(name)
 
@@ -142,24 +144,26 @@ def _base_args(cluster):
     """Build the shared CLI args for auth/connection for one cluster.
 
     Trust model: cluster config (name/conf/keyring/id) comes from the fivenines
-    backend, the same trusted control plane that supplies snmp communities,
-    redis/postgres credentials, etc. Values go into an argv LIST (no shell), so
-    there is no shell injection; a non-string value would raise and is caught by
-    the per-cluster guard in ceph_metrics. We do not allowlist paths -- that is
-    inconsistent with every other collector's trust of backend config.
+    backend, the same trusted control plane that supplies snmp communities and
+    redis/postgres credentials. Values go into an argv LIST (no shell), so there
+    is no shell injection, and we do not allowlist paths (inconsistent with
+    every other collector's trust of backend config). Each value is coerced to
+    str so a mis-typed (non-string, even non-hashable) config field cannot crash
+    the subprocess call or the cache key -- it degrades to a clean CLI error
+    contained by the per-cluster guard in ceph_metrics.
     """
     args = ["--connect-timeout", str(CONNECT_TIMEOUT)]
-    name = cluster.get("name", "ceph")
-    if name and name != "ceph":
-        args += ["--cluster", name]
+    name = cluster.get("name") or "ceph"
+    if name != "ceph":
+        args += ["--cluster", str(name)]
     conf = cluster.get("conf")
     if conf:
-        args += ["-c", conf]
-    cid = cluster.get("id", "fivenines")
+        args += ["-c", str(conf)]
+    cid = cluster.get("id") or "fivenines"
     args += ["--name", "client.{}".format(cid)]
     keyring = cluster.get("keyring")
     if keyring:
-        args += ["--keyring", keyring]
+        args += ["--keyring", str(keyring)]
     # use_sudo is reserved by the contract for a future restricted-wrapper
     # fallback; v1 is keyring-only. Surface intent rather than silently ignore.
     if cluster.get("use_sudo"):
@@ -369,6 +373,8 @@ def _parse_host_osd_counts(tree):
         return []
     hosts = []
     for node in nodes:
+        if not isinstance(node, dict):
+            continue
         if node.get("type") == "host":
             children = node.get("children")
             count = len(children) if isinstance(children, list) else 0

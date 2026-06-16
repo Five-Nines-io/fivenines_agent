@@ -28,7 +28,7 @@ class TTLCache:
     """
 
     def __init__(self):
-        # key -> (stored_at_monotonic, value)
+        # key -> (stored_at_monotonic, value, ttl)
         self._entries = {}
 
     def get_or_compute(self, key, ttl, compute, store_if=None):
@@ -46,5 +46,22 @@ class TTLCache:
             return entry[1]
         value = compute()
         if store_if is None or store_if(value):
-            self._entries[key] = (now, value)
+            # Stamp AFTER compute: a slow command (e.g. a wedged ceph mon near
+            # the subprocess timeout) must not have its own runtime charged
+            # against the TTL, which would re-run it sooner than intended.
+            stored_at = time.monotonic()
+            self._entries[key] = (stored_at, value, ttl)
+            # Drop entries past their own TTL so a caller with a dynamic key
+            # set (e.g. ceph keyed by per-cluster connection args that change
+            # when the backend re-points conf/keyring) cannot grow the cache
+            # without bound over a long-running process. Fixed-key callers
+            # (smart/raid) self-overwrite and are unaffected.
+            self._evict_expired(stored_at)
         return value
+
+    def _evict_expired(self, now):
+        expired = [
+            k for k, (ts, _value, ttl) in self._entries.items() if (now - ts) >= ttl
+        ]
+        for k in expired:
+            del self._entries[k]
