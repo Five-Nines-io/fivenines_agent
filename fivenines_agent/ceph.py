@@ -88,6 +88,12 @@ def _poll_cluster(cluster):
 
     status, error = _run_ceph_cached(base, ["status"], name)
     if error:
+        # fsid stays None here: an unreachable/auth-broken cluster cannot report
+        # its own fsid. The result still carries configured_name, and the host
+        # carries machine_id, so the backend attributes the error at the host
+        # level keyed by (machine_id, configured_name) rather than by fsid (see
+        # the cluster-scope contract). fsid-keying applies only to reachable
+        # clusters whose status succeeded.
         result["collection"]["error"] = error
         return result
 
