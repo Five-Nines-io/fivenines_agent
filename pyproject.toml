@@ -62,7 +62,7 @@ pyinstaller = "^6.11.1"
 virtualenv = ">=20.33.0"
 # Security floors for transitive dev deps. Brought in by poetry/keyring/secretstorage. Pinned here so poetry lock cannot resolve below the patched line.
 poetry = "^2.3.4"  # GHSA-4xc9-8hv6-g4j4 (wheel traversal), GHSA-9q47-jr9w-2qhc (tar traversal)
-cryptography = "^46.0.6"  # GHSA-79v4-65xg-pq4g (subgroup attack), GHSA-h4gh-qq45-vh27 (DNS name constraints)
+cryptography = "^48.0.1"  # GHSA-79v4-65xg-pq4g (subgroup attack), GHSA-h4gh-qq45-vh27 (DNS name constraints)
 
 [build-system]
 requires = ["poetry-core"]
