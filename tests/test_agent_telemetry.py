@@ -428,11 +428,12 @@ def test_handle_permission_refresh_sets_force_flag_on_sighup(
 
 @patch("fivenines_agent.agent.refresh_runtime_caches")
 @patch("fivenines_agent.agent.force_inventory_resend")
-def test_handle_permission_refresh_periodic_does_not_force_resend(
+def test_handle_permission_refresh_periodic_redetects_but_no_force_resend(
     mock_force, mock_refresh
 ):
-    """Periodic 5-min re-probe must NOT force inventory resend or re-detect
-    (only SIGHUP does)."""
+    """Periodic 5-min re-probe re-detects host systemd state (so a cgroup mount
+    gained after boot is picked up) but does NOT force an inventory resend --
+    that orient-and-resend behavior is SIGHUP-only."""
     from fivenines_agent.agent import refresh_permissions_event
 
     agent = make_agent()
@@ -445,6 +446,6 @@ def test_handle_permission_refresh_periodic_does_not_force_resend(
 
     agent._handle_permission_refresh()
 
+    mock_refresh.assert_called_once()
     mock_force.assert_not_called()
-    mock_refresh.assert_not_called()
     assert agent._systemd_force_resend is False

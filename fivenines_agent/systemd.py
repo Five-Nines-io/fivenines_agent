@@ -113,8 +113,12 @@ CONFIG_PROPERTIES = (
     "OnCalendar",
 )
 
-# Properties fetched for per-tick health.
-HEALTH_PROPERTIES = IDENTITY_PROPERTIES + VOLATILE_STATE_PROPERTIES
+# ControlGroup is systemd's real cgroup path for the unit (e.g.
+# "/system.slice/nginx.service", or "/machine.slice/..." for a Slice=-relocated
+# unit). Needed on the health path to read per-unit cgroup metrics without
+# assuming system.slice. It is volatile (empty when the unit is inactive), so
+# it is stripped from the inventory hash via RUNTIME_FIELDS_TO_STRIP below.
+HEALTH_PROPERTIES = IDENTITY_PROPERTIES + VOLATILE_STATE_PROPERTIES + ("ControlGroup",)
 
 # Properties fetched for the inventory snapshot (config-only, hash-stable).
 INVENTORY_PROPERTIES = IDENTITY_PROPERTIES + CONFIG_PROPERTIES
@@ -133,6 +137,7 @@ ALL_PROPERTIES = HEALTH_PROPERTIES + CONFIG_PROPERTIES
 RUNTIME_FIELDS_TO_STRIP = frozenset(
     VOLATILE_STATE_PROPERTIES
     + (
+        "ControlGroup",
         "MainPID",
         "ControlPID",
         "ExecMainPID",
@@ -410,9 +415,11 @@ def _normalize_property_for_hash(key, value):
     - Everything else is stripped of trailing whitespace.
     """
     if key.startswith("Exec"):
-        records = _parse_exec_property(value)
-        records.sort(key=lambda r: (r.get("path", ""), r.get("argv", "")))
-        return records
+        # Preserve definition order: `systemctl show` emits Exec* records in
+        # unit-file order, deterministically across fetches. Sorting would make
+        # a real reorder (e.g. swapping two ExecStartPre= lines on a oneshot,
+        # which changes execution order) invisible to the inventory hash.
+        return _parse_exec_property(value)
     if key in LIST_VALUED_PROPERTIES:
         items = [s for s in (value or "").split() if s]
         items.sort()
@@ -597,12 +604,17 @@ class SystemdCollector:
         cgroup_data = {}
         hierarchy = SystemdCollector._hierarchy
         if hierarchy:
+            control_group = props.get("ControlGroup", "")
             try:
-                cgroup_data = read_unit_resources(name, hierarchy)
+                cgroup_data = read_unit_resources(control_group, hierarchy)
             except ValueError:
-                # Path-traversal defense raised - extremely unlikely with names
-                # from systemctl, but log and continue.
-                log(f"systemd: invalid unit name from list-units: {name!r}", "error")
+                # Path-traversal defense raised - extremely unlikely with a
+                # ControlGroup path from systemctl, but log and continue.
+                log(
+                    f"systemd: invalid control group for {name!r}: "
+                    f"{control_group!r}",
+                    "error",
+                )
                 cgroup_data = {}
 
         return {

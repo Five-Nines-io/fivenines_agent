@@ -5,9 +5,12 @@ Resolves cgroup paths for systemd units across cgroup v1 and v2 hierarchies,
 and provides safe per-unit metric reads. EACCES on cgroup files is treated as
 the expected capability gap (silent None) rather than an error to log.
 
-Path layout:
-  v2 (unified):  /sys/fs/cgroup/system.slice/<unit>/<file>
-  v1 (per-ctrl): /sys/fs/cgroup/<controller>/system.slice/<unit>/<file>
+Paths are built from systemd's per-unit ControlGroup= value (e.g.
+"/system.slice/nginx.service", or "/machine.slice/foo.service" for a unit
+relocated with Slice=), so units outside the default system.slice still report
+metrics:
+  v2 (unified):  /sys/fs/cgroup<ControlGroup>/<file>
+  v1 (per-ctrl): /sys/fs/cgroup/<controller><ControlGroup>/<file>
 
 Hybrid systems (v1 + v2 unified at /sys/fs/cgroup/unified) are detected as v1
 because per-unit memory/cpu accounting still lives in the v1 hierarchy.
@@ -81,20 +84,28 @@ def detect_hierarchy():
     return _cached_hierarchy
 
 
-def _validate_unit_name(unit_name):
-    """Reject unit names that could escape the cgroup root.
+def _validate_control_group(control_group):
+    """Reject ControlGroup paths that could escape the cgroup root.
 
-    systemd unit names are kernel-validated, but defense in depth costs nothing.
+    systemd's ControlGroup= is a clean absolute path (e.g.
+    "/system.slice/nginx.service"); validate defensively before joining it
+    under /sys/fs/cgroup.
     """
-    if "/" in unit_name or "\x00" in unit_name:
-        raise ValueError(f"invalid unit name: {unit_name!r}")
+    if not control_group or not control_group.startswith("/"):
+        raise ValueError(f"invalid control group: {control_group!r}")
+    if "\x00" in control_group or ".." in control_group.split("/"):
+        raise ValueError(f"invalid control group: {control_group!r}")
 
 
-def unit_path(unit_name, hierarchy, controller=None):
-    """Build the cgroup directory path for a systemd unit.
+def cgroup_dir(control_group, hierarchy, controller=None):
+    """Build the cgroup directory for a unit's ControlGroup path.
 
     Args:
-        unit_name: full unit name (e.g. "nginx.service")
+        control_group: systemd's ControlGroup= value for the unit, e.g.
+            "/system.slice/nginx.service" or "/machine.slice/foo.service" for a
+            unit relocated with Slice=. Using it directly (instead of assuming
+            system.slice) is what makes per-unit metrics work for Slice= and
+            transient units.
         hierarchy: "v1" or "v2"
         controller: required for v1 (e.g. "memory", "cpuacct")
 
@@ -102,16 +113,17 @@ def unit_path(unit_name, hierarchy, controller=None):
         Absolute filesystem path string. The caller checks if the path exists.
 
     Raises:
-        ValueError: if unit_name contains path-traversal characters.
+        ValueError: if control_group is malformed or hierarchy is unsupported.
     """
-    _validate_unit_name(unit_name)
+    _validate_control_group(control_group)
+    rel = control_group.lstrip("/")
 
     if hierarchy == "v2":
-        return os.path.join(CGROUP_ROOT, "system.slice", unit_name)
+        return os.path.join(CGROUP_ROOT, rel)
     if hierarchy == "v1":
         if not controller:
             raise ValueError("controller is required for cgroup v1 path")
-        return os.path.join(CGROUP_ROOT, controller, "system.slice", unit_name)
+        return os.path.join(CGROUP_ROOT, controller, rel)
     raise ValueError(f"unsupported hierarchy: {hierarchy!r}")
 
 
@@ -166,24 +178,24 @@ def _parse_kv_field(text, key):
     return None
 
 
-def read_memory_current(unit_name, hierarchy):
+def read_memory_current(control_group, hierarchy):
     """Current memory usage for a unit in bytes. None if unavailable."""
     if hierarchy == "v2":
-        path = os.path.join(unit_path(unit_name, "v2"), "memory.current")
+        path = os.path.join(cgroup_dir(control_group, "v2"), "memory.current")
         return _parse_int(_read_text(path))
     if hierarchy == "v1":
         path = os.path.join(
-            unit_path(unit_name, "v1", controller="memory"),
+            cgroup_dir(control_group, "v1", controller="memory"),
             "memory.usage_in_bytes",
         )
         return _parse_int(_read_text(path))
     return None
 
 
-def read_cpu_usec(unit_name, hierarchy):
+def read_cpu_usec(control_group, hierarchy):
     """Cumulative CPU usage for a unit in microseconds. None if unavailable."""
     if hierarchy == "v2":
-        path = os.path.join(unit_path(unit_name, "v2"), "cpu.stat")
+        path = os.path.join(cgroup_dir(control_group, "v2"), "cpu.stat")
         return _parse_kv_field(_read_text(path), "usage_usec")
     if hierarchy == "v1":
         controller = _v1_cpu_controller()
@@ -191,7 +203,7 @@ def read_cpu_usec(unit_name, hierarchy):
             return None
         # cpuacct.usage is in nanoseconds; convert to microseconds
         path = os.path.join(
-            unit_path(unit_name, "v1", controller=controller),
+            cgroup_dir(control_group, "v1", controller=controller),
             "cpuacct.usage",
         )
         ns = _parse_int(_read_text(path))
@@ -201,7 +213,7 @@ def read_cpu_usec(unit_name, hierarchy):
     return None
 
 
-def read_oom_kill_count(unit_name, hierarchy):
+def read_oom_kill_count(control_group, hierarchy):
     """Cumulative OOM kill count for a unit (cgroup v2 only).
 
     cgroup v1 has no equivalent surface; returns None. Hybrid mode is treated
@@ -209,20 +221,20 @@ def read_oom_kill_count(unit_name, hierarchy):
     """
     if hierarchy != "v2":
         return None
-    path = os.path.join(unit_path(unit_name, "v2"), "memory.events")
+    path = os.path.join(cgroup_dir(control_group, "v2"), "memory.events")
     return _parse_kv_field(_read_text(path), "oom_kill")
 
 
-def read_inception_id(unit_name, hierarchy):
+def read_inception_id(control_group, hierarchy):
     """Inode of the unit's cgroup directory.
 
     Used jointly with NRestarts to detect counter resets when a unit restarts
     and its cgroup is recreated. Returns None if the directory does not exist.
     """
     if hierarchy == "v2":
-        path = unit_path(unit_name, "v2")
+        path = cgroup_dir(control_group, "v2")
     elif hierarchy == "v1":
-        path = unit_path(unit_name, "v1", controller="memory")
+        path = cgroup_dir(control_group, "v1", controller="memory")
     else:
         return None
     try:
@@ -236,18 +248,26 @@ def read_inception_id(unit_name, hierarchy):
         return None
 
 
-def read_unit_resources(unit_name, hierarchy):
+def read_unit_resources(control_group, hierarchy):
     """Read all per-unit cgroup metrics in one call.
+
+    Args:
+        control_group: systemd's ControlGroup= value for the unit. Empty for
+            inactive/transient units with no live cgroup.
+        hierarchy: "v1" or "v2".
 
     Returns dict with keys: memory_current, cpu_usec, oom_kill_count,
     inception_id. Each value is None if the underlying surface is unavailable.
-    Returns empty dict if hierarchy is None.
+    Returns empty dict if hierarchy is None or the unit has no cgroup.
     """
     if hierarchy not in ("v1", "v2"):
         return {}
+    if not control_group:
+        # Inactive/transient unit: no live cgroup to read.
+        return {}
     return {
-        "memory_current": read_memory_current(unit_name, hierarchy),
-        "cpu_usec": read_cpu_usec(unit_name, hierarchy),
-        "oom_kill_count": read_oom_kill_count(unit_name, hierarchy),
-        "inception_id": read_inception_id(unit_name, hierarchy),
+        "memory_current": read_memory_current(control_group, hierarchy),
+        "cpu_usec": read_cpu_usec(control_group, hierarchy),
+        "oom_kill_count": read_oom_kill_count(control_group, hierarchy),
+        "inception_id": read_inception_id(control_group, hierarchy),
     }

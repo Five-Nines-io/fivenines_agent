@@ -225,6 +225,12 @@ class Agent:
         elif self.permissions.refresh_if_needed():
             self.static_data["capabilities"] = self.permissions.get_all()
             self.static_data["capability_reasons"] = self.permissions.get_reasons()
+            # The periodic re-probe can flip the systemd/cgroup capability to
+            # available (e.g. a cgroup mount appears after boot). Re-detect the
+            # cached host state so per-unit metrics start flowing without
+            # waiting for a manual SIGHUP. No forced inventory resend here --
+            # the hash-delta handles that if the inventory actually changed.
+            refresh_runtime_caches()
 
     def _wait_interval(self, running_time):
         log(f"Running time: {running_time:.3f}s", "debug")

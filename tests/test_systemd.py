@@ -833,27 +833,25 @@ def test_collect_show_bulk_error_preserves_failure_cache():
     )
 
 
-def test_collect_invalid_unit_name_does_not_crash():
-    """If somehow an invalid unit name slips through list-units, the cgroup
-    path-traversal defense logs and continues rather than crashing collect()."""
+def test_collect_malformed_control_group_does_not_crash():
+    """A malformed ControlGroup from systemctl triggers the cgroup-path
+    defense, which logs and continues rather than crashing collect()."""
     coll = _make_collector()
-    # The bad name must be present in the show output so it reaches
-    # _build_health_entry (units absent from show are skipped earlier).
-    with patch.object(coll, "_list_units", return_value=(["bad/name.service"], None)):
+    # ControlGroup with a traversal segment -> read_unit_resources raises,
+    # _build_health_entry catches and logs.
+    bad_props = {
+        "Id": "nginx.service",
+        "ControlGroup": "/system.slice/../../etc",
+    }
+    with patch.object(coll, "_list_units", return_value=(["nginx.service"], None)):
         with patch.object(
-            coll,
-            "_show_bulk",
-            return_value=({"bad/name.service": {"Id": "bad/name.service"}}, None),
+            coll, "_show_bulk", return_value=({"nginx.service": bad_props}, None)
         ):
-            with patch(
-                "fivenines_agent.systemd.read_unit_resources",
-                side_effect=ValueError("invalid unit name"),
-            ):
-                with patch("fivenines_agent.systemd.log") as mock_log:
-                    result = coll.collect()
-    assert result["units"][0]["name"] == "bad/name.service"
+            with patch("fivenines_agent.systemd.log") as mock_log:
+                result = coll.collect()
+    assert result["units"][0]["name"] == "nginx.service"
     assert result["units"][0]["memory_current"] is None
-    assert any("invalid unit name" in str(c) for c in mock_log.call_args_list)
+    assert any("invalid control group" in str(c) for c in mock_log.call_args_list)
 
 
 def test_collect_no_cgroup_skips_resource_read():
