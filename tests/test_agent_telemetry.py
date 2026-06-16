@@ -347,19 +347,49 @@ def test_systemd_inventory_sync_skipped_when_systemd_capability_false(mock_sync)
 
 
 @patch("fivenines_agent.agent.systemd_inventory_sync")
-def test_systemd_inventory_sync_telemetry_consumes_force_flag(mock_sync):
-    """force_resend flag is consumed (reset to False) after one sync call."""
+def test_systemd_inventory_sync_telemetry_consumes_force_flag_on_success(mock_sync):
+    """A confirmed send (sync returns True) clears the force flag."""
+    mock_sync.return_value = True
     agent = _make_agent_with_systemd_state()
     agent.config = {"enabled": True, "systemd": {"scan": True}}
     agent._systemd_force_resend = True
 
     agent._systemd_inventory_sync_with_telemetry()
 
-    # The flag must be cleared so the next tick does not re-force
+    # The flag is cleared so the next tick does not re-force
     assert agent._systemd_force_resend is False
     # And the sync was called with force_resend=True
     args, kwargs = mock_sync.call_args
     assert kwargs.get("force_resend") is True
+
+
+@patch("fivenines_agent.agent.systemd_inventory_sync")
+def test_systemd_inventory_sync_keeps_force_flag_on_failed_send(mock_sync):
+    """A failed send (sync returns False) keeps the force flag so the next tick
+    retries -- otherwise a forced metadata refresh on unchanged units would be
+    lost to hash dedupe."""
+    mock_sync.return_value = False
+    agent = _make_agent_with_systemd_state()
+    agent.config = {"enabled": True, "systemd": {"scan": True}}
+    agent._systemd_force_resend = True
+
+    agent._systemd_inventory_sync_with_telemetry()
+
+    assert agent._systemd_force_resend is True
+
+
+@patch("fivenines_agent.agent.systemd_inventory_sync")
+def test_systemd_inventory_sync_keeps_force_flag_on_raise(mock_sync):
+    """If the sync raises (telemetry wrapper returns None), the force flag is
+    kept for the next tick."""
+    mock_sync.side_effect = RuntimeError("boom")
+    agent = _make_agent_with_systemd_state()
+    agent.config = {"enabled": True, "systemd": {"scan": True}}
+    agent._systemd_force_resend = True
+
+    agent._systemd_inventory_sync_with_telemetry()
+
+    assert agent._systemd_force_resend is True
 
 
 @patch("fivenines_agent.agent.systemd_inventory_sync")

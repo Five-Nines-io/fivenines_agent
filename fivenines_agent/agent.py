@@ -301,18 +301,21 @@ class Agent:
         # fail at list-units.
         if not self.permissions.get("systemd"):
             return
-        # Consume the SIGHUP-triggered force flag once per tick. The reset
-        # has to happen before _collect() in case sync raises - we still
-        # want the next tick to fall back to hash-equality comparison.
+        # Pass the SIGHUP-triggered force flag, but only clear it once the send
+        # is confirmed. If the forced send fails (or raises -> _collect returns
+        # None), keep the flag so the next tick retries; otherwise an
+        # unchanged-units inventory would dedupe-skip and the forced metadata
+        # refresh (e.g. a cgroup flip) would be silently lost.
         force = self._systemd_force_resend
-        self._systemd_force_resend = False
-        self._collect(
+        sent = self._collect(
             "systemd_inventory_sync",
             systemd_inventory_sync,
             self.config,
             self.synchronizer.send_systemd_inventory,
             force_resend=force,
         )
+        if sent:
+            self._systemd_force_resend = False
 
     def _handle_sighup_refresh(self):
         """SIGHUP-triggered full reprobe. Kept at the top of the loop (needs no

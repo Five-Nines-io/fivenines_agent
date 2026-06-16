@@ -377,14 +377,25 @@ def _parse_journalctl_failed(stdout):
     return messages
 
 
+# Box-drawing characters systemctl uses for the dependency tree, plus the
+# whitespace around them: U+251C (|-), U+2500 (-), U+2502 (|), U+2514 (L-).
+# Built via chr() to keep the source ASCII-only. We strip ONLY these from the
+# left, NOT "any non-alphanumeric": the root mount unit is literally "-.mount",
+# so a leading-dash strip would corrupt it into "mount".
+_REVERSE_DEP_TREE_CHARS = (
+    "".join(chr(c) for c in (0x2502, 0x2500, 0x251C, 0x2514)) + " \t"
+)
+
+
 def _parse_reverse_deps(stdout):
     """Parse `systemctl list-dependencies --reverse` indented tree output.
 
     First line is the unit being queried; subsequent indented lines are
     prefixed with Unicode box-drawing characters (U+251C, U+2502, U+2500,
-    U+2514) plus spaces. Strip everything before the first ASCII alphanumeric
-    character to land on the unit name. Returns deduplicated list of
-    dependent unit names.
+    U+2514) plus spaces. Strip exactly those prefix characters (not all
+    non-alphanumerics) so unit names that start with punctuation -- notably
+    the root mount "-.mount" -- survive intact. Returns a deduplicated list
+    of dependent unit names.
     """
     if not stdout:
         return []
@@ -393,9 +404,7 @@ def _parse_reverse_deps(stdout):
     lines = stdout.splitlines()
     # Skip first line (the unit being queried)
     for line in lines[1:]:
-        # Drop the tree-prefix: anything that is not an ASCII letter, digit,
-        # or underscore. systemd unit names always begin with [A-Za-z0-9_].
-        cleaned = re.sub(r"^[^A-Za-z0-9_]+", "", line).strip()
+        cleaned = line.lstrip(_REVERSE_DEP_TREE_CHARS).strip()
         if not cleaned:
             continue
         # Some entries include an active marker bullet; take first whitespace-token
@@ -755,7 +764,12 @@ class SystemdCollector:
 
             raw_props, error = self._show_bulk(unit_names, INVENTORY_PROPERTIES)
             if error:
+                # A transient `systemctl show` failure must NOT publish an empty
+                # inventory: shipping units={} tells the backend "this host has
+                # zero units" and wipes the whole inventory until the next clean
+                # sync. Return a None hash so inventory_sync skips this tick.
                 errors.append({"step": "show_bulk_inventory", **error})
+                return {}, None, errors
 
         # Canonicalize each unit (strip runtime, normalize Exec/list fields)
         canon_units = {
@@ -772,15 +786,24 @@ class SystemdCollector:
         return canon_units, h, errors
 
     def inventory_sync(self, config, send_fn, force_resend=False):
-        """Compute inventory hash; send if changed (or force_resend)."""
+        """Compute inventory hash; send if changed (or force_resend).
+
+        Returns True when the force obligation is discharged (sent OK, nothing
+        to send, or dry-run) and False when a forced/changed send could not go
+        through this tick (snapshot failed or send failed). The agent clears its
+        SIGHUP force flag only on a True return, so a forced resend survives a
+        failed send instead of being silently dropped.
+        """
         scan_config = config.get("systemd")
         if not isinstance(scan_config, dict) or not scan_config.get("scan"):
-            return
+            return True
 
         units, h, errors = self.snapshot_inventory()
         if h is None:
+            # Snapshot failed (e.g. transient systemctl error); we could not
+            # send, so keep any force flag and retry next tick.
             log("systemd inventory snapshot failed; skipping", "debug")
-            return
+            return False
 
         server_hash = scan_config.get("last_inventory_hash")
         local_hash = SystemdCollector._last_local_inventory_hash
@@ -791,7 +814,7 @@ class SystemdCollector:
         # round-tripped the hash.
         if not force_resend and (h == server_hash or h == local_hash):
             log("systemd inventory unchanged, skipping", "debug")
-            return
+            return True
 
         payload = {
             "inventory_hash": h,
@@ -807,14 +830,15 @@ class SystemdCollector:
                 "systemd inventory (dry-run): " + json.dumps(payload, indent=2),
                 "debug",
             )
-            return
+            return True
 
         response = send_fn(payload)
         if response is not None:
             SystemdCollector._last_local_inventory_hash = h
             log("systemd inventory sent successfully", "info")
-        else:
-            log("systemd inventory send failed, will retry", "error")
+            return True
+        log("systemd inventory send failed, will retry", "error")
+        return False
 
 
 # ---- Module-level singleton + public API ----
@@ -891,10 +915,14 @@ def systemd_inventory_sync(config, send_fn, force_resend=False):
     consistent with the per-tick metrics scope and the module-level singleton
     is not churned every tick when metrics + inventory disagree on which unit
     types to enumerate.
+
+    Returns True when the force obligation is discharged (sent / nothing to send
+    / dry-run / no systemctl), False when a forced or changed send could not go
+    through this tick. The agent clears its SIGHUP force flag only on True.
     """
     if not shutil.which("systemctl"):
-        return
-    _get_collector(unit_types=_config_unit_types(config)).inventory_sync(
+        return True
+    return _get_collector(unit_types=_config_unit_types(config)).inventory_sync(
         config, send_fn, force_resend=force_resend
     )
 

@@ -490,6 +490,16 @@ def test_parse_reverse_deps_skip_blank_branch_lines():
     assert _parse_reverse_deps(output) == ["multi-user.target"]
 
 
+def test_parse_reverse_deps_preserves_root_mount_dash():
+    """The root mount unit is literally '-.mount'; the tree-prefix strip must
+    not eat its leading dash (a non-alnum strip would corrupt it to 'mount')."""
+    output = "swap.target\n" "\u251c\u2500-.mount\n" "\u2514\u2500multi-user.target\n"
+    deps = _parse_reverse_deps(output)
+    assert "-.mount" in deps
+    assert "mount" not in deps
+    assert "multi-user.target" in deps
+
+
 # ============================================================
 # Exec record extraction
 # ============================================================
@@ -1133,7 +1143,10 @@ def test_snapshot_inventory_no_units():
     assert errors == []
 
 
-def test_snapshot_inventory_show_bulk_partial_error():
+def test_snapshot_inventory_show_bulk_error_returns_none_hash():
+    """A transient `systemctl show` failure must NOT yield a hash for an empty
+    inventory (which would ship units={} and wipe the backend). It returns a
+    None hash so inventory_sync skips this tick."""
     coll = _make_collector()
     with patch.object(coll, "_list_units", return_value=(["x.service"], None)):
         with patch.object(
@@ -1143,8 +1156,24 @@ def test_snapshot_inventory_show_bulk_partial_error():
         ):
             units, h, errors = coll.snapshot_inventory()
     assert any(e["step"] == "show_bulk_inventory" for e in errors)
-    # Still produces a (empty) hash so caller can compare
-    assert h is not None
+    assert h is None
+    assert units == {}
+
+
+def test_inventory_sync_skips_send_on_show_error():
+    """End-to-end: a show error during the inventory snapshot must not POST an
+    empty inventory."""
+    coll = _make_collector()
+    send_fn = MagicMock()
+    with patch.object(coll, "_list_units", return_value=(["x.service"], None)):
+        with patch.object(
+            coll,
+            "_show_bulk",
+            return_value=({}, {"type": "timeout", "message": "x"}),
+        ):
+            result = coll.inventory_sync({"systemd": {"scan": True}}, send_fn)
+    send_fn.assert_not_called()
+    assert result is False  # snapshot failed -> force obligation not discharged
 
 
 def test_inventory_sync_no_scan_does_nothing():
@@ -1268,8 +1297,44 @@ def test_inventory_sync_send_failure_does_not_update_local_hash():
         "snapshot_inventory",
         return_value=({"x.service": {}}, "h", []),
     ):
-        coll.inventory_sync({"systemd": {"scan": True}}, send_fn)
+        result = coll.inventory_sync({"systemd": {"scan": True}}, send_fn)
     assert SystemdCollector._last_local_inventory_hash is None
+    # Failed send -> obligation not discharged, so the agent keeps the force flag.
+    assert result is False
+
+
+def test_inventory_sync_returns_true_on_success():
+    coll = _make_collector()
+    send_fn = MagicMock(return_value={"ok": True})
+    with patch.object(
+        coll, "snapshot_inventory", return_value=({"x.service": {}}, "h", [])
+    ):
+        assert coll.inventory_sync({"systemd": {"scan": True}}, send_fn) is True
+
+
+def test_inventory_sync_returns_true_when_skipped():
+    coll = _make_collector()
+    send_fn = MagicMock()
+    SystemdCollector._last_local_inventory_hash = "h"
+    with patch.object(coll, "snapshot_inventory", return_value=({}, "h", [])):
+        assert coll.inventory_sync({"systemd": {"scan": True}}, send_fn) is True
+    send_fn.assert_not_called()
+
+
+def test_inventory_sync_returns_true_when_scan_disabled():
+    coll = _make_collector()
+    assert coll.inventory_sync({}, MagicMock()) is True
+
+
+def test_inventory_sync_returns_true_on_dry_run():
+    coll = _make_collector()
+    send_fn = MagicMock()
+    with patch.object(
+        coll, "snapshot_inventory", return_value=({"x.service": {}}, "h", [])
+    ):
+        with patch("fivenines_agent.systemd.dry_run", return_value=True):
+            assert coll.inventory_sync({"systemd": {"scan": True}}, send_fn) is True
+    send_fn.assert_not_called()
 
 
 def test_inventory_sync_force_resend_sends_even_if_unchanged():
