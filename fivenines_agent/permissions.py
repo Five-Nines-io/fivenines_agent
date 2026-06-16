@@ -168,8 +168,14 @@ class PermissionProbe:
             # Subsequent probes: log only state flips. Unavailability transitions
             # carry the same hint+reason payload as the initial probe.
             for cap, available in self.capabilities.items():
-                old_value = old_capabilities.get(cap)
-                if old_value is None or old_value == available:
+                if cap not in old_capabilities:
+                    # Newly tracked capability (e.g. an agent upgrade added a
+                    # probe key): no prior state to flip from, so don't log.
+                    continue
+                # Compare against the stored value, NOT `is None`: cgroup is
+                # tri-state ("v1"/"v2"/None), so None is a legitimate prior value
+                # and a None->"v2" mount is a real flip worth logging.
+                if old_capabilities[cap] == available:
                     continue
                 self._log_capability_flip(cap, available)
 

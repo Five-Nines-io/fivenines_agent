@@ -45,6 +45,7 @@ import json
 import re
 import shutil
 import subprocess
+import time
 
 from fivenines_agent.cgroup import detect_hierarchy, read_unit_resources
 from fivenines_agent.cgroup import reset_cache as cgroup_reset_cache
@@ -175,57 +176,62 @@ LIST_VALUED_PROPERTIES = frozenset(
 # Reverse dependencies are gated on systemd >= 230 (CentOS 7 ships 219).
 MIN_SYSTEMD_VERSION_REVERSE_DEPS = 230
 
+# Inventory is config-only and rarely changes, so we canonicalize + hash it at
+# most once per this window rather than on every health tick. Between snapshots
+# the per-tick `systemctl show` fetches only HEALTH_PROPERTIES (cheaper output,
+# fewer parsed lines) and the inventory sync is skipped entirely. The collection
+# interval is a natural floor: a host polled less often than this just snapshots
+# every tick. A forced resend (SIGHUP / capability flip) bypasses the window.
+INVENTORY_SNAPSHOT_INTERVAL = 300
+
+# _pending_inventory sentinel: collect() attempted the shared inventory show this
+# tick and it failed. snapshot_inventory() uses this to skip rather than re-run
+# the same failing subprocess (a distinct state from None = "nothing stashed").
+_FETCH_FAILED = object()
+
+
+def _monotonic():
+    """Wrapped for test injection; monotonic clock for the snapshot cadence."""
+    return time.monotonic()
+
+
 # Static fields to keep from Exec*= structured records. Everything else
 # (start_time, pid, status, etc.) is runtime noise that flaps the hash.
-EXEC_PATH_RE = re.compile(r"path=([^\s;]+)")
-EXEC_ARGV_RE = re.compile(r"argv\[\]=(.*?)(?=\s*;\s|\s*\})")
-EXEC_IGNORE_RE = re.compile(r"ignore_errors=([^\s;]+)")
-
-
-def _extract_exec_record(record_str):
-    """Extract static fields (path, argv, ignore_errors) from one Exec= record.
-
-    Returns a dict with only the static keys; runtime fields are dropped.
-    Returns None if no path can be extracted (malformed record).
-    """
-    out = {}
-    m = EXEC_PATH_RE.search(record_str)
-    if not m:
-        return None
-    out["path"] = m.group(1)
-    m = EXEC_ARGV_RE.search(record_str)
-    if m:
-        out["argv"] = m.group(1).strip()
-    m = EXEC_IGNORE_RE.search(record_str)
-    if m:
-        out["ignore_errors"] = m.group(1)
-    return out
+#
+# `systemctl show` serializes each invocation as one space-delimited record:
+#   { path=P ; argv[]=A B C ; ignore_errors=BOOL ; start_time=... ; pid=N ; ... }
+# path, argv[] and ignore_errors always lead, in that fixed order. We anchor on
+# those literal field keys rather than the surrounding `{ }` or a bare `;`,
+# because systemd does NOT escape `;`, `}`, or `path=` when they appear inside an
+# argv element. Anchoring argv[] on the next field's key (` ; ignore_errors=`)
+# keeps the command line intact for the most common service shape -- a shell
+# wrapper like ExecStart=/bin/sh -c 'sleep 1; echo done' or a `${VAR}` expansion.
+# Runtime tail fields (start_time, pid, status, ...) never form this triple, so
+# finditer walks straight to the next record without any brace bookkeeping.
+EXEC_RECORD_RE = re.compile(
+    r"path=(?P<path>[^\s;]+)\s*;\s*"
+    r"argv\[\]=(?P<argv>.*?)\s*;\s*"
+    r"ignore_errors=(?P<ignore_errors>[^\s;]+)"
+)
 
 
 def _parse_exec_property(value):
     """Parse a multi-record Exec*= property value into static-field records.
 
-    Each record is wrapped in `{ ... }`; multiple records may appear.
-    Returns a list of dicts.
+    Returns a list of {path, argv, ignore_errors} dicts -- one per invocation
+    record -- with all runtime fields dropped. Robust to `;`, `}`, and `path=`
+    inside the command line (see EXEC_RECORD_RE).
     """
     if not value:
         return []
-    records = []
-    depth = 0
-    start = None
-    for i, ch in enumerate(value):
-        if ch == "{":
-            if depth == 0:
-                start = i + 1
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0 and start is not None:
-                rec = _extract_exec_record(value[start:i])
-                if rec:
-                    records.append(rec)
-                start = None
-    return records
+    return [
+        {
+            "path": m.group("path"),
+            "argv": m.group("argv").strip(),
+            "ignore_errors": m.group("ignore_errors"),
+        }
+        for m in EXEC_RECORD_RE.finditer(value)
+    ]
 
 
 def _systemd_version():
@@ -493,6 +499,10 @@ class SystemdCollector:
         # `systemctl show` instead of running its own. Consumed and cleared by
         # snapshot_inventory(); None means "fetch fresh".
         self._pending_inventory = None
+        # Monotonic timestamp of the last inventory snapshot we built; None means
+        # "never", so the first scan tick always snapshots. Throttles inventory
+        # to INVENTORY_SNAPSHOT_INTERVAL (see _inventory_snapshot_due).
+        self._last_inventory_snapshot_monotonic = None
         if SystemdCollector._version is None:
             SystemdCollector._version = _systemd_version()
         if SystemdCollector._hierarchy is None:
@@ -538,17 +548,26 @@ class SystemdCollector:
         if not unit_names:
             return self._empty_result(errors)
 
-        properties = ALL_PROPERTIES if scan else HEALTH_PROPERTIES
+        # Only pull the heavier ALL_PROPERTIES superset (and stash it for the
+        # inventory snapshot) on ticks where an inventory snapshot is actually
+        # due; otherwise health needs only HEALTH_PROPERTIES. This keeps the
+        # steady-state per-tick show small and avoids parsing ~14 config-only
+        # properties per unit that the health payload never reads.
+        take_inventory = scan and self._inventory_snapshot_due()
+        properties = ALL_PROPERTIES if take_inventory else HEALTH_PROPERTIES
         unit_props, error = self._show_bulk(unit_names, properties)
         if error:
             # A transient show failure must NOT blank every unit (which would
             # misreport failed units as empty state) nor wipe the failure-
             # signature debounce cache (every unit would look non-failed).
-            # Return no health this tick; the next tick recovers.
+            # Return no health this tick; the next tick recovers. Flag the
+            # failure so a forced inventory_sync this same tick skips instead of
+            # re-running the same failing subprocess.
+            self._pending_inventory = _FETCH_FAILED
             errors.append({"step": "show_bulk", **error})
             return self._empty_result(errors)
 
-        if scan:
+        if take_inventory:
             self._pending_inventory = (unit_names, unit_props)
 
         units = []
@@ -737,11 +756,26 @@ class SystemdCollector:
 
     # ---- Inventory snapshot ----
 
+    def _inventory_snapshot_due(self):
+        """Whether an inventory snapshot is due (cadence throttle).
+
+        True on the first scan tick and once per INVENTORY_SNAPSHOT_INTERVAL
+        thereafter. collect() and inventory_sync() consult this within the same
+        tick; the timestamp only advances after inventory_sync() builds a
+        snapshot, so both see a consistent answer.
+        """
+        last = self._last_inventory_snapshot_monotonic
+        return last is None or (_monotonic() - last) >= INVENTORY_SNAPSHOT_INTERVAL
+
     def snapshot_inventory(self):
         """Build the full inventory snapshot for all units.
 
         Returns (unit_props_dict, hash, errors) tuple. unit_props_dict is the
         canonical (hash-stable) form, hash is the SHA-256, errors is a list.
+        hash is None when the snapshot cannot be trusted this tick (subprocess
+        error, or a successful-but-empty `systemctl show` against a non-empty
+        unit list) -- inventory_sync skips a None hash so a transient hiccup
+        never ships units={} and wipes the backend inventory.
         """
         errors = []
 
@@ -752,8 +786,12 @@ class SystemdCollector:
         # fetch.
         pending = self._pending_inventory
         self._pending_inventory = None
-        if pending is not None:
-            _unit_names, raw_props = pending
+        if pending is _FETCH_FAILED:
+            # collect() already ran (and logged) the shared show this tick and it
+            # failed; don't hammer the same failing systemctl again. Skip.
+            return {}, None, errors
+        if isinstance(pending, tuple):
+            unit_names, raw_props = pending
         else:
             unit_names, error = self._list_units()
             if error:
@@ -770,6 +808,14 @@ class SystemdCollector:
                 # sync. Return a None hash so inventory_sync skips this tick.
                 errors.append({"step": "show_bulk_inventory", **error})
                 return {}, None, errors
+
+        # A non-empty unit list that parses to zero properties means the show
+        # exited 0 but returned empty/unparseable output (wrapper systemctl,
+        # daemon hiccup, truncated stream). Same blast radius as an error: a None
+        # hash makes inventory_sync skip rather than wipe the backend inventory.
+        if unit_names and not raw_props:
+            errors.append({"step": "show_bulk_inventory", "error": "empty output"})
+            return {}, None, errors
 
         # Canonicalize each unit (strip runtime, normalize Exec/list fields)
         canon_units = {
@@ -798,12 +844,24 @@ class SystemdCollector:
         if not isinstance(scan_config, dict) or not scan_config.get("scan"):
             return True
 
+        # Throttle: config drift is checked at most once per
+        # INVENTORY_SNAPSHOT_INTERVAL, not every health tick. A forced resend
+        # (SIGHUP / capability flip) bypasses the window. Nothing to discharge
+        # when simply throttled, so this returns True.
+        if not force_resend and not self._inventory_snapshot_due():
+            return True
+
         units, h, errors = self.snapshot_inventory()
         if h is None:
             # Snapshot failed (e.g. transient systemctl error); we could not
-            # send, so keep any force flag and retry next tick.
+            # send, so keep any force flag and retry next tick. The cadence
+            # timestamp is NOT advanced, so the next tick retries immediately.
             log("systemd inventory snapshot failed; skipping", "debug")
             return False
+        # A trusted snapshot was built this tick: start the next throttle window
+        # now, regardless of whether the send below is needed or succeeds (the
+        # expensive work we are rate-limiting is the canonicalize + hash above).
+        self._last_inventory_snapshot_monotonic = _monotonic()
 
         server_hash = scan_config.get("last_inventory_hash")
         local_hash = SystemdCollector._last_local_inventory_hash
@@ -943,9 +1001,16 @@ def refresh_runtime_caches():
     The cgroup hierarchy and systemd version are detected once and cached for
     the process lifetime. A host that gains a cgroup mount (e.g. early container
     boot) would otherwise report cgroup=None and null per-unit memory/cpu
-    forever, even after permissions.py re-probes the capability. Called from
-    the agent on SIGHUP so the next tick reflects reality.
+    forever, even after permissions.py re-probes the capability. Called from the
+    agent on SIGHUP (operator-driven, e.g. after a systemd upgrade) and on a
+    cgroup/systemd capability flip, so the next tick reflects reality.
     """
     cgroup_reset_cache()
     SystemdCollector._hierarchy = detect_hierarchy()
-    SystemdCollector._version = _systemd_version()
+    version = _systemd_version()
+    # Keep the last good version if a transient `systemctl --version` hiccup
+    # returns None: clobbering a known version to None would wrongly disable the
+    # reverse-deps drilldown (gated on version >= 230) and ship version=null
+    # until the next successful re-detect.
+    if version is not None:
+        SystemdCollector._version = version

@@ -10,10 +10,11 @@ from fivenines_agent import systemd
 from fivenines_agent.systemd import (
     ALL_PROPERTIES,
     DEFAULT_UNIT_TYPES,
-    EXEC_ARGV_RE,
+    EXEC_RECORD_RE,
     HEALTH_PROPERTIES,
     IDENTITY_PROPERTIES,
     INVENTORY_PROPERTIES,
+    INVENTORY_SNAPSHOT_INTERVAL,
     LIST_VALUED_PROPERTIES,
     MAX_DRILLDOWN_WORKERS,
     MIN_SYSTEMD_VERSION_REVERSE_DEPS,
@@ -23,7 +24,6 @@ from fivenines_agent.systemd import (
     _canonical_inventory_hash,
     _canonicalize_unit,
     _config_unit_types,
-    _extract_exec_record,
     _normalize_property_for_hash,
     _normalize_unit_types,
     _parse_exec_property,
@@ -505,27 +505,20 @@ def test_parse_reverse_deps_preserves_root_mount_dash():
 # ============================================================
 
 
-def test_extract_exec_record_happy():
-    rec = _extract_exec_record(
-        " path=/usr/bin/nginx ; argv[]=/usr/bin/nginx -g daemon off ; "
-        "ignore_errors=no ; start_time=[Mon 2024-01-15] ; pid=1234 "
+def test_parse_exec_property_happy():
+    """path/argv/ignore_errors extracted; runtime tail fields dropped."""
+    value = (
+        "{ path=/usr/bin/nginx ; argv[]=/usr/bin/nginx -g daemon off ; "
+        "ignore_errors=no ; start_time=[Mon 2024-01-15] ; pid=1234 }"
     )
-    assert rec["path"] == "/usr/bin/nginx"
-    assert rec["argv"] == "/usr/bin/nginx -g daemon off"
-    assert rec["ignore_errors"] == "no"
-    assert "start_time" not in rec
-    assert "pid" not in rec
-
-
-def test_extract_exec_record_no_path_returns_none():
-    """Without path, the record is malformed."""
-    assert _extract_exec_record("argv[]=foo ; ignore_errors=no") is None
-
-
-def test_extract_exec_record_only_path():
-    """argv and ignore_errors are optional in the regex."""
-    rec = _extract_exec_record("path=/bin/true")
-    assert rec == {"path": "/bin/true"}
+    result = _parse_exec_property(value)
+    assert result == [
+        {
+            "path": "/usr/bin/nginx",
+            "argv": "/usr/bin/nginx -g daemon off",
+            "ignore_errors": "no",
+        }
+    ]
 
 
 def test_parse_exec_property_single_record():
@@ -553,8 +546,8 @@ def test_parse_exec_property_none():
     assert _parse_exec_property(None) == []
 
 
-def test_parse_exec_property_no_braces():
-    """Malformed value with no braces returns empty list."""
+def test_parse_exec_property_no_anchor_returns_empty():
+    """A value lacking the path/argv/ignore_errors triple yields no records."""
     assert _parse_exec_property("path=/bin/foo argv[]=foo") == []
 
 
@@ -563,11 +556,58 @@ def test_parse_exec_property_record_without_path_skipped():
     assert _parse_exec_property(value) == []
 
 
-def test_exec_argv_re_terminates_at_semicolon():
-    """argv[]=value ; next-field -- value should not include the semicolon."""
-    m = EXEC_ARGV_RE.search("argv[]=foo bar ; next=x")
+def test_parse_exec_property_argv_with_semicolon_not_truncated():
+    """A shell-wrapper argv containing '; ' must survive intact (regression).
+
+    `systemctl show` does NOT escape ';' inside an argv element, so anchoring on
+    a bare ';' (the old EXEC_ARGV_RE) dropped everything after 'sleep 1'.
+    """
+    value = (
+        "{ path=/bin/sh ; argv[]=/bin/sh -c sleep 1; echo done ; "
+        "ignore_errors=no ; pid=42 }"
+    )
+    result = _parse_exec_property(value)
+    assert result == [
+        {
+            "path": "/bin/sh",
+            "argv": "/bin/sh -c sleep 1; echo done",
+            "ignore_errors": "no",
+        }
+    ]
+
+
+def test_parse_exec_property_argv_with_brace_not_split():
+    """An argv containing '}' (e.g. a ${VAR} expansion) must not close early."""
+    value = (
+        "{ path=/bin/sh ; argv[]=/bin/sh -c echo ${FOO} ; ignore_errors=no ; pid=7 }"
+    )
+    result = _parse_exec_property(value)
+    assert result == [
+        {
+            "path": "/bin/sh",
+            "argv": "/bin/sh -c echo ${FOO}",
+            "ignore_errors": "no",
+        }
+    ]
+
+
+def test_parse_exec_property_argv_with_path_eq_not_mis_split():
+    """An argv literally containing 'path=' must not start a phantom record."""
+    value = (
+        "{ path=/bin/echo ; argv[]=/bin/echo path=foo ; ignore_errors=no ; pid=9 } "
+        "{ path=/bin/true ; argv[]=/bin/true ; ignore_errors=no }"
+    )
+    result = _parse_exec_property(value)
+    assert len(result) == 2
+    assert result[0]["argv"] == "/bin/echo path=foo"
+    assert result[1]["path"] == "/bin/true"
+
+
+def test_exec_record_re_anchors_argv_on_ignore_errors():
+    """The argv group terminates at ' ; ignore_errors=', not the first ';'."""
+    m = EXEC_RECORD_RE.search("path=/b ; argv[]=foo bar ; ignore_errors=no")
     assert m
-    assert m.group(1) == "foo bar"
+    assert m.group("argv") == "foo bar"
 
 
 # ============================================================
@@ -1160,6 +1200,54 @@ def test_snapshot_inventory_show_bulk_error_returns_none_hash():
     assert units == {}
 
 
+def test_snapshot_inventory_empty_show_returns_none_hash():
+    """F2: a successful-but-empty `systemctl show` (exit 0, no output) against a
+    non-empty unit list must NOT ship units={} (which would wipe the backend
+    inventory). It returns a None hash so inventory_sync skips."""
+    coll = _make_collector()
+    with patch.object(coll, "_list_units", return_value=(["x.service"], None)):
+        with patch.object(coll, "_show_bulk", return_value=({}, None)):
+            units, h, errors = coll.snapshot_inventory()
+    assert h is None
+    assert units == {}
+    assert any(
+        e["step"] == "show_bulk_inventory" and e.get("error") == "empty output"
+        for e in errors
+    )
+
+
+def test_snapshot_inventory_empty_reuse_returns_none_hash():
+    """F2 (reuse path): an empty raw_props stashed by collect must also skip."""
+    coll = _make_collector()
+    coll._pending_inventory = (["x.service"], {})
+    units, h, errors = coll.snapshot_inventory()
+    assert h is None
+    assert units == {}
+
+
+def test_collect_show_error_then_snapshot_skips_refetch():
+    """F7: a failed shared show this tick must not be re-attempted by
+    snapshot_inventory in the same tick (no double subprocess)."""
+    coll = _make_collector()
+
+    def fake_run(args, timeout=None):
+        if args[0] == "list-units":
+            return LIST_UNITS_OUTPUT, None
+        if args[0] == "show":
+            return None, {"type": "timeout", "message": "show timed out"}
+        return "", None
+
+    with patch("fivenines_agent.systemd._run_systemctl", side_effect=fake_run):
+        with patch("fivenines_agent.systemd.read_unit_resources", return_value={}):
+            coll.collect(scan=True)  # show fails -> _pending_inventory sentinel
+        # snapshot must NOT re-run list-units/show; returns a None hash.
+        with patch.object(coll, "_list_units") as mock_list:
+            units, h, errors = coll.snapshot_inventory()
+    mock_list.assert_not_called()
+    assert h is None
+    assert units == {}
+
+
 def test_inventory_sync_skips_send_on_show_error():
     """End-to-end: a show error during the inventory snapshot must not POST an
     empty inventory."""
@@ -1690,6 +1778,108 @@ def test_refresh_runtime_caches_redetects_hierarchy_and_version():
     mock_reset.assert_called_once()
     assert SystemdCollector._hierarchy == "v2"
     assert SystemdCollector._version == 252
+
+
+def test_refresh_runtime_caches_keeps_version_on_transient_none():
+    """F3: a transient `systemctl --version` miss must NOT clobber a known
+    version to None (which would wrongly disable reverse-deps drilldown)."""
+    SystemdCollector._version = 252
+    SystemdCollector._hierarchy = "v2"
+    with patch("fivenines_agent.systemd.cgroup_reset_cache"):
+        with patch("fivenines_agent.systemd.detect_hierarchy", return_value="v2"):
+            with patch("fivenines_agent.systemd._systemd_version", return_value=None):
+                refresh_runtime_caches()
+    assert SystemdCollector._version == 252
+
+
+# ---- inventory snapshot cadence gate (F7/F8/F9) ----
+
+
+def test_inventory_snapshot_due_logic():
+    coll = _make_collector()
+    assert coll._inventory_snapshot_due() is True  # never snapshotted
+    coll._last_inventory_snapshot_monotonic = 500.0
+    with patch("fivenines_agent.systemd._monotonic", return_value=501.0):
+        assert coll._inventory_snapshot_due() is False
+    with patch(
+        "fivenines_agent.systemd._monotonic",
+        return_value=500.0 + INVENTORY_SNAPSHOT_INTERVAL,
+    ):
+        assert coll._inventory_snapshot_due() is True
+
+
+def test_inventory_sync_throttled_skips_snapshot():
+    """F8: between snapshot windows, inventory_sync skips the snapshot entirely
+    (no canonicalize/hash) and reports the obligation discharged."""
+    coll = _make_collector()
+    send_fn = MagicMock()
+    coll._last_inventory_snapshot_monotonic = 1000.0
+    with patch("fivenines_agent.systemd._monotonic", return_value=1005.0):
+        with patch.object(coll, "snapshot_inventory") as mock_snap:
+            result = coll.inventory_sync({"systemd": {"scan": True}}, send_fn)
+    mock_snap.assert_not_called()
+    send_fn.assert_not_called()
+    assert result is True
+
+
+def test_inventory_sync_force_resend_bypasses_throttle():
+    """A forced resend snapshots + sends even when not due."""
+    coll = _make_collector()
+    send_fn = MagicMock(return_value={"ok": True})
+    coll._last_inventory_snapshot_monotonic = 1000.0
+    with patch("fivenines_agent.systemd._monotonic", return_value=1005.0):
+        with patch.object(
+            coll, "snapshot_inventory", return_value=({"x.service": {}}, "h", [])
+        ):
+            result = coll.inventory_sync(
+                {"systemd": {"scan": True}}, send_fn, force_resend=True
+            )
+    send_fn.assert_called_once()
+    assert result is True
+
+
+def test_inventory_sync_advances_snapshot_timestamp():
+    """A trusted snapshot starts the next throttle window."""
+    coll = _make_collector()
+    send_fn = MagicMock(return_value={"ok": True})
+    with patch("fivenines_agent.systemd._monotonic", return_value=4242.0):
+        with patch.object(
+            coll, "snapshot_inventory", return_value=({"x.service": {}}, "h", [])
+        ):
+            coll.inventory_sync({"systemd": {"scan": True}}, send_fn)
+    assert coll._last_inventory_snapshot_monotonic == 4242.0
+
+
+def test_inventory_sync_failed_snapshot_does_not_advance_timestamp():
+    """A None-hash snapshot must not start the window, so the next tick retries."""
+    coll = _make_collector()
+    send_fn = MagicMock()
+    with patch("fivenines_agent.systemd._monotonic", return_value=4242.0):
+        with patch.object(coll, "snapshot_inventory", return_value=({}, None, [])):
+            coll.inventory_sync({"systemd": {"scan": True}}, send_fn)
+    assert coll._last_inventory_snapshot_monotonic is None
+
+
+def test_collect_scan_not_due_fetches_health_only_no_stash():
+    """F9: between snapshot windows, a scan tick fetches only HEALTH_PROPERTIES
+    and does not stash inventory -- the heavier config props are skipped."""
+    coll = _make_collector()
+    coll._last_inventory_snapshot_monotonic = 9000.0
+    captured = {}
+
+    def fake_show(unit_names, properties):
+        captured["properties"] = properties
+        return ({"nginx.service": {"Id": "nginx.service"}}, None)
+
+    with patch("fivenines_agent.systemd._monotonic", return_value=9005.0):
+        with patch.object(coll, "_list_units", return_value=(["nginx.service"], None)):
+            with patch.object(coll, "_show_bulk", side_effect=fake_show):
+                with patch(
+                    "fivenines_agent.systemd.read_unit_resources", return_value={}
+                ):
+                    coll.collect(scan=True)
+    assert captured["properties"] == HEALTH_PROPERTIES
+    assert coll._pending_inventory is None
 
 
 # ---- LRU touch-on-access (fix #8) ----

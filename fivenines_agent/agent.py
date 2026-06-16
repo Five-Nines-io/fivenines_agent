@@ -82,6 +82,10 @@ _DRY_RUN_CONFIG = {
     "raid_storage_health": True,
     "fail2ban": True,
     "disk_health": True,
+    # Dict (not bare True) because systemd_metrics takes **kwargs; scan=False
+    # exercises the per-tick health surface without the inventory POST (skipped
+    # in dry-run anyway, since there's no synchronizer to dispatch through).
+    "systemd": {"scan": False},
 }
 
 
@@ -329,12 +333,16 @@ class Agent:
             print_capabilities_banner()
             # SIGHUP also forces a fresh systemd inventory resend so the next
             # tick re-sends the full snapshot even if its hash is unchanged.
-            # The cgroup/version cache re-detect is handled by
-            # _resync_systemd_runtime, driven off the capability flip (the same
-            # selective gap re-probe that recovers every other late-arriving
-            # capability).
             force_inventory_resend()
             self._systemd_force_resend = True
+            # Re-detect the cached systemd version + cgroup hierarchy now. SIGHUP
+            # is the operator's "I changed the host" signal -- e.g. an in-place
+            # systemd upgrade that crosses the reverse-deps version gate. The
+            # capability tuple may NOT flip across such a change, so the
+            # flip-gated _resync_systemd_runtime would miss it; refresh here
+            # unconditionally. (It keeps the last good version on a transient
+            # `systemctl --version` miss, so an unconditional call is safe.)
+            refresh_runtime_caches()
 
     def _apply_config_driven_refresh(self, config):
         """Run config-driven permission refresh for this tick, then republish
@@ -386,6 +394,14 @@ class Agent:
         if current != self._last_systemd_cap_state:
             self._last_systemd_cap_state = current
             refresh_runtime_caches()
+            # The inventory hash deliberately excludes cgroup/version metadata,
+            # so a flip arriving via the periodic gap re-probe (not SIGHUP) would
+            # leave the backend's stored inventory on stale cgroup=null until the
+            # next real unit-config change. Force one resend to propagate the new
+            # cgroup/version. Baselined in __init__, so this never fires on the
+            # first tick -- only on an actual later flip.
+            force_inventory_resend()
+            self._systemd_force_resend = True
 
     def _recheck_token_changed(self, token):
         """Nonce state machine for the on-demand "re-detect now" button.
