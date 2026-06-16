@@ -2,10 +2,19 @@
 
 import os
 import subprocess
+import sys
 import tarfile
 import tempfile
 
 import pytest
+
+# Synology SPK builder is a bash script that calls Linux-only tooling
+# (tar, file, gzip in a Linux-shaped layout). Skip on Windows where
+# `bash` either does not exist or invokes WSL with broken stdout/exit codes.
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="Synology SPK build script is Linux-only",
+)
 
 
 SYNOLOGY_DIR = os.path.join(

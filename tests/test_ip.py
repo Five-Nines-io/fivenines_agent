@@ -3,6 +3,8 @@
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 import fivenines_agent.ip as ip_module
 from fivenines_agent.ip import get_ip
 
@@ -241,6 +243,10 @@ def test_now_returns_monotonic_seconds():
     assert b >= a
 
 
+@pytest.mark.skipif(
+    not hasattr(time, "clock_gettime"),
+    reason="time.clock_gettime is POSIX-only; Windows uses the monotonic fallback unconditionally",
+)
 def test_now_falls_back_when_clock_boottime_attribute_missing():
     """On platforms without CLOCK_BOOTTIME, _now() falls back to time.monotonic()."""
     with patch.object(time, "clock_gettime", side_effect=AttributeError):
@@ -248,6 +254,10 @@ def test_now_falls_back_when_clock_boottime_attribute_missing():
     assert isinstance(result, float)
 
 
+@pytest.mark.skipif(
+    not hasattr(time, "clock_gettime"),
+    reason="time.clock_gettime is POSIX-only; Windows uses the monotonic fallback unconditionally",
+)
 def test_now_falls_back_when_clock_boottime_syscall_unsupported():
     """On platforms where clock_gettime(CLOCK_BOOTTIME) fails, _now() falls back."""
     with patch.object(time, "clock_gettime", side_effect=OSError("EINVAL")):

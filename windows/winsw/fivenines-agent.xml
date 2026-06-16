@@ -1,0 +1,64 @@
+<service>
+  <!--
+    WinSW service definition for the fivenines monitoring agent (D16).
+
+    The agent itself is a plain console binary; WinSW wraps it so Windows
+    Service Control Manager (SCM) can start, stop, and restart it, and so
+    stdout/stderr land in a rotating log file under %ProgramData% rather than
+    being discarded (a Windows Service has no terminal). Lifecycle events
+    (started, stopped, failed) go to the Windows Event Log automatically via
+    WinSW's SCM integration - check services.msc and Event Viewer for agent
+    health.
+
+    The service account is set by the MSI installer (T13) post-install per
+    D12: a dedicated low-privilege account added to the built-in
+    "Performance Monitor Users" group, with read access to the
+    root\Microsoft\Windows\Storage WMI namespace delegated by the installer
+    (D19). WinSW intentionally does NOT carry a <serviceaccount> stanza here
+    so the MSI is the single source of truth.
+
+    Tested with WinSW v2.12+ on .NET Framework 4 (Windows Server 2019/2022/2025
+    and Windows 10/11 all ship a compatible runtime).
+  -->
+
+  <id>fivenines-agent</id>
+  <name>Fivenines Monitoring Agent</name>
+  <description>Collects server metrics and reports them to the fivenines API.</description>
+
+  <!-- %BASE% expands to the directory containing the WinSW exe; the MSI
+       lays the agent's frozen binary alongside the wrapper. -->
+  <executable>%BASE%\fivenines-agent-windows-amd64.exe</executable>
+
+  <!-- Start at boot, delayed so the network stack and WMI service are up
+       before the first probe runs. Auto-reprobe (D9) catches up after. -->
+  <startmode>Automatic</startmode>
+  <delayedAutoStart>true</delayedAutoStart>
+
+  <!-- Rotate captured stdout/stderr at 10 MB; keep 5 generations. Logs land
+       in %ProgramData%\fivenines_agent\logs, which the MSI ACLs to the
+       service account + Administrators only (matches the TOKEN file ACL). -->
+  <log mode="roll-by-size">
+    <sizeThreshold>10240</sizeThreshold>
+    <keepFiles>5</keepFiles>
+  </log>
+  <logpath>%ProgramData%\fivenines_agent\logs</logpath>
+
+  <!-- Restart-on-failure with backoff. After 1 hour of clean running the
+       failure counter resets so transient blips don't exhaust the schedule. -->
+  <onfailure action="restart" delay="10 sec"/>
+  <onfailure action="restart" delay="30 sec"/>
+  <onfailure action="restart" delay="60 sec"/>
+  <resetfailure>1 hour</resetfailure>
+
+  <!-- Stop semantics. WinSW's default Ctrl+C signaling requires the child
+       to share an interactive console, which a Windows Service never has -
+       Python's signal.signal(SIGINT, ...) handler in agent.py never fires.
+       After stoptimeout WinSW calls TerminateProcess on the child, but
+       PyInstaller's onedir layout runs the agent as a bootloader + Python
+       interpreter pair: killing the bootloader alone leaves the interpreter
+       orphaned (Get-Service Stopped, Get-Process still alive). Setting
+       stopparentprocessfirst=true reverses the order so the bootloader dies
+       first, which forces the Python interpreter to exit too. -->
+  <stoptimeout>10 sec</stoptimeout>
+  <stopparentprocessfirst>true</stopparentprocessfirst>
+</service>

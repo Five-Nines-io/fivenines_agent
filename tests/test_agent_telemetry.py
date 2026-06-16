@@ -398,54 +398,69 @@ def test_systemd_inventory_sync_telemetry_captures_logged_error(mock_sync):
 # --- _handle_permission_refresh: SIGHUP forces inventory resend ---
 
 
-@patch("fivenines_agent.agent.refresh_runtime_caches")
 @patch("fivenines_agent.agent.print_capabilities_banner")
 @patch("fivenines_agent.agent.force_inventory_resend")
-def test_handle_permission_refresh_sets_force_flag_on_sighup(
-    mock_force, mock_banner, mock_refresh
-):
-    """SIGHUP triggers permission refresh, re-detects host systemd state, AND
-    marks systemd inventory for resend."""
+def test_handle_sighup_refresh_force_resends_inventory(mock_force, mock_banner):
+    """SIGHUP forces a permission re-probe and marks the systemd inventory for
+    a fresh resend. The cgroup/version cache re-detect is deferred to
+    _resync_systemd_runtime (driven off the capability flip), so it is NOT
+    called directly here."""
     from fivenines_agent.agent import refresh_permissions_event
 
     agent = make_agent()
     agent._systemd_force_resend = False
     agent.permissions = MagicMock()
-    agent.permissions.get_all.return_value = {"systemd": True}
     agent.static_data = {}
     refresh_permissions_event.set()
 
     try:
-        agent._handle_permission_refresh()
+        agent._handle_sighup_refresh()
     finally:
         refresh_permissions_event.clear()
 
+    agent.permissions.force_refresh.assert_called_once()
     mock_force.assert_called_once()
-    mock_refresh.assert_called_once()
     assert agent._systemd_force_resend is True
     assert refresh_permissions_event.is_set() is False
 
 
 @patch("fivenines_agent.agent.refresh_runtime_caches")
-@patch("fivenines_agent.agent.force_inventory_resend")
-def test_handle_permission_refresh_periodic_redetects_but_no_force_resend(
-    mock_force, mock_refresh
-):
-    """Periodic 5-min re-probe re-detects host systemd state (so a cgroup mount
-    gained after boot is picked up) but does NOT force an inventory resend --
-    that orient-and-resend behavior is SIGHUP-only."""
-    from fivenines_agent.agent import refresh_permissions_event
-
+def test_resync_systemd_runtime_redetects_on_capability_flip(mock_refresh):
+    """When the gap re-probe flips the cgroup capability (e.g. a mount appears
+    after boot), the collector's cached hierarchy/version are re-detected."""
     agent = make_agent()
-    agent._systemd_force_resend = False
     agent.permissions = MagicMock()
-    agent.permissions.refresh_if_needed.return_value = True
-    agent.permissions.get_all.return_value = {"systemd": True}
-    agent.static_data = {}
-    refresh_permissions_event.clear()
+    # Baseline: systemd up but no cgroup yet.
+    agent._last_systemd_cap_state = (True, None)
+    agent.permissions.get_all.return_value = {"systemd": True, "cgroup": "v2"}
 
-    agent._handle_permission_refresh()
+    agent._resync_systemd_runtime()
 
     mock_refresh.assert_called_once()
-    mock_force.assert_not_called()
-    assert agent._systemd_force_resend is False
+    assert agent._last_systemd_cap_state == (True, "v2")
+
+
+@patch("fivenines_agent.agent.refresh_runtime_caches")
+def test_resync_systemd_runtime_noop_when_unchanged(mock_refresh):
+    """No capability change -> no re-detect (no per-tick subprocess cost)."""
+    agent = make_agent()
+    agent.permissions = MagicMock()
+    agent._last_systemd_cap_state = (True, "v2")
+    agent.permissions.get_all.return_value = {"systemd": True, "cgroup": "v2"}
+
+    agent._resync_systemd_runtime()
+
+    mock_refresh.assert_not_called()
+
+
+@patch("fivenines_agent.agent.refresh_runtime_caches")
+def test_resync_systemd_runtime_noop_on_non_systemd_host(mock_refresh):
+    """A capability set without systemd/cgroup (e.g. Windows) is skipped, even
+    on a partially-constructed agent without _last_systemd_cap_state set."""
+    agent = make_agent()
+    agent.permissions = MagicMock()
+    agent.permissions.get_all.return_value = {"qemu": True}
+
+    agent._resync_systemd_runtime()  # must not raise
+
+    mock_refresh.assert_not_called()

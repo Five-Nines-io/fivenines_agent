@@ -1,8 +1,11 @@
 """Tests for the persistent per-agent machine id."""
 
 import os
+import sys
 import uuid
 from unittest.mock import patch
+
+import pytest
 
 from fivenines_agent.machine_id import (
     MACHINE_ID_FILENAME,
@@ -63,6 +66,15 @@ def test_read_persisted_id_returns_none_on_os_error(tmp_path):
 # --- _persist_id -----------------------------------------------------------
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "Windows os.chmod does not honor POSIX granular modes; "
+        "the agent's actual file protection on Windows comes from the "
+        "MSI's util:PermissionEx on the config dir (Admin + SYSTEM + "
+        "service account only), not from chmod."
+    ),
+)
 def test_persist_id_writes_file_owner_only(tmp_path):
     path = tmp_path / MACHINE_ID_FILENAME
     value = str(uuid.uuid4())

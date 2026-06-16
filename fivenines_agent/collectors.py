@@ -5,6 +5,7 @@ import time
 from fivenines_agent.caddy import caddy_metrics
 from fivenines_agent.cpu import cpu_count, cpu_data, cpu_model, cpu_usage
 from fivenines_agent.debug import log, start_log_capture, stop_log_capture
+from fivenines_agent.disk_health_windows import disk_health_windows
 from fivenines_agent.docker import docker_metrics
 from fivenines_agent.fail2ban import fail2ban_metrics
 from fivenines_agent.fans import fans
@@ -27,7 +28,6 @@ from fivenines_agent.smart_storage import (
 )
 from fivenines_agent.systemd import systemd_metrics
 from fivenines_agent.temperatures import temperatures
-
 
 # Registry of metric collectors.
 # Each entry: (config_key, [(data_key, callable, pass_kwargs), ...])
@@ -82,6 +82,9 @@ COLLECTORS = [
     ("postgresql", [("postgresql", postgresql_metrics, True)]),
     ("proxmox", [("proxmox", proxmox_metrics, True)]),
     ("systemd", [("systemd", systemd_metrics, True)]),
+    # Windows-only: gated by the disk_health capability, only present in the
+    # Windows-tailored capability set (D13 - permissions._build_windows_*).
+    ("disk_health", [("disk_health", disk_health_windows, False)]),
 ]
 
 

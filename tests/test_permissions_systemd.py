@@ -122,6 +122,37 @@ def test_detect_cgroup_hierarchy_none(mock_probe):
             assert probe._detect_cgroup_hierarchy() is None
 
 
+# --- probe-spec table integration (selective gap re-probe) ---
+
+
+@patch.object(PermissionProbe, "_probe_all")
+def test_systemd_and_cgroup_in_linux_probe_specs(mock_probe):
+    """Both must be in the shared spec table so the backend-driven selective
+    gap re-probe recovers them like every other capability."""
+    probe = _make_probe()
+    specs = probe._linux_probe_specs()
+    assert "systemd" in specs
+    assert "cgroup" in specs
+    assert specs["systemd"] == (probe._can_probe_systemd, ())
+    assert specs["cgroup"] == (probe._detect_cgroup_hierarchy, ())
+
+
+@patch.object(PermissionProbe, "_probe_all")
+def test_selective_reprobe_flips_cgroup_when_mount_appears(mock_probe):
+    """A gap re-probe of cgroup detects a hierarchy that appeared after boot."""
+    probe = _make_probe()
+    probe._capability_reasons = {}
+    probe._current_reason = None
+    probe.capabilities = {"cgroup": None, "systemd": True}
+    with patch(
+        "fivenines_agent.permissions.os.path.exists",
+        side_effect=lambda p: p == "/sys/fs/cgroup/cgroup.controllers",
+    ):
+        flipped = probe._reprobe_capabilities(["cgroup"])
+    assert flipped is True
+    assert probe.capabilities["cgroup"] == "v2"
+
+
 # --- Banner placement ---
 
 

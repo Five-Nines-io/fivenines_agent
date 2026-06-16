@@ -6,14 +6,25 @@ Detects what capabilities are available based on user permissions.
 import os
 import shutil
 import subprocess
+import threading
 import time
 
+import psutil
+
 from fivenines_agent.debug import log
+from fivenines_agent.env import is_windows
 from fivenines_agent.subprocess_utils import get_clean_env
 
-
-# Re-probe interval in seconds (5 minutes)
+# Full re-probe interval in seconds (5 minutes): every capability is re-checked
+# on this cadence to catch regressions and newly-relevant capabilities.
 REPROBE_INTERVAL = 300
+
+# Hard timeout (seconds) for the libvirt openReadOnly probe. The probe runs in a
+# worker thread and is abandoned past this deadline: a wedged libvirt stack
+# (socket activation, daemon handshake, polkit, NSS) can otherwise block, and
+# the probe runs synchronously in the agent's main loop -> it would stall ALL
+# metric collection, not just QEMU.
+LIBVIRT_PROBE_TIMEOUT = 3
 
 # Max chars for stdout/stderr in debug logs
 DEBUG_OUTPUT_LIMIT = 500
@@ -37,7 +48,54 @@ CAPABILITY_HINTS = {
     "snmp": "requires net-snmp",
     "systemd": "requires systemd init system",
     "cgroup": "no /sys/fs/cgroup hierarchy found",
+    "disk_health": "requires WMI Storage namespace access",
+    "software_inventory": "requires Uninstall registry key access",
 }
+
+# Banner group layout per OS. Each entry is (section title, [capability keys]).
+LINUX_BANNER_GROUPS = [
+    (
+        "Core Metrics",
+        [
+            "cpu",
+            "memory",
+            "load_average",
+            "io",
+            "network",
+            "partitions",
+            "file_handles",
+            "ports",
+            "processes",
+        ],
+    ),
+    ("Hardware Sensors", ["temperatures", "fans", "nvidia_gpu", "cgroup"]),
+    ("Storage", ["smart_storage", "raid_storage", "zfs"]),
+    ("Services", ["docker", "qemu", "proxmox", "systemd"]),
+    ("Security", ["fail2ban", "packages"]),
+    ("Networking", ["snmp"]),
+]
+
+WINDOWS_BANNER_GROUPS = [
+    # No load_average - Windows has no native equivalent and psutil's
+    # CPU-sampling emulation drops to zero on idle systems, which is more
+    # misleading than helpful. We omit the metric entirely on Windows.
+    (
+        "Core Metrics",
+        [
+            "cpu",
+            "memory",
+            "io",
+            "network",
+            "partitions",
+            "file_handles",
+            "ports",
+            "processes",
+        ],
+    ),
+    ("Hardware Sensors", ["temperatures", "fans", "nvidia_gpu"]),
+    ("Storage", ["disk_health"]),
+    ("Inventory", ["software_inventory"]),
+]
 
 
 class PermissionProbe:
@@ -55,6 +113,10 @@ class PermissionProbe:
         self._capability_reasons = {}
         self._current_reason = None
         self._last_probe_time = 0
+        self._last_gap_probe_time = 0
+        # Tracks an in-flight libvirt probe worker so a wedged libvirt stack
+        # cannot leak one stuck thread per re-probe (see _can_access_libvirt).
+        self._libvirt_probe_thread = None
         self._probe_all()
 
     def _set_reason(self, msg):
@@ -76,49 +138,23 @@ class PermissionProbe:
         return result
 
     def _probe_all(self):
-        """Probe all capabilities and cache results."""
+        """Probe all capabilities and cache results.
+
+        Branches once on OS family. The Linux probe reports its existing
+        capability set; the Windows probe reports a Windows-tailored set
+        (D13 - the backend handles the different shape).
+        """
         self._last_probe_time = time.time()
+        # A full probe also satisfies the selective gap-probe clock: a
+        # force_refresh / startup / SIGHUP full probe must not leave the next
+        # tick re-probing the same caps (the gap branch reads this timer).
+        self._last_gap_probe_time = self._last_probe_time
         old_capabilities = self.capabilities.copy()
 
-        self.capabilities = {
-            # Core metrics - always available via /proc
-            "cpu": self._probe("cpu", self._can_read, "/proc/stat"),
-            "memory": self._probe("memory", self._can_read, "/proc/meminfo"),
-            "load_average": self._probe("load_average", self._can_read, "/proc/loadavg"),
-            "io": self._probe("io", self._can_read, "/proc/diskstats"),
-            "network": self._probe("network", self._can_read, "/proc/net/dev"),
-            "partitions": self._probe("partitions", self._can_read, "/proc/mounts"),
-            "file_handles": self._probe("file_handles", self._can_read, "/proc/sys/fs/file-nr"),
-            "ports": self._probe("ports", self._can_read, "/proc/net/tcp"),
-            # Processes - works but may have limited visibility
-            "processes": self._probe("processes", self._can_read, "/proc/self/stat"),
-            # Hardware sensors - may or may not work without root
-            "temperatures": self._probe("temperatures", self._can_access_hwmon),
-            "fans": self._probe("fans", self._can_access_hwmon),
-            # NVIDIA GPU
-            "nvidia_gpu": self._probe("nvidia_gpu", self._can_access_gpu),
-            # Storage requiring sudo
-            "smart_storage": self._probe("smart_storage", self._can_run_sudo, "smartctl", "--version"),
-            "raid_storage": self._probe("raid_storage", self._can_run_sudo, "mdadm", "--version"),
-            # Security - requires sudo
-            "fail2ban": self._probe("fail2ban", self._can_run_sudo, "fail2ban-client", "status"),
-            # ZFS - doesn't need sudo but needs permissions or delegation
-            "zfs": self._probe("zfs", self._can_run_zfs),
-            # Docker - needs docker group membership
-            "docker": self._probe("docker", self._can_access_docker),
-            # QEMU/libvirt - needs libvirt group membership
-            "qemu": self._probe("qemu", self._can_access_libvirt),
-            # Proxmox VE - needs API access or local node
-            "proxmox": self._probe("proxmox", self._can_access_proxmox),
-            # Package listing - for security scanning
-            "packages": self._probe("packages", self._can_list_packages),
-            # SNMP polling - needs net-snmp CLI tools
-            "snmp": self._probe("snmp", self._has_snmpget),
-            # systemd unit collection
-            "systemd": self._probe("systemd", self._can_probe_systemd),
-            # cgroup hierarchy: "v1", "v2", or None (tri-state)
-            "cgroup": self._probe("cgroup", self._detect_cgroup_hierarchy),
-        }
+        if is_windows():
+            self.capabilities = self._build_windows_capabilities()
+        else:
+            self.capabilities = self._build_linux_capabilities()
 
         if not old_capabilities:
             # Initial probe: surface every unavailable capability at info level
@@ -135,12 +171,114 @@ class PermissionProbe:
                 old_value = old_capabilities.get(cap)
                 if old_value is None or old_value == available:
                     continue
-                if available:
-                    log(f"Capability '{cap}' is now AVAILABLE", "info")
-                else:
-                    log(self._format_unavailable(cap, "is now UNAVAILABLE"), "info")
+                self._log_capability_flip(cap, available)
 
         return self.capabilities
+
+    def _linux_probe_specs(self):
+        """Single source of truth: capability name -> (probe_callable, args).
+
+        Used by both the full build (_build_linux_capabilities) and the
+        selective gap re-probe (_reprobe_capabilities), so the method<->capability
+        mapping lives in exactly one place (no duplication).
+        """
+        return {
+            # Core metrics - always available via /proc
+            "cpu": (self._can_read, ("/proc/stat",)),
+            "memory": (self._can_read, ("/proc/meminfo",)),
+            "load_average": (self._can_read, ("/proc/loadavg",)),
+            "io": (self._can_read, ("/proc/diskstats",)),
+            "network": (self._can_read, ("/proc/net/dev",)),
+            "partitions": (self._can_read, ("/proc/mounts",)),
+            "file_handles": (self._can_read, ("/proc/sys/fs/file-nr",)),
+            "ports": (self._can_read, ("/proc/net/tcp",)),
+            # Processes - works but may have limited visibility
+            "processes": (self._can_read, ("/proc/self/stat",)),
+            # Hardware sensors - may or may not work without root
+            "temperatures": (self._can_access_hwmon, ()),
+            "fans": (self._can_access_hwmon, ()),
+            # NVIDIA GPU
+            "nvidia_gpu": (self._can_access_gpu, ()),
+            # Storage requiring sudo
+            "smart_storage": (self._can_run_sudo, ("smartctl", "--version")),
+            "raid_storage": (self._can_run_sudo, ("mdadm", "--version")),
+            # Security - requires sudo
+            "fail2ban": (self._can_run_sudo, ("fail2ban-client", "status")),
+            # ZFS - doesn't need sudo but needs permissions or delegation
+            "zfs": (self._can_run_zfs, ()),
+            # Docker - needs docker group membership
+            "docker": (self._can_access_docker, ()),
+            # QEMU/libvirt - needs libvirt group membership
+            "qemu": (self._can_access_libvirt, ()),
+            # Proxmox VE - needs API access or local node
+            "proxmox": (self._can_access_proxmox, ()),
+            # Package listing - for security scanning
+            "packages": (self._can_list_packages, ()),
+            # SNMP polling - needs net-snmp CLI tools
+            "snmp": (self._has_snmpget, ()),
+            # systemd unit collection - needs systemd init + systemctl
+            "systemd": (self._can_probe_systemd, ()),
+            # cgroup hierarchy: "v1", "v2", or None (tri-state)
+            "cgroup": (self._detect_cgroup_hierarchy, ()),
+        }
+
+    def _build_linux_capabilities(self):
+        """Linux capability set: /proc, /sys, sudo, sockets, package managers."""
+        return {
+            name: self._probe(name, probe_callable, *args)
+            for name, (probe_callable, args) in self._linux_probe_specs().items()
+        }
+
+    def _windows_probe_specs(self):
+        """Probed Windows capabilities -> (probe_callable, args). The always-True
+        core metrics are added separately in _build_windows_capabilities."""
+        return {
+            # Hardware sensors - psutil reports if any are exposed
+            "temperatures": (self._can_query_psutil_sensors, ("temperatures",)),
+            "fans": (self._can_query_psutil_sensors, ("fans",)),
+            "nvidia_gpu": (self._can_access_gpu, ()),
+            # Windows-native: WMI MSFT_PhysicalDisk + reliability counters
+            "disk_health": (self._can_query_wmi_storage, ()),
+            # Windows-native: registry Uninstall key (classic Win32 installed programs)
+            "software_inventory": (self._can_read_uninstall_registry, ()),
+        }
+
+    def _build_windows_capabilities(self):
+        """Windows-tailored capability set (D13).
+
+        Core metrics report True unconditionally - psutil works on Windows.
+        Linux-only capabilities (raid_storage, zfs, fail2ban, proxmox, qemu,
+        smart_storage via smartctl, packages via dpkg/rpm) are omitted: D13
+        sends a Windows-shaped payload rather than Linux keys marked N/A.
+        Windows-native entries: disk_health (WMI Storage), software_inventory
+        (registry Uninstall key).
+        """
+        # Core metrics - psutil handles these cross-platform.
+        # load_average is intentionally absent: Windows has no equivalent
+        # (no D-state, no real load avg in the kernel), and psutil's
+        # emulation samples CPU activity only and reads zero on idle
+        # systems. Omit rather than ship misleading data (D13 - send a
+        # Windows-shaped payload rather than Linux keys marked N/A).
+        capabilities = {
+            "cpu": True,
+            "memory": True,
+            "io": True,
+            "network": True,
+            "partitions": True,
+            "file_handles": True,
+            "ports": True,
+            "processes": True,
+        }
+        for name, (probe_callable, args) in self._windows_probe_specs().items():
+            capabilities[name] = self._probe(name, probe_callable, *args)
+        return capabilities
+
+    def _probe_specs(self):
+        """OS-appropriate {capability: (probe_callable, args)} map for selective
+        re-probing. Mirrors whichever set _probe_all built."""
+        return (
+            self._windows_probe_specs() if is_windows() else self._linux_probe_specs()
+        )
 
     def _format_unavailable(self, cap, verb):
         """Build the operator-facing log line for an unavailable capability."""
@@ -153,12 +291,58 @@ class PermissionProbe:
             msg += f" ({reason})"
         return msg
 
-    def refresh_if_needed(self):
-        """Re-probe capabilities if enough time has passed."""
-        if time.time() - self._last_probe_time >= REPROBE_INTERVAL:
+    def _log_capability_flip(self, name, available):
+        """Emit the info-level state-flip log shared by the full probe and the
+        selective gap probe (single source of the wording/level)."""
+        if available:
+            log(f"Capability '{name}' is now AVAILABLE", "info")
+        else:
+            log(self._format_unavailable(name, "is now UNAVAILABLE"), "info")
+
+    def _reprobe_capabilities(self, only):
+        """Re-probe only the named capabilities (cheap selective gap probe).
+
+        Logs state flips at info level (same payload as the full probe) and
+        returns True if any of the named capabilities flipped. Names not in the
+        OS probe spec are ignored.
+        """
+        specs = self._probe_specs()
+        flipped = False
+        for name in only:
+            spec = specs.get(name)
+            if spec is None:
+                continue
+            probe_callable, args = spec
+            old_value = self.capabilities.get(name)
+            new_value = self._probe(name, probe_callable, *args)
+            self.capabilities[name] = new_value
+            if old_value != new_value:
+                flipped = True
+                self._log_capability_flip(name, new_value)
+        return flipped
+
+    def refresh_due(self, gap_capabilities=(), gap_interval: float = 0):
+        """Run timed re-probes; return True if any capability flipped.
+
+        - Full probe of every capability every REPROBE_INTERVAL (regressions and
+          newly-relevant capabilities).
+        - Otherwise a cheap selective re-probe of *gap_capabilities* (the
+          enabled-but-missing set) every *gap_interval* seconds. gap_interval=0
+          means "every call"; an empty gap set is a no-op.
+
+        The gap probe is what makes a late-arriving capability (libvirtd coming
+        up, sudoers granted) appear within ~one collection interval instead of
+        waiting for the 5-minute full-probe cycle.
+        """
+        now = time.time()
+        if now - self._last_probe_time >= REPROBE_INTERVAL:
             log("Re-probing capabilities...", "debug")
-            self._probe_all()
-            return True
+            old = self.capabilities.copy()
+            self._probe_all()  # also resets _last_gap_probe_time
+            return old != self.capabilities
+        if gap_capabilities and now - self._last_gap_probe_time >= gap_interval:
+            self._last_gap_probe_time = now
+            return self._reprobe_capabilities(gap_capabilities)
         return False
 
     def force_refresh(self):
@@ -231,7 +415,11 @@ class PermissionProbe:
                 "debug",
             )
             if not success:
-                detail = stderr.splitlines()[0] if stderr else f"returncode {result.returncode}"
+                detail = (
+                    stderr.splitlines()[0]
+                    if stderr
+                    else f"returncode {result.returncode}"
+                )
                 self._set_reason(f"sudo -n {cmd}: {detail}")
             return success
         except subprocess.TimeoutExpired:
@@ -377,7 +565,9 @@ class PermissionProbe:
                 return True
 
             log("_can_run_zfs: -> UNAVAILABLE", "debug")
-            detail = stderr.splitlines()[0] if stderr else f"returncode {result.returncode}"
+            detail = (
+                stderr.splitlines()[0] if stderr else f"returncode {result.returncode}"
+            )
             self._set_reason(f"zpool list: {detail}")
             return False
         except subprocess.TimeoutExpired:
@@ -415,28 +605,69 @@ class PermissionProbe:
         return accessible
 
     def _can_access_libvirt(self):
-        """Check if libvirt socket is accessible."""
-        # Common libvirt socket paths
-        socket_paths = [
-            "/var/run/libvirt/libvirt-sock-ro",
-            "/var/run/libvirt/libvirt-sock",
-        ]
-        log(f"_can_access_libvirt: checking socket paths: {socket_paths}", "debug")
+        """Probe QEMU/libvirt the way the collector connects: attempt
+        libvirt.openReadOnly("qemu:///system").
 
-        for path in socket_paths:
-            exists = os.path.exists(path)
-            if not exists:
-                log(f"_can_access_libvirt: {path} does not exist", "debug")
-                continue
+        This mirrors qemu.py exactly, so True means the collector can actually
+        connect - no guessing about socket paths or permission bits, which had
+        diverged from the collector (os.access(R_OK) vs the read-only connect)
+        and missed the modular-daemon socket layout (virtqemud/virtproxyd).
 
-            readable = os.access(path, os.R_OK)
-            log(f"_can_access_libvirt: {path} exists, readable={readable}", "debug")
-            if readable:
-                log(f"_can_access_libvirt: -> AVAILABLE (via {path})", "debug")
-                return True
+        The connection runs in a worker thread with a hard timeout: a wedged
+        libvirt stack can block indefinitely, and this probe runs synchronously
+        in the agent's main collection loop, so an unbounded call would stall
+        ALL metrics, not just QEMU.
+        """
+        try:
+            import libvirt
+        except ImportError as e:
+            log(f"_can_access_libvirt: libvirt module not importable: {e}", "debug")
+            self._set_reason("libvirt module not available")
+            return False
 
-        log("_can_access_libvirt: -> UNAVAILABLE (no accessible sockets)", "debug")
-        self._set_reason(f"no readable libvirt socket at {' or '.join(socket_paths)}")
+        # Single-flight: refresh_due re-probes a pending qemu capability every
+        # tick, so if a previous openReadOnly is still hung past its timeout,
+        # don't spawn another worker on top of it. This caps leaked threads at
+        # one for a genuinely wedged libvirt stack instead of one per tick.
+        prev = getattr(self, "_libvirt_probe_thread", None)
+        if prev is not None and prev.is_alive():
+            log("_can_access_libvirt: previous probe still running; skipping", "debug")
+            self._set_reason("libvirt probe still running (previous attempt hung)")
+            return False
+
+        result = {}
+
+        def attempt():
+            conn = None
+            try:
+                conn = libvirt.openReadOnly("qemu:///system")
+                result["ok"] = conn is not None
+                if conn is None:
+                    result["reason"] = "openReadOnly returned None"
+            except Exception as e:
+                result["reason"] = f"{type(e).__name__}: {e}"
+            finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+
+        worker = threading.Thread(target=attempt, daemon=True)
+        self._libvirt_probe_thread = worker
+        worker.start()
+        worker.join(LIBVIRT_PROBE_TIMEOUT)
+        if worker.is_alive():
+            log("_can_access_libvirt: probe timed out", "debug")
+            self._set_reason("libvirt probe timed out")
+            return False
+        self._libvirt_probe_thread = None
+        if result.get("ok"):
+            log("_can_access_libvirt: -> AVAILABLE (openReadOnly)", "debug")
+            return True
+        reason = result.get("reason", "openReadOnly failed")
+        log(f"_can_access_libvirt: -> UNAVAILABLE ({reason})", "debug")
+        self._set_reason(reason)
         return False
 
     def _can_access_proxmox(self):
@@ -469,7 +700,9 @@ class PermissionProbe:
                 log(f"_can_list_packages: found '{cmd}'", "debug")
                 return True
         log("_can_list_packages: no supported package manager found", "debug")
-        self._set_reason("no supported package manager (dpkg-query, rpm, apk, pacman, synopkg)")
+        self._set_reason(
+            "no supported package manager (dpkg-query, rpm, apk, pacman, synopkg)"
+        )
         return False
 
     def _can_probe_systemd(self):
@@ -502,9 +735,7 @@ class PermissionProbe:
             return False
         if result.returncode != 0:
             log("_can_probe_systemd: systemctl --version returned non-zero", "debug")
-            self._set_reason(
-                f"systemctl --version returned exit {result.returncode}"
-            )
+            self._set_reason(f"systemctl --version returned exit {result.returncode}")
             return False
         log("_can_probe_systemd: -> AVAILABLE", "debug")
         return True
@@ -524,6 +755,62 @@ class PermissionProbe:
         log("_detect_cgroup_hierarchy: no cgroup hierarchy found", "debug")
         self._set_reason("no cgroup hierarchy found at /sys/fs/cgroup")
         return None
+
+    def _can_query_psutil_sensors(self, kind):
+        """Probe psutil hardware-sensor support on Windows.
+
+        kind is 'temperatures' or 'fans'. psutil docs list these as Linux/FreeBSD
+        only - on Windows the attribute typically does not exist or returns
+        empty. Treat 'method exists and returns at least one sensor' as True.
+        """
+        attr = f"sensors_{kind}"
+        try:
+            method = getattr(psutil, attr)
+        except AttributeError as e:
+            self._set_reason(f"psutil.{attr} unavailable: {e}")
+            return False
+        try:
+            data = method()
+        except (OSError, NotImplementedError) as e:
+            self._set_reason(f"psutil.{attr} call failed: {e}")
+            return False
+        if data:
+            return True
+        self._set_reason(f"psutil.{attr} reported no sensors")
+        return False
+
+    def _can_query_wmi_storage(self):
+        """Probe whether WMI Storage namespace queries are likely to work.
+
+        Light check: the wmi package must import (pywin32 + wmi installed).
+        The actual disk-health collector runs subprocess-isolated and handles
+        WMI runtime errors there (D11). Hung/wedged WMI is the collector's
+        problem, not the probe's.
+        """
+        try:
+            import wmi  # type: ignore[import-not-found]  # noqa: F401
+        except ImportError as e:
+            self._set_reason(f"wmi package not installed: {e}")
+            return False
+        return True
+
+    def _can_read_uninstall_registry(self):
+        """Probe whether the Windows Uninstall registry key opens read-only."""
+        try:
+            import winreg  # type: ignore[import-not-found]
+        except ImportError as e:
+            self._set_reason(f"winreg unavailable: {e}")
+            return False
+        try:
+            key = winreg.OpenKey(  # type: ignore[attr-defined]
+                winreg.HKEY_LOCAL_MACHINE,  # type: ignore[attr-defined]
+                r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+            )
+            winreg.CloseKey(key)  # type: ignore[attr-defined]
+            return True
+        except OSError as e:
+            self._set_reason(f"Uninstall registry key unreadable: {e}")
+            return False
 
     def get(self, capability, default=False):
         """Get a specific capability status."""
@@ -569,23 +856,8 @@ def print_capabilities_banner():
     probe = get_permissions()
     caps = probe.get_all()
 
-    # Group capabilities for display
-    core_metrics = [
-        "cpu",
-        "memory",
-        "load_average",
-        "io",
-        "network",
-        "partitions",
-        "file_handles",
-        "ports",
-        "processes",
-    ]
-    hardware = ["temperatures", "fans", "nvidia_gpu", "cgroup"]
-    storage = ["smart_storage", "raid_storage", "zfs"]
-    services = ["docker", "qemu", "proxmox", "systemd"]
-    security = ["fail2ban", "packages"]
-    networking = ["snmp"]
+    groups = WINDOWS_BANNER_GROUPS if is_windows() else LINUX_BANNER_GROUPS
+    core_metrics = groups[0][1]  # first group is always Core Metrics
 
     print("")
     print("=" * 60)
@@ -613,12 +885,8 @@ def print_capabilities_banner():
             print(f"    {icon} {name}{hint}")
         print("")
 
-    print_section("Core Metrics", core_metrics)
-    print_section("Hardware Sensors", hardware)
-    print_section("Storage", storage)
-    print_section("Services", services)
-    print_section("Security", security)
-    print_section("Networking", networking)
+    for title, caps_list in groups:
+        print_section(title, caps_list)
 
     unavailable = probe.get_unavailable()
     if unavailable:
