@@ -203,6 +203,30 @@ def test_pending_software_inventory_not_added_when_available():
     assert agent._pending_capabilities({"packages": {"scan": True}}) == []
 
 
+def test_pending_includes_systemd_when_enabled_and_missing():
+    # systemd is a regular COLLECTORS config key, so it gap-reprobes like any
+    # other service.
+    agent = _agent({"systemd": False})
+    assert "systemd" in agent._pending_capabilities({"systemd": True})
+
+
+def test_pending_includes_cgroup_when_systemd_enabled_and_cgroup_missing():
+    # cgroup has no config key of its own; it gates per-unit metrics inside the
+    # systemd collector, so it is gap-reprobed alongside systemd.
+    agent = _agent({"systemd": True, "cgroup": None})
+    assert "cgroup" in agent._pending_capabilities({"systemd": True})
+
+
+def test_pending_cgroup_not_added_when_present():
+    agent = _agent({"systemd": True, "cgroup": "v2"})
+    assert "cgroup" not in agent._pending_capabilities({"systemd": True})
+
+
+def test_pending_cgroup_not_added_when_systemd_disabled():
+    agent = _agent({"systemd": True, "cgroup": None})
+    assert agent._pending_capabilities({}) == []
+
+
 # --- _apply_config_driven_refresh ---
 
 

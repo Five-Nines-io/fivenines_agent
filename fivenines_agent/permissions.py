@@ -15,7 +15,6 @@ from fivenines_agent.debug import log
 from fivenines_agent.env import is_windows
 from fivenines_agent.subprocess_utils import get_clean_env
 
-
 # Full re-probe interval in seconds (5 minutes): every capability is re-checked
 # on this cadence to catch regressions and newly-relevant capabilities.
 REPROBE_INTERVAL = 300
@@ -47,17 +46,31 @@ CAPABILITY_HINTS = {
     "temperatures": "no accessible sensors",
     "fans": "no accessible sensors",
     "snmp": "requires net-snmp",
+    "systemd": "requires systemd init system",
+    "cgroup": "no /sys/fs/cgroup hierarchy found",
     "disk_health": "requires WMI Storage namespace access",
     "software_inventory": "requires Uninstall registry key access",
 }
 
 # Banner group layout per OS. Each entry is (section title, [capability keys]).
 LINUX_BANNER_GROUPS = [
-    ("Core Metrics", ["cpu", "memory", "load_average", "io", "network",
-                      "partitions", "file_handles", "ports", "processes"]),
-    ("Hardware Sensors", ["temperatures", "fans", "nvidia_gpu"]),
+    (
+        "Core Metrics",
+        [
+            "cpu",
+            "memory",
+            "load_average",
+            "io",
+            "network",
+            "partitions",
+            "file_handles",
+            "ports",
+            "processes",
+        ],
+    ),
+    ("Hardware Sensors", ["temperatures", "fans", "nvidia_gpu", "cgroup"]),
     ("Storage", ["smart_storage", "raid_storage", "zfs"]),
-    ("Services", ["docker", "qemu", "proxmox"]),
+    ("Services", ["docker", "qemu", "proxmox", "systemd"]),
     ("Security", ["fail2ban", "packages"]),
     ("Networking", ["snmp"]),
 ]
@@ -66,8 +79,19 @@ WINDOWS_BANNER_GROUPS = [
     # No load_average - Windows has no native equivalent and psutil's
     # CPU-sampling emulation drops to zero on idle systems, which is more
     # misleading than helpful. We omit the metric entirely on Windows.
-    ("Core Metrics", ["cpu", "memory", "io", "network",
-                      "partitions", "file_handles", "ports", "processes"]),
+    (
+        "Core Metrics",
+        [
+            "cpu",
+            "memory",
+            "io",
+            "network",
+            "partitions",
+            "file_handles",
+            "ports",
+            "processes",
+        ],
+    ),
     ("Hardware Sensors", ["temperatures", "fans", "nvidia_gpu"]),
     ("Storage", ["disk_health"]),
     ("Inventory", ["software_inventory"]),
@@ -144,8 +168,14 @@ class PermissionProbe:
             # Subsequent probes: log only state flips. Unavailability transitions
             # carry the same hint+reason payload as the initial probe.
             for cap, available in self.capabilities.items():
-                old_value = old_capabilities.get(cap)
-                if old_value is None or old_value == available:
+                if cap not in old_capabilities:
+                    # Newly tracked capability (e.g. an agent upgrade added a
+                    # probe key): no prior state to flip from, so don't log.
+                    continue
+                # Compare against the stored value, NOT `is None`: cgroup is
+                # tri-state ("v1"/"v2"/None), so None is a legitimate prior value
+                # and a None->"v2" mount is a real flip worth logging.
+                if old_capabilities[cap] == available:
                     continue
                 self._log_capability_flip(cap, available)
 
@@ -192,6 +222,10 @@ class PermissionProbe:
             "packages": (self._can_list_packages, ()),
             # SNMP polling - needs net-snmp CLI tools
             "snmp": (self._has_snmpget, ()),
+            # systemd unit collection - needs systemd init + systemctl
+            "systemd": (self._can_probe_systemd, ()),
+            # cgroup hierarchy: "v1", "v2", or None (tri-state)
+            "cgroup": (self._detect_cgroup_hierarchy, ()),
         }
 
     def _build_linux_capabilities(self):
@@ -248,7 +282,9 @@ class PermissionProbe:
     def _probe_specs(self):
         """OS-appropriate {capability: (probe_callable, args)} map for selective
         re-probing. Mirrors whichever set _probe_all built."""
-        return self._windows_probe_specs() if is_windows() else self._linux_probe_specs()
+        return (
+            self._windows_probe_specs() if is_windows() else self._linux_probe_specs()
+        )
 
     def _format_unavailable(self, cap, verb):
         """Build the operator-facing log line for an unavailable capability."""
@@ -385,7 +421,11 @@ class PermissionProbe:
                 "debug",
             )
             if not success:
-                detail = stderr.splitlines()[0] if stderr else f"returncode {result.returncode}"
+                detail = (
+                    stderr.splitlines()[0]
+                    if stderr
+                    else f"returncode {result.returncode}"
+                )
                 self._set_reason(f"sudo -n {cmd}: {detail}")
             return success
         except subprocess.TimeoutExpired:
@@ -531,7 +571,9 @@ class PermissionProbe:
                 return True
 
             log("_can_run_zfs: -> UNAVAILABLE", "debug")
-            detail = stderr.splitlines()[0] if stderr else f"returncode {result.returncode}"
+            detail = (
+                stderr.splitlines()[0] if stderr else f"returncode {result.returncode}"
+            )
             self._set_reason(f"zpool list: {detail}")
             return False
         except subprocess.TimeoutExpired:
@@ -664,8 +706,61 @@ class PermissionProbe:
                 log(f"_can_list_packages: found '{cmd}'", "debug")
                 return True
         log("_can_list_packages: no supported package manager found", "debug")
-        self._set_reason("no supported package manager (dpkg-query, rpm, apk, pacman, synopkg)")
+        self._set_reason(
+            "no supported package manager (dpkg-query, rpm, apk, pacman, synopkg)"
+        )
         return False
+
+    def _can_probe_systemd(self):
+        """Check if systemd is the active init system and systemctl is usable.
+
+        Returns True only when:
+          * /run/systemd/system exists (systemd booted this host)
+          * systemctl is in PATH and `systemctl --version` exits cleanly
+        Returns False on Alpine (OpenRC), bare containers without their own
+        systemd, and macOS dev environments.
+        """
+        if not os.path.isdir("/run/systemd/system"):
+            log("_can_probe_systemd: /run/systemd/system not present", "debug")
+            self._set_reason("/run/systemd/system not present")
+            return False
+        if not shutil.which("systemctl"):
+            log("_can_probe_systemd: systemctl not in PATH", "debug")
+            self._set_reason("systemctl not in PATH")
+            return False
+        try:
+            result = subprocess.run(
+                ["systemctl", "--version"],
+                capture_output=True,
+                timeout=5,
+                env=get_clean_env(),
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log(f"_can_probe_systemd: systemctl --version failed: {e}", "debug")
+            self._set_reason(f"systemctl --version failed: {type(e).__name__}: {e}")
+            return False
+        if result.returncode != 0:
+            log("_can_probe_systemd: systemctl --version returned non-zero", "debug")
+            self._set_reason(f"systemctl --version returned exit {result.returncode}")
+            return False
+        log("_can_probe_systemd: -> AVAILABLE", "debug")
+        return True
+
+    def _detect_cgroup_hierarchy(self):
+        """Detect cgroup hierarchy version. Returns 'v1', 'v2', or None.
+
+        Reads /sys/fs/cgroup directly so this works whether or not systemd is
+        installed (some hosts run cgroups without systemd).
+        """
+        if os.path.exists("/sys/fs/cgroup/cgroup.controllers"):
+            log("_detect_cgroup_hierarchy: -> v2", "debug")
+            return "v2"
+        if os.path.isdir("/sys/fs/cgroup/memory"):
+            log("_detect_cgroup_hierarchy: -> v1", "debug")
+            return "v1"
+        log("_detect_cgroup_hierarchy: no cgroup hierarchy found", "debug")
+        self._set_reason("no cgroup hierarchy found at /sys/fs/cgroup")
+        return None
 
     def _can_query_psutil_sensors(self, kind):
         """Probe psutil hardware-sensor support on Windows.
@@ -782,6 +877,12 @@ def print_capabilities_banner():
             status = caps.get(cap, False)
             icon = "[+]" if status else "[-]"
             name = cap.replace("_", " ").title()
+
+            # cgroup is tri-state: "v1", "v2", or None. Show the version
+            # next to the name when available so operators can see at a
+            # glance which hierarchy is in use.
+            if cap == "cgroup" and status:
+                name = f"Cgroup {status}"
 
             hint = ""
             if not status and cap in CAPABILITY_HINTS:
