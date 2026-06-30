@@ -65,7 +65,7 @@ def test_collect_disabled_is_empty():
 def test_collect_window_clamping():
     seen = {}
 
-    def fake(unit, since, lines):
+    def fake(unit, since, lines, timeout=None):
         seen["since"] = since
         return []
 
@@ -81,7 +81,7 @@ def test_collect_window_clamping():
 
 
 def test_collect_per_unit_isolation():
-    def fake(unit, since, lines):
+    def fake(unit, since, lines, timeout=None):
         if unit == "bad":
             raise RuntimeError("boom")
         return [{"priority": "3", "message": "e"}]
@@ -93,13 +93,26 @@ def test_collect_per_unit_isolation():
 
 
 def test_collect_skips_unit_on_capture_failure():
-    def fake(unit, since, lines):
+    def fake(unit, since, lines, timeout=None):
         return None if unit == "x" else [{"priority": "3", "message": "e"}]
 
     out = logs.collect_log_signals(
         units=["x", "y"], _entries_fn=fake, _now=lambda: 1000
     )
     assert list(out["units"].keys()) == ["y"]
+
+
+def test_collect_uses_short_signal_timeout():
+    # Signals use a short timeout (A6) - distinct from the 30s capture timeout -
+    # so N units x a low incident interval cannot starve the systemd watchdog.
+    seen = {}
+
+    def fake(unit, since, lines, timeout=None):
+        seen["timeout"] = timeout
+        return []
+
+    logs.collect_log_signals(units=["a"], _entries_fn=fake, _now=lambda: 1000)
+    assert seen["timeout"] == logs._SIGNAL_TIMEOUT == 5
 
 
 def test_collect_absorbs_extra_config_kwargs():

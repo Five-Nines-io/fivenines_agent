@@ -73,8 +73,15 @@ _MASKS = [
         "<UUID>",
     ),
     (re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b"), "<IP>"),
+    # IPv6: >=3 colon-separated hex groups (a HH:MM:SS time has only 2 colons,
+    # so it is not matched here; its digits collapse via the \d+ rule below).
+    (re.compile(r"(?:[0-9a-fA-F]{1,4}:){3,}[0-9a-fA-F]{0,4}"), "<IP>"),
     (re.compile(r"0x[0-9a-fA-F]+"), "<HEX>"),
     (re.compile(r"\b[0-9a-fA-F]{16,}\b"), "<HEX>"),
+    # base64 / opaque token: >=20 base64 chars containing at least one digit.
+    # The digit lookahead skips long plain-letter identifiers (class names,
+    # method paths) so distinct errors are not over-collapsed into one fp.
+    (re.compile(r"(?=[A-Za-z0-9+/]*\d)[A-Za-z0-9+/]{20,}={0,2}"), "<B64>"),
     # Any digit run, even when glued to a unit (30s, 5ms), so the same error
     # template collapses to one fingerprint regardless of the number.
     (re.compile(r"\d+"), "<N>"),
@@ -221,6 +228,8 @@ def build_capture_bundle(job, _entries_fn=_capture_entries):
 # --- Brique C: continuous per-tick log signals (error/warn rate + fingerprints) ---
 
 _SIGNAL_LINES = 5000  # upper bound of journal entries scanned per unit per tick
+_SIGNAL_TIMEOUT = 5  # signals scan a small window; short timeout avoids the
+# watchdog risk of N units x 30s on the collection loop at a low incident interval.
 _TOP_FINGERPRINTS = 20
 
 
@@ -284,7 +293,7 @@ def collect_log_signals(
     result = {"window_s": window, "units": {}}
     for unit in units or []:
         try:
-            entries = _entries_fn(unit, since, _SIGNAL_LINES)
+            entries = _entries_fn(unit, since, _SIGNAL_LINES, _SIGNAL_TIMEOUT)
             if entries is None:
                 continue  # capture failed for this unit; skip, others still run
             result["units"][unit] = _signals_for_unit(entries)

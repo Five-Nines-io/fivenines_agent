@@ -70,6 +70,32 @@ def test_fingerprint_masks_uuid_and_ip():
     assert a == b
 
 
+def test_fingerprint_masks_ipv6():
+    a = fingerprint("peer 2001:0db8:85a3:0000:0000:8a2e:0370:7334 closed")
+    b = fingerprint("peer fe80:0000:0000:0000:0202:b3ff:fe1e:8329 closed")
+    assert a == b
+
+
+def test_fingerprint_masks_base64_token():
+    a = fingerprint("auth token c3VwZXJzZWNyZXQ1MjM0NXZhbHVl rejected")
+    b = fingerprint("auth token aGVsbG93b3JsZDk5OTl0b2tlbnh5 rejected")
+    assert a == b
+
+
+def test_fingerprint_keeps_plain_letter_identifiers_distinct():
+    # No digit -> not masked as base64, so distinct long identifiers stay distinct
+    # (guards against over-collapsing different errors into one fingerprint).
+    a = fingerprint("NullPointerException in OrderServiceHandlerFactory")
+    b = fingerprint("NullPointerException in PaymentGatewayDispatcher")
+    assert a != b
+
+
+def test_fingerprint_collapses_timestamps_via_digits():
+    a = fingerprint("request at 12:34:56 failed")
+    b = fingerprint("request at 01:02:03 failed")
+    assert a == b
+
+
 def test_fingerprint_different_template_differs():
     assert fingerprint("disk full") != fingerprint("connection refused")
 
