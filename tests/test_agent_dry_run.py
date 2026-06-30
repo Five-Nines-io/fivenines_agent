@@ -23,6 +23,7 @@ def make_dry_run_agent():
     synchronizer is None, config will be set from _DRY_RUN_CONFIG in run()."""
     agent = Agent.__new__(Agent)
     agent.synchronizer = None
+    agent.log_uploader = None
     agent.permissions = MagicMock()
     agent.permissions.get_all.return_value = {}
     agent.permissions.refresh_due.return_value = False

@@ -20,6 +20,7 @@ def test_registry_has_expected_config_keys():
         "network",
         "partitions",
         "io",
+        "logs",
         "smart_storage_health",
         "raid_storage_health",
         "processes",

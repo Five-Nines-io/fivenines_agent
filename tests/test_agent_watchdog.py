@@ -17,6 +17,7 @@ def make_agent():
     agent = Agent.__new__(Agent)
     agent.config = {"enabled": True, "interval": 60}
     agent.synchronizer = MagicMock()
+    agent.log_uploader = None
     agent.permissions = MagicMock()
     agent.permissions.get_all.return_value = {}
     agent.permissions.refresh_due.return_value = False

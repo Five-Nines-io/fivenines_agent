@@ -28,6 +28,9 @@ from fivenines_agent.env import config_dir, dry_run, env_file, get_user_context,
 from fivenines_agent.files import file_handles_limit, file_handles_used, handle_count
 from fivenines_agent.ip import get_ip
 from fivenines_agent.load_average import load_average
+from fivenines_agent.log_capture import CaptureCoordinator, evaluate_and_enqueue
+from fivenines_agent.log_uploader import LogUploader
+from fivenines_agent.logs import build_capture_bundle
 from fivenines_agent.machine_id import get_machine_id
 from fivenines_agent.packages import packages_sync
 from fivenines_agent.permissions import get_permissions, print_capabilities_banner
@@ -63,6 +66,7 @@ _DRY_RUN_CONFIG = {
     "network": True,
     "partitions": True,
     "io": True,
+    "logs": {"units": ["nginx.service", "ssh.service"]},
     "processes": True,
     "ports": True,
     "temperatures": True,
@@ -134,6 +138,26 @@ class Agent:
             self.synchronizer = Synchronizer(self.token, self.queue, self.static_data)
             self.synchronizer.start()
 
+        # Dedicated channel for incident log-capture bundles (Brique A), kept off
+        # the metric path so a slow/large /logs upload never blocks collection or
+        # /collect. The coordinator applies the capture_id nonce + disk persistence
+        # so a backend command fires exactly once and never replays after a restart.
+        self.log_queue = SynchronizationQueue(maxsize=20)
+        self.capture_coordinator = CaptureCoordinator(
+            os.path.join(CONFIG_DIR, "last_capture_id")
+        )
+        if self.synchronizer is None:
+            self.log_uploader = None
+        else:
+            self.log_uploader = LogUploader(
+                self.log_queue,
+                build_capture_bundle,
+                self.synchronizer.send_logs,
+                on_success=self.capture_coordinator.mark_uploaded,
+                on_failure=self.capture_coordinator.mark_failed,
+            )
+            self.log_uploader.start()
+
     def _load_file(self, filename):
         try:
             path = os.path.join(CONFIG_DIR, filename)
@@ -173,6 +197,8 @@ class Agent:
                         self.queue.put({"get_config": True, **self.static_data})
                         exit_event.wait(25)
                         continue
+
+                self._handle_capture_request(self.config)
 
                 data = self.static_data.copy()
                 data["ts"] = time.time()
@@ -257,6 +283,15 @@ class Agent:
         self._collect(
             "packages_sync", packages_sync, self.config, self.synchronizer.send_packages
         )
+
+    def _handle_capture_request(self, config):
+        """Enqueue an incident log-capture job when the backend issues a new
+        capture_logs command. The coordinator owns the nonce + allowlist + expiry;
+        the LogUploader thread runs the actual journalctl capture off the loop.
+        No-op when log uploading is disabled (dry-run / no synchronizer)."""
+        if self.log_uploader is None:
+            return
+        evaluate_and_enqueue(self.capture_coordinator, self.log_queue, config)
 
     def _handle_sighup_refresh(self):
         """SIGHUP-triggered full reprobe. Kept at the top of the loop (needs no
@@ -378,4 +413,8 @@ class Agent:
             self.synchronizer.stop()
             self.queue.put(None)
             self.synchronizer.join()
+        if self.log_uploader is not None:
+            self.log_uploader.stop()
+            self.log_queue.put(None)
+            self.log_uploader.join()
         sys.exit(0)
