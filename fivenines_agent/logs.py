@@ -23,6 +23,7 @@ import hashlib
 import json
 import re
 import subprocess
+import time
 
 from fivenines_agent.debug import log
 from fivenines_agent.subprocess_utils import get_clean_env
@@ -215,3 +216,78 @@ def build_capture_bundle(job, _entries_fn=_capture_entries):
         "digest": digest,
         "raw": None,
     }
+
+
+# --- Brique C: continuous per-tick log signals (error/warn rate + fingerprints) ---
+
+_SIGNAL_LINES = 5000  # upper bound of journal entries scanned per unit per tick
+_TOP_FINGERPRINTS = 20
+
+
+def _signals_for_unit(entries):
+    """error/warn rate + top redacted fingerprints for one unit's window."""
+    counts = {"error": 0, "warn": 0}
+    groups = {}
+    order = []
+    for e in entries:
+        sev = severity_from_priority(e.get("priority"))
+        if sev not in counts:
+            continue  # signals track error/warn only; info is dropped for size
+        counts[sev] += 1
+        message = e.get("message") or ""
+        fp = fingerprint(message)
+        group = groups.get(fp)
+        if group is None:
+            groups[fp] = {"count": 1, "severity": sev, "message": message}
+            order.append(fp)
+        else:
+            group["count"] += 1
+            if _SEVERITY_RANK[sev] > _SEVERITY_RANK[group["severity"]]:
+                group["severity"] = sev
+    ranked = sorted(order, key=lambda fp: groups[fp]["count"], reverse=True)
+    return {
+        "error_rate": counts["error"],
+        "warn_rate": counts["warn"],
+        "fingerprints": [
+            {
+                "fp": fp,
+                "count": groups[fp]["count"],
+                "severity": groups[fp]["severity"],
+                "sample": redact(groups[fp]["message"])[:_MAX_EXCERPT],
+            }
+            for fp in ranked[:_TOP_FINGERPRINTS]
+        ],
+    }
+
+
+def collect_log_signals(
+    units=None,
+    signal_interval_s=None,
+    enabled=True,
+    _entries_fn=_capture_entries,
+    _now=time.time,
+    **kwargs,
+):
+    """Brique C: per-tick, per-unit error/warn rates + top fingerprints.
+
+    Stateless on purpose: it reports the fingerprints + counts for the last
+    window; the backend derives new-vs-recurring from its own cross-tick history
+    (the agent stays dumb). Each unit is isolated so one bad unit never blanks the
+    others (registry-collector-needs-per-item-isolation).
+    """
+    window = signal_interval_s
+    if isinstance(window, bool) or not isinstance(window, (int, float)) or window <= 0:
+        window = 60
+    if not enabled:
+        return {"window_s": window, "units": {}}
+    since = int(_now()) - int(window)
+    result = {"window_s": window, "units": {}}
+    for unit in units or []:
+        try:
+            entries = _entries_fn(unit, since, _SIGNAL_LINES)
+            if entries is None:
+                continue  # capture failed for this unit; skip, others still run
+            result["units"][unit] = _signals_for_unit(entries)
+        except Exception as e:
+            log(f"log signals failed for {unit!r}: {e}", "error")
+    return result

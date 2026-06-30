@@ -11,6 +11,7 @@ from fivenines_agent.fail2ban import fail2ban_metrics
 from fivenines_agent.fans import fans
 from fivenines_agent.gpu import gpu_metrics
 from fivenines_agent.io import io
+from fivenines_agent.logs import collect_log_signals
 from fivenines_agent.memory import memory, swap
 from fivenines_agent.network import network
 from fivenines_agent.nginx import nginx_metrics
@@ -60,6 +61,9 @@ COLLECTORS = [
         ],
     ),
     ("io", [("io", io, False)]),
+    # Brique C log signals: per-unit error/warn rate + fingerprints. pass_kwargs
+    # unpacks the logs config (units allowlist, signal_interval_s) as **kwargs.
+    ("logs", [("logs", collect_log_signals, True)]),
     (
         "smart_storage_health",
         [
@@ -93,6 +97,9 @@ COLLECTORS = [
 CAPABILITY_KEY_OVERRIDES = {
     "smart_storage_health": "smart_storage",
     "raid_storage_health": "raid_storage",
+    # Log signals are gated by journald read access (capability added with the
+    # journald permission probe); until that lands, the cap is absent -> not gated.
+    "logs": "journald",
 }
 
 # Tracks (config_key, capability_value) pairs that have already been logged

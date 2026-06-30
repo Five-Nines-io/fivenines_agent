@@ -66,6 +66,7 @@ _DRY_RUN_CONFIG = {
     "network": True,
     "partitions": True,
     "io": True,
+    "logs": {"units": ["nginx.service", "ssh.service"]},
     "processes": True,
     "ports": True,
     "temperatures": True,
