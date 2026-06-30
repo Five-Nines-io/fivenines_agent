@@ -1,17 +1,11 @@
-"""Coverage for the small transport seams: Synchronizer.send_logs and the
-Brique A capture stub (build_capture_bundle, implemented in a follow-up chunk)."""
+"""Coverage for the Synchronizer.send_logs transport seam.
+
+Brique A (build_capture_bundle) and its helpers are covered in test_logs.py."""
 
 from unittest.mock import MagicMock
 
-from fivenines_agent.logs import build_capture_bundle
 from fivenines_agent.synchronization_queue import SynchronizationQueue
 from fivenines_agent.synchronizer import Synchronizer
-
-
-def test_build_capture_bundle_stub_returns_none():
-    # The Brique A capture is a follow-up chunk; the seam returns None for now so
-    # the LogUploader simply skips (no bundle to send).
-    assert build_capture_bundle({"capture_id": "x", "unit": "nginx.service"}) is None
 
 
 def test_send_logs_posts_to_logs_endpoint():
