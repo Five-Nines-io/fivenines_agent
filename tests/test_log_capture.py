@@ -34,9 +34,12 @@ def test_new_capture_fires_and_returns_job(tmp_path):
     }
 
 
-def test_fire_persists_capture_id(tmp_path):
+def test_evaluate_does_not_persist_mark_uploaded_does(tmp_path):
     path = os.path.join(str(tmp_path), "last_capture_id")
-    CaptureCoordinator(path).evaluate(_cmd(), ALLOW)
+    c = CaptureCoordinator(path)
+    c.evaluate(_cmd(), ALLOW)
+    assert not os.path.exists(path)  # in flight, not yet served
+    c.mark_uploaded("id-1")
     with open(path) as f:
         assert f.read() == "id-1"
 
@@ -44,7 +47,7 @@ def test_fire_persists_capture_id(tmp_path):
 def test_same_capture_id_does_not_refire(tmp_path):
     c = _coord(tmp_path)
     assert c.evaluate(_cmd(), ALLOW) is not None
-    assert c.evaluate(_cmd(), ALLOW) is None  # replay guard
+    assert c.evaluate(_cmd(), ALLOW) is None  # blocked while in flight
 
 
 def test_absent_or_empty_capture_id_is_noop(tmp_path):
@@ -85,18 +88,43 @@ def test_bool_expiry_is_ignored(tmp_path):
 
 def test_persistence_survives_restart(tmp_path):
     path = os.path.join(str(tmp_path), "last_capture_id")
-    CaptureCoordinator(path).evaluate(_cmd(), ALLOW)  # serves id-1, persists
+    c = CaptureCoordinator(path)
+    c.evaluate(_cmd(), ALLOW)
+    c.mark_uploaded("id-1")  # only an uploaded capture persists as served
     # "restart": a fresh coordinator loads the persisted id and must not replay.
     fresh = CaptureCoordinator(path)
     assert fresh.evaluate(_cmd(), ALLOW) is None
 
 
-def test_persist_failure_still_returns_job(tmp_path):
+def test_persist_failure_in_mark_uploaded_is_best_effort(tmp_path):
     # state_path under a nonexistent dir -> write raises -> caught best-effort.
     bad = os.path.join(str(tmp_path), "missing", "last_capture_id")
     c = CaptureCoordinator(bad)
-    assert c.evaluate(_cmd(), ALLOW) is not None  # capture still proceeds
-    assert c.evaluate(_cmd(), ALLOW) is None  # in-memory guard still holds
+    assert c.evaluate(_cmd(), ALLOW) is not None  # fires (in flight)
+    c.mark_uploaded("id-1")  # persist raises -> caught; in-memory served holds
+    assert c.evaluate(_cmd(), ALLOW) is None  # last_served guard (in-memory)
+
+
+def test_mark_failed_releases_for_retry(tmp_path):
+    c = _coord(tmp_path)
+    assert c.evaluate(_cmd(), ALLOW) is not None  # in flight
+    assert c.evaluate(_cmd(), ALLOW) is None  # blocked while in flight
+    c.mark_failed("id-1")  # upload failed -> release the slot
+    assert c.evaluate(_cmd(), ALLOW) is not None  # retried on a later tick
+
+
+def test_mark_uploaded_blocks_refire(tmp_path):
+    c = _coord(tmp_path)
+    assert c.evaluate(_cmd(), ALLOW) is not None
+    c.mark_uploaded("id-1")
+    assert c.evaluate(_cmd(), ALLOW) is None  # served, no replay
+
+
+def test_mark_helpers_ignore_empty_capture_id(tmp_path):
+    c = _coord(tmp_path)
+    c.mark_uploaded(None)  # no-op, no crash
+    c.mark_failed("")  # no-op
+    assert c.evaluate(_cmd(), ALLOW) is not None  # state untouched
 
 
 def test_load_error_when_state_path_is_dir(tmp_path):

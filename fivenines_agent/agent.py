@@ -150,7 +150,11 @@ class Agent:
             self.log_uploader = None
         else:
             self.log_uploader = LogUploader(
-                self.log_queue, build_capture_bundle, self.synchronizer.send_logs
+                self.log_queue,
+                build_capture_bundle,
+                self.synchronizer.send_logs,
+                on_success=self.capture_coordinator.mark_uploaded,
+                on_failure=self.capture_coordinator.mark_failed,
             )
             self.log_uploader.start()
 

@@ -95,3 +95,66 @@ def test_stop_sets_event():
     assert not up._stop_event.is_set()
     up.stop()
     assert up._stop_event.is_set()
+
+
+# --- coordinator callbacks (B2 retry) ---
+
+
+def _run_cb(build_fn, send_fn, jobs, **cbs):
+    q = SynchronizationQueue(maxsize=50)
+    up = LogUploader(q, build_fn, send_fn, **cbs)
+    up.start()
+    for j in jobs:
+        q.put(j)
+    q.put(None)
+    up.join(timeout=2)
+
+
+def test_on_success_called_with_capture_id():
+    got = []
+    _run_cb(
+        lambda job: {"b": job["capture_id"]},
+        lambda b: True,
+        [{"capture_id": "X"}],
+        on_success=lambda cid: got.append(("ok", cid)),
+        on_failure=lambda cid: got.append(("fail", cid)),
+    )
+    assert got == [("ok", "X")]
+
+
+def test_on_failure_called_on_send_false():
+    got = []
+    _run_cb(
+        lambda job: {"b": 1},
+        lambda b: False,
+        [{"capture_id": "Y"}],
+        on_failure=lambda cid: got.append(cid),
+    )
+    assert got == ["Y"]
+
+
+def test_on_failure_called_on_send_exception():
+    got = []
+
+    def send(b):
+        raise RuntimeError("net down")
+
+    _run_cb(lambda job: {"b": 1}, send, [{"capture_id": "Z"}], on_failure=got.append)
+    assert got == ["Z"]
+
+
+def test_on_failure_called_on_build_none_and_exception():
+    got = []
+
+    def build(job):
+        if job["capture_id"] == "boom":
+            raise ValueError("x")
+        return None  # capture failed -> retry
+
+    _run_cb(
+        build,
+        lambda b: True,
+        [{"capture_id": "none"}, {"capture_id": "boom"}],
+        on_failure=got.append,
+    )
+    assert got == ["none", "boom"]
