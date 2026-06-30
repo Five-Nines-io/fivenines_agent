@@ -121,6 +121,16 @@ class Synchronizer(Thread):
         """Send packages data to /packages. Returns response or None."""
         return self._post("/packages", packages_data)
 
+    def send_logs(self, bundle):
+        """Send a log-capture bundle to /logs. Returns response or None.
+
+        Mirrors send_packages: gzip + auth + bounded retries via _post. Called
+        from the dedicated LogUploader thread (not the collection loop or the
+        /collect synchronizer drain), so a slow/large upload never blocks metric
+        collection or config sync.
+        """
+        return self._post("/logs", bundle)
+
     def get_conn(self):
         url = api_url()
         if not url.startswith("localhost"):
