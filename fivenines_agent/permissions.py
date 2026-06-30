@@ -47,6 +47,7 @@ CAPABILITY_HINTS = {
     "temperatures": "no accessible sensors",
     "fans": "no accessible sensors",
     "snmp": "requires net-snmp",
+    "journald": "requires systemd-journal group",
     "disk_health": "requires WMI Storage namespace access",
     "software_inventory": "requires Uninstall registry key access",
 }
@@ -60,6 +61,7 @@ LINUX_BANNER_GROUPS = [
     ("Services", ["docker", "qemu", "proxmox"]),
     ("Security", ["fail2ban", "packages"]),
     ("Networking", ["snmp"]),
+    ("Logs", ["journald"]),
 ]
 
 WINDOWS_BANNER_GROUPS = [
@@ -192,6 +194,8 @@ class PermissionProbe:
             "packages": (self._can_list_packages, ()),
             # SNMP polling - needs net-snmp CLI tools
             "snmp": (self._has_snmpget, ()),
+            # Log monitoring - needs journald read access (systemd-journal group)
+            "journald": (self._can_read_journal, ()),
         }
 
     def _build_linux_capabilities(self):
@@ -567,6 +571,41 @@ class PermissionProbe:
                 f"{docker_socket} not accessible (readable={readable}, writable={writable})"
             )
         return accessible
+
+    def _can_read_journal(self):
+        """Probe journald read access the way the log collector reads it: a
+        trivial `journalctl -n 0`. True means the agent (which runs as the
+        unprivileged fivenines user) can actually read the journal - in practice
+        that requires systemd-journal group membership. Mirroring the real read
+        avoids guessing about file modes or persistent-vs-volatile storage."""
+        journalctl = shutil.which("journalctl")
+        if not journalctl:
+            log("_can_read_journal: journalctl not found", "debug")
+            self._set_reason("journalctl not found in PATH")
+            return False
+        try:
+            result = subprocess.run(
+                [journalctl, "-n", "0", "--quiet"],
+                capture_output=True,
+                timeout=5,
+                env=get_clean_env(),
+            )
+        except subprocess.TimeoutExpired:
+            log("_can_read_journal: journalctl timed out", "debug")
+            self._set_reason("journalctl timed out")
+            return False
+        except Exception as e:
+            log(f"_can_read_journal: {type(e).__name__}: {e}", "debug")
+            self._set_reason(f"{type(e).__name__}: {e}")
+            return False
+        ok = result.returncode == 0
+        log(
+            f"_can_read_journal: rc={result.returncode} -> {'OK' if ok else 'NO'}",
+            "debug",
+        )
+        if not ok:
+            self._set_reason("journalctl non-zero exit (systemd-journal group?)")
+        return ok
 
     def _can_access_libvirt(self):
         """Probe QEMU/libvirt the way the collector connects: attempt

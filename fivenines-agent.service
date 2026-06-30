@@ -4,6 +4,9 @@ Description=Five Nines monitoring agent
 [Service]
 Type=notify
 User=fivenines
+# Grants read access to the systemd journal so the log-monitoring collector can
+# run as the unprivileged fivenines user (journald capability).
+SupplementaryGroups=systemd-journal
 ExecStart=/opt/fivenines/fivenines_agent
 RestartSec=5
 Restart=always
