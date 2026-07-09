@@ -103,7 +103,11 @@ PYINSTALLER_ARGS="--strip \
     --hidden-import=libvirt \
     --hidden-import=libvirtmod \
     --hidden-import=proxmoxer.backends \
-    --hidden-import=proxmoxer.backends.https"
+    --hidden-import=proxmoxer.backends.https \
+    --hidden-import=scramp \
+    --hidden-import=dateutil.parser \
+    --copy-metadata pg8000 \
+    --copy-metadata scramp"
 
 if [ -n "$PYTHON_LIB" ] && [ -f "$PYTHON_LIB" ]; then
     echo "Adding Python shared library: $PYTHON_LIB"
@@ -127,9 +131,14 @@ echo "Total directory size: $(du -sh ./build/$BINARY_NAME | awk '{print $1}')"
 echo "Binary dependencies:"
 ldd ./build/$BINARY_NAME/$BINARY_NAME | head -10 || echo "ldd check failed"
 
-# Quick test
+# Quick test. --version imports the full collector graph (incl. pg8000, which
+# reads its package metadata at import), so a failure here means a missing
+# hidden import or un-copied metadata -- fail the build rather than ship it.
 echo "=== Testing Built Binary ==="
-./build/$BINARY_NAME/$BINARY_NAME --version || echo "Version check failed, but binary was built"
+if ! ./build/$BINARY_NAME/$BINARY_NAME --version; then
+    echo "Smoke check FAILED: built binary cannot run --version. Aborting."
+    exit 1
+fi
 
 # Move to final location
 mv ./build/$BINARY_NAME ./dist/linux/

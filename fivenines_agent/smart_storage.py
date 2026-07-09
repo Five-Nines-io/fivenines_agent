@@ -8,6 +8,14 @@ from fivenines_agent.subprocess_utils import get_clean_env
 
 _cache = TTLCache()
 
+# Cap data-collection smartctl/nvme calls so a slow or hanging drive cannot
+# block the single-threaded collection loop indefinitely and starve the systemd
+# watchdog. (A drive truly wedged in uninterruptible D-state I/O can still delay
+# the post-timeout reap -- that is a kernel-level limit no userspace timeout
+# fully escapes.) 30s matches the heaviest data collector (packages.py) and is
+# generous for slow-but-healthy drives.
+_DATA_SUBPROCESS_TIMEOUT = 30
+
 # SMART attributes where normalized VALUE (0-100%) is more meaningful than RAW_VALUE
 # These typically represent wear/life percentages
 SMART_LIFE_ATTRIBUTES = {'177', '202', '231', '232', '233'}
@@ -240,47 +248,37 @@ NVME_ATTRIBUTE_NAMES = {
     'Critical Composite Temperature Time': 'critical_comp_time'
 }
 
-def smartctl_available():
-    """
-    Check if smartctl is available and we have permission to run it.
-    Uses sudo -n (non-interactive) to detect if sudoers is configured.
-    Returns False if:
-    - smartctl is not installed
-    - sudo is not configured for this user
-    - sudo would require a password
+def _sudo_probe(args, timeout=5):
+    """Run `sudo -n <args>` and return the CompletedProcess, or None.
+
+    Returns None when the command could not run, exited non-zero, timed out, or
+    raised -- i.e. the tool is not usable via passwordless sudo. Centralizes the
+    one `sudo -n` probe shape shared by the *_available() gates and the
+    get_*_version() fetchers, so the invocation, timeout, and env handling
+    cannot drift between them. Uses sudo -n (non-interactive) to detect whether
+    sudoers is configured without ever prompting for a password.
     """
     try:
         result = subprocess.run(
-            ["sudo", "-n", "smartctl", "--version"],
-            capture_output=True,
-            timeout=5,
+            ["sudo", "-n", *args],
+            capture_output=True, text=True, timeout=timeout,
             env=get_clean_env()
         )
-        return result.returncode == 0
+        return result if result.returncode == 0 else None
     except subprocess.TimeoutExpired:
-        log("smartctl availability check timed out", 'error')
-        return False
-    except Exception:
-        return False
+        log(f"sudo -n {args[0]} probe timed out", 'error')
+        return None
+    except Exception as e:
+        log(f"sudo -n {args[0]} probe failed: {e}", 'debug')
+        return None
+
+def smartctl_available():
+    """Whether smartctl is installed and runnable via passwordless sudo."""
+    return _sudo_probe(["smartctl", "--version"]) is not None
 
 def nvme_cli_available():
-    """
-    Check if nvme-cli is available and we have permission to run it.
-    Uses sudo -n (non-interactive) to detect if sudoers is configured.
-    """
-    try:
-        result = subprocess.run(
-            ["sudo", "-n", "nvme", "version"],
-            capture_output=True,
-            timeout=5,
-            env=get_clean_env()
-        )
-        return result.returncode == 0
-    except subprocess.TimeoutExpired:
-        log("nvme availability check timed out", 'error')
-        return False
-    except Exception:
-        return False
+    """Whether nvme-cli is installed and runnable via passwordless sudo."""
+    return _sudo_probe(["nvme", "version"]) is not None
 
 def is_partition(device):
     """Check if a device is a partition."""
@@ -298,7 +296,7 @@ def list_storage_devices():
     try:
         result = subprocess.run(
             ['sudo', 'smartctl', '--scan'],
-            capture_output=True,
+            capture_output=True, timeout=_DATA_SUBPROCESS_TIMEOUT,
             env=get_clean_env()
         )
         lines = result.stdout.decode().splitlines()
@@ -321,6 +319,7 @@ def get_nvme_enhanced_info(device):
         result = subprocess.run(
             ["sudo", "nvme", "smart-log", device, "-o", "json"],
             capture_output=True, text=True, check=True,
+            timeout=_DATA_SUBPROCESS_TIMEOUT,
             env=get_clean_env()
         )
         raw = json.loads(result.stdout)
@@ -341,8 +340,14 @@ def get_nvme_enhanced_info(device):
         log(f"Error fetching NVMe enhanced info for device: {device}: {e}", 'error')
         return {}
 
-def get_storage_info(device):
-    """Get storage device information using smartctl and optionally nvme-cli."""
+def get_storage_info(device, nvme_available=lambda: False):
+    """Get storage device information using smartctl and optionally nvme-cli.
+
+    nvme_available is a zero-arg callable, memoized once per collection tick by
+    the caller. It is consulted only for devices whose parsed SMART output is
+    NVMe, so a host with no NVMe device never shells out to `nvme version` and a
+    multi-NVMe host probes exactly once per tick.
+    """
     try:
         results = {
             "device": device.split('/')[-1]
@@ -350,6 +355,7 @@ def get_storage_info(device):
         proc_result = subprocess.run(
             ['sudo', 'smartctl', '-A', '-H', device],
             capture_output=True, text=True,
+            timeout=_DATA_SUBPROCESS_TIMEOUT,
             env=get_clean_env()
         )
         storage_stats = proc_result.stdout.splitlines()
@@ -402,8 +408,10 @@ def get_storage_info(device):
             elif key == "Critical Warning":
                 results["critical_warning"] = safe_int_conversion(value, 16)
 
-        # If it's an NVMe device and nvme-cli is available, get enhanced info
-        if current_section == "nvme" and nvme_cli_available():
+        # If it's an NVMe device and nvme-cli is available, get enhanced info.
+        # The probe is memoized by the caller, so this runs `nvme version` at
+        # most once per tick no matter how many NVMe devices are present.
+        if current_section == "nvme" and nvme_available():
             nvme_info = get_nvme_enhanced_info(device)
             results.update(nvme_info)
 
@@ -426,10 +434,32 @@ def safe_int_conversion(value, base=10):
     """Safely convert a string to integer, handling various formats."""
     if not value:
         return None
+    value = value.strip()
     try:
-        # Remove any non-numeric characters except for minus sign
-        cleaned = ''.join(c for c in value if c.isdigit() or c == '-')
-        return int(cleaned, base)
+        # Direct parse first. With base 16 this correctly reads hex like
+        # "0x0c" -> 12; the old digit-only strip dropped a-f, so an NVMe
+        # "Critical Warning: 0x0c" became 0 and a failing drive read as healthy.
+        return int(value, base)
+    except (ValueError, TypeError):
+        pass
+    try:
+        # Fall back for values with trailing text (e.g. "100 (raw)" or a
+        # hypothetical annotated "0x0c (A)"). Drop a base-matching radix prefix
+        # first, then take the LEADING run of valid characters and stop at the
+        # first invalid one. Filtering the whole string instead would let the
+        # annotation's letters bleed into the result (e.g. "0x0c (A)" -> 202).
+        v = value.lower()
+        for prefix, prefix_base in (("0x", 16), ("0o", 8), ("0b", 2)):
+            if base == prefix_base and v.startswith(prefix):
+                v = v[len(prefix):]
+                break
+        valid = set("0123456789abcdef"[:base] + "-")
+        leading = ""
+        for c in v:
+            if c not in valid:
+                break
+            leading += c
+        return int(leading, base)
     except (ValueError, TypeError):
         return None
 
@@ -445,34 +475,25 @@ def safe_temperature_conversion(value):
         return None
 
 def get_smartctl_version():
-    """Get smartctl version information."""
-    try:
-        result = subprocess.run(
-            ["sudo", "smartctl", "--version"],
-            capture_output=True, text=True, check=True,
-            env=get_clean_env()
-        )
-        # Extract version from first line
-        version_line = result.stdout.split('\n')[0]
-        return version_line.strip()
-    except Exception as e:
-        log(f"Error fetching smartctl version: {e}", 'error')
+    """Return the smartctl version string, or None if smartctl is unavailable.
+
+    Routes through _sudo_probe, so it doubles as the availability check: an
+    unusable smartctl (absent, no passwordless sudo) -- or empty version output
+    -- returns None quietly, letting the caller skip a separate probe.
+    """
+    proc = _sudo_probe(["smartctl", "--version"])
+    if proc is None:
         return None
+    # First line, or None if the tool printed nothing parseable.
+    return proc.stdout.split('\n')[0].strip() or None
 
 def get_nvme_cli_version():
-    """Get nvme-cli version information."""
-    try:
-        result = subprocess.run(
-            ["sudo", "nvme", "version"],
-            capture_output=True, text=True, check=True,
-            env=get_clean_env()
-        )
-        # Extract version from first line
-        version_line = result.stdout.split('\n')[0]
-        return version_line.strip()
-    except Exception as e:
-        log(f"Error fetching nvme-cli version: {e}", 'error')
+    """Return the nvme-cli version string, or None if nvme-cli is unavailable."""
+    proc = _sudo_probe(["nvme", "version"])
+    if proc is None:
         return None
+    # First line, or None if the tool printed nothing parseable.
+    return proc.stdout.split('\n')[0].strip() or None
 
 def get_storage_identification(device):
     """Get storage device identification using smartctl."""
@@ -480,6 +501,7 @@ def get_storage_identification(device):
         result = subprocess.run(
             ["sudo", "smartctl", "-i", device],
             capture_output=True, text=True, check=True,
+            timeout=_DATA_SUBPROCESS_TIMEOUT,
             env=get_clean_env()
         )
 
@@ -514,13 +536,12 @@ def smart_storage_identification():
 
 
 def _compute_storage_identification():
-    # Get tool versions only if we have devices to process
-    tool_versions = {
-        "smartctl_version": get_smartctl_version() if smartctl_available() else None,
-        "nvme_cli_version": get_nvme_cli_version() if nvme_cli_available() else None
-    }
-
-    if tool_versions["smartctl_version"] is None:
+    # Preserve the prior failure contract: if smartctl's version is unreadable,
+    # emit nothing rather than a partial payload (the backend reads this shape).
+    # get_smartctl_version() self-checks via `sudo -n`, so it doubles as the
+    # availability gate -- no separate smartctl_available() shell-out.
+    smartctl_version = get_smartctl_version()
+    if smartctl_version is None:
         log("smartctl unavailable (not installed or no sudo permissions)", 'debug')
         return []
 
@@ -529,11 +550,40 @@ def _compute_storage_identification():
         log("No storage devices found", 'error')
         return []
 
+    # Fetch the nvme-cli version only when an NVMe device is present, so
+    # ATA-only hosts never shell out to `nvme version`. Identification
+    # keys off the device path (its `smartctl -i` output has no SMART
+    # section to parse, unlike the health collector). get_nvme_cli_version()
+    # self-checks via `sudo -n` and returns None when nvme-cli is unusable,
+    # so it doubles as the availability gate. The key stays in the payload
+    # (null when absent) to keep the per-device shape stable.
+    has_nvme = any(is_nvme_device(dev) for dev in devices)
+    tool_versions = {
+        "smartctl_version": smartctl_version,
+        "nvme_cli_version": get_nvme_cli_version() if has_nvme else None,
+    }
     data = [get_storage_identification(dev) for dev in devices]
     data = [d for d in data if d is not None]
     for device_info in data:
         device_info.update(tool_versions)
     return data
+
+
+def _memoized_nvme_probe():
+    """Build a zero-arg callable that runs nvme_cli_available() at most once.
+
+    Passed to get_storage_info per tick so several NVMe drives share a single
+    `nvme version` probe, while a host with no NVMe device (no parsed nvme
+    section) never probes at all.
+    """
+    state = {}
+
+    def probe():
+        if "available" not in state:
+            state["available"] = nvme_cli_available()
+        return state["available"]
+
+    return probe
 
 
 @debug('smart_storage_health')
@@ -556,6 +606,10 @@ def _compute_storage_health():
         log("No storage devices found", 'error')
         return []
 
-    data = [get_storage_info(dev) for dev in devices]
+    # Probe nvme-cli at most once per tick (memoized) and only for
+    # devices whose parsed SMART output is NVMe, matching the per-device
+    # gate in get_storage_info. Hosts with no NVMe device never probe.
+    nvme_probe = _memoized_nvme_probe()
+    data = [get_storage_info(dev, nvme_probe) for dev in devices]
     # Remove None values
     return [d for d in data if d is not None]

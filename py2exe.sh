@@ -283,6 +283,8 @@ PYI_BASE=(
     --exclude-module doctest --exclude-module test --exclude-module distutils
     --noconfirm --onedir --name "$BINARY_NAME"
     --workpath ./build/tmp --distpath ./build --clean
+    --hidden-import=scramp --hidden-import=dateutil.parser
+    --copy-metadata pg8000 --copy-metadata scramp
     --add-binary "$PYTHON_LIB:."
     --add-binary "/usr/local/lib/libcrypt.so.2:." --add-binary "/usr/local/lib/libcrypt.so.1:."
     --add-binary "/usr/lib64/libz.so.1:."
@@ -308,9 +310,14 @@ echo "Total directory size: $(du -sh ./build/$BINARY_NAME | awk '{print $1}')"
 echo "Binary dependencies:"
 ldd ./build/$BINARY_NAME/$BINARY_NAME | head -10 || echo "ldd check failed (might be expected)"
 
-# Quick test of the binary
+# Quick test of the binary. --version must succeed: it imports the full
+# collector graph (incl. pg8000, which reads its package metadata at import),
+# so this catches missing hidden imports or un-copied metadata before shipping.
 echo "=== Testing Built Binary ==="
-./build/$BINARY_NAME/$BINARY_NAME --version || echo "Version check failed, but binary was built"
+if ! ./build/$BINARY_NAME/$BINARY_NAME --version; then
+    echo "Smoke check FAILED: built binary cannot run --version (missing hidden import or bundled metadata). Aborting."
+    exit 1
+fi
 
 # Move to final location
 if [ -n "${SYNOLOGY:-}" ]; then

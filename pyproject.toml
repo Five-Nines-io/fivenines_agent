@@ -14,6 +14,11 @@ certifi = "^2024.12.14"
 docker = "^7.1.0"
 dnspython = "^2.7"
 requests = "^2.33.0"
+# Pure-Python PostgreSQL driver for the postgresql collector. Chosen over
+# psycopg (C extension + libpq) because it bundles into the PyInstaller binary
+# on both glibc and musl with no shared-library handling. Pulls scramp +
+# python-dateutil transitively (locked in poetry.lock, no security floor).
+pg8000 = "^1.31.5"
 # Security floor: GHSA-pq67-6m6q-mj2v (decompression bomb), GHSA-48p4-8xcf-vxj5 (header leak across origins). Brought in transitively by requests/docker; pinned here so future lock regenerations cannot drop below the patched line.
 urllib3 = "^2.7.0"
 
@@ -57,7 +62,7 @@ pyinstaller = "^6.11.1"
 virtualenv = ">=20.33.0"
 # Security floors for transitive dev deps. Brought in by poetry/keyring/secretstorage. Pinned here so poetry lock cannot resolve below the patched line.
 poetry = "^2.3.4"  # GHSA-4xc9-8hv6-g4j4 (wheel traversal), GHSA-9q47-jr9w-2qhc (tar traversal)
-cryptography = "^46.0.6"  # GHSA-79v4-65xg-pq4g (subgroup attack), GHSA-h4gh-qq45-vh27 (DNS name constraints)
+cryptography = "^48.0.1"  # GHSA-79v4-65xg-pq4g (subgroup attack), GHSA-h4gh-qq45-vh27 (DNS name constraints)
 
 [build-system]
 requires = ["poetry-core"]
