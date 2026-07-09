@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 from unittest.mock import patch
 
@@ -37,6 +38,15 @@ def clock(monkeypatch):
 
 
 def test_metrics_no_clusters_returns_none(clock):
+    """BY DESIGN (cross-repo contract): the server owns the default target.
+
+    Empty means the server sent nothing to poll -- the agent must NOT invent a
+    fallback cluster here. The standard enable path never sends an empty list:
+    fivenines-server's ceph_targets_for_host returns [{"name": "ceph"}] when a
+    host has no CephTarget override rows. If this pin breaks in either repo,
+    the ownership of the default target has silently moved -- coordinate with
+    fivenines-server (spec/requests/api_collect_ceph_spec.rb) before changing.
+    """
     assert ceph.ceph_metrics(clusters=None) is None
     assert ceph.ceph_metrics(clusters=[]) is None
 
@@ -533,3 +543,141 @@ def test_metrics_tolerates_extra_config_keys(clock):
         # the collector (caught by **_).
         out = ceph.ceph_metrics(clusters=[{"name": "a"}], poll_mode="fast")
     assert out == {"clusters": [{"configured_name": "a"}]}
+
+
+# --- cross-repo contract (fivenines-server) ---------------------------------
+
+
+class _KeySpy(dict):
+    """Dict that records every key consulted via .get()."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.accessed = set()
+
+    def get(self, key, default=None):
+        self.accessed.add(key)
+        return super().get(key, default)
+
+
+def test_config_key_names_match_server_contract(clock):
+    """Documented server shape (ceph_targets_for_host): a cluster entry carries
+    exactly name, id, keyring, conf, use_sudo -- blank keyring/conf are omitted
+    server-side (.compact), so absence must mean "standard search path".
+
+    Two-way pin: every documented key is consulted and takes effect (drift =
+    the agent ignores server config), and NO other key is consulted (drift =
+    the agent invents a key the server never sends). Fix any mismatch toward
+    the server's names.
+    """
+    cluster = _KeySpy(
+        name="prod",
+        id="agent",
+        keyring="/etc/ceph/prod.client.agent.keyring",
+        conf="/etc/ceph/prod.conf",
+        use_sudo=True,
+    )
+    seen = {}
+
+    def runner(base, cmd, name):
+        seen["base"] = base
+        return (None, {"type": "unreachable", "message": "x"})
+
+    with patch.object(ceph, "_run_ceph_cached", runner), patch.object(ceph, "log"):
+        ceph._poll_cluster(cluster)
+
+    base = seen["base"]
+    assert base[base.index("--cluster") + 1] == "prod"
+    assert base[base.index("-c") + 1] == "/etc/ceph/prod.conf"
+    assert base[base.index("--name") + 1] == "client.agent"
+    assert base[base.index("--keyring") + 1] == "/etc/ceph/prod.client.agent.keyring"
+    assert cluster.accessed == {"name", "id", "keyring", "conf", "use_sudo"}
+
+
+# Canned `ceph ... -f json` CLI outputs backing the shared fixture. Realistic
+# (Reef-era) shapes trimmed to the fields the parsers read: 3 mons in quorum,
+# 1 of 3 OSDs down, 12 PGs undersized+degraded, 2 CRUSH host buckets.
+_CLI_STATUS = {
+    "fsid": "3f6ad3d1-8f6e-4a5b-9e6c-2f4a1b8c9d0e",
+    "health": {
+        "status": "HEALTH_WARN",
+        "checks": {"OSD_DOWN": {"severity": "HEALTH_WARN"}},
+    },
+    "quorum": [0, 1, 2],
+    "monmap": {"mons": [{"name": "a"}, {"name": "b"}, {"name": "c"}]},
+    "osdmap": {"num_osds": 3, "num_up_osds": 2, "num_in_osds": 3},
+    "pgmap": {
+        "num_pgs": 129,
+        "pgs_by_state": [
+            {"state_name": "active+clean", "count": 117},
+            {"state_name": "active+undersized+degraded", "count": 12},
+        ],
+    },
+}
+_CLI_DF = {
+    "stats": {
+        "total_bytes": 32212254720,
+        "total_used_bytes": 12884901888,
+        "total_avail_bytes": 19327352832,
+    }
+}
+_CLI_TREE = {
+    "nodes": [
+        {"id": -1, "name": "default", "type": "root", "children": [-3, -2]},
+        {"id": -2, "name": "node-1", "type": "host", "children": [0, 1]},
+        {"id": -3, "name": "node-2", "type": "host", "children": [2]},
+        {"id": 0, "name": "osd.0", "type": "osd"},
+        {"id": 1, "name": "osd.1", "type": "osd"},
+        {"id": 2, "name": "osd.2", "type": "osd"},
+    ]
+}
+
+_FIXTURE_PATH = os.path.join(
+    os.path.dirname(__file__), "fixtures", "ceph_contract_payload.json"
+)
+
+
+def test_contract_fixture_round_trip(clock):
+    """SHARED FIXTURE (cross-repo contract): fixtures/ceph_contract_payload.json.
+
+    The same file is asserted on both sides:
+    - here: ceph_metrics(**fixture["config"]) must equal fixture["payload"]
+      with only subprocess.run mocked (canned CLI JSON above), so the whole
+      config-in -> parse -> payload-out pipeline is pinned;
+    - fivenines-server: spec/requests/api_collect_ceph_spec.rb posts
+      fixture["payload"] under data["ceph"] and asserts Ingesters::Ceph
+      ingests it (metrics are gated on the collection *_ok flags).
+
+    Change the payload shape only in lockstep with the server spec and its
+    fixture copy.
+    """
+    with open(_FIXTURE_PATH) as f:
+        fixture = json.load(f)
+
+    def fake_run(argv, **kwargs):
+        if "edge" in argv:  # second cluster: unreachable
+            return _FakeProc(1, "", "unable to connect to cluster")
+        if "status" in argv:
+            return _FakeProc(0, json.dumps(_CLI_STATUS))
+        if "df" in argv:
+            return _FakeProc(0, json.dumps(_CLI_DF))
+        assert "tree" in argv, "unexpected ceph subcommand: {}".format(argv)
+        return _FakeProc(0, json.dumps(_CLI_TREE))
+
+    with patch.object(ceph.shutil, "which", lambda _: "/usr/bin/ceph"), patch.object(
+        ceph.subprocess, "run", fake_run
+    ):
+        out = ceph.ceph_metrics(**fixture["config"])
+
+    assert out == fixture["payload"]
+    # Completeness flags, explicitly: exactly the names the server's ingester
+    # reads. A renamed or dropped flag must fail here, not silently zero the
+    # server-side metrics.
+    for cluster in out["clusters"]:
+        assert set(cluster["collection"]) == {
+            "reachable",
+            "status_ok",
+            "df_ok",
+            "tree_ok",
+            "error",
+        }
