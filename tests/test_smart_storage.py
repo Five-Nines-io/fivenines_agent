@@ -45,18 +45,22 @@ def _proc(returncode=0, stdout=""):
 
 
 def _nvme_smartctl_proc():
-    return _proc(stdout=(
-        "=== START OF SMART DATA SECTION ===\n"
-        "SMART overall-health self-assessment test result: PASSED\n"
-        "Critical Warning: 0x0c\n"
-    ))
+    return _proc(
+        stdout=(
+            "=== START OF SMART DATA SECTION ===\n"
+            "SMART overall-health self-assessment test result: PASSED\n"
+            "Critical Warning: 0x0c\n"
+        )
+    )
 
 
 def _ata_smartctl_proc():
-    return _proc(stdout=(
-        "=== START OF READ SMART DATA SECTION ===\n"
-        "  9 Power_On_Hours        0x0032   100   100   000    Old_age   1234\n"
-    ))
+    return _proc(
+        stdout=(
+            "=== START OF READ SMART DATA SECTION ===\n"
+            "  9 Power_On_Hours        0x0032   100   100   000    Old_age   1234\n"
+        )
+    )
 
 
 # --- safe_int_conversion --------------------------------------------------
@@ -80,8 +84,8 @@ def test_safe_int_conversion_parses_hex_and_decimal():
     assert smart_storage.safe_int_conversion("nonsense") is None
     # Annotated values take only the LEADING valid run -- a trailing annotation
     # must not inject digits into the result (the fallback path).
-    assert smart_storage.safe_int_conversion("12 (200)") == 12       # not 12200
-    assert smart_storage.safe_int_conversion("0c foo", 16) == 12     # not 0x0cf=207
+    assert smart_storage.safe_int_conversion("12 (200)") == 12  # not 12200
+    assert smart_storage.safe_int_conversion("0c foo", 16) == 12  # not 0x0cf=207
     # Radix-prefixed + annotated hex: strip the 0x, then leading run -- must NOT
     # collapse to 0 (a dangerous "healthy" critical_warning).
     assert smart_storage.safe_int_conversion("0x04 (foo)", 16) == 4
@@ -102,9 +106,7 @@ def test_get_smartctl_version_parses_first_line(monkeypatch):
 
 def test_get_smartctl_version_none_when_unavailable(monkeypatch):
     """Non-zero exit (no smartctl / no passwordless sudo) -> None, quietly."""
-    monkeypatch.setattr(
-        smart_storage.subprocess, "run", lambda *_a, **_k: _proc(1, "")
-    )
+    monkeypatch.setattr(smart_storage.subprocess, "run", lambda *_a, **_k: _proc(1, ""))
     assert smart_storage.get_smartctl_version() is None
 
 
@@ -118,9 +120,7 @@ def test_get_nvme_cli_version_parses_first_line(monkeypatch):
 
 
 def test_get_nvme_cli_version_none_when_unavailable(monkeypatch):
-    monkeypatch.setattr(
-        smart_storage.subprocess, "run", lambda *_a, **_k: _proc(1, "")
-    )
+    monkeypatch.setattr(smart_storage.subprocess, "run", lambda *_a, **_k: _proc(1, ""))
     assert smart_storage.get_nvme_cli_version() is None
 
 
@@ -139,9 +139,7 @@ def test_smartctl_available_reflects_probe(monkeypatch):
         smart_storage.subprocess, "run", lambda *_a, **_k: _proc(0, "smartctl 7.2\n")
     )
     assert smart_storage.smartctl_available() is True
-    monkeypatch.setattr(
-        smart_storage.subprocess, "run", lambda *_a, **_k: _proc(1, "")
-    )
+    monkeypatch.setattr(smart_storage.subprocess, "run", lambda *_a, **_k: _proc(1, ""))
     assert smart_storage.smartctl_available() is False
 
 
@@ -151,14 +149,13 @@ def test_nvme_cli_available_reflects_probe(monkeypatch):
         smart_storage.subprocess, "run", lambda *_a, **_k: _proc(0, "nvme 2.1\n")
     )
     assert smart_storage.nvme_cli_available() is True
-    monkeypatch.setattr(
-        smart_storage.subprocess, "run", lambda *_a, **_k: _proc(1, "")
-    )
+    monkeypatch.setattr(smart_storage.subprocess, "run", lambda *_a, **_k: _proc(1, ""))
     assert smart_storage.nvme_cli_available() is False
 
 
 def test_version_fetchers_none_on_timeout(monkeypatch):
     """A stuck sudo (TimeoutExpired) returns None instead of stalling the loop."""
+
     def boom(*_a, **_k):
         raise smart_storage.subprocess.TimeoutExpired(cmd="x", timeout=5)
 
@@ -169,6 +166,7 @@ def test_version_fetchers_none_on_timeout(monkeypatch):
 
 def test_version_fetchers_none_on_unexpected_error(monkeypatch):
     """Any other subprocess failure returns None quietly."""
+
     def boom(*_a, **_k):
         raise RuntimeError("nope")
 
@@ -283,7 +281,9 @@ def test_identification_no_devices_returns_empty(monkeypatch):
 def test_identification_cache_hit_skips_all_work(monkeypatch):
     """Fresh cache (<600s) returns cached data without touching subprocess paths."""
     smart_storage._cache._entries["identification"] = (
-        time.monotonic(), [{"device": "cached"}], 600,
+        time.monotonic(),
+        [{"device": "cached"}],
+        600,
     )
 
     smartctl_version = mock.Mock()
@@ -342,13 +342,13 @@ def test_health_probes_nvme_availability_once_for_multi_nvme(monkeypatch):
 
     data = smart_storage.smart_storage_health()
 
-    nvme_available.assert_called_once()      # memoized across all 3 devices
-    assert enhanced.call_count == 3          # but each NVMe device still enriched
+    nvme_available.assert_called_once()  # memoized across all 3 devices
+    assert enhanced.call_count == 3  # but each NVMe device still enriched
     assert len(data) == 3
     for device_info in data:
         assert device_info["device_type"] == "nvme"
-        assert device_info["critical_warning"] == 12   # 0x0c parsed correctly
-        assert device_info["percent_used"] == 7         # enrichment merged in
+        assert device_info["critical_warning"] == 12  # 0x0c parsed correctly
+        assert device_info["percent_used"] == 7  # enrichment merged in
 
 
 def test_health_no_nvme_section_never_probes(monkeypatch):
@@ -413,6 +413,7 @@ def test_health_no_devices_returns_empty(monkeypatch):
 
 def test_health_happy_filters_none(monkeypatch):
     """A device whose info collection failed (None) is dropped from the payload."""
+
     def fake_info(dev, nvme_available=None):
         return None if dev == "/dev/sdb" else {"device": "sda"}
 
@@ -428,7 +429,9 @@ def test_health_happy_filters_none(monkeypatch):
 def test_health_cache_hit_skips_all_work(monkeypatch):
     """Fresh health cache (<60s) returns cached data without re-collecting."""
     smart_storage._cache._entries["health"] = (
-        time.monotonic(), [{"device": "cached"}], 60,
+        time.monotonic(),
+        [{"device": "cached"}],
+        60,
     )
 
     smartctl = mock.Mock()
@@ -485,11 +488,13 @@ def test_get_storage_info_honors_nvme_available_flag(monkeypatch):
     monkeypatch.setattr(
         smart_storage.subprocess,
         "run",
-        lambda *_a, **_k: _proc(stdout=(
-            "=== START OF SMART DATA SECTION ===\n"
-            "SMART overall-health self-assessment test result: PASSED\n"
-            "Critical Warning: 0x0c\n"
-        )),
+        lambda *_a, **_k: _proc(
+            stdout=(
+                "=== START OF SMART DATA SECTION ===\n"
+                "SMART overall-health self-assessment test result: PASSED\n"
+                "Critical Warning: 0x0c\n"
+            )
+        ),
     )
     monkeypatch.setattr(
         smart_storage, "calculate_percentage_used", lambda *_a, **_k: 95
@@ -503,9 +508,9 @@ def test_get_storage_info_honors_nvme_available_flag(monkeypatch):
     enhanced.assert_called_once_with("/dev/nvme0")
     assert res["device"] == "nvme0"
     assert res["device_type"] == "nvme"
-    assert res["critical_warning"] == 12        # 0x0c, not silently zeroed
-    assert res["percent_used"] == 5             # results.update(nvme_info) ran
-    assert res["percentage_used"] == 95         # percentage_used write path ran
+    assert res["critical_warning"] == 12  # 0x0c, not silently zeroed
+    assert res["percent_used"] == 5  # results.update(nvme_info) ran
+    assert res["percentage_used"] == 95  # percentage_used write path ran
 
     # Probe says nvme-cli is not usable -> enhanced info is skipped, but the
     # smartctl-parsed fields are still present.
@@ -529,11 +534,11 @@ def test_data_path_subprocess_calls_set_timeout(monkeypatch):
         proc = mock.Mock()
         proc.returncode = 0
         if "--scan" in cmd:
-            proc.stdout = b""           # list_storage_devices does .decode()
+            proc.stdout = b""  # list_storage_devices does .decode()
         elif "smart-log" in cmd:
-            proc.stdout = "{}"          # get_nvme_enhanced_info does json.loads
+            proc.stdout = "{}"  # get_nvme_enhanced_info does json.loads
         else:
-            proc.stdout = ""            # -A -H / -i do .splitlines()
+            proc.stdout = ""  # -A -H / -i do .splitlines()
         return proc
 
     monkeypatch.setattr(smart_storage.subprocess, "run", spy)
@@ -558,6 +563,7 @@ def test_data_path_subprocess_calls_set_timeout(monkeypatch):
 
 def test_data_path_degrades_on_timeout(monkeypatch):
     """A timed-out data call degrades to a safe value instead of propagating."""
+
     def boom(*_a, **_k):
         raise smart_storage.subprocess.TimeoutExpired(cmd="smartctl", timeout=30)
 
@@ -589,7 +595,7 @@ def test_get_storage_info_gates_on_parsed_section_not_device_path(monkeypatch):
     # Non-/dev/nvme path, but the parsed SMART section is NVMe.
     res = smart_storage.get_storage_info("/dev/sda", nvme_available=lambda: True)
 
-    enhanced.assert_called_once_with("/dev/sda")   # gated on section, not path
+    enhanced.assert_called_once_with("/dev/sda")  # gated on section, not path
     assert res["device_type"] == "nvme"
     assert res["percent_used"] == 9
 
