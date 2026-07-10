@@ -1,5 +1,7 @@
 """Tests for fivenines_agent.proxmox module."""
 
+import json
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -976,3 +978,171 @@ def test_collect_storage_null_fields_coerce_to_zero(field_in, field_out):
     pmock = make_proxmox_mock(nodes=[{"node": "pve1"}], storage_by_node={"pve1": [s]})
     c = make_collector(proxmox_mock=pmock)
     assert c._collect_storage()[0][field_out] == 0
+
+
+# --- error-path normalization (1.9.0) ---------------------------------------
+
+
+def test_collect_unreachable_returns_none():
+    """T64 [1.9.0]: version.get() AND the node-listing probe both raising
+    (whole-module unreachable / auth failure after lazy token-auth construction)
+    collapses to None, so the collector emits data['proxmox']=null instead of an
+    empty-but-shaped dict a healthy idle node could never actually produce."""
+    c = make_collector(
+        proxmox_mock=make_proxmox_mock(version_raises=True, nodes_raises=True)
+    )
+    assert c.collect() is None
+
+
+def test_collect_version_denied_but_nodes_reachable_returns_dict():
+    """T65 [1.9.0]: a restricted token whose /version is denied but whose node
+    listing works is reachable -- collect() still returns a payload (version
+    null) rather than being misread as unreachable and dropped."""
+    c = make_collector(
+        proxmox_mock=make_proxmox_mock(
+            version_raises=True,
+            cluster_status=[],
+            nodes=[{"node": "pve1"}],
+            node_status_by_name={"pve1": {"uptime": 1}},
+            qemu_by_node={"pve1": []},
+            lxc_by_node={"pve1": []},
+        )
+    )
+    result = c.collect()
+    assert result is not None
+    assert result["version"] is None
+    assert [n["name"] for n in result["nodes"]] == ["pve1"]
+
+
+def test_collect_reachability_probe_only_when_version_fails():
+    """T66 [1.9.0]: the node-listing reachability probe is issued only when
+    version.get() fails. A healthy collection (version OK) does NOT probe, so the
+    healthy-path API call pattern is unchanged; the version-denied path adds
+    exactly one node listing (the probe)."""
+    healthy = make_proxmox_mock(version={"version": "8"}, cluster_status=[], nodes=[])
+    make_collector(proxmox_mock=healthy).collect()
+
+    denied = make_proxmox_mock(version_raises=True, cluster_status=[], nodes=[])
+    make_collector(proxmox_mock=denied).collect()
+
+    assert denied.nodes.get.call_count == healthy.nodes.get.call_count + 1
+
+
+def test_proxmox_metrics_unreachable_returns_none_end_to_end():
+    """T67 [1.9.0]: the entry point returns None on an unreachable API, so
+    collect_metrics stores data['proxmox']=None (the sole unreachable signal)."""
+    mock = make_proxmox_mock(version_raises=True, nodes_raises=True)
+    with patch("fivenines_agent.proxmox.ProxmoxAPI", return_value=mock):
+        assert proxmox_metrics(token_id="root@pam!c", token_secret="s") is None
+
+
+# --- cross-repo contract (fivenines-server) ---------------------------------
+#
+# Shared fixture tests/fixtures/proxmox_contract_payload.json is asserted on
+# both sides. Here: for each scenario, proxmox_metrics() built from the mock
+# spec in scenario["api"] must equal scenario["payload"], with only
+# proxmoxer.ProxmoxAPI mocked -- so the whole connect -> collect -> payload
+# pipeline is pinned. On fivenines-server: spec posts each scenario["payload"]
+# under data["proxmox"] and asserts the cluster-scope ingester derives the right
+# completeness flags. Unlike ceph the payload has NO 'collection' block:
+# completeness is inferred from SHAPE, so these shapes must stay pinned. Change
+# payloads only in lockstep with the server's byte-identical fixture copy.
+
+_CONTRACT_FIXTURE_PATH = os.path.join(
+    os.path.dirname(__file__), "fixtures", "proxmox_contract_payload.json"
+)
+
+with open(_CONTRACT_FIXTURE_PATH) as _f:
+    _CONTRACT = json.load(_f)
+
+_CONTRACT_SCENARIOS = _CONTRACT["scenarios"]
+
+# Top-level and per-entry key sets the server's shape inference depends on. A
+# rename or dropped key must fail HERE, not silently zero a server-side metric.
+_PAYLOAD_KEYS = {"version", "cluster", "nodes", "vms", "lxc", "storage"}
+_CLUSTER_KEYS = {"name", "quorate", "nodes", "nodes_online"}
+_NODE_KEYS = {
+    "name",
+    "status",
+    "cpu_usage",
+    "memory_used",
+    "memory_total",
+    "uptime",
+    "vms_running",
+    "lxc_running",
+}
+_GUEST_KEYS = {
+    "vmid",
+    "name",
+    "node",
+    "status",
+    "cpu_usage",
+    "memory_used",
+    "memory_max",
+    "disk_read",
+    "disk_write",
+    "net_in",
+    "net_out",
+    "uptime",
+}
+_STORAGE_KEYS = {"name", "node", "type", "total", "used", "available", "active"}
+
+
+@pytest.mark.parametrize("scenario_name", sorted(_CONTRACT_SCENARIOS))
+def test_contract_fixture_scenarios(scenario_name):
+    """SHARED FIXTURE (cross-repo contract): each scenario's payload is exactly
+    what proxmox_metrics() emits under data['proxmox'] for that Proxmox API
+    state, with only proxmoxer mocked."""
+    scenario = _CONTRACT_SCENARIOS[scenario_name]
+    mock = make_proxmox_mock(**scenario["api"])
+    with patch("fivenines_agent.proxmox.ProxmoxAPI", return_value=mock):
+        out = proxmox_metrics(token_id="root@pam!contract", token_secret="secret")
+    assert out == scenario["payload"]
+
+
+@pytest.mark.parametrize("scenario_name", sorted(_CONTRACT_SCENARIOS))
+def test_contract_payload_key_sets(scenario_name):
+    """Pin the payload key contract across every non-null scenario, so a
+    rename/drop breaks the build instead of the server's inference."""
+    payload = _CONTRACT_SCENARIOS[scenario_name]["payload"]
+    if payload is None:  # 'unreachable' -> data["proxmox"] is null
+        return
+    assert set(payload) == _PAYLOAD_KEYS
+    if payload["cluster"] is not None:
+        assert set(payload["cluster"]) == _CLUSTER_KEYS
+    for node in payload["nodes"]:
+        assert set(node) == _NODE_KEYS
+    for guest in payload["vms"] + payload["lxc"]:
+        assert set(guest) == _GUEST_KEYS
+    for storage in payload["storage"]:
+        assert set(storage) == _STORAGE_KEYS
+
+
+def test_contract_reachable_signal():
+    """reachable <=> payload is not None. Only 'unreachable' yields a null
+    payload; every other scenario is reachable."""
+    for name, scenario in _CONTRACT_SCENARIOS.items():
+        assert (scenario["payload"] is None) == (name == "unreachable")
+
+
+def test_contract_nodes_ok_signal():
+    """The server's nodes_ok signal is len(nodes) == cluster.nodes_online. It
+    holds in the fully-healthy cluster and is deliberately violated by the
+    mid-loop node timeout (pve2 online in corosync but dropped from nodes)."""
+    healthy = _CONTRACT_SCENARIOS["quorate_cluster"]["payload"]
+    assert healthy["cluster"]["nodes_online"] == len(healthy["nodes"]) == 3
+
+    partial = _CONTRACT_SCENARIOS["partial_node_timeout"]["payload"]
+    assert partial["cluster"]["nodes_online"] == 3
+    assert len(partial["nodes"]) == 2  # pve2 dropped mid-loop -> nodes_ok=false
+
+
+def test_contract_standalone_cluster_is_null():
+    """A reachable standalone node reports cluster:null but is NOT unreachable:
+    version present and nodes non-empty. Pins the shape the server must not
+    confuse with a null payload."""
+    standalone = _CONTRACT_SCENARIOS["standalone"]["payload"]
+    assert standalone is not None
+    assert standalone["cluster"] is None
+    assert standalone["version"] is not None
+    assert len(standalone["nodes"]) == 1
