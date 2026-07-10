@@ -71,7 +71,20 @@ class ProxmoxCollector:
             log(f"Error appending metric {metric_name}: {e}", 'error')
 
     def collect(self):
-        """Collect all Proxmox metrics."""
+        """Collect all Proxmox metrics.
+
+        Returns None when the Proxmox API is unreachable (host down, connection
+        refused, or auth failure). proxmoxer builds the token-auth client
+        lazily, so an unreachable API is not caught at construction time --
+        every request raises instead. Left un-normalized the result would be
+        {"version": None, "cluster": None, "nodes": [], "vms": [], "lxc": [],
+        "storage": []}: a shape a reachable node can never produce (it always
+        reports a version and lists at least itself) yet still easy to misread
+        as "empty but healthy". Collapsing whole-module failure to None gives
+        the server one unambiguous signal -- data["proxmox"] is null iff the
+        API was unreachable -- instead of inferring reachability from empty
+        arrays. See tests/fixtures/proxmox_contract_payload.json.
+        """
         if not self.proxmox:
             return None
 
@@ -84,13 +97,30 @@ class ProxmoxCollector:
             'storage': []
         }
 
+        reachable = False
+
         try:
             # Get Proxmox version
             version_info = self.proxmox.version.get()
             result['version'] = version_info.get('version', 'unknown')
+            reachable = True
             log(f"Proxmox version: {result['version']}", 'debug')
         except Exception as e:
             log(f"Error getting Proxmox version: {e}", 'error')
+
+        if not reachable:
+            # /version failed. Probe the node listing before declaring the
+            # whole module unreachable: a reachable-but-restricted token whose
+            # /version is denied still enumerates nodes and must count as
+            # reachable (partial payload), whereas a down/unreachable API fails
+            # here too and yields a None payload the server reads as
+            # unreachable.
+            try:
+                self.proxmox.nodes.get()
+                reachable = True
+            except Exception as e:
+                log(f"Proxmox API unreachable, skipping collection: {e}", 'debug')
+                return None
 
         # Collect cluster status
         try:
