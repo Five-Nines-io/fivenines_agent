@@ -36,6 +36,7 @@ DEBUG_OUTPUT_LIMIT = 500
 CAPABILITY_HINTS = {
     "smart_storage": "requires sudo smartctl",
     "raid_storage": "requires sudo mdadm",
+    "ceph": "requires ceph CLI + client keyring",
     "docker": "requires docker group",
     "qemu": "requires libvirt group",
     "proxmox": "requires Proxmox VE host",
@@ -69,7 +70,7 @@ LINUX_BANNER_GROUPS = [
         ],
     ),
     ("Hardware Sensors", ["temperatures", "fans", "nvidia_gpu"]),
-    ("Storage", ["smart_storage", "raid_storage", "zfs"]),
+    ("Storage", ["smart_storage", "raid_storage", "zfs", "ceph"]),
     # cgroup sits next to systemd because it exists to gate the systemd
     # collector's per-unit resource metrics (kernel surface, not a sensor).
     ("Services", ["docker", "qemu", "proxmox", "systemd", "cgroup"]),
@@ -210,6 +211,11 @@ class PermissionProbe:
             # Storage requiring sudo
             "smart_storage": (self._can_run_sudo, ("smartctl", "--version")),
             "raid_storage": (self._can_run_sudo, ("mdadm", "--version")),
+            # Ceph - light probe only (CLI present). Cluster reachability/auth is
+            # reported per-cluster as runtime data by the collector, NOT gated
+            # here: a cluster outage must show as a metric, not disable the
+            # collector for the 5-minute reprobe window.
+            "ceph": (self._can_run_ceph, ()),
             # Security - requires sudo
             "fail2ban": (self._can_run_sudo, ("fail2ban-client", "status")),
             # ZFS - doesn't need sudo but needs permissions or delegation
@@ -444,6 +450,23 @@ class PermissionProbe:
             log(f"_can_run_sudo: '{cmd}' exception: {type(e).__name__}: {e}", "debug")
             self._set_reason(f"sudo -n {cmd}: {type(e).__name__}: {e}")
             return False
+
+    def _can_run_ceph(self):
+        """Light probe: is the ceph CLI present?
+
+        Intentionally does NOT run `ceph status`. A capability that flips False
+        on a transient cluster/auth/network failure would skip the whole
+        collector for the reprobe window (collectors.py gates on it), blinding
+        Ceph monitoring exactly when the cluster breaks. Per-cluster keyring
+        readability and reachability are reported by the collector as runtime
+        data instead.
+        """
+        if shutil.which("ceph"):
+            log("_can_run_ceph: 'ceph' found in PATH", "debug")
+            return True
+        log("_can_run_ceph: 'ceph' not found in PATH", "debug")
+        self._set_reason("ceph not found in PATH")
+        return False
 
     def _can_access_hwmon(self):
         """Check if hardware monitoring sensors are readable."""

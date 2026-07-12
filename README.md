@@ -143,6 +143,7 @@ The agent works without sudo, but these features will be unavailable (this is al
 | systemd unit metrics | `systemd` init system (`systemctl`; `journalctl` only for failure journal tails) |
 | systemd failure journal tails | journal read access: the bundled service unit grants `SupplementaryGroups=systemd-journal`; for user installs add your user to the `systemd-journal` group (tails degrade to empty without it) |
 | Per-unit cgroup metrics | cgroup v1 or v2 mounted at `/sys/fs/cgroup` |
+| Ceph cluster status | `ceph` CLI + read-only cephx keyring (no sudo) |
 
 ### Capabilities by Permission Level
 
@@ -276,6 +277,43 @@ sudo apk add net-snmp-tools
 2. The server sends `snmp_targets` to the agent via `sync_config`
 3. The agent polls devices concurrently using `snmpget`/`snmpbulkwalk`
 4. Per-device polling intervals are configurable from the dashboard
+
+## Ceph Cluster Monitoring
+
+Requires agent version **1.9.0+**. When Ceph monitoring is enabled for a host in the fivenines dashboard, the agent polls `ceph status`, `ceph df` and `ceph osd tree` and reports cluster health (status + active checks), monitor quorum, OSD up/in counts, PG states (degraded/inactive/undersized), raw capacity and per-host OSD counts. Multiple clusters per host are supported (each entry can carry its own `--cluster` name, config file and keyring).
+
+### Requirements
+
+The `ceph` CLI must be present on the host:
+
+```bash
+# Debian/Ubuntu
+sudo apt install ceph-common
+
+# RHEL/Rocky/CentOS
+sudo yum install ceph-common
+```
+
+**Containerized Ceph (Kolla-Ansible, cephadm, Rook):** on these deployments the host often has no `ceph` binary -- the CLI lives inside a container. The agent detects this and skips Ceph collection gracefully, but to monitor the cluster you must install `ceph-common` on the host (plus a copy of `ceph.conf` and the keyring below, e.g. via `cephadm shell -- ceph auth get-or-create ...` or by copying them out of the container). A shell alias to `cephadm shell` is not enough: the agent needs a real `ceph` executable in `PATH`.
+
+### Authentication (no sudo required)
+
+The agent authenticates with a least-privilege cephx identity, `client.fivenines`, read-only on mon and mgr. Create it on any node with admin keys:
+
+```bash
+sudo ceph auth get-or-create client.fivenines mon 'allow r' mgr 'allow r' \
+  -o /etc/ceph/ceph.client.fivenines.keyring
+sudo chown fivenines /etc/ceph/ceph.client.fivenines.keyring
+sudo chmod 600 /etc/ceph/ceph.client.fivenines.keyring
+```
+
+`/etc/ceph/ceph.client.fivenines.keyring` is on the standard keyring search path, so no extra agent configuration is needed -- the default target polls the local `ceph` cluster with `--name client.fivenines`. `/etc/ceph/ceph.conf` must be readable by the `fivenines` user (it is world-readable on standard installs). Non-default cluster names, config paths, keyring paths and client ids can be set per cluster from the dashboard.
+
+The `use_sudo` per-cluster option is accepted but **reserved**: this version always uses keyring auth (the agent logs a notice and proceeds). No sudoers entry is needed or honored for Ceph.
+
+### Capability Detection
+
+The capabilities banner reports Ceph as available when the `ceph` CLI is found in `PATH` (`requires ceph CLI + client keyring` otherwise). Cluster reachability and keyring validity are deliberately NOT part of the capability probe -- a cluster outage or auth failure is reported as data (an unreachable cluster with an error type), so monitoring does not go blind exactly when the cluster breaks.
 
 ## Application Integrations
 

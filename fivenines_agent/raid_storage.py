@@ -1,14 +1,12 @@
-import subprocess
-import time
 import re
+import subprocess
 
+from fivenines_agent.cache import TTLCache
 from fivenines_agent.debug import debug, log
 from fivenines_agent.subprocess_utils import get_clean_env
 
-_raid_cache = {
-    "timestamp": 0,
-    "data": []
-}
+
+_cache = TTLCache()
 
 def mdadm_available() -> bool:
     """
@@ -263,30 +261,24 @@ def raid_storage_health():
     Collect health info for all RAID devices managed by mdadm.
     Cached for 60 seconds.
     """
-    global _raid_cache
-    now = time.time()
+    return _cache.get_or_compute("health", 60, _compute_raid_storage_health)
 
-    if now - _raid_cache["timestamp"] < 60:
-        return _raid_cache["data"]
 
+def _compute_raid_storage_health():
     if not mdadm_available():
         log("mdadm unavailable (not installed or no sudo permissions)", 'debug')
-        data = []
-    else:
-        mdadm_version = get_mdadm_version()
+        return []
 
-        devices = list_raid_devices()
-        if not devices:
-            log("No RAID devices found", 'error')
-            data = []
-        else:
-            data = [get_raid_info(dev) for dev in devices]
-            # Remove None values and add mdadm version
-            data = [d for d in data if d is not None]
-            for raid_info in data:
-                raid_info["mdadm_version"] = mdadm_version
+    mdadm_version = get_mdadm_version()
 
-    _raid_cache["timestamp"] = now
-    _raid_cache["data"] = data
+    devices = list_raid_devices()
+    if not devices:
+        log("No RAID devices found", 'error')
+        return []
 
+    data = [get_raid_info(dev) for dev in devices]
+    # Remove None values and add mdadm version
+    data = [d for d in data if d is not None]
+    for raid_info in data:
+        raid_info["mdadm_version"] = mdadm_version
     return data

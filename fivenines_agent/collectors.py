@@ -3,6 +3,7 @@
 import time
 
 from fivenines_agent.caddy import caddy_metrics
+from fivenines_agent.ceph import ceph_metrics
 from fivenines_agent.cpu import cpu_count, cpu_data, cpu_model, cpu_usage
 from fivenines_agent.debug import log, start_log_capture, stop_log_capture
 from fivenines_agent.disk_health_windows import disk_health_windows
@@ -68,6 +69,9 @@ COLLECTORS = [
         ],
     ),
     ("raid_storage_health", [("raid_storage_health", raid_storage_health, False)]),
+    # Ceph: list-driven multi-cluster. config["ceph"] == {"clusters": [...]} is
+    # unpacked (pass_kwargs) into ceph_metrics(clusters=[...]).
+    ("ceph", [("ceph", ceph_metrics, True)]),
     ("processes", [("processes", processes, False)]),
     ("ports", [("ports", listening_ports, True)]),
     ("temperatures", [("temperatures", temperatures, False)]),

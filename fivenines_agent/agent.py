@@ -11,6 +11,7 @@ from threading import Event
 import psutil
 from dotenv import load_dotenv
 
+
 try:
     import systemd_watchdog
 except ImportError:
@@ -80,6 +81,7 @@ _DRY_RUN_CONFIG = {
     "nvidia_gpu": True,
     "smart_storage_health": True,
     "raid_storage_health": True,
+    "ceph": {"clusters": [{"name": "ceph"}]},
     "fail2ban": True,
     "disk_health": True,
     # Dict (not bare True) because systemd_metrics takes **kwargs; scan=False
