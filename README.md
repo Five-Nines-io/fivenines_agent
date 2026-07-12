@@ -140,6 +140,9 @@ The agent works without sudo, but these features will be unavailable (this is al
 | ZFS pools | ZFS delegation or permissions |
 | NVIDIA GPU metrics | NVIDIA driver + pynvml library |
 | SNMP device polling | `net-snmp` tools (`snmpget`, `snmpbulkwalk`) |
+| systemd unit metrics | `systemd` init system (`systemctl`; `journalctl` only for failure journal tails) |
+| systemd failure journal tails | journal read access: the bundled service unit grants `SupplementaryGroups=systemd-journal`; for user installs add your user to the `systemd-journal` group (tails degrade to empty without it) |
+| Per-unit cgroup metrics | cgroup v1 or v2 mounted at `/sys/fs/cgroup` |
 
 ### Capabilities by Permission Level
 
@@ -196,37 +199,39 @@ When the agent starts, it displays a banner showing which features are available
 ============================================================
 
   Core Metrics:
-    [OK] Cpu
-    [OK] Memory
-    [OK] Load Average
-    [OK] Io
-    [OK] Network
-    [OK] Partitions
-    [OK] File Handles
-    [OK] Ports
-    [OK] Processes
+    [+] Cpu
+    [+] Memory
+    [+] Load Average
+    [+] Io
+    [+] Network
+    [+] Partitions
+    [+] File Handles
+    [+] Ports
+    [+] Processes
 
   Hardware Sensors:
-    [OK] Temperatures
-    [X] Fans (no accessible sensors)
-    [-] Gpu (requires: NVIDIA driver)
+    [+] Temperatures
+    [-] Fans (no accessible sensors)
+    [-] Nvidia Gpu (requires NVIDIA driver)
 
   Storage:
-    [X] Smart Storage (requires: sudo smartctl)
-    [X] Raid Storage (requires: sudo mdadm)
+    [-] Smart Storage (requires sudo smartctl)
+    [-] Raid Storage (requires sudo mdadm)
+    [-] Zfs (requires zfs permissions)
 
   Services:
-    [OK] Docker
-    [OK] Caddy
-    [X] Qemu (requires: libvirt group)
-    [OK] Proxmox
+    [+] Docker
+    [-] Qemu (requires libvirt group)
+    [+] Proxmox
+    [+] Systemd
+    [+] Cgroup v2
 
   Security:
-    [X] Fail2Ban (requires: sudo fail2ban-client)
-    [X] Packages
+    [-] Fail2Ban (requires sudo fail2ban-client)
+    [+] Packages
 
   Networking:
-    [OK] Snmp
+    [+] Snmp
 
   [!] Some features unavailable. See: https://docs.fivenines.io/agent/permissions
 
@@ -303,14 +308,14 @@ location /nginx_status {
 
 ### PostgreSQL
 
-Collects metrics via `psql`:
+Collects metrics via a direct connection (pure-Python `pg8000` driver, no `psql` binary required):
 - Connection counts by state
 - Database statistics (transactions, cache hit ratio)
 - Database sizes
 - Replication lag (for replicas)
 - Lock counts
 
-Requires `psql` available and appropriate database credentials.
+Requires appropriate database credentials.
 
 ### Redis
 
