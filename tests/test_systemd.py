@@ -2309,7 +2309,21 @@ def test_journal_messages_truncated():
     assert len(msgs[0]) == systemd.JOURNAL_MSG_MAX_CHARS
 
 
-def test_list_unit_files_filters_types_and_marks():
+def test_is_template_unit():
+    from fivenines_agent.systemd import _is_template_unit
+
+    # Bare templates (empty instance) -- unshowable.
+    assert _is_template_unit("getty@.service")
+    assert _is_template_unit("autovt@.service")
+    assert _is_template_unit("user@.slice")
+    # Concrete instances and plain units -- showable.
+    assert not _is_template_unit("getty@tty1.service")
+    assert not _is_template_unit("nginx.service")
+    assert not _is_template_unit("-.mount")
+    assert not _is_template_unit("dev-sda@1.device")
+
+
+def test_list_unit_files_filters_types_marks_and_templates():
     coll = _make_collector()
 
     def fake_run(args, timeout=None):
@@ -2323,7 +2337,12 @@ def test_list_unit_files_filters_types_and_marks():
             + chr(0x25CF)
             + "\n"
             "boot.mount static -\n"
-            "tmpl@.service disabled enabled\n"
+            # Bare templates: excluded (systemctl show would reject them and
+            # fail the whole bulk fetch -- the autovt@.service prod blackout).
+            "autovt@.service alias -\n"
+            "getty@.service enabled enabled\n"
+            # A concrete template instance IS a real unit and stays.
+            "getty@tty1.service enabled enabled\n"
         ), None
 
     with patch("fivenines_agent.systemd._run_systemctl", side_effect=fake_run):
@@ -2333,8 +2352,40 @@ def test_list_unit_files_filters_types_and_marks():
         "nginx.service",
         "backup.timer",
         "odd.service",
-        "tmpl@.service",
+        "getty@tty1.service",
     ]
+
+
+def test_inventory_surface_never_passes_templates_to_show():
+    """Regression: a bare template from list-unit-files must never reach the
+    bulk show (one bad name blacks out health + inventory for the host)."""
+    coll = _make_collector()
+
+    def fake_run(args, timeout=None):
+        if args[0] == "list-unit-files":
+            return (
+                "nginx.service enabled enabled\n"
+                "autovt@.service alias -\n"
+                "getty@.service enabled enabled\n"
+            ), None
+        return "", None
+
+    shown = {}
+
+    def fake_show(unit_names, properties):
+        shown["names"] = list(unit_names)
+        return ({n: {"Id": n} for n in unit_names}, None)
+
+    with patch("fivenines_agent.systemd._run_systemctl", side_effect=fake_run):
+        with patch.object(coll, "_list_units", return_value=(["nginx.service"], None)):
+            with patch.object(coll, "_show_bulk", side_effect=fake_show):
+                with patch(
+                    "fivenines_agent.systemd.read_unit_resources", return_value={}
+                ):
+                    coll.collect(scan=True)
+    assert "autovt@.service" not in shown["names"]
+    assert "getty@.service" not in shown["names"]
+    assert shown["names"] == ["nginx.service"]
 
 
 def test_inventory_includes_disabled_unit_files():

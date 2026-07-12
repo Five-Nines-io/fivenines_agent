@@ -29,6 +29,22 @@ thread.
 - **Depends on:** nothing (architecture change, touch synchronizer + agent)
 - **Files:** `fivenines_agent/synchronizer.py`, `fivenines_agent/agent.py`, tests
 
+## P3: Generalized resilience to an unshowable name in the bulk show
+
+A single unit name that `systemctl show` rejects fails the whole bulk fetch
+(exit non-zero -> `_run_subprocess` drops all stdout), blacking out health +
+inventory for the host every tick. Bare template units were the known trigger
+and are now filtered (`_is_template_unit`), and `list-units` only yields
+concrete showable units, so the surface is showable in practice. But if any
+other unshowable name ever appears, the blast radius is the whole host. Harden
+by isolating the bad name on a `cli_error` -- bisect the failing chunk and drop
+the offending unit(s) -- instead of failing the entire fetch. Locale-independent
+(no error-message parsing); bounded at log2(chunk) retries.
+
+- **Effort:** M (human) / S (CC)
+- **Depends on:** nothing
+- **Files:** `fivenines_agent/systemd.py` (`_show_bulk`), tests
+
 ## P3: Docker image caching for CI resilience
 
 Mirror the 14 distro base images used in `test-distro-matrix` to ghcr.io or use

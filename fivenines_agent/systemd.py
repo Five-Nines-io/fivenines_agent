@@ -635,6 +635,25 @@ def _canonical_inventory_hash(units_props):
     return _hash_canonical(canonical)
 
 
+def _is_template_unit(name):
+    """A bare template unit (empty instance), e.g. getty@.service.
+
+    Templates are NOT instantiable, so `systemctl show` rejects them ("Unit
+    name X is neither a valid invocation ID nor unit name") -- and because the
+    bulk show passes every name in one call, a single template name fails the
+    WHOLE fetch, blacking out health + inventory for the host every tick.
+    They only reach us via `list-unit-files` (bare templates are never loaded,
+    so list-units never yields them); their running instances
+    (getty@tty1.service) are concrete and show fine, so only the empty-instance
+    template file is excluded. Detected structurally: the "@" sits immediately
+    before the type extension (empty instance).
+    """
+    at = name.rfind("@")
+    if at == -1:
+        return False
+    return name.rfind(".") == at + 1
+
+
 class SystemdCollector:
     """Collects per-tick systemd unit health and inventory snapshots.
 
@@ -831,7 +850,8 @@ class SystemdCollector:
         file that is installed but disabled/never started -- the classic
         "service present but off" drift signal -- is invisible to it.
         `--type=` on list-unit-files is not portable back to systemd 219, so
-        filter suffixes ourselves.
+        filter suffixes ourselves. Bare template files (getty@.service) are
+        excluded -- they cannot be `systemctl show`n (see _is_template_unit).
         """
         args = [
             "list-unit-files",
@@ -852,7 +872,11 @@ class SystemdCollector:
             if not parts:
                 continue
             name = parts[0]
-            if "." in name and name.rsplit(".", 1)[-1] in types:
+            if (
+                "." in name
+                and name.rsplit(".", 1)[-1] in types
+                and not _is_template_unit(name)
+            ):
                 names.append(name)
         return names, None
 
