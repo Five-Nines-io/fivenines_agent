@@ -27,8 +27,8 @@ from fivenines_agent.smart_storage import (
     smart_storage_health,
     smart_storage_identification,
 )
+from fivenines_agent.systemd import systemd_metrics
 from fivenines_agent.temperatures import temperatures
-
 
 # Registry of metric collectors.
 # Each entry: (config_key, [(data_key, callable, pass_kwargs), ...])
@@ -85,6 +85,7 @@ COLLECTORS = [
     ("caddy", [("caddy", caddy_metrics, True)]),
     ("postgresql", [("postgresql", postgresql_metrics, True)]),
     ("proxmox", [("proxmox", proxmox_metrics, True)]),
+    ("systemd", [("systemd", systemd_metrics, True)]),
     # Windows-only: gated by the disk_health capability, only present in the
     # Windows-tailored capability set (D13 - permissions._build_windows_*).
     ("disk_health", [("disk_health", disk_health_windows, False)]),
