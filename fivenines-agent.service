@@ -4,6 +4,13 @@ Description=Five Nines monitoring agent
 [Service]
 Type=notify
 User=fivenines
+# Journal read access for the systemd collector's failure drilldown
+# (journalctl tail); without it tails degrade silently to [] on system
+# installs. The group ships with systemd's sysusers config on every
+# packaged distro. Caveat: on hand-rolled images that stripped the group,
+# systemd fails the unit with status 216/GROUP -- remove this line there
+# (tails degrade gracefully to empty).
+SupplementaryGroups=systemd-journal
 ExecStart=/opt/fivenines/fivenines_agent
 RestartSec=5
 Restart=always

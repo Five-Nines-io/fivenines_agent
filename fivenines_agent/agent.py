@@ -24,7 +24,13 @@ from fivenines_agent.collectors import (
     collect_metrics,
 )
 from fivenines_agent.debug import log
-from fivenines_agent.env import config_dir, dry_run, env_file, get_user_context, is_windows
+from fivenines_agent.env import (
+    config_dir,
+    dry_run,
+    env_file,
+    get_user_context,
+    is_windows,
+)
 from fivenines_agent.files import file_handles_limit, file_handles_used, handle_count
 from fivenines_agent.ip import get_ip
 from fivenines_agent.load_average import load_average
@@ -34,7 +40,11 @@ from fivenines_agent.permissions import get_permissions, print_capabilities_bann
 from fivenines_agent.ping import tcp_ping
 from fivenines_agent.synchronization_queue import SynchronizationQueue
 from fivenines_agent.synchronizer import Synchronizer
-
+from fivenines_agent.systemd import (
+    force_inventory_resend,
+    refresh_runtime_caches,
+    systemd_inventory_sync,
+)
 
 CONFIG_DIR = config_dir()
 load_dotenv(dotenv_path=env_file())
@@ -72,6 +82,10 @@ _DRY_RUN_CONFIG = {
     "raid_storage_health": True,
     "fail2ban": True,
     "disk_health": True,
+    # Dict (not bare True) because systemd_metrics takes **kwargs; scan=False
+    # exercises the per-tick health surface without the inventory POST (skipped
+    # in dry-run anyway, since there's no synchronizer to dispatch through).
+    "systemd": {"scan": False},
 }
 
 
@@ -94,6 +108,11 @@ def setup_signals():
 
 
 class Agent:
+    # Baselined in __init__ from the first probe; class default keeps
+    # partially-constructed instances (tests) from raising in
+    # _resync_systemd_runtime before __init__ has run.
+    _last_systemd_cap_state = None
+
     def __init__(self):
         setup_signals()
 
@@ -133,6 +152,19 @@ class Agent:
         else:
             self.synchronizer = Synchronizer(self.token, self.queue, self.static_data)
             self.synchronizer.start()
+
+        # Set to True after SIGHUP so the next systemd_inventory_sync resends
+        # the full snapshot regardless of hash equality.
+        self._systemd_force_resend = False
+
+        # Last (systemd, cgroup) capability values the collector cache was
+        # synced to. Baselined from the initial probe so tick 1 does not trigger
+        # a spurious re-detect; _resync_systemd_runtime fires only on a change.
+        _init_caps = self.permissions.get_all()
+        self._last_systemd_cap_state = (
+            _init_caps.get("systemd"),
+            _init_caps.get("cgroup"),
+        )
 
     def _load_file(self, filename):
         try:
@@ -181,7 +213,15 @@ class Agent:
 
                 self._collect_metrics(data)
 
+                if wd is not None:
+                    # Second feed before the synchronous POST phase: packages +
+                    # inventory sends each retry with backoff during an API
+                    # outage (~45s worst case apiece), and a tick stretched
+                    # past WatchdogSec=90 would get the agent SIGABRT-killed
+                    # into a restart loop exactly when buffering matters most.
+                    wd.notify()
                 self._packages_sync_with_telemetry()
+                self._systemd_inventory_sync_with_telemetry()
                 data["_telemetry"] = self._telemetry
 
                 # Running time and enqueue
@@ -212,9 +252,7 @@ class Agent:
         self._collect_file_handles(data)
 
         # Conditional metrics via registry, gated by capability where available
-        collect_metrics(
-            self.config, data, self._telemetry, self.permissions.get_all()
-        )
+        collect_metrics(self.config, data, self._telemetry, self.permissions.get_all())
 
         # Special-case collectors (unique dispatch patterns)
         if self.config.get("ping"):
@@ -243,8 +281,12 @@ class Agent:
         if is_windows():
             data["handle_count"] = self._collect("handle_count", handle_count)
         else:
-            data["file_handles_used"] = self._collect("file_handles_used", file_handles_used)
-            data["file_handles_limit"] = self._collect("file_handles_limit", file_handles_limit)
+            data["file_handles_used"] = self._collect(
+                "file_handles_used", file_handles_used
+            )
+            data["file_handles_limit"] = self._collect(
+                "file_handles_limit", file_handles_limit
+            )
 
     def _collect(self, name, fn, *args, **kwargs):
         return _collect_with_telemetry(name, fn, self._telemetry, *args, **kwargs)
@@ -258,6 +300,34 @@ class Agent:
             "packages_sync", packages_sync, self.config, self.synchronizer.send_packages
         )
 
+    def _systemd_inventory_sync_with_telemetry(self):
+        # POSTs to /systemd_inventory; skip in --dry-run (no synchronizer to
+        # dispatch through), mirroring _packages_sync_with_telemetry.
+        if self.synchronizer is None:
+            return
+        # Skip when the host is not systemd-managed. Mirrors the capability
+        # gate the metrics registry already applies via _is_capability_gated.
+        # Without this, containers where systemctl exists but the host wasn't
+        # booted by systemd would pay subprocess cost on every tick only to
+        # fail at list-units.
+        if not self.permissions.get("systemd"):
+            return
+        # Pass the SIGHUP-triggered force flag, but only clear it once the send
+        # is confirmed. If the forced send fails (or raises -> _collect returns
+        # None), keep the flag so the next tick retries; otherwise an
+        # unchanged-units inventory would dedupe-skip and the forced metadata
+        # refresh (e.g. a cgroup flip) would be silently lost.
+        force = self._systemd_force_resend
+        sent = self._collect(
+            "systemd_inventory_sync",
+            systemd_inventory_sync,
+            self.config,
+            self.synchronizer.send_systemd_inventory,
+            force_resend=force,
+        )
+        if sent:
+            self._systemd_force_resend = False
+
     def _handle_sighup_refresh(self):
         """SIGHUP-triggered full reprobe. Kept at the top of the loop (needs no
         config) so it stays responsive even when the backend is unreachable."""
@@ -268,6 +338,18 @@ class Agent:
             # _apply_config_driven_refresh, which always runs later this same
             # tick (both loop branches), so we don't write static_data here.
             print_capabilities_banner()
+            # SIGHUP also forces a fresh systemd inventory resend so the next
+            # tick re-sends the full snapshot even if its hash is unchanged.
+            force_inventory_resend()
+            self._systemd_force_resend = True
+            # Re-detect the cached systemd version + cgroup hierarchy now. SIGHUP
+            # is the operator's "I changed the host" signal -- e.g. an in-place
+            # systemd upgrade that crosses the reverse-deps version gate. The
+            # capability tuple may NOT flip across such a change, so the
+            # flip-gated _resync_systemd_runtime would miss it; refresh here
+            # unconditionally. (It keeps the last good version on a transient
+            # `systemctl --version` miss, so an unconditional call is safe.)
+            refresh_runtime_caches()
 
     def _apply_config_driven_refresh(self, config):
         """Run config-driven permission refresh for this tick, then republish
@@ -293,6 +375,45 @@ class Agent:
         self.static_data["capabilities"] = self.permissions.get_all()
         self.static_data["capability_reasons"] = self.permissions.get_reasons()
         self.static_data["pending_capabilities"] = pending
+        # Re-sync the systemd collector's cached cgroup hierarchy / version when
+        # the probe just flipped those capabilities (e.g. a cgroup mount that
+        # appeared after boot). Runs after the refresh above so it sees the
+        # post-probe state from BOTH the SIGHUP force_refresh (earlier this
+        # tick) and the config-driven refresh.
+        self._resync_systemd_runtime()
+
+    def _resync_systemd_runtime(self):
+        """Re-detect the systemd collector's cached host state when the systemd
+        or cgroup capability flips.
+
+        The collector caches the cgroup hierarchy and systemd version
+        independently of the permission probe, so without this they would stay
+        stale (cgroup=None, null per-unit metrics) until a process restart even
+        after the gap re-probe marks the capability available. Cheap and rare:
+        only fires on an actual capability change, not every tick.
+        """
+        caps = self.permissions.get_all()
+        if "systemd" not in caps and "cgroup" not in caps:
+            # Not a systemd-probed host (Windows, or a capability set that
+            # never included these keys). Nothing to keep in sync.
+            return
+        current = (caps.get("systemd"), caps.get("cgroup"))
+        if current != self._last_systemd_cap_state:
+            self._last_systemd_cap_state = current
+            # On a SIGHUP tick that ALSO flips a capability, _handle_sighup_refresh
+            # already ran refresh_runtime_caches + force_inventory_resend, so this
+            # repeats them. Both are idempotent (re-detect yields the same values;
+            # the force flag/None hash are set-twice no-ops) and the trigger is
+            # doubly rare, so we don't special-case it.
+            refresh_runtime_caches()
+            # The inventory hash deliberately excludes cgroup/version metadata,
+            # so a flip arriving via the periodic gap re-probe (not SIGHUP) would
+            # leave the backend's stored inventory on stale cgroup=null until the
+            # next real unit-config change. Force one resend to propagate the new
+            # cgroup/version. Baselined in __init__, so this never fires on the
+            # first tick -- only on an actual later flip.
+            force_inventory_resend()
+            self._systemd_force_resend = True
 
     def _recheck_token_changed(self, token):
         """Nonce state machine for the on-demand "re-detect now" button.
@@ -362,6 +483,11 @@ class Agent:
             for pkg_cap in ("packages", "software_inventory"):
                 if pkg_cap in caps and not caps[pkg_cap]:
                     pending.append(pkg_cap)
+        # cgroup has no collector config key of its own: it gates per-unit
+        # metrics inside the systemd collector. Gap-reprobe it alongside systemd
+        # so a cgroup mount appearing after boot recovers in ~one interval.
+        if config.get("systemd") and "cgroup" in caps and not caps["cgroup"]:
+            pending.append("cgroup")
         return list(dict.fromkeys(pending))
 
     def _wait_interval(self, running_time):
