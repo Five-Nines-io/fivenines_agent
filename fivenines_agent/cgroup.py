@@ -17,6 +17,7 @@ because per-unit memory/cpu accounting still lives in the v1 hierarchy.
 """
 
 import os
+import posixpath
 
 from fivenines_agent.debug import log
 
@@ -54,7 +55,7 @@ def _v1_cpu_controller():
     if _cached_v1_cpu_controller_set:
         return _cached_v1_cpu_controller
     for candidate in ("cpuacct", "cpu,cpuacct"):
-        if os.path.isdir(os.path.join(CGROUP_ROOT, candidate)):
+        if os.path.isdir(posixpath.join(CGROUP_ROOT, candidate)):
             _cached_v1_cpu_controller = candidate
             break
     else:
@@ -67,7 +68,7 @@ def _v1_cpu_controller():
             entries = []
         for entry in entries:
             if "cpuacct" in entry.split(",") and os.path.isdir(
-                os.path.join(CGROUP_ROOT, entry)
+                posixpath.join(CGROUP_ROOT, entry)
             ):
                 _cached_v1_cpu_controller = entry
                 break
@@ -83,9 +84,9 @@ def detect_hierarchy_uncached():
     call this, so the two views can never drift -- the agent uses a
     probe-value flip as the trigger to refresh the collector's cache.
     """
-    if os.path.exists(os.path.join(CGROUP_ROOT, "cgroup.controllers")):
+    if os.path.exists(posixpath.join(CGROUP_ROOT, "cgroup.controllers")):
         return "v2"
-    if os.path.isdir(os.path.join(CGROUP_ROOT, "memory")):
+    if os.path.isdir(posixpath.join(CGROUP_ROOT, "memory")):
         return "v1"
     return None
 
@@ -142,11 +143,11 @@ def cgroup_dir(control_group, hierarchy, controller=None):
     rel = control_group.lstrip("/")
 
     if hierarchy == "v2":
-        return os.path.join(CGROUP_ROOT, rel)
+        return posixpath.join(CGROUP_ROOT, rel)
     if hierarchy == "v1":
         if not controller:
             raise ValueError("controller is required for cgroup v1 path")
-        return os.path.join(CGROUP_ROOT, controller, rel)
+        return posixpath.join(CGROUP_ROOT, controller, rel)
     raise ValueError(f"unsupported hierarchy: {hierarchy!r}")
 
 
@@ -204,10 +205,10 @@ def _parse_kv_field(text, key):
 def read_memory_current(control_group, hierarchy):
     """Current memory usage for a unit in bytes. None if unavailable."""
     if hierarchy == "v2":
-        path = os.path.join(cgroup_dir(control_group, "v2"), "memory.current")
+        path = posixpath.join(cgroup_dir(control_group, "v2"), "memory.current")
         return _parse_int(_read_text(path))
     if hierarchy == "v1":
-        path = os.path.join(
+        path = posixpath.join(
             cgroup_dir(control_group, "v1", controller="memory"),
             "memory.usage_in_bytes",
         )
@@ -218,14 +219,14 @@ def read_memory_current(control_group, hierarchy):
 def read_cpu_usec(control_group, hierarchy):
     """Cumulative CPU usage for a unit in microseconds. None if unavailable."""
     if hierarchy == "v2":
-        path = os.path.join(cgroup_dir(control_group, "v2"), "cpu.stat")
+        path = posixpath.join(cgroup_dir(control_group, "v2"), "cpu.stat")
         return _parse_kv_field(_read_text(path), "usage_usec")
     if hierarchy == "v1":
         controller = _v1_cpu_controller()
         if controller is None:
             return None
         # cpuacct.usage is in nanoseconds; convert to microseconds
-        path = os.path.join(
+        path = posixpath.join(
             cgroup_dir(control_group, "v1", controller=controller),
             "cpuacct.usage",
         )
@@ -244,7 +245,7 @@ def read_oom_kill_count(control_group, hierarchy):
     """
     if hierarchy != "v2":
         return None
-    path = os.path.join(cgroup_dir(control_group, "v2"), "memory.events")
+    path = posixpath.join(cgroup_dir(control_group, "v2"), "memory.events")
     return _parse_kv_field(_read_text(path), "oom_kill")
 
 

@@ -5,7 +5,19 @@ import subprocess
 from contextlib import redirect_stdout
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from fivenines_agent.permissions import PermissionProbe, print_capabilities_banner
+
+
+@pytest.fixture(autouse=True)
+def _default_to_linux_probe():
+    """This file exercises the Linux systemd/cgroup capabilities and the Linux
+    banner layout. Force is_windows=False so it runs identically on Windows CI
+    runners (which would otherwise render the Windows-tailored capability set
+    and banner, with no Systemd/Cgroup rows)."""
+    with patch("fivenines_agent.permissions.is_windows", return_value=False):
+        yield
 
 
 def _make_probe():
