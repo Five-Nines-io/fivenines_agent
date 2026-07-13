@@ -3,7 +3,6 @@
 import sys
 from unittest.mock import MagicMock, patch
 
-
 # Mock libvirt before any fivenines_agent imports that transitively need it
 sys.modules.setdefault("libvirt", MagicMock())
 
@@ -23,6 +22,7 @@ def test_registry_has_expected_config_keys():
         "logs",
         "smart_storage_health",
         "raid_storage_health",
+        "ceph",
         "processes",
         "ports",
         "temperatures",
@@ -36,6 +36,7 @@ def test_registry_has_expected_config_keys():
         "caddy",
         "postgresql",
         "proxmox",
+        "systemd",
         "disk_health",
     ]
     assert config_keys == expected

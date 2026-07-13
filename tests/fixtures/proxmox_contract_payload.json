@@ -1,0 +1,256 @@
+{
+  "description": "Shared Proxmox contract fixture between fivenines-agent and fivenines-server. Source of truth: fivenines-agent tests/fixtures/proxmox_contract_payload.json, asserted end-to-end by tests/test_proxmox.py::test_contract_fixture_scenarios (only proxmoxer.ProxmoxAPI is mocked). For each scenario, 'api' is the agent-side proxmoxer mock input (fed to tests/test_proxmox.py::make_proxmox_mock; the server ignores it, it only documents how the payload arises) and 'payload' is the artifact the agent emits under data['proxmox'] -- the exact thing the server's cluster-scope ingester must parse. Unlike the ceph payload there is NO per-cluster 'collection' flags block: the Proxmox payload carries no completeness metadata, so the server infers reachable / cluster_ok / nodes_ok / guests_ok / storage_ok from the payload SHAPE. That inference is only safe because these shapes are pinned by tests on the agent side. Change only in lockstep with spec/fixtures/proxmox_contract_payload.json on the server.",
+  "agent_min_version": "1.9.0",
+  "inference_contract": {
+    "reachable": "payload is not null. A null payload (proxmox_metrics() -> None) is the ONLY unreachable/auth-failure signal; there is no partial 'all empty' payload to disambiguate (normalized agent-side in ProxmoxCollector.collect).",
+    "cluster_ok": "payload.cluster is not null. CAVEAT: payload.cluster is also null for a genuine standalone node (see scenario 'standalone'). cluster:null is therefore ambiguous between (a) standalone, no corosync, and (b) a clustered reporter whose /cluster/status call failed -- ProxmoxCollector._collect_cluster returns None for both. The server must disambiguate with its own cross-reporter knowledge (a lone reporter => standalone; one of N cluster reporters returning cluster:null => that reporter's cluster fetch failed).",
+    "nodes_ok": "when payload.cluster is present, len(payload.nodes) == payload.cluster.nodes_online. A node counted online by corosync (cluster.status) but missing from payload.nodes means its per-node detail collection failed mid-loop (see scenario 'partial_node_timeout'). For a standalone node (cluster:null) expect exactly one node entry.",
+    "guests_ok": "guests (vms + lxc) are only reported for nodes present in payload.nodes; a node that dropped out of payload.nodes also drops its guests. There is no expected-guest-count in the payload, so guests_ok is derived transitively from nodes_ok, not independently.",
+    "storage_ok": "same as guests_ok: storage is reported per node present in payload.nodes. SHARED storage (e.g. ceph/nfs) is reported once PER reporting node (not deduplicated) and the payload carries no shared flag -- the server must dedupe shared pools across reporters by (name, type, total). See scenario 'quorate_cluster' where 'ceph-pool' appears three times, once per node."
+  },
+  "error_path_audit": {
+    "proxmoxer_missing": "proxmox_metrics() -> None (ProxmoxAPI is None guard). data['proxmox'] = null.",
+    "no_credentials": "_connect() logs and leaves self.proxmox = None; collect() returns None. data['proxmox'] = null.",
+    "constructor_raises": "ProxmoxAPI(...) raising is caught in _connect (self.proxmox = None) OR, if ProxmoxCollector.__init__ itself raises, by proxmox_metrics' outer try. Either way -> None.",
+    "api_unreachable_after_construction": "The realistic auth-failure / host-down case: token-auth ProxmoxAPI constructs lazily (no None), then every request raises. version.get() raises AND the node-listing probe raises => collect() returns None (see scenario 'unreachable'). BEFORE 1.9.0 this returned {\"version\": null, \"cluster\": null, \"nodes\": [], \"vms\": [], \"lxc\": [], \"storage\": []}, indistinguishable-by-value from an idle node; normalized to None in 1.9.0.",
+    "single_node_timeout": "One node's per-node calls raise mid-loop while the cluster-wide /cluster/status still counts it online. Exceptions are swallowed per-node in _collect_nodes/_collect_vms/_collect_lxc/_collect_storage, so that node silently drops from payload.nodes/vms/lxc/storage while payload.cluster.nodes_online still includes it (see scenario 'partial_node_timeout')."
+  },
+  "scenarios": {
+    "quorate_cluster": {
+      "description": "3-node quorate cluster 'production'. Guests spread across nodes (pve1: vm 100 + ct 200; pve2: vm 101; pve3: stopped ct 201). Shared storage 'ceph-pool' visible on all three nodes (reported 3x, once per node -- server must dedupe) plus a per-node 'local-lvm'. cluster.nodes_online (3) == len(nodes) (3) => nodes_ok. This is the fully-healthy reference shape.",
+      "api": {
+        "version": {"version": "8.2.4"},
+        "cluster_status": [
+          {"type": "cluster", "name": "production", "quorate": 1, "nodes": 3},
+          {"type": "node", "name": "pve1", "online": 1},
+          {"type": "node", "name": "pve2", "online": 1},
+          {"type": "node", "name": "pve3", "online": 1}
+        ],
+        "nodes": [
+          {"node": "pve1", "status": "online", "cpu": 0.12, "mem": 8589934592, "maxmem": 34359738368},
+          {"node": "pve2", "status": "online", "cpu": 0.34, "mem": 4294967296, "maxmem": 34359738368},
+          {"node": "pve3", "status": "online", "cpu": 0.05, "mem": 2147483648, "maxmem": 17179869184}
+        ],
+        "node_status_by_name": {
+          "pve1": {"uptime": 864000},
+          "pve2": {"uptime": 432000},
+          "pve3": {"uptime": 216000}
+        },
+        "qemu_by_node": {
+          "pve1": [
+            {"vmid": 100, "name": "web-01", "status": "running", "cpu": 0.08, "mem": 2147483648, "maxmem": 4294967296, "diskread": 1048576, "diskwrite": 2097152, "netin": 3145728, "netout": 4194304, "uptime": 863900}
+          ],
+          "pve2": [
+            {"vmid": 101, "name": "db-01", "status": "running", "cpu": 0.25, "mem": 8589934592, "maxmem": 8589934592, "diskread": 5242880, "diskwrite": 10485760, "netin": 6291456, "netout": 7340032, "uptime": 431900}
+          ],
+          "pve3": []
+        },
+        "lxc_by_node": {
+          "pve1": [
+            {"vmid": 200, "name": "proxy-01", "status": "running", "cpu": 0.02, "mem": 536870912, "maxmem": 1073741824, "diskread": 524288, "diskwrite": 1048576, "netin": 2097152, "netout": 3145728, "uptime": 863800}
+          ],
+          "pve2": [],
+          "pve3": [
+            {"vmid": 201, "name": "backup-01", "status": "stopped", "cpu": 0, "mem": 0, "maxmem": 1073741824, "diskread": 0, "diskwrite": 0, "netin": 0, "netout": 0, "uptime": 0}
+          ]
+        },
+        "storage_by_node": {
+          "pve1": [
+            {"storage": "ceph-pool", "type": "rbd", "total": 10995116277760, "used": 3298534883328, "avail": 7696581394432, "active": 1, "shared": 1},
+            {"storage": "local-lvm", "type": "lvmthin", "total": 137438953472, "used": 34359738368, "avail": 103079215104, "active": 1}
+          ],
+          "pve2": [
+            {"storage": "ceph-pool", "type": "rbd", "total": 10995116277760, "used": 3298534883328, "avail": 7696581394432, "active": 1, "shared": 1},
+            {"storage": "local-lvm", "type": "lvmthin", "total": 137438953472, "used": 20000000000, "avail": 117438953472, "active": 1}
+          ],
+          "pve3": [
+            {"storage": "ceph-pool", "type": "rbd", "total": 10995116277760, "used": 3298534883328, "avail": 7696581394432, "active": 1, "shared": 1},
+            {"storage": "local-lvm", "type": "lvmthin", "total": 68719476736, "used": 10000000000, "avail": 58719476736, "active": 1}
+          ]
+        }
+      },
+      "payload": {
+        "version": "8.2.4",
+        "cluster": {"name": "production", "quorate": true, "nodes": 3, "nodes_online": 3},
+        "nodes": [
+          {"name": "pve1", "status": "online", "cpu_usage": 0.12, "memory_used": 8589934592, "memory_total": 34359738368, "uptime": 864000, "vms_running": 1, "lxc_running": 1},
+          {"name": "pve2", "status": "online", "cpu_usage": 0.34, "memory_used": 4294967296, "memory_total": 34359738368, "uptime": 432000, "vms_running": 1, "lxc_running": 0},
+          {"name": "pve3", "status": "online", "cpu_usage": 0.05, "memory_used": 2147483648, "memory_total": 17179869184, "uptime": 216000, "vms_running": 0, "lxc_running": 0}
+        ],
+        "vms": [
+          {"vmid": 100, "name": "web-01", "node": "pve1", "status": "running", "cpu_usage": 0.08, "memory_used": 2147483648, "memory_max": 4294967296, "disk_read": 1048576, "disk_write": 2097152, "net_in": 3145728, "net_out": 4194304, "uptime": 863900},
+          {"vmid": 101, "name": "db-01", "node": "pve2", "status": "running", "cpu_usage": 0.25, "memory_used": 8589934592, "memory_max": 8589934592, "disk_read": 5242880, "disk_write": 10485760, "net_in": 6291456, "net_out": 7340032, "uptime": 431900}
+        ],
+        "lxc": [
+          {"vmid": 200, "name": "proxy-01", "node": "pve1", "status": "running", "cpu_usage": 0.02, "memory_used": 536870912, "memory_max": 1073741824, "disk_read": 524288, "disk_write": 1048576, "net_in": 2097152, "net_out": 3145728, "uptime": 863800},
+          {"vmid": 201, "name": "backup-01", "node": "pve3", "status": "stopped", "cpu_usage": 0, "memory_used": 0, "memory_max": 1073741824, "disk_read": 0, "disk_write": 0, "net_in": 0, "net_out": 0, "uptime": 0}
+        ],
+        "storage": [
+          {"name": "ceph-pool", "node": "pve1", "type": "rbd", "total": 10995116277760, "used": 3298534883328, "available": 7696581394432, "active": true},
+          {"name": "local-lvm", "node": "pve1", "type": "lvmthin", "total": 137438953472, "used": 34359738368, "available": 103079215104, "active": true},
+          {"name": "ceph-pool", "node": "pve2", "type": "rbd", "total": 10995116277760, "used": 3298534883328, "available": 7696581394432, "active": true},
+          {"name": "local-lvm", "node": "pve2", "type": "lvmthin", "total": 137438953472, "used": 20000000000, "available": 117438953472, "active": true},
+          {"name": "ceph-pool", "node": "pve3", "type": "rbd", "total": 10995116277760, "used": 3298534883328, "available": 7696581394432, "active": true},
+          {"name": "local-lvm", "node": "pve3", "type": "lvmthin", "total": 68719476736, "used": 10000000000, "available": 58719476736, "active": true}
+        ]
+      }
+    },
+    "quorum_lost": {
+      "description": "2-node cluster 'homelab' that lost quorum: pve2 is down, so the surviving reporter pve1 has quorate:false and nodes_online:1. pve2 stays in /cluster/status (config membership) but every pve2 per-node call raises, so it drops from nodes/vms/lxc/storage. Pins quorate:false serialization AND nodes_online (1) < cluster.nodes (2).",
+      "api": {
+        "version": {"version": "8.2.4"},
+        "cluster_status": [
+          {"type": "cluster", "name": "homelab", "quorate": 0, "nodes": 2},
+          {"type": "node", "name": "pve1", "online": 1},
+          {"type": "node", "name": "pve2", "online": 0}
+        ],
+        "nodes": [
+          {"node": "pve1", "status": "online", "cpu": 0.1, "mem": 4294967296, "maxmem": 17179869184},
+          {"node": "pve2", "status": "offline", "cpu": 0, "mem": 0, "maxmem": 17179869184}
+        ],
+        "node_status_by_name": {"pve1": {"uptime": 604800}},
+        "node_status_raises_for": ["pve2"],
+        "qemu_by_node": {
+          "pve1": [
+            {"vmid": 100, "name": "web-01", "status": "running", "cpu": 0.05, "mem": 1073741824, "maxmem": 2147483648, "diskread": 1048576, "diskwrite": 2097152, "netin": 3145728, "netout": 4194304, "uptime": 604700}
+          ]
+        },
+        "qemu_raises_for": ["pve2"],
+        "lxc_by_node": {"pve1": []},
+        "lxc_raises_for": ["pve2"],
+        "storage_by_node": {
+          "pve1": [
+            {"storage": "local", "type": "dir", "total": 100000000000, "used": 40000000000, "avail": 60000000000, "active": 1}
+          ]
+        },
+        "storage_raises_for": ["pve2"]
+      },
+      "payload": {
+        "version": "8.2.4",
+        "cluster": {"name": "homelab", "quorate": false, "nodes": 2, "nodes_online": 1},
+        "nodes": [
+          {"name": "pve1", "status": "online", "cpu_usage": 0.1, "memory_used": 4294967296, "memory_total": 17179869184, "uptime": 604800, "vms_running": 1, "lxc_running": 0}
+        ],
+        "vms": [
+          {"vmid": 100, "name": "web-01", "node": "pve1", "status": "running", "cpu_usage": 0.05, "memory_used": 1073741824, "memory_max": 2147483648, "disk_read": 1048576, "disk_write": 2097152, "net_in": 3145728, "net_out": 4194304, "uptime": 604700}
+        ],
+        "lxc": [],
+        "storage": [
+          {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 40000000000, "available": 60000000000, "active": true}
+        ]
+      }
+    },
+    "standalone": {
+      "description": "Standalone node (never joined a cluster): /cluster/status returns only the local node entry with no 'cluster'-type entry, so _collect_cluster returns None => payload.cluster is null. version present and nodes non-empty prove reachability -- this is the shape the server must NOT confuse with 'unreachable' (payload:null). Reuses the None-return pinned by test_collect_cluster_no_cluster_entry_returns_none (T25).",
+      "api": {
+        "version": {"version": "8.2.4"},
+        "cluster_status": [
+          {"type": "node", "name": "standalone-pve", "online": 1, "local": 1}
+        ],
+        "nodes": [
+          {"node": "standalone-pve", "status": "online", "cpu": 0.03, "mem": 2147483648, "maxmem": 8589934592}
+        ],
+        "node_status_by_name": {"standalone-pve": {"uptime": 1209600}},
+        "qemu_by_node": {
+          "standalone-pve": [
+            {"vmid": 100, "name": "vm-01", "status": "running", "cpu": 0.04, "mem": 1073741824, "maxmem": 2147483648, "diskread": 1048576, "diskwrite": 2097152, "netin": 3145728, "netout": 4194304, "uptime": 1209500}
+          ]
+        },
+        "lxc_by_node": {"standalone-pve": []},
+        "storage_by_node": {
+          "standalone-pve": [
+            {"storage": "local", "type": "dir", "total": 100000000000, "used": 30000000000, "avail": 70000000000, "active": 1},
+            {"storage": "local-lvm", "type": "lvmthin", "total": 200000000000, "used": 50000000000, "avail": 150000000000, "active": 1}
+          ]
+        }
+      },
+      "payload": {
+        "version": "8.2.4",
+        "cluster": null,
+        "nodes": [
+          {"name": "standalone-pve", "status": "online", "cpu_usage": 0.03, "memory_used": 2147483648, "memory_total": 8589934592, "uptime": 1209600, "vms_running": 1, "lxc_running": 0}
+        ],
+        "vms": [
+          {"vmid": 100, "name": "vm-01", "node": "standalone-pve", "status": "running", "cpu_usage": 0.04, "memory_used": 1073741824, "memory_max": 2147483648, "disk_read": 1048576, "disk_write": 2097152, "net_in": 3145728, "net_out": 4194304, "uptime": 1209500}
+        ],
+        "lxc": [],
+        "storage": [
+          {"name": "local", "node": "standalone-pve", "type": "dir", "total": 100000000000, "used": 30000000000, "available": 70000000000, "active": true},
+          {"name": "local-lvm", "node": "standalone-pve", "type": "lvmthin", "total": 200000000000, "used": 50000000000, "available": 150000000000, "active": true}
+        ]
+      }
+    },
+    "unreachable": {
+      "description": "Whole-module failure: API unreachable / auth failure after lazy token-auth construction. version.get() raises AND the node-listing reachability probe raises => collect() returns None => data['proxmox'] is null. This is the ONLY unreachable signal (there is no 'all empty' partial payload). Server reads reachable=false. NOTE (agent 1.9.0 normalization): before 1.9.0 this scenario returned {\"version\": null, \"cluster\": null, \"nodes\": [], \"vms\": [], \"lxc\": [], \"storage\": []}, which the server could not tell apart from a healthy idle node by value.",
+      "api": {
+        "version_raises": true,
+        "cluster_status_raises": true,
+        "nodes_raises": true
+      },
+      "payload": null
+    },
+    "partial_node_timeout": {
+      "description": "Healthy 3-node quorate cluster where pve2's per-node API hangs (times out) mid-loop while corosync still counts it online. The cluster-wide /cluster/status call succeeds, so payload.cluster.nodes_online stays 3, but pve2's status/qemu/lxc/storage calls each raise and are swallowed per-node -- pve2 silently drops from nodes/vms/lxc/storage. Pins the partial-collection shape: cluster.nodes_online (3) != len(nodes) (2) is the server's nodes_ok=false signal; pve2's guests and storage vanish with it (guests_ok/storage_ok derived transitively).",
+      "api": {
+        "version": {"version": "8.2.4"},
+        "cluster_status": [
+          {"type": "cluster", "name": "production", "quorate": 1, "nodes": 3},
+          {"type": "node", "name": "pve1", "online": 1},
+          {"type": "node", "name": "pve2", "online": 1},
+          {"type": "node", "name": "pve3", "online": 1}
+        ],
+        "nodes": [
+          {"node": "pve1", "status": "online", "cpu": 0.12, "mem": 8589934592, "maxmem": 34359738368},
+          {"node": "pve2", "status": "online", "cpu": 0.2, "mem": 4294967296, "maxmem": 34359738368},
+          {"node": "pve3", "status": "online", "cpu": 0.05, "mem": 2147483648, "maxmem": 17179869184}
+        ],
+        "node_status_by_name": {"pve1": {"uptime": 864000}, "pve3": {"uptime": 216000}},
+        "node_status_raises_for": ["pve2"],
+        "qemu_by_node": {
+          "pve1": [
+            {"vmid": 100, "name": "web-01", "status": "running", "cpu": 0.08, "mem": 2147483648, "maxmem": 4294967296, "diskread": 1048576, "diskwrite": 2097152, "netin": 3145728, "netout": 4194304, "uptime": 863900}
+          ],
+          "pve3": [
+            {"vmid": 102, "name": "app-01", "status": "running", "cpu": 0.15, "mem": 1073741824, "maxmem": 2147483648, "diskread": 4194304, "diskwrite": 8388608, "netin": 5242880, "netout": 6291456, "uptime": 215900}
+          ]
+        },
+        "qemu_raises_for": ["pve2"],
+        "lxc_by_node": {
+          "pve1": [
+            {"vmid": 200, "name": "proxy-01", "status": "running", "cpu": 0.02, "mem": 536870912, "maxmem": 1073741824, "diskread": 524288, "diskwrite": 1048576, "netin": 2097152, "netout": 3145728, "uptime": 863800}
+          ],
+          "pve3": []
+        },
+        "lxc_raises_for": ["pve2"],
+        "storage_by_node": {
+          "pve1": [
+            {"storage": "local-lvm", "type": "lvmthin", "total": 137438953472, "used": 34359738368, "avail": 103079215104, "active": 1}
+          ],
+          "pve3": [
+            {"storage": "local-lvm", "type": "lvmthin", "total": 68719476736, "used": 10000000000, "avail": 58719476736, "active": 1}
+          ]
+        },
+        "storage_raises_for": ["pve2"]
+      },
+      "payload": {
+        "version": "8.2.4",
+        "cluster": {"name": "production", "quorate": true, "nodes": 3, "nodes_online": 3},
+        "nodes": [
+          {"name": "pve1", "status": "online", "cpu_usage": 0.12, "memory_used": 8589934592, "memory_total": 34359738368, "uptime": 864000, "vms_running": 1, "lxc_running": 1},
+          {"name": "pve3", "status": "online", "cpu_usage": 0.05, "memory_used": 2147483648, "memory_total": 17179869184, "uptime": 216000, "vms_running": 1, "lxc_running": 0}
+        ],
+        "vms": [
+          {"vmid": 100, "name": "web-01", "node": "pve1", "status": "running", "cpu_usage": 0.08, "memory_used": 2147483648, "memory_max": 4294967296, "disk_read": 1048576, "disk_write": 2097152, "net_in": 3145728, "net_out": 4194304, "uptime": 863900},
+          {"vmid": 102, "name": "app-01", "node": "pve3", "status": "running", "cpu_usage": 0.15, "memory_used": 1073741824, "memory_max": 2147483648, "disk_read": 4194304, "disk_write": 8388608, "net_in": 5242880, "net_out": 6291456, "uptime": 215900}
+        ],
+        "lxc": [
+          {"vmid": 200, "name": "proxy-01", "node": "pve1", "status": "running", "cpu_usage": 0.02, "memory_used": 536870912, "memory_max": 1073741824, "disk_read": 524288, "disk_write": 1048576, "net_in": 2097152, "net_out": 3145728, "uptime": 863800}
+        ],
+        "storage": [
+          {"name": "local-lvm", "node": "pve1", "type": "lvmthin", "total": 137438953472, "used": 34359738368, "available": 103079215104, "active": true},
+          {"name": "local-lvm", "node": "pve3", "type": "lvmthin", "total": 68719476736, "used": 10000000000, "available": 58719476736, "active": true}
+        ]
+      }
+    }
+  }
+}

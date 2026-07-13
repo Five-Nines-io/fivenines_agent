@@ -63,7 +63,7 @@ poetry run fivenines_agent --version
 **Permission Probing (`permissions.py`)**
 - Detects available monitoring capabilities at startup based on file permissions, sudo access, and group memberships
 - Re-probes automatically every 5 minutes or on SIGHUP signal to detect permission changes
-- Capabilities include: core metrics (always available), hardware sensors, storage (SMART/RAID), services (Docker/QEMU/Proxmox), security (fail2ban), etc.
+- Capabilities include: core metrics (always available), hardware sensors, storage (SMART/RAID), services (Docker/QEMU/Proxmox/systemd), kernel surfaces (cgroup, tri-state "v1"/"v2"/None), security (fail2ban), etc.
 - Prints a capabilities banner showing what features are available/unavailable with hints
 
 **Synchronizer (`synchronizer.py`)**
@@ -98,10 +98,11 @@ Each metric collector is a separate module that exports functions to collect spe
 
 - **Core metrics** (always enabled): `cpu.py`, `memory.py`, `load_average.py`, `io.py`, `network.py`, `partitions.py`, `files.py`, `ports.py`, `processes.py`, `temperatures.py`, `fans.py`
 - **Storage**: `smart_storage.py` (requires sudo smartctl), `raid_storage.py` (requires sudo mdadm), `zfs.py`
-- **Services**: `docker.py`, `qemu.py`, `proxmox.py`, `caddy.py`, `nginx.py`, `postgresql.py`, `redis.py`
+- **Services**: `docker.py`, `qemu.py`, `proxmox.py`, `caddy.py`, `nginx.py`, `postgresql.py`, `redis.py`, `systemd.py` (per-unit health + inventory delta-sync, requires systemctl; journalctl only for failure journal tails)
 - **Security**: `fail2ban.py` (requires sudo fail2ban-client)
 - **Network/connectivity**: `ip.py` (public IPv4/IPv6 via ip.fivenines.io with 60s cache), `ping.py` (TCP latency), `snmp.py` (SNMP device polling via net-snmp CLI tools)
 - **Security scanning**: `packages.py` (installed packages via dpkg/rpm/apk/pacman with hash-based delta sync)
+- **Kernel surfaces**: `cgroup.py` (v1/v2 hierarchy detection + safe per-unit metric reads, used by `systemd.py`)
 
 Collectors use the `@debug` decorator from `debug.py` to log execution time and results.
 
@@ -115,6 +116,7 @@ Collectors use the `@debug` decorator from `debug.py` to log execution time and 
   - Service-specific config (e.g., redis host/port, docker socket path)
   - `request_options`: timeout, retry count, retry interval
   - `packages.scan`: triggers package inventory sync with hash-based deduplication
+  - `systemd`: unit collection config (`unit_types` as comma-separated string or list; `scan` triggers inventory delta-sync to `/systemd_inventory`)
 
 ### Installation Types
 
@@ -154,7 +156,7 @@ if perms.get('smart_storage'):
 
 ### Signal Handling
 - SIGTERM/SIGINT: Sets `exit_event` to trigger graceful shutdown
-- SIGHUP: Sets `refresh_permissions_event` to re-probe capabilities without restart
+- SIGHUP: Sets `refresh_permissions_event` to re-probe capabilities without restart; also forces a full systemd inventory resend and re-detects the cached cgroup hierarchy/systemd version
 
 ### Debug Decorator
 Wrap metric collection functions for automatic timing and error logging:

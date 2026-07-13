@@ -131,6 +131,10 @@ class Synchronizer(Thread):
         """
         return self._post("/logs", bundle)
 
+    def send_systemd_inventory(self, inventory_data):
+        """Send systemd inventory snapshot to /systemd_inventory. Returns response or None."""
+        return self._post("/systemd_inventory", inventory_data)
+
     def get_conn(self):
         url = api_url()
         if not url.startswith("localhost"):

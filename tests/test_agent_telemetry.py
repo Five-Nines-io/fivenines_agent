@@ -300,3 +300,215 @@ def test_packages_sync_telemetry_captures_logged_error(
     assert "duration_ms" in entry
     assert "errors" in entry
     assert "Packages synchronization failed, will retry" in entry["errors"]
+
+
+# --- _systemd_inventory_sync_with_telemetry ---
+
+
+def _make_agent_with_systemd_state(systemd_capable=True):
+    agent = make_agent()
+    agent._systemd_force_resend = False
+    # Capability probe is checked before each tick's inventory sync. Default
+    # to a systemd-capable host so existing tests do not have to set it.
+    agent.permissions = MagicMock()
+    agent.permissions.get.return_value = systemd_capable
+    return agent
+
+
+@patch("fivenines_agent.agent.systemd_inventory_sync")
+def test_systemd_inventory_sync_telemetry_early_return(mock_sync):
+    """Telemetry recorded even when systemd_inventory_sync is a no-op."""
+    agent = _make_agent_with_systemd_state()
+    agent.config = {"enabled": True}
+
+    agent._systemd_inventory_sync_with_telemetry()
+
+    assert "systemd_inventory_sync" in agent._telemetry
+    entry = agent._telemetry["systemd_inventory_sync"]
+    assert "duration_ms" in entry
+    assert "errors" not in entry
+    mock_sync.assert_called_once()
+
+
+@patch("fivenines_agent.agent.systemd_inventory_sync")
+def test_systemd_inventory_sync_skipped_when_systemd_capability_false(mock_sync):
+    """On a host where systemd capability is False (Alpine OpenRC, bare
+    container without its own systemd), the agent must NOT pay subprocess
+    cost on every tick."""
+    agent = _make_agent_with_systemd_state(systemd_capable=False)
+    agent.config = {"enabled": True, "systemd": {"scan": True}}
+
+    agent._systemd_inventory_sync_with_telemetry()
+
+    mock_sync.assert_not_called()
+    # No telemetry entry recorded - we exited before _collect was invoked
+    assert "systemd_inventory_sync" not in agent._telemetry
+    agent.permissions.get.assert_called_once_with("systemd")
+
+
+@patch("fivenines_agent.agent.systemd_inventory_sync")
+def test_systemd_inventory_sync_telemetry_consumes_force_flag_on_success(mock_sync):
+    """A confirmed send (sync returns True) clears the force flag."""
+    mock_sync.return_value = True
+    agent = _make_agent_with_systemd_state()
+    agent.config = {"enabled": True, "systemd": {"scan": True}}
+    agent._systemd_force_resend = True
+
+    agent._systemd_inventory_sync_with_telemetry()
+
+    # The flag is cleared so the next tick does not re-force
+    assert agent._systemd_force_resend is False
+    # And the sync was called with force_resend=True
+    args, kwargs = mock_sync.call_args
+    assert kwargs.get("force_resend") is True
+
+
+@patch("fivenines_agent.agent.systemd_inventory_sync")
+def test_systemd_inventory_sync_keeps_force_flag_on_failed_send(mock_sync):
+    """A failed send (sync returns False) keeps the force flag so the next tick
+    retries -- otherwise a forced metadata refresh on unchanged units would be
+    lost to hash dedupe."""
+    mock_sync.return_value = False
+    agent = _make_agent_with_systemd_state()
+    agent.config = {"enabled": True, "systemd": {"scan": True}}
+    agent._systemd_force_resend = True
+
+    agent._systemd_inventory_sync_with_telemetry()
+
+    assert agent._systemd_force_resend is True
+
+
+@patch("fivenines_agent.agent.systemd_inventory_sync")
+def test_systemd_inventory_sync_keeps_force_flag_on_raise(mock_sync):
+    """If the sync raises (telemetry wrapper returns None), the force flag is
+    kept for the next tick."""
+    mock_sync.side_effect = RuntimeError("boom")
+    agent = _make_agent_with_systemd_state()
+    agent.config = {"enabled": True, "systemd": {"scan": True}}
+    agent._systemd_force_resend = True
+
+    agent._systemd_inventory_sync_with_telemetry()
+
+    assert agent._systemd_force_resend is True
+
+
+@patch("fivenines_agent.agent.systemd_inventory_sync")
+def test_systemd_inventory_sync_telemetry_on_exception(mock_sync):
+    """Telemetry with errors recorded when exception occurs."""
+    agent = _make_agent_with_systemd_state()
+    agent.config = {"enabled": True, "systemd": {"scan": True}}
+    mock_sync.side_effect = RuntimeError("snapshot blew up")
+
+    agent._systemd_inventory_sync_with_telemetry()
+
+    entry = agent._telemetry["systemd_inventory_sync"]
+    assert "duration_ms" in entry
+    assert "errors" in entry
+    assert "snapshot blew up" in entry["errors"]
+
+
+@patch("fivenines_agent.agent.systemd_inventory_sync")
+def test_systemd_inventory_sync_telemetry_captures_logged_error(mock_sync):
+    """Errors logged inside systemd_inventory_sync end up in telemetry."""
+    agent = _make_agent_with_systemd_state()
+    agent.config = {"enabled": True, "systemd": {"scan": True}}
+
+    def fake_sync(_config, _send_fn, force_resend=False):
+        log("systemd inventory send failed, will retry", "error")
+
+    mock_sync.side_effect = fake_sync
+
+    agent._systemd_inventory_sync_with_telemetry()
+
+    entry = agent._telemetry["systemd_inventory_sync"]
+    assert "errors" in entry
+    assert "systemd inventory send failed, will retry" in entry["errors"]
+
+
+# --- _handle_permission_refresh: SIGHUP forces inventory resend ---
+
+
+@patch("fivenines_agent.agent.print_capabilities_banner")
+@patch("fivenines_agent.agent.refresh_runtime_caches")
+@patch("fivenines_agent.agent.force_inventory_resend")
+def test_handle_sighup_refresh_force_resends_inventory(
+    mock_force, mock_refresh, mock_banner
+):
+    """SIGHUP forces a permission re-probe, marks the systemd inventory for a
+    fresh resend, AND re-detects the cached systemd version + cgroup hierarchy.
+    SIGHUP is the operator's "I changed the host" signal (e.g. an in-place
+    systemd upgrade that crosses the reverse-deps version gate), which may not
+    flip the capability tuple -- so we refresh the runtime caches directly here
+    rather than relying solely on the flip-gated _resync_systemd_runtime."""
+    from fivenines_agent.agent import refresh_permissions_event
+
+    agent = make_agent()
+    agent._systemd_force_resend = False
+    agent.permissions = MagicMock()
+    agent.static_data = {}
+    refresh_permissions_event.set()
+
+    try:
+        agent._handle_sighup_refresh()
+    finally:
+        refresh_permissions_event.clear()
+
+    agent.permissions.force_refresh.assert_called_once()
+    mock_force.assert_called_once()
+    mock_refresh.assert_called_once()
+    assert agent._systemd_force_resend is True
+    assert refresh_permissions_event.is_set() is False
+
+
+@patch("fivenines_agent.agent.force_inventory_resend")
+@patch("fivenines_agent.agent.refresh_runtime_caches")
+def test_resync_systemd_runtime_redetects_on_capability_flip(mock_refresh, mock_force):
+    """When the gap re-probe flips the cgroup capability (e.g. a mount appears
+    after boot), the collector's cached hierarchy/version are re-detected AND a
+    fresh inventory resend is forced -- the inventory hash excludes cgroup/
+    version metadata, so without the resend the backend would keep cgroup=null
+    until the next unit-config change."""
+    agent = make_agent()
+    agent.permissions = MagicMock()
+    agent._systemd_force_resend = False
+    # Baseline: systemd up but no cgroup yet.
+    agent._last_systemd_cap_state = (True, None)
+    agent.permissions.get_all.return_value = {"systemd": True, "cgroup": "v2"}
+
+    agent._resync_systemd_runtime()
+
+    mock_refresh.assert_called_once()
+    mock_force.assert_called_once()
+    assert agent._systemd_force_resend is True
+    assert agent._last_systemd_cap_state == (True, "v2")
+
+
+@patch("fivenines_agent.agent.force_inventory_resend")
+@patch("fivenines_agent.agent.refresh_runtime_caches")
+def test_resync_systemd_runtime_noop_when_unchanged(mock_refresh, mock_force):
+    """No capability change -> no re-detect and no forced resend (no per-tick
+    subprocess cost, no spurious inventory POST)."""
+    agent = make_agent()
+    agent.permissions = MagicMock()
+    agent._systemd_force_resend = False
+    agent._last_systemd_cap_state = (True, "v2")
+    agent.permissions.get_all.return_value = {"systemd": True, "cgroup": "v2"}
+
+    agent._resync_systemd_runtime()
+
+    mock_refresh.assert_not_called()
+    mock_force.assert_not_called()
+    assert agent._systemd_force_resend is False
+
+
+@patch("fivenines_agent.agent.refresh_runtime_caches")
+def test_resync_systemd_runtime_noop_on_non_systemd_host(mock_refresh):
+    """A capability set without systemd/cgroup (e.g. Windows) is skipped, even
+    on a partially-constructed agent without _last_systemd_cap_state set."""
+    agent = make_agent()
+    agent.permissions = MagicMock()
+    agent.permissions.get_all.return_value = {"qemu": True}
+
+    agent._resync_systemd_runtime()  # must not raise
+
+    mock_refresh.assert_not_called()

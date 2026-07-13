@@ -128,6 +128,25 @@ def test_flip_to_available_logs_without_hint():
     assert "requires" not in avail_msg[0]
 
 
+def test_flip_cgroup_none_to_available_logs():
+    """F6: cgroup is tri-state ('v1'/'v2'/None), so None is a legitimate prior
+    value -- a None->'v2' mount on a subsequent full probe must log 'now
+    AVAILABLE'. The old `old_value is None` guard wrongly suppressed it (treated
+    None as 'newly tracked')."""
+    probe = _new_probe_with({**_ALL_TRUE_CAPS, "cgroup": None, "systemd": True})
+    with _patched_probe({"default": True}), patch.object(
+        PermissionProbe, "_detect_cgroup_hierarchy", return_value="v2"
+    ), patch.object(
+        PermissionProbe, "_can_probe_systemd", return_value=True
+    ), patch(
+        "fivenines_agent.permissions.log"
+    ) as mock_log:
+        probe._probe_all()
+
+    info_msgs = [c.args[0] for c in mock_log.call_args_list if c.args[1] == "info"]
+    assert any("cgroup" in m and "now AVAILABLE" in m for m in info_msgs)
+
+
 def test_capability_hints_keys_are_known_capabilities():
     """Every hint key must correspond to a capability in some OS probe."""
     with _patched_probe({"default": True}):

@@ -15,7 +15,6 @@ from fivenines_agent.debug import log
 from fivenines_agent.env import is_windows
 from fivenines_agent.subprocess_utils import get_clean_env
 
-
 # Full re-probe interval in seconds (5 minutes): every capability is re-checked
 # on this cadence to catch regressions and newly-relevant capabilities.
 REPROBE_INTERVAL = 300
@@ -37,6 +36,7 @@ DEBUG_OUTPUT_LIMIT = 500
 CAPABILITY_HINTS = {
     "smart_storage": "requires sudo smartctl",
     "raid_storage": "requires sudo mdadm",
+    "ceph": "requires ceph CLI + client keyring",
     "docker": "requires docker group",
     "qemu": "requires libvirt group",
     "proxmox": "requires Proxmox VE host",
@@ -48,17 +48,33 @@ CAPABILITY_HINTS = {
     "fans": "no accessible sensors",
     "snmp": "requires net-snmp",
     "journald": "requires systemd-journal group",
+    "systemd": "requires systemd init system",
+    "cgroup": "no /sys/fs/cgroup hierarchy found",
     "disk_health": "requires WMI Storage namespace access",
     "software_inventory": "requires Uninstall registry key access",
 }
 
 # Banner group layout per OS. Each entry is (section title, [capability keys]).
 LINUX_BANNER_GROUPS = [
-    ("Core Metrics", ["cpu", "memory", "load_average", "io", "network",
-                      "partitions", "file_handles", "ports", "processes"]),
+    (
+        "Core Metrics",
+        [
+            "cpu",
+            "memory",
+            "load_average",
+            "io",
+            "network",
+            "partitions",
+            "file_handles",
+            "ports",
+            "processes",
+        ],
+    ),
     ("Hardware Sensors", ["temperatures", "fans", "nvidia_gpu"]),
-    ("Storage", ["smart_storage", "raid_storage", "zfs"]),
-    ("Services", ["docker", "qemu", "proxmox"]),
+    ("Storage", ["smart_storage", "raid_storage", "zfs", "ceph"]),
+    # cgroup sits next to systemd because it exists to gate the systemd
+    # collector's per-unit resource metrics (kernel surface, not a sensor).
+    ("Services", ["docker", "qemu", "proxmox", "systemd", "cgroup"]),
     ("Security", ["fail2ban", "packages"]),
     ("Networking", ["snmp"]),
     ("Logs", ["journald"]),
@@ -68,8 +84,19 @@ WINDOWS_BANNER_GROUPS = [
     # No load_average - Windows has no native equivalent and psutil's
     # CPU-sampling emulation drops to zero on idle systems, which is more
     # misleading than helpful. We omit the metric entirely on Windows.
-    ("Core Metrics", ["cpu", "memory", "io", "network",
-                      "partitions", "file_handles", "ports", "processes"]),
+    (
+        "Core Metrics",
+        [
+            "cpu",
+            "memory",
+            "io",
+            "network",
+            "partitions",
+            "file_handles",
+            "ports",
+            "processes",
+        ],
+    ),
     ("Hardware Sensors", ["temperatures", "fans", "nvidia_gpu"]),
     ("Storage", ["disk_health"]),
     ("Inventory", ["software_inventory"]),
@@ -146,8 +173,14 @@ class PermissionProbe:
             # Subsequent probes: log only state flips. Unavailability transitions
             # carry the same hint+reason payload as the initial probe.
             for cap, available in self.capabilities.items():
-                old_value = old_capabilities.get(cap)
-                if old_value is None or old_value == available:
+                if cap not in old_capabilities:
+                    # Newly tracked capability (e.g. an agent upgrade added a
+                    # probe key): no prior state to flip from, so don't log.
+                    continue
+                # Compare against the stored value, NOT `is None`: cgroup is
+                # tri-state ("v1"/"v2"/None), so None is a legitimate prior value
+                # and a None->"v2" mount is a real flip worth logging.
+                if old_capabilities[cap] == available:
                     continue
                 self._log_capability_flip(cap, available)
 
@@ -180,6 +213,11 @@ class PermissionProbe:
             # Storage requiring sudo
             "smart_storage": (self._can_run_sudo, ("smartctl", "--version")),
             "raid_storage": (self._can_run_sudo, ("mdadm", "--version")),
+            # Ceph - light probe only (CLI present). Cluster reachability/auth is
+            # reported per-cluster as runtime data by the collector, NOT gated
+            # here: a cluster outage must show as a metric, not disable the
+            # collector for the 5-minute reprobe window.
+            "ceph": (self._can_run_ceph, ()),
             # Security - requires sudo
             "fail2ban": (self._can_run_sudo, ("fail2ban-client", "status")),
             # ZFS - doesn't need sudo but needs permissions or delegation
@@ -196,6 +234,10 @@ class PermissionProbe:
             "snmp": (self._has_snmpget, ()),
             # Log monitoring - needs journald read access (systemd-journal group)
             "journald": (self._can_read_journal, ()),
+            # systemd unit collection - needs systemd init + systemctl
+            "systemd": (self._can_probe_systemd, ()),
+            # cgroup hierarchy: "v1", "v2", or None (tri-state)
+            "cgroup": (self._detect_cgroup_hierarchy, ()),
         }
 
     def _build_linux_capabilities(self):
@@ -252,7 +294,9 @@ class PermissionProbe:
     def _probe_specs(self):
         """OS-appropriate {capability: (probe_callable, args)} map for selective
         re-probing. Mirrors whichever set _probe_all built."""
-        return self._windows_probe_specs() if is_windows() else self._linux_probe_specs()
+        return (
+            self._windows_probe_specs() if is_windows() else self._linux_probe_specs()
+        )
 
     def _format_unavailable(self, cap, verb):
         """Build the operator-facing log line for an unavailable capability."""
@@ -267,7 +311,13 @@ class PermissionProbe:
 
     def _log_capability_flip(self, name, available):
         """Emit the info-level state-flip log shared by the full probe and the
-        selective gap probe (single source of the wording/level)."""
+        selective gap probe (single source of the wording/level).
+
+        Keys on truthiness, so a tri-state value change between two truthy states
+        (cgroup 'v1'->'v2') logs "now AVAILABLE" rather than the more precise
+        "changed v1->v2". Cosmetic only, and the trigger (a live cgroup hierarchy
+        switch) needs a remount/reboot that restarts the agent anyway.
+        """
         if available:
             log(f"Capability '{name}' is now AVAILABLE", "info")
         else:
@@ -389,7 +439,11 @@ class PermissionProbe:
                 "debug",
             )
             if not success:
-                detail = stderr.splitlines()[0] if stderr else f"returncode {result.returncode}"
+                detail = (
+                    stderr.splitlines()[0]
+                    if stderr
+                    else f"returncode {result.returncode}"
+                )
                 self._set_reason(f"sudo -n {cmd}: {detail}")
             return success
         except subprocess.TimeoutExpired:
@@ -400,6 +454,23 @@ class PermissionProbe:
             log(f"_can_run_sudo: '{cmd}' exception: {type(e).__name__}: {e}", "debug")
             self._set_reason(f"sudo -n {cmd}: {type(e).__name__}: {e}")
             return False
+
+    def _can_run_ceph(self):
+        """Light probe: is the ceph CLI present?
+
+        Intentionally does NOT run `ceph status`. A capability that flips False
+        on a transient cluster/auth/network failure would skip the whole
+        collector for the reprobe window (collectors.py gates on it), blinding
+        Ceph monitoring exactly when the cluster breaks. Per-cluster keyring
+        readability and reachability are reported by the collector as runtime
+        data instead.
+        """
+        if shutil.which("ceph"):
+            log("_can_run_ceph: 'ceph' found in PATH", "debug")
+            return True
+        log("_can_run_ceph: 'ceph' not found in PATH", "debug")
+        self._set_reason("ceph not found in PATH")
+        return False
 
     def _can_access_hwmon(self):
         """Check if hardware monitoring sensors are readable."""
@@ -535,7 +606,9 @@ class PermissionProbe:
                 return True
 
             log("_can_run_zfs: -> UNAVAILABLE", "debug")
-            detail = stderr.splitlines()[0] if stderr else f"returncode {result.returncode}"
+            detail = (
+                stderr.splitlines()[0] if stderr else f"returncode {result.returncode}"
+            )
             self._set_reason(f"zpool list: {detail}")
             return False
         except subprocess.TimeoutExpired:
@@ -703,8 +776,64 @@ class PermissionProbe:
                 log(f"_can_list_packages: found '{cmd}'", "debug")
                 return True
         log("_can_list_packages: no supported package manager found", "debug")
-        self._set_reason("no supported package manager (dpkg-query, rpm, apk, pacman, synopkg)")
+        self._set_reason(
+            "no supported package manager (dpkg-query, rpm, apk, pacman, synopkg)"
+        )
         return False
+
+    def _can_probe_systemd(self):
+        """Check if systemd is the active init system and systemctl is usable.
+
+        Returns True only when:
+          * /run/systemd/system exists (systemd booted this host)
+          * systemctl is in PATH and `systemctl --version` exits cleanly
+        Returns False on Alpine (OpenRC), bare containers without their own
+        systemd, and macOS dev environments.
+        """
+        if not os.path.isdir("/run/systemd/system"):
+            log("_can_probe_systemd: /run/systemd/system not present", "debug")
+            self._set_reason("/run/systemd/system not present")
+            return False
+        if not shutil.which("systemctl"):
+            log("_can_probe_systemd: systemctl not in PATH", "debug")
+            self._set_reason("systemctl not in PATH")
+            return False
+        try:
+            result = subprocess.run(
+                ["systemctl", "--version"],
+                capture_output=True,
+                timeout=5,
+                env=get_clean_env(),
+            )
+        except (subprocess.TimeoutExpired, OSError) as e:
+            log(f"_can_probe_systemd: systemctl --version failed: {e}", "debug")
+            self._set_reason(f"systemctl --version failed: {type(e).__name__}: {e}")
+            return False
+        if result.returncode != 0:
+            log("_can_probe_systemd: systemctl --version returned non-zero", "debug")
+            self._set_reason(f"systemctl --version returned exit {result.returncode}")
+            return False
+        log("_can_probe_systemd: -> AVAILABLE", "debug")
+        return True
+
+    def _detect_cgroup_hierarchy(self):
+        """Detect cgroup hierarchy version. Returns 'v1', 'v2', or None.
+
+        Delegates to cgroup.detect_hierarchy_uncached() -- the same decision
+        the collector caches -- so the probe and the collector can never
+        disagree on what the hierarchy is (the agent uses a probe-value flip
+        as the trigger to refresh the collector's cache). Works whether or not
+        systemd is installed (some hosts run cgroups without systemd).
+        """
+        from fivenines_agent.cgroup import detect_hierarchy_uncached
+
+        hierarchy = detect_hierarchy_uncached()
+        if hierarchy is None:
+            log("_detect_cgroup_hierarchy: no cgroup hierarchy found", "debug")
+            self._set_reason("no cgroup hierarchy found at /sys/fs/cgroup")
+        else:
+            log(f"_detect_cgroup_hierarchy: -> {hierarchy}", "debug")
+        return hierarchy
 
     def _can_query_psutil_sensors(self, kind):
         """Probe psutil hardware-sensor support on Windows.
@@ -821,6 +950,12 @@ def print_capabilities_banner():
             status = caps.get(cap, False)
             icon = "[+]" if status else "[-]"
             name = cap.replace("_", " ").title()
+
+            # cgroup is tri-state: "v1", "v2", or None. Show the version
+            # next to the name when available so operators can see at a
+            # glance which hierarchy is in use.
+            if cap == "cgroup" and status:
+                name = f"Cgroup {status}"
 
             hint = ""
             if not status and cap in CAPABILITY_HINTS:

@@ -60,6 +60,14 @@ def test_dry_run_uses_static_config_when_synchronizer_is_none(mock_ps, mock_cm, 
         agent_module.systemd_watchdog = original
 
 
+def test_dry_run_config_includes_systemd():
+    """F5: systemd is a host-level collector (no external service config needed,
+    like cpu/disk_health), so --dry-run must exercise its per-tick health
+    surface. Regression: the key was omitted when the collector was added, so
+    collect_metrics' `if not config_value` gate silently skipped it."""
+    assert _DRY_RUN_CONFIG.get("systemd")  # present and truthy
+
+
 @patch("fivenines_agent.agent.dry_run", return_value=True)
 def test_dry_run_cleanup_skips_synchronizer(mock_dr):
     """_cleanup() must not crash when synchronizer is None."""

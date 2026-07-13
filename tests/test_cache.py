@@ -1,0 +1,130 @@
+from fivenines_agent import cache as cache_mod
+
+
+class _FakeClock:
+    """Controllable monotonic clock for deterministic TTL tests."""
+
+    def __init__(self, start=1000.0):
+        self.t = start
+
+    def monotonic(self):
+        return self.t
+
+
+def test_miss_computes_and_stores(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(cache_mod, "time", clock)
+    cache = cache_mod.TTLCache()
+    calls = []
+
+    def compute():
+        calls.append(1)
+        return "v1"
+
+    assert cache.get_or_compute("k", 60, compute) == "v1"
+    assert calls == [1]
+
+
+def test_hit_within_ttl_returns_cached_without_recompute(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(cache_mod, "time", clock)
+    cache = cache_mod.TTLCache()
+    calls = []
+
+    def compute():
+        calls.append(1)
+        return "v1"
+
+    assert cache.get_or_compute("k", 60, compute) == "v1"
+    clock.t += 59  # still inside the TTL window
+    assert cache.get_or_compute("k", 60, lambda: "should-not-run") == "v1"
+    assert calls == [1]
+
+
+def test_stale_at_ttl_boundary_recomputes(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(cache_mod, "time", clock)
+    cache = cache_mod.TTLCache()
+    values = iter(["v1", "v2"])
+
+    def compute():
+        return next(values)
+
+    assert cache.get_or_compute("k", 60, compute) == "v1"
+    clock.t += 60  # elapsed == ttl, not < ttl, so recompute
+    assert cache.get_or_compute("k", 60, compute) == "v2"
+
+
+def test_distinct_keys_are_independent(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(cache_mod, "time", clock)
+    cache = cache_mod.TTLCache()
+
+    assert cache.get_or_compute("a", 60, lambda: "A") == "A"
+    assert cache.get_or_compute("b", 60, lambda: "B") == "B"
+    # Each key keeps its own value; neither overwrites the other.
+    assert cache.get_or_compute("a", 60, lambda: "x") == "A"
+    assert cache.get_or_compute("b", 60, lambda: "x") == "B"
+
+
+def test_store_if_false_skips_caching(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(cache_mod, "time", clock)
+    cache = cache_mod.TTLCache()
+    calls = []
+
+    def compute():
+        calls.append(1)
+        return "err"
+
+    # store_if False -> value never cached -> recomputed on every call
+    cache.get_or_compute("k", 60, compute, store_if=lambda v: False)
+    cache.get_or_compute("k", 60, compute, store_if=lambda v: False)
+    assert len(calls) == 2
+
+
+def test_store_if_true_caches(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(cache_mod, "time", clock)
+    cache = cache_mod.TTLCache()
+    calls = []
+
+    def compute():
+        calls.append(1)
+        return "ok"
+
+    cache.get_or_compute("k", 60, compute, store_if=lambda v: True)
+    cache.get_or_compute("k", 60, compute, store_if=lambda v: True)
+    assert len(calls) == 1
+
+
+def test_evicts_expired_entries_on_insert(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(cache_mod, "time", clock)
+    cache = cache_mod.TTLCache()
+
+    cache.get_or_compute("a", 10, lambda: "A")
+    clock.t += 11  # "a" is now older than its own 10s ttl
+    cache.get_or_compute("b", 10, lambda: "B")  # this insert sweeps expired keys
+
+    assert "a" not in cache._entries  # dynamic-key leak prevented
+    assert "b" in cache._entries
+
+
+def test_timestamp_is_taken_after_compute(monkeypatch):
+    clock = _FakeClock()
+    monkeypatch.setattr(cache_mod, "time", clock)
+    cache = cache_mod.TTLCache()
+
+    def slow_compute():
+        clock.t += 8  # the work itself takes 8s
+        return "v"
+
+    cache.get_or_compute("k", 10, slow_compute)  # stored at t=1008, not t=1000
+    clock.t = 1017  # 9s after the post-compute stamp, still < 10s ttl
+    calls = []
+    cache.get_or_compute("k", 10, lambda: (calls.append(1), "v2")[1])
+
+    # Pre-compute stamp (1000) would be stale at 1017 (17 >= 10) and recompute;
+    # post-compute stamp (1008) is fresh (9 < 10), so no recompute.
+    assert calls == []

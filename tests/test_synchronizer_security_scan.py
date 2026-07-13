@@ -164,6 +164,34 @@ def test_send_packages_failure(mock_post):
     assert result is None
 
 
+# --- send_systemd_inventory ---
+
+
+@patch.object(Synchronizer, "_post")
+def test_send_systemd_inventory_success(mock_post):
+    sync = make_synchronizer()
+    mock_post.return_value = {"status": "queued"}
+
+    inventory = {
+        "inventory_hash": "deadbeef",
+        "units": {"nginx.service": {"FragmentPath": "/etc/foo"}},
+        "version": 252,
+        "cgroup": "v2",
+    }
+    result = sync.send_systemd_inventory(inventory)
+    assert result == {"status": "queued"}
+    mock_post.assert_called_once_with("/systemd_inventory", inventory)
+
+
+@patch.object(Synchronizer, "_post")
+def test_send_systemd_inventory_failure(mock_post):
+    sync = make_synchronizer()
+    mock_post.return_value = None
+
+    result = sync.send_systemd_inventory({"inventory_hash": "x", "units": {}})
+    assert result is None
+
+
 # --- get_config ---
 
 

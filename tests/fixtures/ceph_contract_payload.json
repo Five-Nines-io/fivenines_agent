@@ -1,0 +1,64 @@
+{
+  "description": "Shared Ceph contract fixture between fivenines-agent and fivenines-server. Source of truth: fivenines-agent tests/fixtures/ceph_contract_payload.json, asserted end-to-end by tests/test_ceph.py::test_contract_fixture_round_trip (only subprocess.run is mocked). The server's spec/requests/api_collect_ceph_spec.rb posts 'payload' under data['ceph'] and asserts Ingesters::Ceph ingests it; 'config' is the shape config['ceph'] must take (clusters[0] is the default target ceph_targets_for_host returns when a host has no CephTarget override rows; clusters[1] is a full override row). Change only in lockstep across both repos.",
+  "agent_min_version": "1.9.0",
+  "config": {
+    "clusters": [
+      { "name": "ceph" },
+      {
+        "name": "edge",
+        "id": "fivenines",
+        "keyring": "/etc/ceph/edge.client.fivenines.keyring",
+        "conf": "/etc/ceph/edge.conf",
+        "use_sudo": false
+      }
+    ]
+  },
+  "payload": {
+    "clusters": [
+      {
+        "fsid": "3f6ad3d1-8f6e-4a5b-9e6c-2f4a1b8c9d0e",
+        "configured_name": "ceph",
+        "collection": {
+          "reachable": true,
+          "status_ok": true,
+          "df_ok": true,
+          "tree_ok": true,
+          "error": null
+        },
+        "health": { "status": "HEALTH_WARN", "checks": ["OSD_DOWN"] },
+        "mon": { "in_quorum": 3, "total": 3 },
+        "osd": { "up": 2, "in": 3, "total": 3 },
+        "pg": { "total": 129, "degraded": 12, "inactive": 0, "undersized": 12 },
+        "capacity": {
+          "total_bytes": 32212254720,
+          "used_bytes": 12884901888,
+          "avail_bytes": 19327352832
+        },
+        "hosts": [
+          { "host": "node-1", "osd_count": 2 },
+          { "host": "node-2", "osd_count": 1 }
+        ]
+      },
+      {
+        "fsid": null,
+        "configured_name": "edge",
+        "collection": {
+          "reachable": false,
+          "status_ok": false,
+          "df_ok": false,
+          "tree_ok": false,
+          "error": {
+            "type": "unreachable",
+            "message": "unable to connect to cluster"
+          }
+        },
+        "health": null,
+        "mon": null,
+        "osd": null,
+        "pg": null,
+        "capacity": null,
+        "hosts": null
+      }
+    ]
+  }
+}

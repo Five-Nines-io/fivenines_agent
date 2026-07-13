@@ -1,20 +1,12 @@
-import subprocess
 import json
-import os
-import time
+import subprocess
 
+from fivenines_agent.cache import TTLCache
 from fivenines_agent.debug import debug, log
 from fivenines_agent.subprocess_utils import get_clean_env
 
-_health_storage_cache = {
-    "timestamp": 0,
-    "data": []
-}
 
-_identification_storage_cache = {
-    "timestamp": 0,
-    "data": []
-}
+_cache = TTLCache()
 
 # Cap data-collection smartctl/nvme calls so a slow or hanging drive cannot
 # block the single-threaded collection loop indefinitely and starve the systemd
@@ -535,18 +527,15 @@ def get_storage_identification(device):
 @debug('smart_storage_identification')
 def smart_storage_identification():
     """Collect storage identification for all storage devices.
-    Uses smartctl for all devices.
-    Cached for 10 minutes.
+    Uses smartctl for all devices. Cached for 10 minutes (identification only
+    changes on hotswapped drives).
     """
-    global _identification_storage_cache
-    now = time.time()
+    return _cache.get_or_compute(
+        "identification", 600, _compute_storage_identification
+    )
 
 
-    # Cache for 10 minutes as we don't need to update this too often
-    # This can change only for hotswapped drives
-    if now - _identification_storage_cache["timestamp"] < 600:
-        return _identification_storage_cache["data"]
-
+def _compute_storage_identification():
     # Preserve the prior failure contract: if smartctl's version is unreadable,
     # emit nothing rather than a partial payload (the backend reads this shape).
     # get_smartctl_version() self-checks via `sudo -n`, so it doubles as the
@@ -554,34 +543,31 @@ def smart_storage_identification():
     smartctl_version = get_smartctl_version()
     if smartctl_version is None:
         log("smartctl unavailable (not installed or no sudo permissions)", 'debug')
-        data = []
-    else:
-        devices = list_storage_devices()
-        if not devices:
-            log("No storage devices found", 'error')
-            data = []
-        else:
-            # Fetch the nvme-cli version only when an NVMe device is present, so
-            # ATA-only hosts never shell out to `nvme version`. Identification
-            # keys off the device path (its `smartctl -i` output has no SMART
-            # section to parse, unlike the health collector). get_nvme_cli_version()
-            # self-checks via `sudo -n` and returns None when nvme-cli is unusable,
-            # so it doubles as the availability gate. The key stays in the payload
-            # (null when absent) to keep the per-device shape stable.
-            has_nvme = any(is_nvme_device(dev) for dev in devices)
-            tool_versions = {
-                "smartctl_version": smartctl_version,
-                "nvme_cli_version": get_nvme_cli_version() if has_nvme else None,
-            }
-            data = [get_storage_identification(dev) for dev in devices]
-            data = [d for d in data if d is not None]
-            for device_info in data:
-                device_info.update(tool_versions)
+        return []
 
-    _identification_storage_cache["timestamp"] = now
-    _identification_storage_cache["data"] = data
+    devices = list_storage_devices()
+    if not devices:
+        log("No storage devices found", 'error')
+        return []
 
+    # Fetch the nvme-cli version only when an NVMe device is present, so
+    # ATA-only hosts never shell out to `nvme version`. Identification
+    # keys off the device path (its `smartctl -i` output has no SMART
+    # section to parse, unlike the health collector). get_nvme_cli_version()
+    # self-checks via `sudo -n` and returns None when nvme-cli is unusable,
+    # so it doubles as the availability gate. The key stays in the payload
+    # (null when absent) to keep the per-device shape stable.
+    has_nvme = any(is_nvme_device(dev) for dev in devices)
+    tool_versions = {
+        "smartctl_version": smartctl_version,
+        "nvme_cli_version": get_nvme_cli_version() if has_nvme else None,
+    }
+    data = [get_storage_identification(dev) for dev in devices]
+    data = [d for d in data if d is not None]
+    for device_info in data:
+        device_info.update(tool_versions)
     return data
+
 
 def _memoized_nvme_probe():
     """Build a zero-arg callable that runs nvme_cli_available() at most once.
@@ -607,29 +593,23 @@ def smart_storage_health():
     Uses smartctl for all devices and enhances NVMe devices with nvme-cli when available.
     Cached for 60 seconds.
     """
-    global _health_storage_cache
-    now = time.time()
+    return _cache.get_or_compute("health", 60, _compute_storage_health)
 
-    if now - _health_storage_cache["timestamp"] < 60:
-        return _health_storage_cache["data"]
 
+def _compute_storage_health():
     if not smartctl_available():
         log("smartctl unavailable (not installed or no sudo permissions)", 'debug')
-        data = []
-    else:
-        devices = list_storage_devices()
-        if not devices:
-            log("No storage devices found", 'error')
-            data = []
-        else:
-            # Probe nvme-cli at most once per tick (memoized) and only for
-            # devices whose parsed SMART output is NVMe, matching the per-device
-            # gate in get_storage_info. Hosts with no NVMe device never probe.
-            nvme_probe = _memoized_nvme_probe()
-            data = [get_storage_info(dev, nvme_probe) for dev in devices]
-            data = [d for d in data if d is not None]
+        return []
 
-    _health_storage_cache["timestamp"] = now
-    _health_storage_cache["data"] = data
+    devices = list_storage_devices()
+    if not devices:
+        log("No storage devices found", 'error')
+        return []
 
-    return data
+    # Probe nvme-cli at most once per tick (memoized) and only for
+    # devices whose parsed SMART output is NVMe, matching the per-device
+    # gate in get_storage_info. Hosts with no NVMe device never probe.
+    nvme_probe = _memoized_nvme_probe()
+    data = [get_storage_info(dev, nvme_probe) for dev in devices]
+    # Remove None values
+    return [d for d in data if d is not None]

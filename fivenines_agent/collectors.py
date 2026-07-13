@@ -3,6 +3,7 @@
 import time
 
 from fivenines_agent.caddy import caddy_metrics
+from fivenines_agent.ceph import ceph_metrics
 from fivenines_agent.cpu import cpu_count, cpu_data, cpu_model, cpu_usage
 from fivenines_agent.debug import log, start_log_capture, stop_log_capture
 from fivenines_agent.disk_health_windows import disk_health_windows
@@ -27,8 +28,8 @@ from fivenines_agent.smart_storage import (
     smart_storage_health,
     smart_storage_identification,
 )
+from fivenines_agent.systemd import systemd_metrics
 from fivenines_agent.temperatures import temperatures
-
 
 # Registry of metric collectors.
 # Each entry: (config_key, [(data_key, callable, pass_kwargs), ...])
@@ -72,6 +73,9 @@ COLLECTORS = [
         ],
     ),
     ("raid_storage_health", [("raid_storage_health", raid_storage_health, False)]),
+    # Ceph: list-driven multi-cluster. config["ceph"] == {"clusters": [...]} is
+    # unpacked (pass_kwargs) into ceph_metrics(clusters=[...]).
+    ("ceph", [("ceph", ceph_metrics, True)]),
     ("processes", [("processes", processes, False)]),
     ("ports", [("ports", listening_ports, True)]),
     ("temperatures", [("temperatures", temperatures, False)]),
@@ -85,6 +89,7 @@ COLLECTORS = [
     ("caddy", [("caddy", caddy_metrics, True)]),
     ("postgresql", [("postgresql", postgresql_metrics, True)]),
     ("proxmox", [("proxmox", proxmox_metrics, True)]),
+    ("systemd", [("systemd", systemd_metrics, True)]),
     # Windows-only: gated by the disk_health capability, only present in the
     # Windows-tailored capability set (D13 - permissions._build_windows_*).
     ("disk_health", [("disk_health", disk_health_windows, False)]),
