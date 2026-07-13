@@ -22,6 +22,7 @@ def test_registry_has_expected_config_keys():
         "smart_storage_health",
         "raid_storage_health",
         "ceph",
+        "zfs",
         "processes",
         "ports",
         "temperatures",

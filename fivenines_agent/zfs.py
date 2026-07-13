@@ -1,4 +1,4 @@
-import os
+import re
 import shutil
 import subprocess
 import time
@@ -6,68 +6,152 @@ import time
 from fivenines_agent.debug import debug, log
 from fivenines_agent.subprocess_utils import get_clean_env
 
+# Default poll throttle (seconds). Overridable via the "zfs" config dict, which
+# collectors.py unpacks as kwargs: {"interval": N} -> zfs_storage_health(interval=N).
+_DEFAULT_INTERVAL = 60
+
 _zfs_cache = {
     "timestamp": 0,
-    "data": []
+    "data": [],
 }
+
+# Stable wire contract: zpool health string -> numeric code. Append-only, never
+# renumber (the server's ZFS ingester depends on these values). Unknown -> None,
+# and the raw "health" string is kept so the backend can still react to it.
+_HEALTH_CODES = {
+    "ONLINE": 0,
+    "DEGRADED": 1,
+    "FAULTED": 2,
+    "OFFLINE": 3,
+    "REMOVED": 4,
+    "UNAVAIL": 5,
+    "SUSPENDED": 6,
+}
+
+# vdev/device states that count toward degraded_vdevs. ONLINE and spare states
+# (AVAIL/INUSE) are healthy and excluded.
+_UNHEALTHY_VDEV_STATES = {"DEGRADED", "FAULTED", "OFFLINE", "REMOVED", "UNAVAIL"}
+
+# `zpool status` line labels, used to bound the multi-line scan block.
+_STATUS_LABELS = (
+    "pool:",
+    "state:",
+    "status:",
+    "action:",
+    "see:",
+    "scan:",
+    "config:",
+    "errors:",
+    "remove:",
+    "checkpoint:",
+    "dedup:",
+)
+
 
 def zfs_available() -> bool:
     """Check if ZFS is available on the system."""
     return shutil.which("zpool") is not None
 
-def get_zfs_version():
-    """Get ZFS version information."""
-    try:
-        result = subprocess.run(
-            ["zpool", "version"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=True,
-            env=get_clean_env()
-        )
-        return result.stdout.split('\n')[0].strip()
-    except Exception as e:
-        log(f"Error fetching ZFS version: {e}", 'error')
-        return None
-
-def list_zfs_pools():
-    """List all ZFS pools."""
-    pools = []
-    try:
-        result = subprocess.run(
-            ["zpool", "list", "-H", "-o", "name"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            check=True,
-            env=get_clean_env()
-        )
-        for line in result.stdout.splitlines():
-            if line.strip():
-                pools.append(line.strip())
-    except Exception as e:
-        log(f"Error listing ZFS pools: {e}", 'error')
-    return pools
 
 def _run(cmd):
     return subprocess.run(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, check=False, env=get_clean_env()
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+        env=get_clean_env(),
     )
+
+
+def get_zfs_version():
+    """Get ZFS version information (first line of `zpool version`)."""
+    r = _run(["zpool", "version"])
+    if r.returncode != 0:
+        return None
+    line = r.stdout.split("\n", 1)[0].strip()
+    return line or None
+
+
+def list_zfs_pools():
+    """List all ZFS pool names."""
+    r = _run(["zpool", "list", "-H", "-o", "name"])
+    if r.returncode != 0:
+        return []
+    return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
+
 
 def _safe_int(x, default=None):
     try:
         return int(x)
-    except Exception:
+    except (TypeError, ValueError):
         try:
             return int(float(x))
-        except Exception:
+        except (TypeError, ValueError):
             return default
+
+
+def _health_code(health):
+    """Map a zpool health string to the stable numeric contract code (or None)."""
+    if not health:
+        return None
+    return _HEALTH_CODES.get(health.strip().upper())
+
+
+def _count_degraded_vdevs(vdev_tree):
+    """Count devices/vdevs below the pool root whose state is unhealthy.
+
+    Walks the primary child tree only. Section devices (spares/cache/logs) are
+    already reachable there via the indentation parser, so they are counted once.
+    Returns None when there is no vdev tree (status unavailable).
+    """
+    if not vdev_tree:
+        return None
+    count = 0
+    stack = list(vdev_tree.get("children", []) or [])
+    while stack:
+        node = stack.pop()
+        state = node.get("state")
+        if state and state.strip().upper() in _UNHEALTHY_VDEV_STATES:
+            count += 1
+        stack.extend(node.get("children", []) or [])
+    return count
+
+
+def _parse_resilver_progress(scan_text):
+    """Percent (0-100) of an in-progress resilver; 0.0 when not resilvering.
+
+    Returns None when no scan information is available (status unavailable).
+    """
+    if scan_text is None:
+        return None
+    if "resilver in progress" not in scan_text.lower():
+        return 0.0
+    m = re.search(r"(\d+(?:\.\d+)?)\s*% done", scan_text)
+    return float(m.group(1)) if m else 0.0
+
+
+def _parse_scrub_errors(scan_text):
+    """Error count reported by the last completed scrub.
+
+    Returns None when the last scan was not a completed scrub (never scrubbed,
+    resilver in progress, or status unavailable), so the backend can tell a clean
+    scrub (0) from an unknown one.
+    """
+    if not scan_text or "scrub repaired" not in scan_text.lower():
+        return None
+    m = re.search(r"with (\d+) errors", scan_text)
+    return _safe_int(m.group(1)) if m else None
+
 
 def _indent_width(line):
     expanded = line.expandtabs(8)
     return len(expanded) - len(expanded.lstrip(" "))
+
+
+def _is_status_label(stripped):
+    return any(stripped.startswith(lbl) for lbl in _STATUS_LABELS)
+
 
 def _push_by_indent(indent_stack, root, indent, node):
     while indent_stack and indent_stack[-1][0] >= indent:
@@ -79,11 +163,13 @@ def _push_by_indent(indent_stack, root, indent, node):
         root.setdefault("children", []).append(node)
     indent_stack.append((indent, node))
 
+
 def _parse_zpool_status(text):
     pools = {}
     cur = None
     in_config = False
     header_seen = False
+    in_scan = False
     indent_stack = []
     section = None  # logs/spares/cache/special
     pool_name = None
@@ -100,17 +186,26 @@ def _parse_zpool_status(text):
             finalize_current()
             pool_name = line.split(":", 1)[1].strip()
             cur = {
-                "name": pool_name,
                 "scan": None,
+                "scan_full": None,
                 "errors": None,
                 "vdev_tree": {
-                    "name": None, "state": None, "read": None, "write": None, "cksum": None,
-                    "children": [], "logs": [], "spares": [], "cache": [], "special": []
+                    "name": None,
+                    "state": None,
+                    "read": None,
+                    "write": None,
+                    "cksum": None,
+                    "children": [],
+                    "logs": [],
+                    "spares": [],
+                    "cache": [],
+                    "special": [],
                 },
-                "parser_warnings": []
+                "_scan_lines": [],
             }
             in_config = False
             header_seen = False
+            in_scan = False
             indent_stack = []
             section = None
             continue
@@ -118,11 +213,28 @@ def _parse_zpool_status(text):
         if not cur:
             continue
 
+        # Accumulate the multi-line scan block. Continuation lines are indented
+        # and are not themselves status labels. This must run before the label
+        # handlers so the "% done" / "with N errors" details are not dropped.
+        if in_scan:
+            stripped_c = line.strip()
+            if (
+                line[:1] in (" ", "\t")
+                and stripped_c
+                and not _is_status_label(stripped_c)
+            ):
+                cur["_scan_lines"].append(stripped_c)
+                continue
+            in_scan = False  # not a continuation: fall through to normal handling
+
         if line.startswith(" state:"):
             cur["vdev_tree"]["state"] = line.split(":", 1)[1].strip()
             continue
         if line.strip().startswith("scan:"):
-            cur["scan"] = line.split(":", 1)[1].strip()
+            first = line.split(":", 1)[1].strip()
+            cur["scan"] = first
+            cur["_scan_lines"] = [first]
+            in_scan = True
             continue
         if line.strip().startswith("errors:"):
             cur["errors"] = line.split(":", 1)[1].strip()
@@ -152,29 +264,29 @@ def _parse_zpool_status(text):
             section = st
             continue
 
-        # Device/vdev row
+        # Device/vdev row (line is already known non-empty here)
         leading = _indent_width(line)
         cols = line.split()
-        if not cols:
-            continue
-
         name = cols[0]
         state = cols[1] if len(cols) > 1 else None
 
         def _num(i):
             try:
                 return int(cols[i])
-            except Exception:
+            except (IndexError, ValueError):
                 return None
 
-        read = _num(2)
-        write = _num(3)
-        cksum = _num(4)
-        node = {"name": name, "state": state, "read": read, "write": write, "cksum": cksum}
+        node = {
+            "name": name,
+            "state": state,
+            "read": _num(2),
+            "write": _num(3),
+            "cksum": _num(4),
+        }
 
         root = cur["vdev_tree"]
 
-        if root["name"] is None and name == cur["name"]:
+        if root["name"] is None and name == pool_name:
             root.update(node)
             indent_stack = [(leading, root)]
             continue
@@ -187,11 +299,26 @@ def _parse_zpool_status(text):
 
     finalize_current()
 
+    # Collapse the scan block into a single string for numeric derivation and
+    # drop the scratch field.
+    for p in pools.values():
+        lines = p.pop("_scan_lines", [])
+        p["scan_full"] = " ".join(lines) if lines else p.get("scan")
+
     return pools
+
 
 def _zpool_list_summary():
     res = {}
-    q = _run(["zpool", "list", "-Hp", "-o", "name,health,size,alloc,free,frag,cap,dedupratio"])
+    q = _run(
+        [
+            "zpool",
+            "list",
+            "-Hp",
+            "-o",
+            "name,health,size,alloc,free,frag,cap,dedupratio",
+        ]
+    )
     if q.returncode != 0:
         return res
     for line in filter(None, q.stdout.splitlines()):
@@ -208,67 +335,81 @@ def _zpool_list_summary():
                 "frag_percent": _safe_int(frag),
                 "capacity_percent": _safe_int(cap),
                 "dedup_ratio": (None if dedup in ("-", "") else float(dedup)),
-            }
+            },
         }
     return res
 
+
 def get_zfs_pool_info(pool_name):
-    """Get comprehensive ZFS pool information."""
+    """Collect the health contract for a single ZFS pool."""
     try:
         list_summary = _zpool_list_summary()
-        status_cp = _run(["zpool", "status", "-PLv", pool_name])
+
+        # -p (parseable) is unsupported on very old ZFS; fall back to -PLv.
+        status_cp = _run(["zpool", "status", "-pPLv", pool_name])
+        if status_cp.returncode != 0:
+            status_cp = _run(["zpool", "status", "-PLv", pool_name])
 
         if status_cp.returncode != 0 and pool_name not in list_summary:
-            log(f"Error getting ZFS pool info for {pool_name}: {status_cp.stderr.strip() or 'zpool failed'}", 'error')
+            log(
+                f"Error getting ZFS pool info for {pool_name}: "
+                f"{status_cp.stderr.strip() or 'zpool failed'}",
+                "error",
+            )
             return None
 
-        details = _parse_zpool_status(status_cp.stdout) if status_cp.returncode == 0 else {}
+        details = (
+            _parse_zpool_status(status_cp.stdout) if status_cp.returncode == 0 else {}
+        )
         d = details.get(pool_name, {})
         s = list_summary.get(pool_name, {})
+        summary = s.get("summary")
+        health = s.get("health")
         vdev_tree = d.get("vdev_tree")
+        scan_full = d.get("scan_full")
 
-        parser_warnings = d.get("parser_warnings", [])
-        if vdev_tree and vdev_tree.get("name") != pool_name:
-            parser_warnings.append(f"root.name={vdev_tree.get('name')} != pool {pool_name}")
-
-        pool_info = {
+        return {
             "name": pool_name,
-            "health": s.get("health"),
-            "summary": s.get("summary"),
-            "scan": d.get("scan"),
+            "health": health,
+            "health_code": _health_code(health),
+            "degraded_vdevs": _count_degraded_vdevs(vdev_tree),
+            "resilver_progress": _parse_resilver_progress(scan_full),
+            "scrub_errors": _parse_scrub_errors(scan_full),
+            "fragmentation": (summary or {}).get("frag_percent"),
+            "summary": summary,
             "errors": d.get("errors"),
             "vdev_tree": vdev_tree,
-            "parser_warnings": parser_warnings,
-            "status_raw": status_cp.stdout if status_cp.returncode == 0 else None,
         }
 
-        return pool_info
-
     except Exception as e:
-        log(f"Error fetching ZFS pool info for {pool_name}: {e}", 'error')
+        log(f"Error fetching ZFS pool info for {pool_name}: {e}", "error")
         return None
 
-@debug('zfs_storage_health')
-def zfs_storage_health():
+
+@debug("zfs_storage_health")
+def zfs_storage_health(interval=_DEFAULT_INTERVAL):
+    """Collect health for all ZFS pools.
+
+    Throttled to at most once per `interval` seconds (default 60); the agent's
+    global tick can be shorter than a zpool poll is worth.
     """
-    Collect health info for all ZFS pools.
-    Cached for 60 seconds.
-    """
-    global _zfs_cache
     now = time.time()
 
-    if now - _zfs_cache["timestamp"] < 60:
+    ttl = _safe_int(interval, _DEFAULT_INTERVAL)
+    if ttl < 0:
+        ttl = _DEFAULT_INTERVAL
+
+    if now - _zfs_cache["timestamp"] < ttl:
         return _zfs_cache["data"]
 
     if not zfs_available():
-        log("ZFS not available", 'error')
+        log("ZFS not available", "debug")
         data = []
     else:
         zfs_version = get_zfs_version()
-
         pools = list_zfs_pools()
         if not pools:
-            log("No ZFS pools found", 'error')
+            log("No ZFS pools found", "debug")
             data = []
         else:
             data = [get_zfs_pool_info(pool) for pool in pools]
