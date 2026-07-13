@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from fivenines_agent.proxmox import ProxmoxCollector, proxmox_metrics
+from fivenines_agent.proxmox import ProxmoxCollector, _record_failure, proxmox_metrics
 
 
 def make_proxmox_mock(
@@ -234,8 +234,9 @@ def test_collect_returns_none_when_proxmox_is_none():
     assert c.collect() is None
 
 
-def test_collect_returns_dict_with_six_keys():
-    """T14: collect returns dict with all six top-level keys."""
+def test_collect_returns_dict_with_seven_keys():
+    """T14: collect returns dict with all seven top-level keys (six data keys
+    plus the 1.10.0 'collection' flags block)."""
     c = make_collector(
         proxmox_mock=make_proxmox_mock(
             version={"version": "8"}, cluster_status=[], nodes=[]
@@ -249,6 +250,7 @@ def test_collect_returns_dict_with_six_keys():
         "vms",
         "lxc",
         "storage",
+        "collection",
     }
 
 
@@ -1036,6 +1038,253 @@ def test_proxmox_metrics_unreachable_returns_none_end_to_end():
         assert proxmox_metrics(token_id="root@pam!c", token_secret="s") is None
 
 
+# --- explicit collection flags block (1.10.0) -------------------------------
+#
+# data['proxmox'].collection = {reachable, cluster_ok, nodes_ok, guests_ok,
+# storage_ok, error}. Each *_ok is True iff every API call backing that section
+# succeeded (guests_ok covers both the qemu and lxc loops); the server reads
+# these instead of inferring completeness from the payload shape. reachable is
+# always True inside a non-null payload -- an unreachable API returns None (see
+# the 1.9.0 tests above), never a payload with reachable:false.
+
+
+def _collection(result):
+    """Pull the collection block, asserting the payload is non-null first."""
+    assert result is not None
+    return result["collection"]
+
+
+def test_record_failure_noop_when_collection_none():
+    """T68: _record_failure is a no-op when collection is None, so every
+    _collect_* helper stays callable in isolation (as the unit tests above do)
+    without a flags block to thread through."""
+    assert _record_failure(None, "nodes_ok", "ignored") is None
+
+
+def test_collection_all_ok_on_healthy_collection():
+    """T69: every section succeeding sets all flags True and error None."""
+    c = make_collector(
+        proxmox_mock=make_proxmox_mock(
+            version={"version": "8"},
+            cluster_status=[
+                {"type": "cluster", "name": "c1", "quorate": 1, "nodes": 1},
+                {"type": "node", "online": 1},
+            ],
+            nodes=[{"node": "pve1"}],
+            node_status_by_name={"pve1": {"uptime": 1}},
+            qemu_by_node={"pve1": []},
+            lxc_by_node={"pve1": []},
+            storage_by_node={"pve1": []},
+        )
+    )
+    assert _collection(c.collect()) == {
+        "reachable": True,
+        "cluster_ok": True,
+        "nodes_ok": True,
+        "guests_ok": True,
+        "storage_ok": True,
+        "error": None,
+    }
+
+
+def test_collection_cluster_ok_false_when_cluster_status_raises():
+    """T70: /cluster/status raising sets cluster_ok False (cluster stays null)
+    and records the error; the node/guest/storage sections are unaffected."""
+    c = make_collector(
+        proxmox_mock=make_proxmox_mock(
+            version={"version": "8"},
+            cluster_status_raises=True,
+            nodes=[{"node": "pve1"}],
+            node_status_by_name={"pve1": {"uptime": 1}},
+            qemu_by_node={"pve1": []},
+            lxc_by_node={"pve1": []},
+            storage_by_node={"pve1": []},
+        )
+    )
+    result = c.collect()
+    assert result["cluster"] is None
+    coll = _collection(result)
+    assert coll["cluster_ok"] is False
+    assert coll["nodes_ok"] is True
+    assert coll["guests_ok"] is True
+    assert coll["storage_ok"] is True
+    assert coll["error"] == "cluster status query failed"
+
+
+def test_collection_standalone_keeps_cluster_ok_true():
+    """T71 [DISAMBIGUATION]: a standalone node (no cluster-type entry) leaves
+    cluster:null but cluster_ok True -- the flag the server uses to tell it
+    apart from a failed /cluster/status (cluster:null, cluster_ok False)."""
+    c = make_collector(
+        proxmox_mock=make_proxmox_mock(
+            version={"version": "8"},
+            cluster_status=[{"type": "node", "online": 1}],
+            nodes=[{"node": "pve1"}],
+            node_status_by_name={"pve1": {"uptime": 1}},
+            qemu_by_node={"pve1": []},
+            lxc_by_node={"pve1": []},
+            storage_by_node={"pve1": []},
+        )
+    )
+    result = c.collect()
+    assert result["cluster"] is None
+    coll = _collection(result)
+    assert coll["cluster_ok"] is True
+    assert coll["error"] is None
+
+
+def test_collection_nodes_ok_false_when_node_status_raises():
+    """T72: a per-node status fetch raising drops that node and sets nodes_ok
+    False; the error names the node. guests_ok/storage_ok stay True here, so
+    the failure is attributed to the node section alone."""
+    c = make_collector(
+        proxmox_mock=make_proxmox_mock(
+            version={"version": "8"},
+            cluster_status=[],
+            nodes=[{"node": "pve1"}, {"node": "pve2"}],
+            node_status_by_name={"pve1": {"uptime": 1}},
+            node_status_raises_for={"pve2"},
+            qemu_by_node={"pve1": [], "pve2": []},
+            lxc_by_node={"pve1": [], "pve2": []},
+            storage_by_node={"pve1": [], "pve2": []},
+        )
+    )
+    result = c.collect()
+    assert [n["name"] for n in result["nodes"]] == ["pve1"]
+    coll = _collection(result)
+    assert coll["nodes_ok"] is False
+    assert coll["guests_ok"] is True
+    assert coll["storage_ok"] is True
+    assert coll["error"] == "node pve2: status query failed"
+
+
+def test_collection_node_listing_failure_marks_all_node_derived_flags():
+    """T73: the /nodes listing itself raising fails the node, guest, and
+    storage sections together (each re-lists nodes). reachability still holds
+    via the version call, and cluster_ok is untouched."""
+    c = make_collector(
+        proxmox_mock=make_proxmox_mock(
+            version={"version": "8"},
+            cluster_status=[],
+            nodes_raises=True,
+        )
+    )
+    coll = _collection(c.collect())
+    assert coll["reachable"] is True
+    assert coll["cluster_ok"] is True
+    assert coll["nodes_ok"] is False
+    assert coll["guests_ok"] is False
+    assert coll["storage_ok"] is False
+    assert coll["error"] == "node listing failed"
+
+
+def test_collection_guests_ok_false_when_qemu_raises():
+    """T74: a per-node qemu listing raising sets guests_ok False; nodes_ok and
+    storage_ok are unaffected."""
+    c = make_collector(
+        proxmox_mock=make_proxmox_mock(
+            version={"version": "8"},
+            cluster_status=[],
+            nodes=[{"node": "pve1"}],
+            node_status_by_name={"pve1": {"uptime": 1}},
+            qemu_raises_for={"pve1"},
+            lxc_by_node={"pve1": []},
+            storage_by_node={"pve1": []},
+        )
+    )
+    coll = _collection(c.collect())
+    assert coll["guests_ok"] is False
+    assert coll["nodes_ok"] is True
+    assert coll["storage_ok"] is True
+    assert coll["error"] == "node pve1: qemu query failed"
+
+
+def test_collection_guests_ok_false_when_lxc_raises():
+    """T75: a per-node lxc listing raising also sets guests_ok False -- the flag
+    covers both guest loops (qemu and lxc)."""
+    c = make_collector(
+        proxmox_mock=make_proxmox_mock(
+            version={"version": "8"},
+            cluster_status=[],
+            nodes=[{"node": "pve1"}],
+            node_status_by_name={"pve1": {"uptime": 1}},
+            qemu_by_node={"pve1": []},
+            lxc_raises_for={"pve1"},
+            storage_by_node={"pve1": []},
+        )
+    )
+    coll = _collection(c.collect())
+    assert coll["guests_ok"] is False
+    assert coll["nodes_ok"] is True
+    assert coll["storage_ok"] is True
+    assert coll["error"] == "node pve1: lxc query failed"
+
+
+def test_collection_storage_ok_false_in_isolation():
+    """T76: a lone storage failure sets ONLY storage_ok False -- nodes_ok and
+    guests_ok stay True (issue #80's example shape). This is what shape
+    inference cannot express: an empty storage array here means 'query failed',
+    not 'no storages exist'."""
+    c = make_collector(
+        proxmox_mock=make_proxmox_mock(
+            version={"version": "8"},
+            cluster_status=[],
+            nodes=[{"node": "pve1"}],
+            node_status_by_name={"pve1": {"uptime": 1}},
+            qemu_by_node={"pve1": []},
+            lxc_by_node={"pve1": []},
+            storage_raises_for={"pve1"},
+        )
+    )
+    coll = _collection(c.collect())
+    assert coll["storage_ok"] is False
+    assert coll["nodes_ok"] is True
+    assert coll["guests_ok"] is True
+    assert coll["cluster_ok"] is True
+    assert coll["error"] == "node pve1: storage query failed"
+
+
+def test_collection_error_is_first_failure_in_section_order():
+    """T77: with failures in multiple sections, error is the FIRST one in
+    collect() order (cluster before storage), not the last -- and later
+    failures still flip their own flag."""
+    c = make_collector(
+        proxmox_mock=make_proxmox_mock(
+            version={"version": "8"},
+            cluster_status_raises=True,
+            nodes=[{"node": "pve1"}],
+            node_status_by_name={"pve1": {"uptime": 1}},
+            qemu_by_node={"pve1": []},
+            lxc_by_node={"pve1": []},
+            storage_raises_for={"pve1"},
+        )
+    )
+    coll = _collection(c.collect())
+    assert coll["cluster_ok"] is False
+    assert coll["storage_ok"] is False
+    assert coll["error"] == "cluster status query failed"
+
+
+def test_collection_reachable_true_when_version_denied_but_nodes_listed():
+    """T78: reachable is True even when /version is denied, as long as the node
+    listing probe succeeds -- the payload exists, so reachable is stated True
+    (version is null, but that is carried by result['version'], not a flag)."""
+    c = make_collector(
+        proxmox_mock=make_proxmox_mock(
+            version_raises=True,
+            cluster_status=[],
+            nodes=[{"node": "pve1"}],
+            node_status_by_name={"pve1": {"uptime": 1}},
+            qemu_by_node={"pve1": []},
+            lxc_by_node={"pve1": []},
+            storage_by_node={"pve1": []},
+        )
+    )
+    result = c.collect()
+    assert result["version"] is None
+    assert _collection(result)["reachable"] is True
+
+
 # --- cross-repo contract (fivenines-server) ---------------------------------
 #
 # Shared fixture tests/fixtures/proxmox_contract_payload.json is asserted on
@@ -1043,10 +1292,12 @@ def test_proxmox_metrics_unreachable_returns_none_end_to_end():
 # spec in scenario["api"] must equal scenario["payload"], with only
 # proxmoxer.ProxmoxAPI mocked -- so the whole connect -> collect -> payload
 # pipeline is pinned. On fivenines-server: spec posts each scenario["payload"]
-# under data["proxmox"] and asserts the cluster-scope ingester derives the right
-# completeness flags. Unlike ceph the payload has NO 'collection' block:
-# completeness is inferred from SHAPE, so these shapes must stay pinned. Change
-# payloads only in lockstep with the server's byte-identical fixture copy.
+# under data["proxmox"] and asserts the cluster-scope ingester reads the right
+# completeness flags. As of agent 1.10.0 the payload carries an explicit
+# ceph-style 'collection' block (reachable/cluster_ok/nodes_ok/guests_ok/
+# storage_ok/error); the server prefers it over shape inference. Both the flags
+# AND the underlying shapes must stay pinned (shape is the pre-1.10.0 fallback).
+# Change payloads only in lockstep with the server's byte-identical fixture copy.
 
 _CONTRACT_FIXTURE_PATH = os.path.join(
     os.path.dirname(__file__), "fixtures", "proxmox_contract_payload.json"
@@ -1059,7 +1310,15 @@ _CONTRACT_SCENARIOS = _CONTRACT["scenarios"]
 
 # Top-level and per-entry key sets the server's shape inference depends on. A
 # rename or dropped key must fail HERE, not silently zero a server-side metric.
-_PAYLOAD_KEYS = {"version", "cluster", "nodes", "vms", "lxc", "storage"}
+_PAYLOAD_KEYS = {"version", "cluster", "nodes", "vms", "lxc", "storage", "collection"}
+_COLLECTION_KEYS = {
+    "reachable",
+    "cluster_ok",
+    "nodes_ok",
+    "guests_ok",
+    "storage_ok",
+    "error",
+}
 _CLUSTER_KEYS = {"name", "quorate", "nodes", "nodes_online"}
 _NODE_KEYS = {
     "name",
@@ -1108,6 +1367,7 @@ def test_contract_payload_key_sets(scenario_name):
     if payload is None:  # 'unreachable' -> data["proxmox"] is null
         return
     assert set(payload) == _PAYLOAD_KEYS
+    assert set(payload["collection"]) == _COLLECTION_KEYS
     if payload["cluster"] is not None:
         assert set(payload["cluster"]) == _CLUSTER_KEYS
     for node in payload["nodes"]:
@@ -1146,3 +1406,38 @@ def test_contract_standalone_cluster_is_null():
     assert standalone["cluster"] is None
     assert standalone["version"] is not None
     assert len(standalone["nodes"]) == 1
+
+
+def test_contract_collection_reachable_matches_non_null_payload():
+    """collection.reachable is True in every non-null payload; the only
+    unreachable signal remains a null payload ('unreachable')."""
+    for name, scenario in _CONTRACT_SCENARIOS.items():
+        payload = scenario["payload"]
+        if payload is None:
+            assert name == "unreachable"
+        else:
+            assert payload["collection"]["reachable"] is True
+
+
+def test_contract_collection_disambiguates_standalone_from_cluster_failure():
+    """The whole point of #80: 'standalone' and 'cluster_fetch_failed' both emit
+    cluster:null, and the explicit cluster_ok flag is what separates them --
+    a distinction the pre-1.10.0 shape inference could not make."""
+    standalone = _CONTRACT_SCENARIOS["standalone"]["payload"]
+    failed = _CONTRACT_SCENARIOS["cluster_fetch_failed"]["payload"]
+    assert standalone["cluster"] is None
+    assert failed["cluster"] is None
+    assert standalone["collection"]["cluster_ok"] is True
+    assert failed["collection"]["cluster_ok"] is False
+    assert failed["collection"]["error"] == "cluster status query failed"
+
+
+def test_contract_collection_storage_ok_independent():
+    """'storage_query_failed' pins storage_ok independence: only storage_ok is
+    false while nodes_ok/guests_ok/cluster_ok stay true (issue #80's example)."""
+    coll = _CONTRACT_SCENARIOS["storage_query_failed"]["payload"]["collection"]
+    assert coll["storage_ok"] is False
+    assert coll["nodes_ok"] is True
+    assert coll["guests_ok"] is True
+    assert coll["cluster_ok"] is True
+    assert coll["error"] == "node pve2: storage query failed"
