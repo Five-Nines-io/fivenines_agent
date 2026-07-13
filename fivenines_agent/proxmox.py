@@ -17,6 +17,28 @@ except ImportError:  # pragma: no cover
     ProxmoxAPI = None  # type: ignore[assignment, misc]
 
 
+# Defensive cap on the collection.error hint. The messages the collector emits
+# are short and structured; this only bounds a pathological value.
+_ERROR_MAX_LEN = 500
+
+
+def _record_failure(collection, flag, message):
+    """Flip a section completeness flag off and record the first failure.
+
+    `collection` is the mutable flags block collect() threads through every
+    section. It is None when a _collect_* helper is exercised in isolation (the
+    unit tests call them directly), in which case recording is a no-op so the
+    helper's return value is unchanged. collect() runs the sections in a fixed
+    order (cluster, nodes, vms, lxc, storage), so the first message recorded is
+    deterministic: it wins, and later failures only flip their own flag.
+    """
+    if collection is None:
+        return
+    collection[flag] = False
+    if collection["error"] is None:
+        collection["error"] = message[:_ERROR_MAX_LEN]
+
+
 class ProxmoxCollector:
     """Collector for Proxmox VE metrics."""
 
@@ -77,13 +99,24 @@ class ProxmoxCollector:
         refused, or auth failure). proxmoxer builds the token-auth client
         lazily, so an unreachable API is not caught at construction time --
         every request raises instead. Left un-normalized the result would be
-        {"version": None, "cluster": None, "nodes": [], "vms": [], "lxc": [],
-        "storage": []}: a shape a reachable node can never produce (it always
+        an empty-but-shaped dict a reachable node can never produce (it always
         reports a version and lists at least itself) yet still easy to misread
         as "empty but healthy". Collapsing whole-module failure to None gives
         the server one unambiguous signal -- data["proxmox"] is null iff the
         API was unreachable -- instead of inferring reachability from empty
-        arrays. See tests/fixtures/proxmox_contract_payload.json.
+        arrays.
+
+        A non-null payload also carries an explicit `collection` flags block
+        (reachable / cluster_ok / nodes_ok / guests_ok / storage_ok / error),
+        ceph-style, so the server no longer has to infer per-section
+        completeness from the payload shape. Each *_ok flag is True iff every
+        API call backing that section succeeded (`guests_ok` covers both the
+        qemu and lxc loops); `error` is the first failure message. The key
+        disambiguation the block adds: cluster:null with cluster_ok True is a
+        genuine standalone node, whereas cluster:null with cluster_ok False is
+        a clustered reporter whose /cluster/status call failed -- two shapes
+        the server otherwise could not tell apart. See
+        tests/fixtures/proxmox_contract_payload.json.
         """
         if not self.proxmox:
             return None
@@ -94,8 +127,17 @@ class ProxmoxCollector:
             'nodes': [],
             'vms': [],
             'lxc': [],
-            'storage': []
+            'storage': [],
+            'collection': {
+                'reachable': False,
+                'cluster_ok': True,
+                'nodes_ok': True,
+                'guests_ok': True,
+                'storage_ok': True,
+                'error': None,
+            },
         }
+        collection = result['collection']
 
         reachable = False
 
@@ -122,40 +164,56 @@ class ProxmoxCollector:
                 log(f"Proxmox API unreachable, skipping collection: {e}", 'debug')
                 return None
 
+        # We reached this point, so the API responded (an unreachable API
+        # returned None above). State reachability explicitly rather than
+        # leaving the server to re-derive it from a non-null payload.
+        collection['reachable'] = True
+
         # Collect cluster status
         try:
-            result['cluster'] = self._collect_cluster()
+            result['cluster'] = self._collect_cluster(collection)
         except Exception as e:
             log(f"Error collecting cluster metrics: {e}", 'error')
+            _record_failure(collection, 'cluster_ok', 'cluster status query failed')
 
         # Collect node metrics
         try:
-            result['nodes'] = self._collect_nodes()
+            result['nodes'] = self._collect_nodes(collection)
         except Exception as e:
             log(f"Error collecting node metrics: {e}", 'error')
+            _record_failure(collection, 'nodes_ok', 'node listing failed')
 
         # Collect VM metrics
         try:
-            result['vms'] = self._collect_vms()
+            result['vms'] = self._collect_vms(collection)
         except Exception as e:
             log(f"Error collecting VM metrics: {e}", 'error')
+            _record_failure(collection, 'guests_ok', 'node listing failed')
 
         # Collect LXC metrics
         try:
-            result['lxc'] = self._collect_lxc()
+            result['lxc'] = self._collect_lxc(collection)
         except Exception as e:
             log(f"Error collecting LXC metrics: {e}", 'error')
+            _record_failure(collection, 'guests_ok', 'node listing failed')
 
         # Collect storage metrics
         try:
-            result['storage'] = self._collect_storage()
+            result['storage'] = self._collect_storage(collection)
         except Exception as e:
             log(f"Error collecting storage metrics: {e}", 'error')
+            _record_failure(collection, 'storage_ok', 'node listing failed')
 
         return result
 
-    def _collect_cluster(self):
-        """Collect cluster status information."""
+    def _collect_cluster(self, collection=None):
+        """Collect cluster status information.
+
+        Returns None both for a genuine standalone node (no cluster-type entry
+        in /cluster/status) and when the /cluster/status call itself fails --
+        but only the latter flips cluster_ok, so the server can tell the two
+        apart. A standalone node leaves cluster_ok True.
+        """
         try:
             cluster_status = self.proxmox.cluster.status.get()
 
@@ -186,9 +244,10 @@ class ProxmoxCollector:
 
         except Exception as e:
             log(f"Error getting cluster status: {e}", 'debug')
+            _record_failure(collection, 'cluster_ok', 'cluster status query failed')
             return None
 
-    def _collect_nodes(self):
+    def _collect_nodes(self, collection=None):
         """Collect metrics for all nodes."""
         nodes = []
         try:
@@ -233,13 +292,19 @@ class ProxmoxCollector:
 
                 except Exception as e:
                     log(f"Error getting status for node {node_name}: {e}", 'error')
+                    _record_failure(
+                        collection,
+                        'nodes_ok',
+                        f'node {node_name}: status query failed',
+                    )
 
         except Exception as e:
             log(f"Error listing nodes: {e}", 'error')
+            _record_failure(collection, 'nodes_ok', 'node listing failed')
 
         return nodes
 
-    def _collect_vms(self):
+    def _collect_vms(self, collection=None):
         """Collect metrics for all QEMU/KVM VMs."""
         vms = []
         try:
@@ -279,13 +344,19 @@ class ProxmoxCollector:
 
                 except Exception as e:
                     log(f"Error getting VMs for node {node_name}: {e}", 'error')
+                    _record_failure(
+                        collection,
+                        'guests_ok',
+                        f'node {node_name}: qemu query failed',
+                    )
 
         except Exception as e:
             log(f"Error listing VMs: {e}", 'error')
+            _record_failure(collection, 'guests_ok', 'node listing failed')
 
         return vms
 
-    def _collect_lxc(self):
+    def _collect_lxc(self, collection=None):
         """Collect metrics for all LXC containers."""
         containers = []
         try:
@@ -322,13 +393,19 @@ class ProxmoxCollector:
 
                 except Exception as e:
                     log(f"Error getting LXC containers for node {node_name}: {e}", 'error')
+                    _record_failure(
+                        collection,
+                        'guests_ok',
+                        f'node {node_name}: lxc query failed',
+                    )
 
         except Exception as e:
             log(f"Error listing LXC containers: {e}", 'error')
+            _record_failure(collection, 'guests_ok', 'node listing failed')
 
         return containers
 
-    def _collect_storage(self):
+    def _collect_storage(self, collection=None):
         """Collect metrics for all storage pools."""
         storage_pools = []
         try:
@@ -360,9 +437,15 @@ class ProxmoxCollector:
 
                 except Exception as e:
                     log(f"Error getting storage for node {node_name}: {e}", 'error')
+                    _record_failure(
+                        collection,
+                        'storage_ok',
+                        f'node {node_name}: storage query failed',
+                    )
 
         except Exception as e:
             log(f"Error listing storage: {e}", 'error')
+            _record_failure(collection, 'storage_ok', 'node listing failed')
 
         return storage_pools
 

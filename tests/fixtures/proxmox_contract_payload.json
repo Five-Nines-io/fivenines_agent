@@ -1,7 +1,16 @@
 {
-  "description": "Shared Proxmox contract fixture between fivenines-agent and fivenines-server. Source of truth: fivenines-agent tests/fixtures/proxmox_contract_payload.json, asserted end-to-end by tests/test_proxmox.py::test_contract_fixture_scenarios (only proxmoxer.ProxmoxAPI is mocked). For each scenario, 'api' is the agent-side proxmoxer mock input (fed to tests/test_proxmox.py::make_proxmox_mock; the server ignores it, it only documents how the payload arises) and 'payload' is the artifact the agent emits under data['proxmox'] -- the exact thing the server's cluster-scope ingester must parse. Unlike the ceph payload there is NO per-cluster 'collection' flags block: the Proxmox payload carries no completeness metadata, so the server infers reachable / cluster_ok / nodes_ok / guests_ok / storage_ok from the payload SHAPE. That inference is only safe because these shapes are pinned by tests on the agent side. Change only in lockstep with spec/fixtures/proxmox_contract_payload.json on the server.",
-  "agent_min_version": "1.9.0",
+  "description": "Shared Proxmox contract fixture between fivenines-agent and fivenines-server. Source of truth: fivenines-agent tests/fixtures/proxmox_contract_payload.json, asserted end-to-end by tests/test_proxmox.py::test_contract_fixture_scenarios (only proxmoxer.ProxmoxAPI is mocked). For each scenario, 'api' is the agent-side proxmoxer mock input (fed to tests/test_proxmox.py::make_proxmox_mock; the server ignores it, it only documents how the payload arises) and 'payload' is the artifact the agent emits under data['proxmox'] -- the exact thing the server's cluster-scope ingester must parse. As of agent 1.10.0 the payload carries an explicit ceph-style 'collection' flags block (reachable / cluster_ok / nodes_ok / guests_ok / storage_ok / error); the server MUST prefer these flags over shape inference when the block is present. 'inference_contract' below is retained as the pre-1.10.0 fallback: how the server derives the same signals from payload SHAPE when 'collection' is absent (an older agent). Both must agree on every scenario here. Change only in lockstep with spec/fixtures/proxmox_contract_payload.json on the server.",
+  "agent_min_version": "1.10.0",
+  "collection_contract": {
+    "reachable": "collection.reachable. Always true inside a non-null payload -- an unreachable API yields a null payload (proxmox_metrics() -> None), never a payload with reachable:false. Stated explicitly so the server reads a flag rather than re-deriving 'reachable == payload is not null'.",
+    "cluster_ok": "collection.cluster_ok. True iff the /cluster/status call succeeded. Resolves the cluster:null ambiguity the inference contract could not: standalone node => cluster:null AND cluster_ok:true (the call succeeded, there was simply no cluster-type entry); clustered reporter whose /cluster/status failed => cluster:null AND cluster_ok:false. See scenarios 'standalone' vs 'cluster_fetch_failed'.",
+    "nodes_ok": "collection.nodes_ok. True iff the /nodes listing AND every per-node /nodes/<n>/status call succeeded. A node dropped from payload.nodes because its status fetch raised mid-loop sets nodes_ok:false (see 'partial_node_timeout', 'quorum_lost'). Unlike the shape heuristic (len(nodes)==cluster.nodes_online) this fires even when the dropped node is genuinely offline and excluded from nodes_online -- it reports call success, not head-count agreement.",
+    "guests_ok": "collection.guests_ok. True iff every qemu AND lxc listing across all reporting nodes succeeded (covers both guest loops). A single node's qemu or lxc call raising sets guests_ok:false; the guests of that node are absent from payload.vms/lxc.",
+    "storage_ok": "collection.storage_ok. True iff every per-node /nodes/<n>/storage call succeeded. Independent of the other flags: a lone storage timeout leaves nodes_ok/guests_ok true and only storage_ok false (see 'storage_query_failed'). This is what the shape heuristic could never express -- 'no storages exist' (empty array, storage_ok:true) vs 'storage query failed' (empty/partial array, storage_ok:false).",
+    "error": "collection.error. First failure message across the sections in collect() order (cluster, nodes, vms, lxc, storage), or null when every flag is true. A short structured hint ('node pve2: storage query failed'), truncated to 500 chars; the full exception goes to the agent log, not the payload. Opaque to the server -- surfaced as a diagnostic, never parsed."
+  },
   "inference_contract": {
+    "_note": "PRE-1.10.0 FALLBACK ONLY. When the explicit 'collection' block is present (agent >= 1.10.0) the server MUST use it (see 'collection_contract'); these shape rules are how the same signals are recovered from older agents that emit no flags.",
     "reachable": "payload is not null. A null payload (proxmox_metrics() -> None) is the ONLY unreachable/auth-failure signal; there is no partial 'all empty' payload to disambiguate (normalized agent-side in ProxmoxCollector.collect).",
     "cluster_ok": "payload.cluster is not null. CAVEAT: payload.cluster is also null for a genuine standalone node (see scenario 'standalone'). cluster:null is therefore ambiguous between (a) standalone, no corosync, and (b) a clustered reporter whose /cluster/status call failed -- ProxmoxCollector._collect_cluster returns None for both. The server must disambiguate with its own cross-reporter knowledge (a lone reporter => standalone; one of N cluster reporters returning cluster:null => that reporter's cluster fetch failed).",
     "nodes_ok": "when payload.cluster is present, len(payload.nodes) == payload.cluster.nodes_online. A node counted online by corosync (cluster.status) but missing from payload.nodes means its per-node detail collection failed mid-loop (see scenario 'partial_node_timeout'). For a standalone node (cluster:null) expect exactly one node entry.",
@@ -92,7 +101,8 @@
           {"name": "local-lvm", "node": "pve2", "type": "lvmthin", "total": 137438953472, "used": 20000000000, "available": 117438953472, "active": true},
           {"name": "ceph-pool", "node": "pve3", "type": "rbd", "total": 10995116277760, "used": 3298534883328, "available": 7696581394432, "active": true},
           {"name": "local-lvm", "node": "pve3", "type": "lvmthin", "total": 68719476736, "used": 10000000000, "available": 58719476736, "active": true}
-        ]
+        ],
+        "collection": {"reachable": true, "cluster_ok": true, "nodes_ok": true, "guests_ok": true, "storage_ok": true, "error": null}
       }
     },
     "quorum_lost": {
@@ -137,7 +147,8 @@
         "lxc": [],
         "storage": [
           {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 40000000000, "available": 60000000000, "active": true}
-        ]
+        ],
+        "collection": {"reachable": true, "cluster_ok": true, "nodes_ok": false, "guests_ok": false, "storage_ok": false, "error": "node pve2: status query failed"}
       }
     },
     "standalone": {
@@ -177,7 +188,8 @@
         "storage": [
           {"name": "local", "node": "standalone-pve", "type": "dir", "total": 100000000000, "used": 30000000000, "available": 70000000000, "active": true},
           {"name": "local-lvm", "node": "standalone-pve", "type": "lvmthin", "total": 200000000000, "used": 50000000000, "available": 150000000000, "active": true}
-        ]
+        ],
+        "collection": {"reachable": true, "cluster_ok": true, "nodes_ok": true, "guests_ok": true, "storage_ok": true, "error": null}
       }
     },
     "unreachable": {
@@ -190,7 +202,7 @@
       "payload": null
     },
     "partial_node_timeout": {
-      "description": "Healthy 3-node quorate cluster where pve2's per-node API hangs (times out) mid-loop while corosync still counts it online. The cluster-wide /cluster/status call succeeds, so payload.cluster.nodes_online stays 3, but pve2's status/qemu/lxc/storage calls each raise and are swallowed per-node -- pve2 silently drops from nodes/vms/lxc/storage. Pins the partial-collection shape: cluster.nodes_online (3) != len(nodes) (2) is the server's nodes_ok=false signal; pve2's guests and storage vanish with it (guests_ok/storage_ok derived transitively).",
+      "description": "Healthy 3-node quorate cluster where pve2's per-node API hangs (times out) mid-loop while corosync still counts it online. The cluster-wide /cluster/status call succeeds, so payload.cluster.nodes_online stays 3, but pve2's status/qemu/lxc/storage calls each raise and are swallowed per-node -- pve2 silently drops from nodes/vms/lxc/storage. The explicit collection block reports this directly: nodes_ok/guests_ok/storage_ok all false (cluster_ok stays true), error the first failure ('node pve2: status query failed'). It also pins the pre-1.10.0 fallback shape for the same signal: cluster.nodes_online (3) != len(nodes) (2).",
       "api": {
         "version": {"version": "8.2.4"},
         "cluster_status": [
@@ -249,7 +261,91 @@
         "storage": [
           {"name": "local-lvm", "node": "pve1", "type": "lvmthin", "total": 137438953472, "used": 34359738368, "available": 103079215104, "active": true},
           {"name": "local-lvm", "node": "pve3", "type": "lvmthin", "total": 68719476736, "used": 10000000000, "available": 58719476736, "active": true}
-        ]
+        ],
+        "collection": {"reachable": true, "cluster_ok": true, "nodes_ok": false, "guests_ok": false, "storage_ok": false, "error": "node pve2: status query failed"}
+      }
+    },
+    "cluster_fetch_failed": {
+      "description": "Clustered reporter whose /cluster/status call fails (mon/pmxcfs hiccup) while its own node detail, guests, and storage all succeed. _collect_cluster swallows the error and returns None, so payload.cluster is null -- SHAPE-identical to 'standalone'. The explicit flag is what tells them apart: here cluster_ok is false (the call raised), whereas 'standalone' has cluster_ok true (the call succeeded, there was just no cluster entry). This is the disambiguation the whole collection block exists to provide. error is the first (and only) failure. version + nodes present => reachable true.",
+      "api": {
+        "version": {"version": "8.2.4"},
+        "cluster_status_raises": true,
+        "nodes": [
+          {"node": "pve1", "status": "online", "cpu": 0.09, "mem": 4294967296, "maxmem": 17179869184}
+        ],
+        "node_status_by_name": {"pve1": {"uptime": 500000}},
+        "qemu_by_node": {"pve1": []},
+        "lxc_by_node": {"pve1": []},
+        "storage_by_node": {
+          "pve1": [
+            {"storage": "local", "type": "dir", "total": 100000000000, "used": 25000000000, "avail": 75000000000, "active": 1}
+          ]
+        }
+      },
+      "payload": {
+        "version": "8.2.4",
+        "cluster": null,
+        "nodes": [
+          {"name": "pve1", "status": "online", "cpu_usage": 0.09, "memory_used": 4294967296, "memory_total": 17179869184, "uptime": 500000, "vms_running": 0, "lxc_running": 0}
+        ],
+        "vms": [],
+        "lxc": [],
+        "storage": [
+          {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 25000000000, "available": 75000000000, "active": true}
+        ],
+        "collection": {"reachable": true, "cluster_ok": false, "nodes_ok": true, "guests_ok": true, "storage_ok": true, "error": "cluster status query failed"}
+      }
+    },
+    "storage_query_failed": {
+      "description": "Healthy 2-node quorate cluster where ONLY pve2's /nodes/pve2/storage call fails (e.g. a wedged storage plugin) -- its status, qemu, and lxc calls all succeed. pve2 stays in payload.nodes with its guests; just its storage rows drop. Pins storage_ok independence: nodes_ok/guests_ok stay true and only storage_ok is false, the exact shape from issue #80's example. This is what shape inference could never express: an empty/partial storage array here means 'query failed' (storage_ok:false), not 'no storages exist' (storage_ok:true).",
+      "api": {
+        "version": {"version": "8.2.4"},
+        "cluster_status": [
+          {"type": "cluster", "name": "production", "quorate": 1, "nodes": 2},
+          {"type": "node", "name": "pve1", "online": 1},
+          {"type": "node", "name": "pve2", "online": 1}
+        ],
+        "nodes": [
+          {"node": "pve1", "status": "online", "cpu": 0.1, "mem": 4294967296, "maxmem": 17179869184},
+          {"node": "pve2", "status": "online", "cpu": 0.2, "mem": 2147483648, "maxmem": 17179869184}
+        ],
+        "node_status_by_name": {"pve1": {"uptime": 700000}, "pve2": {"uptime": 700001}},
+        "qemu_by_node": {
+          "pve1": [
+            {"vmid": 100, "name": "web-01", "status": "running", "cpu": 0.08, "mem": 2147483648, "maxmem": 4294967296, "diskread": 1048576, "diskwrite": 2097152, "netin": 3145728, "netout": 4194304, "uptime": 699900}
+          ],
+          "pve2": []
+        },
+        "lxc_by_node": {
+          "pve1": [],
+          "pve2": [
+            {"vmid": 200, "name": "proxy-01", "status": "running", "cpu": 0.02, "mem": 536870912, "maxmem": 1073741824, "diskread": 524288, "diskwrite": 1048576, "netin": 2097152, "netout": 3145728, "uptime": 699800}
+          ]
+        },
+        "storage_by_node": {
+          "pve1": [
+            {"storage": "local-lvm", "type": "lvmthin", "total": 137438953472, "used": 34359738368, "avail": 103079215104, "active": 1}
+          ]
+        },
+        "storage_raises_for": ["pve2"]
+      },
+      "payload": {
+        "version": "8.2.4",
+        "cluster": {"name": "production", "quorate": true, "nodes": 2, "nodes_online": 2},
+        "nodes": [
+          {"name": "pve1", "status": "online", "cpu_usage": 0.1, "memory_used": 4294967296, "memory_total": 17179869184, "uptime": 700000, "vms_running": 1, "lxc_running": 0},
+          {"name": "pve2", "status": "online", "cpu_usage": 0.2, "memory_used": 2147483648, "memory_total": 17179869184, "uptime": 700001, "vms_running": 0, "lxc_running": 1}
+        ],
+        "vms": [
+          {"vmid": 100, "name": "web-01", "node": "pve1", "status": "running", "cpu_usage": 0.08, "memory_used": 2147483648, "memory_max": 4294967296, "disk_read": 1048576, "disk_write": 2097152, "net_in": 3145728, "net_out": 4194304, "uptime": 699900}
+        ],
+        "lxc": [
+          {"vmid": 200, "name": "proxy-01", "node": "pve2", "status": "running", "cpu_usage": 0.02, "memory_used": 536870912, "memory_max": 1073741824, "disk_read": 524288, "disk_write": 1048576, "net_in": 2097152, "net_out": 3145728, "uptime": 699800}
+        ],
+        "storage": [
+          {"name": "local-lvm", "node": "pve1", "type": "lvmthin", "total": 137438953472, "used": 34359738368, "available": 103079215104, "active": true}
+        ],
+        "collection": {"reachable": true, "cluster_ok": true, "nodes_ok": true, "guests_ok": true, "storage_ok": false, "error": "node pve2: storage query failed"}
       }
     }
   }
