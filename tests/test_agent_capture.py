@@ -56,3 +56,25 @@ def test_handle_capture_refuses_unit_outside_allowlist(tmp_path):
     agent = _agent(tmp_path, uploader=MagicMock())
     agent._handle_capture_request(_cfg(unit="secret.service"))  # default-deny
     assert agent.log_queue.qsize() == 0
+
+
+def test_cleanup_stops_uploader_with_sentinel_then_join(tmp_path):
+    """_cleanup must stop the uploader thread: stop(), push the None sentinel
+    (unblocks the queue.get), then join. A wrong order would hang agent exit."""
+    import pytest
+
+    from fivenines_agent.agent import Agent as _Agent
+
+    agent = _Agent.__new__(_Agent)
+    agent.queue = MagicMock()
+    agent.synchronizer = None
+    agent.log_uploader = MagicMock()
+    agent.log_queue = MagicMock()
+
+    with pytest.raises(SystemExit) as exc_info:
+        agent._cleanup()
+
+    assert exc_info.value.code == 0
+    agent.log_uploader.stop.assert_called_once()
+    agent.log_queue.put.assert_called_once_with(None)
+    agent.log_uploader.join.assert_called_once()

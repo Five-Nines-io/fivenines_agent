@@ -297,6 +297,21 @@ def test_capability_overrides_raid_storage():
     mock_fn.assert_not_called()
 
 
+def test_capability_overrides_logs_journald():
+    """logs config gates on the journald capability (not a 'logs' capability)."""
+    _reset_skip_log()
+    mock_fn = MagicMock(return_value="x")
+    registry = [("logs", [("logs", mock_fn, True)])]
+    config = {"logs": {"units": ["nginx.service"]}}
+    permissions = {"journald": False}
+    data = {}
+
+    with patch("fivenines_agent.collectors.COLLECTORS", registry):
+        collect_metrics(config, data, permissions=permissions)
+
+    mock_fn.assert_not_called()
+
+
 def test_skip_logged_only_once_per_process():
     """Subsequent skipped invocations do not re-log."""
     _reset_skip_log()
