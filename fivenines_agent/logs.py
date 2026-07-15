@@ -190,8 +190,16 @@ def _capture_entries(unit, since, lines, timeout=_CAPTURE_TIMEOUT):
         if not isinstance(obj, dict):
             continue
         message = obj.get("MESSAGE")
-        if not isinstance(message, str):
-            continue  # binary/array MESSAGE: skip (best-effort)
+        if isinstance(message, list):
+            # journald emits non-UTF8 payloads as byte arrays; decode them
+            # (same handling as the systemd collector's journal tail) rather
+            # than dropping the entry.
+            try:
+                message = bytes(message).decode("utf-8", errors="replace")
+            except (TypeError, ValueError):
+                continue
+        if not isinstance(message, str) or not message:
+            continue
         entries.append({"priority": obj.get("PRIORITY"), "message": message})
     return entries
 

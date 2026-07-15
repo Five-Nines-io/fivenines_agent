@@ -182,7 +182,11 @@ def test_capture_entries_parses_json_skips_garbage():
             "",  # blank
             "not json",  # bad
             json.dumps(["array", "not", "dict"]),  # non-dict
-            json.dumps({"PRIORITY": "6", "MESSAGE": [1, 2, 3]}),  # binary MESSAGE
+            # binary MESSAGE (byte array): decoded, not dropped (mirrors the
+            # systemd collector's journal-tail handling)
+            json.dumps({"PRIORITY": "6", "MESSAGE": [104, 105]}),
+            json.dumps({"PRIORITY": "6", "MESSAGE": [999999]}),  # undecodable
+            json.dumps({"PRIORITY": "6", "MESSAGE": ""}),  # empty: skipped
             json.dumps({"PRIORITY": "4", "MESSAGE": "warn here"}),
         ]
     )
@@ -192,6 +196,7 @@ def test_capture_entries_parses_json_skips_garbage():
         entries = logs._capture_entries("nginx.service", 1000, 500)
     assert entries == [
         {"priority": "3", "message": "boom"},
+        {"priority": "6", "message": "hi"},
         {"priority": "4", "message": "warn here"},
     ]
     # timeout + clean env are passed (the two learnings).

@@ -503,6 +503,20 @@ def test_parse_journalctl_byte_array_invalid():
     assert result == []
 
 
+def test_parse_journalctl_tail_is_redacted():
+    """Journal tails ship in the /collect payload: secrets embedded in error
+    lines (often the credential that caused the failure) must be scrubbed with
+    the same best-effort redaction as the log-monitoring digests."""
+    lines = [
+        json.dumps({"MESSAGE": "FATAL: postgres://app:S3cretPass@db:5432 refused"}),
+        json.dumps({"MESSAGE": "auth failed for token=sk_live_abc123"}),
+    ]
+    result = _parse_journalctl_failed("\n".join(lines))
+    assert len(result) == 2
+    assert "S3cretPass" not in result[0] and "[REDACTED]" in result[0]
+    assert "sk_live_abc123" not in result[1]
+
+
 def test_parse_journalctl_missing_message_key():
     line = json.dumps({"_PID": "1234"})
     assert _parse_journalctl_failed(line) == []
