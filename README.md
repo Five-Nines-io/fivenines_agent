@@ -142,6 +142,7 @@ The agent works without sudo, but these features will be unavailable (this is al
 | SNMP device polling | `net-snmp` tools (`snmpget`, `snmpbulkwalk`) |
 | systemd unit metrics | `systemd` init system (`systemctl`; `journalctl` only for failure journal tails) |
 | systemd failure journal tails | journal read access: the bundled service unit grants `SupplementaryGroups=systemd-journal`; for user installs add your user to the `systemd-journal` group (tails degrade to empty without it) |
+| Log monitoring (journald capture + signals) | journal read access (`systemd-journal` group) |
 | Per-unit cgroup metrics | cgroup v1 or v2 mounted at `/sys/fs/cgroup` |
 | Ceph cluster status | `ceph` CLI + read-only cephx keyring (no sudo) |
 
@@ -233,6 +234,9 @@ When the agent starts, it displays a banner showing which features are available
 
   Networking:
     [+] Snmp
+
+  Logs:
+    [+] Journald
 
   [!] Some features unavailable. See: https://docs.fivenines.io/agent/permissions
 
