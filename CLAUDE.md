@@ -98,7 +98,7 @@ Each metric collector is a separate module that exports functions to collect spe
 
 - **Core metrics** (always enabled): `cpu.py`, `memory.py`, `load_average.py`, `io.py`, `network.py`, `partitions.py`, `files.py`, `ports.py`, `processes.py`, `temperatures.py`, `fans.py`
 - **Storage**: `smart_storage.py` (requires sudo smartctl), `raid_storage.py` (requires sudo mdadm), `zfs.py`
-- **Services**: `docker.py`, `qemu.py`, `proxmox.py`, `caddy.py`, `nginx.py`, `postgresql.py`, `redis.py`, `systemd.py` (per-unit health + inventory delta-sync, requires systemctl; journalctl only for failure journal tails)
+- **Services**: `docker.py` (per-container state + metrics: status/health/exit-code/OOM/restart-count for every container from its first tick, plus running-container CPU/memory/block-I/O; keyed by full container id; `docker_metrics` returns `None` on daemon-unreachable so the server never prunes on error, `{}` only when genuinely zero containers), `qemu.py`, `proxmox.py`, `caddy.py`, `nginx.py`, `postgresql.py`, `redis.py`, `systemd.py` (per-unit health + inventory delta-sync, requires systemctl; journalctl only for failure journal tails)
 - **Security**: `fail2ban.py` (requires sudo fail2ban-client)
 - **Network/connectivity**: `ip.py` (public IPv4/IPv6 via ip.fivenines.io with 60s cache), `ping.py` (TCP latency), `snmp.py` (SNMP device polling via net-snmp CLI tools)
 - **Security scanning**: `packages.py` (installed packages via dpkg/rpm/apk/pacman with hash-based delta sync)
@@ -113,7 +113,7 @@ Collectors use the `@debug` decorator from `debug.py` to log execution time and 
   - `enabled`: whether collection is active
   - `interval`: seconds between collections (default 60)
   - Feature flags for each metric type (cpu, memory, etc.)
-  - Service-specific config (e.g., redis host/port, docker socket path)
+  - Service-specific config (e.g., redis host/port, `docker.socket_url` which drives both per-container state and metrics collection)
   - `request_options`: timeout, retry count, retry interval
   - `packages.scan`: triggers package inventory sync with hash-based deduplication
   - `systemd`: unit collection config (`unit_types` as comma-separated string or list; `scan` triggers inventory delta-sync to `/systemd_inventory`)
