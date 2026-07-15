@@ -8,15 +8,18 @@ persistence, so a Restart=always agent never replays a capture it already served
     config.capture_logs = {capture_id, unit, since, lines, max_bytes, expiry}
           |
           v  evaluate()
-    capture_id == last_served (persisted) ?  -> None   (replay guard, survives restart)
+    capture_id already served or in flight ? -> None   (replay guard + no dup)
     unit not in allowlist ?                  -> None   (default-deny)
     expiry set and now > expiry ?            -> None   (stale command)
-    otherwise -> persist last_served = capture_id, return the JOB (enqueue once)
+    otherwise -> mark in-flight, return the JOB (enqueue once)
 
-last_served is updated optimistically when the job is enqueued, not after the
-upload acks. Tradeoff: a crash between enqueue and a successful POST drops that one
-capture; the backend re-issues a NEW capture_id once `expiry` passes without an ack.
-This keeps replay prevention simple and avoids an in-flight retry loop.
+last_served advances only AFTER a confirmed upload (mark_uploaded), not at enqueue
+time, so a failed capture or upload is retried on a later tick instead of being
+lost; mark_failed releases the in-flight slot. last_served is persisted to disk so
+a Restart=always agent never replays a capture it already uploaded (a crash mid-
+capture re-fires, which the idempotent backend dedupes on capture_id). max_bytes is
+forward-plumbed into the job for the raw posture; V1 ships digest only, whose size
+is already bounded by the fingerprint/excerpt caps in logs.py.
 """
 
 import threading

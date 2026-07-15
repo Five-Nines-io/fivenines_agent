@@ -297,6 +297,7 @@ def build_capture_bundle(job, _entries_fn=_capture_entries):
 _SIGNAL_LINES = 5000  # upper bound of journal entries scanned per unit per tick
 _SIGNAL_TIMEOUT = 5  # signals scan a small window; short timeout avoids the
 # watchdog risk of N units x 30s on the collection loop at a low incident interval.
+_DEFAULT_WINDOW_S = 60  # signal window fallback when the backend sends no/invalid value
 _TOP_FINGERPRINTS = 20
 
 
@@ -353,7 +354,7 @@ def collect_log_signals(
     """
     window = signal_interval_s
     if isinstance(window, bool) or not isinstance(window, (int, float)) or window <= 0:
-        window = 60
+        window = _DEFAULT_WINDOW_S
     if not enabled:
         return {"window_s": window, "units": {}}
     since = int(_now()) - int(window)

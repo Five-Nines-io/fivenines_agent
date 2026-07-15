@@ -102,8 +102,9 @@ COLLECTORS = [
 CAPABILITY_KEY_OVERRIDES = {
     "smart_storage_health": "smart_storage",
     "raid_storage_health": "raid_storage",
-    # Log signals are gated by journald read access (capability added with the
-    # journald permission probe); until that lands, the cap is absent -> not gated.
+    # Log signals are gated by journald read access, probed via `journalctl -n 0`
+    # in permissions.py (_can_read_journal). Hosts where the cap is absent (non
+    # systemd, or no group) are simply not gated on it.
     "logs": "journald",
 }
 
