@@ -30,6 +30,12 @@ from fivenines_agent.subprocess_utils import get_clean_env
 
 _CAPTURE_TIMEOUT = 30  # seconds; matches packages.py (timeout-the-data-path)
 _DEFAULT_LINES = 1000
+# Hard agent-side ceiling on captured lines, independent of the backend-supplied
+# `lines`. journalctl buffers the whole slice in RAM before any digest
+# truncation, so an unbounded backend value (a huge -n over an ancient --since)
+# would be a one-request OOM. The backend is trusted-but-verify: enforce our own
+# resource bound regardless of what it asks for.
+_MAX_CAPTURE_LINES = 10000
 _MAX_FINGERPRINTS = 50
 _MAX_EXCERPT = 500
 REDACTION_VERSION = 1
@@ -60,6 +66,10 @@ _REDACTIONS = [
         re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"),
         "[REDACTED_EMAIL]",
     ),
+    # Long opaque base64/hex run (>=40 chars): PEM key bodies, API tokens, hashes,
+    # session blobs. Higher threshold than the fingerprint mask so readable
+    # excerpts are not over-redacted.
+    (re.compile(r"[A-Za-z0-9+/]{40,}={0,2}"), "[REDACTED_BLOB]"),
 ]
 
 # Fingerprint masking: collapse volatile tokens so the same error template hashes
@@ -96,8 +106,15 @@ def redact(text):
 
 
 def fingerprint(message):
-    """Stable fingerprint of an error template (volatile tokens masked, then hashed)."""
-    masked = message
+    """Stable fingerprint of an error template.
+
+    Redact FIRST, then mask volatile tokens, then hash. Redacting first collapses
+    per-occurrence secrets/PII (emails, tokens, opaque blobs) to constant markers,
+    so the same error template with different secret values fingerprints
+    identically instead of fragmenting recurrence/top-N counts (which matters most
+    during an incident, when those values churn).
+    """
+    masked = redact(message)
     for pattern, repl in _MASKS:
         masked = pattern.sub(repl, masked)
     return hashlib.sha256(masked.encode("utf-8")).hexdigest()[:12]
@@ -219,7 +236,14 @@ def assemble_multiline(entries):
 def _capture_entries(unit, since, lines, timeout=_CAPTURE_TIMEOUT):
     """Run a bounded journalctl slice. Returns a list of entries on success
     (possibly empty), or None on failure (timeout / non-zero exit / error)."""
-    cmd = ["journalctl", "-u", str(unit), "-o", "json", "-n", str(int(lines))]
+    # Clamp lines to a hard agent ceiling: `lines` is backend-supplied and
+    # journalctl buffers the whole slice in RAM, so an unbounded value is an OOM
+    # DoS. A non-numeric value falls back to the default rather than raising.
+    try:
+        capped_lines = min(int(lines), _MAX_CAPTURE_LINES)
+    except (TypeError, ValueError):
+        capped_lines = _DEFAULT_LINES
+    cmd = ["journalctl", "-u", str(unit), "-o", "json", "-n", str(capped_lines)]
     since_arg = _since_arg(since)
     if since_arg is not None:
         cmd += ["--since", since_arg]
@@ -298,6 +322,11 @@ _SIGNAL_LINES = 5000  # upper bound of journal entries scanned per unit per tick
 _SIGNAL_TIMEOUT = 5  # signals scan a small window; short timeout avoids the
 # watchdog risk of N units x 30s on the collection loop at a low incident interval.
 _DEFAULT_WINDOW_S = 60  # signal window fallback when the backend sends no/invalid value
+# Hard cap on units scanned for signals per tick. Each unit runs one journalctl
+# (up to _SIGNAL_TIMEOUT) sequentially on the main collection loop, so an
+# oversized backend allowlist could exceed WatchdogSec (90s) and self-trigger a
+# restart loop. _MAX_SIGNAL_UNITS x _SIGNAL_TIMEOUT stays well under the watchdog.
+_MAX_SIGNAL_UNITS = 12
 _TOP_FINGERPRINTS = 20
 
 
@@ -337,6 +366,20 @@ def _signals_for_unit(entries):
     }
 
 
+_signal_units_capped_warned = False
+
+
+def _warn_units_capped_once(total):
+    global _signal_units_capped_warned
+    if not _signal_units_capped_warned:
+        log(
+            f"log signals: allowlist has {total} units, scanning only the first "
+            f"{_MAX_SIGNAL_UNITS}/tick to stay under the systemd watchdog",
+            "error",
+        )
+        _signal_units_capped_warned = True
+
+
 def collect_log_signals(
     units=None,
     signal_interval_s=None,
@@ -359,7 +402,10 @@ def collect_log_signals(
         return {"window_s": window, "units": {}}
     since = int(_now()) - int(window)
     result = {"window_s": window, "units": {}}
-    for unit in units or []:
+    all_units = units or []
+    if len(all_units) > _MAX_SIGNAL_UNITS:
+        _warn_units_capped_once(len(all_units))
+    for unit in all_units[:_MAX_SIGNAL_UNITS]:
         try:
             entries = _entries_fn(unit, since, _SIGNAL_LINES, _SIGNAL_TIMEOUT)
             if entries is None:

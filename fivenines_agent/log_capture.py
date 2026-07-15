@@ -130,6 +130,16 @@ def evaluate_and_enqueue(coordinator, log_queue, config):
     logs_cfg = config.get("logs")
     allowed = logs_cfg.get("units", []) if isinstance(logs_cfg, dict) else []
     job = coordinator.evaluate(config.get("capture_logs"), allowed)
-    if job is not None:
-        log_queue.put(job)
+    if job is None:
+        return None
+    # evaluate() already marked this capture in-flight. The bounded log_queue
+    # drops the OLDEST job silently on overflow, and a dropped job never reaches
+    # the uploader -> its in-flight slot would leak forever. So when the queue is
+    # full, shed THIS capture and release its slot instead; the backend re-mints a
+    # fresh capture_id after expiry.
+    if log_queue.full():
+        log("evaluate_and_enqueue: log queue full, shedding capture", "error")
+        coordinator.mark_failed(job.get("capture_id"))
+        return None
+    log_queue.put(job)
     return job

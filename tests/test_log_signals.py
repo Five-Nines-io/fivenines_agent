@@ -115,6 +115,23 @@ def test_collect_uses_short_signal_timeout():
     assert seen["timeout"] == logs._SIGNAL_TIMEOUT == 5
 
 
+def test_collect_caps_units_per_tick_and_warns_once():
+    # An oversized backend allowlist is capped so N sequential journalctl calls
+    # on the main loop can't exceed the systemd watchdog and self-restart.
+    logs._signal_units_capped_warned = False  # reset module-level warn-once flag
+    seen = []
+
+    def fake(unit, since, lines, timeout=None):
+        seen.append(unit)
+        return [{"priority": "3", "message": "e"}]
+
+    many = [f"u{i}.service" for i in range(20)]
+    out = logs.collect_log_signals(units=many, _entries_fn=fake, _now=lambda: 1000)
+    assert len(seen) == logs._MAX_SIGNAL_UNITS  # only the first N scanned
+    assert len(out["units"]) == logs._MAX_SIGNAL_UNITS
+    assert logs._signal_units_capped_warned is True
+
+
 def test_collect_absorbs_extra_config_kwargs():
     # posture / redaction come from the logs config block; must not break the call.
     out = logs.collect_log_signals(

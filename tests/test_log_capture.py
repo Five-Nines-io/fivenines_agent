@@ -127,6 +127,20 @@ def test_mark_helpers_ignore_empty_capture_id(tmp_path):
     assert c.evaluate(_cmd(), ALLOW) is not None  # state untouched
 
 
+def test_enqueue_sheds_capture_when_queue_full(tmp_path):
+    # A full bounded queue would drop-oldest silently, orphaning the dropped
+    # job's in-flight slot; instead shed the NEW capture and release its slot so
+    # it can retry (the backend re-mints after expiry) rather than leak.
+    q = SynchronizationQueue(maxsize=1)
+    q.put({"capture_id": "old"})  # queue now full
+    c = _coord(tmp_path)
+    job = evaluate_and_enqueue(c, q, {"logs": {"units": ALLOW}, "capture_logs": _cmd()})
+    assert job is None
+    assert q.qsize() == 1  # new capture not enqueued, old not evicted
+    # in-flight was released -> the same capture_id can fire again (retry)
+    assert c.evaluate(_cmd(), ALLOW) is not None
+
+
 def test_load_error_when_state_path_is_dir(tmp_path):
     # An unreadable state path (a directory) degrades to no baseline, fires once.
     d = os.path.join(str(tmp_path), "as_dir")

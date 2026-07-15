@@ -2317,7 +2317,10 @@ def test_parse_reverse_deps_capped():
 
 
 def test_journal_messages_truncated():
-    huge = "x" * (systemd.JOURNAL_MSG_MAX_CHARS + 500)
+    # Word-separated free text (so best-effort redaction leaves it intact) longer
+    # than the bound is truncated. A single long char run would instead be
+    # redacted as an opaque blob, which is a different path.
+    huge = "spam " * systemd.JOURNAL_MSG_MAX_CHARS
     out = json.dumps({"MESSAGE": huge})
     msgs = _parse_journalctl_failed(out)
     assert len(msgs[0]) == systemd.JOURNAL_MSG_MAX_CHARS

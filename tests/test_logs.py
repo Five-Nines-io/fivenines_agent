@@ -55,6 +55,14 @@ def test_redact_leaves_plain_text_untouched():
     assert redact("connection refused on socket") == "connection refused on socket"
 
 
+def test_redact_long_opaque_blob():
+    # A PEM key body line / long token (>=40 base64 chars) is redacted so
+    # multiline / high-entropy secrets don't leave in the digest excerpt.
+    body = "MIIEpAIBAAKCAQEA7Yk3v9fVxQzL8mN0pQ4rS6tU8wX1yZ3aB5cD7eF9gH0iJ2kL4m"
+    out = redact(f"key material {body} loaded")
+    assert body not in out and "[REDACTED_BLOB]" in out
+
+
 # --- fingerprint ---
 
 
@@ -94,6 +102,18 @@ def test_fingerprint_collapses_timestamps_via_digits():
     a = fingerprint("request at 12:34:56 failed")
     b = fingerprint("request at 01:02:03 failed")
     assert a == b
+
+
+def test_fingerprint_collapses_per_occurrence_secrets():
+    # Redact-before-fingerprint: emails/tokens that vary per occurrence collapse
+    # to constant markers, so the same error template stays ONE fingerprint
+    # instead of fragmenting recurrence/top-N during an incident.
+    assert fingerprint("auth failed for alice@corp.com") == fingerprint(
+        "auth failed for bob@other.org"
+    )
+    assert fingerprint("login token=sk_live_aaa rejected") == fingerprint(
+        "login token=sk_live_bbb rejected"
+    )
 
 
 def test_fingerprint_different_template_differs():
@@ -310,6 +330,22 @@ def test_capture_entries_parses_json_skips_garbage():
     _, kwargs = run.call_args
     assert kwargs["timeout"] == logs._CAPTURE_TIMEOUT
     assert "env" in kwargs
+
+
+def test_capture_entries_clamps_lines_to_ceiling():
+    # A huge backend-supplied `lines` is clamped so journalctl can't buffer an
+    # unbounded slice in RAM (OOM DoS).
+    with patch.object(logs.subprocess, "run", return_value=_result(stdout="")) as run:
+        logs._capture_entries("u", None, 10**9)
+    cmd = run.call_args[0][0]
+    assert cmd[cmd.index("-n") + 1] == str(logs._MAX_CAPTURE_LINES)
+
+
+def test_capture_entries_non_numeric_lines_falls_back():
+    with patch.object(logs.subprocess, "run", return_value=_result(stdout="")) as run:
+        logs._capture_entries("u", None, "garbage")
+    cmd = run.call_args[0][0]
+    assert cmd[cmd.index("-n") + 1] == str(logs._DEFAULT_LINES)
 
 
 def test_capture_entries_since_epoch_becomes_at_arg():
