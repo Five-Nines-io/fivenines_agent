@@ -159,6 +159,63 @@ def _since_arg(since):
     return None
 
 
+# Multiline assembly (E3): stdout-captured services log stack traces one line
+# per journal entry, so without assembly one crash fans out into N fingerprints
+# (inflated counts, diluted top-N, false "new errors"). Group continuation
+# lines with the entry that started them BEFORE fingerprinting. Conservative,
+# promtail-style heuristics: indented lines and known chain markers continue a
+# group; a Python traceback header additionally absorbs its final unindented
+# exception line. Native journal-protocol apps (multiline in one MESSAGE) are
+# unaffected.
+_MAX_ASSEMBLED_LINES = 50  # cap text growth per group; grouping continues past it
+_TRACEBACK_HEADER = "Traceback (most recent call last):"
+_CONTINUATION_PREFIXES = (
+    "Caused by:",  # Java chained exceptions
+    "Suppressed:",  # Java try-with-resources
+    "During handling of the above exception",  # Python chained exceptions
+)
+
+
+def _is_continuation(message):
+    return message.startswith((" ", "\t")) or message.startswith(_CONTINUATION_PREFIXES)
+
+
+def assemble_multiline(entries):
+    """Group line-per-entry stack traces into single logical entries.
+
+    Returns entries in the same {priority, message} shape; a group keeps the
+    worst severity seen across its lines and joins messages with newlines
+    (text capped at _MAX_ASSEMBLED_LINES; grouping itself never stops, so an
+    oversized trace still yields ONE entry with a deterministic fingerprint).
+    """
+    assembled = []
+    line_counts = []
+    open_traceback = False  # awaiting the final unindented exception line
+    for e in entries:
+        message = e.get("message") or ""
+        if assembled:
+            cont = _is_continuation(message)
+            terminator = open_traceback and not cont
+            if cont or terminator:
+                group = assembled[-1]
+                if line_counts[-1] < _MAX_ASSEMBLED_LINES:
+                    group["message"] = group["message"] + "\n" + message
+                line_counts[-1] += 1
+                new_sev = severity_from_priority(e.get("priority"))
+                if (
+                    _SEVERITY_RANK[new_sev]
+                    > _SEVERITY_RANK[severity_from_priority(group.get("priority"))]
+                ):
+                    group["priority"] = e.get("priority")
+                if terminator:
+                    open_traceback = False
+                continue
+        assembled.append({"priority": e.get("priority"), "message": message})
+        line_counts.append(1)
+        open_traceback = message.startswith(_TRACEBACK_HEADER)
+    return assembled
+
+
 def _capture_entries(unit, since, lines, timeout=_CAPTURE_TIMEOUT):
     """Run a bounded journalctl slice. Returns a list of entries on success
     (possibly empty), or None on failure (timeout / non-zero exit / error)."""
@@ -201,7 +258,9 @@ def _capture_entries(unit, since, lines, timeout=_CAPTURE_TIMEOUT):
         if not isinstance(message, str) or not message:
             continue
         entries.append({"priority": obj.get("PRIORITY"), "message": message})
-    return entries
+    # Single-source multiline assembly BEFORE any fingerprinting: both consumers
+    # (Brique C signals and Brique A capture digests) read this seam.
+    return assemble_multiline(entries)
 
 
 def build_capture_bundle(job, _entries_fn=_capture_entries):

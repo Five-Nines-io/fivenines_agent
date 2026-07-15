@@ -168,6 +168,113 @@ def test_build_digest_empty():
     assert digest == {"counts": {"error": 0, "warn": 0, "info": 0}, "fingerprints": []}
 
 
+# --- assemble_multiline (E3: single-source assembly BEFORE fingerprint) ---
+
+
+def _e(msg, prio="6"):
+    return {"priority": prio, "message": msg}
+
+
+def test_multiline_python_traceback_is_one_entry_one_fingerprint():
+    """The critical plan test: a stdout-captured Python crash (one journal
+    entry per line) collapses to ONE entry -> ONE fingerprint, including the
+    final unindented exception line."""
+    crash = [
+        _e("Traceback (most recent call last):", "3"),
+        _e('  File "app.py", line 10, in <module>'),
+        _e("    main()"),
+        _e('  File "app.py", line 7, in main'),
+        _e("    raise ValueError('boom 42')"),
+        _e("ValueError: boom 42"),
+    ]
+    out = logs.assemble_multiline(crash)
+    assert len(out) == 1
+    assert "ValueError: boom 42" in out[0]["message"]
+    # Same crash with different line numbers -> same single fingerprint.
+    crash2 = [
+        _e("Traceback (most recent call last):", "3"),
+        _e('  File "app.py", line 99, in <module>'),
+        _e("    main()"),
+        _e('  File "app.py", line 55, in main'),
+        _e("    raise ValueError('boom 7')"),
+        _e("ValueError: boom 7"),
+    ]
+    (only,) = logs.assemble_multiline(crash2)
+    assert fingerprint(only["message"]) == fingerprint(out[0]["message"])
+
+
+def test_multiline_traceback_terminator_closes_block():
+    # The line AFTER the exception terminator is a fresh entry, not merged.
+    out = logs.assemble_multiline(
+        [
+            _e("Traceback (most recent call last):"),
+            _e("  File 'x'"),
+            _e("KeyError: 'k'"),
+            _e("worker restarted"),
+        ]
+    )
+    assert len(out) == 2
+    assert out[1]["message"] == "worker restarted"
+
+
+def test_multiline_java_chain_merges():
+    out = logs.assemble_multiline(
+        [
+            _e("Exception in thread main java.lang.RuntimeException: x", "3"),
+            _e("\tat com.app.Main.run(Main.java:10)"),
+            _e("Caused by: java.io.IOException: disk"),
+            _e("\tat com.app.Disk.read(Disk.java:5)"),
+        ]
+    )
+    assert len(out) == 1
+    assert "Caused by" in out[0]["message"]
+
+
+def test_multiline_severity_escalates_to_worst_line():
+    out = logs.assemble_multiline([_e("Exception: x", "4"), _e("\tat frame", "3")])
+    assert len(out) == 1
+    assert logs.severity_from_priority(out[0]["priority"]) == "error"
+
+
+def test_multiline_plain_lines_do_not_merge():
+    out = logs.assemble_multiline(
+        [_e("connection refused"), _e("retrying"), _e("connected")]
+    )
+    assert len(out) == 3
+
+
+def test_multiline_leading_continuation_starts_own_group():
+    # Window cut mid-traceback: first entry is indented -> becomes its own group.
+    out = logs.assemble_multiline([_e("  File 'x'"), _e("KeyError: 'k'")])
+    assert len(out) == 2
+
+
+def test_multiline_cap_bounds_text_but_keeps_grouping():
+    entries = [_e("Traceback (most recent call last):")] + [
+        _e(f"  frame {i}") for i in range(80)
+    ]
+    out = logs.assemble_multiline(entries)
+    assert len(out) == 1  # grouping never splits past the cap
+    # text growth stops at the cap
+    assert len(out[0]["message"].splitlines()) == logs._MAX_ASSEMBLED_LINES
+
+
+def test_capture_entries_applies_multiline_assembly():
+    stdout = "\n".join(
+        [
+            json.dumps(
+                {"PRIORITY": "3", "MESSAGE": "Traceback (most recent call last):"}
+            ),
+            json.dumps({"PRIORITY": "3", "MESSAGE": "  File 'app.py', line 1"}),
+            json.dumps({"PRIORITY": "3", "MESSAGE": "TypeError: bad"}),
+        ]
+    )
+    with patch.object(logs.subprocess, "run", return_value=_result(stdout=stdout)):
+        entries = logs._capture_entries("u", None, 100)
+    assert len(entries) == 1
+    assert "TypeError: bad" in entries[0]["message"]
+
+
 # --- _capture_entries (subprocess seam) ---
 
 
