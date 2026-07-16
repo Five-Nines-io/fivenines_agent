@@ -284,7 +284,7 @@ PYI_BASE=(
     --noconfirm --onedir --name "$BINARY_NAME"
     --workpath ./build/tmp --distpath ./build --clean
     --hidden-import=scramp --hidden-import=dateutil.parser
-    --copy-metadata pg8000 --copy-metadata scramp
+    --copy-metadata fivenines_agent --copy-metadata pg8000 --copy-metadata scramp
     --add-binary "$PYTHON_LIB:."
     --add-binary "/usr/local/lib/libcrypt.so.2:." --add-binary "/usr/local/lib/libcrypt.so.1:."
     --add-binary "/usr/lib64/libz.so.1:."
@@ -314,10 +314,20 @@ ldd ./build/$BINARY_NAME/$BINARY_NAME | head -10 || echo "ldd check failed (migh
 # collector graph (incl. pg8000, which reads its package metadata at import),
 # so this catches missing hidden imports or un-copied metadata before shipping.
 echo "=== Testing Built Binary ==="
-if ! ./build/$BINARY_NAME/$BINARY_NAME --version; then
+if ! VERSION_OUTPUT="$(./build/$BINARY_NAME/$BINARY_NAME --version)"; then
     echo "Smoke check FAILED: built binary cannot run --version (missing hidden import or bundled metadata). Aborting."
     exit 1
 fi
+echo "$VERSION_OUTPUT"
+# cli.py derives VERSION from the bundled fivenines_agent metadata; the
+# 0.0.0+unknown fallback means --copy-metadata fivenines_agent did not land, so
+# refuse to ship a binary that would report the wrong version.
+case "$VERSION_OUTPUT" in
+    *0.0.0+unknown*)
+        echo "Smoke check FAILED: --version reports the metadata-missing fallback (fivenines_agent metadata not bundled). Aborting."
+        exit 1
+        ;;
+esac
 
 # Move to final location
 if [ -n "${SYNOLOGY:-}" ]; then
