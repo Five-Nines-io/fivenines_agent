@@ -2,6 +2,7 @@
 
 import time
 
+from fivenines_agent.apache import apache_metrics
 from fivenines_agent.caddy import caddy_metrics
 from fivenines_agent.ceph import ceph_metrics
 from fivenines_agent.cpu import cpu_count, cpu_data, cpu_model, cpu_usage
@@ -83,6 +84,7 @@ COLLECTORS = [
     ("nvidia_gpu", [("nvidia_gpu", gpu_metrics, False)]),
     ("redis", [("redis", redis_metrics, True)]),
     ("nginx", [("nginx", nginx_metrics, True)]),
+    ("apache", [("apache", apache_metrics, True)]),
     ("docker", [("docker", docker_metrics, True)]),
     ("qemu", [("qemu", qemu_metrics, True)]),
     ("fail2ban", [("fail2ban", fail2ban_metrics, False)]),
