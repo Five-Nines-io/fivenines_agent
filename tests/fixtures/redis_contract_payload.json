@@ -1,0 +1,177 @@
+{
+  "description": "Shared Redis contract fixture between fivenines-agent and fivenines-server. Source of truth: fivenines-agent tests/fixtures/redis_contract_payload.json, asserted end-to-end by tests/test_redis.py::test_contract_fixture_round_trip (only socket.create_connection is mocked -- each scenario's raw 'info' is fed back as the socket reply and redis_metrics(**config) must equal 'payload'). The server's spec/requests/api_collect_redis_spec.rb posts each 'payload' under data['redis'] through /collect and asserts Ingesters::Agent ingests it (an empty payload is skipped by the presence gate). 'config' is the shape config['redis'] takes. The '$<n>' RESP bulk-length line is illustrative -- the agent skips it without validating the byte count. Change only in lockstep across both repos.",
+  "agent_min_version": "1.11.0",
+  "config": {
+    "port": 6379
+  },
+  "scenarios": {
+    "master": {
+      "info": "$882\r\n# Server\r\nredis_version:7.2.4\r\nuptime_in_seconds:123456\r\n# Clients\r\nconnected_clients:10\r\nblocked_clients:0\r\nmaxclients:10000\r\n# Memory\r\nused_memory:1048576\r\nused_memory_rss:2097152\r\nused_memory_peak:1572864\r\nmaxmemory:2147483648\r\nmaxmemory_policy:noeviction\r\nmem_fragmentation_ratio:1.23\r\n# Persistence\r\nrdb_last_save_time:1699564800\r\nrdb_last_bgsave_status:ok\r\naof_enabled:0\r\n# Stats\r\ntotal_connections_received:1000\r\ntotal_commands_processed:50000\r\ninstantaneous_ops_per_sec:12\r\nexpired_keys:42\r\nexpired_stale_perc:0.00\r\nevicted_keys:0\r\nevicted_clients:0\r\nkeyspace_hits:900\r\nkeyspace_misses:100\r\n# Replication\r\nrole:master\r\nconnected_slaves:2\r\nslave0:ip=10.0.0.2,port=6379,state=online,offset=123400,lag=0\r\nslave1:ip=10.0.0.3,port=6379,state=online,offset=123390,lag=1\r\nmaster_repl_offset:123456\r\n# Keyspace\r\ndb0:keys=1000,expires=50,avg_ttl=0\r\ndb1:keys=200,expires=0,avg_ttl=0\r\n+OK\r\n",
+      "payload": {
+        "redis_version": "7.2.4",
+        "uptime_in_seconds": 123456.0,
+        "connected_clients": 10.0,
+        "blocked_clients": 0.0,
+        "maxclients": 10000.0,
+        "used_memory": 1048576.0,
+        "maxmemory": 2147483648.0,
+        "mem_fragmentation_ratio": 1.23,
+        "rdb_last_save_time": 1699564800.0,
+        "rdb_last_bgsave_status": "ok",
+        "aof_enabled": 0.0,
+        "total_connections_received": 1000.0,
+        "total_commands_processed": 50000.0,
+        "instantaneous_ops_per_sec": 12.0,
+        "expired_keys": 42.0,
+        "evicted_keys": 0.0,
+        "evicted_clients": 0.0,
+        "keyspace_hits": 900.0,
+        "keyspace_misses": 100.0,
+        "role": "master",
+        "connected_slaves": 2.0,
+        "slave0": {
+          "ip": "10.0.0.2",
+          "port": 6379.0,
+          "state": "online",
+          "offset": 123400.0,
+          "lag": 0.0
+        },
+        "slave1": {
+          "ip": "10.0.0.3",
+          "port": 6379.0,
+          "state": "online",
+          "offset": 123390.0,
+          "lag": 1.0
+        },
+        "master_repl_offset": 123456.0,
+        "db0": {
+          "keys": 1000.0,
+          "expires": 50.0,
+          "avg_ttl": 0.0
+        },
+        "db1": {
+          "keys": 200.0,
+          "expires": 0.0,
+          "avg_ttl": 0.0
+        }
+      }
+    },
+    "replica": {
+      "info": "$677\r\n# Server\r\nredis_version:7.2.4\r\nuptime_in_seconds:9999\r\n# Clients\r\nconnected_clients:5\r\nblocked_clients:0\r\nmaxclients:10000\r\n# Memory\r\nused_memory:524288\r\nmaxmemory:0\r\nmem_fragmentation_ratio:1.07\r\n# Persistence\r\nrdb_last_save_time:1699564900\r\nrdb_last_bgsave_status:ok\r\naof_enabled:1\r\n# Stats\r\ntotal_connections_received:200\r\ntotal_commands_processed:10000\r\ninstantaneous_ops_per_sec:3\r\nexpired_keys:5\r\nevicted_keys:0\r\nevicted_clients:0\r\nkeyspace_hits:400\r\nkeyspace_misses:50\r\n# Replication\r\nrole:slave\r\nmaster_link_status:up\r\nmaster_last_io_seconds_ago:1\r\nslave_repl_offset:120000\r\nmaster_repl_offset:120000\r\nconnected_slaves:0\r\n# Keyspace\r\ndb0:keys=500,expires=10,avg_ttl=0\r\n+OK\r\n",
+      "payload": {
+        "redis_version": "7.2.4",
+        "uptime_in_seconds": 9999.0,
+        "connected_clients": 5.0,
+        "blocked_clients": 0.0,
+        "maxclients": 10000.0,
+        "used_memory": 524288.0,
+        "maxmemory": 0.0,
+        "mem_fragmentation_ratio": 1.07,
+        "rdb_last_save_time": 1699564900.0,
+        "rdb_last_bgsave_status": "ok",
+        "aof_enabled": 1.0,
+        "total_connections_received": 200.0,
+        "total_commands_processed": 10000.0,
+        "instantaneous_ops_per_sec": 3.0,
+        "expired_keys": 5.0,
+        "evicted_keys": 0.0,
+        "evicted_clients": 0.0,
+        "keyspace_hits": 400.0,
+        "keyspace_misses": 50.0,
+        "role": "slave",
+        "master_link_status": "up",
+        "master_last_io_seconds_ago": 1.0,
+        "slave_repl_offset": 120000.0,
+        "master_repl_offset": 120000.0,
+        "connected_slaves": 0.0,
+        "db0": {
+          "keys": 500.0,
+          "expires": 10.0,
+          "avg_ttl": 0.0
+        }
+      }
+    },
+    "standalone": {
+      "info": "$586\r\n# Server\r\nredis_version:7.0.11\r\nuptime_in_seconds:3600\r\n# Clients\r\nconnected_clients:1\r\nblocked_clients:0\r\nmaxclients:10000\r\n# Memory\r\nused_memory:262144\r\nmaxmemory:0\r\nmem_fragmentation_ratio:1.5\r\n# Persistence\r\nrdb_last_save_time:1699560000\r\nrdb_last_bgsave_status:ok\r\naof_enabled:0\r\n# Stats\r\ntotal_connections_received:10\r\ntotal_commands_processed:100\r\ninstantaneous_ops_per_sec:0\r\nexpired_keys:0\r\nevicted_keys:0\r\nevicted_clients:0\r\nkeyspace_hits:10\r\nkeyspace_misses:2\r\n# Replication\r\nrole:master\r\nconnected_slaves:0\r\nmaster_repl_offset:0\r\n# Keyspace\r\ndb0:keys=3,expires=0,avg_ttl=0\r\n+OK\r\n",
+      "payload": {
+        "redis_version": "7.0.11",
+        "uptime_in_seconds": 3600.0,
+        "connected_clients": 1.0,
+        "blocked_clients": 0.0,
+        "maxclients": 10000.0,
+        "used_memory": 262144.0,
+        "maxmemory": 0.0,
+        "mem_fragmentation_ratio": 1.5,
+        "rdb_last_save_time": 1699560000.0,
+        "rdb_last_bgsave_status": "ok",
+        "aof_enabled": 0.0,
+        "total_connections_received": 10.0,
+        "total_commands_processed": 100.0,
+        "instantaneous_ops_per_sec": 0.0,
+        "expired_keys": 0.0,
+        "evicted_keys": 0.0,
+        "evicted_clients": 0.0,
+        "keyspace_hits": 10.0,
+        "keyspace_misses": 2.0,
+        "role": "master",
+        "connected_slaves": 0.0,
+        "master_repl_offset": 0.0,
+        "db0": {
+          "keys": 3.0,
+          "expires": 0.0,
+          "avg_ttl": 0.0
+        }
+      }
+    },
+    "valkey": {
+      "info": "$621\r\n# Server\r\nredis_version:7.2.4\r\nvalkey_version:8.0.1\r\nuptime_in_seconds:7200\r\n# Clients\r\nconnected_clients:3\r\nblocked_clients:0\r\nmaxclients:10000\r\n# Memory\r\nused_memory:393216\r\nmaxmemory:1073741824\r\nmem_fragmentation_ratio:1.34\r\n# Persistence\r\nrdb_last_save_time:1699565000\r\nrdb_last_bgsave_status:ok\r\naof_enabled:0\r\n# Stats\r\ntotal_connections_received:50\r\ntotal_commands_processed:2000\r\ninstantaneous_ops_per_sec:5\r\nexpired_keys:1\r\nevicted_keys:0\r\nevicted_clients:0\r\nkeyspace_hits:150\r\nkeyspace_misses:20\r\n# Replication\r\nrole:master\r\nconnected_slaves:0\r\nmaster_repl_offset:0\r\n# Keyspace\r\ndb0:keys=42,expires=0,avg_ttl=0\r\n+OK\r\n",
+      "payload": {
+        "redis_version": "7.2.4",
+        "valkey_version": "8.0.1",
+        "uptime_in_seconds": 7200.0,
+        "connected_clients": 3.0,
+        "blocked_clients": 0.0,
+        "maxclients": 10000.0,
+        "used_memory": 393216.0,
+        "maxmemory": 1073741824.0,
+        "mem_fragmentation_ratio": 1.34,
+        "rdb_last_save_time": 1699565000.0,
+        "rdb_last_bgsave_status": "ok",
+        "aof_enabled": 0.0,
+        "total_connections_received": 50.0,
+        "total_commands_processed": 2000.0,
+        "instantaneous_ops_per_sec": 5.0,
+        "expired_keys": 1.0,
+        "evicted_keys": 0.0,
+        "evicted_clients": 0.0,
+        "keyspace_hits": 150.0,
+        "keyspace_misses": 20.0,
+        "role": "master",
+        "connected_slaves": 0.0,
+        "master_repl_offset": 0.0,
+        "db0": {
+          "keys": 42.0,
+          "expires": 0.0,
+          "avg_ttl": 0.0
+        }
+      }
+    },
+    "legacy_minimal": {
+      "info": "$127\r\n# Server\r\nredis_version:6.2.6\r\n# Clients\r\nconnected_clients:2\r\nmaxclients:10000\r\n# Keyspace\r\ndb0:keys=100,expires=5,avg_ttl=0\r\n+OK\r\n",
+      "payload": {
+        "redis_version": "6.2.6",
+        "connected_clients": 2.0,
+        "maxclients": 10000.0,
+        "db0": {
+          "keys": 100.0,
+          "expires": 5.0,
+          "avg_ttl": 0.0
+        }
+      }
+    },
+    "auth_failure": {
+      "info": "-WRONGPASS invalid username-password pair or user is disabled.\r\n-NOAUTH Authentication required.\r\n",
+      "payload": {}
+    }
+  }
+}

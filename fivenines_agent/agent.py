@@ -82,6 +82,7 @@ _DRY_RUN_CONFIG = {
     "smart_storage_health": True,
     "raid_storage_health": True,
     "ceph": {"clusters": [{"name": "ceph"}]},
+    "redis": {"port": 6379},
     "fail2ban": True,
     "disk_health": True,
     # Dict (not bare True) because systemd_metrics takes **kwargs; scan=False
