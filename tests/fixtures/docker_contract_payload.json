@@ -1,0 +1,624 @@
+{
+  "description": "Shared Docker container-state contract fixture between fivenines-agent and fivenines-server (server issue #492). Source of truth: fivenines-agent tests/fixtures/docker_contract_payload.json, asserted end-to-end by tests/test_docker.py::test_contract_fixture_scenarios (only the Docker SDK -- containers.list / container.reload / container.stats / images.get -- is mocked). For each scenario, 'sdk' is the agent-side mock input (per-container inspect attrs + stats samples + the image objects images.get returns) and documents how the payload arises; the server ignores it. 'payload' is the exact value the agent emits under data['docker'] -- the artifact the server's DockerContainer ingester must parse. The server's spec posts each 'payload' under data['docker'] and asserts ingestion; copy this file byte-identical into the server's spec/fixtures/. Change only in lockstep. Contract highlights: (a) the identity+state block is UNCONDITIONAL -- present for every container, any status, from its first sighting; (b) stats keys (cpu/memory/block/networks) appear ONLY for a running container that has a prior stats sample (CPU-delta warm-up), so a running container's first tick is state-only too; (c) the raw blkio_stats dict is DROPPED and replaced by the clean cumulative counters block_read_bytes/block_write_bytes (the server never read blkio_stats, so removal is safe in both deploy orders); (d) collection failure emits data['docker']=null (never {}), and {'containers': {}} means GENUINELY zero containers (prune-safe).",
+  "agent_min_version": "1.11.2",
+  "_agent_min_version_note": "1.11.0 was taken by the Redis/Valkey deepening (server #491), 1.11.1 by log monitoring V1; container-state monitoring ships in 1.11.2. The server's FEATURES_SUPPORTED_VERSIONS[\"docker_states\"] must match this exactly.",
+  "error_path_audit": {
+    "connect_failure": "get_docker_client returns None (daemon down / socket refused) -> docker_metrics returns None -> data['docker'] is null. The server must never prune on null.",
+    "list_failure": "client.containers.list(all=True, sparse=True) raising -> docker_metrics returns None -> data['docker'] is null. Same never-prune contract as connect failure.",
+    "per_container_inspect_or_stats_failure": "container.reload() (the inspect) or container.stats() raising, or a NotFound race (container removed between list and inspect), skips ONLY that container; its siblings are still emitted. A skipped container is simply absent from this tick's payload (the server's freshness window handles a transient absence).",
+    "image_metadata_failure": "client.images.get(image_id) raising (image deleted mid-tick) yields image_tags=[] and image_repo_digests=[] for that entry; the container entry itself survives with its full state block (image still carries Config.Image, image_id still carries attrs.Image).",
+    "previous_stats_pruning": "the module-level previous_stats warm-up cache is pruned every tick to the set of containers seen this tick, so removed containers do not leak; a restarted container keeps the same id (warm-up preserved) while a recreated container gets a new id (warm-up restarts)."
+  },
+  "scenarios": {
+    "running_healthy": {
+      "description": "Running container, HEALTHCHECK healthy, second tick (previous_stats present) so full stats ship: CPU/memory/block-I/O/networks. blkio uses cgroup v2 LOWERCASE ops and two entries per op (summed). Config.Image is the tag as written; image_tags come independently from the image object. The fully-healthy reference shape.",
+      "sdk": {
+        "containers": [
+          {
+            "id": "1a2b3c4d5e6f70811a2b3c4d5e6f70811a2b3c4d5e6f70811a2b3c4d5e6f7081",
+            "attrs": {
+              "Name": "/web-1",
+              "Image": "sha256:a1b2c3d4e5f60718a1b2c3d4e5f60718a1b2c3d4e5f60718a1b2c3d4e5f60718",
+              "RestartCount": 0,
+              "Config": {"Image": "nginx:1.27"},
+              "State": {
+                "Status": "running",
+                "ExitCode": 0,
+                "OOMKilled": false,
+                "StartedAt": "2026-07-15T09:12:33.123456789Z",
+                "FinishedAt": "0001-01-01T00:00:00Z",
+                "Health": {"Status": "healthy"}
+              }
+            },
+            "previous_stats": {
+              "cpu_stats": {
+                "cpu_usage": {
+                  "total_usage": 1000000000,
+                  "usage_in_kernelmode": 200000000,
+                  "usage_in_usermode": 800000000
+                },
+                "system_cpu_usage": 10000000000
+              }
+            },
+            "stats": {
+              "cpu_stats": {
+                "cpu_usage": {
+                  "total_usage": 1250000000,
+                  "usage_in_kernelmode": 250000000,
+                  "usage_in_usermode": 1000000000
+                },
+                "system_cpu_usage": 12000000000,
+                "online_cpus": 4,
+                "throttling_data": {"periods": 10, "throttled_periods": 2, "throttled_time": 500}
+              },
+              "memory_stats": {
+                "usage": 600000000,
+                "limit": 1000000000,
+                "stats": {"total_inactive_file": 100000000}
+              },
+              "blkio_stats": {
+                "io_service_bytes_recursive": [
+                  {"major": 259, "minor": 0, "op": "read", "value": 100000000},
+                  {"major": 259, "minor": 0, "op": "write", "value": 900000000},
+                  {"major": 259, "minor": 0, "op": "read", "value": 23456789},
+                  {"major": 259, "minor": 0, "op": "write", "value": 87654321}
+                ]
+              },
+              "pids_stats": {"current": 42, "limit": 4096},
+              "networks": {
+                "eth0": {
+                  "rx_bytes": 1024,
+                  "tx_bytes": 2048,
+                  "rx_packets": 10,
+                  "tx_packets": 12,
+                  "rx_errors": 0,
+                  "tx_errors": 0,
+                  "rx_dropped": 0,
+                  "tx_dropped": 0
+                }
+              }
+            }
+          }
+        ],
+        "images": {
+          "sha256:a1b2c3d4e5f60718a1b2c3d4e5f60718a1b2c3d4e5f60718a1b2c3d4e5f60718": {
+            "tags": ["nginx:1.27"],
+            "repo_digests": ["nginx@sha256:aaaa1111bbbb2222aaaa1111bbbb2222aaaa1111bbbb2222aaaa1111bbbb2222"]
+          }
+        }
+      },
+      "payload": {
+        "containers": {
+          "1a2b3c4d5e6f70811a2b3c4d5e6f70811a2b3c4d5e6f70811a2b3c4d5e6f7081": {
+            "name": "web-1",
+            "image": "nginx:1.27",
+            "image_id": "sha256:a1b2c3d4e5f60718a1b2c3d4e5f60718a1b2c3d4e5f60718a1b2c3d4e5f60718",
+            "image_tags": ["nginx:1.27"],
+            "image_repo_digests": ["nginx@sha256:aaaa1111bbbb2222aaaa1111bbbb2222aaaa1111bbbb2222aaaa1111bbbb2222"],
+            "status": "running",
+            "exit_code": 0,
+            "oom_killed": false,
+            "restart_count": 0,
+            "started_at": "2026-07-15T09:12:33.123456789Z",
+            "finished_at": null,
+            "health": "healthy",
+            "cpu_percent": 12.5,
+            "memory_percent": 50.0,
+            "memory_usage": 500000000,
+            "memory_limit": 1000000000,
+            "pids_stats": {"current": 42, "limit": 4096},
+            "cpu_throttling": {"periods": 10, "throttled_periods": 2, "throttled_time": 500},
+            "online_cpus": 4,
+            "cpu_kernelmode_percent": 2.5,
+            "cpu_usermode_percent": 10.0,
+            "block_read_bytes": 123456789,
+            "block_write_bytes": 987654321,
+            "networks": {
+              "eth0": {
+                "rx_bytes": 1024,
+                "tx_bytes": 2048,
+                "rx_packets": 10,
+                "tx_packets": 12,
+                "rx_errors": 0,
+                "tx_errors": 0,
+                "rx_dropped": 0,
+                "tx_dropped": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    "running_no_healthcheck": {
+      "description": "Running container with NO HEALTHCHECK -> health is null (not-applicable, never a good/bad signal). Second tick, full stats. blkio uses cgroup v1 CAPITALIZED ops (Read/Write), summed case-insensitively. No networks key in the stats sample -> no networks key in the payload.",
+      "sdk": {
+        "containers": [
+          {
+            "id": "2b3c4d5e6f7081922b3c4d5e6f7081922b3c4d5e6f7081922b3c4d5e6f708192",
+            "attrs": {
+              "Name": "/cache-1",
+              "Image": "sha256:b2c3d4e5f6071829b2c3d4e5f6071829b2c3d4e5f6071829b2c3d4e5f6071829",
+              "RestartCount": 0,
+              "Config": {"Image": "redis:7"},
+              "State": {
+                "Status": "running",
+                "ExitCode": 0,
+                "OOMKilled": false,
+                "StartedAt": "2026-07-14T20:01:02.5Z",
+                "FinishedAt": "0001-01-01T00:00:00Z"
+              }
+            },
+            "previous_stats": {
+              "cpu_stats": {
+                "cpu_usage": {
+                  "total_usage": 500000000,
+                  "usage_in_kernelmode": 100000000,
+                  "usage_in_usermode": 400000000
+                },
+                "system_cpu_usage": 5000000000
+              }
+            },
+            "stats": {
+              "cpu_stats": {
+                "cpu_usage": {
+                  "total_usage": 600000000,
+                  "usage_in_kernelmode": 140000000,
+                  "usage_in_usermode": 460000000
+                },
+                "system_cpu_usage": 6000000000,
+                "online_cpus": 8,
+                "throttling_data": {"periods": 0, "throttled_periods": 0, "throttled_time": 0}
+              },
+              "memory_stats": {
+                "usage": 200000000,
+                "limit": 2000000000,
+                "stats": {}
+              },
+              "blkio_stats": {
+                "io_service_bytes_recursive": [
+                  {"major": 8, "minor": 0, "op": "Read", "value": 50000000},
+                  {"major": 8, "minor": 0, "op": "Write", "value": 150000000}
+                ]
+              },
+              "pids_stats": {"current": 10, "limit": 2048}
+            }
+          }
+        ],
+        "images": {
+          "sha256:b2c3d4e5f6071829b2c3d4e5f6071829b2c3d4e5f6071829b2c3d4e5f6071829": {
+            "tags": ["redis:7"],
+            "repo_digests": ["redis@sha256:cccc3333dddd4444cccc3333dddd4444cccc3333dddd4444cccc3333dddd4444"]
+          }
+        }
+      },
+      "payload": {
+        "containers": {
+          "2b3c4d5e6f7081922b3c4d5e6f7081922b3c4d5e6f7081922b3c4d5e6f708192": {
+            "name": "cache-1",
+            "image": "redis:7",
+            "image_id": "sha256:b2c3d4e5f6071829b2c3d4e5f6071829b2c3d4e5f6071829b2c3d4e5f6071829",
+            "image_tags": ["redis:7"],
+            "image_repo_digests": ["redis@sha256:cccc3333dddd4444cccc3333dddd4444cccc3333dddd4444cccc3333dddd4444"],
+            "status": "running",
+            "exit_code": 0,
+            "oom_killed": false,
+            "restart_count": 0,
+            "started_at": "2026-07-14T20:01:02.5Z",
+            "finished_at": null,
+            "health": null,
+            "cpu_percent": 10.0,
+            "memory_percent": 10.0,
+            "memory_usage": 200000000,
+            "memory_limit": 2000000000,
+            "pids_stats": {"current": 10, "limit": 2048},
+            "cpu_throttling": {"periods": 0, "throttled_periods": 0, "throttled_time": 0},
+            "online_cpus": 8,
+            "cpu_kernelmode_percent": 4.0,
+            "cpu_usermode_percent": 6.0,
+            "block_read_bytes": 50000000,
+            "block_write_bytes": 150000000
+          }
+        }
+      }
+    },
+    "running_first_sighting": {
+      "description": "Running container on its FIRST sighting: no previous_stats sample exists, so the CPU-delta warm-up produces NO stats keys -- the entry is state-only even though the container is running. The stats sample IS collected (to seed the next tick) but not emitted. health is 'starting' (a just-launched HEALTHCHECK), shipped in the state block. Pins mission #2: state ships from the first tick.",
+      "sdk": {
+        "containers": [
+          {
+            "id": "3c4d5e6f708192033c4d5e6f708192033c4d5e6f708192033c4d5e6f70819203",
+            "attrs": {
+              "Name": "/worker-1",
+              "Image": "sha256:c3d4e5f607182930c3d4e5f607182930c3d4e5f607182930c3d4e5f607182930",
+              "RestartCount": 0,
+              "Config": {"Image": "myapp:v2"},
+              "State": {
+                "Status": "running",
+                "ExitCode": 0,
+                "OOMKilled": false,
+                "StartedAt": "2026-07-15T10:00:00Z",
+                "FinishedAt": "0001-01-01T00:00:00Z",
+                "Health": {"Status": "starting"}
+              }
+            },
+            "stats": {
+              "cpu_stats": {
+                "cpu_usage": {
+                  "total_usage": 300000000,
+                  "usage_in_kernelmode": 60000000,
+                  "usage_in_usermode": 240000000
+                },
+                "system_cpu_usage": 3000000000,
+                "online_cpus": 4,
+                "throttling_data": {"periods": 0, "throttled_periods": 0, "throttled_time": 0}
+              },
+              "memory_stats": {"usage": 100000000, "limit": 1000000000, "stats": {}},
+              "blkio_stats": {"io_service_bytes_recursive": []},
+              "pids_stats": {"current": 5, "limit": 4096}
+            }
+          }
+        ],
+        "images": {
+          "sha256:c3d4e5f607182930c3d4e5f607182930c3d4e5f607182930c3d4e5f607182930": {
+            "tags": ["myapp:v2"],
+            "repo_digests": []
+          }
+        }
+      },
+      "payload": {
+        "containers": {
+          "3c4d5e6f708192033c4d5e6f708192033c4d5e6f708192033c4d5e6f70819203": {
+            "name": "worker-1",
+            "image": "myapp:v2",
+            "image_id": "sha256:c3d4e5f607182930c3d4e5f607182930c3d4e5f607182930c3d4e5f607182930",
+            "image_tags": ["myapp:v2"],
+            "image_repo_digests": [],
+            "status": "running",
+            "exit_code": 0,
+            "oom_killed": false,
+            "restart_count": 0,
+            "started_at": "2026-07-15T10:00:00Z",
+            "finished_at": null,
+            "health": "starting"
+          }
+        }
+      }
+    },
+    "exited_oom": {
+      "description": "Exited container killed by the OOM killer: status exited, exit_code 137, oom_killed true, finished_at set. Never running this tick -> no stats collected (no stats keys). The bread and butter of the 'container died' alert.",
+      "sdk": {
+        "containers": [
+          {
+            "id": "4d5e6f70819203044d5e6f70819203044d5e6f70819203044d5e6f7081920304",
+            "attrs": {
+              "Name": "/batch-1",
+              "Image": "sha256:d4e5f60718293041d4e5f60718293041d4e5f60718293041d4e5f60718293041",
+              "RestartCount": 0,
+              "Config": {"Image": "busybox:latest"},
+              "State": {
+                "Status": "exited",
+                "ExitCode": 137,
+                "OOMKilled": true,
+                "StartedAt": "2026-07-15T08:00:00Z",
+                "FinishedAt": "2026-07-15T08:05:00Z"
+              }
+            }
+          }
+        ],
+        "images": {
+          "sha256:d4e5f60718293041d4e5f60718293041d4e5f60718293041d4e5f60718293041": {
+            "tags": ["busybox:latest"],
+            "repo_digests": ["busybox@sha256:eeee5555ffff6666eeee5555ffff6666eeee5555ffff6666eeee5555ffff6666"]
+          }
+        }
+      },
+      "payload": {
+        "containers": {
+          "4d5e6f70819203044d5e6f70819203044d5e6f70819203044d5e6f7081920304": {
+            "name": "batch-1",
+            "image": "busybox:latest",
+            "image_id": "sha256:d4e5f60718293041d4e5f60718293041d4e5f60718293041d4e5f60718293041",
+            "image_tags": ["busybox:latest"],
+            "image_repo_digests": ["busybox@sha256:eeee5555ffff6666eeee5555ffff6666eeee5555ffff6666eeee5555ffff6666"],
+            "status": "exited",
+            "exit_code": 137,
+            "oom_killed": true,
+            "restart_count": 0,
+            "started_at": "2026-07-15T08:00:00Z",
+            "finished_at": "2026-07-15T08:05:00Z",
+            "health": null
+          }
+        }
+      }
+    },
+    "exited_clean": {
+      "description": "Exited container with a clean exit_code 0 (a completed one-shot job). oom_killed false, finished_at set, no stats keys.",
+      "sdk": {
+        "containers": [
+          {
+            "id": "5e6f7081920304155e6f7081920304155e6f7081920304155e6f708192030415",
+            "attrs": {
+              "Name": "/job-1",
+              "Image": "sha256:e5f60718293041aae5f60718293041aae5f60718293041aae5f60718293041aa",
+              "RestartCount": 0,
+              "Config": {"Image": "alpine:3.20"},
+              "State": {
+                "Status": "exited",
+                "ExitCode": 0,
+                "OOMKilled": false,
+                "StartedAt": "2026-07-15T07:00:00Z",
+                "FinishedAt": "2026-07-15T07:00:30Z"
+              }
+            }
+          }
+        ],
+        "images": {
+          "sha256:e5f60718293041aae5f60718293041aae5f60718293041aae5f60718293041aa": {
+            "tags": ["alpine:3.20"],
+            "repo_digests": ["alpine@sha256:1111aaaa2222bbbb1111aaaa2222bbbb1111aaaa2222bbbb1111aaaa2222bbbb"]
+          }
+        }
+      },
+      "payload": {
+        "containers": {
+          "5e6f7081920304155e6f7081920304155e6f7081920304155e6f708192030415": {
+            "name": "job-1",
+            "image": "alpine:3.20",
+            "image_id": "sha256:e5f60718293041aae5f60718293041aae5f60718293041aae5f60718293041aa",
+            "image_tags": ["alpine:3.20"],
+            "image_repo_digests": ["alpine@sha256:1111aaaa2222bbbb1111aaaa2222bbbb1111aaaa2222bbbb1111aaaa2222bbbb"],
+            "status": "exited",
+            "exit_code": 0,
+            "oom_killed": false,
+            "restart_count": 0,
+            "started_at": "2026-07-15T07:00:00Z",
+            "finished_at": "2026-07-15T07:00:30Z",
+            "health": null
+          }
+        }
+      }
+    },
+    "restart_looping": {
+      "description": "Restart-looping container: status restarting, restart_count 5 (the daemon's restart policy has restarted it 5 times). The agent ships the raw RestartCount; the server's restart-loop trigger watches increments within a window. A restarting container's stats are frozen/unstable -> state-only, no stats keys.",
+      "sdk": {
+        "containers": [
+          {
+            "id": "6f708192030415266f708192030415266f708192030415266f70819203041526",
+            "attrs": {
+              "Name": "/flaky-1",
+              "Image": "sha256:f6071829304152bbf6071829304152bbf6071829304152bbf6071829304152bb",
+              "RestartCount": 5,
+              "Config": {"Image": "myservice:latest"},
+              "State": {
+                "Status": "restarting",
+                "ExitCode": 1,
+                "OOMKilled": false,
+                "StartedAt": "2026-07-15T09:00:00Z",
+                "FinishedAt": "2026-07-15T09:01:00Z"
+              }
+            }
+          }
+        ],
+        "images": {
+          "sha256:f6071829304152bbf6071829304152bbf6071829304152bbf6071829304152bb": {
+            "tags": ["myservice:latest"],
+            "repo_digests": []
+          }
+        }
+      },
+      "payload": {
+        "containers": {
+          "6f708192030415266f708192030415266f708192030415266f70819203041526": {
+            "name": "flaky-1",
+            "image": "myservice:latest",
+            "image_id": "sha256:f6071829304152bbf6071829304152bbf6071829304152bbf6071829304152bb",
+            "image_tags": ["myservice:latest"],
+            "image_repo_digests": [],
+            "status": "restarting",
+            "exit_code": 1,
+            "oom_killed": false,
+            "restart_count": 5,
+            "started_at": "2026-07-15T09:00:00Z",
+            "finished_at": "2026-07-15T09:01:00Z",
+            "health": null
+          }
+        }
+      }
+    },
+    "unhealthy": {
+      "description": "Running container whose HEALTHCHECK reports unhealthy -- the docker_container_status trigger's primary target. Full stats (second tick). Config.Image ('api:v3') is the tag as written while the image object carries an extra tag ('api:latest'): pins that 'image' comes from Config.Image and 'image_tags' independently from the image object, and that image_repo_digests may be [].",
+      "sdk": {
+        "containers": [
+          {
+            "id": "708192030415263a708192030415263a708192030415263a708192030415263a",
+            "attrs": {
+              "Name": "/api-1",
+              "Image": "sha256:0718293041526374071829304152637407182930415263740718293041526374",
+              "RestartCount": 2,
+              "Config": {"Image": "api:v3"},
+              "State": {
+                "Status": "running",
+                "ExitCode": 0,
+                "OOMKilled": false,
+                "StartedAt": "2026-07-15T06:30:00Z",
+                "FinishedAt": "0001-01-01T00:00:00Z",
+                "Health": {"Status": "unhealthy"}
+              }
+            },
+            "previous_stats": {
+              "cpu_stats": {
+                "cpu_usage": {
+                  "total_usage": 2000000000,
+                  "usage_in_kernelmode": 400000000,
+                  "usage_in_usermode": 1600000000
+                },
+                "system_cpu_usage": 20000000000
+              }
+            },
+            "stats": {
+              "cpu_stats": {
+                "cpu_usage": {
+                  "total_usage": 2400000000,
+                  "usage_in_kernelmode": 480000000,
+                  "usage_in_usermode": 1920000000
+                },
+                "system_cpu_usage": 24000000000,
+                "online_cpus": 4,
+                "throttling_data": {"periods": 3, "throttled_periods": 1, "throttled_time": 250}
+              },
+              "memory_stats": {"usage": 800000000, "limit": 1000000000, "stats": {}},
+              "blkio_stats": {
+                "io_service_bytes_recursive": [
+                  {"major": 259, "minor": 0, "op": "read", "value": 5000000},
+                  {"major": 259, "minor": 0, "op": "write", "value": 10000000}
+                ]
+              },
+              "pids_stats": {"current": 25, "limit": 4096},
+              "networks": {"eth0": {"rx_bytes": 500, "tx_bytes": 600}}
+            }
+          }
+        ],
+        "images": {
+          "sha256:0718293041526374071829304152637407182930415263740718293041526374": {
+            "tags": ["api:v3", "api:latest"],
+            "repo_digests": []
+          }
+        }
+      },
+      "payload": {
+        "containers": {
+          "708192030415263a708192030415263a708192030415263a708192030415263a": {
+            "name": "api-1",
+            "image": "api:v3",
+            "image_id": "sha256:0718293041526374071829304152637407182930415263740718293041526374",
+            "image_tags": ["api:v3", "api:latest"],
+            "image_repo_digests": [],
+            "status": "running",
+            "exit_code": 0,
+            "oom_killed": false,
+            "restart_count": 2,
+            "started_at": "2026-07-15T06:30:00Z",
+            "finished_at": null,
+            "health": "unhealthy",
+            "cpu_percent": 10.0,
+            "memory_percent": 80.0,
+            "memory_usage": 800000000,
+            "memory_limit": 1000000000,
+            "pids_stats": {"current": 25, "limit": 4096},
+            "cpu_throttling": {"periods": 3, "throttled_periods": 1, "throttled_time": 250},
+            "online_cpus": 4,
+            "cpu_kernelmode_percent": 2.0,
+            "cpu_usermode_percent": 8.0,
+            "block_read_bytes": 5000000,
+            "block_write_bytes": 10000000,
+            "networks": {"eth0": {"rx_bytes": 500, "tx_bytes": 600}}
+          }
+        }
+      }
+    },
+    "paused": {
+      "description": "Paused container: status paused, started_at set (it ran before being paused), finished_at null, no HEALTHCHECK. A paused container's stats are frozen -> state-only, no stats keys.",
+      "sdk": {
+        "containers": [
+          {
+            "id": "8192030415263a4b8192030415263a4b8192030415263a4b8192030415263a4b",
+            "attrs": {
+              "Name": "/frozen-1",
+              "Image": "sha256:1829304152637485182930415263748518293041526374851829304152637485",
+              "RestartCount": 0,
+              "Config": {"Image": "postgres:16"},
+              "State": {
+                "Status": "paused",
+                "ExitCode": 0,
+                "OOMKilled": false,
+                "StartedAt": "2026-07-15T05:00:00Z",
+                "FinishedAt": "0001-01-01T00:00:00Z"
+              }
+            }
+          }
+        ],
+        "images": {
+          "sha256:1829304152637485182930415263748518293041526374851829304152637485": {
+            "tags": ["postgres:16"],
+            "repo_digests": ["postgres@sha256:3333cccc4444dddd3333cccc4444dddd3333cccc4444dddd3333cccc4444dddd"]
+          }
+        }
+      },
+      "payload": {
+        "containers": {
+          "8192030415263a4b8192030415263a4b8192030415263a4b8192030415263a4b": {
+            "name": "frozen-1",
+            "image": "postgres:16",
+            "image_id": "sha256:1829304152637485182930415263748518293041526374851829304152637485",
+            "image_tags": ["postgres:16"],
+            "image_repo_digests": ["postgres@sha256:3333cccc4444dddd3333cccc4444dddd3333cccc4444dddd3333cccc4444dddd"],
+            "status": "paused",
+            "exit_code": 0,
+            "oom_killed": false,
+            "restart_count": 0,
+            "started_at": "2026-07-15T05:00:00Z",
+            "finished_at": null,
+            "health": null
+          }
+        }
+      }
+    },
+    "created_never_started": {
+      "description": "Created-but-never-started container: status created, BOTH timestamps are the Go zero value (0001-01-01T00:00:00Z) -> normalized to null. No stats keys.",
+      "sdk": {
+        "containers": [
+          {
+            "id": "92030415263a4b5c92030415263a4b5c92030415263a4b5c92030415263a4b5c",
+            "attrs": {
+              "Name": "/pending-1",
+              "Image": "sha256:a1b2c3d4e5f60718a1b2c3d4e5f60718a1b2c3d4e5f60718a1b2c3d4e5f60718",
+              "RestartCount": 0,
+              "Config": {"Image": "nginx:1.27"},
+              "State": {
+                "Status": "created",
+                "ExitCode": 0,
+                "OOMKilled": false,
+                "StartedAt": "0001-01-01T00:00:00Z",
+                "FinishedAt": "0001-01-01T00:00:00Z"
+              }
+            }
+          }
+        ],
+        "images": {
+          "sha256:a1b2c3d4e5f60718a1b2c3d4e5f60718a1b2c3d4e5f60718a1b2c3d4e5f60718": {
+            "tags": ["nginx:1.27"],
+            "repo_digests": ["nginx@sha256:aaaa1111bbbb2222aaaa1111bbbb2222aaaa1111bbbb2222aaaa1111bbbb2222"]
+          }
+        }
+      },
+      "payload": {
+        "containers": {
+          "92030415263a4b5c92030415263a4b5c92030415263a4b5c92030415263a4b5c": {
+            "name": "pending-1",
+            "image": "nginx:1.27",
+            "image_id": "sha256:a1b2c3d4e5f60718a1b2c3d4e5f60718a1b2c3d4e5f60718a1b2c3d4e5f60718",
+            "image_tags": ["nginx:1.27"],
+            "image_repo_digests": ["nginx@sha256:aaaa1111bbbb2222aaaa1111bbbb2222aaaa1111bbbb2222aaaa1111bbbb2222"],
+            "status": "created",
+            "exit_code": 0,
+            "oom_killed": false,
+            "restart_count": 0,
+            "started_at": null,
+            "finished_at": null,
+            "health": null
+          }
+        }
+      }
+    },
+    "zero_containers": {
+      "description": "Genuinely zero containers on the host: the list succeeds and is empty. Emits {'containers': {}} -- distinct from a collection failure (null). The server MAY prune every row for the host on this prune-safe payload.",
+      "sdk": {"containers": [], "images": {}},
+      "payload": {"containers": {}}
+    },
+    "daemon_unreachable": {
+      "description": "Docker daemon unreachable (socket refused / daemon down): get_docker_client returns None, so docker_metrics returns None -> data['docker'] is null. The server must NEVER prune on this (a daemon hiccup is not 'all containers removed'). This is the behavior change from the pre-1.11.0 collector, which returned {'containers': {}} on failure -- indistinguishable from a genuinely empty host.",
+      "sdk": {"connect_error": true},
+      "payload": null
+    }
+  }
+}

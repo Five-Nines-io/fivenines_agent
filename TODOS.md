@@ -168,6 +168,23 @@ collection rather than the per-tick loop.
 - **Depends on:** product signal that boot-time analysis matters to customers
 - **Files:** `fivenines_agent/systemd.py` (one-shot collection), `fivenines_agent/agent.py` (static data), tests
 
+## P3: Docker events API for short-lived container capture
+
+The container-state collector (server #492) polls `containers.list(all=True)` once
+per tick, so a container that starts and exits (or is `--rm`'d) entirely between
+two ticks is never observed -- its death, exit code, and OOM status are invisible.
+The 10x version subscribes to the Docker events stream (`client.events()`) and
+records terminal transitions as they happen, eliminating the polling blind spot.
+Deferred from the initial ship because an events subscription is a persistent
+connection with its own lifecycle/reconnect handling (a different shape from the
+per-tick poll loop) and the poll already covers every container that lives at
+least one interval -- the common case. Documented as a known limitation in the
+`docker.py` module docstring.
+
+- **Effort:** L (human) / M (CC)
+- **Depends on:** container-state collector shipped (done, 1.11.0)
+- **Files:** new events-stream path in `fivenines_agent/docker.py` (or a sibling), `fivenines_agent/agent.py` (subscription lifecycle), tests
+
 ## P3: OOM detection journal-parse fallback for cgroup v1
 
 The systemd module ships OOM kill detection via cgroup v2 `memory.events`.
