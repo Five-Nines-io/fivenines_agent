@@ -14,6 +14,7 @@ from fivenines_agent.gpu import gpu_metrics
 from fivenines_agent.io import io
 from fivenines_agent.logs import collect_log_signals
 from fivenines_agent.memory import memory, swap
+from fivenines_agent.mysql import mysql_metrics
 from fivenines_agent.network import network
 from fivenines_agent.nginx import nginx_metrics
 from fivenines_agent.partitions import partitions_metadata, partitions_usage
@@ -88,6 +89,7 @@ COLLECTORS = [
     ("fail2ban", [("fail2ban", fail2ban_metrics, False)]),
     ("caddy", [("caddy", caddy_metrics, True)]),
     ("postgresql", [("postgresql", postgresql_metrics, True)]),
+    ("mysql", [("mysql", mysql_metrics, True)]),
     ("proxmox", [("proxmox", proxmox_metrics, True)]),
     ("systemd", [("systemd", systemd_metrics, True)]),
     # Windows-only: gated by the disk_health capability, only present in the

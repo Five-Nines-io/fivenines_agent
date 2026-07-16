@@ -35,6 +35,7 @@ def test_registry_has_expected_config_keys():
         "fail2ban",
         "caddy",
         "postgresql",
+        "mysql",
         "proxmox",
         "systemd",
         "disk_health",
