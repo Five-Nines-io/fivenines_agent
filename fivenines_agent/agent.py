@@ -86,6 +86,9 @@ _DRY_RUN_CONFIG = {
     "smart_storage_health": True,
     "raid_storage_health": True,
     "ceph": {"clusters": [{"name": "ceph"}]},
+    # Host-level collector (generic zpool, no external config); True uses the
+    # default poll interval. Gated on the "zfs" capability like smart/raid.
+    "zfs": True,
     "redis": {"port": 6379},
     "fail2ban": True,
     "disk_health": True,
