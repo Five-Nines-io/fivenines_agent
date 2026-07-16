@@ -10,6 +10,13 @@ from fivenines_agent.subprocess_utils import get_clean_env
 # collectors.py unpacks as kwargs: {"interval": N} -> zfs_storage_health(interval=N).
 _DEFAULT_INTERVAL = 60
 
+# Hard subprocess timeout (seconds). A wedged `zpool` call -- SUSPENDED pool,
+# dying controller, kernel stuck on I/O, the exact states this collector exists
+# to report -- must never hang the whole collect tick. zpool reads kernel state
+# and answers in milliseconds when healthy, so 10s is generous. Mirrors
+# ceph.py's SUBPROCESS_TIMEOUT posture.
+_SUBPROCESS_TIMEOUT = 10
+
 _zfs_cache = {
     "timestamp": 0,
     "data": [],
@@ -54,14 +61,26 @@ def zfs_available() -> bool:
 
 
 def _run(cmd):
-    return subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-        env=get_clean_env(),
-    )
+    """Run a zpool command, bounded by _SUBPROCESS_TIMEOUT.
+
+    A timeout is returned as a synthetic failed result (returncode 1, empty
+    stdout, stderr "timeout") so it is indistinguishable from any other command
+    failure. Every existing failure path then applies unchanged: the
+    -pPLv -> -PLv retry, the list-only degrade, the pool skip, and the
+    collector returning [].
+    """
+    try:
+        return subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            timeout=_SUBPROCESS_TIMEOUT,
+            env=get_clean_env(),
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="timeout")
 
 
 def get_zfs_version():
@@ -74,10 +93,16 @@ def get_zfs_version():
 
 
 def list_zfs_pools():
-    """List all ZFS pool names."""
+    """List ZFS pool names, or None if the `zpool list` command failed.
+
+    None (command failure/timeout) is deliberately distinct from [] (command
+    succeeded, host has zero pools): the collector maps the former to a null
+    payload (collection failure) and the latter to an empty list, so the server
+    never mistakes a transient CLI failure for "all pools destroyed".
+    """
     r = _run(["zpool", "list", "-H", "-o", "name"])
     if r.returncode != 0:
-        return []
+        return None
     return [ln.strip() for ln in r.stdout.splitlines() if ln.strip()]
 
 
@@ -390,8 +415,19 @@ def get_zfs_pool_info(pool_name):
 def zfs_storage_health(interval=_DEFAULT_INTERVAL):
     """Collect health for all ZFS pools.
 
-    Throttled to at most once per `interval` seconds (default 60); the agent's
-    global tick can be shorter than a zpool poll is worth.
+    Returns one of three outcomes, cached for `interval` seconds (default 60):
+
+    - ``None`` -- COLLECTION FAILURE: the `zpool` binary vanished mid-run, the
+      pool listing failed/timed out, or pools exist but every per-pool read
+      failed. Surfaced as ``data["zfs"] = null`` so the server never mistakes a
+      transient CLI failure for "all pools destroyed" and prunes health rows
+      (same null-vs-empty discipline as the docker contract).
+    - ``[]`` -- the listing succeeded and the host genuinely has zero pools
+      (safe for the server to prune).
+    - a non-empty list of per-pool health objects.
+
+    The outcome (including ``None``) is cached like any other, so a failure does
+    not turn into a per-tick re-probe storm.
     """
     now = time.time()
 
@@ -402,22 +438,37 @@ def zfs_storage_health(interval=_DEFAULT_INTERVAL):
     if now - _zfs_cache["timestamp"] < ttl:
         return _zfs_cache["data"]
 
-    if not zfs_available():
-        log("ZFS not available", "debug")
-        data = []
-    else:
-        zfs_version = get_zfs_version()
-        pools = list_zfs_pools()
-        if not pools:
-            log("No ZFS pools found", "debug")
-            data = []
-        else:
-            data = [get_zfs_pool_info(pool) for pool in pools]
-            data = [d for d in data if d is not None]
-            for pool_info in data:
-                pool_info["zfs_version"] = zfs_version
+    data = _collect_zfs_pools()
 
     _zfs_cache["timestamp"] = now
     _zfs_cache["data"] = data
 
     return data
+
+
+def _collect_zfs_pools():
+    """Collect all pools, or None on any collection failure. See caller."""
+    if not zfs_available():
+        # zpool binary gone mid-run -> collection failure, not "no pools".
+        log("ZFS not available", "debug")
+        return None
+
+    pools = list_zfs_pools()
+    if pools is None:
+        log("ZFS pool listing failed", "debug")
+        return None
+    if not pools:
+        # Listing succeeded, host genuinely has zero pools.
+        return []
+
+    zfs_version = get_zfs_version()
+    infos = [get_zfs_pool_info(pool) for pool in pools]
+    infos = [d for d in infos if d is not None]
+    if not infos:
+        # Pools exist but not one could be read -> collection failure.
+        log("ZFS pools present but all reads failed", "debug")
+        return None
+
+    for pool_info in infos:
+        pool_info["zfs_version"] = zfs_version
+    return infos

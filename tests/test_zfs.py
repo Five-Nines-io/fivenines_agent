@@ -78,6 +78,22 @@ def test_run_passes_through_to_subprocess(monkeypatch):
     assert proc.stdout == "ok"
     assert captured["cmd"] == ["zpool", "version"]
     assert captured["kwargs"]["check"] is False
+    assert captured["kwargs"]["timeout"] == zfs._SUBPROCESS_TIMEOUT
+
+
+def test_run_timeout_returns_synthetic_failure(monkeypatch):
+    """A hung zpool must not hang the tick. TimeoutExpired is caught in _run and
+    returned as a failed result -- indistinguishable from a failed command, so
+    every downstream failure path applies unchanged. No exception escapes."""
+
+    def boom(cmd, **kwargs):
+        raise zfs.subprocess.TimeoutExpired(cmd, zfs._SUBPROCESS_TIMEOUT)
+
+    monkeypatch.setattr(zfs.subprocess, "run", boom)
+    proc = zfs._run(["zpool", "status", "-pPLv", "rpool"])
+    assert proc.returncode != 0
+    assert proc.stdout == ""
+    assert "timeout" in proc.stderr
 
 
 def _contract_run(cmd):
@@ -115,22 +131,37 @@ def test_contract_fixture_round_trip(monkeypatch):
     """SHARED FIXTURE (cross-repo contract): fixtures/zfs_contract_payload.json.
 
     The same file is asserted on both sides:
-    - here: zfs_storage_health(**fixture["config"]) must equal fixture["payload"]
-      with only zfs._run and shutil.which mocked (canned CLI above), pinning the
+    - here: zfs_storage_health(**config) must equal the scenario payload with
+      only zfs._run and shutil.which mocked (canned CLI above), pinning the
       whole probe -> parse -> payload pipeline;
-    - fivenines-server: its ZFS ingester posts fixture["payload"] under data["zfs"].
+    - fivenines-server: its ZFS ingester posts the payload under data["zfs"].
 
     Change the payload shape only in lockstep with the server spec and its copy.
     """
     with open(_FIXTURE_PATH) as f:
         fixture = json.load(f)
+    scenario = fixture["scenarios"]["healthy_and_degraded"]
 
     monkeypatch.setattr(zfs.shutil, "which", lambda _: "/usr/sbin/zpool")
     monkeypatch.setattr(zfs, "_run", _contract_run)
 
-    out = zfs.zfs_storage_health(**fixture["config"])
+    out = zfs.zfs_storage_health(**scenario["config"])
 
-    assert out == fixture["payload"]
+    assert out == scenario["payload"]
+
+
+def test_contract_fixture_null_scenario(monkeypatch):
+    """The collection-failure scenario pins data["zfs"] = null: a real listing
+    failure must produce exactly None (the server keys off this to NOT prune)."""
+    with open(_FIXTURE_PATH) as f:
+        fixture = json.load(f)
+    scenario = fixture["scenarios"]["collection_failure"]
+    assert scenario["payload"] is None  # the pinned contract value
+
+    monkeypatch.setattr(zfs.shutil, "which", lambda _: "/usr/sbin/zpool")
+    monkeypatch.setattr(zfs, "_run", lambda cmd: FakeProc(1, "", "boom"))
+
+    assert zfs.zfs_storage_health(**scenario["config"]) is None
 
 
 def test_contract_health_code_mapping_matches_fixture():
@@ -186,7 +217,14 @@ def test_list_zfs_pools_ok(monkeypatch):
 
 
 def test_list_zfs_pools_failure(monkeypatch):
-    monkeypatch.setattr(zfs, "_run", lambda cmd: FakeProc(2, "", "no pools"))
+    """Command failure -> None (distinct from [] = zero pools)."""
+    monkeypatch.setattr(zfs, "_run", lambda cmd: FakeProc(2, "", "boom"))
+    assert zfs.list_zfs_pools() is None
+
+
+def test_list_zfs_pools_empty(monkeypatch):
+    """Command succeeded, zero pools -> [] (distinct from None = failure)."""
+    monkeypatch.setattr(zfs, "_run", lambda cmd: FakeProc(0, ""))
     assert zfs.list_zfs_pools() == []
 
 
@@ -276,6 +314,30 @@ def test_count_degraded_vdevs_ignores_spares_and_states():
         ]
     }
     assert zfs._count_degraded_vdevs(tree) == 1
+
+
+def test_count_degraded_vdevs_reaches_section_devices_via_parser():
+    """Pin the parser invariant _count_degraded_vdevs' docstring relies on: a
+    FAULTED device in a SECTION (logs) is reachable through 'children' by the
+    walk. Exercises the real parser, not a hand-built tree, and confirms the
+    device is counted exactly once despite also living in tree['logs']."""
+    text = (
+        "  pool: tank\n"
+        " state: DEGRADED\n"
+        "  scan: none requested\n"
+        "config:\n"
+        "\n"
+        "\tNAME        STATE     READ WRITE CKSUM\n"
+        "\ttank        DEGRADED     0     0     0\n"
+        "\t  sda       ONLINE       0     0     0\n"
+        "\tlogs\n"
+        "\t  sdb       FAULTED      0     0     0\n"
+        "\n"
+        "errors: No known data errors\n"
+    )
+    tree = zfs._parse_zpool_status(text)["tank"]["vdev_tree"]
+    assert [d["name"] for d in tree["logs"]] == ["sdb"]  # in the section list...
+    assert zfs._count_degraded_vdevs(tree) == 1  # ...and counted once via children
 
 
 # ---------------------------------------------------------------------------
@@ -559,6 +621,36 @@ def test_get_zfs_pool_info_exception_returns_none(monkeypatch):
     assert zfs.get_zfs_pool_info("rpool") is None
 
 
+def test_get_zfs_pool_info_status_timeout_degrades_to_list(monkeypatch):
+    """A hung `zpool status` (both -pPLv and -PLv) is caught in _run as a
+    failure, so the pool degrades to list-only health -- same outcome as
+    test_get_zfs_pool_info_status_fails_but_in_summary, reached via a real
+    timeout rather than a non-zero return code."""
+
+    def run(cmd, **kwargs):
+        if "status" in cmd:
+            raise zfs.subprocess.TimeoutExpired(cmd, zfs._SUBPROCESS_TIMEOUT)
+        return FakeProc(0, LIST_SUMMARY_OUT)  # `zpool list -Hp` still answers
+
+    monkeypatch.setattr(zfs.subprocess, "run", run)
+    info = zfs.get_zfs_pool_info("rpool")
+    assert info["health"] == "ONLINE"
+    assert info["degraded_vdevs"] is None
+    assert info["resilver_progress"] is None
+    assert info["vdev_tree"] is None
+
+
+def test_get_zfs_pool_info_all_timeout_returns_none(monkeypatch):
+    """Both `zpool status` and `zpool list` hang -> no health anywhere -> None,
+    and no exception escapes."""
+
+    def run(cmd, **kwargs):
+        raise zfs.subprocess.TimeoutExpired(cmd, zfs._SUBPROCESS_TIMEOUT)
+
+    monkeypatch.setattr(zfs.subprocess, "run", run)
+    assert zfs.get_zfs_pool_info("rpool") is None
+
+
 # ---------------------------------------------------------------------------
 # zfs_storage_health
 # ---------------------------------------------------------------------------
@@ -586,21 +678,46 @@ def test_storage_health_cache_hit(monkeypatch):
     assert zfs.zfs_storage_health(interval=60) is sentinel
 
 
-def test_storage_health_not_available(monkeypatch):
+def test_storage_health_not_available_returns_none(monkeypatch):
+    """zpool binary gone mid-run -> collection failure -> None (NOT [], which
+    the server would read as 'zero pools' and prune health rows on)."""
     monkeypatch.setattr(zfs.shutil, "which", lambda _: None)
-    assert zfs.zfs_storage_health() == []
+    assert zfs.zfs_storage_health() is None
 
 
-def test_storage_health_no_pools(monkeypatch):
+def test_storage_health_no_pools_returns_empty(monkeypatch):
+    """Listing succeeded with genuinely zero pools -> [] (safe to prune)."""
     monkeypatch.setattr(zfs.shutil, "which", lambda _: "/usr/sbin/zpool")
 
     def run(cmd):
         if "version" in cmd:
             return FakeProc(0, VERSION_OUT)
-        return FakeProc(0, "")  # no pools listed
+        return FakeProc(0, "")  # `zpool list` succeeds, reports zero pools
 
     monkeypatch.setattr(zfs, "_run", run)
     assert zfs.zfs_storage_health() == []
+
+
+def test_storage_health_list_failure_returns_none(monkeypatch):
+    """`zpool list` itself fails -> collection failure -> None, not []."""
+    monkeypatch.setattr(zfs.shutil, "which", lambda _: "/usr/sbin/zpool")
+    monkeypatch.setattr(zfs, "_run", lambda cmd: FakeProc(1, "", "boom"))
+    assert zfs.zfs_storage_health() is None
+
+
+def test_storage_health_all_pools_timeout_returns_none(monkeypatch):
+    """Pool list answers, but every per-pool call hangs -> all reads None ->
+    collection failure -> None (we KNOW pools exist, we just couldn't read
+    them). A wedged host never hangs the tick and never falsely prunes."""
+    monkeypatch.setattr(zfs.shutil, "which", lambda _: "/usr/sbin/zpool")
+
+    def run(cmd, **kwargs):
+        if "-H" in cmd:  # `zpool list -H -o name` (pool names) answers
+            return FakeProc(0, POOL_NAMES_OUT)
+        raise zfs.subprocess.TimeoutExpired(cmd, zfs._SUBPROCESS_TIMEOUT)
+
+    monkeypatch.setattr(zfs.subprocess, "run", run)
+    assert zfs.zfs_storage_health() is None
 
 
 def test_storage_health_filters_none_pool_info(monkeypatch):

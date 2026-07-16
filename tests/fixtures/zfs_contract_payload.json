@@ -1,6 +1,7 @@
 {
-  "description": "Shared ZFS contract fixture between fivenines-agent and fivenines-server. Source of truth: fivenines-agent tests/fixtures/zfs_contract_payload.json, asserted end-to-end by tests/test_zfs.py::test_contract_fixture_round_trip (only zfs._run and shutil.which are mocked with the canned zpool CLI output below). 'config' is the shape config['zfs'] takes (True, or {'interval': N}); 'payload' is the artifact the agent emits under data['zfs'] -- a list of per-pool health objects the server's ZFS ingester must parse. The collector is GENERIC (host-local zpool), not Proxmox-scoped: the server joins these pools to proxmox_storages where storage_type='zfs' on (host, pool name). Change the payload shape only in lockstep with the server spec and its fixture copy.",
+  "description": "Shared ZFS contract fixture between fivenines-agent and fivenines-server. Source of truth: fivenines-agent tests/fixtures/zfs_contract_payload.json, asserted end-to-end by tests/test_zfs.py::test_contract_fixture_round_trip (only zfs._run and shutil.which are mocked with the canned zpool CLI below). Each scenario's 'config' is the shape config['zfs'] takes (True, or {'interval': N}); 'payload' is the artifact the agent emits under data['zfs']. The collector is GENERIC (host-local zpool), not Proxmox-scoped: the server treats each pool as a HOST-SCOPED entity keyed (host, pool name). Proxmox correlation is a possible LATER enrichment, NOT part of this contract and NOT a simple join on proxmox_storages.name -- that column is the PVE storage ID (e.g. 'local-zfs'), not the zpool name (e.g. 'rpool'); a stock PVE install has storage 'local-zfs' -> dataset 'rpool/data' while zpool list reports 'rpool', so the names never match. Mapping would require collecting the PVE storage's 'pool' property, which neither side does today. See 'null_contract' for the null-vs-empty pruning rule. Change the payload shape only in lockstep with the server spec and its byte-identical fixture copy.",
   "agent_min_version": "1.11.3",
+  "null_contract": "data['zfs'] is one of THREE outcomes and the server MUST branch on them: (a) null (JSON null / Python None) = COLLECTION FAILURE -- `zpool list` failed or timed out, the zpool binary vanished mid-run, or pools exist but every per-pool read failed. The server MUST NOT prune zfs_pools rows or auto-resolve zfs_pool_health incidents on null: a transient CLI failure is not 'all pools destroyed', and treating it as recovery is a false-recovery bug on a monitoring product. (b) [] (empty array) = the listing succeeded and the host genuinely has ZERO pools -- safe to prune. (c) a non-empty array of per-pool objects = the live set. Same null-vs-empty discipline as the docker contract (data['docker'] = null = collection failure). The agent caches the null outcome under the poll interval like any other, so a failure does not become a per-tick re-probe storm.",
   "health_code_contract": {
     "_note": "Stable, append-only mapping of the zpool health string to payload.health_code. Never renumber. Unrecognized states -> null, with the raw 'health' string preserved so the backend can still react.",
     "0": "ONLINE",
@@ -15,106 +16,112 @@
   "field_contract": {
     "health": "raw zpool list health string, preserved verbatim.",
     "health_code": "health mapped via health_code_contract; null if unrecognized.",
-    "degraded_vdevs": "count of devices/vdevs below the pool root whose state is DEGRADED/FAULTED/OFFLINE/REMOVED/UNAVAIL. null when zpool status was unavailable.",
-    "resilver_progress": "percent 0-100 of an in-progress resilver; 0.0 when not resilvering; null when zpool status was unavailable.",
+    "degraded_vdevs": "count of devices/vdevs below the pool root whose state is DEGRADED/FAULTED/OFFLINE/REMOVED/UNAVAIL. null when zpool status was unavailable. SHARP EDGE: counts EVERY unhealthy node in the tree -- intermediate vdevs AND leaves (one FAULTED disk in a mirror = 2: the DEGRADED mirror + the FAULTED leaf, as in the 'tank' scenario). Use it for >0 alerting; do NOT render it as 'N disks failed'.",
+    "resilver_progress": "percent 0-100 of an in-progress resilver; 0.0 when not resilvering; null when zpool status was unavailable. SHARP EDGE: 0.0 means BOTH 'not resilvering' AND 'resilver just started, no % done printed yet'. Detect that a resilver is HAPPENING from health/scan state, never from progress > 0.",
     "scrub_errors": "error count from the LAST COMPLETED scrub ('...with N errors'); null when the last scan was not a completed scrub (never scrubbed, resilver in progress, or status unavailable) -- distinguishes clean (0) from unknown (null). Distinct from 'errors' (current known data errors).",
-    "fragmentation": "pool fragmentation percent (mirror of summary.frag_percent, surfaced top-level for the backend join).",
+    "fragmentation": "pool fragmentation percent (mirror of summary.frag_percent, surfaced top-level for convenience).",
     "summary": "capacity block from 'zpool list -Hp': byte totals, frag/capacity percent, dedup_ratio (null when '-').",
     "errors": "raw 'errors:' line from zpool status (current known data errors), NOT the scrub error count.",
-    "vdev_tree": "parsed device hierarchy (diagnostic); each node carries name/state/read/write/cksum and nested children; section devices in logs/spares/cache/special.",
+    "vdev_tree": "parsed device hierarchy (diagnostic); each node carries name/state/read/write/cksum and nested children. SHARP EDGE: section devices (logs/cache/spares/special) appear BOTH nested under 'children' (via the indent parser -- which is what lets the degraded_vdevs walk reach them) AND in their own section list. Deliberate; the server must not double-render them.",
     "zfs_version": "first line of 'zpool version', repeated per pool."
   },
-  "config": { "interval": 60 },
-  "scenario": {
-    "rpool": "healthy: ONLINE, last scrub completed with 0 errors, not resilvering -> health_code 0, degraded_vdevs 0, resilver_progress 0.0, scrub_errors 0.",
-    "tank": "degraded: one mirror leg FAULTED, resilver in progress at 42.13% -> health_code 1, degraded_vdevs 2 (the DEGRADED mirror + the FAULTED leaf), resilver_progress 42.13, scrub_errors null (last scan is a resilver, not a scrub)."
-  },
-  "payload": [
-    {
-      "name": "rpool",
-      "health": "ONLINE",
-      "health_code": 0,
-      "degraded_vdevs": 0,
-      "resilver_progress": 0.0,
-      "scrub_errors": 0,
-      "fragmentation": 5,
-      "summary": {
-        "size_bytes": 1000204886016,
-        "alloc_bytes": 500102443008,
-        "free_bytes": 500102443008,
-        "frag_percent": 5,
-        "capacity_percent": 50,
-        "dedup_ratio": 1.0
-      },
-      "errors": "No known data errors",
-      "vdev_tree": {
-        "name": "rpool",
-        "state": "ONLINE",
-        "read": 0,
-        "write": 0,
-        "cksum": 0,
-        "children": [
-          {
-            "name": "mirror-0",
+  "scenarios": {
+    "healthy_and_degraded": {
+      "description": "Two pools. rpool: ONLINE, last scrub completed with 0 errors, not resilvering -> health_code 0, degraded_vdevs 0, resilver_progress 0.0, scrub_errors 0. tank: one mirror leg FAULTED, resilver in progress at 42.13% -> health_code 1, degraded_vdevs 2 (the DEGRADED mirror + the FAULTED leaf), resilver_progress 42.13, scrub_errors null (last scan is a resilver, not a scrub).",
+      "config": { "interval": 60 },
+      "payload": [
+        {
+          "name": "rpool",
+          "health": "ONLINE",
+          "health_code": 0,
+          "degraded_vdevs": 0,
+          "resilver_progress": 0.0,
+          "scrub_errors": 0,
+          "fragmentation": 5,
+          "summary": {
+            "size_bytes": 1000204886016,
+            "alloc_bytes": 500102443008,
+            "free_bytes": 500102443008,
+            "frag_percent": 5,
+            "capacity_percent": 50,
+            "dedup_ratio": 1.0
+          },
+          "errors": "No known data errors",
+          "vdev_tree": {
+            "name": "rpool",
             "state": "ONLINE",
             "read": 0,
             "write": 0,
             "cksum": 0,
             "children": [
-              { "name": "sda", "state": "ONLINE", "read": 0, "write": 0, "cksum": 0 },
-              { "name": "sdb", "state": "ONLINE", "read": 0, "write": 0, "cksum": 0 }
-            ]
-          }
-        ],
-        "logs": [],
-        "spares": [],
-        "cache": [],
-        "special": []
-      },
-      "zfs_version": "zfs-2.2.2-1"
-    },
-    {
-      "name": "tank",
-      "health": "DEGRADED",
-      "health_code": 1,
-      "degraded_vdevs": 2,
-      "resilver_progress": 42.13,
-      "scrub_errors": null,
-      "fragmentation": 12,
-      "summary": {
-        "size_bytes": 4000787030016,
-        "alloc_bytes": 1200236109004,
-        "free_bytes": 2800550921012,
-        "frag_percent": 12,
-        "capacity_percent": 30,
-        "dedup_ratio": 1.0
-      },
-      "errors": "No known data errors",
-      "vdev_tree": {
-        "name": "tank",
-        "state": "DEGRADED",
-        "read": 0,
-        "write": 0,
-        "cksum": 0,
-        "children": [
-          {
-            "name": "mirror-0",
+              {
+                "name": "mirror-0",
+                "state": "ONLINE",
+                "read": 0,
+                "write": 0,
+                "cksum": 0,
+                "children": [
+                  { "name": "sda", "state": "ONLINE", "read": 0, "write": 0, "cksum": 0 },
+                  { "name": "sdb", "state": "ONLINE", "read": 0, "write": 0, "cksum": 0 }
+                ]
+              }
+            ],
+            "logs": [],
+            "spares": [],
+            "cache": [],
+            "special": []
+          },
+          "zfs_version": "zfs-2.2.2-1"
+        },
+        {
+          "name": "tank",
+          "health": "DEGRADED",
+          "health_code": 1,
+          "degraded_vdevs": 2,
+          "resilver_progress": 42.13,
+          "scrub_errors": null,
+          "fragmentation": 12,
+          "summary": {
+            "size_bytes": 4000787030016,
+            "alloc_bytes": 1200236109004,
+            "free_bytes": 2800550921012,
+            "frag_percent": 12,
+            "capacity_percent": 30,
+            "dedup_ratio": 1.0
+          },
+          "errors": "No known data errors",
+          "vdev_tree": {
+            "name": "tank",
             "state": "DEGRADED",
             "read": 0,
             "write": 0,
             "cksum": 0,
             "children": [
-              { "name": "sdc", "state": "ONLINE", "read": 0, "write": 0, "cksum": 0 },
-              { "name": "sdd", "state": "FAULTED", "read": 3, "write": 0, "cksum": 0 }
-            ]
-          }
-        ],
-        "logs": [],
-        "spares": [],
-        "cache": [],
-        "special": []
-      },
-      "zfs_version": "zfs-2.2.2-1"
+              {
+                "name": "mirror-0",
+                "state": "DEGRADED",
+                "read": 0,
+                "write": 0,
+                "cksum": 0,
+                "children": [
+                  { "name": "sdc", "state": "ONLINE", "read": 0, "write": 0, "cksum": 0 },
+                  { "name": "sdd", "state": "FAULTED", "read": 3, "write": 0, "cksum": 0 }
+                ]
+              }
+            ],
+            "logs": [],
+            "spares": [],
+            "cache": [],
+            "special": []
+          },
+          "zfs_version": "zfs-2.2.2-1"
+        }
+      ]
+    },
+    "collection_failure": {
+      "description": "`zpool list` failed / timed out (or the listing succeeded but every per-pool read failed, or the zpool binary vanished mid-run). The agent emits data['zfs'] = null. The server MUST NOT prune zfs_pools rows or auto-resolve health incidents -- this is a transient failure, not 'all pools destroyed'. Contrast the empty-array case (listing succeeded, zero pools), which IS safe to prune.",
+      "config": { "interval": 60 },
+      "payload": null
     }
-  ]
+  }
 }
