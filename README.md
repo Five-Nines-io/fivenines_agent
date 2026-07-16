@@ -382,6 +382,24 @@ Collects metrics via a direct connection (pure-Python `pg8000` driver, no `psql`
 
 Requires appropriate database credentials.
 
+### MySQL / MariaDB
+
+Collects metrics via the `mysql`/`mariadb` client CLI (unix socket or TCP;
+`MYSQL_PWD` keeps the password out of the process list). Works with MySQL 8 and
+MariaDB. Reports a reachability status so the dashboard can tell an outage apart
+from a credentials problem. Available in agent version **1.11.4+**:
+
+- Reachable / unreachable / config-error status with the underlying error
+- Connections and `max_connections`; queries, slow queries, aborted connects
+  (raw counters; the dashboard derives rates)
+- Uptime and server version
+- InnoDB buffer-pool hit ratio and usage (computed)
+- Replication status and lag for replicas (`SHOW REPLICA STATUS` with a
+  `SHOW SLAVE STATUS` fallback for MariaDB / MySQL < 8.0.22)
+
+Requires a `mysql` (or `mariadb`) client on the host and appropriate database
+credentials.
+
 ### Redis / Valkey
 
 Collects metrics from a single `INFO` call over the Redis protocol. Works with

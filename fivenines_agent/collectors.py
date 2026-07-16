@@ -15,6 +15,7 @@ from fivenines_agent.gpu import gpu_metrics
 from fivenines_agent.io import io
 from fivenines_agent.logs import collect_log_signals
 from fivenines_agent.memory import memory, swap
+from fivenines_agent.mysql import mysql_metrics
 from fivenines_agent.network import network
 from fivenines_agent.nginx import nginx_metrics
 from fivenines_agent.partitions import partitions_metadata, partitions_usage
@@ -31,6 +32,7 @@ from fivenines_agent.smart_storage import (
 )
 from fivenines_agent.systemd import systemd_metrics
 from fivenines_agent.temperatures import temperatures
+from fivenines_agent.zfs import zfs_storage_health
 
 # Registry of metric collectors.
 # Each entry: (config_key, [(data_key, callable, pass_kwargs), ...])
@@ -77,6 +79,10 @@ COLLECTORS = [
     # Ceph: list-driven multi-cluster. config["ceph"] == {"clusters": [...]} is
     # unpacked (pass_kwargs) into ceph_metrics(clusters=[...]).
     ("ceph", [("ceph", ceph_metrics, True)]),
+    # ZFS: host-local pool health (generic, not Proxmox-scoped). config["zfs"]
+    # may be True (defaults) or {"interval": N}, unpacked into
+    # zfs_storage_health(interval=N). Gated on the "zfs" capability.
+    ("zfs", [("zfs", zfs_storage_health, True)]),
     ("processes", [("processes", processes, False)]),
     ("ports", [("ports", listening_ports, True)]),
     ("temperatures", [("temperatures", temperatures, False)]),
@@ -90,6 +96,7 @@ COLLECTORS = [
     ("fail2ban", [("fail2ban", fail2ban_metrics, False)]),
     ("caddy", [("caddy", caddy_metrics, True)]),
     ("postgresql", [("postgresql", postgresql_metrics, True)]),
+    ("mysql", [("mysql", mysql_metrics, True)]),
     ("proxmox", [("proxmox", proxmox_metrics, True)]),
     ("systemd", [("systemd", systemd_metrics, True)]),
     # Windows-only: gated by the disk_health capability, only present in the
