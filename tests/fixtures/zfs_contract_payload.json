@@ -1,6 +1,6 @@
 {
   "description": "Shared ZFS contract fixture between fivenines-agent and fivenines-server. Source of truth: fivenines-agent tests/fixtures/zfs_contract_payload.json, asserted end-to-end by tests/test_zfs.py::test_contract_fixture_round_trip (only zfs._run and shutil.which are mocked with the canned zpool CLI output below). 'config' is the shape config['zfs'] takes (True, or {'interval': N}); 'payload' is the artifact the agent emits under data['zfs'] -- a list of per-pool health objects the server's ZFS ingester must parse. The collector is GENERIC (host-local zpool), not Proxmox-scoped: the server joins these pools to proxmox_storages where storage_type='zfs' on (host, pool name). Change the payload shape only in lockstep with the server spec and its fixture copy.",
-  "agent_min_version": "1.11.0",
+  "agent_min_version": "1.11.3",
   "health_code_contract": {
     "_note": "Stable, append-only mapping of the zpool health string to payload.health_code. Never renumber. Unrecognized states -> null, with the raw 'health' string preserved so the backend can still react.",
     "0": "ONLINE",
