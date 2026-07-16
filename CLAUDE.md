@@ -63,7 +63,7 @@ poetry run fivenines_agent --version
 **Permission Probing (`permissions.py`)**
 - Detects available monitoring capabilities at startup based on file permissions, sudo access, and group memberships
 - Re-probes automatically every 5 minutes or on SIGHUP signal to detect permission changes
-- Capabilities include: core metrics (always available), hardware sensors, storage (SMART/RAID), services (Docker/QEMU/Proxmox/systemd), kernel surfaces (cgroup, tri-state "v1"/"v2"/None), security (fail2ban), etc.
+- Capabilities include: core metrics (always available), hardware sensors, storage (SMART/RAID), services (Docker/QEMU/Proxmox/systemd), kernel surfaces (cgroup, tri-state "v1"/"v2"/None), security (fail2ban), logs (`journald` read access, probed via `journalctl -n 0`), etc.
 - Prints a capabilities banner showing what features are available/unavailable with hints
 
 **Synchronizer (`synchronizer.py`)**
@@ -76,6 +76,11 @@ poetry run fivenines_agent --version
 **SynchronizationQueue (`synchronization_queue.py`)**
 - Thread-safe queue with maxsize limit for buffering collected metrics
 - Prevents memory exhaustion if API is unreachable
+
+**Log Uploader (`log_uploader.py`, `log_capture.py`)**
+- Dedicated `LogUploader` worker thread + bounded queue that upload incident log-capture bundles to `/logs` via `Synchronizer.send_logs`, kept off the metric-collection loop so a slow/large upload never stalls collection, `/collect`, or the systemd watchdog
+- `CaptureCoordinator` applies the backend `capture_logs` command with a capture_id nonce + on-disk `last_capture_id` persistence: each command fires exactly once and never replays after a `Restart=always` restart; `last_served` advances only after a confirmed upload, so a failed capture retries
+- Part of log-monitoring V1; inert until the backend implements the `/collect` `capture_logs` command and the `/logs` endpoint
 
 **Subprocess Utilities (`subprocess_utils.py`)**
 - Critical for PyInstaller compatibility: removes LD_LIBRARY_PATH and other environment variables that can interfere with system commands
@@ -98,11 +103,12 @@ Each metric collector is a separate module that exports functions to collect spe
 
 - **Core metrics** (always enabled): `cpu.py`, `memory.py`, `load_average.py`, `io.py`, `network.py`, `partitions.py`, `files.py`, `ports.py`, `processes.py`, `temperatures.py`, `fans.py`
 - **Storage**: `smart_storage.py` (requires sudo smartctl), `raid_storage.py` (requires sudo mdadm), `zfs.py`
-- **Services**: `docker.py`, `qemu.py`, `proxmox.py`, `caddy.py`, `nginx.py`, `postgresql.py`, `redis.py`, `systemd.py` (per-unit health + inventory delta-sync, requires systemctl; journalctl only for failure journal tails)
+- **Services**: `docker.py`, `qemu.py`, `proxmox.py`, `caddy.py`, `nginx.py`, `postgresql.py`, `redis.py`, `systemd.py` (per-unit health + inventory delta-sync, requires systemctl; journalctl only for failure journal tails, redacted before send)
 - **Security**: `fail2ban.py` (requires sudo fail2ban-client)
 - **Network/connectivity**: `ip.py` (public IPv4/IPv6 via ip.fivenines.io with 60s cache), `ping.py` (TCP latency), `snmp.py` (SNMP device polling via net-snmp CLI tools)
 - **Security scanning**: `packages.py` (installed packages via dpkg/rpm/apk/pacman with hash-based delta sync)
 - **Kernel surfaces**: `cgroup.py` (v1/v2 hierarchy detection + safe per-unit metric reads, used by `systemd.py`)
+- **Log monitoring** (V1): `logs.py` (continuous per-unit error/warn signals + top fingerprints via `collect_log_signals`, wired as the `logs` collector; incident capture via `build_capture_bundle`: bounded retroactive `journalctl` slice -> redacted enriched digest; shared best-effort `redact()` for secrets/PII, also used by `systemd.py`). Gated on the `journald` capability (journal read access); transport/coordination live in `log_capture.py` + `log_uploader.py` (see Core Components).
 
 Collectors use the `@debug` decorator from `debug.py` to log execution time and results.
 
@@ -117,6 +123,8 @@ Collectors use the `@debug` decorator from `debug.py` to log execution time and 
   - `request_options`: timeout, retry count, retry interval
   - `packages.scan`: triggers package inventory sync with hash-based deduplication
   - `systemd`: unit collection config (`unit_types` as comma-separated string or list; `scan` triggers inventory delta-sync to `/systemd_inventory`)
+  - `logs`: continuous log-signal collection (`units` allowlist, `signal_interval_s` window); gated on the `journald` capability
+  - `capture_logs`: backend-pull incident capture command (`capture_id`, `unit`, `since`, `lines`, `expiry`); fired exactly once via the capture_id nonce + on-disk persistence, uploaded to `/logs` off the collection loop
 
 ### Installation Types
 

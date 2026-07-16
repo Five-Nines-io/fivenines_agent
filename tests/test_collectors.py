@@ -19,6 +19,7 @@ def test_registry_has_expected_config_keys():
         "network",
         "partitions",
         "io",
+        "logs",
         "smart_storage_health",
         "raid_storage_health",
         "ceph",
@@ -288,6 +289,21 @@ def test_capability_overrides_raid_storage():
     registry = [("raid_storage_health", [("raid_storage_health", mock_fn, False)])]
     config = {"raid_storage_health": True}
     permissions = {"raid_storage": False}
+    data = {}
+
+    with patch("fivenines_agent.collectors.COLLECTORS", registry):
+        collect_metrics(config, data, permissions=permissions)
+
+    mock_fn.assert_not_called()
+
+
+def test_capability_overrides_logs_journald():
+    """logs config gates on the journald capability (not a 'logs' capability)."""
+    _reset_skip_log()
+    mock_fn = MagicMock(return_value="x")
+    registry = [("logs", [("logs", mock_fn, True)])]
+    config = {"logs": {"units": ["nginx.service"]}}
+    permissions = {"journald": False}
     data = {}
 
     with patch("fivenines_agent.collectors.COLLECTORS", registry):

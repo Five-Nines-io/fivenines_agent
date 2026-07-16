@@ -53,6 +53,7 @@ from fivenines_agent.cgroup import detect_hierarchy, read_unit_resources
 from fivenines_agent.cgroup import reset_cache as cgroup_reset_cache
 from fivenines_agent.debug import debug, log
 from fivenines_agent.env import dry_run
+from fivenines_agent.logs import redact
 from fivenines_agent.subprocess_utils import get_clean_env
 
 # Subprocess timeouts (seconds)
@@ -493,8 +494,13 @@ def _parse_journalctl_failed(stdout):
             except (TypeError, ValueError):
                 msg = ""
         if msg:
+            # Journal tails ship in the /collect payload, so scrub secrets/PII
+            # with the same best-effort redaction as the log-monitoring digests
+            # (an error line often embeds the credential that caused the
+            # failure). Redact BEFORE truncating: truncating first could split
+            # a token and let the remainder slip past the patterns.
             # Payload bound: journald's LineMax default is 48K per line.
-            messages.append(msg[:JOURNAL_MSG_MAX_CHARS])
+            messages.append(redact(msg)[:JOURNAL_MSG_MAX_CHARS])
     return messages
 
 
