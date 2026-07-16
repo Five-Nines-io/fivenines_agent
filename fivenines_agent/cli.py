@@ -1,8 +1,18 @@
 """Command-line interface and argument parsing for fivenines agent."""
 
 import argparse
+from importlib.metadata import PackageNotFoundError, version
 
-VERSION = '1.11.1'
+# Single source of truth for the version is pyproject.toml; importlib.metadata
+# reads it back from the installed distribution's metadata so this stays in sync
+# automatically. The PyInstaller binary bundles that metadata via
+# `--copy-metadata fivenines_agent` in py2exe.sh (whose --version smoke check
+# aborts the build if it is missing). The fallback only applies when running
+# from a source tree with no installed distribution metadata.
+try:
+    VERSION = version('fivenines_agent')
+except PackageNotFoundError:  # pragma: no cover - only hit in uninstalled source trees
+    VERSION = '0.0.0+unknown'
 
 # Global args storage (set by parse_args)
 _args = None
