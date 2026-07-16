@@ -31,6 +31,7 @@ def test_registry_has_expected_config_keys():
         "nvidia_gpu",
         "redis",
         "nginx",
+        "apache",
         "docker",
         "qemu",
         "fail2ban",

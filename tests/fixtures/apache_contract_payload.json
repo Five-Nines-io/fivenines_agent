@@ -1,0 +1,35 @@
+{
+  "description": "Shared Apache mod_status contract fixture between fivenines-agent and fivenines-server. Source of truth: fivenines-agent tests/fixtures/apache_contract_payload.json, asserted end-to-end by tests/test_apache.py::test_contract_fixture_round_trip (only requests.get is mocked -- 'raw_auto' is fed back as response.text and 'server_header' as the Server header, and apache_metrics(**config['apache']) must equal payload['apache']). The server's spec/requests/api_collect_apache_spec.rb posts payload['apache'] under data['apache'] through /collect and asserts Ingesters::Agent ingests it. 'config', 'raw_auto' and 'server_header' are agent-side inputs the server ignores. Change the payload shape only in lockstep across both repos.",
+  "agent_min_version": "1.11.5",
+  "config": {
+    "apache": {
+      "status_page_url": "http://127.0.0.1/server-status?auto"
+    }
+  },
+  "server_header": "Apache/2.4.52 (Ubuntu)",
+  "raw_auto": "127.0.0.1\nServerVersion: Apache/2.4.52 (Ubuntu)\nServerMPM: event\nServer Built: 2021-12-31T00:00:00\nCurrentTime: Wednesday, 15-Jul-2026 12:00:00 UTC\nRestartTime: Wednesday, 15-Jul-2026 11:00:00 UTC\nParentServerConfigGeneration: 1\nParentServerMPMGeneration: 0\nServerUptimeSeconds: 3600\nServerUptime: 1 hour\nLoad1: 0.05\nLoad5: 0.10\nLoad15: 0.15\nTotal Accesses: 1250\nTotal kBytes: 8945\nTotal Duration: 45678\nCPUUser: 1.2\nCPUSystem: .8\nCPUChildrenUser: 0\nCPUChildrenSystem: 0\nCPULoad: .0555556\nUptime: 3600\nReqPerSec: .345304\nBytesPerSec: 2529.71\nBytesPerReq: 7327.36\nDurationPerReq: 36.5424\nBusyWorkers: 1\nIdleWorkers: 49\nProcesses: 2\nStopping: 0\nBusyWorkers: 1\nIdleWorkers: 49\nConnsTotal: 3\nConnsAsyncWriting: 0\nConnsAsyncKeepAlive: 1\nConnsAsyncClosing: 0\nScoreboard: ________________________________________________WK..............................................................................................................................................................................\n",
+  "payload": {
+    "apache": {
+      "apache_version": "Apache/2.4.52 (Ubuntu)",
+      "requests_per_second": 0.345304,
+      "bytes_per_second": 2529.71,
+      "busy_workers": 1,
+      "idle_workers": 49,
+      "total_accesses": 1250,
+      "total_kbytes": 8945,
+      "scoreboard": {
+        "waiting": 48,
+        "starting": 0,
+        "reading": 0,
+        "sending": 1,
+        "keepalive": 1,
+        "dns_lookup": 0,
+        "closing": 0,
+        "logging": 0,
+        "graceful": 0,
+        "idle_cleanup": 0,
+        "open": 174
+      }
+    }
+  }
+}

@@ -323,6 +323,29 @@ The capabilities banner reports Ceph as available when the `ceph` CLI is found i
 
 The agent can collect metrics from various applications when configured.
 
+### Apache
+
+Collects metrics from Apache's `mod_status` machine-readable endpoint
+(`server-status?auto`). Works with both `mpm_prefork` and `mpm_event`:
+- Requests/sec and bytes/sec
+- Busy/idle workers (the dashboard derives worker utilization %)
+- Total accesses and kBytes served (cumulative counters)
+- Scoreboard: per-state worker distribution (waiting, reading, sending,
+  keepalive, closing, ...)
+
+Requires the `mod_status` module enabled (`a2enmod status` on Debian/Ubuntu;
+often on by default) and a `server-status` handler:
+```apache
+<Location "/server-status">
+    SetHandler server-status
+    Require local
+</Location>
+```
+Scrapes `http://127.0.0.1/server-status?auto` by default; `?auto` is appended
+automatically if the configured URL omits it. All derived values (worker
+utilization %, request/byte rates) are computed server-side from these raw
+fields.
+
 ### Caddy
 
 Collects metrics from Caddy's admin API (default: `http://localhost:2019`):
