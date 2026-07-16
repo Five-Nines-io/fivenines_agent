@@ -68,6 +68,13 @@ def test_dry_run_config_includes_systemd():
     assert _DRY_RUN_CONFIG.get("systemd")  # present and truthy
 
 
+def test_dry_run_config_includes_zfs():
+    """ZFS is a host-level collector (generic zpool, no external config), so
+    --dry-run must exercise it. Same regression class as systemd: without the
+    key, collect_metrics' `if not config_value` gate silently skips it."""
+    assert _DRY_RUN_CONFIG.get("zfs")  # present and truthy
+
+
 @patch("fivenines_agent.agent.dry_run", return_value=True)
 def test_dry_run_cleanup_skips_synchronizer(mock_dr):
     """_cleanup() must not crash when synchronizer is None."""

@@ -31,6 +31,7 @@ from fivenines_agent.smart_storage import (
 )
 from fivenines_agent.systemd import systemd_metrics
 from fivenines_agent.temperatures import temperatures
+from fivenines_agent.zfs import zfs_storage_health
 
 # Registry of metric collectors.
 # Each entry: (config_key, [(data_key, callable, pass_kwargs), ...])
@@ -77,6 +78,10 @@ COLLECTORS = [
     # Ceph: list-driven multi-cluster. config["ceph"] == {"clusters": [...]} is
     # unpacked (pass_kwargs) into ceph_metrics(clusters=[...]).
     ("ceph", [("ceph", ceph_metrics, True)]),
+    # ZFS: host-local pool health (generic, not Proxmox-scoped). config["zfs"]
+    # may be True (defaults) or {"interval": N}, unpacked into
+    # zfs_storage_health(interval=N). Gated on the "zfs" capability.
+    ("zfs", [("zfs", zfs_storage_health, True)]),
     ("processes", [("processes", processes, False)]),
     ("ports", [("ports", listening_ports, True)]),
     ("temperatures", [("temperatures", temperatures, False)]),
