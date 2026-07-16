@@ -142,6 +142,7 @@ The agent works without sudo, but these features will be unavailable (this is al
 | SNMP device polling | `net-snmp` tools (`snmpget`, `snmpbulkwalk`) |
 | systemd unit metrics | `systemd` init system (`systemctl`; `journalctl` only for failure journal tails) |
 | systemd failure journal tails | journal read access: the bundled service unit grants `SupplementaryGroups=systemd-journal`; for user installs add your user to the `systemd-journal` group (tails degrade to empty without it) |
+| Log monitoring (journald capture + signals) | journal read access (`systemd-journal` group) |
 | Per-unit cgroup metrics | cgroup v1 or v2 mounted at `/sys/fs/cgroup` |
 | Ceph cluster status | `ceph` CLI + read-only cephx keyring (no sudo) |
 
@@ -233,6 +234,9 @@ When the agent starts, it displays a banner showing which features are available
 
   Networking:
     [+] Snmp
+
+  Logs:
+    [+] Journald
 
   [!] Some features unavailable. See: https://docs.fivenines.io/agent/permissions
 
@@ -355,16 +359,24 @@ Collects metrics via a direct connection (pure-Python `pg8000` driver, no `psql`
 
 Requires appropriate database credentials.
 
-### Redis
+### Redis / Valkey
 
-Collects metrics via Redis protocol:
-- Version and uptime
-- Connected/blocked clients
-- Commands processed
-- Evicted/expired keys
-- Per-database key counts
+Collects metrics from a single `INFO` call over the Redis protocol. Works with
+Redis and [Valkey](https://valkey.io) (the collector also reports
+`valkey_version` when present). Deepened in agent version **1.11.0+**:
 
-Connects to `localhost:6379` by default.
+- Version and uptime (`valkey_version` on Valkey)
+- Connected/blocked clients, commands processed, ops/sec
+- Memory: used memory, `maxmemory` limit, fragmentation ratio
+- Keyspace hits/misses (the dashboard derives the hit ratio)
+- Evicted/expired keys, per-database key counts
+- Replication: role, connected replicas, replication offset, per-replica
+  state/offset/lag (master) and link status/lag (replica)
+- Persistence: last RDB save time, last background-save status, AOF enabled
+
+Connects to `localhost:6379` by default; an optional password is supported. All
+derived values (memory usage %, hit ratio, RDB age, replication lag) are
+computed server-side from these raw fields.
 
 ## Contribute
 

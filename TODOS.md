@@ -1,5 +1,46 @@
 # TODOS
 
+## P2: Log monitoring - flat-file (non-journald) source (E2)
+
+Deferred from `ceo-plans/2026-06-30-log-file-monitoring.md` at the Codex
+cut-scope. V1 reads journald only, so services that log to their own files
+(`/var/log/nginx/*.log`, apps writing files, non-systemd hosts) are uncovered.
+Add a log2journal-style parser + a ring-buffer for rotation (no retroactive
+read on rotating files). This is the "second subsystem" the review flagged.
+
+- **Effort:** L (human) / M (CC)
+- **Depends on:** log monitoring V1 shipped
+- **Files:** `fivenines_agent/logs.py` (file source alongside journald), tests
+
+## P3: Log monitoring - remaining V1 fast-follows
+
+Consolidated deferrals from the same CEO plan, each a complete follow-up:
+- **E1 ML edge trigger** (k-means anomaly detection on the agent) - gated behind
+  a PyInstaller/BLAS feasibility spike; deterministic triggers suffice for now.
+- **Local instant capture trigger** (sub-second, agent-side) - V1 uses
+  backend-pull + incident-mode interval drop; the local detector is deferred.
+- **Windows Event Log source** - V1 is Linux/journald only.
+- **Raw posture opt-in** - V1 hardcodes `posture: "digest"`; wire the per-account
+  raw flag through and enforce `max_bytes` (only meaningful for raw). E4
+  log-based alerting is backend-side.
+
+- **Effort:** varies (see plan) / mostly M (CC)
+- **Depends on:** log monitoring V1 in production + demand signal
+- **Files:** `fivenines_agent/logs.py`, `fivenines_agent/log_capture.py`
+
+## P3: Log monitoring - DRY debt from pre-landing review
+
+Two duplications flagged (confidence 4-5, deferred rather than refactor at ship):
+`logs._signals_for_unit` and `logs.build_digest` share a fingerprint-grouping
+loop with subtly different outputs (info counted or not, `sample` vs `excerpt`
+key, top-N cap); and journald `-o json` MESSAGE parsing is duplicated between
+`logs._capture_entries` and `systemd._parse_journalctl_failed`. Extract shared
+helpers once the shapes stabilize.
+
+- **Effort:** S (human) / S (CC)
+- **Depends on:** nothing
+- **Files:** `fivenines_agent/logs.py`, `fivenines_agent/systemd.py`, tests
+
 ## P1: Hourly re-send TTL for stuck-failed unit drilldowns
 
 Deferred from plan `2026-05-04-systemd-services.md` (ship gate decision). The
@@ -126,6 +167,23 @@ collection rather than the per-tick loop.
 - **Effort:** M (human) / S (CC)
 - **Depends on:** product signal that boot-time analysis matters to customers
 - **Files:** `fivenines_agent/systemd.py` (one-shot collection), `fivenines_agent/agent.py` (static data), tests
+
+## P3: Docker events API for short-lived container capture
+
+The container-state collector (server #492) polls `containers.list(all=True)` once
+per tick, so a container that starts and exits (or is `--rm`'d) entirely between
+two ticks is never observed -- its death, exit code, and OOM status are invisible.
+The 10x version subscribes to the Docker events stream (`client.events()`) and
+records terminal transitions as they happen, eliminating the polling blind spot.
+Deferred from the initial ship because an events subscription is a persistent
+connection with its own lifecycle/reconnect handling (a different shape from the
+per-tick poll loop) and the poll already covers every container that lives at
+least one interval -- the common case. Documented as a known limitation in the
+`docker.py` module docstring.
+
+- **Effort:** L (human) / M (CC)
+- **Depends on:** container-state collector shipped (done, 1.11.0)
+- **Files:** new events-stream path in `fivenines_agent/docker.py` (or a sibling), `fivenines_agent/agent.py` (subscription lifecycle), tests
 
 ## P3: OOM detection journal-parse fallback for cgroup v1
 

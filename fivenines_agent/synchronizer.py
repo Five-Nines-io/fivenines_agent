@@ -121,6 +121,16 @@ class Synchronizer(Thread):
         """Send packages data to /packages. Returns response or None."""
         return self._post("/packages", packages_data)
 
+    def send_logs(self, bundle):
+        """Send a log-capture bundle to /logs. Returns response or None.
+
+        Mirrors send_packages: gzip + auth + bounded retries via _post. Called
+        from the dedicated LogUploader thread (not the collection loop or the
+        /collect synchronizer drain), so a slow/large upload never blocks metric
+        collection or config sync.
+        """
+        return self._post("/logs", bundle)
+
     def send_systemd_inventory(self, inventory_data):
         """Send systemd inventory snapshot to /systemd_inventory. Returns response or None."""
         return self._post("/systemd_inventory", inventory_data)
