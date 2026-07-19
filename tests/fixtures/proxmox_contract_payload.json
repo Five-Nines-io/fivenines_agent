@@ -24,6 +24,13 @@
     "api_unreachable_after_construction": "The realistic auth-failure / host-down case: token-auth ProxmoxAPI constructs lazily (no None), then every request raises. version.get() raises AND the node-listing probe raises => collect() returns None (see scenario 'unreachable'). BEFORE 1.9.0 this returned {\"version\": null, \"cluster\": null, \"nodes\": [], \"vms\": [], \"lxc\": [], \"storage\": []}, indistinguishable-by-value from an idle node; normalized to None in 1.9.0.",
     "single_node_timeout": "One node's per-node calls raise mid-loop while the cluster-wide /cluster/status still counts it online. Exceptions are swallowed per-node in _collect_nodes/_collect_vms/_collect_lxc/_collect_storage, so that node silently drops from payload.nodes/vms/lxc/storage while payload.cluster.nodes_online still includes it (see scenario 'partial_node_timeout')."
   },
+  "storage_pool_contract": {
+    "_note": "Agent-side prerequisite for the deferred ZFS<->Proxmox join (issue #49, ZFS pool health shipped in agent 1.11.3). Each storage entry OPTIONALLY carries 'pool', read from the datacenter storage config (/storage -> self.proxmox.storage.get(), one cluster-wide call), which is DISTINCT from the per-node /nodes/<n>/storage runtime status the total/used/available/active fields come from. See scenario 'standalone' for the pinned shape (local-zfs carries pool, local/local-lvm do not).",
+    "field": "pool",
+    "present_for": "Pool-backed storage types only: zfspool (the ZFS dataset, e.g. 'rpool/data'), rbd/cephfs (the Ceph pool). OMITTED (key absent, never null) for dir/lvmthin/nfs/etc, so a host with no pool-backed storage stays byte-identical to the pre-field payload -- the contract is purely additive and the field is the single allowed optional key beyond the base 7.",
+    "server_join": "For a zfspool storage the zpool ROOT is pool.split('/')[0] (e.g. 'rpool/data' -> 'rpool'); the server joins that to host-local ZfsPool.name per (host, pool root). This is the join key proxmox_storages.name could never provide -- that column is the PVE storage ID (e.g. 'local-zfs'), not the zpool name. rbd/cephfs 'pool' is the Ceph pool; the server filters by type when joining. OUT OF SCOPE for the agent: the server adds proxmox_storages.pool and performs the join in a paired lockstep PR.",
+    "best_effort": "Enrichment is best-effort. A restricted token that cannot read /storage, or an older PVE, degrades to no 'pool' on any entry and NEVER fails or flips storage_ok -- _storage_config_map swallows its own error and is deliberately not threaded through the 'collection' flags block. Deploy order is not sensitive: an old server ignores the extra 'pool' key; a new server reads it with .get('pool')."
+  },
   "scenarios": {
     "quorate_cluster": {
       "description": "3-node quorate cluster 'production'. Guests spread across nodes (pve1: vm 100 + ct 200; pve2: vm 101; pve3: stopped ct 201). Shared storage 'ceph-pool' visible on all three nodes (reported 3x, once per node -- server must dedupe) plus a per-node 'local-lvm'. cluster.nodes_online (3) == len(nodes) (3) => nodes_ok. This is the fully-healthy reference shape.",
@@ -171,9 +178,15 @@
         "storage_by_node": {
           "standalone-pve": [
             {"storage": "local", "type": "dir", "total": 100000000000, "used": 30000000000, "avail": 70000000000, "active": 1},
-            {"storage": "local-lvm", "type": "lvmthin", "total": 200000000000, "used": 50000000000, "avail": 150000000000, "active": 1}
+            {"storage": "local-lvm", "type": "lvmthin", "total": 200000000000, "used": 50000000000, "avail": 150000000000, "active": 1},
+            {"storage": "local-zfs", "type": "zfspool", "total": 500000000000, "used": 100000000000, "avail": 400000000000, "active": 1}
           ]
-        }
+        },
+        "storage_config": [
+          {"storage": "local", "type": "dir"},
+          {"storage": "local-lvm", "type": "lvmthin"},
+          {"storage": "local-zfs", "type": "zfspool", "pool": "rpool/data"}
+        ]
       },
       "payload": {
         "version": "8.2.4",
@@ -187,7 +200,8 @@
         "lxc": [],
         "storage": [
           {"name": "local", "node": "standalone-pve", "type": "dir", "total": 100000000000, "used": 30000000000, "available": 70000000000, "active": true},
-          {"name": "local-lvm", "node": "standalone-pve", "type": "lvmthin", "total": 200000000000, "used": 50000000000, "available": 150000000000, "active": true}
+          {"name": "local-lvm", "node": "standalone-pve", "type": "lvmthin", "total": 200000000000, "used": 50000000000, "available": 150000000000, "active": true},
+          {"name": "local-zfs", "node": "standalone-pve", "type": "zfspool", "total": 500000000000, "used": 100000000000, "available": 400000000000, "active": true, "pool": "rpool/data"}
         ],
         "collection": {"reachable": true, "cluster_ok": true, "nodes_ok": true, "guests_ok": true, "storage_ok": true, "error": null}
       }
