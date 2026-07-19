@@ -23,12 +23,17 @@ def make_proxmox_mock(
     lxc_raises_for=None,
     storage_by_node=None,
     storage_raises_for=None,
+    storage_config=None,
+    storage_config_raises=False,
     version_raises=False,
 ):
     """Build a MagicMock simulating proxmoxer.ProxmoxAPI chained-call API.
 
     Each kwarg controls one endpoint. The `_raises_for` variants take a set
-    of node names that should raise instead of returning data.
+    of node names that should raise instead of returning data. `storage_config`
+    wires the datacenter /storage endpoint (self.proxmox.storage.get(), distinct
+    from the per-node storage below); it defaults to [] so absent-config tests
+    get a clean empty datacenter config rather than a bare MagicMock.
     """
     mock = MagicMock()
 
@@ -46,6 +51,16 @@ def make_proxmox_mock(
         mock.nodes.get.side_effect = RuntimeError("nodes boom")
     elif nodes is not None:
         mock.nodes.get.return_value = nodes
+
+    # Datacenter /storage config (self.proxmox.storage.get()), distinct from the
+    # per-node /nodes/<n>/storage runtime status wired in nodes_call below. This
+    # is where the 'pool' property lives, driving the #49 pool enrichment.
+    if storage_config_raises:
+        mock.storage.get.side_effect = RuntimeError("storage config boom")
+    else:
+        mock.storage.get.return_value = (
+            storage_config if storage_config is not None else []
+        )
 
     node_status_raises_for = node_status_raises_for or set()
     qemu_raises_for = qemu_raises_for or set()
@@ -1285,6 +1300,100 @@ def test_collection_reachable_true_when_version_denied_but_nodes_listed():
     assert _collection(result)["reachable"] is True
 
 
+# --- storage 'pool' enrichment (#49 ZFS<->Proxmox join key) ------------------
+#
+# Each storage entry OPTIONALLY carries 'pool', read from the datacenter
+# /storage config (self.proxmox.storage.get()), which the per-node runtime
+# status endpoint does not return. It is the join key the server uses to
+# correlate a PVE storage to host-local ZFS pool health: for a zfspool the zpool
+# root is pool.split('/')[0]. Enrichment is additive and best-effort -- absent
+# for non-pool types, and a /storage failure degrades to no 'pool' WITHOUT
+# flipping storage_ok.
+
+
+def test_collect_storage_pool_enrichment_sets_zfspool_omits_dir():
+    """T79 [#49]: a zfspool storage gets 'pool' from the datacenter /storage
+    config; a dir storage (no pool property) does not."""
+    pmock = make_proxmox_mock(
+        nodes=[{"node": "pve1"}],
+        storage_by_node={
+            "pve1": [
+                {"storage": "local", "type": "dir", "active": 1},
+                {"storage": "local-zfs", "type": "zfspool", "active": 1},
+            ]
+        },
+        storage_config=[
+            {"storage": "local", "type": "dir"},
+            {"storage": "local-zfs", "type": "zfspool", "pool": "rpool/data"},
+        ],
+    )
+    c = make_collector(proxmox_mock=pmock)
+    by_name = {p["name"]: p for p in c._collect_storage()}
+    assert by_name["local-zfs"]["pool"] == "rpool/data"
+    assert "pool" not in by_name["local"]
+
+
+def test_collect_storage_pool_omitted_when_absent_from_config():
+    """T80 [#49]: a storage present in per-node runtime status but absent from
+    the datacenter /storage config gets no 'pool' (omitted, never null)."""
+    pmock = make_proxmox_mock(
+        nodes=[{"node": "pve1"}],
+        storage_by_node={
+            "pve1": [{"storage": "local-zfs", "type": "zfspool", "active": 1}]
+        },
+        storage_config=[],
+    )
+    c = make_collector(proxmox_mock=pmock)
+    pools = c._collect_storage()
+    assert "pool" not in pools[0]
+
+
+def test_collect_storage_degrades_when_storage_config_fails():
+    """T81 [#49]: /storage (datacenter config) raising degrades to no 'pool' on
+    any entry but still collects storage and does NOT flip storage_ok -- pool
+    enrichment is best-effort and off the collection flags block."""
+    pmock = make_proxmox_mock(
+        version={"version": "8"},
+        cluster_status=[],
+        nodes=[{"node": "pve1"}],
+        node_status_by_name={"pve1": {"uptime": 1}},
+        qemu_by_node={"pve1": []},
+        lxc_by_node={"pve1": []},
+        storage_by_node={
+            "pve1": [{"storage": "local-zfs", "type": "zfspool", "active": 1}]
+        },
+        storage_config_raises=True,
+    )
+    c = make_collector(proxmox_mock=pmock)
+    result = c.collect()
+    assert [p["name"] for p in result["storage"]] == ["local-zfs"]
+    assert "pool" not in result["storage"][0]
+    assert result["collection"]["storage_ok"] is True
+
+
+def test_storage_config_map_builds_and_skips_unnamed():
+    """T82 [#49]: _storage_config_map indexes /storage entries by storage id and
+    skips entries with no 'storage' key."""
+    pmock = make_proxmox_mock(
+        storage_config=[
+            {"storage": "local-zfs", "type": "zfspool", "pool": "rpool/data"},
+            {"type": "dir"},  # no storage id -> skipped
+        ],
+    )
+    c = make_collector(proxmox_mock=pmock)
+    config_map = c._storage_config_map()
+    assert set(config_map) == {"local-zfs"}
+    assert config_map["local-zfs"]["pool"] == "rpool/data"
+
+
+def test_storage_config_map_degrades_on_failure():
+    """T83 [#49]: _storage_config_map swallows a /storage failure and returns an
+    empty map (best-effort, never raises)."""
+    pmock = make_proxmox_mock(storage_config_raises=True)
+    c = make_collector(proxmox_mock=pmock)
+    assert c._storage_config_map() == {}
+
+
 # --- cross-repo contract (fivenines-server) ---------------------------------
 #
 # Shared fixture tests/fixtures/proxmox_contract_payload.json is asserted on
@@ -1345,6 +1454,9 @@ _GUEST_KEYS = {
     "uptime",
 }
 _STORAGE_KEYS = {"name", "node", "type", "total", "used", "available", "active"}
+# 'pool' (#49) is the only key a storage entry may carry beyond the base 7 --
+# present for pool-backed types (zfspool/rbd/cephfs), omitted otherwise.
+_STORAGE_OPTIONAL_KEYS = {"pool"}
 
 
 @pytest.mark.parametrize("scenario_name", sorted(_CONTRACT_SCENARIOS))
@@ -1375,7 +1487,9 @@ def test_contract_payload_key_sets(scenario_name):
     for guest in payload["vms"] + payload["lxc"]:
         assert set(guest) == _GUEST_KEYS
     for storage in payload["storage"]:
-        assert set(storage) == _STORAGE_KEYS
+        keys = set(storage)
+        assert _STORAGE_KEYS <= keys
+        assert keys - _STORAGE_KEYS <= _STORAGE_OPTIONAL_KEYS
 
 
 def test_contract_reachable_signal():
@@ -1441,3 +1555,17 @@ def test_contract_collection_storage_ok_independent():
     assert coll["guests_ok"] is True
     assert coll["cluster_ok"] is True
     assert coll["error"] == "node pve2: storage query failed"
+
+
+def test_contract_storage_pool_join_key():
+    """#49: the 'standalone' scenario pins the storage 'pool' join key -- a
+    zfspool storage carries pool='rpool/data' (its zpool root 'rpool' is what the
+    server joins to host-local ZFS pool health), while dir/lvmthin carry no pool.
+    This is the field proxmox_storages.name (the PVE storage ID 'local-zfs')
+    could never provide."""
+    storage = _CONTRACT_SCENARIOS["standalone"]["payload"]["storage"]
+    by_name = {s["name"]: s for s in storage}
+    assert by_name["local-zfs"]["pool"] == "rpool/data"
+    assert by_name["local-zfs"]["pool"].split("/")[0] == "rpool"
+    assert "pool" not in by_name["local"]
+    assert "pool" not in by_name["local-lvm"]

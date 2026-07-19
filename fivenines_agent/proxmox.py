@@ -405,11 +405,39 @@ class ProxmoxCollector:
 
         return containers
 
+    def _storage_config_map(self):
+        """Map storage id -> its datacenter /storage config entry.
+
+        The per-node /nodes/<n>/storage endpoint returns runtime status only
+        (total/used/avail/active); the 'pool' property -- a zfspool's ZFS
+        dataset (e.g. 'rpool/data'), an rbd/cephfs's Ceph pool -- lives in the
+        cluster-wide datacenter storage config (/storage). One call per collect,
+        used to enrich each per-node storage row with the ZFS<->Proxmox join key
+        (issue #49). Best-effort: a restricted token that cannot read /storage,
+        or an older PVE, yields {} and no 'pool' enrichment rather than failing
+        the storage section -- deliberately NOT threaded through the `collection`
+        flags block, so it never flips storage_ok.
+        """
+        config = {}
+        try:
+            for entry in self.proxmox.storage.get():
+                storage_id = entry.get('storage')
+                if storage_id:
+                    config[storage_id] = entry
+        except Exception as e:
+            log(f"Error listing datacenter storage config: {e}", 'debug')
+        return config
+
     def _collect_storage(self, collection=None):
         """Collect metrics for all storage pools."""
         storage_pools = []
         try:
             node_list = self.proxmox.nodes.get()
+
+            # Datacenter storage config (/storage), one cluster-wide call, maps
+            # storage id -> its config entry so each per-node storage row can be
+            # enriched with 'pool' (the ZFS<->Proxmox join key, issue #49).
+            config_map = self._storage_config_map()
 
             for node_info in node_list:
                 node_name = node_info.get('node')
@@ -433,6 +461,15 @@ class ProxmoxCollector:
                             'available': storage.get('avail') or 0,
                             'active': storage.get('active', 0) == 1
                         }
+
+                        # Additive 'pool' enrichment: present only for storage
+                        # types that carry one (zfspool/rbd/cephfs), omitted
+                        # (never null) otherwise, so a host with only dir/lvmthin
+                        # stays byte-identical to the pre-field payload.
+                        pool = config_map.get(storage_name, {}).get('pool')
+                        if pool is not None:
+                            storage_data['pool'] = pool
+
                         storage_pools.append(storage_data)
 
                 except Exception as e:
