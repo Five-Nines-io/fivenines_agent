@@ -197,3 +197,36 @@ subprocess cost; deferred until a concrete backend requirement appears.
 - **Effort:** M (human) / S (CC)
 - **Depends on:** backend signal that v1 OOM coverage matters
 - **Files:** `fivenines_agent/systemd.py` (add fallback path), tests, fixtures
+
+## P3: Hoist net_if_addrs() out of the per-interface loop in interfaces()
+
+Pre-existing (predates the issue #50 bridge/link-speed work, flagged by its
+pre-landing review). `interfaces()` calls `psutil.net_if_addrs()` once per
+interface, and each call rebuilds the full address map for every interface --
+O(N^2). Harmless on a normal host, but the bridge-saturation feature aims
+exactly at Proxmox hosts with thousands of veth/tap interfaces, where this is
+the dominant cost each tick. Fix is a one-liner (compute the map once before the
+loop), but it touches the address-lookup try/except that
+`test_interfaces_skips_when_net_if_addrs_raises` pins, so do it deliberately
+with the test in front of you. Kept out of the #50 PR to keep that diff scoped
+to the contract.
+
+- **Effort:** S (human) / S (CC)
+- **Depends on:** nothing
+- **Files:** `fivenines_agent/network.py` (`interfaces()`), `tests/test_network.py`
+
+## P4: Finer interface_type classification (bond / vlan / paravirtual)
+
+The issue #50 `interface_type` is a coarse three-way heuristic: bridge (has
+`bridge/`), physical (has a `device` node), else virtual. That mislabels bond
+and vlan masters -- which can carry the host's real uplink -- as "virtual", and
+labels paravirtual NICs (virtio-net, Xen, Hyper-V, SR-IOV VFs) as "physical".
+Not a correctness bug: saturation keys off `network_link_speed_bps` presence,
+not `interface_type` (documented in the collector + the contract fixture), so a
+mislabel only affects backend grouping. If the backend wants precise grouping,
+read `bonding/` / vlan markers (or `uevent` DEVTYPE) and widen the enum. Deferred
+as an enhancement beyond the bridge-vs-physical ask in #50.
+
+- **Effort:** S (human) / M (CC)
+- **Depends on:** a backend grouping requirement that needs bond/vlan precision
+- **Files:** `fivenines_agent/network.py` (`_interface_type`), `tests/test_network.py`, `tests/fixtures/network_contract_payload.json`

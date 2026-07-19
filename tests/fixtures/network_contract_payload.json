@@ -1,0 +1,79 @@
+{
+  "description": "Shared bridge/link-speed network contract fixture between fivenines-agent and fivenines-server (issue #50: bridge saturation monitoring). Source of truth: fivenines-agent tests/fixtures/network_contract_payload.json, asserted end-to-end by tests/test_network.py::test_contract_fixture_round_trip -- with os_family forced to 'linux', interfaces()/psutil.net_io_counters mocked from 'interfaces'/'counters', and /sys/class/net modelled by 'sysfs', network() must equal payload['network']. The server ingests data['network'] == payload['network']; it consumes the new per-interface keys (interface_type, network_link_speed_bps, bridge_member_count, bridge). Saturation = rate(bytes)/network_link_speed_bps is computed for every interface whose network_link_speed_bps is non-null; a null value is 'unknown' and skips the calc. Saturation must key off network_link_speed_bps presence, NOT interface_type == 'physical' -- interface_type is a coarse grouping hint (a bond or vlan carrying the host uplink is labelled 'virtual'; paravirtual NICs are 'physical'), so gating the calc on it would drop real uplinks. 'interfaces', 'counters' and 'sysfs' are agent-side inputs the server ignores. Change the payload shape only in lockstep across both repos.",
+  "agent_min_version": "1.11.6",
+  "interfaces": ["vmbr0", "eno1", "eno2", "wg0"],
+  "sysfs": {
+    "vmbr0": {"bridge": true, "members": ["eno1", "tap100i0"], "device": false, "speed": "-1"},
+    "eno1": {"bridge": false, "members": [], "device": true, "speed": "10000"},
+    "eno2": {"bridge": false, "members": [], "device": true, "speed": "1000"},
+    "wg0": {"bridge": false, "members": [], "device": false, "speed": null}
+  },
+  "counters": {
+    "vmbr0": {"bytes_sent": 900000000, "bytes_recv": 1200000000, "packets_sent": 800000, "packets_recv": 1100000, "errin": 0, "errout": 0, "dropin": 5, "dropout": 0},
+    "eno1": {"bytes_sent": 5000000000, "bytes_recv": 8000000000, "packets_sent": 4000000, "packets_recv": 6500000, "errin": 1, "errout": 0, "dropin": 12, "dropout": 0},
+    "eno2": {"bytes_sent": 100000000, "bytes_recv": 250000000, "packets_sent": 90000, "packets_recv": 210000, "errin": 0, "errout": 0, "dropin": 0, "dropout": 0},
+    "wg0": {"bytes_sent": 30000000, "bytes_recv": 45000000, "packets_sent": 40000, "packets_recv": 52000, "errin": 0, "errout": 0, "dropin": 0, "dropout": 0}
+  },
+  "payload": {
+    "network": [
+      {
+        "vmbr0": {
+          "bytes_sent": 900000000,
+          "bytes_recv": 1200000000,
+          "packets_sent": 800000,
+          "packets_recv": 1100000,
+          "errin": 0,
+          "errout": 0,
+          "dropin": 5,
+          "dropout": 0,
+          "interface_type": "bridge",
+          "network_link_speed_bps": null,
+          "bridge_member_count": 2
+        }
+      },
+      {
+        "eno1": {
+          "bytes_sent": 5000000000,
+          "bytes_recv": 8000000000,
+          "packets_sent": 4000000,
+          "packets_recv": 6500000,
+          "errin": 1,
+          "errout": 0,
+          "dropin": 12,
+          "dropout": 0,
+          "interface_type": "physical",
+          "network_link_speed_bps": 10000000000,
+          "bridge": "vmbr0"
+        }
+      },
+      {
+        "eno2": {
+          "bytes_sent": 100000000,
+          "bytes_recv": 250000000,
+          "packets_sent": 90000,
+          "packets_recv": 210000,
+          "errin": 0,
+          "errout": 0,
+          "dropin": 0,
+          "dropout": 0,
+          "interface_type": "physical",
+          "network_link_speed_bps": 1000000000
+        }
+      },
+      {
+        "wg0": {
+          "bytes_sent": 30000000,
+          "bytes_recv": 45000000,
+          "packets_sent": 40000,
+          "packets_recv": 52000,
+          "errin": 0,
+          "errout": 0,
+          "dropin": 0,
+          "dropout": 0,
+          "interface_type": "virtual",
+          "network_link_speed_bps": null
+        }
+      }
+    ]
+  }
+}
