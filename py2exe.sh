@@ -284,6 +284,7 @@ PYI_BASE=(
     --noconfirm --onedir --name "$BINARY_NAME"
     --workpath ./build/tmp --distpath ./build --clean
     --hidden-import=scramp --hidden-import=dateutil.parser
+    --hidden-import=paho.mqtt.client
     --copy-metadata fivenines_agent --copy-metadata pg8000 --copy-metadata scramp
     --add-binary "$PYTHON_LIB:."
     --add-binary "/usr/local/lib/libcrypt.so.2:." --add-binary "/usr/local/lib/libcrypt.so.1:."

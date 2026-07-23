@@ -106,6 +106,7 @@ PYINSTALLER_ARGS="--strip \
     --hidden-import=proxmoxer.backends.https \
     --hidden-import=scramp \
     --hidden-import=dateutil.parser \
+    --hidden-import=paho.mqtt.client \
     --copy-metadata pg8000 \
     --copy-metadata scramp"
 

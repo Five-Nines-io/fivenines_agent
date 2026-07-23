@@ -90,6 +90,7 @@ $pyInstallerArgs = @(
     "--hidden-import", "wmi",
     "--hidden-import", "scramp",
     "--hidden-import", "dateutil.parser",
+    "--hidden-import", "paho.mqtt.client",
     "--copy-metadata", "pg8000",
     "--copy-metadata", "scramp",
     "--noconfirm",

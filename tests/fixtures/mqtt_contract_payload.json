@@ -1,0 +1,275 @@
+{
+  "description": "Shared MQTT contract fixture between fivenines-agent and fivenines-server. Source of truth: fivenines-agent tests/fixtures/mqtt_contract_payload.json, asserted end-to-end by tests/test_mqtt.py::test_contract_fixture_round_trip (paho's Client is mocked; each scenario's 'events' are replayed against a real MQTTManager under a deterministic clock, and manager.snapshot() at 'snapshot_at' must equal 'payload'). The server's spec posts each 'payload' under data['mqtt'] through /collect and asserts Ingesters::Agent ingests it. 'config' is the shape config['mqtt'] takes (a list of brokers). 'events' and 'max_topics' are agent-side replay inputs the server ignores. Ages are seconds (floats) computed as snapshot_at minus the recorded monotonic mark; the server anchors everything to its own received_at, so these are relative, not timestamps. Change only in lockstep across both repos.",
+  "agent_min_version": "1.12.0",
+  "scenarios": {
+    "healthy_multi_topic": {
+      "description": "A reachable broker, one monitor, two concrete topics fed by live (RETAIN=0) messages. last_live_seen_age_s tracks the newest live delivery; payloads are captured.",
+      "config": [
+        {
+          "broker_id": "prod-emqx",
+          "host": "emqx.factory.internal",
+          "port": 8883,
+          "tls": true,
+          "username": "fivenines",
+          "password": "s3cr3t",
+          "monitors": [
+            {"id": "line-status", "topic_filter": "factory/+/status", "capture_payload": true}
+          ]
+        }
+      ],
+      "events": [
+        {"at": 1000.0, "type": "connect", "reason": "Success"},
+        {"at": 1002.0, "type": "message", "topic": "factory/line1/status", "payload": "RUNNING", "retain": false},
+        {"at": 1004.0, "type": "message", "topic": "factory/line2/status", "payload": "IDLE", "retain": false},
+        {"at": 1050.0, "type": "message", "topic": "factory/line1/status", "payload": "RUNNING", "retain": false}
+      ],
+      "snapshot_at": 1060.0,
+      "payload": {
+        "brokers": {
+          "prod-emqx": {
+            "status": "connected",
+            "error": null,
+            "connected_age_s": 60.0,
+            "monitors": {
+              "line-status": {
+                "subscribed_age_s": 60.0,
+                "capped": false,
+                "topics": {
+                  "factory/line1/status": {
+                    "first_seen_age_s": 58.0,
+                    "last_message_age_s": 10.0,
+                    "last_live_seen_age_s": 10.0,
+                    "last_payload": "RUNNING",
+                    "last_payload_retained": false
+                  },
+                  "factory/line2/status": {
+                    "first_seen_age_s": 56.0,
+                    "last_message_age_s": 56.0,
+                    "last_live_seen_age_s": 56.0,
+                    "last_payload": "IDLE",
+                    "last_payload_retained": false
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "retained_only": {
+      "description": "The Uptime-Kuma anti-pattern we refuse to ship: a topic seen ONLY via a RETAIN=1 replay. last_payload is present (fresh stored state) but last_live_seen_age_s is null -- a stored status is not proof the device is alive.",
+      "config": [
+        {
+          "broker_id": "iot-hub",
+          "host": "10.20.0.5",
+          "port": 1883,
+          "tls": false,
+          "monitors": [
+            {"id": "room-temp", "topic_filter": "home/+/temperature", "capture_payload": true}
+          ]
+        }
+      ],
+      "events": [
+        {"at": 2000.0, "type": "connect", "reason": "Success"},
+        {"at": 2001.0, "type": "message", "topic": "home/kitchen/temperature", "payload": "21.5", "retain": true}
+      ],
+      "snapshot_at": 2030.0,
+      "payload": {
+        "brokers": {
+          "iot-hub": {
+            "status": "connected",
+            "error": null,
+            "connected_age_s": 30.0,
+            "monitors": {
+              "room-temp": {
+                "subscribed_age_s": 30.0,
+                "capped": false,
+                "topics": {
+                  "home/kitchen/temperature": {
+                    "first_seen_age_s": 29.0,
+                    "last_message_age_s": 29.0,
+                    "last_live_seen_age_s": null,
+                    "last_payload": "21.5",
+                    "last_payload_retained": true
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "wildcard_fanout": {
+      "description": "One wildcard monitor (sensors/#) fanning out to three concrete topics. capture_payload is false, so topic entries carry only freshness ages -- no last_payload / last_payload_retained keys.",
+      "config": [
+        {
+          "broker_id": "sensors",
+          "host": "sensors.local",
+          "port": 1883,
+          "tls": false,
+          "monitors": [
+            {"id": "all-sensors", "topic_filter": "sensors/#", "capture_payload": false}
+          ]
+        }
+      ],
+      "events": [
+        {"at": 3000.0, "type": "connect", "reason": "Success"},
+        {"at": 3010.0, "type": "message", "topic": "sensors/floor1/temp", "payload": "20", "retain": false},
+        {"at": 3011.0, "type": "message", "topic": "sensors/floor1/humidity", "payload": "40", "retain": false},
+        {"at": 3012.0, "type": "message", "topic": "sensors/floor2/temp", "payload": "22", "retain": false}
+      ],
+      "snapshot_at": 3020.0,
+      "payload": {
+        "brokers": {
+          "sensors": {
+            "status": "connected",
+            "error": null,
+            "connected_age_s": 20.0,
+            "monitors": {
+              "all-sensors": {
+                "subscribed_age_s": 20.0,
+                "capped": false,
+                "topics": {
+                  "sensors/floor1/temp": {
+                    "first_seen_age_s": 10.0,
+                    "last_message_age_s": 10.0,
+                    "last_live_seen_age_s": 10.0
+                  },
+                  "sensors/floor1/humidity": {
+                    "first_seen_age_s": 9.0,
+                    "last_message_age_s": 9.0,
+                    "last_live_seen_age_s": 9.0
+                  },
+                  "sensors/floor2/temp": {
+                    "first_seen_age_s": 8.0,
+                    "last_message_age_s": 8.0,
+                    "last_live_seen_age_s": 8.0
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "auth_failure": {
+      "description": "CONNACK rejects the credentials. status is auth_error (maps to the server's amber config_error), connected_age_s and subscribed_age_s are null, and the configured monitor is reported with NO fabricated topics.",
+      "config": [
+        {
+          "broker_id": "secure-broker",
+          "host": "secure.example.com",
+          "port": 8883,
+          "tls": true,
+          "username": "fivenines",
+          "password": "wrong",
+          "monitors": [
+            {"id": "commands", "topic_filter": "cmd/#", "capture_payload": true}
+          ]
+        }
+      ],
+      "events": [
+        {"at": 4000.0, "type": "connect", "reason": "Not authorized"}
+      ],
+      "snapshot_at": 4005.0,
+      "payload": {
+        "brokers": {
+          "secure-broker": {
+            "status": "auth_error",
+            "error": "Not authorized",
+            "connected_age_s": null,
+            "monitors": {
+              "commands": {
+                "subscribed_age_s": null,
+                "capped": false,
+                "topics": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "broker_unreachable": {
+      "description": "The broker is not accepting connections. status is error with a detail, ages are null, no topics are fabricated -- failure is distinguishable from a healthy-but-empty broker.",
+      "config": [
+        {
+          "broker_id": "offline-broker",
+          "host": "192.0.2.10",
+          "port": 1883,
+          "tls": false,
+          "monitors": [
+            {"id": "telemetry", "topic_filter": "data/#", "capture_payload": true}
+          ]
+        }
+      ],
+      "events": [
+        {"at": 5000.0, "type": "connect", "reason": "Server unavailable"}
+      ],
+      "snapshot_at": 5005.0,
+      "payload": {
+        "brokers": {
+          "offline-broker": {
+            "status": "error",
+            "error": "Server unavailable",
+            "connected_age_s": null,
+            "monitors": {
+              "telemetry": {
+                "subscribed_age_s": null,
+                "capped": false,
+                "topics": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "capped_discovery": {
+      "description": "A topic storm under one wildcard monitor. Discovery stops at the per-monitor cap (max_topics here overrides MAX_TOPICS_PER_MONITOR to 2 for a compact fixture) and the capped flag is raised; already-tracked topics keep updating, the overflow topic is dropped.",
+      "config": [
+        {
+          "broker_id": "storm",
+          "host": "storm.local",
+          "port": 1883,
+          "tls": false,
+          "monitors": [
+            {"id": "heartbeats", "topic_filter": "dev/+/beat", "capture_payload": false}
+          ]
+        }
+      ],
+      "max_topics": 2,
+      "events": [
+        {"at": 6000.0, "type": "connect", "reason": "Success"},
+        {"at": 6001.0, "type": "message", "topic": "dev/a/beat", "payload": "1", "retain": false},
+        {"at": 6002.0, "type": "message", "topic": "dev/b/beat", "payload": "1", "retain": false},
+        {"at": 6003.0, "type": "message", "topic": "dev/c/beat", "payload": "1", "retain": false}
+      ],
+      "snapshot_at": 6010.0,
+      "payload": {
+        "brokers": {
+          "storm": {
+            "status": "connected",
+            "error": null,
+            "connected_age_s": 10.0,
+            "monitors": {
+              "heartbeats": {
+                "subscribed_age_s": 10.0,
+                "capped": true,
+                "topics": {
+                  "dev/a/beat": {
+                    "first_seen_age_s": 9.0,
+                    "last_message_age_s": 9.0,
+                    "last_live_seen_age_s": 9.0
+                  },
+                  "dev/b/beat": {
+                    "first_seen_age_s": 8.0,
+                    "last_message_age_s": 8.0,
+                    "last_live_seen_age_s": 8.0
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

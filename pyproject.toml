@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "fivenines_agent"
-version = "1.11.7"
+version = "1.12.0"
 description = ""
 authors = ["Sebastien Puyet <sebastien@fivenines.io>"]
 license = "WTFPL"
@@ -19,6 +19,13 @@ requests = "^2.33.0"
 # on both glibc and musl with no shared-library handling. Pulls scramp +
 # python-dateutil transitively (locked in poetry.lock, no security floor).
 pg8000 = "^1.31.5"
+# Pure-Python MQTT client for the mqtt collector (the agent's first long-lived
+# connection). Chosen over a mosquitto_sub subprocess because a persistent
+# subscription is a poor fit for subprocess supervision, and paho exposes
+# msg.retain -- the retained-vs-live flag the collector's honesty hangs on. No C
+# extension, so it bundles into the PyInstaller binary with no shared-library
+# handling. paho pulls no runtime dependencies of its own.
+paho-mqtt = "^2.1.0"
 # Security floor: GHSA-pq67-6m6q-mj2v (decompression bomb), GHSA-48p4-8xcf-vxj5 (header leak across origins). Brought in transitively by requests/docker; pinned here so future lock regenerations cannot drop below the patched line.
 urllib3 = "^2.7.0"
 

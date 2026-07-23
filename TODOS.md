@@ -230,3 +230,28 @@ as an enhancement beyond the bridge-vs-physical ask in #50.
 - **Effort:** S (human) / M (CC)
 - **Depends on:** a backend grouping requirement that needs bond/vlan precision
 - **Files:** `fivenines_agent/network.py` (`_interface_type`), `tests/test_network.py`, `tests/fixtures/network_contract_payload.json`
+
+## P3: MQTT collector - v1 protocol/transport fast-follows
+
+Issue #92 v1 deliberately scoped MQTT to 3.1.1 over TCP/TLS with QoS 0 + clean
+session, username/password auth, subscribe-only. Deferred, each a complete
+follow-up gated on demand:
+- **MQTT 5** - richer reason codes + subscription options; `_connect_status`
+  already normalizes v3/v5 reason codes, so this is mostly a protocol flag + a
+  callback-signature pass.
+- **WebSockets transport** - `transport="websockets"` for brokers behind a
+  reverse proxy / cloud MQTT (HiveMQ Cloud, AWS IoT over WSS).
+- **mTLS client certificates** - `tls_set(certfile=, keyfile=)` for brokers that
+  require a client cert; needs a secret-delivery path for the key material.
+- **`tls_insecure` opt-in** - v1 always verifies the broker cert (system CAs +
+  hostname). Self-signed customer brokers need an explicit per-broker
+  insecure/`ca_certs` override, wired from the dashboard.
+- **Active liveness probe (publish)** - v1 never publishes; an optional
+  round-trip publish to a canary topic would distinguish "broker up but device
+  silent" from "broker reachable" more sharply than passive freshness.
+
+- **Effort:** varies / mostly M (CC)
+- **Depends on:** MQTT v1 in production + demand signal (e.g. a customer broker
+  that needs WSS or a self-signed cert)
+- **Files:** `fivenines_agent/mqtt.py` (`_BrokerClient._build_client`,
+  `_connect_status`), `tests/test_mqtt.py`, `tests/fixtures/mqtt_contract_payload.json`

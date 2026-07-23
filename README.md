@@ -282,6 +282,31 @@ sudo apk add net-snmp-tools
 3. The agent polls devices concurrently using `snmpget`/`snmpbulkwalk`
 4. Per-device polling intervals are configurable from the dashboard
 
+## MQTT Broker Monitoring
+
+Requires agent version **1.12.0+**. When MQTT monitoring is enabled for a host in the fivenines dashboard, the agent keeps a persistent background subscription to each configured broker and reports per-topic freshness every tick. This is the agent's first long-lived-connection feature; it relies on the bundled `paho-mqtt` client's own network thread, so nothing extra needs installing on the host.
+
+### Scope (v1)
+
+- MQTT **3.1.1** over TCP or **TLS**, username/password auth
+- Subscriptions at **QoS 0 with a clean session** (the agent never publishes)
+- Out of scope: MQTT 5, WebSockets transport, mTLS client certificates
+
+### Collected Metrics
+
+**Per broker:** connection `status` (connected / error / auth_error), an `error` detail, and `connected_age_s`.
+
+**Per monitor** (a subscription filter, e.g. `iot/+/status`): `subscribed_age_s` (the alarm-arming input) and a `capped` flag, grouped by the concrete topics seen under it.
+
+**Per topic:** `last_message_age_s` (any delivery), `last_live_seen_age_s` (RETAIN=0 deliveries **only** -- a stored retained replay is never counted as device liveness), `first_seen_age_s`, and, when payload capture is enabled, a truncated `last_payload` plus `last_payload_retained`. Everything is reported as an age in seconds, so the backend anchors freshness to its own receive time and agent clock drift is irrelevant.
+
+### How It Works
+
+1. Add MQTT brokers + topic monitors in the fivenines dashboard (host/port/TLS/credentials + topic filters)
+2. The server sends the `mqtt` broker list to the agent via `sync_config`
+3. Each tick the agent diffs desired-vs-current and only starts, stops, or resubscribes on an actual change (it never reconnects on an unchanged config, which would re-trigger retained replays)
+4. A bounded per-topic snapshot is reported under `data["mqtt"]`; discovery is capped per monitor to bound memory under a topic storm
+
 ## Ceph Cluster Monitoring
 
 Requires agent version **1.9.0+**. When Ceph monitoring is enabled for a host in the fivenines dashboard, the agent polls `ceph status`, `ceph df` and `ceph osd tree` and reports cluster health (status + active checks), monitor quorum, OSD up/in counts, PG states (degraded/inactive/undersized), raw capacity and per-host OSD counts. Multiple clusters per host are supported (each entry can carry its own `--cluster` name, config file and keyring).
