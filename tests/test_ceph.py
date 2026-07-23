@@ -98,17 +98,39 @@ def test_poll_full_success(clock):
         "pgmap": {
             "num_pgs": 10,
             "pgs_by_state": [{"state_name": "active+clean", "count": 10}],
+            "read_bytes_sec": 2048,
+            "write_op_per_sec": 7,
+            "misplaced_objects": 3,
         },
     }
     df = {
-        "stats": {"total_bytes": 100, "total_used_bytes": 40, "total_avail_bytes": 60}
+        "stats": {"total_bytes": 100, "total_used_bytes": 40, "total_avail_bytes": 60},
+        "pools": [
+            {"name": "rbd", "id": 2, "stats": {"stored": 40, "objects": 5,
+                                               "percent_used": 0.4, "max_avail": 60}}
+        ],
     }
     tree = {"nodes": [{"type": "host", "name": "h1", "children": [0, 1]}]}
+    perf = {
+        "osdstats": {
+            "osd_perf_infos": [
+                {"id": 0, "perf_stats": {"commit_latency_ms": 2, "apply_latency_ms": 2}}
+            ]
+        }
+    }
+    osd_df = {
+        "nodes": [
+            {"id": 0, "name": "osd.0", "kb": 100, "kb_used": 40, "kb_avail": 60,
+             "utilization": 40.0, "status": "up"}
+        ]
+    }
     runner = _fake_cmd_runner(
         {
             ("status",): (status, None),
             ("df",): (df, None),
             ("osd", "tree"): (tree, None),
+            ("osd", "perf"): (perf, None),
+            ("osd", "df"): (osd_df, None),
         }
     )
     with patch.object(ceph, "_run_ceph_cached", runner):
@@ -119,6 +141,8 @@ def test_poll_full_success(clock):
         "status_ok": True,
         "df_ok": True,
         "tree_ok": True,
+        "perf_ok": True,
+        "osd_df_ok": True,
         "error": None,
     }
     assert r["fsid"] == "abc"
@@ -126,7 +150,29 @@ def test_poll_full_success(clock):
     assert r["mon"] == {"in_quorum": 3, "total": 3}
     assert r["osd"] == {"up": 3, "in": 3, "total": 3}
     assert r["pg"] == {"total": 10, "degraded": 0, "inactive": 0, "undersized": 0}
+    # io/recovery: present keys forwarded, absent keys normalized to 0.
+    assert r["io"] == {
+        "read_bytes_sec": 2048,
+        "write_bytes_sec": 0,
+        "read_op_per_sec": 0,
+        "write_op_per_sec": 7,
+    }
+    assert r["recovery"]["misplaced_objects"] == 3
+    assert r["recovery"]["degraded_total"] == 0
+    assert r["osd_fullness"] == {"nearfull": None, "full": None}
     assert r["capacity"] == {"total_bytes": 100, "used_bytes": 40, "avail_bytes": 60}
+    assert r["pools"] == [
+        {"name": "rbd", "id": 2, "stored_bytes": 40, "objects": 5,
+         "percent_used": 0.4, "max_avail_bytes": 60}
+    ]
+    assert r["pools_truncated"] is False
+    assert r["osd_perf"] == [{"id": 0, "commit_latency_ms": 2, "apply_latency_ms": 2}]
+    assert r["osd_perf_truncated"] is False
+    assert r["osd_df"] == [
+        {"id": 0, "name": "osd.0", "utilization": 40.0, "total_bytes": 102400,
+         "used_bytes": 40960, "avail_bytes": 61440, "status": "up"}
+    ]
+    assert r["osd_df_truncated"] is False
     assert r["hosts"] == [{"host": "h1", "osd_count": 2}]
 
 
@@ -545,6 +591,343 @@ def test_metrics_tolerates_extra_config_keys(clock):
     assert out == {"clusters": [{"configured_name": "a"}]}
 
 
+# --- v2: io / recovery / osd_fullness (from status) ------------------------
+
+
+def test_parse_io_absent_keys_zero_filled():
+    # Idle cluster: mgr omits the io keys -> normalized to 0, object still emitted.
+    assert ceph._parse_io({"pgmap": {}}) == {
+        "read_bytes_sec": 0,
+        "write_bytes_sec": 0,
+        "read_op_per_sec": 0,
+        "write_op_per_sec": 0,
+    }
+
+
+def test_parse_io_non_dict_pgmap():
+    assert ceph._parse_io({"pgmap": "weird"}) == {
+        "read_bytes_sec": 0,
+        "write_bytes_sec": 0,
+        "read_op_per_sec": 0,
+        "write_op_per_sec": 0,
+    }
+
+
+def test_parse_io_forwards_present_values():
+    out = ceph._parse_io(
+        {
+            "pgmap": {
+                "read_bytes_sec": 10,
+                "write_bytes_sec": 20,
+                "read_op_per_sec": 3,
+                "write_op_per_sec": 4,
+            }
+        }
+    )
+    assert out == {
+        "read_bytes_sec": 10,
+        "write_bytes_sec": 20,
+        "read_op_per_sec": 3,
+        "write_op_per_sec": 4,
+    }
+
+
+def test_num_or_zero_variants():
+    assert ceph._num_or_zero(5) == 5
+    assert ceph._num_or_zero(1.5) == 1.5
+    assert ceph._num_or_zero(None) == 0
+    assert ceph._num_or_zero("x") == 0
+    assert ceph._num_or_zero(True) == 0  # bool is an int subclass -> rejected
+
+
+def test_parse_recovery_absent_and_present():
+    out = ceph._parse_recovery({"pgmap": {"misplaced_objects": 7, "degraded_total": 9}})
+    assert out == {
+        "recovering_objects_per_sec": 0,
+        "recovering_bytes_per_sec": 0,
+        "misplaced_objects": 7,
+        "misplaced_total": 0,
+        "degraded_objects": 0,
+        "degraded_total": 9,
+    }
+
+
+def test_parse_recovery_non_dict_pgmap():
+    assert ceph._parse_recovery({"pgmap": None})["misplaced_objects"] == 0
+
+
+def test_parse_osd_fullness_count_path():
+    status = {
+        "health": {
+            "checks": {
+                "OSD_NEARFULL": {
+                    "summary": {"message": "3 nearfull osd(s)", "count": 3}
+                },
+                "OSD_FULL": {"summary": {"message": "1 full osd(s)", "count": 1}},
+            }
+        }
+    }
+    assert ceph._parse_osd_fullness(status) == {"nearfull": 3, "full": 1}
+
+
+def test_parse_osd_fullness_message_fallback():
+    # No count key -> parse the leading integer of the human message.
+    status = {
+        "health": {"checks": {"OSD_NEARFULL": {"summary": {"message": "5 nearfull"}}}}
+    }
+    assert ceph._parse_osd_fullness(status) == {"nearfull": 5, "full": None}
+
+
+def test_parse_osd_fullness_absent_checks_are_null():
+    # Healthy cluster: no nearfull/full checks -> null (unknown), never a faked 0.
+    assert ceph._parse_osd_fullness({"health": {"checks": {}}}) == {
+        "nearfull": None,
+        "full": None,
+    }
+
+
+def test_parse_osd_fullness_health_non_dict():
+    assert ceph._parse_osd_fullness({"health": "HEALTH_OK"}) == {
+        "nearfull": None,
+        "full": None,
+    }
+
+
+def test_parse_osd_fullness_checks_non_dict():
+    assert ceph._parse_osd_fullness({"health": {"checks": "weird"}}) == {
+        "nearfull": None,
+        "full": None,
+    }
+
+
+def test_extract_fullness_count_bool_count_falls_back_to_message():
+    # bool count is rejected (int subclass); the message is parsed instead.
+    check = {"summary": {"message": "4 nearfull osd(s)", "count": True}}
+    assert ceph._extract_fullness_count(check) == 4
+
+
+def test_extract_fullness_count_summary_non_dict():
+    assert ceph._extract_fullness_count({"summary": "x"}) is None
+
+
+def test_extract_fullness_count_unparseable_message_is_none():
+    # Present-but-unparseable check -> None, NOT a fabricated 0 (would silence
+    # a real nearfull/full alert).
+    assert ceph._extract_fullness_count({"summary": {"message": "osds nearfull"}}) is None
+
+
+def test_extract_fullness_count_non_str_message_is_none():
+    assert ceph._extract_fullness_count({"summary": {"message": 123}}) is None
+
+
+def test_leading_int_no_digits():
+    assert ceph._leading_int("no number here") is None
+
+
+# --- v2: pools (from df) ---------------------------------------------------
+
+
+def test_parse_pools_non_list():
+    assert ceph._parse_pools({"pools": "weird"}) == ([], False)
+    assert ceph._parse_pools({}) == ([], False)
+
+
+def test_parse_pools_maps_and_skips_non_dict():
+    df = {
+        "pools": [
+            "notadict",
+            {
+                "name": "rbd",
+                "id": 2,
+                "stats": {
+                    "stored": 40,
+                    "objects": 5,
+                    "percent_used": 0.4,
+                    "max_avail": 60,
+                },
+            },
+        ]
+    }
+    pools, truncated = ceph._parse_pools(df)
+    assert truncated is False
+    assert pools == [
+        {
+            "name": "rbd",
+            "id": 2,
+            "stored_bytes": 40,
+            "objects": 5,
+            "percent_used": 0.4,
+            "max_avail_bytes": 60,
+        }
+    ]
+
+
+def test_parse_pools_stats_non_dict():
+    df = {"pools": [{"name": "p", "id": 1, "stats": "weird"}]}
+    pools, _ = ceph._parse_pools(df)
+    assert pools == [
+        {
+            "name": "p",
+            "id": 1,
+            "stored_bytes": None,
+            "objects": None,
+            "percent_used": None,
+            "max_avail_bytes": None,
+        }
+    ]
+
+
+def test_parse_pools_truncation(monkeypatch):
+    monkeypatch.setattr(ceph, "POOLS_CAP", 2)
+    df = {"pools": [{"name": "a"}, {"name": "b"}, {"name": "c"}]}
+    pools, truncated = ceph._parse_pools(df)
+    assert truncated is True
+    assert len(pools) == 2
+
+
+# --- v2: osd_perf / osd_df (new commands) ----------------------------------
+
+
+def test_kb_to_bytes_variants():
+    assert ceph._kb_to_bytes(1) == 1024
+    assert ceph._kb_to_bytes(2.5) == 2560
+    assert ceph._kb_to_bytes(None) is None
+    assert ceph._kb_to_bytes("x") is None
+    assert ceph._kb_to_bytes(True) is None  # bool rejected
+
+
+def test_osd_perf_infos_nested_shape():
+    assert ceph._osd_perf_infos({"osdstats": {"osd_perf_infos": [{"id": 0}]}}) == [
+        {"id": 0}
+    ]
+
+
+def test_osd_perf_infos_legacy_top_level_shape():
+    assert ceph._osd_perf_infos({"osd_perf_infos": [{"id": 1}]}) == [{"id": 1}]
+
+
+def test_osd_perf_infos_nested_non_list_falls_through():
+    # osdstats present but osd_perf_infos not a list -> top-level absent -> [].
+    assert ceph._osd_perf_infos({"osdstats": {"osd_perf_infos": "x"}}) == []
+
+
+def test_osd_perf_infos_neither_shape():
+    assert ceph._osd_perf_infos({}) == []
+
+
+def test_parse_osd_perf_maps_and_skips_non_dict():
+    perf = {
+        "osdstats": {
+            "osd_perf_infos": [
+                "notadict",
+                {
+                    "id": 0,
+                    "perf_stats": {"commit_latency_ms": 3, "apply_latency_ms": 4},
+                },
+            ]
+        }
+    }
+    result, truncated = ceph._parse_osd_perf(perf)
+    assert truncated is False
+    assert result == [{"id": 0, "commit_latency_ms": 3, "apply_latency_ms": 4}]
+
+
+def test_parse_osd_perf_perf_stats_non_dict():
+    perf = {"osd_perf_infos": [{"id": 2, "perf_stats": "weird"}]}
+    result, _ = ceph._parse_osd_perf(perf)
+    assert result == [{"id": 2, "commit_latency_ms": None, "apply_latency_ms": None}]
+
+
+def test_parse_osd_perf_truncation(monkeypatch):
+    monkeypatch.setattr(ceph, "OSD_CAP", 1)
+    perf = {"osdstats": {"osd_perf_infos": [{"id": 0}, {"id": 1}]}}
+    result, truncated = ceph._parse_osd_perf(perf)
+    assert truncated is True
+    assert len(result) == 1
+
+
+def test_parse_osd_df_non_list_nodes():
+    assert ceph._parse_osd_df({"nodes": "weird"}) == ([], False)
+    assert ceph._parse_osd_df({}) == ([], False)
+
+
+def test_parse_osd_df_maps_kb_and_skips_non_dict():
+    osd_df = {
+        "nodes": [
+            "notadict",
+            {
+                "id": 0,
+                "name": "osd.0",
+                "kb": 100,
+                "kb_used": 40,
+                "kb_avail": 60,
+                "utilization": 40.0,
+                "status": "up",
+            },
+        ]
+    }
+    result, truncated = ceph._parse_osd_df(osd_df)
+    assert truncated is False
+    assert result == [
+        {
+            "id": 0,
+            "name": "osd.0",
+            "utilization": 40.0,
+            "total_bytes": 102400,
+            "used_bytes": 40960,
+            "avail_bytes": 61440,
+            "status": "up",
+        }
+    ]
+
+
+def test_parse_osd_df_absent_kb_fields_are_none():
+    osd_df = {"nodes": [{"id": 1, "name": "osd.1", "utilization": 0.0, "status": "up"}]}
+    result, _ = ceph._parse_osd_df(osd_df)
+    assert result == [
+        {
+            "id": 1,
+            "name": "osd.1",
+            "utilization": 0.0,
+            "total_bytes": None,
+            "used_bytes": None,
+            "avail_bytes": None,
+            "status": "up",
+        }
+    ]
+
+
+def test_parse_osd_df_truncation(monkeypatch):
+    monkeypatch.setattr(ceph, "OSD_CAP", 1)
+    osd_df = {"nodes": [{"id": 0}, {"id": 1}]}
+    result, truncated = ceph._parse_osd_df(osd_df)
+    assert truncated is True
+    assert len(result) == 1
+
+
+def test_poll_perf_and_osd_df_failure_isolated(clock):
+    # A perf/osd_df command failure must NOT touch the core sections: the two
+    # *_ok flags stay False and the values stay None, like df/tree isolation.
+    status = {"fsid": "abc", "health": "HEALTH_OK"}
+    runner = _fake_cmd_runner(
+        {
+            ("status",): (status, None),
+            ("df",): ({"stats": {"total_bytes": 1}}, None),
+            ("osd", "tree"): ({"nodes": []}, None),
+        }  # osd perf + osd df unmapped -> _fake_cmd_runner returns a ceph_error
+    )
+    with patch.object(ceph, "_run_ceph_cached", runner), patch.object(ceph, "log"):
+        r = ceph._poll_cluster({"name": "ceph"})
+    assert r["collection"]["status_ok"] is True
+    assert r["collection"]["df_ok"] is True
+    assert r["collection"]["perf_ok"] is False
+    assert r["collection"]["osd_df_ok"] is False
+    assert r["osd_perf"] is None
+    assert r["osd_df"] is None
+    assert r["osd_perf_truncated"] is False
+    assert r["osd_df_truncated"] is False
+
+
 # --- cross-repo contract (fivenines-server) ---------------------------------
 
 
@@ -596,12 +979,20 @@ def test_config_key_names_match_server_contract(clock):
 
 # Canned `ceph ... -f json` CLI outputs backing the shared fixture. Realistic
 # (Reef-era) shapes trimmed to the fields the parsers read: 3 mons in quorum,
-# 1 of 3 OSDs down, 12 PGs undersized+degraded, 2 CRUSH host buckets.
+# 1 of 3 OSDs down, 2 nearfull, 12 PGs undersized+degraded, 2 CRUSH host
+# buckets, active client I/O + a recovery in progress.
 _CLI_STATUS = {
     "fsid": "3f6ad3d1-8f6e-4a5b-9e6c-2f4a1b8c9d0e",
     "health": {
         "status": "HEALTH_WARN",
-        "checks": {"OSD_DOWN": {"severity": "HEALTH_WARN"}},
+        "checks": {
+            "OSD_DOWN": {"severity": "HEALTH_WARN"},
+            # count present -> used directly; OSD_FULL absent -> full is null.
+            "OSD_NEARFULL": {
+                "severity": "HEALTH_WARN",
+                "summary": {"message": "2 nearfull osd(s)", "count": 2},
+            },
+        },
     },
     "quorum": [0, 1, 2],
     "monmap": {"mons": [{"name": "a"}, {"name": "b"}, {"name": "c"}]},
@@ -612,6 +1003,16 @@ _CLI_STATUS = {
             {"state_name": "active+clean", "count": 117},
             {"state_name": "active+undersized+degraded", "count": 12},
         ],
+        "read_bytes_sec": 104857600,
+        "write_bytes_sec": 52428800,
+        "read_op_per_sec": 1500,
+        "write_op_per_sec": 750,
+        "recovering_objects_per_sec": 240,
+        "recovering_bytes_per_sec": 1006632960,
+        "misplaced_objects": 1024,
+        "misplaced_total": 200000,
+        "degraded_objects": 512,
+        "degraded_total": 200000,
     },
 }
 _CLI_DF = {
@@ -619,7 +1020,29 @@ _CLI_DF = {
         "total_bytes": 32212254720,
         "total_used_bytes": 12884901888,
         "total_avail_bytes": 19327352832,
-    }
+    },
+    "pools": [
+        {
+            "name": "device_health_metrics",
+            "id": 1,
+            "stats": {
+                "stored": 0,
+                "objects": 0,
+                "percent_used": 0.0,
+                "max_avail": 6120000000,
+            },
+        },
+        {
+            "name": "rbd",
+            "id": 2,
+            "stats": {
+                "stored": 6442450944,
+                "objects": 1580,
+                "percent_used": 0.1,
+                "max_avail": 6120000000,
+            },
+        },
+    ],
 }
 _CLI_TREE = {
     "nodes": [
@@ -630,6 +1053,31 @@ _CLI_TREE = {
         {"id": 1, "name": "osd.1", "type": "osd"},
         {"id": 2, "name": "osd.2", "type": "osd"},
     ]
+}
+# Nautilus+ nests the perf list under osdstats; the parser also accepts the
+# older top-level osd_perf_infos shape (see test_parse_osd_perf_legacy_shape).
+_CLI_OSD_PERF = {
+    "osdstats": {
+        "osd_perf_infos": [
+            {"id": 0, "perf_stats": {"commit_latency_ms": 3, "apply_latency_ms": 3}},
+            {"id": 1, "perf_stats": {"commit_latency_ms": 5, "apply_latency_ms": 5}},
+            {"id": 2, "perf_stats": {"commit_latency_ms": 1, "apply_latency_ms": 1}},
+        ]
+    }
+}
+# kb_* fields (KiB) are converted to bytes (x1024) by the agent. Each OSD is
+# 10 GiB; osd.1 is 80% full, osd.2 is down.
+_CLI_OSD_DF = {
+    "nodes": [
+        {"id": 0, "name": "osd.0", "kb": 10485760, "kb_used": 4194304,
+         "kb_avail": 6291456, "utilization": 40.0, "status": "up"},
+        {"id": 1, "name": "osd.1", "kb": 10485760, "kb_used": 8388608,
+         "kb_avail": 2097152, "utilization": 80.0, "status": "up"},
+        {"id": 2, "name": "osd.2", "kb": 10485760, "kb_used": 2097152,
+         "kb_avail": 8388608, "utilization": 20.0, "status": "down"},
+    ],
+    "stray": [],
+    "summary": {"total_kb": 31457280, "average_utilization": 46.67},
 }
 
 _FIXTURE_PATH = os.path.join(
@@ -655,14 +1103,21 @@ def test_contract_fixture_round_trip(clock):
         fixture = json.load(f)
 
     def fake_run(argv, **kwargs):
+        # Route on the most specific token first: `osd tree`/`osd perf` both
+        # carry "osd", and `osd df` shares "df" with plain `df`, so the unique
+        # verbs (tree/perf) are matched before the generic "osd"/"df" fallbacks.
         if "edge" in argv:  # second cluster: unreachable
             return _FakeProc(1, "", "unable to connect to cluster")
         if "status" in argv:
             return _FakeProc(0, json.dumps(_CLI_STATUS))
-        if "df" in argv:
-            return _FakeProc(0, json.dumps(_CLI_DF))
-        assert "tree" in argv, "unexpected ceph subcommand: {}".format(argv)
-        return _FakeProc(0, json.dumps(_CLI_TREE))
+        if "tree" in argv:
+            return _FakeProc(0, json.dumps(_CLI_TREE))
+        if "perf" in argv:
+            return _FakeProc(0, json.dumps(_CLI_OSD_PERF))
+        if "osd" in argv:  # osd df (osd + df, after tree/perf ruled out)
+            return _FakeProc(0, json.dumps(_CLI_OSD_DF))
+        assert "df" in argv, "unexpected ceph subcommand: {}".format(argv)
+        return _FakeProc(0, json.dumps(_CLI_DF))
 
     with patch.object(ceph.shutil, "which", lambda _: "/usr/bin/ceph"), patch.object(
         ceph.subprocess, "run", fake_run
@@ -679,5 +1134,7 @@ def test_contract_fixture_round_trip(clock):
             "status_ok",
             "df_ok",
             "tree_ok",
+            "perf_ok",
+            "osd_df_ok",
             "error",
         }
