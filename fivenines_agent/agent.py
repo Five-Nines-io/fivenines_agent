@@ -39,6 +39,7 @@ from fivenines_agent.log_capture import CaptureCoordinator, evaluate_and_enqueue
 from fivenines_agent.log_uploader import LogUploader
 from fivenines_agent.logs import build_capture_bundle
 from fivenines_agent.machine_id import get_machine_id
+from fivenines_agent.mqtt import mqtt_metrics, shutdown_mqtt
 from fivenines_agent.packages import packages_sync
 from fivenines_agent.permissions import get_permissions, print_capabilities_banner
 from fivenines_agent.ping import tcp_ping
@@ -301,6 +302,18 @@ class Agent:
             data["snmp_metrics"] = self._collect(
                 "snmp_metrics", snmp_metrics, snmp_targets
             )
+        # MQTT: persistent background subscriptions. Reconcile runs on every
+        # collection tick (this enabled path) even when the key is absent, so
+        # removing the config tears the clients down; the snapshot is None until
+        # a broker is configured, so data["mqtt"] stays absent for unconfigured
+        # hosts (old servers see no new key). A live-but-failing broker returns
+        # an error envelope (not None), so a real failure is never confused with
+        # "unconfigured". (A host toggled disabled skips collection entirely and
+        # keeps its clients until re-enable or shutdown -- like every collector,
+        # MQTT is tied to the enabled loop; teardown-on-disable is deferred.)
+        mqtt_snapshot = self._collect("mqtt", mqtt_metrics, self.config.get("mqtt"))
+        if mqtt_snapshot is not None:
+            data["mqtt"] = mqtt_snapshot
 
     def _collect_file_handles(self, data):
         """Emit file-handle metrics under OS-appropriate keys (D2/D10).
@@ -549,4 +562,8 @@ class Agent:
             self.log_uploader.stop()
             self.log_queue.put(None)
             self.log_uploader.join()
+        # Tear down the persistent MQTT clients (loop_stop + disconnect) so no
+        # paho network threads leak past shutdown. No-op when MQTT was never
+        # configured (the manager singleton is still None).
+        shutdown_mqtt()
         sys.exit(0)
