@@ -1,5 +1,5 @@
 {
-  "description": "Shared MQTT contract fixture between fivenines-agent and fivenines-server. Source of truth: fivenines-agent tests/fixtures/mqtt_contract_payload.json, asserted end-to-end by tests/test_mqtt.py::test_contract_fixture_round_trip (paho's Client is mocked; each scenario's 'events' are replayed against a real MQTTManager under a deterministic clock, and manager.snapshot() at 'snapshot_at' must equal 'payload'). The server's spec posts each 'payload' under data['mqtt'] through /collect and asserts Ingesters::Agent ingests it. 'config' is the shape config['mqtt'] takes (a list of brokers). 'events' and 'max_topics' are agent-side replay inputs the server ignores. Ages are seconds (floats) computed as snapshot_at minus the recorded monotonic mark; the server anchors everything to its own received_at, so these are relative, not timestamps. Change only in lockstep across both repos.",
+  "description": "Shared MQTT contract fixture between fivenines-agent and fivenines-server. Source of truth: fivenines-agent tests/fixtures/mqtt_contract_payload.json, asserted end-to-end by tests/test_mqtt.py::test_contract_fixture_round_trip (paho's Client is mocked; each scenario's 'events' are replayed against a real MQTTManager under a deterministic clock, and manager.snapshot() at 'snapshot_at' must equal 'payload'). The server's spec posts each 'payload' under data['mqtt'] through /collect and asserts Ingesters::Agent ingests it. 'config' is the shape config['mqtt'] takes (a list of brokers). 'events' and 'max_topics' are agent-side replay inputs the server ignores. Ages are seconds (floats) computed as snapshot_at minus the recorded monotonic mark; the server anchors everything to its own received_at, so these are relative, not timestamps. Absence semantics (server-side rule, no agent-visible payload -- so pinned here, not as a scenario): the whole data['mqtt'] key is ABSENT both when the feature is unconfigured AND when the collector raises (the agent's per-collector wrapper swallows the exception and emits nothing), so the server disambiguates 'unconfigured' from 'collection failed' only from what it configured, and must never synthesize a healthy-empty shape for a configured host that reported no key. Likewise a broker whose client construction fails is OMITTED from the 'brokers' map (the key is present, that broker_id is not) -- treat a configured-but-missing broker_id as collection-failed, never as removed. A broker that connected then dropped is NOT absent: it reports a status:error envelope with its topics retained (see disconnected_after_data) so staleness alarms stay gated. Change only in lockstep across both repos.",
   "agent_min_version": "1.12.0",
   "scenarios": {
     "healthy_multi_topic": {
@@ -263,6 +263,60 @@
                     "first_seen_age_s": 8.0,
                     "last_message_age_s": 8.0,
                     "last_live_seen_age_s": 8.0
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "disconnected_after_data": {
+      "description": "The safety-critical GATE state: a broker that connected, collected live topics, then dropped. status is error and BOTH connected_age_s and subscribed_age_s are null (we can no longer vouch), but the topics SURVIVE the drop with their growing last-observed ages -- the server anchors staleness to last_live_seen_age_s while treating the broker as failed, and must NOT fire a freshness alarm the instant a broker blips (the disconnect envelope is the signal). Events: connect -> two live messages -> disconnect -> snapshot.",
+      "config": [
+        {
+          "broker_id": "plant-mqtt",
+          "host": "plant.internal",
+          "port": 8883,
+          "tls": true,
+          "username": "fivenines",
+          "password": "s3cr3t",
+          "monitors": [
+            {"id": "reactors", "topic_filter": "plant/+/temp", "capture_payload": true}
+          ]
+        }
+      ],
+      "events": [
+        {"at": 7000.0, "type": "connect", "reason": "Success"},
+        {"at": 7005.0, "type": "message", "topic": "plant/reactor1/temp", "payload": "300", "retain": false},
+        {"at": 7010.0, "type": "message", "topic": "plant/reactor2/temp", "payload": "305", "retain": false},
+        {"at": 7020.0, "type": "disconnect", "reason": "Keep alive timeout"}
+      ],
+      "snapshot_at": 7040.0,
+      "payload": {
+        "brokers": {
+          "plant-mqtt": {
+            "status": "error",
+            "error": "disconnected: Keep alive timeout",
+            "connected_age_s": null,
+            "monitors": {
+              "reactors": {
+                "subscribed_age_s": null,
+                "capped": false,
+                "topics": {
+                  "plant/reactor1/temp": {
+                    "first_seen_age_s": 35.0,
+                    "last_message_age_s": 35.0,
+                    "last_live_seen_age_s": 35.0,
+                    "last_payload": "300",
+                    "last_payload_retained": false
+                  },
+                  "plant/reactor2/temp": {
+                    "first_seen_age_s": 30.0,
+                    "last_message_age_s": 30.0,
+                    "last_live_seen_age_s": 30.0,
+                    "last_payload": "305",
+                    "last_payload_retained": false
                   }
                 }
               }

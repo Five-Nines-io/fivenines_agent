@@ -531,6 +531,29 @@ def test_update_new_monitor_while_connected_is_armed(h):
     assert bc.monitors["m2"].subscribed_at == 70.0
 
 
+def test_resubscribe_refused_does_not_arm(h):
+    # subscribe() returns NO_CONN (rc=4) without raising -- the monitor must NOT
+    # be armed, so subscribed_age_s stays null (truthful).
+    bc = m._BrokerClient(_broker(monitors=[{"id": "m1", "topic_filter": "a/#"}]))
+    bc._client.subscribe.return_value = (4, None)  # MQTT_ERR_NO_CONN
+    _connect(bc)
+    assert bc.status == "connected"  # CONNACK was fine; the SUBSCRIBE just failed
+    assert bc.monitors["m1"].subscribed_at is None
+    assert bc._subscribed_filters == set()
+
+
+def test_update_subscribe_refused_does_not_arm(h):
+    bc = m._BrokerClient(_broker(monitors=[{"id": "m1", "topic_filter": "a/#"}]))
+    _connect(bc)  # m1 armed (subscribe accepted)
+    bc._client.subscribe.return_value = (4, None)  # next SUBSCRIBE is refused
+    bc.update_monitors(
+        [{"id": "m1", "topic_filter": "a/#"}, {"id": "m2", "topic_filter": "b/#"}]
+    )
+    assert bc.monitors["m2"].subscribed_at is None  # b/# never went out
+    assert "b/#" not in bc._subscribed_filters
+    assert bc.monitors["m1"].subscribed_at is not None  # unchanged monitor stays armed
+
+
 # --- broker snapshot -------------------------------------------------------
 
 
@@ -819,6 +842,19 @@ def test_contract_pins_retained_and_failure_semantics(h):
     capped = scenarios["capped_discovery"]["payload"]["brokers"]["storm"]
     assert capped["monitors"]["heartbeats"]["capped"] is True
     assert len(capped["monitors"]["heartbeats"]["topics"]) == 2
+
+    # Disconnected-after-data: staleness must be GATED. The broker dropped after
+    # collecting topics -> status error, connected/subscribed ages null (can't
+    # vouch), but the topics SURVIVE with their last-observed live ages so the
+    # server anchors staleness to them instead of alarming on the blip.
+    dropped = scenarios["disconnected_after_data"]["payload"]["brokers"]["plant-mqtt"]
+    assert dropped["status"] == "error"
+    assert dropped["error"].startswith("disconnected:")
+    assert dropped["connected_age_s"] is None
+    reactors = dropped["monitors"]["reactors"]
+    assert reactors["subscribed_age_s"] is None
+    assert reactors["topics"]["plant/reactor1/temp"]["last_live_seen_age_s"] == 35.0
+    assert reactors["topics"]["plant/reactor2/temp"]["last_message_age_s"] == 30.0
 
 
 def test_fixture_min_version_matches_release():

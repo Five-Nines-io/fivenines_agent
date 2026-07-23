@@ -249,6 +249,14 @@ follow-up gated on demand:
 - **Active liveness probe (publish)** - v1 never publishes; an optional
   round-trip publish to a canary topic would distinguish "broker up but device
   silent" from "broker reachable" more sharply than passive freshness.
+- **SUBACK-verified arming** - v1 arms `subscribed_at` on the subscribe() return
+  code (NO_CONN skips the arm; the honest signal we have). It does NOT wait for
+  the `on_subscribe` SUBACK, because Mosquitto deliberately returns SUBACK
+  success for ACL-denied filters and then silently drops deliveries, so
+  client-side "am I really subscribed" detection is structurally unreliable. The
+  server's exact-topic staleness (a topic that never arrives) is the real safety
+  net; a granted-QoS check via on_subscribe is a marginal add if a customer ACL
+  setup ever needs it.
 
 - **Effort:** varies / mostly M (CC)
 - **Depends on:** MQTT v1 in production + demand signal (e.g. a customer broker

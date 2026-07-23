@@ -368,8 +368,8 @@ class _BrokerClient:
     # --- subscription management ------------------------------------------
 
     def _resubscribe_all(self):
-        """Subscribe every current monitor filter and mark all monitors armed.
-        Called on each (re)connect."""
+        """Subscribe every current monitor filter and arm the monitors whose
+        SUBSCRIBE paho actually accepted. Called on each (re)connect."""
         now = _monotonic()
         with self._lock:
             filters = {
@@ -377,19 +377,35 @@ class _BrokerClient:
                 for mon in self.monitors.values()
                 if mon.topic_filter
             }
-        for topic_filter in filters:
-            self._wire_subscribe(topic_filter)
+        subscribed = {f for f in filters if self._wire_subscribe(f)}
         with self._lock:
-            self._subscribed_filters = set(filters)
+            self._subscribed_filters = set(subscribed)
+            # Arm only monitors whose filter went out; a filter paho refused
+            # (e.g. NO_CONN on a same-tick drop) stays disarmed, so
+            # subscribed_age_s is null until the next connect resubscribes it.
             for mon in self.monitors.values():
-                if mon.topic_filter:
-                    mon.subscribed_at = now
+                armed = bool(mon.topic_filter) and mon.topic_filter in subscribed
+                mon.subscribed_at = now if armed else None
 
     def _wire_subscribe(self, topic_filter):
+        """Send a SUBSCRIBE; return True only if paho accepted it.
+
+        subscribe() does NOT raise when the socket is down -- it returns
+        ``(MQTT_ERR_NO_CONN, None)`` -- so a truthful ``subscribed_at`` has to
+        gate on the return code, not just the exception path.
+        """
         try:
-            self._client.subscribe(topic_filter, qos=0)
+            rc, _mid = self._client.subscribe(topic_filter, qos=0)
         except Exception as e:  # pragma: no cover - defensive
             log(f"MQTT subscribe {self.broker_id} {topic_filter}: {e}", "error")
+            return False
+        if rc != mqtt_client.MQTT_ERR_SUCCESS:
+            log(
+                f"MQTT subscribe {self.broker_id} {topic_filter} not sent: rc={rc}",
+                "debug",
+            )
+            return False
+        return True
 
     def _wire_unsubscribe(self, topic_filter):
         try:
@@ -424,16 +440,19 @@ class _BrokerClient:
                 if mid in desired:
                     continue
                 self.monitors.pop(mid)
+            fresh_ids = []
             for mid, spec in desired.items():
                 current = self.monitors.get(mid)
                 if current is None or current.topic_filter != spec["topic_filter"]:
-                    # New monitor, or its filter changed: fresh state, armed now.
-                    fresh = _MonitorState(spec["topic_filter"], spec["capture_payload"])
-                    if connected and spec["topic_filter"]:
-                        fresh.subscribed_at = now
-                    self.monitors[mid] = fresh
+                    # New monitor or changed filter: fresh state. Armed below,
+                    # once its SUBSCRIBE is accepted (not at intent time).
+                    self.monitors[mid] = _MonitorState(
+                        spec["topic_filter"], spec["capture_payload"]
+                    )
+                    fresh_ids.append(mid)
                 else:
-                    # Same filter: a capture_payload toggle needs no wire change.
+                    # Same filter: a capture_payload toggle needs no wire change,
+                    # and must NOT reset an unchanged monitor's subscribed_at.
                     current.capture_payload = spec["capture_payload"]
             # Recompute the wire subscription set from the new monitor list.
             wanted = {
@@ -441,15 +460,26 @@ class _BrokerClient:
                 for mon in self.monitors.values()
                 if mon.topic_filter
             }
-            to_subscribe = wanted - self._subscribed_filters if connected else set()
-            to_unsubscribe = self._subscribed_filters - wanted if connected else set()
-            if connected:
-                self._subscribed_filters = set(wanted)
+            already = set(self._subscribed_filters)
+            to_subscribe = (wanted - already) if connected else set()
+            to_unsubscribe = (already - wanted) if connected else set()
 
         for topic_filter in to_unsubscribe:
             self._wire_unsubscribe(topic_filter)
-        for topic_filter in to_subscribe:
-            self._wire_subscribe(topic_filter)
+        newly = {f for f in to_subscribe if self._wire_subscribe(f)}
+
+        if not connected:
+            return
+        with self._lock:
+            # Filters live after this edit: the still-wanted ones already on the
+            # wire, plus the newly-accepted ones (a refused SUBSCRIBE is excluded
+            # so its monitor stays disarmed).
+            active = (already & wanted) | newly
+            self._subscribed_filters = set(active)
+            for mid in fresh_ids:
+                mon = self.monitors.get(mid)
+                if mon and mon.topic_filter and mon.topic_filter in active:
+                    mon.subscribed_at = now
 
     # --- snapshot (runs on the main collection thread) --------------------
 
