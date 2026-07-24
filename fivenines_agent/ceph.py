@@ -7,9 +7,19 @@ the backend arbitrates by fsid (see the backend cluster-scope contract:
 plus-complet > arrivee-serveur > plus petit machine_id).
 
 Per cluster, every tick (cached per (cluster, command) for CACHE_TTL):
-    ceph status -f json    -> health, mon quorum, osd counts, pg states, fsid
-    ceph df -f json        -> raw capacity
+    ceph status -f json    -> health, mon quorum, osd counts, pg states, fsid,
+                              client io, recovery/rebalance progress, nearfull/full
+    ceph df -f json        -> raw capacity + per-pool usage
     ceph osd tree -f json  -> best-effort per-host OSD count
+    ceph osd perf -f json  -> per-OSD commit/apply latency
+    ceph osd df -f json    -> per-OSD fullness (bytes + utilization)
+
+The status/df surfaces above the "raw capacity" line are the v1 (1.9.0) shape;
+io/recovery/osd_fullness/pools + the two per-OSD commands are the v2 (1.13.0)
+extension. Every v2 field is additive and independently isolated: a new command
+failing leaves its *_ok flag False and value None without touching the core
+sections, and the server presence-guards every key so an older agent (which
+omits them entirely) keeps ingesting bit-identically.
 
 Auth: a least-privilege cephx keyring (client.fivenines, caps mon 'allow r'
 mgr 'allow r'), invoked explicitly with --name/--keyring. No sudo by default.
@@ -20,8 +30,10 @@ red metric, not make the collector vanish for the 5-minute reprobe window.
 """
 
 import json
+import re
 import shutil
 import subprocess
+import time
 
 from fivenines_agent.cache import TTLCache
 from fivenines_agent.debug import log
@@ -31,6 +43,28 @@ from fivenines_agent.subprocess_utils import get_clean_env
 CONNECT_TIMEOUT = 5  # seconds, --connect-timeout passed to the ceph CLI
 SUBPROCESS_TIMEOUT = 15  # seconds, hard subprocess kill (a wedged mon can hang)
 CACHE_TTL = 30  # seconds, per (cluster, command)
+
+# Per-cluster wall-clock budget. Collectors run serially in the main loop and
+# ceph failures are not cached (a persistently-down cluster is retried every
+# tick), so a wedged mon would otherwise block the tick for up to 5 commands x
+# SUBPROCESS_TIMEOUT per cluster. Once this many seconds have elapsed for a
+# cluster, the enrichment tail (df/tree/perf/osd df) is shed with its *_ok flag
+# left False -- capping the worst case near the v1 3-command budget so a
+# multi-cluster host cannot blow past the server's offline window. status is
+# core (drives reachability) and always runs regardless.
+ENRICHMENT_DEADLINE = 30  # seconds
+
+# Per-cluster emission caps. pools is small in practice; the per-OSD arrays can
+# be large on a big cluster, so they are capped harder. A hit sets the matching
+# *_truncated flag so the server can skip that section (honesty over partial
+# data) rather than ingest a silently-clipped list.
+POOLS_CAP = 200
+OSD_CAP = 2048
+
+# Leading integer of a health-check summary message ("3 nearfull osd(s)" -> 3).
+# ASCII [0-9] (not \d) so a Unicode digit in an odd locale cannot slip through
+# the codebase's ASCII-only rule.
+_LEADING_INT = re.compile(r"\s*([0-9]+)")
 
 _cache = TTLCache()
 
@@ -78,13 +112,18 @@ def ceph_metrics(clusters=None, **_):
 def _poll_cluster(cluster):
     """Poll one cluster and build its contract payload.
 
-    status drives reachability + most metrics. df and osd tree are partial:
-    a failure leaves their *_ok False and value None without making the whole
-    cluster unreachable.
+    status drives reachability + most metrics (health, mon, osd, pg, io,
+    recovery, osd_fullness) and always runs. df, osd tree, osd perf and osd df
+    are the enrichment tail: each is partial and independently isolated (a
+    failure leaves that command's *_ok flag False and its value None without
+    making the whole cluster unreachable), and each is skipped once the
+    per-cluster ENRICHMENT_DEADLINE passes so a wedged mon cannot block the
+    serial main loop for the full 5 x SUBPROCESS_TIMEOUT.
     """
     name = cluster.get("name") or "ceph"
     base = _base_args(cluster)
     result = _empty_result(name)
+    deadline = time.monotonic() + ENRICHMENT_DEADLINE
 
     status, error = _run_ceph_cached(base, ["status"], name)
     if error:
@@ -101,32 +140,85 @@ def _poll_cluster(cluster):
     result["collection"]["status_ok"] = True
     _apply_status(result, status)
 
-    df, error = _run_ceph_cached(base, ["df"], name)
-    if error:
-        log(
-            "ceph df failed for cluster {}: {}".format(name, error.get("message")),
-            "error",
-        )
-    else:
-        result["collection"]["df_ok"] = True
-        result["capacity"] = _parse_capacity(df)
+    if not _past_deadline(deadline, name):
+        df, error = _run_ceph_cached(base, ["df"], name)
+        if error:
+            log(
+                "ceph df failed for cluster {}: {}".format(name, error.get("message")),
+                "error",
+            )
+        else:
+            result["collection"]["df_ok"] = True
+            result["capacity"] = _parse_capacity(df)
+            result["pools"], result["pools_truncated"] = _parse_pools(df)
 
-    tree, error = _run_ceph_cached(base, ["osd", "tree"], name)
-    if error:
-        log(
-            "ceph osd tree failed for cluster {}: {}".format(
-                name, error.get("message")
-            ),
-            "error",
-        )
-    else:
-        result["collection"]["tree_ok"] = True
-        result["hosts"] = _parse_host_osd_counts(tree)
+    if not _past_deadline(deadline, name):
+        tree, error = _run_ceph_cached(base, ["osd", "tree"], name)
+        if error:
+            log(
+                "ceph osd tree failed for cluster {}: {}".format(
+                    name, error.get("message")
+                ),
+                "error",
+            )
+        else:
+            result["collection"]["tree_ok"] = True
+            result["hosts"] = _parse_host_osd_counts(tree)
+
+    if not _past_deadline(deadline, name):
+        perf, error = _run_ceph_cached(base, ["osd", "perf"], name)
+        if error:
+            log(
+                "ceph osd perf failed for cluster {}: {}".format(
+                    name, error.get("message")
+                ),
+                "error",
+            )
+        else:
+            result["collection"]["perf_ok"] = True
+            result["osd_perf"], result["osd_perf_truncated"] = _parse_osd_perf(perf)
+
+    if not _past_deadline(deadline, name):
+        osd_df, error = _run_ceph_cached(base, ["osd", "df"], name)
+        if error:
+            log(
+                "ceph osd df failed for cluster {}: {}".format(
+                    name, error.get("message")
+                ),
+                "error",
+            )
+        else:
+            result["collection"]["osd_df_ok"] = True
+            result["osd_df"], result["osd_df_truncated"] = _parse_osd_df(osd_df)
 
     return result
 
 
+def _past_deadline(deadline, name):
+    """True once this cluster's enrichment budget is spent (logged once per hit).
+
+    Checked before each enrichment command; the commands already run core-first
+    (df -> tree -> perf -> osd df) so what gets shed is always the least-critical
+    tail. The shed commands keep their *_ok False, which the server treats as
+    "section not collected" -- identical to a per-command failure.
+    """
+    if time.monotonic() < deadline:
+        return False
+    log(
+        "ceph: enrichment deadline reached for cluster {}, "
+        "skipping remaining commands".format(name),
+        "error",
+    )
+    return True
+
+
 def _empty_result(name):
+    # Every value here is the "not collected" default. A reachable cluster
+    # overwrites the sections whose command succeeded; the *_truncated flags stay
+    # False until a real cap hit sets them (an omitted section is never
+    # "truncated"). An unreachable cluster returns this dict verbatim (fsid None,
+    # all metrics None) -- the new v2 keys are additive nulls the server
+    # presence-guards, so the unreachable payload stays semantically "as-is".
     return {
         "fsid": None,
         "configured_name": name,
@@ -135,13 +227,24 @@ def _empty_result(name):
             "status_ok": False,
             "df_ok": False,
             "tree_ok": False,
+            "perf_ok": False,
+            "osd_df_ok": False,
             "error": None,
         },
         "health": None,
         "mon": None,
         "osd": None,
         "pg": None,
+        "io": None,
+        "recovery": None,
+        "osd_fullness": None,
         "capacity": None,
+        "pools": None,
+        "pools_truncated": False,
+        "osd_perf": None,
+        "osd_perf_truncated": False,
+        "osd_df": None,
+        "osd_df_truncated": False,
         "hosts": None,
     }
 
@@ -277,6 +380,12 @@ def _apply_status(result, status):
     result["mon"] = _parse_mon(status)
     result["osd"] = _parse_osd(status)
     result["pg"] = _parse_pg(status)
+    # io/recovery/osd_fullness ride the status call that already succeeded, so
+    # they are set unconditionally here (no separate *_ok flag): if status_ok is
+    # True the server can trust all three objects exist.
+    result["io"] = _parse_io(status)
+    result["recovery"] = _parse_recovery(status)
+    result["osd_fullness"] = _parse_osd_fullness(status)
 
 
 def _parse_health(status):
@@ -354,6 +463,120 @@ def _parse_pg(status):
     }
 
 
+def _num_or_zero(value):
+    """Numeric passthrough with absent/malformed -> 0.
+
+    pgmap io/recovery keys are omitted by the mgr when a cluster is idle -- that
+    is a true zero, not missing data, so a missing (None) or non-numeric value
+    normalizes to 0. bool is an int subclass; reject it so a stray JSON boolean
+    is not forwarded as 0/1.
+    """
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        return value
+    return 0
+
+
+def _parse_io(status):
+    """Client I/O throughput/IOPS from pgmap (absent keys -> 0).
+
+    Emitted whenever status succeeded (the caller only reaches this after
+    status_ok), so an idle cluster reports an all-zeros object rather than a
+    null -- the server can graph a flat line instead of a gap.
+    """
+    pgmap = status.get("pgmap")
+    if not isinstance(pgmap, dict):
+        pgmap = {}
+    return {
+        "read_bytes_sec": _num_or_zero(pgmap.get("read_bytes_sec")),
+        "write_bytes_sec": _num_or_zero(pgmap.get("write_bytes_sec")),
+        "read_op_per_sec": _num_or_zero(pgmap.get("read_op_per_sec")),
+        "write_op_per_sec": _num_or_zero(pgmap.get("write_op_per_sec")),
+    }
+
+
+def _parse_recovery(status):
+    """Recovery/rebalance progress from pgmap (absent keys -> 0, same as io)."""
+    pgmap = status.get("pgmap")
+    if not isinstance(pgmap, dict):
+        pgmap = {}
+    return {
+        "recovering_objects_per_sec": _num_or_zero(
+            pgmap.get("recovering_objects_per_sec")
+        ),
+        "recovering_bytes_per_sec": _num_or_zero(
+            pgmap.get("recovering_bytes_per_sec")
+        ),
+        "misplaced_objects": _num_or_zero(pgmap.get("misplaced_objects")),
+        "misplaced_total": _num_or_zero(pgmap.get("misplaced_total")),
+        "degraded_objects": _num_or_zero(pgmap.get("degraded_objects")),
+        "degraded_total": _num_or_zero(pgmap.get("degraded_total")),
+    }
+
+
+def _parse_osd_fullness(status):
+    """nearfull/full OSD counts from the OSD_NEARFULL / OSD_FULL health checks.
+
+    Ceph raises a health check IFF the condition is active, so in a valid checks
+    dict an ABSENT check is the mon positively asserting a true zero -- the same
+    absent-means-0 rule this collector applies to idle pgmap io/recovery keys. A
+    healthy cluster therefore reports 0 (a flat line the server can chart and an
+    alert can resolve against), not a null that would make "healthy" and "no
+    data" indistinguishable.
+
+    None is reserved for genuine unknowns: a PRESENT-but-unparseable check (see
+    _extract_fullness_count), or a malformed health/checks structure where we
+    cannot even tell which checks are active -- there, both counts are None.
+    """
+    health = status.get("health")
+    checks = health.get("checks") if isinstance(health, dict) else None
+    if not isinstance(checks, dict):
+        return {"nearfull": None, "full": None}
+    return {
+        "nearfull": (
+            _extract_fullness_count(checks["OSD_NEARFULL"])
+            if "OSD_NEARFULL" in checks
+            else 0
+        ),
+        "full": (
+            _extract_fullness_count(checks["OSD_FULL"])
+            if "OSD_FULL" in checks
+            else 0
+        ),
+    }
+
+
+def _extract_fullness_count(check):
+    """Pull an OSD count out of one PRESENT health check, else None.
+
+    Prefer summary.count (added in later releases); fall back to the leading
+    integer of summary.message ("3 nearfull osd(s)") for older mons that only
+    carry the human string. A present check we cannot turn into an integer -- a
+    non-dict check, a non-dict summary, an unparseable message -- is None
+    ("unknown"), NEVER a fabricated 0: the check fired, so a wrong 0 would
+    silence a real nearfull/full condition. (Absent checks are handled as a true
+    0 by the caller; this helper only ever sees present ones.)
+    """
+    if not isinstance(check, dict):
+        return None
+    summary = check.get("summary")
+    if not isinstance(summary, dict):
+        return None
+    count = summary.get("count")
+    if isinstance(count, int) and not isinstance(count, bool):
+        return count
+    message = summary.get("message")
+    if isinstance(message, str):
+        return _leading_int(message)
+    return None
+
+
+def _leading_int(message):
+    match = _LEADING_INT.match(message)
+    return int(match.group(1)) if match else None
+
+
 def _parse_capacity(df):
     stats = df.get("stats")
     if not isinstance(stats, dict):
@@ -366,6 +589,37 @@ def _parse_capacity(df):
         "used_bytes": used,
         "avail_bytes": stats.get("total_avail_bytes"),
     }
+
+
+def _parse_pools(df):
+    """Per-pool usage from `ceph df`. Returns (pools, truncated).
+
+    percent_used is forwarded verbatim as the 0-1 float ceph reports (the server
+    converts for display). Capped at POOLS_CAP: the flag is set from the raw
+    input length so it is honest even if some entries are skipped as non-dicts.
+    """
+    pools = df.get("pools")
+    if not isinstance(pools, list):
+        return [], False
+    truncated = len(pools) > POOLS_CAP
+    result = []
+    for pool in pools[:POOLS_CAP]:
+        if not isinstance(pool, dict):
+            continue
+        stats = pool.get("stats")
+        if not isinstance(stats, dict):
+            stats = {}
+        result.append(
+            {
+                "name": pool.get("name"),
+                "id": pool.get("id"),
+                "stored_bytes": stats.get("stored"),
+                "objects": stats.get("objects"),
+                "percent_used": stats.get("percent_used"),
+                "max_avail_bytes": stats.get("max_avail"),
+            }
+        )
+    return result, truncated
 
 
 def _parse_host_osd_counts(tree):
@@ -386,3 +640,94 @@ def _parse_host_osd_counts(tree):
             count = len(children) if isinstance(children, list) else 0
             hosts.append({"host": node.get("name"), "osd_count": count})
     return hosts
+
+
+def _kb_to_bytes(value):
+    """ceph reports OSD sizes in KiB; the contract is bytes-native. x1024, or
+    None when the field is absent/non-numeric (bool rejected as an int subclass).
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value * 1024
+    return None
+
+
+def _osd_perf_infos(perf):
+    """The per-OSD perf list, tolerant of both JSON shapes.
+
+    Nautilus+ nests it under osdstats.osd_perf_infos; older releases put
+    osd_perf_infos at the top level. Return [] when neither is present so the
+    caller ships an empty (not null) array on a responding-but-empty cluster.
+    """
+    osdstats = perf.get("osdstats")
+    if isinstance(osdstats, dict):
+        infos = osdstats.get("osd_perf_infos")
+        if isinstance(infos, list):
+            return infos
+    infos = perf.get("osd_perf_infos")
+    if isinstance(infos, list):
+        return infos
+    return []
+
+
+def _parse_osd_perf(perf):
+    """Per-OSD commit/apply latency. Returns (osd_perf, truncated).
+
+    Capped at OSD_CAP; the flag is set from the raw list length so the server
+    can skip per-OSD emission on a clipped tick rather than ingest partial data.
+    """
+    infos = _osd_perf_infos(perf)
+    truncated = len(infos) > OSD_CAP
+    result = []
+    for info in infos[:OSD_CAP]:
+        if not isinstance(info, dict):
+            continue
+        stats = info.get("perf_stats")
+        if not isinstance(stats, dict):
+            stats = {}
+        result.append(
+            {
+                "id": info.get("id"),
+                "commit_latency_ms": stats.get("commit_latency_ms"),
+                "apply_latency_ms": stats.get("apply_latency_ms"),
+            }
+        )
+    return result, truncated
+
+
+def _parse_osd_df(osd_df):
+    """Per-OSD fullness (bytes + utilization). Returns (osd_df, truncated).
+
+    kb_* fields are converted to bytes (x1024) to stay bytes-native like
+    capacity; utilization is forwarded verbatim as the 0-100 float. Capped at
+    OSD_CAP with the same honest-flag semantics as _parse_osd_perf.
+
+    Plain `ceph osd df` emits only OSD rows, but a node whose type is present and
+    not "osd" is skipped defensively: if the command is ever pointed at `osd df
+    tree`, the host/root CRUSH buckets it interleaves would otherwise ingest as
+    phantom OSDs. A node with no type (the plain-command shape) is kept.
+    """
+    nodes = osd_df.get("nodes")
+    if not isinstance(nodes, list):
+        return [], False
+    truncated = len(nodes) > OSD_CAP
+    result = []
+    for node in nodes[:OSD_CAP]:
+        if not isinstance(node, dict):
+            continue
+        node_type = node.get("type")
+        if node_type is not None and node_type != "osd":
+            continue
+        result.append(
+            {
+                "id": node.get("id"),
+                "name": node.get("name"),
+                "utilization": node.get("utilization"),
+                "total_bytes": _kb_to_bytes(node.get("kb")),
+                "used_bytes": _kb_to_bytes(node.get("kb_used")),
+                "avail_bytes": _kb_to_bytes(node.get("kb_avail")),
+                "status": node.get("status"),
+            }
+        )
+    return result, truncated

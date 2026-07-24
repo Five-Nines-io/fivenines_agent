@@ -1,6 +1,6 @@
 {
-  "description": "Shared Ceph contract fixture between fivenines-agent and fivenines-server. Source of truth: fivenines-agent tests/fixtures/ceph_contract_payload.json, asserted end-to-end by tests/test_ceph.py::test_contract_fixture_round_trip (only subprocess.run is mocked). The server's spec/requests/api_collect_ceph_spec.rb posts 'payload' under data['ceph'] and asserts Ingesters::Ceph ingests it; 'config' is the shape config['ceph'] must take (clusters[0] is the default target ceph_targets_for_host returns when a host has no CephTarget override rows; clusters[1] is a full override row). Change only in lockstep across both repos.",
-  "agent_min_version": "1.9.0",
+  "description": "Shared Ceph contract fixture between fivenines-agent and fivenines-server. Source of truth: fivenines-agent tests/fixtures/ceph_contract_payload.json, asserted end-to-end by tests/test_ceph.py::test_contract_fixture_round_trip (only subprocess.run is mocked). The server's spec/requests/api_collect_ceph_spec.rb posts 'payload' under data['ceph'] and asserts Ingesters::Ceph ingests it; 'config' is the shape config['ceph'] must take (clusters[0] is the default target ceph_targets_for_host returns when a host has no CephTarget override rows; clusters[1] is a full override row). The reachable entry carries the v2 (1.13.0) surface -- io / recovery / osd_fullness / pools / osd_perf / osd_df + perf_ok / osd_df_ok / *_truncated flags -- which the server presence-guards (FEATURES_SUPPORTED_VERSIONS['ceph_extended']); the base ceph capability stays 1.9.0. Change only in lockstep across both repos.",
+  "agent_min_version": "1.13.0",
   "config": {
     "clusters": [
       { "name": "ceph" },
@@ -23,17 +23,89 @@
           "status_ok": true,
           "df_ok": true,
           "tree_ok": true,
+          "perf_ok": true,
+          "osd_df_ok": true,
           "error": null
         },
-        "health": { "status": "HEALTH_WARN", "checks": ["OSD_DOWN"] },
+        "health": { "status": "HEALTH_WARN", "checks": ["OSD_DOWN", "OSD_NEARFULL"] },
         "mon": { "in_quorum": 3, "total": 3 },
         "osd": { "up": 2, "in": 3, "total": 3 },
         "pg": { "total": 129, "degraded": 12, "inactive": 0, "undersized": 12 },
+        "io": {
+          "read_bytes_sec": 104857600,
+          "write_bytes_sec": 52428800,
+          "read_op_per_sec": 1500,
+          "write_op_per_sec": 750
+        },
+        "recovery": {
+          "recovering_objects_per_sec": 240,
+          "recovering_bytes_per_sec": 1006632960,
+          "misplaced_objects": 1024,
+          "misplaced_total": 200000,
+          "degraded_objects": 512,
+          "degraded_total": 200000
+        },
+        "osd_fullness": { "nearfull": 2, "full": 0 },
         "capacity": {
           "total_bytes": 32212254720,
           "used_bytes": 12884901888,
           "avail_bytes": 19327352832
         },
+        "pools": [
+          {
+            "name": "device_health_metrics",
+            "id": 1,
+            "stored_bytes": 0,
+            "objects": 0,
+            "percent_used": 0.0,
+            "max_avail_bytes": 6120000000
+          },
+          {
+            "name": "rbd",
+            "id": 2,
+            "stored_bytes": 6442450944,
+            "objects": 1580,
+            "percent_used": 0.1,
+            "max_avail_bytes": 6120000000
+          }
+        ],
+        "pools_truncated": false,
+        "osd_perf": [
+          { "id": 0, "commit_latency_ms": 3, "apply_latency_ms": 3 },
+          { "id": 1, "commit_latency_ms": 5, "apply_latency_ms": 5 },
+          { "id": 2, "commit_latency_ms": 1, "apply_latency_ms": 1 }
+        ],
+        "osd_perf_truncated": false,
+        "osd_df": [
+          {
+            "id": 0,
+            "name": "osd.0",
+            "utilization": 40.0,
+            "total_bytes": 10737418240,
+            "used_bytes": 4294967296,
+            "avail_bytes": 6442450944,
+            "status": "up"
+          },
+          {
+            "id": 1,
+            "name": "osd.1",
+            "utilization": 80.0,
+            "total_bytes": 10737418240,
+            "used_bytes": 8589934592,
+            "avail_bytes": 2147483648,
+            "status": "up"
+          },
+          {
+            "id": 2,
+            "name": "osd.2",
+            "utilization": 20.0,
+            "total_bytes": 10737418240,
+            "used_bytes": 2147483648,
+            "avail_bytes": 8589934592,
+            "status": "down"
+          }
+        ],
+        "osd_df_truncated": false,
         "hosts": [
           { "host": "node-1", "osd_count": 2 },
           { "host": "node-2", "osd_count": 1 }
@@ -47,6 +119,8 @@
           "status_ok": false,
           "df_ok": false,
           "tree_ok": false,
+          "perf_ok": false,
+          "osd_df_ok": false,
           "error": {
             "type": "unreachable",
             "message": "unable to connect to cluster"
@@ -56,7 +130,16 @@
         "mon": null,
         "osd": null,
         "pg": null,
+        "io": null,
+        "recovery": null,
+        "osd_fullness": null,
         "capacity": null,
+        "pools": null,
+        "pools_truncated": false,
+        "osd_perf": null,
+        "osd_perf_truncated": false,
+        "osd_df": null,
+        "osd_df_truncated": false,
         "hosts": null
       }
     ]
