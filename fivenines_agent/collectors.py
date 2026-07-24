@@ -19,6 +19,7 @@ from fivenines_agent.mysql import mysql_metrics
 from fivenines_agent.network import network
 from fivenines_agent.nginx import nginx_metrics
 from fivenines_agent.partitions import partitions_metadata, partitions_usage
+from fivenines_agent.php_fpm import php_fpm_metrics
 from fivenines_agent.ports import listening_ports
 from fivenines_agent.postgresql import postgresql_metrics
 from fivenines_agent.processes import processes
@@ -91,6 +92,11 @@ COLLECTORS = [
     ("redis", [("redis", redis_metrics, True)]),
     ("nginx", [("nginx", nginx_metrics, True)]),
     ("apache", [("apache", apache_metrics, True)]),
+    # PHP-FPM: config-driven per-pool status scrape (nginx/apache posture, no
+    # capability gate). config["php_fpm"] == {"status_page_url": ...} is unpacked
+    # (pass_kwargs) into php_fpm_metrics(status_page_url=...). Emits an array of
+    # per-pool objects, [] (zero pools), or None (collection failure).
+    ("php_fpm", [("php_fpm", php_fpm_metrics, True)]),
     ("docker", [("docker", docker_metrics, True)]),
     ("qemu", [("qemu", qemu_metrics, True)]),
     ("fail2ban", [("fail2ban", fail2ban_metrics, False)]),
