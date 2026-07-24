@@ -595,6 +595,11 @@ def test_fcgi_connect_unix(monkeypatch):
         made["kind"] = kind
         return FakeSocket()
 
+    # Windows lacks socket.AF_UNIX, so inject it to exercise the unix-connect
+    # path on every platform (the real "no AF_UNIX" behaviour is pinned by
+    # test_fcgi_connect_unix_without_af_unix). raising=False permits the set
+    # where the attribute is absent.
+    monkeypatch.setattr(php_fpm.socket, "AF_UNIX", 1, raising=False)
     monkeypatch.setattr(php_fpm.socket, "socket", fake_socket)
     sock = php_fpm._fcgi_connect({"kind": "unix", "address": "/run/x.sock", "script_name": "/s"})
     assert made["family"] == php_fpm.socket.AF_UNIX
