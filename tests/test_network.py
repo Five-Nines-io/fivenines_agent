@@ -315,8 +315,15 @@ def test_network_enriches_bridge_physical_virtual_and_tags_members():
 
 
 def _split(path):
-    """Split /sys/class/net/<iface>/<rest...> into (iface, rest)."""
-    rel = path[len(SYS_CLASS_NET):].strip("/")
+    """Split /sys/class/net/<iface>/<rest...> into (iface, rest).
+
+    network() builds these paths with os.path.join, which uses the host's
+    separator. On the Windows CI runner (where the tests force the linux branch)
+    that is '\\', so normalise to '/' before splitting -- otherwise the mock
+    would model sysfs differently per platform and the enrichment would silently
+    misparse.
+    """
+    rel = path[len(SYS_CLASS_NET):].replace("\\", "/").strip("/")
     parts = rel.split("/", 1)
     return parts[0], (parts[1] if len(parts) > 1 else "")
 
