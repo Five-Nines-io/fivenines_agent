@@ -32,6 +32,7 @@ def test_registry_has_expected_config_keys():
         "redis",
         "nginx",
         "apache",
+        "php_fpm",
         "docker",
         "qemu",
         "fail2ban",

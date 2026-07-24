@@ -1,0 +1,125 @@
+{
+  "description": "Shared PHP-FPM contract fixture between fivenines-agent and fivenines-server. Source of truth: fivenines-agent tests/fixtures/php_fpm_contract_payload.json, asserted end-to-end by tests/test_php_fpm.py::test_contract_fixture_round_trip (only the HTTP/FastCGI transport is mocked -- each scenario's 'raw_status' bodies are fed back per endpoint, and for 'auto' scenarios the 'pool_configs' are written to a temp dir that discovery is pointed at). php_fpm_metrics(**scenario['config']) must equal scenario['payload']. The server's spec/requests/api_collect_php_fpm_spec.rb posts scenario['payload'] under data['php_fpm'] through /collect and asserts Ingesters::Agent ingests each shape (array / [] / null). 'config', 'pool_configs' and 'raw_status' are agent-side inputs the server ignores. Change the payload shape only in lockstep across both repos, keeping the two copies byte-identical.",
+  "agent_min_version": "1.13.1",
+  "_agent_min_version_note": "1.12.0 was taken by the MQTT collector (server #608). PHP-FPM has NO server version gate (no FEATURES_SUPPORTED_VERSIONS entry -- it is purely config-driven, php_fpm_enabled defaults false), so this number is free. Ships as 1.13.1, a PATCH that cedes the 1.13.0 minor slot to Ceph v2 (#94), which is hard-gated on ceph_extended == '1.13.0'. Nothing gates on this number.",
+  "null_contract": "data['php_fpm'] is one of THREE outcomes and the server MUST branch on them (dispatch gate: is_a?(Array)): (a) null (JSON null / Python None) = COLLECTION FAILURE -- the endpoint was unreachable / timed out / returned non-200 / returned malformed JSON, OR (the multi-pool sharp edge) ANY single known pool's fetch failed. The server MUST NOT prune php_fpm_pools rows or auto-resolve php_fpm_saturation incidents on null: a pool that is merely unreachable is not 'deleted', and treating it as recovery is a false-resolve bug. (b) [] (empty array) = auto-discovery ran and the host genuinely has ZERO pollable pools -- safe to prune. (c) a non-empty array of per-pool objects = the live set; a pool the operator genuinely removed simply stops being discovered and drops out, which the server prunes. Single-endpoint http/unix/tcp mode degenerates to success -> [pool], failure -> null (it never emits []). Same null-vs-empty discipline as the zfs and docker contracts.",
+  "field_contract": {
+    "name": "FPM 'pool' -- the pool name, the per-pool entity key.",
+    "process_manager": "FPM 'process manager' (dynamic / static / ondemand).",
+    "active_processes": "FPM 'active processes' -- gauge.",
+    "idle_processes": "FPM 'idle processes' -- gauge.",
+    "total_processes": "FPM 'total processes' -- gauge.",
+    "listen_queue": "FPM 'listen queue' -- requests waiting for a free worker RIGHT NOW; > 0 is the live saturation signal.",
+    "max_listen_queue": "FPM 'max listen queue' -- high-water mark of the listen queue since FPM start.",
+    "max_children_reached": "FPM 'max children reached' -- RAW cumulative counter of times pm.max_children was hit; the server rate()s it into the durable saturation trigger. Never reset or diff agent-side.",
+    "slow_requests": "FPM 'slow requests' -- RAW cumulative counter (needs request_slowlog_timeout). Shipped raw.",
+    "accepted_connections": "FPM 'accepted conn' -- RAW cumulative counter of accepted connections. Shipped raw.",
+    "_dropped": "FPM's 'start time', 'start since', 'listen queue len' and 'max active processes' are NOT ingested and are dropped from the payload; the 'full' per-process array is never requested."
+  },
+  "scenarios": {
+    "healthy_multi_pool": {
+      "description": "Auto-discovery finds two pools in one pool.d file: 'www' healthy over a unix socket, 'api' SATURATED over a TCP socket (listen_queue 12 + max_children_reached 7 + slow_requests 3). Pins the multi-entity array payload, the snake_case normalization, the drop of start time/start since/listen queue len/max active processes, and raw counter passthrough. Discovery order follows the file, so the array is [www, api].",
+      "config": { "status_page_url": "auto" },
+      "pool_configs": {
+        "fivenines-pools.conf": "[global]\npid = /run/php-fpm.pid\n\n[www]\nuser = www-data\nlisten = /run/php/php8.2-fpm-www.sock  ; the WordPress pool\npm = dynamic\npm.status_path = \"/status\"\n\n[api]\nuser = api\nlisten = 127.0.0.1:9000\npm = static\npm.status_path = /status\n"
+      },
+      "raw_status": {
+        "unix:/run/php/php8.2-fpm-www.sock/status": {
+          "pool": "www",
+          "process manager": "dynamic",
+          "start time": 1721815200,
+          "start since": 3600,
+          "accepted conn": 154823,
+          "listen queue": 0,
+          "max listen queue": 5,
+          "listen queue len": 128,
+          "idle processes": 8,
+          "active processes": 2,
+          "total processes": 10,
+          "max active processes": 3,
+          "max children reached": 0,
+          "slow requests": 0
+        },
+        "tcp:127.0.0.1:9000/status": {
+          "pool": "api",
+          "process manager": "dynamic",
+          "start time": 1721815200,
+          "start since": 3600,
+          "accepted conn": 98211,
+          "listen queue": 12,
+          "max listen queue": 34,
+          "listen queue len": 128,
+          "idle processes": 0,
+          "active processes": 20,
+          "total processes": 20,
+          "max active processes": 20,
+          "max children reached": 7,
+          "slow requests": 3
+        }
+      },
+      "payload": [
+        {
+          "name": "www",
+          "process_manager": "dynamic",
+          "active_processes": 2,
+          "idle_processes": 8,
+          "total_processes": 10,
+          "listen_queue": 0,
+          "max_listen_queue": 5,
+          "max_children_reached": 0,
+          "slow_requests": 0,
+          "accepted_connections": 154823
+        },
+        {
+          "name": "api",
+          "process_manager": "dynamic",
+          "active_processes": 20,
+          "idle_processes": 0,
+          "total_processes": 20,
+          "listen_queue": 12,
+          "max_listen_queue": 34,
+          "max_children_reached": 7,
+          "slow_requests": 3,
+          "accepted_connections": 98211
+        }
+      ]
+    },
+    "zero_pools": {
+      "description": "Auto-discovery succeeds but no pool declares BOTH a listen socket and a pm.status_path (the [global] pseudo-section and a status-less pool are both skipped). Emits [] so the server prunes all rows. Distinct from null: the scrape genuinely succeeded with zero pollable pools.",
+      "config": { "status_page_url": "auto" },
+      "pool_configs": {
+        "no-status.conf": "[global]\npid = /run/php-fpm.pid\n\n[www]\nlisten = /run/php/php8.2-fpm.sock\npm = dynamic\n; pm.status_path intentionally unset -> this pool is not pollable\n"
+      },
+      "payload": []
+    },
+    "collection_failure": {
+      "description": "Single HTTP endpoint that is unreachable / times out / returns non-200 or malformed JSON -- the transport yields None. Emits null (collection failure); the server must NOT prune rows or resolve incidents.",
+      "config": { "status_page_url": "http://127.0.0.1/status?json" },
+      "raw_status": { "http://127.0.0.1/status?json": null },
+      "payload": null
+    },
+    "partial_failure": {
+      "description": "THE FALSE-RESOLVE GUARD. Auto-discovery finds two pools; 'www' responds but 'api' is unreachable (its fetch yields None). Because a pool silently missing from the array reads as 'operator deleted it' and resolves its open incident, ANY known pool failing sinks the WHOLE tick to null -- never a partial array. unknown != recovered.",
+      "config": { "status_page_url": "auto" },
+      "pool_configs": {
+        "two-pools.conf": "[www]\nlisten = /run/php/php8.2-fpm-www.sock\npm.status_path = /status\n\n[api]\nlisten = 127.0.0.1:9000\npm.status_path = /status\n"
+      },
+      "raw_status": {
+        "unix:/run/php/php8.2-fpm-www.sock/status": {
+          "pool": "www",
+          "process manager": "dynamic",
+          "accepted conn": 154823,
+          "listen queue": 0,
+          "max listen queue": 5,
+          "idle processes": 8,
+          "active processes": 2,
+          "total processes": 10,
+          "max children reached": 0,
+          "slow requests": 0
+        },
+        "tcp:127.0.0.1:9000/status": null
+      },
+      "payload": null
+    }
+  }
+}
