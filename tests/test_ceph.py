@@ -159,7 +159,8 @@ def test_poll_full_success(clock):
     }
     assert r["recovery"]["misplaced_objects"] == 3
     assert r["recovery"]["degraded_total"] == 0
-    assert r["osd_fullness"] == {"nearfull": None, "full": None}
+    # HEALTH_OK with a valid (empty) checks dict: no nearfull/full checks -> 0.
+    assert r["osd_fullness"] == {"nearfull": 0, "full": 0}
     assert r["capacity"] == {"total_bytes": 100, "used_bytes": 40, "avail_bytes": 60}
     assert r["pools"] == [
         {"name": "rbd", "id": 2, "stored_bytes": 40, "objects": 5,
@@ -671,22 +672,39 @@ def test_parse_osd_fullness_count_path():
 
 
 def test_parse_osd_fullness_message_fallback():
-    # No count key -> parse the leading integer of the human message.
+    # OSD_NEARFULL present w/o count -> parse the message; OSD_FULL absent in a
+    # valid checks dict -> true 0 (the mon would raise the check if any were full).
     status = {
         "health": {"checks": {"OSD_NEARFULL": {"summary": {"message": "5 nearfull"}}}}
     }
-    assert ceph._parse_osd_fullness(status) == {"nearfull": 5, "full": None}
+    assert ceph._parse_osd_fullness(status) == {"nearfull": 5, "full": 0}
 
 
-def test_parse_osd_fullness_absent_checks_are_null():
-    # Healthy cluster: no nearfull/full checks -> null (unknown), never a faked 0.
+def test_parse_osd_fullness_absent_checks_are_zero():
+    # Healthy cluster: valid (empty) checks dict, no nearfull/full checks -> the
+    # mon is asserting a true 0, not "unknown" (mirrors idle pgmap io -> 0).
     assert ceph._parse_osd_fullness({"health": {"checks": {}}}) == {
-        "nearfull": None,
-        "full": None,
+        "nearfull": 0,
+        "full": 0,
     }
 
 
+def test_parse_osd_fullness_present_unparseable_is_null():
+    # A check that fired but we cannot turn into an integer -> None (unknown), not
+    # a fabricated 0. OSD_NEARFULL: unparseable message; OSD_FULL: non-dict check.
+    status = {
+        "health": {
+            "checks": {
+                "OSD_NEARFULL": {"summary": {"message": "some osds nearfull"}},
+                "OSD_FULL": "weird",
+            }
+        }
+    }
+    assert ceph._parse_osd_fullness(status) == {"nearfull": None, "full": None}
+
+
 def test_parse_osd_fullness_health_non_dict():
+    # Malformed health -> cannot tell which checks are active -> both None.
     assert ceph._parse_osd_fullness({"health": "HEALTH_OK"}) == {
         "nearfull": None,
         "full": None,
@@ -905,6 +923,22 @@ def test_parse_osd_df_truncation(monkeypatch):
     assert len(result) == 1
 
 
+def test_parse_osd_df_skips_non_osd_typed_node():
+    # A typed bucket row (type != "osd") is skipped; a typeless node and a
+    # type=="osd" node are both kept. Guards against `osd df tree` bucket rows.
+    osd_df = {
+        "nodes": [
+            {"id": -1, "name": "default", "type": "root", "kb": 999},
+            {"id": 0, "name": "osd.0", "type": "osd", "kb": 100, "kb_used": 40,
+             "kb_avail": 60, "utilization": 40.0, "status": "up"},
+            {"id": 1, "name": "osd.1", "kb": 100, "kb_used": 10, "kb_avail": 90,
+             "utilization": 10.0, "status": "up"},
+        ]
+    }
+    result, _ = ceph._parse_osd_df(osd_df)
+    assert [n["name"] for n in result] == ["osd.0", "osd.1"]  # root bucket dropped
+
+
 def test_poll_perf_and_osd_df_failure_isolated(clock):
     # A perf/osd_df command failure must NOT touch the core sections: the two
     # *_ok flags stay False and the values stay None, like df/tree isolation.
@@ -926,6 +960,38 @@ def test_poll_perf_and_osd_df_failure_isolated(clock):
     assert r["osd_df"] is None
     assert r["osd_perf_truncated"] is False
     assert r["osd_df_truncated"] is False
+
+
+def test_poll_cluster_deadline_sheds_enrichment_tail(clock):
+    # A slow cluster: status succeeds, then the per-cluster wall-clock deadline
+    # trips and every enrichment command is shed with its *_ok left False. status
+    # (core) still populated the payload; the main loop is not blocked further.
+    class _MonoClock:
+        def __init__(self):
+            self.t = 0.0
+
+        def monotonic(self):
+            return self.t
+
+    fake = _MonoClock()
+    calls = []
+
+    def runner(base, cmd, name):
+        calls.append(tuple(cmd))
+        fake.t += 100.0  # jump past ENRICHMENT_DEADLINE (30s) after status returns
+        return ({"fsid": "abc", "health": "HEALTH_OK"}, None)
+
+    with patch.object(ceph, "time", fake), patch.object(
+        ceph, "_run_ceph_cached", runner
+    ), patch.object(ceph, "log"):
+        r = ceph._poll_cluster({"name": "ceph"})
+
+    assert calls == [("status",)]  # only status ran; the tail was shed, not issued
+    assert r["collection"]["status_ok"] is True
+    assert r["collection"]["df_ok"] is False
+    assert r["collection"]["tree_ok"] is False
+    assert r["collection"]["perf_ok"] is False
+    assert r["collection"]["osd_df_ok"] is False
 
 
 # --- cross-repo contract (fivenines-server) ---------------------------------
@@ -1069,11 +1135,11 @@ _CLI_OSD_PERF = {
 # 10 GiB; osd.1 is 80% full, osd.2 is down.
 _CLI_OSD_DF = {
     "nodes": [
-        {"id": 0, "name": "osd.0", "kb": 10485760, "kb_used": 4194304,
+        {"id": 0, "name": "osd.0", "type": "osd", "kb": 10485760, "kb_used": 4194304,
          "kb_avail": 6291456, "utilization": 40.0, "status": "up"},
-        {"id": 1, "name": "osd.1", "kb": 10485760, "kb_used": 8388608,
+        {"id": 1, "name": "osd.1", "type": "osd", "kb": 10485760, "kb_used": 8388608,
          "kb_avail": 2097152, "utilization": 80.0, "status": "up"},
-        {"id": 2, "name": "osd.2", "kb": 10485760, "kb_used": 2097152,
+        {"id": 2, "name": "osd.2", "type": "osd", "kb": 10485760, "kb_used": 2097152,
          "kb_avail": 8388608, "utilization": 20.0, "status": "down"},
     ],
     "stray": [],

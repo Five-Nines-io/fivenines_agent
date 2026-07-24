@@ -45,7 +45,7 @@
           "degraded_objects": 512,
           "degraded_total": 200000
         },
-        "osd_fullness": { "nearfull": 2, "full": null },
+        "osd_fullness": { "nearfull": 2, "full": 0 },
         "capacity": {
           "total_bytes": 32212254720,
           "used_bytes": 12884901888,
