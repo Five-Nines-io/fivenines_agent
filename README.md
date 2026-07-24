@@ -311,6 +311,8 @@ Requires agent version **1.12.0+**. When MQTT monitoring is enabled for a host i
 
 Requires agent version **1.9.0+**. When Ceph monitoring is enabled for a host in the fivenines dashboard, the agent polls `ceph status`, `ceph df` and `ceph osd tree` and reports cluster health (status + active checks), monitor quorum, OSD up/in counts, PG states (degraded/inactive/undersized), raw capacity and per-host OSD counts. Multiple clusters per host are supported (each entry can carry its own `--cluster` name, config file and keyring).
 
+Agent version **1.13.0+** adds a Datadog-parity second tier from the same targets (no extra config): client I/O throughput/IOPS and recovery/rebalance progress (curated out of `ceph status`), nearfull/full OSD counts (from the `OSD_NEARFULL`/`OSD_FULL` health checks), per-pool usage (from `ceph df`), and two additional read-only commands -- `ceph osd perf` (per-OSD commit/apply latency) and `ceph osd df` (per-OSD fullness). Each new command is independently isolated: a failure or timeout leaves its section absent without affecting the core metrics, and the server presence-guards every field, so older agents keep reporting unchanged.
+
 ### Requirements
 
 The `ceph` CLI must be present on the host:
