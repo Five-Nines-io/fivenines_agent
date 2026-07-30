@@ -423,6 +423,10 @@ from a credentials problem. Available in agent version **1.11.4+**:
 - InnoDB buffer-pool hit ratio and usage (computed)
 - Replication status and lag for replicas (`SHOW REPLICA STATUS` with a
   `SHOW SLAVE STATUS` fallback for MariaDB / MySQL < 8.0.22)
+- Galera / wsrep cluster state on MariaDB/MySQL Galera nodes (cluster size and
+  status, local state, ready/connected, flow-control pause and receive-queue
+  averages). Detection is implicit: a non-Galera server reports no wsrep data,
+  so these keys are simply absent. Available in agent version **1.16.0+**.
 
 Requires a `mysql` (or `mariadb`) client on the host and appropriate database
 credentials.
