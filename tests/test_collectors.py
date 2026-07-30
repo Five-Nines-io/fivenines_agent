@@ -30,6 +30,7 @@ def test_registry_has_expected_config_keys():
         "fans",
         "nvidia_gpu",
         "redis",
+        "memcached",
         "nginx",
         "apache",
         "php_fpm",

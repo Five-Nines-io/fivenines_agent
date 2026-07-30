@@ -14,6 +14,7 @@ from fivenines_agent.fans import fans
 from fivenines_agent.gpu import gpu_metrics
 from fivenines_agent.io import io
 from fivenines_agent.logs import collect_log_signals
+from fivenines_agent.memcached import memcached_metrics
 from fivenines_agent.memory import memory, swap
 from fivenines_agent.mysql import mysql_metrics
 from fivenines_agent.network import network
@@ -90,6 +91,11 @@ COLLECTORS = [
     ("fans", [("fans", fans, False)]),
     ("nvidia_gpu", [("nvidia_gpu", gpu_metrics, False)]),
     ("redis", [("redis", redis_metrics, True)]),
+    # Memcached: config-driven single `stats` scrape over TCP (nginx/caddy
+    # posture, no capability gate). config["memcached"] == {"host":..,"port":..}
+    # is unpacked (pass_kwargs) into memcached_metrics(host=.., port=..). Emits a
+    # flat snapshot dict, or None (collection failure). `false` disables it.
+    ("memcached", [("memcached", memcached_metrics, True)]),
     ("nginx", [("nginx", nginx_metrics, True)]),
     ("apache", [("apache", apache_metrics, True)]),
     # PHP-FPM: config-driven per-pool status scrape (nginx/apache posture, no
