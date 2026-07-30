@@ -684,7 +684,10 @@ class PermissionProbe:
             return default_socket, "default socket"
         xdg = os.environ.get("XDG_RUNTIME_DIR")
         if xdg:
-            return os.path.join(xdg, "docker.sock"), "XDG_RUNTIME_DIR (rootless)"
+            # POSIX join on purpose (see docker.rootless_socket_url): a unix
+            # socket path is always POSIX, and ntpath.join would yield
+            # "/run/user/1000\\docker.sock" when the suite runs on Windows.
+            return f"{xdg.rstrip('/')}/docker.sock", "XDG_RUNTIME_DIR (rootless)"
         return default_socket, "default socket"
 
     def _can_access_docker(self):

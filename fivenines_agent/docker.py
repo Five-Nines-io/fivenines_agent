@@ -71,7 +71,10 @@ def rootless_socket_url():
     xdg = os.environ.get("XDG_RUNTIME_DIR")
     if not xdg:
         return None
-    candidate = os.path.join(xdg, "docker.sock")
+    # Joined POSIX-style on purpose, not with os.path.join: a Docker unix socket
+    # path is always POSIX, and ntpath.join would produce
+    # "/run/user/1000\\docker.sock" when the suite runs on Windows.
+    candidate = f"{xdg.rstrip('/')}/docker.sock"
     if not os.path.exists(candidate):
         return None
     return f"unix://{candidate}"
