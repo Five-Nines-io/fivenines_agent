@@ -37,6 +37,7 @@ def test_registry_has_expected_config_keys():
         "qemu",
         "fail2ban",
         "caddy",
+        "tsdb",
         "postgresql",
         "mysql",
         "proxmox",
