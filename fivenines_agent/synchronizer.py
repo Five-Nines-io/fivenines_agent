@@ -135,6 +135,18 @@ class Synchronizer(Thread):
         """Send systemd inventory snapshot to /systemd_inventory. Returns response or None."""
         return self._post("/systemd_inventory", inventory_data)
 
+    def send_image_packages(self, image_packages_data):
+        """Send one Docker image's OS package inventory to /image_packages.
+        Returns the parsed response (truthy) on a 200, None otherwise.
+
+        Mirrors send_packages / send_logs: gzip + auth + bounded retries via
+        _post. Called from the dedicated ImageInventoryUploader thread (never the
+        collection loop or the /collect drain), so a slow upload cannot block
+        metric collection or config sync. The server answers 200 for every
+        definitive outcome including refusals (so the digest is marked done and
+        not retried); non-200 is transient only."""
+        return self._post("/image_packages", image_packages_data)
+
     def get_conn(self):
         url = api_url()
         if not url.startswith("localhost"):
