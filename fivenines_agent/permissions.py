@@ -29,6 +29,19 @@ LIBVIRT_PROBE_TIMEOUT = 3
 # Max chars for stdout/stderr in debug logs
 DEBUG_OUTPUT_LIMIT = 500
 
+# Endpoint schemes docker-py can actually dial. A configured socket_url or
+# DOCKER_HOST outside this set is a misconfiguration, not a remote daemon, and
+# must not report the docker capability as available.
+SUPPORTED_DOCKER_SCHEMES = (
+    "unix://",
+    "http+unix://",
+    "tcp://",
+    "http://",
+    "https://",
+    "ssh://",
+    "npipe://",
+)
+
 # Short, operator-friendly hint for each capability when it is unavailable.
 # Used in both the startup banner and the info-level log emitted on initial
 # probe / state flips. The deeper diagnostic (specific exception, missing
@@ -122,6 +135,12 @@ class PermissionProbe:
         # Tracks an in-flight libvirt probe worker so a wedged libvirt stack
         # cannot leak one stuck thread per re-probe (see _can_access_libvirt).
         self._libvirt_probe_thread = None
+        # Configured Docker socket_url (config["docker"]["socket_url"]), pushed in
+        # by the agent each tick via set_docker_socket_url so _can_access_docker
+        # probes the socket the collector will actually use, not a hardcoded path.
+        # None until the first config arrives (startup probe uses DOCKER_HOST /
+        # the default paths, which is correct for the systemd drop-in setup).
+        self._docker_socket_url = None
         self._probe_all()
 
     def _set_reason(self, msg):
@@ -620,18 +639,95 @@ class PermissionProbe:
             self._set_reason(f"zpool list: {type(e).__name__}: {e}")
             return False
 
-    def _can_access_docker(self):
-        """Check if Docker socket is accessible."""
-        docker_socket = "/var/run/docker.sock"
-        log(f"_can_access_docker: checking {docker_socket}", "debug")
+    def set_docker_socket_url(self, socket_url):
+        """Record the configured Docker socket_url (config["docker"]["socket_url"])
+        so _can_access_docker probes the socket the collector will actually use.
+        Called from the agent's config-driven refresh each tick; a value change
+        is picked up by the next (gap or full) re-probe."""
+        self._docker_socket_url = socket_url
 
-        if not os.path.exists(docker_socket):
-            log(f"_can_access_docker: {docker_socket} does not exist", "debug")
-            self._set_reason(f"{docker_socket} does not exist")
+    @staticmethod
+    def _docker_socket_from_url(url, source):
+        """Filesystem path of a Docker endpoint URL, and where it came from.
+
+        'unix:///path' or a bare '/path' -> that path. A tcp:// / npipe:// / ssh://
+        endpoint has no local socket file, so path is None (no os.access check
+        applies -- the collector's own connect will surface a real failure as
+        runtime data, like the Ceph light probe)."""
+        if url.startswith("unix://"):
+            return url.removeprefix("unix://"), source
+        if url.startswith("http+unix://"):
+            return url.removeprefix("http+unix://"), source
+        if url.startswith("/"):
+            return url, source
+        return None, source
+
+    def _resolve_docker_socket(self):
+        """(path, source) for the socket get_docker_client would talk to.
+
+        Mirrors the collector's resolution order: configured socket_url ->
+        DOCKER_HOST (what docker.from_env() reads) -> /var/run/docker.sock ->
+        $XDG_RUNTIME_DIR/docker.sock (rootless). path is None for a non-unix
+        endpoint. This replaces the old hardcoded /var/run/docker.sock, which
+        made a reachable rootless / relocated socket look permanently
+        unavailable (same fix as _can_access_libvirt: probe what the collector
+        uses, not a guessed path)."""
+        if self._docker_socket_url:
+            return self._docker_socket_from_url(
+                self._docker_socket_url, "configured socket_url"
+            )
+        docker_host = os.environ.get("DOCKER_HOST")
+        if docker_host:
+            return self._docker_socket_from_url(docker_host, "DOCKER_HOST")
+        default_socket = "/var/run/docker.sock"
+        if os.path.exists(default_socket):
+            return default_socket, "default socket"
+        xdg = os.environ.get("XDG_RUNTIME_DIR")
+        if xdg:
+            return os.path.join(xdg, "docker.sock"), "XDG_RUNTIME_DIR (rootless)"
+        return default_socket, "default socket"
+
+    def _can_access_docker(self):
+        """Check whether the Docker socket the collector would use is accessible.
+
+        Resolves the socket the same way get_docker_client does and reports the
+        path it actually tried, so an operator who relocated the socket (rootless
+        DOCKER_HOST, a configured socket_url) sees the real reason instead of a
+        misleading '/var/run/docker.sock does not exist'."""
+        path, source = self._resolve_docker_socket()
+        if path is None:
+            # A non-file endpoint (tcp:// / npipe:// / ssh://). We cannot
+            # os.access it, and we deliberately do NOT open a connection here:
+            # the Ceph probe sets the precedent that a transient network failure
+            # must not disable a collector for a whole reprobe window. So assume
+            # reachable and let the collector report a real connect failure as
+            # runtime data. But validate the SCHEME first -- otherwise a typo or
+            # a malformed backend value silently reports the capability as
+            # available on a host with no Docker at all.
+            endpoint = self._docker_socket_url or os.environ.get("DOCKER_HOST", "")
+            if not endpoint.startswith(SUPPORTED_DOCKER_SCHEMES):
+                log(
+                    f"_can_access_docker: unsupported endpoint {endpoint!r}",
+                    "debug",
+                )
+                self._set_reason(
+                    f"unsupported Docker endpoint {endpoint!r} (from {source})"
+                )
+                return False
+            log(
+                f"_can_access_docker: {source} is not a unix socket; assuming reachable",
+                "debug",
+            )
+            return True
+
+        log(f"_can_access_docker: checking {path} (from {source})", "debug")
+        if not os.path.exists(path):
+            log(f"_can_access_docker: {path} does not exist", "debug")
+            self._set_reason(f"{path} does not exist (from {source})")
             return False
 
-        readable = os.access(docker_socket, os.R_OK)
-        writable = os.access(docker_socket, os.W_OK)
+        readable = os.access(path, os.R_OK)
+        writable = os.access(path, os.W_OK)
         accessible = readable and writable
 
         log(f"_can_access_docker: readable={readable}, writable={writable}", "debug")
@@ -641,7 +737,7 @@ class PermissionProbe:
         )
         if not accessible:
             self._set_reason(
-                f"{docker_socket} not accessible (readable={readable}, writable={writable})"
+                f"{path} not accessible (readable={readable}, writable={writable})"
             )
         return accessible
 
