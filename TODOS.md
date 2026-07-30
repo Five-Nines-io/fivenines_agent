@@ -263,3 +263,53 @@ follow-up gated on demand:
   that needs WSS or a self-signed cert)
 - **Files:** `fivenines_agent/mqtt.py` (`_BrokerClient._build_client`,
   `_connect_status`), `tests/test_mqtt.py`, `tests/fixtures/mqtt_contract_payload.json`
+
+## P2: Resolve /image_packages merge semantics before the language-ecosystem phase
+
+The image-inventory payload carries `ecosystem: null` ("the image's OS
+ecosystem") so a later phase can send `{"name":"lodash","version":"4.17.20",
+"ecosystem":"npm"}` on the same endpoint without a contract break. Two things are
+unresolved and BLOCK that phase:
+
+- **Merge vs replace.** If a POST replaces all packages for an `image_id`, the
+  npm POST would wipe the OS packages -- and the agent will never re-send them,
+  because `mark_done` is once-per-digest-forever. Upserting by
+  `(name, version, ecosystem)` avoids that.
+- **`packages_hash` excludes `ecosystem`.** It is `sha256` over `name=version\n`
+  only (reused verbatim from the host `/packages` path for byte-compatibility),
+  so once `ecosystem` is populated two different sets hash identically. Either
+  fold ecosystem into a distinct image-side hash or stop using `packages_hash` as
+  a set identity.
+
+Both are documented in the shared fixture's `packages_contract` block; this TODO
+is to actually decide them with the server side.
+
+- **Effort:** S (human) / S (CC)
+- **Depends on:** server `/image_packages` ingester shipped
+- **Files:** `fivenines_agent/docker_image_inventory.py` (`_payload`), `tests/fixtures/docker_image_inventory_contract_payload.json`, server ingester
+
+## P3: RPM package extraction for image inventory (phase 1.5)
+
+Phase 1 covers dpkg + apk. RPM images (AlmaLinux, Rocky, RHEL, Fedora, Amazon
+Linux, openSUSE) currently report `unsupported_distro` with a reason -- honest,
+but unscannable. `rpmdb.sqlite` retrieves identically via the archive API, but
+the rows hold binary RPM header blobs that need decoding (tags 1000/1001/1002/
+1003), and RHEL 8-era images use Berkeley DB instead. Tracked as a separate issue
+per #101.
+
+- **Effort:** M (human) / M (CC)
+- **Depends on:** image inventory phase 1 shipped
+- **Files:** `fivenines_agent/docker_image_inventory.py` (`_RPM_IDS` branch, a new parser), tests, fixture
+
+## P4: package_cap fixture scenario for the image-inventory contract
+
+`errors[].type` includes `package_cap` (the package list was TRUNCATED to 2000,
+so `packages` is a prefix and the server must not render the scan as complete).
+It is declared in the fixture's `errors_contract` and pinned by a drift test, but
+it has no `scenarios` entry, because a 2001-package fixture would bloat the file
+the server vendors byte-identical. If the server team wants a concrete example,
+generate one at spec time from the declared enum rather than committing it.
+
+- **Effort:** S (human) / S (CC)
+- **Depends on:** nothing
+- **Files:** `tests/fixtures/docker_image_inventory_contract_payload.json`, `tests/test_docker_image_inventory.py`
