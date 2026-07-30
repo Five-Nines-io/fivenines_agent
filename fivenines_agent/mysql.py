@@ -1,3 +1,4 @@
+import math
 import shutil
 import subprocess
 
@@ -48,6 +49,12 @@ ERROR_DETAIL_MAX = 500
 # with a syntax error).
 REPLICA_STATUS_SQL = "SHOW REPLICA STATUS"
 SLAVE_STATUS_SQL = "SHOW SLAVE STATUS"
+
+# Galera / wsrep cluster state (issue #107). One extra statement on the same CLI
+# path as the rest of the collector. A non-Galera server returns zero wsrep rows,
+# so the whitelisted keys are simply absent -- Galera detection is implicit (no
+# config, no gate; no-data == not clustered).
+GALERA_STATUS_SQL = "SHOW GLOBAL STATUS LIKE 'wsrep%'"
 
 
 def _resolve_binary():
@@ -194,6 +201,24 @@ def _to_int(value):
         return None
 
 
+def _to_float(value):
+    """float(value) or None -- absorbs NULL/blank/None/garbage and non-finite.
+
+    inf/-inf/nan (and overflowing magnitudes like "1e999" that float() rounds to
+    inf) are valid Python floats but serialize as the non-RFC-8259 tokens
+    Infinity/NaN under the synchronizer's json.dumps (default allow_nan=True),
+    which a strict backend JSON parser rejects -- poisoning the WHOLE tick
+    payload (every collector), not just this key. Rejecting them to None omits
+    the gauge (no-data) and keeps a bad wsrep value isolated, matching the
+    collector's omit-not-fabricate discipline.
+    """
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
 def _first(row, *keys):
     """Return the first present key's value (handles MySQL/MariaDB spellings)."""
     for key in keys:
@@ -273,6 +298,46 @@ def _add_variable_metrics(metrics, variables):
     version = variables.get("version")
     if version:
         metrics["version"] = version
+
+
+# Galera / wsrep whitelist merged into data["mysql"]: (payload_key, coercion).
+# Numeric gauges are parsed (ints/floats); cluster/health status strings ship
+# verbatim (str). Everything here is an instantaneous gauge/status -- nothing to
+# rate. A field whose coercion yields None (unparseable/NULL) is omitted, never
+# fabricated. Anything outside this list (wsrep_provider, ...) is dropped.
+_WSREP_FIELDS = (
+    ("wsrep_cluster_size", _to_int),
+    ("wsrep_cluster_status", str),
+    ("wsrep_local_state", _to_int),
+    ("wsrep_local_state_comment", str),
+    ("wsrep_ready", str),
+    ("wsrep_connected", str),
+    ("wsrep_flow_control_paused", _to_float),
+    ("wsrep_local_recv_queue_avg", _to_float),
+)
+
+
+def _add_galera_metrics(metrics, status):
+    """Merge the whitelisted Galera / wsrep cluster-state gauges.
+
+    `status` is the parsed SHOW GLOBAL STATUS LIKE 'wsrep%' output. A non-Galera
+    server returns zero wsrep rows, so nothing is added and every wsrep_* key is
+    simply absent -- Galera detection is implicit (no-data == not clustered).
+    Present-but-empty values are omitted too: a numeric field that fails to parse
+    (NULL / non-finite / garbage) and a blank status string both drop out rather
+    than ship a fabricated null or "". Non-blank status strings ship verbatim; a
+    real 0 / 0.0 gauge is kept.
+    """
+    for key, coerce in _WSREP_FIELDS:
+        if key in status:
+            value = coerce(status[key])
+            # Omit missing/blank values: None from a numeric coercion (NULL /
+            # non-finite / garbage) or "" from a present-but-empty status field.
+            # No-data reads as absent, never a fabricated null or blank string. A
+            # real 0 / 0.0 gauge (e.g. local_state 0, no flow control) is kept.
+            if value is None or value == "":
+                continue
+            metrics[key] = value
 
 
 def _build_replication(row):
@@ -397,5 +462,12 @@ def mysql_metrics(
         metrics["is_replica"] = is_replica
     if replication is not None:
         metrics["replication"] = replication
+
+    # Best-effort: Galera / wsrep cluster state (one extra statement, issue #107).
+    # Zero rows on a non-Galera server -> no keys added (implicit detection). A
+    # failure drops only these keys; reachable stays True.
+    wsrep_out, werr, _ = _run_mysql(binary, GALERA_STATUS_SQL, conn)
+    if not werr and wsrep_out is not None:
+        _add_galera_metrics(metrics, _parse_status(wsrep_out))
 
     return metrics
