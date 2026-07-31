@@ -60,6 +60,30 @@ if [ -z "${SYNOLOGY:-}" ]; then
 fi
 
 #
+# Build environment: prefer the image-baked venv. The builder image
+# (Dockerfile / Dockerfile.arm) bakes /opt/venv with poetry + all locked deps,
+# keyed on pyproject.toml + poetry.lock, so this no longer runs on every build.
+# Here we install ONLY the root project, editable from the mounted source, so the
+# frozen binary carries this commit's code + version metadata (deps stay baked).
+# Falls back to building the whole environment from scratch for local/non-image
+# runs (kept in sync with the Dockerfile bake).
+#
+if [ -d /opt/venv ]; then
+    echo "=== Using pre-baked build venv (/opt/venv) ==="
+    # shellcheck disable=SC1091
+    source /opt/venv/bin/activate
+    if [ -z "$VIRTUAL_ENV" ]; then
+        echo "Failed to activate /opt/venv. Exiting."
+        exit 1
+    fi
+    echo "Installing root project (editable, no deps) from the mounted source"
+    pip install -e . --no-deps || {
+        echo "Root project install failed. Exiting."
+        exit 1
+    }
+else
+echo "=== No pre-baked venv found; building environment from scratch (fallback) ==="
+#
 # Install and enable virtualenv
 #
 echo "Installing and enabling virtualenv"
@@ -162,6 +186,7 @@ poetry export --without-hashes -o requirements.txt || {
     echo "Failed to export dependencies. Exiting."
     exit 1
 }
+fi
 
 #
 # Build libpython3.10.so from source for PyInstaller.
@@ -296,12 +321,16 @@ PYI_BASE=(
     --add-binary "/usr/lib64/libz.so.1:."
 )
 if [ -n "${SYNOLOGY:-}" ]; then
-    PYI_EXTRA=(--exclude-module libvirt --exclude-module libvirtmod --exclude-module systemd_watchdog --exclude-module proxmoxer)
+    # Exclude every virtualization-group module. With the image-baked venv these
+    # are now installed (unlike the old --without-virtualization install), so
+    # they must be excluded explicitly or PyInstaller would bundle them --
+    # pynvml included, which the standard build --hidden-imports.
+    PYI_EXTRA=(--exclude-module libvirt --exclude-module libvirtmod --exclude-module systemd_watchdog --exclude-module proxmoxer --exclude-module pynvml)
 else
     PYI_EXTRA=(--hidden-import=libvirt --hidden-import=libvirtmod --hidden-import=proxmoxer.backends --hidden-import=proxmoxer.backends.https --hidden-import=pynvml --add-binary "/usr/lib64/libtirpc.so.3:.")
 fi
 
-LD_LIBRARY_PATH="/opt/python/cp310-cp310/lib:$LD_LIBRARY_PATH" poetry run pyinstaller \
+LD_LIBRARY_PATH="/opt/python/cp310-cp310/lib:$LD_LIBRARY_PATH" pyinstaller \
     "${PYI_BASE[@]}" "${PYI_EXTRA[@]}" ./py2exe_entrypoint.py || {
     echo "PyInstaller failed. Exiting."
     exit 1

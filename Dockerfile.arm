@@ -162,6 +162,29 @@ RUN . /etc/profile && \
     find $PYTHON_PATH -name "Python.h" | head -1 && \
     echo "manylinux2014 + libvirt 4.5.0 setup complete - should have RSS support and CentOS 7 compatibility!"
 
+# Bake the Python build environment (poetry + all locked deps) into an
+# image-resident venv (/opt/venv) so py2exe.sh no longer rebuilds it on every
+# job -- installing the poetry tool (~120s) then the deps (~120s) were the bulk
+# of each Linux build. Keyed on pyproject.toml + poetry.lock: cached until deps
+# change. libvirt-python (C ext) compiles here once against the image's libvirt.
+# The root project is intentionally NOT installed (--no-root); py2exe.sh installs
+# it editable from the mounted /workspace at runtime, so the frozen binary always
+# carries the current commit's code + version metadata while deps stay baked.
+COPY pyproject.toml poetry.lock /build/
+RUN echo "=== Baking build venv at /opt/venv ===" && \
+    export PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/lib64/pkgconfig" && \
+    /opt/python/cp310-cp310/bin/python3.10 -m venv /opt/venv && \
+    . /opt/venv/bin/activate && \
+    pip install --upgrade pip setuptools wheel && \
+    pip install poetry==2.4.1 && \
+    poetry config virtualenvs.create false && \
+    poetry config installer.max-workers 1 && \
+    pip install libvirt-python==11.6.0 && \
+    cd /build && \
+    poetry install --no-root --with virtualization && \
+    python -c "import libvirt, PyInstaller; print('venv ok - libvirt', libvirt.getVersion())" && \
+    cd / && rm -rf /build
+
 ENV TARGET_ARCH="arm64"
 WORKDIR /workspace
 CMD ["bash"]
