@@ -1,0 +1,345 @@
+{
+  "description": "Shared Docker IMAGE OS-package inventory contract fixture between fivenines-agent and fivenines-server (server issue #101). Source of truth: fivenines-agent tests/fixtures/docker_image_inventory_contract_payload.json, asserted end-to-end by tests/test_docker_image_inventory.py::test_contract_fixture_scenarios (only the Docker SDK boundary -- client.containers.get / container.get_archive -- is mocked). For each scenario, 'sdk' describes the container's filesystem as the agent-side test builds it (files by path, symlinks with their linkTarget, paths that 404 via 'not_found', a DB that overflows the 5 MB cap via 'oversized'); the server ignores 'sdk'. 'payload' is the EXACT body the agent POSTs to /image_packages -- the artifact the server's image-package ingester must parse; copy this file byte-identical into the server spec/fixtures and bump FEATURES_SUPPORTED_VERSIONS['docker_image_inventory'] to agent_min_version exactly. Change only in lockstep. Contract highlights: (a) packages carry {name, version, ecosystem} where ecosystem is null == 'the image OS ecosystem' (a future phase sends npm/pypi/etc. on the same endpoint, no v2); (b) packages_hash reuses the host packages path's get_packages_hash and is null on a failure payload; (c) an extraction failure is NEVER empty-and-clean -- every failure records a structured errors[] entry so the server renders 'not scannable, <reason>' instead of a false '0 vulnerabilities'; (d) the /etc/os-release symlink MUST be followed via stat['linkTarget'] or every Debian image looks unscannable; (e) the dpkg Status filter keeps only 'install ok installed'; (f) RPM is unsupported in phase 1 (reported, not empty).",
+  "agent_min_version": "1.14.0",
+  "_agent_min_version_note": "Docker image inventory ships in 1.14.0 (the first MINOR after the 1.13.x line: 1.13.0 Ceph v2, 1.13.1 PHP-FPM). The server's FEATURES_SUPPORTED_VERSIONS['docker_image_inventory'] must match this exactly.",
+  "config": {
+    "_note": "How the server TURNS THIS ON. Without this the server can ship the whole ingester and the agent will never POST anything.",
+    "image_inventory": true,
+    "_image_inventory_note": "TOP-LEVEL /collect config key, truthy-checked. It must NOT be nested under config['docker']: collectors.py splats config['docker'] as **kwargs into docker_metrics(), so a new nested key would raise TypeError on every agent older than 1.14.0, get swallowed into data['docker']=null, and (with the never-prune-on-null rule) freeze container-state rows fleet-wide. Agent 1.14.0 also adds **_kwargs to docker_metrics as a belt-and-braces guard, but the key stays top-level regardless.",
+    "_requires_docker": "config['docker'] must ALSO be enabled. The agent derives the set of image digests to scan from the already-collected data['docker']['containers'] payload (no second daemon call), so with Docker collection off there are no digests to inventory.",
+    "_join_key": "payload['image_id'] == data['docker']['containers'][*]['image_id'] (both are the container's attrs.Image local digest). That join is how the server turns image vulnerabilities into per-container findings.",
+    "_socket_url": "config['docker']['socket_url'], when set, is reused verbatim for the archive API connection and is also what the agent's docker capability probe checks."
+  },
+  "response_contract": {
+    "_note": "The agent's retry/stop behaviour depends on the RESPONSE, and a server that gets this wrong creates a permanent re-extraction treadmill (each retry re-runs archive GETs + tar parse + POST).",
+    "success_requires_non_empty_json_body": "CRITICAL: the agent treats a request as successful when _post returns a TRUTHY parsed JSON body -- not merely on status 200. A 200 with an empty body makes json.loads('') raise (treated as transient, full retry budget burned), and a 200 with '{}' parses to a FALSY dict (also treated as transient). Always return a non-empty JSON object, e.g. {\"status\":\"ok\",\"accepted\":true} or {\"status\":\"ok\",\"accepted\":false,\"reason\":\"unsupported_distro\"}.",
+    "refusals_are_200": "Answer 200 for EVERY definitive outcome, including refusals, so the agent marks the digest done and stops re-extracting an immutable image. Do NOT use 4xx for a permanent refusal (unentitled tenant, unknown image): the agent treats every non-200 as transient and there is no per-digest backoff or circuit breaker.",
+    "durability": "A 200 is a ONE-SHOT commitment: the agent appends the digest to its on-disk done set and never re-sends it (digests are immutable). Persist the payload durably BEFORE responding 200. If ingest is async, a lost write is permanent -- there is no reconciliation path and no server-side way to ask the agent to re-scan a digest.",
+    "non_200_is_transient": "Any non-200 (or a connection failure) releases the digest so it retries on a later tick."
+  },
+  "errors_contract": {
+    "_note": "errors[] is a CLOSED set the server can switch on. Every value the agent can emit is enumerated here -- do not infer the set from the scenarios below, which exercise only the common ones. (Inferring a value set from an incomplete sample is exactly how the Ceph v2 ingester shipped dead gauges.)",
+    "type": {
+      "not_found": "A 404 from the archive API. On the os_release step this is the distroless/scratch signal; on a DB step it means the image has no such package DB. Also how a container removed mid-extraction surfaces -- indistinguishable at the API. Render: not scannable.",
+      "api_error": "Any non-404 daemon/SDK/stream failure. Render: not scannable this time (transient-ish); the digest is still marked done on a 200, so it will not be retried automatically.",
+      "file_over_cap": "The file exceeded the 5 MB per-file cap and was abandoned mid-stream. Render: not scannable.",
+      "parse_error": "The file was read but yielded nothing usable (unreadable tar, unresolved symlink chain, or a DB whose every entry was filtered out). Render: not scannable -- NEVER as '0 vulnerabilities'.",
+      "unsupported_distro": "Either os-release has no ID, or the distro family is out of scope for phase 1 (RPM is phase 1.5). Render: not scannable, unsupported distro.",
+      "package_cap": "HIGHEST-STAKES VALUE. The package list was TRUNCATED to the 2000-package cap. `packages` is a PREFIX, not the whole image. The server MUST NOT treat such a scan as complete -- doing so silently under-reports vulnerabilities, which is the false all-clear this whole error contract exists to prevent. Note this type has no scenario below (a 2001-package fixture would bloat the shared file); it is covered by agent unit tests and pinned by a drift test asserting this enum matches the code."
+    },
+    "step": {
+      "os_release": "Reading/parsing /etc/os-release (follows one symlink hop).",
+      "distro": "Classifying the parsed distro into a package-DB family.",
+      "dpkg_status": "Reading/parsing /var/lib/dpkg/status.",
+      "apk_installed": "Reading/parsing /lib/apk/db/installed."
+    },
+    "message_determinism": "errors[].message is deterministic -- it never embeds raw SDK exception text, which varies by daemon version. The raw exception goes to the agent's debug log instead. Safe for the server to key on."
+  },
+  "packages_contract": {
+    "ordering": "packages is sorted by name, and packages_hash is ORDER-SENSITIVE (it is the concatenation of 'name=version\\n' over the list as given). Preserve order if you re-serialize, or the hash will not match.",
+    "packages_hash": "sha256 over 'name=version\\n' per entry, byte-compatible with the host /packages path (same get_packages_hash function). It covers name+version ONLY -- it deliberately does NOT include `ecosystem`. Once a later phase populates ecosystem, two sets differing only in ecosystem would hash identically, so do not use packages_hash as a set identity beyond OS packages. null on a failure payload.",
+    "ecosystem_null": "null means 'the image's OS ecosystem'. The slot exists so a future phase can send {\"name\":\"lodash\",\"version\":\"4.17.20\",\"ecosystem\":\"npm\"} on the SAME endpoint without a contract break.",
+    "merge_semantics": "UNRESOLVED - decide before the language-ecosystem phase. If a POST replaces all packages for an image_id, the future npm POST would wipe the OS packages, and the agent will never re-send them (mark_done is once-per-digest-forever). Upserting by (name, version, ecosystem) avoids that.",
+    "field_hygiene": "name and version have C0/C1 control characters and U+FFFD stripped and are truncated to 256 chars by the agent; an entry whose name or version scrubs to empty is dropped rather than shipped."
+  },
+  "error_path_audit": {
+    "daemon_unreachable": "get_docker_client returns None -> build_image_inventory returns None (NOT a payload) -> the uploader calls on_failure -> the digest is released and retried on a later tick. A transient infra condition is never a scan verdict.",
+    "container_gone_before_extraction": "client.containers.get raising NotFound -> build_image_inventory returns None -> retry. A later tick re-picks the digest with whatever container then runs it; if none does, the digest is never learned again, which is fine (an image with no container is out of scope).",
+    "container_removed_mid_extraction": "A get_archive 404 AFTER we hold the container surfaces as a not_found error inside a real payload (see the scenario), marked done on a 200 so it is not retried forever.",
+    "server_refusal_is_200": "The server answers 200 for every definitive outcome INCLUDING refusals (unsupported_distro, unscannable) so the agent marks the digest done and stops re-extracting the immutable image. Non-200 is transient only and releases the digest for retry.",
+    "once_per_image_forever": "The ImageInventoryCoordinator persists done digests to disk (image_inventory_done), so a Restart=always agent does not re-extract the whole host on restart; digests are immutable, so once done, done."
+  },
+  "scenarios": {
+    "debian_slim": {
+      "description": "Debian 12 slim image, dpkg. os-release -> debian:12; /var/lib/dpkg/status parsed to three installed packages (sorted by name). Extra RFC822 fields and a folded Description continuation are ignored -- only Package/Status/Version are read. The reference success shape: non-empty packages, empty errors.",
+      "sdk": {
+        "image_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "container_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "files": {
+          "/etc/os-release": "PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\nNAME=\"Debian GNU/Linux\"\nID=debian\nVERSION_ID=\"12\"\nVERSION_CODENAME=bookworm\n",
+          "/var/lib/dpkg/status": "Package: bash\nStatus: install ok installed\nPriority: required\nArchitecture: amd64\nVersion: 5.2.15-2+b7\n\nPackage: libc6\nStatus: install ok installed\nVersion: 2.36-9+deb12u4\n\nPackage: openssl\nStatus: install ok installed\nPriority: optional\nSection: utils\nMaintainer: Debian OpenSSL Team\nArchitecture: amd64\nVersion: 3.0.11-1~deb12u2\nDescription: Secure Sockets Layer toolkit\n This package is part of the OpenSSL project.\n Version: 9.9.9 -- a continuation line that must be skipped.\n"
+        }
+      },
+      "payload": {
+        "image_id": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "distro": "debian:12",
+        "packages_hash": "c08dd1364c7cf82f2d26dec52ec0a81687d1fea7f4ce5c5eecf4b177d497cc40",
+        "packages": [
+          {
+            "name": "bash",
+            "version": "5.2.15-2+b7",
+            "ecosystem": null
+          },
+          {
+            "name": "libc6",
+            "version": "2.36-9+deb12u4",
+            "ecosystem": null
+          },
+          {
+            "name": "openssl",
+            "version": "3.0.11-1~deb12u2",
+            "ecosystem": null
+          }
+        ],
+        "errors": []
+      }
+    },
+    "alpine": {
+      "description": "Alpine 3.19 image, apk. os-release -> alpine:3.19.1; /lib/apk/db/installed parsed via P:/V: keys to two packages (sorted). No Status filter -- the apk installed DB lists only installed packages.",
+      "sdk": {
+        "image_id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "container_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "files": {
+          "/etc/os-release": "NAME=\"Alpine Linux\"\nID=alpine\nVERSION_ID=3.19.1\nPRETTY_NAME=\"Alpine Linux v3.19\"\n",
+          "/lib/apk/db/installed": "C:Q1a2b3c4d5e6f\nP:busybox\nV:1.36.1-r15\nA:x86_64\n\nC:Q1112233445566\nP:musl\nV:1.2.4-r2\nA:x86_64\n"
+        }
+      },
+      "payload": {
+        "image_id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "distro": "alpine:3.19.1",
+        "packages_hash": "4e60f0ee085a36aa7b1053cea91e31391d56987a2c9995afb50de8cc3a5b00da",
+        "packages": [
+          {
+            "name": "busybox",
+            "version": "1.36.1-r15",
+            "ecosystem": null
+          },
+          {
+            "name": "musl",
+            "version": "1.2.4-r2",
+            "ecosystem": null
+          }
+        ],
+        "errors": []
+      }
+    },
+    "os_release_symlink": {
+      "description": "THE GOTCHA: /etc/os-release is a symlink to /usr/lib/os-release. The archive GET does NOT follow it -- it returns a tar with a SYMLINK entry plus stat['linkTarget'] = the ABSOLUTE target. The agent must re-request that target (NOT the tar entry's relative linkname) to read the file. An agent that skips this reports every Debian image as os-release-less / unscannable.",
+      "sdk": {
+        "image_id": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "container_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "symlinks": {
+          "/etc/os-release": "/usr/lib/os-release"
+        },
+        "files": {
+          "/usr/lib/os-release": "PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\nNAME=\"Debian GNU/Linux\"\nID=debian\nVERSION_ID=\"12\"\nVERSION_CODENAME=bookworm\n",
+          "/var/lib/dpkg/status": "Package: zlib1g\nStatus: install ok installed\nVersion: 1:1.2.13.dfsg-1\n"
+        }
+      },
+      "payload": {
+        "image_id": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "distro": "debian:12",
+        "packages_hash": "7dad7e78d199d025642dd270d327e848eb10ec99956ccfb7ebe918873addf5b9",
+        "packages": [
+          {
+            "name": "zlib1g",
+            "version": "1:1.2.13.dfsg-1",
+            "ecosystem": null
+          }
+        ],
+        "errors": []
+      }
+    },
+    "distroless_no_package_db": {
+      "description": "Distroless: /etc/os-release present (distro known) but no single-file /var/lib/dpkg/status (distroless keeps per-package status.d/ files). The DB GET 404s -> unsupported. packages is EMPTY but errors is NON-empty, so the server renders 'not scannable', never a false '0 vulnerabilities'.",
+      "sdk": {
+        "image_id": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "container_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "files": {
+          "/etc/os-release": "PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\nNAME=\"Debian GNU/Linux\"\nID=debian\nVERSION_ID=\"12\"\nVERSION_CODENAME=bookworm\n"
+        },
+        "not_found": [
+          "/var/lib/dpkg/status"
+        ]
+      },
+      "payload": {
+        "image_id": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "distro": "debian:12",
+        "packages_hash": null,
+        "packages": [],
+        "errors": [
+          {
+            "step": "dpkg_status",
+            "type": "not_found",
+            "message": "/var/lib/dpkg/status not found in image"
+          }
+        ]
+      }
+    },
+    "container_removed_mid_extraction": {
+      "description": "The container disappears and the first archive GET (os-release) 404s. distro cannot be determined (null). Recorded as os_release/not_found: a removed container and a scratch image are indistinguishable at the archive API, so we record the step honestly and let the server label it. Never an empty-and-clean payload.",
+      "sdk": {
+        "image_id": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "container_id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "not_found": [
+          "/etc/os-release"
+        ]
+      },
+      "payload": {
+        "image_id": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "distro": null,
+        "packages_hash": null,
+        "packages": [],
+        "errors": [
+          {
+            "step": "os_release",
+            "type": "not_found",
+            "message": "/etc/os-release not found in image"
+          }
+        ]
+      }
+    },
+    "file_over_cap": {
+      "description": "The package DB streams past the 5 MB per-file cap, aborted MID-stream (running buf.tell() check, not after). os-release resolved first (distro known) then the DB read fails -> unscannable with a file_over_cap error, empty packages.",
+      "sdk": {
+        "image_id": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "container_id": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "files": {
+          "/etc/os-release": "PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\nNAME=\"Debian GNU/Linux\"\nID=debian\nVERSION_ID=\"12\"\nVERSION_CODENAME=bookworm\n"
+        },
+        "oversized": [
+          "/var/lib/dpkg/status"
+        ]
+      },
+      "payload": {
+        "image_id": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "distro": "debian:12",
+        "packages_hash": null,
+        "packages": [],
+        "errors": [
+          {
+            "step": "dpkg_status",
+            "type": "file_over_cap",
+            "message": "archive exceeds 5242880 bytes"
+          }
+        ]
+      }
+    },
+    "rpm_unsupported": {
+      "description": "AlmaLinux (RPM) image. os-release resolves to almalinux:9.3, but RPM extraction is phase 1.5 (rpmdb.sqlite holds binary header blobs). Reported unsupported with the distro known -- never silently empty. No DB read is attempted.",
+      "sdk": {
+        "image_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "container_id": "1111111111111111111111111111111111111111111111111111111111111111",
+        "files": {
+          "/etc/os-release": "NAME=\"AlmaLinux\"\nID=\"almalinux\"\nVERSION_ID=\"9.3\"\nPLATFORM_ID=\"platform:el9\"\n"
+        }
+      },
+      "payload": {
+        "image_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "distro": "almalinux:9.3",
+        "packages_hash": null,
+        "packages": [],
+        "errors": [
+          {
+            "step": "distro",
+            "type": "unsupported_distro",
+            "message": "RPM-based distro 'almalinux:9.3'; extraction is phase 1.5"
+          }
+        ]
+      }
+    },
+    "dpkg_status_with_deinstalled_entry": {
+      "description": "dpkg status with one installed package and one removed-but-config-files-remain entry ('deinstall ok config-files'). The Status filter keeps ONLY 'install ok installed', so the deinstalled entry -- which still carries a Version -- is NOT reported as installed.",
+      "sdk": {
+        "image_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "container_id": "2222222222222222222222222222222222222222222222222222222222222222",
+        "files": {
+          "/etc/os-release": "PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\nNAME=\"Debian GNU/Linux\"\nID=debian\nVERSION_ID=\"12\"\nVERSION_CODENAME=bookworm\n",
+          "/var/lib/dpkg/status": "Package: openssl\nStatus: install ok installed\nVersion: 3.0.11-1~deb12u2\n\nPackage: python3-pip\nStatus: deinstall ok config-files\nVersion: 23.0.1+dfsg-1\n"
+        }
+      },
+      "payload": {
+        "image_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "distro": "debian:12",
+        "packages_hash": "592ab40f6da0781e193eb97170fbdecd79dfa2d03d45e7c14166968fb2541a87",
+        "packages": [
+          {
+            "name": "openssl",
+            "version": "3.0.11-1~deb12u2",
+            "ecosystem": null
+          }
+        ],
+        "errors": []
+      }
+    },
+    "db_readable_but_nothing_installed": {
+      "description": "The package DB reads fine but every entry is filtered out (here: a single 'deinstall ok config-files' entry). That is a parse_error, NOT a clean zero -- an empty packages array with an empty errors array would render as '0 vulnerabilities', a false all-clear. This is the scenario that carries a real parse_error example.",
+      "sdk": {
+        "image_id": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "container_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "files": {
+          "/etc/os-release": "PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\nNAME=\"Debian GNU/Linux\"\nID=debian\nVERSION_ID=\"12\"\nVERSION_CODENAME=bookworm\n",
+          "/var/lib/dpkg/status": "Package: python3-pip\nStatus: deinstall ok config-files\nVersion: 23.0.1+dfsg-1\n"
+        }
+      },
+      "payload": {
+        "image_id": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "distro": "debian:12",
+        "packages_hash": null,
+        "packages": [],
+        "errors": [
+          {
+            "step": "dpkg_status",
+            "type": "parse_error",
+            "message": "no installed packages parsed from package DB"
+          }
+        ]
+      }
+    },
+    "daemon_api_error": {
+      "description": "The daemon returns a non-404 API error for the package DB (500, permission denied, driver failure). Distinguished from not_found: the image is not declared unscannable-because-distroless, it simply could not be read this time. Carries a real api_error example. Messages are deterministic by design -- the raw SDK exception text varies by daemon version and is logged at debug instead, so the server can key on the message safely.",
+      "sdk": {
+        "image_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+        "container_id": "5555555555555555555555555555555555555555555555555555555555555555",
+        "files": {
+          "/etc/os-release": "PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\nNAME=\"Debian GNU/Linux\"\nID=debian\nVERSION_ID=\"12\"\nVERSION_CODENAME=bookworm\n"
+        },
+        "api_error": [
+          "/var/lib/dpkg/status"
+        ]
+      },
+      "payload": {
+        "image_id": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+        "distro": "debian:12",
+        "packages_hash": null,
+        "packages": [],
+        "errors": [
+          {
+            "step": "dpkg_status",
+            "type": "api_error",
+            "message": "/var/lib/dpkg/status: daemon error"
+          }
+        ]
+      }
+    },
+    "malformed_stanza": {
+      "description": "dpkg status with a valid package, a partial stanza (Package but no Version), a block of non-RFC822 garbage, and another valid package. The parser is tolerant: it skips the partial + garbage stanzas and keeps the two complete ones (sorted). errors is empty -- a partial stanza among valid ones is not itself a scan failure.",
+      "sdk": {
+        "image_id": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "container_id": "3333333333333333333333333333333333333333333333333333333333333333",
+        "files": {
+          "/etc/os-release": "PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\nNAME=\"Debian GNU/Linux\"\nID=debian\nVERSION_ID=\"12\"\nVERSION_CODENAME=bookworm\n",
+          "/var/lib/dpkg/status": "Package: bash\nStatus: install ok installed\nVersion: 5.2.15-2+b7\n\nPackage: broken-pkg\nStatus: install ok installed\n\ngarbage line with no colon-delimited fields\nanother garbage line\n\nPackage: coreutils\nStatus: install ok installed\nVersion: 9.1-1\n"
+        }
+      },
+      "payload": {
+        "image_id": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "distro": "debian:12",
+        "packages_hash": "d5a7d6f27a0b9cb25973189b345054684f9fdf1d7b872e1bc19f14dbfc2b6061",
+        "packages": [
+          {
+            "name": "bash",
+            "version": "5.2.15-2+b7",
+            "ecosystem": null
+          },
+          {
+            "name": "coreutils",
+            "version": "9.1-1",
+            "ecosystem": null
+          }
+        ],
+        "errors": []
+      }
+    }
+  }
+}

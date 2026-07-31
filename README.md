@@ -179,6 +179,57 @@ The agent works without sudo, but these features will be unavailable (this is al
 - SMART storage health monitoring
 - RAID (mdadm) array monitoring
 
+### Rootless Docker
+
+Two setups get called "non-root Docker", and they are not the same:
+
+- **Agent as a non-root user (`User=fivenines`) talking to a root daemon** via
+  `/var/run/docker.sock` works out of the box once `fivenines` is in the
+  `docker` group (see above). This is the common case and needs no extra
+  privilege for Docker image inventory (image vulnerability scanning) either --
+  it uses the same socket.
+- **Rootless Docker** (the daemon itself runs as an unprivileged user, with its
+  socket at `$XDG_RUNTIME_DIR/docker.sock`, e.g. `/run/user/1000/docker.sock`)
+  needs the agent pointed at that socket, because the daemon's on-disk layers
+  are owned by subordinate UIDs (`/etc/subuid`, 100000+) that a process outside
+  the user namespace cannot read at all. The archive API is the only way in, and
+  it works only against the daemon's own socket.
+
+The agent resolves the Docker socket in this order, and both the collector and
+the capability probe follow it:
+
+1. the socket URL configured for this host in the fivenines UI (sent as
+   `docker.socket_url` in the agent config),
+2. the `DOCKER_HOST` environment variable,
+3. `/var/run/docker.sock`,
+4. `$XDG_RUNTIME_DIR/docker.sock` (rootless).
+
+To monitor a rootless daemon, use **one** of:
+
+1. **Point the service at the rootless socket** with a systemd drop-in
+   (`sudo systemctl edit fivenines-agent`):
+   ```ini
+   [Service]
+   Environment=DOCKER_HOST=unix:///run/user/1000/docker.sock
+   ```
+   Replace `1000` with the rootless daemon's UID. Note that `/run/user/<uid>`
+   is mode `0700` and owned by that UID, so the `fivenines` user generally
+   **cannot** reach another user's rootless socket -- run the agent as that user
+   instead (option 2) unless you have explicitly widened the permissions.
+2. **Run the agent as the rootless user**, so `XDG_RUNTIME_DIR` is set and
+   `/run/user/<uid>/docker.sock` resolves via step 4 above (no `DOCKER_HOST`
+   needed).
+
+The agent will **not** auto-discover another user's rootless socket: `/run/user/<uid>`
+is `0700` by design, and reaching into it would be wrong. If the socket is not
+reachable, the capabilities banner reports the exact path it tried.
+
+> **User-install trap:** `fivenines_setup_user.sh` starts the agent from an
+> `@reboot` cron job, where `XDG_RUNTIME_DIR` is typically unset. `docker.from_env()`
+> then works in an interactive shell but fails under cron -- a classic rootless
+> false negative. Set `DOCKER_HOST` explicitly (option 1) for cron-launched
+> user installs.
+
 ### Refreshing Capabilities After Permission Changes
 
 The agent automatically re-probes capabilities every 5 minutes. If you make permission changes and want immediate detection:

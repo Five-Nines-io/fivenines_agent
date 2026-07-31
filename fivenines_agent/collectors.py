@@ -12,6 +12,7 @@ from fivenines_agent.docker import docker_metrics
 from fivenines_agent.fail2ban import fail2ban_metrics
 from fivenines_agent.fans import fans
 from fivenines_agent.gpu import gpu_metrics
+from fivenines_agent.haproxy import haproxy_metrics
 from fivenines_agent.io import io
 from fivenines_agent.logs import collect_log_signals
 from fivenines_agent.memcached import memcached_metrics
@@ -26,6 +27,7 @@ from fivenines_agent.postgresql import postgresql_metrics
 from fivenines_agent.processes import processes
 from fivenines_agent.proxmox import proxmox_metrics
 from fivenines_agent.qemu import qemu_metrics
+from fivenines_agent.rabbitmq import rabbitmq_metrics
 from fivenines_agent.raid_storage import raid_storage_health
 from fivenines_agent.redis import redis_metrics
 from fivenines_agent.smart_storage import (
@@ -34,6 +36,7 @@ from fivenines_agent.smart_storage import (
 )
 from fivenines_agent.systemd import systemd_metrics
 from fivenines_agent.temperatures import temperatures
+from fivenines_agent.tsdb import tsdb_metrics
 from fivenines_agent.zfs import zfs_storage_health
 
 # Registry of metric collectors.
@@ -103,12 +106,32 @@ COLLECTORS = [
     # (pass_kwargs) into php_fpm_metrics(status_page_url=...). Emits an array of
     # per-pool objects, [] (zero pools), or None (collection failure).
     ("php_fpm", [("php_fpm", php_fpm_metrics, True)]),
+    # HAProxy: config-driven stats scrape (nginx/apache posture, no capability
+    # gate). config["haproxy"] == {"stats_socket": ..., "stats_url": ...,
+    # "username": ..., "password": ...} is unpacked (pass_kwargs) into
+    # haproxy_metrics(**config). Emits a list of frontend/backend/server rows,
+    # the capped wrapper {"rows": [...], "servers_capped": True}, [] (zero
+    # proxies), or None (collection failure).
+    ("haproxy", [("haproxy", haproxy_metrics, True)]),
     ("docker", [("docker", docker_metrics, True)]),
     ("qemu", [("qemu", qemu_metrics, True)]),
     ("fail2ban", [("fail2ban", fail2ban_metrics, False)]),
     ("caddy", [("caddy", caddy_metrics, True)]),
+    # TSDB (Prometheus / VictoriaMetrics) server health: config-driven HTTP
+    # scrape, no capability gate (nginx/apache posture). config["tsdb"] is
+    # unpacked (pass_kwargs) into tsdb_metrics(url=..., ...). Emits a
+    # reachability envelope -- NEVER None -- so the server distinguishes "TSDB
+    # unreachable" (the signal) from "collector disabled".
+    ("tsdb", [("tsdb", tsdb_metrics, True)]),
     ("postgresql", [("postgresql", postgresql_metrics, True)]),
     ("mysql", [("mysql", mysql_metrics, True)]),
+    # RabbitMQ: config-driven management-API poll (nginx/apache/postgresql
+    # posture, no capability gate). config["rabbitmq"] == {url, username,
+    # password, vhost, include_queues} is unpacked (pass_kwargs) into
+    # rabbitmq_metrics(...). Emits a reachability envelope: reachable:true with
+    # node health + a bounded queues array + queues_total, or reachable:false
+    # (a dead broker / partial listing) so the server never prunes queue rows.
+    ("rabbitmq", [("rabbitmq", rabbitmq_metrics, True)]),
     ("proxmox", [("proxmox", proxmox_metrics, True)]),
     ("systemd", [("systemd", systemd_metrics, True)]),
     # Windows-only: gated by the disk_health capability, only present in the

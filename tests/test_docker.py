@@ -21,6 +21,7 @@ from fivenines_agent.docker import (
     docker_containers,
     docker_metrics,
     get_docker_client,
+    rootless_socket_url,
 )
 
 # ---------------------------------------------------------------------------
@@ -203,6 +204,75 @@ class TestGetDockerClient:
         mock_docker.errors.DockerException = docker_lib.errors.DockerException
         mock_docker.from_env.side_effect = docker_lib.errors.DockerException("nope")
         assert get_docker_client() is None
+
+
+class TestRootlessSocketFallback:
+    """docker.from_env() reads DOCKER_HOST but has NO XDG_RUNTIME_DIR fallback,
+    so without this a rootless host whose operator never exported DOCKER_HOST
+    fails to connect -- while the permission probe (which DOES check XDG) reports
+    the capability available. The collector and the probe must agree."""
+
+    def test_uses_xdg_socket_when_it_is_the_only_one(self):
+        with patch.dict(
+            "os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}, clear=True
+        ), patch(
+            "fivenines_agent.docker.os.path.exists",
+            side_effect=lambda p: p == "/run/user/1000/docker.sock",
+        ):
+            assert rootless_socket_url() == "unix:///run/user/1000/docker.sock"
+
+    def test_defers_to_from_env_when_docker_host_is_set(self):
+        """DOCKER_HOST must keep going through from_env so its TLS env vars
+        (DOCKER_TLS_VERIFY, DOCKER_CERT_PATH) keep working."""
+        with patch.dict(
+            "os.environ",
+            {"DOCKER_HOST": "tcp://x:2375", "XDG_RUNTIME_DIR": "/run/user/1000"},
+            clear=True,
+        ):
+            assert rootless_socket_url() is None
+
+    def test_defers_when_the_rootful_socket_exists(self):
+        with patch.dict(
+            "os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}, clear=True
+        ), patch("fivenines_agent.docker.os.path.exists", return_value=True):
+            assert rootless_socket_url() is None
+
+    def test_none_without_xdg_runtime_dir(self):
+        with patch.dict("os.environ", {}, clear=True), patch(
+            "fivenines_agent.docker.os.path.exists", return_value=False
+        ):
+            assert rootless_socket_url() is None
+
+    def test_none_when_the_xdg_socket_does_not_exist(self):
+        with patch.dict(
+            "os.environ", {"XDG_RUNTIME_DIR": "/run/user/1000"}, clear=True
+        ), patch("fivenines_agent.docker.os.path.exists", return_value=False):
+            assert rootless_socket_url() is None
+
+    @patch("fivenines_agent.docker.docker")
+    def test_client_dials_the_rootless_socket(self, mock_docker):
+        client = MagicMock()
+        mock_docker.DockerClient.return_value = client
+        with patch(
+            "fivenines_agent.docker.rootless_socket_url",
+            return_value="unix:///run/user/1000/docker.sock",
+        ):
+            assert get_docker_client() is client
+        mock_docker.DockerClient.assert_called_once_with(
+            base_url="unix:///run/user/1000/docker.sock"
+        )
+        mock_docker.from_env.assert_not_called()
+
+    @patch("fivenines_agent.docker.docker")
+    def test_explicit_socket_url_still_wins(self, mock_docker):
+        client = MagicMock()
+        mock_docker.DockerClient.return_value = client
+        with patch(
+            "fivenines_agent.docker.rootless_socket_url",
+            return_value="unix:///run/user/1000/docker.sock",
+        ):
+            assert get_docker_client(socket_url="unix:///custom.sock") is client
+        mock_docker.DockerClient.assert_called_once_with(base_url="unix:///custom.sock")
 
 
 # ===========================================================================
@@ -763,6 +833,17 @@ class TestDockerMetrics:
     def test_none_propagates_as_none(self, mock_containers):
         mock_containers.return_value = None
         assert docker_metrics() is None
+
+    @patch("fivenines_agent.docker.docker_containers")
+    def test_ignores_unknown_kwargs(self, mock_containers):
+        """HAZARD guard: collectors.py splats config['docker'] as **kwargs. A new
+        server-side key nested under docker must be swallowed, not raise
+        TypeError (which _collect_with_telemetry would turn into data['docker']=
+        None and freeze container-state rows fleet-wide). Matches systemd/ceph."""
+        mock_containers.return_value = {}
+        result = docker_metrics(socket_url=None, image_inventory=True, future_key=42)
+        assert result == {"containers": {}}
+        mock_containers.assert_called_once_with(None)
 
 
 # ===========================================================================

@@ -1,0 +1,185 @@
+{
+  "description": "Shared TSDB (Prometheus / VictoriaMetrics) contract fixture between fivenines-agent and fivenines-server (server #672). Source of truth: fivenines-agent tests/fixtures/tsdb_contract_payload.json, asserted end-to-end by tests/test_tsdb.py::test_contract_fixture_round_trip -- only requests.get is mocked, each scenario's 'responses' are fed back per URL path ('body' as response.text, 'json' as response.json()), a 'raise' entry makes that path raise the named transport exception, and tsdb_metrics(**scenario['config']) must equal scenario['payload']. The server's spec/requests/api_collect_tsdb_spec.rb posts scenario['payload'] under data['tsdb'] through /collect and asserts Ingesters::Agent ingests each shape (reachable true/false). 'config', 'responses' and 'raise' are agent-side inputs the server ignores. Change the payload shape only in lockstep across both repos, keeping the two copies byte-identical.",
+  "agent_min_version": "1.14.1",
+  "_agent_min_version_note": "TSDB is config-driven with NO server version gate (tsdb_enabled defaults false; any FEATURES_SUPPORTED_VERSIONS entry the server adds is only an 'agent too old' hint), so this number is free. Ships as 1.14.1, a PATCH landing after the in-flight Docker image-inventory PR #102 (issue #101) which takes the 1.14.0 slot. Nothing gates on this number.",
+  "reachability_contract": "data['tsdb'] is a reachability ENVELOPE and MUST NEVER be null (contrast the php_fpm/zfs null contract): here UNREACHABLE IS THE SIGNAL. (a) {reachable:true, flavor, version, ...metrics} = the TSDB answered GET /metrics with a 2xx. reachable is true even if every whitelisted metric is missing or /api/v1/targets fails -- those keys are simply omitted (THE SHARP EDGE: an agent-side parse bug must never page 'your Prometheus is down'). (b) {reachable:false, error_type, error_message} = a connection-level failure ON /metrics (refused/timeout/tls/auth/non-2xx). error_type in {connection_refused, timeout, tls_error, auth_failed, http_error}; the server maps auth/tls -> config_error and the rest -> unreachable. All *_total fields are RAW cumulative counters (the server rate()s them; never diff/reset agent-side); a metric absent from the exposition omits its key, never fabricates 0. Prometheus ships targets_*/rule keys; single-node VictoriaMetrics ships free_disk_space/data_size/insert counters/active_series and NO targets_* keys.",
+  "scenarios": {
+    "healthy_prometheus": {
+      "description": "Healthy Prometheus, targets_down > 0. GET /metrics returns the self-metrics (build_info version label, head_series, storage_blocks_bytes, and three raw counters -- rule_evaluation_failures summed across two rule_group series, notifications_dropped, wal_corruptions), GET /api/v1/targets returns 4 active targets of which 2 are not 'up' (one down, one unknown). Pins flavor sniff via the prometheus_ namespace, version from the build_info label, raw-counter passthrough, the label sum, and targets_total/targets_down from the API.",
+      "config": {
+        "url": "http://127.0.0.1:9090",
+        "auth_header_name": null,
+        "auth_header_value": null,
+        "basic_auth_username": null,
+        "basic_auth_password": null,
+        "verify_ssl": true
+      },
+      "responses": {
+        "/metrics": {
+          "status": 200,
+          "body": "# HELP prometheus_build_info A metric with a constant '1' value labeled by version, revision, branch, and goversion.\n# TYPE prometheus_build_info gauge\nprometheus_build_info{branch=\"HEAD\",goversion=\"go1.22.5\",revision=\"a1b2c3d\",version=\"2.53.1\"} 1\n# HELP prometheus_tsdb_head_series Total number of series in the head block.\n# TYPE prometheus_tsdb_head_series gauge\nprometheus_tsdb_head_series 812345\n# HELP prometheus_tsdb_storage_blocks_bytes The number of bytes that are currently used for local storage by all blocks.\n# TYPE prometheus_tsdb_storage_blocks_bytes gauge\nprometheus_tsdb_storage_blocks_bytes 5368709120\n# HELP prometheus_rule_evaluation_failures_total The total number of rule evaluation failures.\n# TYPE prometheus_rule_evaluation_failures_total counter\nprometheus_rule_evaluation_failures_total{rule_group=\"/etc/prometheus/rules.yml;alerts\"} 0\nprometheus_rule_evaluation_failures_total{rule_group=\"/etc/prometheus/rules.yml;records\"} 0\n# HELP prometheus_notifications_dropped_total Total number of alerts dropped due to errors when sending to Alertmanager.\n# TYPE prometheus_notifications_dropped_total counter\nprometheus_notifications_dropped_total 0\n# HELP prometheus_tsdb_wal_corruptions_total Total number of WAL corruptions.\n# TYPE prometheus_tsdb_wal_corruptions_total counter\nprometheus_tsdb_wal_corruptions_total 0\n# HELP go_goroutines Number of goroutines that currently exist.\n# TYPE go_goroutines gauge\ngo_goroutines 148\n"
+        },
+        "/api/v1/targets": {
+          "status": 200,
+          "json": {
+            "status": "success",
+            "data": {
+              "activeTargets": [
+                {
+                  "health": "up",
+                  "scrapeUrl": "http://10.0.0.1:9100/metrics",
+                  "labels": {
+                    "job": "node",
+                    "instance": "10.0.0.1:9100"
+                  },
+                  "lastError": ""
+                },
+                {
+                  "health": "up",
+                  "scrapeUrl": "http://10.0.0.2:9100/metrics",
+                  "labels": {
+                    "job": "node",
+                    "instance": "10.0.0.2:9100"
+                  },
+                  "lastError": ""
+                },
+                {
+                  "health": "down",
+                  "scrapeUrl": "http://10.0.0.3:9100/metrics",
+                  "labels": {
+                    "job": "node",
+                    "instance": "10.0.0.3:9100"
+                  },
+                  "lastError": "connect: connection refused"
+                },
+                {
+                  "health": "unknown",
+                  "scrapeUrl": "http://10.0.0.4:9100/metrics",
+                  "labels": {
+                    "job": "node",
+                    "instance": "10.0.0.4:9100"
+                  },
+                  "lastError": ""
+                }
+              ],
+              "droppedTargets": []
+            }
+          }
+        }
+      },
+      "payload": {
+        "reachable": true,
+        "flavor": "prometheus",
+        "version": "2.53.1",
+        "head_series": 812345,
+        "storage_bytes": 5368709120,
+        "rule_eval_failures_total": 0,
+        "notifications_dropped_total": 0,
+        "wal_corruptions_total": 0,
+        "targets_total": 4,
+        "targets_down": 2
+      }
+    },
+    "healthy_victoriametrics": {
+      "description": "Healthy single-node VictoriaMetrics. GET /metrics returns vm_ self-metrics; the flavor sniff hits the vm_ namespace so NO /api/v1/targets call is made (a single-node VM scrapes nothing) and NO targets_*/rule keys appear. version comes from the vm_app_version short_version label with its leading 'v' stripped; data_size_bytes and rows_ignored_total are summed across their label series; active_series is the vm_cache_entries series filtered to type 'storage/hour_metric_ids' (NOT the sum of all cache_entries).",
+      "config": {
+        "url": "http://127.0.0.1:8428",
+        "auth_header_name": null,
+        "auth_header_value": null,
+        "basic_auth_username": null,
+        "basic_auth_password": null,
+        "verify_ssl": true
+      },
+      "responses": {
+        "/metrics": {
+          "status": 200,
+          "body": "# HELP vm_app_version The version of VictoriaMetrics.\n# TYPE vm_app_version gauge\nvm_app_version{version=\"victoria-metrics-20240801-120000-tags-v1.102.0-0-ga1b2c3d\", short_version=\"v1.102.0\"} 1\n# HELP vm_free_disk_space_bytes The free disk space at -storageDataPath\n# TYPE vm_free_disk_space_bytes gauge\nvm_free_disk_space_bytes{path=\"/victoria-metrics-data\"} 107374182400\n# HELP vm_data_size_bytes The size of data on disk\n# TYPE vm_data_size_bytes gauge\nvm_data_size_bytes{type=\"storage/small\"} 32212254720\nvm_data_size_bytes{type=\"storage/big\"} 85899345920\nvm_data_size_bytes{type=\"indexdb\"} 1073741824\n# HELP vm_slow_row_inserts_total The number of slow inserts.\n# TYPE vm_slow_row_inserts_total counter\nvm_slow_row_inserts_total 12\n# HELP vm_rows_ignored_total The number of rows ignored on insert.\n# TYPE vm_rows_ignored_total counter\nvm_rows_ignored_total{reason=\"big_timestamp\"} 3\nvm_rows_ignored_total{reason=\"small_timestamp\"} 2\n# HELP vm_new_timeseries_created_total The number of created time series.\n# TYPE vm_new_timeseries_created_total counter\nvm_new_timeseries_created_total 45678\n# HELP vm_cache_entries The number of entries in the cache.\n# TYPE vm_cache_entries gauge\nvm_cache_entries{type=\"storage/hour_metric_ids\"} 152340\nvm_cache_entries{type=\"storage/date_metric_ids\"} 987654\nvm_cache_entries{type=\"indexdb/tagFilters\"} 111\ngo_goroutines 88\n"
+        }
+      },
+      "payload": {
+        "reachable": true,
+        "flavor": "victoriametrics",
+        "version": "1.102.0",
+        "free_disk_space_bytes": 107374182400,
+        "data_size_bytes": 119185342464,
+        "slow_inserts_total": 12,
+        "rows_ignored_total": 5,
+        "new_series_created_total": 45678,
+        "active_series": 152340
+      }
+    },
+    "unreachable_connection_refused": {
+      "description": "The TSDB process is down: GET /metrics raises a transport-level ConnectionError. UNREACHABLE IS THE SIGNAL, so the payload is a reachable:false envelope (error_type connection_refused) and MUST NOT be null. error_message is the transport error text (truncated to 200 chars).",
+      "config": {
+        "url": "http://127.0.0.1:9090",
+        "auth_header_name": null,
+        "auth_header_value": null,
+        "basic_auth_username": null,
+        "basic_auth_password": null,
+        "verify_ssl": true
+      },
+      "raise": {
+        "path": "/metrics",
+        "type": "connection_refused",
+        "message": "Connection refused"
+      },
+      "payload": {
+        "reachable": false,
+        "error_type": "connection_refused",
+        "error_message": "Connection refused"
+      }
+    },
+    "auth_failure": {
+      "description": "Basic-auth credentials are wrong (or missing): GET /metrics returns HTTP 401. A non-2xx on /metrics is a reachability failure; 401/403 map to error_type auth_failed (the server folds auth/tls into config_error). Still never null.",
+      "config": {
+        "url": "https://prometheus.example.com",
+        "auth_header_name": null,
+        "auth_header_value": null,
+        "basic_auth_username": "monitor",
+        "basic_auth_password": "s3cr3t",
+        "verify_ssl": true
+      },
+      "responses": {
+        "/metrics": {
+          "status": 401,
+          "body": "Unauthorized"
+        }
+      },
+      "payload": {
+        "reachable": false,
+        "error_type": "auth_failed",
+        "error_message": "HTTP 401 on /metrics"
+      }
+    },
+    "targets_api_absent_but_metrics_ok": {
+      "description": "THE SHARP EDGE. GET /metrics is a clean 2xx (Prometheus flavor) but GET /api/v1/targets is locked down and returns HTTP 403. reachable STAYS true and the self-metrics still ship -- only the targets_total/targets_down keys are omitted. A custom auth header is set to exercise that transport branch. This body also omits notifications_dropped entirely, so notifications_dropped_total is absent from the payload (a missing metric omits its key, never fabricates 0); rule_eval_failures_total ships the raw value 5.",
+      "config": {
+        "url": "http://127.0.0.1:9090",
+        "auth_header_name": "X-Scope-OrgID",
+        "auth_header_value": "tenant-a",
+        "basic_auth_username": null,
+        "basic_auth_password": null,
+        "verify_ssl": true
+      },
+      "responses": {
+        "/metrics": {
+          "status": 200,
+          "body": "# TYPE prometheus_build_info gauge\nprometheus_build_info{branch=\"HEAD\",goversion=\"go1.21.0\",revision=\"deadbee\",version=\"2.48.0\"} 1\n# TYPE prometheus_tsdb_head_series gauge\nprometheus_tsdb_head_series 42000\n# TYPE prometheus_tsdb_storage_blocks_bytes gauge\nprometheus_tsdb_storage_blocks_bytes 1073741824\n# TYPE prometheus_rule_evaluation_failures_total counter\nprometheus_rule_evaluation_failures_total 5\n# TYPE prometheus_tsdb_wal_corruptions_total counter\nprometheus_tsdb_wal_corruptions_total 0\n"
+        },
+        "/api/v1/targets": {
+          "status": 403,
+          "body": "Forbidden"
+        }
+      },
+      "payload": {
+        "reachable": true,
+        "flavor": "prometheus",
+        "version": "2.48.0",
+        "head_series": 42000,
+        "storage_bytes": 1073741824,
+        "rule_eval_failures_total": 5,
+        "wal_corruptions_total": 0
+      }
+    }
+  }
+}
