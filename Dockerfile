@@ -108,6 +108,39 @@ RUN echo "=== Configuring libcrypt for PyInstaller ===" && \
     echo "libcrypt configuration complete" && \
     ls -la /usr/lib64/libcrypt.so*
 
+# Pre-build libpython3.10.so (shared) so py2exe.sh's runtime guard skips the
+# multi-minute compile on every build job. manylinux2014 ships only a static
+# libpython; PyInstaller needs the shared object. Doing it once here (cached in
+# the image and the registry buildcache) instead of on each of the 4 Linux
+# build jobs (amd64/arm64 x standard/Synology) is the main build-time win.
+# Kept in sync with the fallback build block in py2exe.sh: same CPython 3.10.18,
+# same configure flags, same install layout (real .so + .so.1.0 symlink) so the
+# `find -name "libpython3.10.so*" -type f` in py2exe.sh resolves the real file.
+RUN echo "=== Pre-building libpython3.10.so (shared) ===" && \
+    PYTHON_LIB_DIR="/opt/python/cp310-cp310/lib" && \
+    cd /tmp && \
+    wget -q --timeout=30 "https://www.python.org/ftp/python/3.10.18/Python-3.10.18.tgz" && \
+    tar xzf Python-3.10.18.tgz && \
+    cd Python-3.10.18 && \
+    ./configure \
+        --enable-shared \
+        --disable-test-modules \
+        --prefix=/tmp/python-shared \
+        --quiet \
+        --without-ensurepip \
+        --without-static-libpython \
+        --with-system-ffi \
+        --enable-loadable-sqlite-extensions \
+        ac_cv_working_openssl_hashlib_md5=yes \
+        ac_cv_working_openssl_ssl=yes && \
+    make libpython3.10.so -j"$(nproc)" && \
+    cp libpython3.10.so "$PYTHON_LIB_DIR/libpython3.10.so" && \
+    ln -sf libpython3.10.so "$PYTHON_LIB_DIR/libpython3.10.so.1.0" && \
+    echo "$PYTHON_LIB_DIR" > /etc/ld.so.conf.d/python-shared.conf && \
+    ldconfig && \
+    ls -la "$PYTHON_LIB_DIR"/libpython3.10.so* && \
+    cd / && rm -rf /tmp/Python-3.10.18*
+
 # Set environment variables
 ENV BASH_ENV=/etc/profile
 ENV PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/lib64/pkgconfig"
@@ -128,6 +161,29 @@ RUN . /etc/profile && \
     PYTHON_PATH=$(cat /etc/python_path | cut -d= -f2) && \
     find $PYTHON_PATH -name "Python.h" | head -1 && \
     echo "manylinux2014 + libvirt 4.5.0 setup complete - should have RSS support and CentOS 7 compatibility!"
+
+# Bake the Python build environment (poetry + all locked deps) into an
+# image-resident venv (/opt/venv) so py2exe.sh no longer rebuilds it on every
+# job -- installing the poetry tool (~120s) then the deps (~120s) were the bulk
+# of each Linux build. Keyed on pyproject.toml + poetry.lock: cached until deps
+# change. libvirt-python (C ext) compiles here once against the image's libvirt.
+# The root project is intentionally NOT installed (--no-root); py2exe.sh installs
+# it editable from the mounted /workspace at runtime, so the frozen binary always
+# carries the current commit's code + version metadata while deps stay baked.
+COPY pyproject.toml poetry.lock /build/
+RUN echo "=== Baking build venv at /opt/venv ===" && \
+    export PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/lib64/pkgconfig" && \
+    /opt/python/cp310-cp310/bin/python3.10 -m venv /opt/venv && \
+    . /opt/venv/bin/activate && \
+    pip install --upgrade pip setuptools wheel && \
+    pip install poetry==2.4.1 && \
+    poetry config virtualenvs.create false && \
+    poetry config installer.max-workers 1 && \
+    pip install libvirt-python==11.6.0 && \
+    cd /build && \
+    poetry install --no-root --with virtualization && \
+    python -c "import libvirt, PyInstaller; print('venv ok - libvirt', libvirt.getVersion())" && \
+    cd / && rm -rf /build
 
 ENV TARGET_ARCH="amd64"
 WORKDIR /workspace
