@@ -82,6 +82,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Tag the builder image with the commit SHA as well as :latest, so
+      # build-synology-amd64 can pull this exact same-commit image. :latest is
+      # global across runs and gets overwritten by concurrent builds (any branch).
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v6
@@ -89,6 +92,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
           tags: |
             type=raw,value=latest
+            type=raw,value=${{ github.sha }}
 
       - name: Build and push Docker image (amd64)
         uses: docker/build-push-action@v6
@@ -150,6 +154,9 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Tag the builder image with the commit SHA as well as :latest, so
+      # build-synology-arm64 can pull this exact same-commit image. :latest is
+      # global across runs and gets overwritten by concurrent builds (any branch).
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v6
@@ -157,6 +164,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
           tags: |
             type=raw,value=latest
+            type=raw,value=${{ github.sha }}
 
       - name: Build and push Docker image (arm64)
         uses: docker/build-push-action@v6
@@ -446,12 +454,16 @@ jobs:
 
       - name: Build agent binary (synology-amd64)
         run: |
+          # Pull the builder image by commit SHA, not :latest. :latest is global
+          # across runs, so a concurrent build (any branch) can overwrite it
+          # between build-amd64's push and this pull, yielding a foreign image
+          # (and defeating the pre-baked libpython). build-amd64 pushes :<sha>.
           IMAGE=$(echo "${{ env.REGISTRY }}/${{ github.repository }}-builder-amd64" | tr '[:upper:]' '[:lower:]')
           docker run --rm \
             -v ${{ github.workspace }}:/workspace \
             -e TARGET_ARCH=amd64 \
             -e SYNOLOGY=1 \
-            ${IMAGE}:latest \
+            ${IMAGE}:${{ github.sha }} \
             bash /workspace/py2exe.sh
 
       - name: Fix permissions and build SPK (synology-amd64)
@@ -486,12 +498,16 @@ jobs:
 
       - name: Build agent binary (synology-arm64)
         run: |
+          # Pull the builder image by commit SHA, not :latest. :latest is global
+          # across runs, so a concurrent build (any branch) can overwrite it
+          # between build-arm64's push and this pull, yielding a foreign image
+          # (and defeating the pre-baked libpython). build-arm64 pushes :<sha>.
           IMAGE=$(echo "${{ env.REGISTRY }}/${{ github.repository }}-builder-arm64" | tr '[:upper:]' '[:lower:]')
           docker run --rm \
             -v ${{ github.workspace }}:/workspace \
             -e TARGET_ARCH=arm64 \
             -e SYNOLOGY=1 \
-            ${IMAGE}:latest \
+            ${IMAGE}:${{ github.sha }} \
             bash /workspace/py2exe.sh
 
       - name: Fix permissions and build SPK (synology-arm64)
