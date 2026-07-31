@@ -33,6 +33,7 @@ def test_registry_has_expected_config_keys():
         "nginx",
         "apache",
         "php_fpm",
+        "haproxy",
         "docker",
         "qemu",
         "fail2ban",
