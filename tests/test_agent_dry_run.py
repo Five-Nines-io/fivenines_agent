@@ -24,6 +24,7 @@ def make_dry_run_agent():
     agent = Agent.__new__(Agent)
     agent.synchronizer = None
     agent.log_uploader = None
+    agent.image_inventory_uploader = None
     agent.permissions = MagicMock()
     agent.permissions.get_all.return_value = {}
     agent.permissions.refresh_due.return_value = False
@@ -73,6 +74,14 @@ def test_dry_run_config_includes_zfs():
     --dry-run must exercise it. Same regression class as systemd: without the
     key, collect_metrics' `if not config_value` gate silently skips it."""
     assert _DRY_RUN_CONFIG.get("zfs")  # present and truthy
+
+
+def test_dry_run_config_includes_docker():
+    """The Docker collector had NO key in _DRY_RUN_CONFIG, so --dry-run never
+    exercised it. Must be truthy (not {}, which collect_metrics' `if not
+    config_value` gate would skip) so docker_metrics() actually runs where the
+    socket is reachable."""
+    assert _DRY_RUN_CONFIG.get("docker")  # present and truthy
 
 
 @patch("fivenines_agent.agent.dry_run", return_value=True)
