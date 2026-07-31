@@ -497,6 +497,21 @@ Connects to `localhost:6379` by default; an optional password is supported. All
 derived values (memory usage %, hit ratio, RDB age, replication lag) are
 computed server-side from these raw fields.
 
+### Memcached
+
+Collects a snapshot from a single `stats` command over the Memcached text
+protocol (one short-lived TCP connection, no extra dependency). Available in
+agent version **1.14.4+**:
+
+- Server version and uptime
+- Current connections, stored bytes vs the `limit_maxbytes` ceiling
+- Raw cumulative counters: get hits/misses, get/set commands, evictions,
+  expired-unfetched items (the dashboard derives the hit ratio and rates)
+
+Connects to `127.0.0.1:11211` by default; set `host`/`port` to point elsewhere.
+A refused connection, timeout, or malformed reply reports as a collection
+failure, so a transient outage is never mistaken for an empty cache.
+
 ## Contribute
 
 Feel free to open a PR/issues if you encounter any bug or want to contribute.
