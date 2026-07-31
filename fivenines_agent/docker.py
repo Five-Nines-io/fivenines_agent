@@ -23,9 +23,14 @@ between two ticks is never observed. Capturing those needs the Docker events
 API, which is a later phase.
 """
 
+import os
+
 import docker
 
 from fivenines_agent.debug import debug, log
+
+# The rootful socket docker-py falls back to when DOCKER_HOST is unset.
+DEFAULT_SOCKET_PATH = "/var/run/docker.sock"
 
 # Per-tick container cap. Running containers are always kept first; the rest are
 # taken newest-first (by Created). Bounds the payload on hosts with a large
@@ -47,12 +52,43 @@ previous_stats = {}
 _cap_logged = False
 
 
+def rootless_socket_url():
+    """unix:// URL for $XDG_RUNTIME_DIR/docker.sock when that is the only socket
+    available, else None.
+
+    docker.from_env() reads DOCKER_HOST but has NO XDG_RUNTIME_DIR fallback, so
+    without this a rootless host whose operator never exported DOCKER_HOST
+    resolves to /var/run/docker.sock and fails to connect -- while the permission
+    probe (which does check XDG) reports the docker capability AVAILABLE. That
+    split is worse than either behaviour alone: the collector is gated on a
+    capability that lies. Returning None for every other case keeps
+    docker.from_env() in charge, so DOCKER_HOST + its TLS env vars
+    (DOCKER_TLS_VERIFY, DOCKER_CERT_PATH) behave exactly as before."""
+    if os.environ.get("DOCKER_HOST"):
+        return None  # from_env handles it, including the TLS env vars
+    if os.path.exists(DEFAULT_SOCKET_PATH):
+        return None  # rootful socket present: the normal path
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    if not xdg:
+        return None
+    # Joined POSIX-style on purpose, not with os.path.join: a Docker unix socket
+    # path is always POSIX, and ntpath.join would produce
+    # "/run/user/1000\\docker.sock" when the suite runs on Windows.
+    candidate = f"{xdg.rstrip('/')}/docker.sock"
+    if not os.path.exists(candidate):
+        return None
+    return f"unix://{candidate}"
+
+
 def get_docker_client(socket_url=None):
     try:
         if socket_url:
             return docker.DockerClient(base_url=socket_url)
-        else:
-            return docker.from_env()
+        rootless = rootless_socket_url()
+        if rootless:
+            log(f"Connecting to rootless Docker socket {rootless}", "debug")
+            return docker.DockerClient(base_url=rootless)
+        return docker.from_env()
     except docker.errors.DockerException as e:
         log(f"Error connecting to Docker daemon: {e}", "error")
         return None
@@ -358,7 +394,13 @@ def calculate_memory_usage(stats):
 
 
 @debug("docker_metrics")
-def docker_metrics(socket_url=None):
+def docker_metrics(socket_url=None, **_kwargs):
+    # Extra kwargs are accepted but ignored so a new server-side config key
+    # nested under config["docker"] cannot make this raise TypeError on older
+    # agents (collectors.py splats config["docker"] as **kwargs). Matches the
+    # systemd.py / ceph.py precedent; docker.py was the odd one out. The image
+    # inventory feature deliberately uses a TOP-LEVEL config key instead of
+    # nesting here, but this guard closes the trap regardless.
     containers = docker_containers(socket_url)
     if containers is None:
         return None

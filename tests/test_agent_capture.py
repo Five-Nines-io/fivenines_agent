@@ -70,6 +70,7 @@ def test_cleanup_stops_uploader_with_sentinel_then_join(tmp_path):
     agent.synchronizer = None
     agent.log_uploader = MagicMock()
     agent.log_queue = MagicMock()
+    agent.image_inventory_uploader = None
 
     with pytest.raises(SystemExit) as exc_info:
         agent._cleanup()
