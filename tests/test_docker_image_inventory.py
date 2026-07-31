@@ -165,14 +165,17 @@ def test_contract_hash_matches_packages(name):
 
 
 def test_contract_agent_min_version_matches_pyproject():
-    """agent_min_version must equal the SHIPPED version, not a hand-typed twin.
+    """agent_min_version must never exceed the SHIPPED version.
 
     The server gates FEATURES_SUPPORTED_VERSIONS["docker_image_inventory"] on
-    this exact string. Asserting it against a literal cannot catch the failure it
-    looks like it prevents -- if the release slot moves (this repo has repeated
-    contention: Ceph took 1.13.0, PHP-FPM ceded to 1.13.1, ZFS rebased to
-    1.11.7), a literal-vs-literal assert stays green while the server gates on a
-    version no agent reports. Read the real version instead."""
+    this exact string. Asserting it against a literal cannot catch the failure
+    it looks like it prevents -- if the release slot moves before shipping
+    (this repo has repeated contention: Ceph took 1.13.0, PHP-FPM ceded to
+    1.13.1, ZFS rebased to 1.11.7), a literal-vs-literal assert stays green
+    while the server gates on a version no agent reports. Read the real
+    version instead. <= rather than ==: the feature shipped in 1.14.0, so the
+    contract stays pinned there while pyproject keeps moving with every later
+    release."""
     pyproject = os.path.join(os.path.dirname(__file__), "..", "pyproject.toml")
     with open(pyproject) as f:
         for line in f:
@@ -181,7 +184,11 @@ def test_contract_agent_min_version_matches_pyproject():
                 break
         else:  # pragma: no cover - pyproject always has a version
             raise AssertionError("no version in pyproject.toml")
-    assert _CONTRACT["agent_min_version"] == shipped
+
+    def as_tuple(version):
+        return tuple(int(part) for part in version.split("."))
+
+    assert as_tuple(_CONTRACT["agent_min_version"]) <= as_tuple(shipped)
 
 
 def test_packages_are_sorted_by_name_regardless_of_db_order():

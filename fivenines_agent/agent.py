@@ -272,7 +272,17 @@ class Agent:
                     # hosts too.
                     self._apply_config_driven_refresh(self.config)
                     if not self.config.get("enabled", False):
-                        self.queue.put({"get_config": True, **self.static_data})
+                        # Poll through the queue only once a config fetch has
+                        # succeeded (enabled is False, not still None). Before
+                        # that, self.token may still be an enrollment token,
+                        # and a queued request drains on the synchronizer
+                        # thread OUTSIDE the single-flight fetch guard: during
+                        # an API outage at install time it could race the
+                        # direct fetch above and enroll the host twice. While
+                        # enabled is None, get_config() above already retries
+                        # every pass, so the queued poll adds nothing.
+                        if self.config.get("enabled") is not None:
+                            self.queue.put({"get_config": True, **self.static_data})
                         exit_event.wait(25)
                         continue
 
