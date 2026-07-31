@@ -12,6 +12,7 @@ from fivenines_agent.docker import docker_metrics
 from fivenines_agent.fail2ban import fail2ban_metrics
 from fivenines_agent.fans import fans
 from fivenines_agent.gpu import gpu_metrics
+from fivenines_agent.haproxy import haproxy_metrics
 from fivenines_agent.io import io
 from fivenines_agent.logs import collect_log_signals
 from fivenines_agent.memory import memory, swap
@@ -99,6 +100,13 @@ COLLECTORS = [
     # (pass_kwargs) into php_fpm_metrics(status_page_url=...). Emits an array of
     # per-pool objects, [] (zero pools), or None (collection failure).
     ("php_fpm", [("php_fpm", php_fpm_metrics, True)]),
+    # HAProxy: config-driven stats scrape (nginx/apache posture, no capability
+    # gate). config["haproxy"] == {"stats_socket": ..., "stats_url": ...,
+    # "username": ..., "password": ...} is unpacked (pass_kwargs) into
+    # haproxy_metrics(**config). Emits a list of frontend/backend/server rows,
+    # the capped wrapper {"rows": [...], "servers_capped": True}, [] (zero
+    # proxies), or None (collection failure).
+    ("haproxy", [("haproxy", haproxy_metrics, True)]),
     ("docker", [("docker", docker_metrics, True)]),
     ("qemu", [("qemu", qemu_metrics, True)]),
     ("fail2ban", [("fail2ban", fail2ban_metrics, False)]),
