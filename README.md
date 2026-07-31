@@ -426,7 +426,7 @@ from a credentials problem. Available in agent version **1.11.4+**:
 - Galera / wsrep cluster state on MariaDB/MySQL Galera nodes (cluster size and
   status, local state, ready/connected, flow-control pause and receive-queue
   averages). Detection is implicit: a non-Galera server reports no wsrep data,
-  so these keys are simply absent. Available in agent version **1.16.0+**.
+  so these keys are simply absent. Available in agent version **1.15.0+**.
 
 Requires a `mysql` (or `mariadb`) client on the host and appropriate database
 credentials.

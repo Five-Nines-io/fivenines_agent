@@ -1003,7 +1003,7 @@ def test_contract_fixture_round_trip(name):
 
 
 def test_fixture_agent_min_version():
-    assert _load_fixture()["agent_min_version"] == "1.16.0"
+    assert _load_fixture()["agent_min_version"] == "1.15.0"
 
 
 def test_fixture_galera_keys_match_whitelist():
