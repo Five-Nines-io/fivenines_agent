@@ -1,0 +1,65 @@
+{
+  "description": "Shared Memcached contract fixture between fivenines-agent and fivenines-server. Source of truth: fivenines-agent tests/fixtures/memcached_contract_payload.json, asserted end-to-end by tests/test_memcached.py::test_contract_fixture_round_trip (only socket.create_connection is mocked -- each scenario's raw 'reply' is fed back as the socket reply and memcached_metrics(**config) must equal 'payload'). The server's spec/requests/api_collect_memcached_spec.rb posts each 'payload' under data['memcached'] through /collect and asserts Ingesters::Agent ingests the snapshot / null shapes. 'config' is the shape config['memcached'] takes; 'reply' is an agent-side input the server ignores. Change the payload shape only in lockstep across both repos, keeping the two copies byte-identical.",
+  "agent_min_version": "1.14.4",
+  "_agent_min_version_note": "Memcached has NO server version gate (no FEATURES_SUPPORTED_VERSIONS entry -- it is purely config-driven, memcached_enabled defaults false, metric_threshold alerting only, no dedicated trigger), so this number is free and nothing gates on it. Ships as 1.14.4, sitting above the in-flight Docker image-inventory PR (#102, 1.14.0). Bump both fixture copies in lockstep if this is re-numbered.",
+  "null_contract": "data['memcached'] is one of TWO outcomes and the server MUST branch on them: (a) null (JSON null / Python None) = COLLECTION FAILURE -- the connection was refused / timed out, or the reply was not a complete, END-terminated stats response (a truncated read or a non-memcached endpoint). The server MUST skip the tick entirely: do NOT ingest a zeroed snapshot, because a merely-unreachable cache is not an empty one, and process-down alerting lives on the generic host_port / systemd paths, not here (there is no status axis on this collector, mirroring the php_fpm null discipline minus the array). (b) a snapshot object = the reachable tick, the live counter/gauge values. The agent's presence gate is `version`: a reply lacking `version` (a bare `END`, a non-memcached endpoint) is null, never an empty-but-reachable snapshot. The individual counter/gauge keys are a best-effort whitelist -- a real memcached always emits them, but the agent ships only the keys present, so the server MUST treat any absent key as absent (not zero) and never assume the full set is present.",
+  "field_contract": {
+    "version": "memcached STAT 'version' -- the server version string (the one non-numeric field).",
+    "uptime": "STAT 'uptime' -- seconds since the daemon started (gauge).",
+    "curr_connections": "STAT 'curr_connections' -- open client connections right now (gauge).",
+    "bytes": "STAT 'bytes' -- bytes of item data currently stored (gauge); compare to limit_maxbytes for memory-pressure.",
+    "limit_maxbytes": "STAT 'limit_maxbytes' -- the configured cache size ceiling in bytes (gauge).",
+    "get_hits_total": "STAT 'get_hits' -- RAW cumulative count of keys served from cache. The server derives the hit ratio from get_hits/get_misses deltas; never diff agent-side.",
+    "get_misses_total": "STAT 'get_misses' -- RAW cumulative count of gets that missed. Shipped raw.",
+    "cmd_get_total": "STAT 'cmd_get' -- RAW cumulative count of get commands. Shipped raw.",
+    "cmd_set_total": "STAT 'cmd_set' -- RAW cumulative count of set commands. Shipped raw.",
+    "evictions_total": "STAT 'evictions' -- RAW cumulative count of valid items evicted to make room. A climbing rate is the memory-pressure signal the server rate()s.",
+    "expired_unfetched_total": "STAT 'expired_unfetched' -- RAW cumulative count of items that expired before ever being fetched. Shipped raw.",
+    "_dropped": "Every other STAT memcached emits (pid, time, total_connections, threads, the per-slab / item breakdowns, ...) is NOT ingested and is dropped from the payload. Whitelist extraction is tolerant of unknown / extra STAT keys across memcached versions."
+  },
+  "config": {
+    "host": "127.0.0.1",
+    "port": 11211
+  },
+  "scenarios": {
+    "healthy": {
+      "description": "A healthy cache well under its memory ceiling with a high hit ratio. The reply carries extra un-whitelisted STATs (pid, time, total_connections) that must be dropped, pinning the whitelist extraction, the *_total rename of the raw counters, and the version string passthrough.",
+      "reply": "STAT pid 2080\r\nSTAT uptime 86400\r\nSTAT time 1699564800\r\nSTAT version 1.6.29\r\nSTAT curr_connections 12\r\nSTAT total_connections 1450\r\nSTAT cmd_get 993566\r\nSTAT cmd_set 44210\r\nSTAT get_hits 981221\r\nSTAT get_misses 12345\r\nSTAT bytes 5242880\r\nSTAT limit_maxbytes 67108864\r\nSTAT evictions 17\r\nSTAT expired_unfetched 90\r\nEND\r\n",
+      "payload": {
+        "version": "1.6.29",
+        "uptime": 86400,
+        "curr_connections": 12,
+        "bytes": 5242880,
+        "limit_maxbytes": 67108864,
+        "get_hits_total": 981221,
+        "get_misses_total": 12345,
+        "cmd_get_total": 993566,
+        "cmd_set_total": 44210,
+        "evictions_total": 17,
+        "expired_unfetched_total": 90
+      }
+    },
+    "evicting_under_memory_pressure": {
+      "description": "The cache is full (bytes 67043328 is ~99.9% of the 67108864 limit), the miss rate is high, and evictions have climbed into the millions -- the memory-pressure story the server's metric_threshold alerting exists for. Same whitelist, larger raw counters (no agent-side derivation of the ratio).",
+      "reply": "STAT pid 3120\r\nSTAT uptime 259200\r\nSTAT version 1.6.29\r\nSTAT curr_connections 512\r\nSTAT threads 8\r\nSTAT cmd_get 88250310\r\nSTAT cmd_set 40155200\r\nSTAT get_hits 61200000\r\nSTAT get_misses 27050310\r\nSTAT bytes 67043328\r\nSTAT limit_maxbytes 67108864\r\nSTAT evictions 4582130\r\nSTAT expired_unfetched 120400\r\nEND\r\n",
+      "payload": {
+        "version": "1.6.29",
+        "uptime": 259200,
+        "curr_connections": 512,
+        "bytes": 67043328,
+        "limit_maxbytes": 67108864,
+        "get_hits_total": 61200000,
+        "get_misses_total": 27050310,
+        "cmd_get_total": 88250310,
+        "cmd_set_total": 40155200,
+        "evictions_total": 4582130,
+        "expired_unfetched_total": 120400
+      }
+    },
+    "collection_failure": {
+      "description": "A truncated reply: some STAT lines arrive but the connection drops before the END terminator (a timeout mid-read, or a non-memcached endpoint that never sends END). Because a half-snapshot is not trustworthy, the collector emits null (collection failure) rather than shipping the partial data. The server must SKIP the tick -- not ingest a zero. (The connection-refused path yields the same null; it is exercised by a unit test since it has no socket reply to feed.)",
+      "reply": "STAT pid 2080\r\nSTAT uptime 86400\r\nSTAT version 1.6.29\r\n",
+      "payload": null
+    }
+  }
+}

@@ -19,6 +19,9 @@ class Synchronizer(Thread):
         Thread.__init__(self)
         self._stop_event = Event()
         self.config_lock = Lock()
+        # Single-flight guard: at most one get_config fetch in flight at a
+        # time, across the startup fetch (run) and the main loop (get_config).
+        self._config_fetch_lock = Lock()
         self.token = token
         self.config = {
             "enabled": None,
@@ -29,7 +32,7 @@ class Synchronizer(Thread):
 
     def run(self):
         # We fetch the config from the server before starting to collect metrics
-        self.send_metrics({"get_config": True, **self.static_data})
+        self._fetch_config_once()
 
         while not self._stop_event.is_set():
             data = self.queue.get()
@@ -135,6 +138,18 @@ class Synchronizer(Thread):
         """Send systemd inventory snapshot to /systemd_inventory. Returns response or None."""
         return self._post("/systemd_inventory", inventory_data)
 
+    def send_image_packages(self, image_packages_data):
+        """Send one Docker image's OS package inventory to /image_packages.
+        Returns the parsed response (truthy) on a 200, None otherwise.
+
+        Mirrors send_packages / send_logs: gzip + auth + bounded retries via
+        _post. Called from the dedicated ImageInventoryUploader thread (never the
+        collection loop or the /collect drain), so a slow upload cannot block
+        metric collection or config sync. The server answers 200 for every
+        definitive outcome including refusals (so the digest is marked done and
+        not retried); non-200 is transient only."""
+        return self._post("/image_packages", image_packages_data)
+
     def get_conn(self):
         url = api_url()
         if not url.startswith("localhost"):
@@ -189,11 +204,48 @@ class Synchronizer(Thread):
             )
             return conn
 
+    def _fetch_config_once(self, wait_timeout=0):
+        """Fire one get_config fetch unless another is already in flight.
+
+        Both the startup fetch (run) and the main loop (get_config) land here
+        while self.token can still be an ENROLLMENT token; two concurrent
+        fetches enroll the same machine twice and mint a duplicate host (the
+        server dedup key is machine_id, which not every install can persist).
+        A failed fetch releases the guard so a later call retries: one in
+        flight, not one ever. The recheck under config_lock closes the window
+        where the winning fetch already populated the config before we got
+        the guard.
+
+        On contention the loser never fetches. With wait_timeout it may wait
+        (bounded) for the in-flight fetch to finish -- so a healthy startup
+        ticks as soon as the config lands instead of a poll interval later --
+        but it returns without fetching even if that fetch failed: stacking a
+        wait plus a fresh retry ladder (~45s each) in one loop iteration
+        could outlast the systemd watchdog (90s). The next loop pass finds
+        the guard free and retries as the fetcher.
+        """
+        if not self._config_fetch_lock.acquire(blocking=False):
+            if wait_timeout and self._config_fetch_lock.acquire(
+                timeout=wait_timeout
+            ):
+                self._config_fetch_lock.release()
+            return
+        try:
+            with self.config_lock:
+                if self.config["enabled"] is not None:
+                    return
+            self.send_metrics({"get_config": True, **self.static_data})
+        finally:
+            self._config_fetch_lock.release()
+
     def get_config(self):
         with self.config_lock:
             config = self.config
         if config["enabled"] is None:
-            self.send_metrics({"get_config": True, **self.static_data})
+            # 45s: enough to sit out the startup fetch's full retry ladder in
+            # the common case, while keeping this call (plus the caller's 25s
+            # disabled-branch wait) under the 90s systemd watchdog.
+            self._fetch_config_once(wait_timeout=45)
             with self.config_lock:
                 return self.config
         return config

@@ -13,6 +13,7 @@ def make_synchronizer():
     sync = Synchronizer.__new__(Synchronizer)
     sync._stop_event = Event()
     sync.config_lock = __import__("threading").Lock()
+    sync._config_fetch_lock = __import__("threading").Lock()
     sync.token = "test-token"
     sync.config = {
         "enabled": True,
@@ -189,6 +190,35 @@ def test_send_systemd_inventory_failure(mock_post):
     mock_post.return_value = None
 
     result = sync.send_systemd_inventory({"inventory_hash": "x", "units": {}})
+    assert result is None
+
+
+# --- send_image_packages ---
+
+
+@patch.object(Synchronizer, "_post")
+def test_send_image_packages_success(mock_post):
+    sync = make_synchronizer()
+    mock_post.return_value = {"status": "ok", "accepted": True}
+
+    image_data = {
+        "image_id": "sha256:abc",
+        "distro": "debian:12",
+        "packages_hash": "deadbeef",
+        "packages": [{"name": "openssl", "version": "3.0", "ecosystem": None}],
+        "errors": [],
+    }
+    result = sync.send_image_packages(image_data)
+    assert result == {"status": "ok", "accepted": True}
+    mock_post.assert_called_once_with("/image_packages", image_data)
+
+
+@patch.object(Synchronizer, "_post")
+def test_send_image_packages_failure(mock_post):
+    sync = make_synchronizer()
+    mock_post.return_value = None
+
+    result = sync.send_image_packages({"image_id": "sha256:x", "packages": []})
     assert result is None
 
 

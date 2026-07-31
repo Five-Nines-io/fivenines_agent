@@ -201,6 +201,14 @@ rm -f "${INSTALL_DIR}/run_agent.sh"
 chown -R fivenines:fivenines "$INSTALL_DIR"
 chmod -R 755 "$AGENT_DIR"
 
+# Heal installs set up before the config dir was owned by the agent user:
+# without ownership of /etc/fivenines_agent the agent can never persist
+# MACHINE_ID, so a reinstall on such a box enrolls a duplicate host.
+if [ -d /etc/fivenines_agent ]; then
+        chown fivenines:fivenines /etc/fivenines_agent
+        chmod 750 /etc/fivenines_agent
+fi
+
 # CloudLinux: ensure fivenines is in clsupergid group for proper permissions
 if [ -f "/etc/cloudlinux-release" ]; then
         print_success "CloudLinux detected"

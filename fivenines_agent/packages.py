@@ -25,6 +25,31 @@ def packages_available():
     return False
 
 
+def parse_os_release(lines):
+    """Parse an os-release ID + VERSION_ID into a short distro identifier.
+
+    Returns 'id:version_id' (e.g. 'debian:13'), just 'id' when VERSION_ID is
+    absent, or 'unknown' when there is no ID. Same lowercase / strip-quotes
+    rules the host path has always used. Shared with the Docker image inventory
+    path (docker_image_inventory.py), which extracts /etc/os-release from an
+    image via the archive API -- one parser, one set of rules, so the host and
+    image distro strings can never diverge. *lines* is any iterable of raw
+    os-release lines (an open file, or a list from a decoded blob)."""
+    fields = {}
+    for line in lines:
+        if line.startswith("ID="):
+            fields["id"] = line.strip().split("=", 1)[1].strip('"').lower()
+        elif line.startswith("VERSION_ID="):
+            fields["version_id"] = line.strip().split("=", 1)[1].strip('"').lower()
+    distro_id = fields.get("id")
+    if not distro_id:
+        return "unknown"
+    version_id = fields.get("version_id")
+    if version_id:
+        return f"{distro_id}:{version_id}"
+    return distro_id
+
+
 def get_distro():
     """Return a short OS identifier suitable for the packages payload.
 
@@ -42,22 +67,8 @@ def get_distro():
             log(f"Error reading Windows release: {e}", "error")
             return "windows"
     try:
-        fields = {}
         with open("/etc/os-release", "r") as f:
-            for line in f:
-                if line.startswith("ID="):
-                    fields["id"] = line.strip().split("=", 1)[1].strip('"').lower()
-                elif line.startswith("VERSION_ID="):
-                    fields["version_id"] = (
-                        line.strip().split("=", 1)[1].strip('"').lower()
-                    )
-        distro_id = fields.get("id")
-        if not distro_id:
-            return "unknown"
-        version_id = fields.get("version_id")
-        if version_id:
-            return f"{distro_id}:{version_id}"
-        return distro_id
+            return parse_os_release(f)
     except Exception as e:
         log(f"Error reading /etc/os-release: {e}", "error")
     return "unknown"
