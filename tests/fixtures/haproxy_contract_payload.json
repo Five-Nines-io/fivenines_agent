@@ -1,0 +1,144 @@
+{
+  "description": "Shared HAProxy contract fixture between fivenines-agent and fivenines-server (server issue #494). Source of truth: fivenines-agent tests/fixtures/haproxy_contract_payload.json, asserted end-to-end by tests/test_haproxy.py::test_contract_fixture_round_trip (only the socket/HTTP transport is mocked -- each scenario's 'raw_lines' are joined into the CSV that _socket_show_stat/_http_show_stat would return, and the 'capped_tick' scenario shrinks _SERVER_CAP to 'server_cap' so the cap can be exercised without synthesising 400+ rows). haproxy_metrics(**scenario['config']) must equal scenario['payload']. The server's spec/requests/api_collect_haproxy_spec.rb posts scenario['payload'] under data['haproxy'] through /collect and asserts Ingesters::Agent ingests each shape (list / capped-wrapper / [] / null). 'config' is the only field the server reads; 'raw_lines' and 'server_cap' are agent-side inputs the server ignores. Change the payload shape only in lockstep across both repos, keeping the two copies byte-identical.",
+  "agent_min_version": "1.14.3",
+  "_agent_min_version_note": "PATCH on the 1.14.x release train (user-assigned): 1.14.0 = Docker image-inventory (issue #101), 1.14.1 = TSDB (issue #103), 1.14.3 = HAProxy (issue #105), 1.14.4 = Memcached (issue #106). HAProxy has NO server version gate (no FEATURES_SUPPORTED_VERSIONS entry -- it is purely config-driven, haproxy_enabled defaults false), so nothing gates on this number and a PATCH is fine; it is reconciled at merge/ship time.",
+  "null_contract": "data['haproxy'] is one of FOUR shapes and the server MUST branch on them: (a) null (JSON null / Python None) = COLLECTION FAILURE -- the stats socket was refused/timed out, the HTTP CSV request failed / returned non-200, or the body was not parseable stats CSV. The server MUST NOT prune haproxy rows or auto-resolve haproxy_backend_down incidents on null: an unreachable HAProxy is not 'every backend recovered', and treating it as recovery is a false-resolve bug. (b) a plain LIST of row objects = an uncapped, trustworthy tick: every frontend/backend/server row present (servers under the cap). The server prunes rows that disappeared from a list tick. (c) the WRAPPER object {'rows': [...], 'servers_capped': true} = a CAPPED tick: all frontend+backend rows plus the first _SERVER_CAP (400) server rows sorted problems-first. The server MUST NOT prune server-type rows on a capped tick (a server absent only because it was capped is not 'removed'); frontend/backend rows are still complete and may be pruned. (d) [] (empty list) = the stats endpoint was reachable with genuinely zero proxies -- safe to prune all rows. Dispatch: null -> skip; dict -> capped (rows = data['rows'], skip pruning servers); list -> normal (prune missing). Same null-vs-empty discipline as the zfs and php_fpm contracts.",
+  "row_contract": {
+    "proxy": "HAProxy CSV 'pxname' -- the proxy (frontend/backend) name.",
+    "server": "HAProxy CSV 'svname' -- 'FRONTEND' / 'BACKEND' for aggregate rows, else the server name. (proxy, server) is the per-entity key.",
+    "type": "Derived from the CSV 'type' column: 0->'frontend', 1->'backend', 2->'server'. Listener rows (type 3) and any unknown type are DROPPED (per-bind noise, out of scope for the backend-down trigger).",
+    "status": "HAProxy CSV 'status' passed through VERBATIM (UP / DOWN / MAINT / DRAIN / NOLB / 'no check' / transitional 'UP 1/3' / 'DOWN 1/2'). The server normalizes; MAINT/DRAIN MUST stay distinguishable from DOWN so maintenance never pages.",
+    "sessions_current": "CSV 'scur' -- current sessions gauge.",
+    "sessions_limit": "CSV 'slim' -- session limit (maxconn); null when unset.",
+    "queue_current": "CSV 'qcur' -- requests queued right now; null on rows that do not queue (frontends).",
+    "http_4xx_total": "CSV 'hrsp_4xx' -- RAW cumulative 4xx counter; the server rate()s it. Never reset or diff agent-side.",
+    "http_5xx_total": "CSV 'hrsp_5xx' -- RAW cumulative 5xx counter.",
+    "retries_total": "CSV 'wretr' -- RAW cumulative connection-retry counter.",
+    "bytes_in_total": "CSV 'bin' -- RAW cumulative bytes received.",
+    "bytes_out_total": "CSV 'bout' -- RAW cumulative bytes sent.",
+    "check_status": "CSV 'check_status' -- last health-check result (e.g. L4OK / L7OK / L4CON / L4TOUT); null for frontend/backend aggregate rows and no-check servers.",
+    "check_duration_ms": "CSV 'check_duration' -- last health-check duration in ms; null when no check ran.",
+    "_mapping": "Columns are mapped BY HEADER NAME, never by index -- the CSV column set shifts across HAProxy versions. The fixture header interleaves unmapped columns (qmax/smax/stot/weight/rate) between the mapped ones so an index-based reader would produce garbage. Every row carries all fourteen keys with null where the column is empty/absent.",
+    "_capped_wrapper": "When a tick is capped the payload is {'rows': [...], 'servers_capped': true} instead of a bare list. frontend+backend rows come first (CSV order), then the kept server rows in problems-first order."
+  },
+  "scenarios": {
+    "healthy": {
+      "description": "Socket mode. One frontend, one backend, two UP servers. Pins the plain-list payload, the type-code -> string mapping, by-name column mapping, verbatim status, raw counters, and null on absent cells (frontend qcur/retries/check_*, backend check_*, server slim). CSV order (frontend, servers, BACKEND) is preserved.",
+      "config": { "stats_socket": "/run/haproxy/admin.sock", "stats_url": null, "username": null, "password": null },
+      "raw_lines": [
+        "# pxname,svname,qcur,qmax,scur,smax,slim,stot,bin,bout,wretr,status,weight,type,rate,check_status,check_duration,hrsp_4xx,hrsp_5xx,",
+        "web_front,FRONTEND,,,5,10,2000,12345,555000,999000,,OPEN,,0,3,,,40,2,",
+        "web_back,web1,0,0,3,8,,5000,200000,400000,1,UP,1,2,1,L4OK,2,600,15,",
+        "web_back,web2,0,0,4,9,,6000,300000,500000,3,UP,1,2,1,L7OK,5,600,16,",
+        "web_back,BACKEND,0,5,42,100,2000,11000,9912212,18821133,4,UP,2,1,8,,,1200,31,"
+      ],
+      "payload": [
+        { "proxy": "web_front", "server": "FRONTEND", "type": "frontend", "status": "OPEN",
+          "sessions_current": 5, "sessions_limit": 2000, "queue_current": null,
+          "http_4xx_total": 40, "http_5xx_total": 2, "retries_total": null,
+          "bytes_in_total": 555000, "bytes_out_total": 999000,
+          "check_status": null, "check_duration_ms": null },
+        { "proxy": "web_back", "server": "web1", "type": "server", "status": "UP",
+          "sessions_current": 3, "sessions_limit": null, "queue_current": 0,
+          "http_4xx_total": 600, "http_5xx_total": 15, "retries_total": 1,
+          "bytes_in_total": 200000, "bytes_out_total": 400000,
+          "check_status": "L4OK", "check_duration_ms": 2 },
+        { "proxy": "web_back", "server": "web2", "type": "server", "status": "UP",
+          "sessions_current": 4, "sessions_limit": null, "queue_current": 0,
+          "http_4xx_total": 600, "http_5xx_total": 16, "retries_total": 3,
+          "bytes_in_total": 300000, "bytes_out_total": 500000,
+          "check_status": "L7OK", "check_duration_ms": 5 },
+        { "proxy": "web_back", "server": "BACKEND", "type": "backend", "status": "UP",
+          "sessions_current": 42, "sessions_limit": 2000, "queue_current": 0,
+          "http_4xx_total": 1200, "http_5xx_total": 31, "retries_total": 4,
+          "bytes_in_total": 9912212, "bytes_out_total": 18821133,
+          "check_status": null, "check_duration_ms": null }
+      ]
+    },
+    "backend_down_server_maint": {
+      "description": "HTTP CSV mode with basic auth. A backend is DOWN with one server DOWN (check L4CON) and one server in MAINT (check L4OK). THE DISTINGUISHABILITY GUARD: MAINT is passed through verbatim, never collapsed to DOWN, so the server can suppress paging for the maintenance server while the DOWN server and DOWN backend drive haproxy_backend_down.",
+      "config": { "stats_socket": null, "stats_url": "http://127.0.0.1:8404/stats", "username": "admin", "password": "secret" },
+      "raw_lines": [
+        "# pxname,svname,qcur,qmax,scur,smax,slim,stot,bin,bout,wretr,status,weight,type,rate,check_status,check_duration,hrsp_4xx,hrsp_5xx,",
+        "api_front,FRONTEND,,,0,3,2000,500,10000,20000,,OPEN,,0,1,,,5,0,",
+        "api_back,api1,0,0,0,2,,100,1000,2000,5,DOWN,1,2,0,L4CON,2001,10,8,",
+        "api_back,api2,0,0,0,2,,50,500,900,0,MAINT,1,2,0,L4OK,3,4,1,",
+        "api_back,BACKEND,3,10,0,5,2000,200,1500,2900,5,DOWN,2,1,0,,,14,9,"
+      ],
+      "payload": [
+        { "proxy": "api_front", "server": "FRONTEND", "type": "frontend", "status": "OPEN",
+          "sessions_current": 0, "sessions_limit": 2000, "queue_current": null,
+          "http_4xx_total": 5, "http_5xx_total": 0, "retries_total": null,
+          "bytes_in_total": 10000, "bytes_out_total": 20000,
+          "check_status": null, "check_duration_ms": null },
+        { "proxy": "api_back", "server": "api1", "type": "server", "status": "DOWN",
+          "sessions_current": 0, "sessions_limit": null, "queue_current": 0,
+          "http_4xx_total": 10, "http_5xx_total": 8, "retries_total": 5,
+          "bytes_in_total": 1000, "bytes_out_total": 2000,
+          "check_status": "L4CON", "check_duration_ms": 2001 },
+        { "proxy": "api_back", "server": "api2", "type": "server", "status": "MAINT",
+          "sessions_current": 0, "sessions_limit": null, "queue_current": 0,
+          "http_4xx_total": 4, "http_5xx_total": 1, "retries_total": 0,
+          "bytes_in_total": 500, "bytes_out_total": 900,
+          "check_status": "L4OK", "check_duration_ms": 3 },
+        { "proxy": "api_back", "server": "BACKEND", "type": "backend", "status": "DOWN",
+          "sessions_current": 0, "sessions_limit": 2000, "queue_current": 3,
+          "http_4xx_total": 14, "http_5xx_total": 9, "retries_total": 5,
+          "bytes_in_total": 1500, "bytes_out_total": 2900,
+          "check_status": null, "check_duration_ms": null }
+      ]
+    },
+    "zero_proxies": {
+      "description": "Socket mode. The stats endpoint is reachable but the CSV carries only the header (genuinely zero proxies). Emits [] so the server prunes all rows. Distinct from null: the scrape succeeded and parsed.",
+      "config": { "stats_socket": "/run/haproxy/admin.sock", "stats_url": null, "username": null, "password": null },
+      "raw_lines": [
+        "# pxname,svname,qcur,qmax,scur,smax,slim,stot,bin,bout,wretr,status,weight,type,rate,check_status,check_duration,hrsp_4xx,hrsp_5xx,"
+      ],
+      "payload": []
+    },
+    "collection_failure": {
+      "description": "Socket mode where the transport yields nothing (socket refused / timed out / unparseable body). Emits null (collection failure); the server MUST NOT prune rows or resolve haproxy_backend_down incidents.",
+      "config": { "stats_socket": "/run/haproxy/admin.sock", "stats_url": null, "username": null, "password": null },
+      "raw_lines": null,
+      "payload": null
+    },
+    "capped_tick": {
+      "description": "THE CAP SHARP EDGE. Three servers under one backend with _SERVER_CAP shrunk to 2 (server_cap, an agent-side test input). CSV order is [srv_up_a, srv_down, srv_up_b] but the DOWN server MUST survive the cap: the payload is the wrapper {'rows': [...], 'servers_capped': true} with frontend+backend first (always shipped), then the kept servers problems-first (srv_down ahead of the UP servers). srv_up_b is dropped. The server must skip pruning server rows on this tick.",
+      "config": { "stats_socket": "/run/haproxy/admin.sock", "stats_url": null, "username": null, "password": null },
+      "server_cap": 2,
+      "raw_lines": [
+        "# pxname,svname,qcur,qmax,scur,smax,slim,stot,bin,bout,wretr,status,weight,type,rate,check_status,check_duration,hrsp_4xx,hrsp_5xx,",
+        "lb_front,FRONTEND,,,1,2,2000,10,1000,2000,,OPEN,,0,0,,,0,0,",
+        "lb_back,srv_up_a,0,0,1,2,,50,100,200,0,UP,1,2,0,L4OK,1,0,0,",
+        "lb_back,srv_down,0,0,0,2,,60,150,250,7,DOWN,1,2,0,L4TOUT,2000,0,0,",
+        "lb_back,srv_up_b,0,0,2,3,,70,180,280,0,UP,1,2,0,L4OK,1,0,0,",
+        "lb_back,BACKEND,0,0,3,5,2000,180,430,730,7,UP,3,1,0,,,0,0,"
+      ],
+      "payload": {
+        "servers_capped": true,
+        "rows": [
+          { "proxy": "lb_front", "server": "FRONTEND", "type": "frontend", "status": "OPEN",
+            "sessions_current": 1, "sessions_limit": 2000, "queue_current": null,
+            "http_4xx_total": 0, "http_5xx_total": 0, "retries_total": null,
+            "bytes_in_total": 1000, "bytes_out_total": 2000,
+            "check_status": null, "check_duration_ms": null },
+          { "proxy": "lb_back", "server": "BACKEND", "type": "backend", "status": "UP",
+            "sessions_current": 3, "sessions_limit": 2000, "queue_current": 0,
+            "http_4xx_total": 0, "http_5xx_total": 0, "retries_total": 7,
+            "bytes_in_total": 430, "bytes_out_total": 730,
+            "check_status": null, "check_duration_ms": null },
+          { "proxy": "lb_back", "server": "srv_down", "type": "server", "status": "DOWN",
+            "sessions_current": 0, "sessions_limit": null, "queue_current": 0,
+            "http_4xx_total": 0, "http_5xx_total": 0, "retries_total": 7,
+            "bytes_in_total": 150, "bytes_out_total": 250,
+            "check_status": "L4TOUT", "check_duration_ms": 2000 },
+          { "proxy": "lb_back", "server": "srv_up_a", "type": "server", "status": "UP",
+            "sessions_current": 1, "sessions_limit": null, "queue_current": 0,
+            "http_4xx_total": 0, "http_5xx_total": 0, "retries_total": 0,
+            "bytes_in_total": 100, "bytes_out_total": 200,
+            "check_status": "L4OK", "check_duration_ms": 1 }
+        ]
+      }
+    }
+  }
+}
