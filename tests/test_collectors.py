@@ -39,6 +39,7 @@ def test_registry_has_expected_config_keys():
         "caddy",
         "postgresql",
         "mysql",
+        "rabbitmq",
         "proxmox",
         "systemd",
         "disk_health",
