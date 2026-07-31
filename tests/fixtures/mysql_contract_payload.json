@@ -1,0 +1,114 @@
+{
+  "description": "Shared MySQL / MariaDB contract fixture between fivenines-agent and fivenines-server. The MySQL collector (#488 / PR #88) shipped WITHOUT a fixture; issue #107 (Galera wsrep cluster state) adds this one and it becomes the source of truth, vendored byte-identical server-side. Source of truth: fivenines-agent tests/fixtures/mysql_contract_payload.json, asserted end-to-end by tests/test_mysql.py::test_contract_fixture_round_trip with ONLY the CLI transport mocked -- each scenario's 'queries' bodies are fed back per statement (matched by longest query-needle so 'SHOW GLOBAL STATUS LIKE ...' is not shadowed by the 'SHOW GLOBAL STATUS' probe prefix), and mysql_metrics(**config) must equal scenario['payload']. The server's spec/requests/api_collect_mysql_spec.rb posts scenario['payload'] under data['mysql'] through /collect and asserts Ingesters::Mysql ingests each shape (Galera present / absent / unreachable envelope). 'config' and 'queries' are agent-side inputs the server ignores. Change the payload shape only in lockstep across both repos, keeping the two copies byte-identical.",
+  "agent_min_version": "1.15.0",
+  "_agent_min_version_note": "MINOR bump: Galera adds a new user-facing capability (cluster-state gauges + the server-side galera_cluster_degraded trigger). Released main is 1.13.1; the only PRs pushed above it are 1.14.0 (Docker image-inventory #102) and 1.14.1 (TSDB #103), so 1.15.0 is the next free minor. MySQL has NO server version gate (no FEATURES_SUPPORTED_VERSIONS entry -- it is purely config-driven, mysql_enabled defaults false), so nothing gates on this number; it exists only to date the payload.",
+  "galera_contract": "The Galera keys are the whitelisted subset of SHOW GLOBAL STATUS LIKE 'wsrep%', merged into the SAME data['mysql'] object as the base metrics (no new payload key, no new config). Galera detection is IMPLICIT: a non-Galera server returns zero wsrep rows, so every wsrep_* key is simply ABSENT (no-data server-side, not null). The keys are likewise ABSENT when the reachability envelope reports unreachable/config_error -- the probe fails before the wsrep statement runs, so the payload is envelope-only. Never fabricate: a wsrep_* numeric that fails to parse (NULL / garbage), a non-finite float (inf/nan/overflow -- these would serialize as invalid Infinity/NaN JSON and poison the whole tick), and a present-but-blank status string are all OMITTED, not sent as null or empty. Every shipped float is therefore finite. All values are instantaneous gauges/status -- nothing to rate; ints/floats are parsed to native types, non-blank status strings ship verbatim. Same absent-vs-null discipline as the rest of the reachable/error envelope from #488.",
+  "field_contract": {
+    "_base": "reachable/connections/queries/slow_queries/aborted_connects/uptime/innodb_buffer_pool_hit_ratio/innodb_buffer_pool_usage_pct/max_connections/version/is_replica/replication are the pre-#107 MySQL payload (PR #88); unchanged here and included so the round-trip pins the WHOLE data['mysql'] object, not just the Galera delta.",
+    "wsrep_cluster_size": "wsrep_cluster_size -- number of nodes in the component this node sees (int). A drop below the configured size is the split-brain / lost-quorum signal.",
+    "wsrep_cluster_status": "wsrep_cluster_status verbatim -- 'Primary' when the node is in the primary component; anything else ('non-Primary', 'Disconnected') means it cannot serve writes. Drives galera_cluster_degraded server-side.",
+    "wsrep_local_state": "wsrep_local_state -- numeric node FSM state (int; 4 == Synced). Pairs with wsrep_local_state_comment.",
+    "wsrep_local_state_comment": "wsrep_local_state_comment verbatim -- human label for wsrep_local_state ('Synced', 'Donor/Desynced', 'Joining', 'Initialized').",
+    "wsrep_ready": "wsrep_ready verbatim -- 'ON' when the node will accept queries, 'OFF' when it will reject them.",
+    "wsrep_connected": "wsrep_connected verbatim -- 'ON' when the node has network connectivity to the cluster.",
+    "wsrep_flow_control_paused": "wsrep_flow_control_paused -- fraction of time (0.0-1.0) replication was paused by flow control since the last status read (float). Sustained > 0 means a slow node is throttling the cluster.",
+    "wsrep_local_recv_queue_avg": "wsrep_local_recv_queue_avg -- average length of the local received-write-set queue (float). > 0 means this node is falling behind on apply.",
+    "_dropped": "Every other wsrep_* row (wsrep_provider_name, wsrep_protocol_version, wsrep_local_state_uuid, ...) is NOT ingested and is dropped from the payload; only the eight keys above are whitelisted."
+  },
+  "config": { "host": "localhost", "port": 3306, "user": "root" },
+  "scenarios": {
+    "galera_healthy": {
+      "description": "A healthy 3-node Galera / MariaDB member: Primary component, local state 4/Synced, ready+connected ON, negligible flow control. Pins native typing (cluster_size/local_state ints, flow_control_paused/local_recv_queue_avg floats, status strings verbatim) and the whitelist drop of the extra wsrep rows (wsrep_protocol_version, wsrep_provider_name).",
+      "queries": {
+        "SHOW GLOBAL STATUS": ["Threads_connected\t24\nQueries\t9876543\nSlow_queries\t4\nAborted_connects\t2\nUptime\t172800\nInnodb_buffer_pool_reads\t2000\nInnodb_buffer_pool_read_requests\t5000000\nInnodb_buffer_pool_pages_total\t8192\nInnodb_buffer_pool_pages_free\t1024\n", "", 0],
+        "SHOW GLOBAL VARIABLES": ["max_connections\t512\nversion\t10.11.6-MariaDB-log\n", "", 0],
+        "SHOW REPLICA STATUS": ["", "", 0],
+        "SHOW GLOBAL STATUS LIKE 'wsrep%'": ["wsrep_protocol_version\t10\nwsrep_cluster_size\t3\nwsrep_cluster_status\tPrimary\nwsrep_local_state\t4\nwsrep_local_state_comment\tSynced\nwsrep_ready\tON\nwsrep_connected\tON\nwsrep_flow_control_paused\t0.012\nwsrep_local_recv_queue_avg\t0.05\nwsrep_provider_name\tGalera\n", "", 0]
+      },
+      "payload": {
+        "reachable": true,
+        "connections": 24,
+        "queries": 9876543,
+        "slow_queries": 4,
+        "aborted_connects": 2,
+        "uptime": 172800,
+        "innodb_buffer_pool_hit_ratio": 99.96,
+        "innodb_buffer_pool_usage_pct": 87.5,
+        "max_connections": 512,
+        "version": "10.11.6-MariaDB-log",
+        "is_replica": false,
+        "wsrep_cluster_size": 3,
+        "wsrep_cluster_status": "Primary",
+        "wsrep_local_state": 4,
+        "wsrep_local_state_comment": "Synced",
+        "wsrep_ready": "ON",
+        "wsrep_connected": "ON",
+        "wsrep_flow_control_paused": 0.012,
+        "wsrep_local_recv_queue_avg": 0.05
+      }
+    },
+    "galera_degraded": {
+      "description": "A partitioned Galera node cut off from quorum: non-Primary component, cluster_size collapsed to 1, local state 0/Initialized, wsrep_ready OFF (rejects queries), heavy flow-control pausing and a backed-up recv queue. This is the shape that fires galera_cluster_degraded server-side. reachable stays true -- the node is up, the CLUSTER is degraded.",
+      "queries": {
+        "SHOW GLOBAL STATUS": ["Threads_connected\t5\nQueries\t42\nSlow_queries\t0\nAborted_connects\t9\nUptime\t120\nInnodb_buffer_pool_reads\t10\nInnodb_buffer_pool_read_requests\t100\nInnodb_buffer_pool_pages_total\t1024\nInnodb_buffer_pool_pages_free\t512\n", "", 0],
+        "SHOW GLOBAL VARIABLES": ["max_connections\t151\nversion\t10.6.16-MariaDB\n", "", 0],
+        "SHOW REPLICA STATUS": ["", "", 0],
+        "SHOW GLOBAL STATUS LIKE 'wsrep%'": ["wsrep_cluster_size\t1\nwsrep_cluster_status\tnon-Primary\nwsrep_local_state\t0\nwsrep_local_state_comment\tInitialized\nwsrep_ready\tOFF\nwsrep_connected\tON\nwsrep_flow_control_paused\t0.87\nwsrep_local_recv_queue_avg\t3.5\n", "", 0]
+      },
+      "payload": {
+        "reachable": true,
+        "connections": 5,
+        "queries": 42,
+        "slow_queries": 0,
+        "aborted_connects": 9,
+        "uptime": 120,
+        "innodb_buffer_pool_hit_ratio": 90.0,
+        "innodb_buffer_pool_usage_pct": 50.0,
+        "max_connections": 151,
+        "version": "10.6.16-MariaDB",
+        "is_replica": false,
+        "wsrep_cluster_size": 1,
+        "wsrep_cluster_status": "non-Primary",
+        "wsrep_local_state": 0,
+        "wsrep_local_state_comment": "Initialized",
+        "wsrep_ready": "OFF",
+        "wsrep_connected": "ON",
+        "wsrep_flow_control_paused": 0.87,
+        "wsrep_local_recv_queue_avg": 3.5
+      }
+    },
+    "non_galera": {
+      "description": "A plain (non-Galera) MySQL 8 server. SHOW GLOBAL STATUS LIKE 'wsrep%' returns ZERO rows (empty stdout), so no wsrep_* key is emitted -- Galera detection is implicit (no-data == not clustered). The payload is exactly the pre-#107 base object; the server sees no Galera keys and treats the host as non-clustered.",
+      "queries": {
+        "SHOW GLOBAL STATUS": ["Threads_connected\t10\nQueries\t555000\nSlow_queries\t1\nAborted_connects\t0\nUptime\t3600\nInnodb_buffer_pool_reads\t500\nInnodb_buffer_pool_read_requests\t1000000\nInnodb_buffer_pool_pages_total\t2048\nInnodb_buffer_pool_pages_free\t48\n", "", 0],
+        "SHOW GLOBAL VARIABLES": ["max_connections\t151\nversion\t8.0.36\n", "", 0],
+        "SHOW REPLICA STATUS": ["", "", 0],
+        "SHOW GLOBAL STATUS LIKE 'wsrep%'": ["", "", 0]
+      },
+      "payload": {
+        "reachable": true,
+        "connections": 10,
+        "queries": 555000,
+        "slow_queries": 1,
+        "aborted_connects": 0,
+        "uptime": 3600,
+        "innodb_buffer_pool_hit_ratio": 99.95,
+        "innodb_buffer_pool_usage_pct": 97.66,
+        "max_connections": 151,
+        "version": "8.0.36",
+        "is_replica": false
+      }
+    },
+    "unreachable": {
+      "description": "The reachability probe (SHOW GLOBAL STATUS) fails with a refused connection, so mysql_metrics returns the envelope only and never runs the wsrep statement. Proves the Galera keys are absent on unreachable -- the server must not read (or fabricate) cluster state from a host it could not reach.",
+      "queries": {
+        "SHOW GLOBAL STATUS": ["", "ERROR 2002 (HY000): Can't connect to local MySQL server through socket '/run/mysqld/mysqld.sock' (2)", 1]
+      },
+      "payload": {
+        "reachable": false,
+        "error": "connection_refused",
+        "error_detail": "ERROR 2002 (HY000): Can't connect to local MySQL server through socket '/run/mysqld/mysqld.sock' (2)"
+      }
+    }
+  }
+}

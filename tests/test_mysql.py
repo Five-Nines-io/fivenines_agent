@@ -11,12 +11,15 @@ tests/fixtures dir / conftest for collectors). The acceptance criterion
 parametrized parser/replication cases.
 """
 
+import json
+import os
 import subprocess
 from unittest.mock import patch
 
 import pytest
 
 from fivenines_agent.mysql import (
+    _add_galera_metrics,
     _add_status_metrics,
     _add_variable_metrics,
     _buffer_pool_hit_ratio,
@@ -31,6 +34,7 @@ from fivenines_agent.mysql import (
     _parse_vertical,
     _resolve_binary,
     _run_mysql,
+    _to_float,
     _to_int,
     _yes,
     mysql_metrics,
@@ -708,3 +712,306 @@ def test_metrics_tolerates_unknown_config_keys():
         future_option="whatever",
     )
     assert result["reachable"] is True
+
+
+# ---------------------------------------------------------------------------
+# _to_float: native float coercion, NULL/garbage -> None (Galera gauges)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("0.012", 0.012),
+        ("3", 3.0),
+        ("0", 0.0),
+        ("1e308", 1e308),  # large but FINITE -> kept
+        ("NULL", None),
+        ("", None),
+        (None, None),
+        ("x", None),
+        # Non-finite floats are rejected to None: they are valid Python floats
+        # but serialize as invalid Infinity/NaN JSON that poisons the whole tick.
+        ("inf", None),
+        ("-inf", None),
+        ("Infinity", None),
+        ("nan", None),
+        ("NaN", None),
+        ("1e999", None),  # overflows float() to inf -> rejected
+    ],
+)
+def test_to_float(value, expected):
+    assert _to_float(value) == expected
+
+
+# ---------------------------------------------------------------------------
+# Galera / wsrep whitelist extraction (issue #107)
+# ---------------------------------------------------------------------------
+
+# Healthy Galera node. Carries two non-whitelisted rows (wsrep_protocol_version,
+# wsrep_provider_name) to prove the whitelist drops everything else.
+GALERA_WSREP = (
+    "wsrep_protocol_version\t10\n"
+    "wsrep_cluster_size\t3\n"
+    "wsrep_cluster_status\tPrimary\n"
+    "wsrep_local_state\t4\n"
+    "wsrep_local_state_comment\tSynced\n"
+    "wsrep_ready\tON\n"
+    "wsrep_connected\tON\n"
+    "wsrep_flow_control_paused\t0.012\n"
+    "wsrep_local_recv_queue_avg\t0.05\n"
+    "wsrep_provider_name\tGalera\n"
+)
+
+
+def test_add_galera_metrics_whitelist_and_types():
+    metrics = {}
+    _add_galera_metrics(metrics, _parse_status(GALERA_WSREP))
+    assert metrics == {
+        "wsrep_cluster_size": 3,
+        "wsrep_cluster_status": "Primary",
+        "wsrep_local_state": 4,
+        "wsrep_local_state_comment": "Synced",
+        "wsrep_ready": "ON",
+        "wsrep_connected": "ON",
+        "wsrep_flow_control_paused": 0.012,
+        "wsrep_local_recv_queue_avg": 0.05,
+    }
+    # Non-whitelisted wsrep rows are dropped; numerics are native, not strings.
+    assert "wsrep_protocol_version" not in metrics
+    assert "wsrep_provider_name" not in metrics
+    assert isinstance(metrics["wsrep_cluster_size"], int)
+    assert isinstance(metrics["wsrep_flow_control_paused"], float)
+
+
+def test_add_galera_metrics_empty_is_noop():
+    """Non-Galera server: zero wsrep rows -> no keys added (implicit detection)."""
+    metrics = {}
+    _add_galera_metrics(metrics, {})
+    assert metrics == {}
+
+
+def test_add_galera_metrics_omits_unparseable_numeric():
+    """A NULL/garbage numeric gauge is omitted, never fabricated as null."""
+    metrics = {}
+    _add_galera_metrics(
+        metrics,
+        {
+            "wsrep_cluster_size": "NULL",
+            "wsrep_flow_control_paused": "n/a",
+            "wsrep_cluster_status": "Primary",
+        },
+    )
+    # Numeric coercion failed -> keys omitted; the status string still survives.
+    assert metrics == {"wsrep_cluster_status": "Primary"}
+
+
+def test_add_galera_metrics_omits_non_finite_and_blank():
+    """inf/nan floats and blank status strings drop out; a real 0 / 0.0 stays."""
+    metrics = {}
+    _add_galera_metrics(
+        metrics,
+        {
+            "wsrep_flow_control_paused": "nan",  # non-finite -> omitted
+            "wsrep_local_recv_queue_avg": "inf",  # non-finite -> omitted
+            "wsrep_cluster_status": "",  # blank status string -> omitted
+            "wsrep_local_state": "0",  # real 0 gauge -> KEPT (not blank)
+            "wsrep_ready": "ON",  # real status string -> kept
+        },
+    )
+    assert metrics == {"wsrep_local_state": 0, "wsrep_ready": "ON"}
+
+
+def _galera_dispatch(status, variables, wsrep, replica=("", "", 0)):
+    """subprocess.run fake for the full Galera flow.
+
+    Checks 'wsrep' BEFORE 'GLOBAL STATUS' so the wsrep statement is not
+    shadowed by the reachability probe (both SQL strings contain 'GLOBAL
+    STATUS').
+    """
+
+    def fake(cmd, **kwargs):
+        sql = cmd[-1]
+        if "wsrep" in sql:
+            return completed(*wsrep)
+        if "GLOBAL STATUS" in sql:
+            return completed(*status)
+        if "VARIABLES" in sql:
+            return completed(*variables)
+        if "REPLICA STATUS" in sql or "SLAVE STATUS" in sql:
+            return completed(*replica)
+        return completed("", "", 0)
+
+    return fake
+
+
+def _run_galera(dispatch, **kwargs):
+    with patch(f"{MY}.shutil.which", return_value="/usr/bin/mysql"), patch(
+        f"{MY}.subprocess.run", side_effect=dispatch
+    ):
+        return mysql_metrics(**kwargs)
+
+
+def test_metrics_galera_keys_merged_into_payload():
+    result = _run_galera(
+        _galera_dispatch((MYSQL8_STATUS, "", 0), (MARIADB_VARS, "", 0), (GALERA_WSREP, "", 0))
+    )
+    assert result["reachable"] is True
+    # Base metrics survive alongside the merged Galera keys.
+    assert result["connections"] == 42
+    assert result["wsrep_cluster_size"] == 3
+    assert result["wsrep_cluster_status"] == "Primary"
+    assert result["wsrep_local_state_comment"] == "Synced"
+    assert result["wsrep_flow_control_paused"] == 0.012
+
+
+def test_metrics_non_galera_omits_wsrep_keys():
+    """Zero wsrep rows -> no wsrep_* key leaks into the payload."""
+    result = _run_galera(
+        _galera_dispatch((MYSQL8_STATUS, "", 0), (MYSQL8_VARS, "", 0), ("", "", 0))
+    )
+    assert result["reachable"] is True
+    assert not any(k.startswith("wsrep_") for k in result)
+
+
+def test_metrics_galera_query_failure_stays_reachable():
+    """A denied/failed wsrep query drops only the Galera keys; reachable True."""
+    result = _run_galera(
+        _galera_dispatch(
+            (MYSQL8_STATUS, "", 0),
+            (MYSQL8_VARS, "", 0),
+            ("", "ERROR 1227 (42000): Access denied; you need SUPER", 1),
+        )
+    )
+    assert result["reachable"] is True
+    assert not any(k.startswith("wsrep_") for k in result)
+
+
+# A Galera node reporting a pathological non-finite flow-control gauge.
+GALERA_WSREP_NAN = (
+    "wsrep_cluster_size\t3\n"
+    "wsrep_cluster_status\tPrimary\n"
+    "wsrep_local_state\t4\n"
+    "wsrep_local_state_comment\tSynced\n"
+    "wsrep_ready\tON\n"
+    "wsrep_connected\tON\n"
+    "wsrep_flow_control_paused\tnan\n"
+    "wsrep_local_recv_queue_avg\t0.05\n"
+)
+
+
+def test_metrics_galera_non_finite_gauge_omitted_keeps_payload_json_safe():
+    """A non-finite wsrep float is dropped, never shipped as Infinity/NaN.
+
+    Regression: json.dumps (the synchronizer's default allow_nan=True) would
+    emit invalid Infinity/NaN tokens for a non-finite float, and a strict
+    backend parser would reject the WHOLE tick payload (every collector). The
+    bad gauge must be omitted; the rest of the payload survives and stays
+    strict-JSON encodable.
+    """
+    result = _run_galera(
+        _galera_dispatch((MYSQL8_STATUS, "", 0), (MARIADB_VARS, "", 0), (GALERA_WSREP_NAN, "", 0))
+    )
+    assert result["reachable"] is True
+    assert "wsrep_flow_control_paused" not in result  # non-finite -> omitted
+    assert result["wsrep_local_recv_queue_avg"] == 0.05  # finite sibling kept
+    assert result["wsrep_cluster_status"] == "Primary"
+    # Must be strict-JSON encodable -- raises ValueError if any inf/nan leaked.
+    json.dumps(result, allow_nan=False)
+
+
+def test_metrics_unreachable_omits_wsrep_keys():
+    """Probe failure -> envelope only; the wsrep statement never runs."""
+    result = run_metrics(
+        {"GLOBAL STATUS": ("", "ERROR 2002 (HY000): Can't connect", 1)}
+    )
+    assert result["reachable"] is False
+    assert not any(k.startswith("wsrep_") for k in result)
+
+
+# ---------------------------------------------------------------------------
+# Cross-repo contract fixture (fivenines-server): mysql_contract_payload.json
+# ---------------------------------------------------------------------------
+
+_FIXTURE_PATH = os.path.join(
+    os.path.dirname(__file__), "fixtures", "mysql_contract_payload.json"
+)
+
+# The eight whitelisted Galera keys, pinned independently of the collector's
+# _WSREP_FIELDS so a drift in either side fails loudly.
+_EXPECTED_WSREP_KEYS = {
+    "wsrep_cluster_size",
+    "wsrep_cluster_status",
+    "wsrep_local_state",
+    "wsrep_local_state_comment",
+    "wsrep_ready",
+    "wsrep_connected",
+    "wsrep_flow_control_paused",
+    "wsrep_local_recv_queue_avg",
+}
+
+
+def _load_fixture():
+    with open(_FIXTURE_PATH) as f:
+        return json.load(f)
+
+
+def _fixture_dispatch(queries):
+    """subprocess.run fake driven by a scenario's 'queries' map.
+
+    The LONGEST matching query-needle wins, so "SHOW GLOBAL STATUS LIKE
+    'wsrep%'" beats the "SHOW GLOBAL STATUS" probe prefix. Unmapped queries
+    return empty success (e.g. the SLAVE fallback is never reached here).
+    """
+
+    def fake(cmd, **kwargs):
+        sql = cmd[-1]
+        best = None
+        for needle in queries:
+            if needle in sql and (best is None or len(needle) > len(best)):
+                best = needle
+        return completed(*queries[best]) if best is not None else completed("", "", 0)
+
+    return fake
+
+
+@pytest.mark.parametrize(
+    "name", ["galera_healthy", "galera_degraded", "non_galera", "unreachable"]
+)
+def test_contract_fixture_round_trip(name):
+    """SHARED FIXTURE (cross-repo contract): fixtures/mysql_contract_payload.json.
+
+    Asserted on both sides:
+    - here: mysql_metrics(**config) must equal scenario["payload"] with only the
+      CLI transport mocked (each scenario's "queries" fed back per statement);
+    - fivenines-server: spec/requests/api_collect_mysql_spec.rb posts
+      scenario["payload"] under data["mysql"] and asserts Ingesters::Mysql
+      handles the Galera-present / absent / unreachable-envelope shapes.
+
+    Change the payload shape only in lockstep with the server spec and its
+    byte-identical fixture copy.
+    """
+    fixture = _load_fixture()
+    config = fixture["config"]
+    scenario = fixture["scenarios"][name]
+    dispatch = _fixture_dispatch({k: tuple(v) for k, v in scenario["queries"].items()})
+    with patch(f"{MY}.shutil.which", return_value="/usr/bin/mysql"), patch(
+        f"{MY}.subprocess.run", side_effect=dispatch
+    ):
+        out = mysql_metrics(**config)
+    assert out == scenario["payload"], "scenario '{}' drifted".format(name)
+
+
+def test_fixture_agent_min_version():
+    assert _load_fixture()["agent_min_version"] == "1.15.0"
+
+
+def test_fixture_galera_keys_match_whitelist():
+    """The healthy scenario's wsrep_* keys are exactly the documented whitelist."""
+    payload = _load_fixture()["scenarios"]["galera_healthy"]["payload"]
+    assert {k for k in payload if k.startswith("wsrep_")} == _EXPECTED_WSREP_KEYS
+
+
+def test_fixture_non_galera_has_no_wsrep_keys():
+    payload = _load_fixture()["scenarios"]["non_galera"]["payload"]
+    assert not any(k.startswith("wsrep_") for k in payload)
