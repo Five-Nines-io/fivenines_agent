@@ -1,0 +1,573 @@
+{
+  "description": "Shared RabbitMQ management-API contract fixture between fivenines-agent and fivenines-server (server issue #499). Source of truth: fivenines-agent tests/fixtures/rabbitmq_contract_payload.json, asserted end-to-end by tests/test_rabbitmq.py::test_contract_fixture_round_trip (only the HTTP transport is mocked -- a fake session dispatches each scenario's 'responses' per endpoint, feeding status codes + bodies back through the real _request classification and normalization). rabbitmq_metrics(**scenario['config']['rabbitmq']) must equal scenario['payload']['rabbitmq']. The server's spec/requests/api_collect_rabbitmq_spec.rb posts scenario['payload']['rabbitmq'] under data['rabbitmq'] through /collect and asserts Ingesters::Agent ingests each shape (reachable envelope / unreachable envelope). 'config' and 'responses' are agent-side inputs the server ignores. Change the payload shape only in lockstep across both repos, keeping the two copies byte-identical.",
+  "agent_min_version": "1.14.2",
+  "_agent_min_version_note": "RabbitMQ has NO server version gate (no FEATURES_SUPPORTED_VERSIONS entry -- purely config-driven, rabbitmq_enabled defaults false), so this number is free and nothing gates on it. 1.14.2 slots into the in-flight 1.14.x collector cluster (Docker image-inventory PR #102 = 1.14.0; TSDB PR #108 / issue #103 = 1.14.1; then RabbitMQ = 1.14.2), between those and Memcached's 1.14.4. Same cede-the-taken-slot discipline as PHP-FPM #97 (which ceded 1.13.0 to Ceph). The maintainer may re-slot on merge; nothing depends on the exact value.",
+  "envelope_contract": "data['rabbitmq'] is ALWAYS one of two envelopes and the server MUST branch on 'reachable'. (a) reachable:true = a trustworthy tick -> {version, node{...}, queues_total, queues[...]}. (b) reachable:false = a dead broker OR a partially-fetched queue list -> {error_type, error_message} with NO 'queues'/'node'/'version' key. On reachable:false the server MUST NOT ingest queue rows, prune rabbitmq_queues rows, or auto-resolve rabbitmq_queue_backlog incidents: a broker that is merely unreachable (or a page that failed midway) is not 'every queue deleted', and treating it as recovery is a false-resolve bug. This is the postgresql/mysql reachability posture, NOT the php_fpm null contract -- a dead broker on a control plane IS the signal, so it rides the payload rather than collapsing to null.",
+  "bounded_queues_contract": "'queues' is BOUNDED: the union of top-N by 'messages' and top-N by 'messages_unacked', plus any 'include_queues' names (the server echoes trigger watch lists there so a below-cap watched queue keeps updating). 'queues_total' carries the broker's TRUE queue count for the collected scope (the SNMP interface_count precedent) even when far more queues exist than are shipped -- see the cap_overflow scenario (queues_total 184 > 3 shipped). The unacked dimension is NOT redundant with 'messages' (which already includes unacked): a small queue whose consumers are stuck (high unacked, low total) can miss top-N-by-messages yet is exactly the 'consumers == 0 with depth > 0' case the trigger fires on -- see the 'dlq.orders' queue in cap_overflow, surfaced only by the unacked sort.",
+  "field_contract": {
+    "version": "overview.rabbitmq_version -- the broker version string.",
+    "node": "Local node health from /api/nodes (the node serving the management request, selected by overview.node on a cluster).",
+    "node.mem_alarm": "Memory high-watermark alarm (bool). true blocks publishers cluster-wide -- a direct outage predictor.",
+    "node.disk_free_alarm": "Free-disk alarm (bool). true blocks publishers.",
+    "node.fd_used / node.fd_total": "File descriptors in use / limit -- socket + file headroom.",
+    "node.sockets_used / node.sockets_total": "Sockets in use / limit.",
+    "queues_total": "TRUE count of queues in the collected scope, independent of how many rows are shipped (bounded array). Server uses it for a 'N queues not shown' indicator.",
+    "queue.vhost / queue.name": "The per-queue entity key (a queue name is unique within a vhost).",
+    "queue.messages": "Total ready + unacknowledged messages -- the backlog DEPTH the trigger reads.",
+    "queue.messages_unacked": "RabbitMQ messages_unacknowledged -- delivered-but-not-acked; a stuck-consumer signal.",
+    "queue.consumers": "Consumer count. 0 with messages > 0 is the zero-consumer backlog the trigger fires on.",
+    "queue.publish_total": "message_stats.publish -- RAW cumulative publishes; the server rate()s it. OMITTED when the queue has no message_stats (idle, never published). Never diff/reset agent-side.",
+    "queue.deliver_total": "message_stats.deliver_get -- RAW cumulative deliveries/gets; the server rate()s it. OMITTED with publish_total when message_stats is absent."
+  },
+  "scenarios": {
+    "healthy": {
+      "description": "A healthy single-node broker. 'notifications' is a zero-consumer backlog queue (consumers 0, messages 12000) -- the trigger's headline case. 'orders' is a normally-drained queue. 'logs' is idle with NO message_stats, so publish_total/deliver_total are OMITTED (not null). No node alarms. Both ranked pages return the same three queues, so the union dedups to three in messages order.",
+      "config": {
+        "rabbitmq": {
+          "url": "http://127.0.0.1:15672",
+          "username": "fivenines",
+          "password": "secret",
+          "vhost": null,
+          "include_queues": []
+        }
+      },
+      "responses": {
+        "overview": { "status": 200, "json": { "rabbitmq_version": "3.13.2", "node": "rabbit@node1" } },
+        "nodes": {
+          "status": 200,
+          "json": [
+            {
+              "name": "rabbit@node1",
+              "mem_alarm": false,
+              "disk_free_alarm": false,
+              "fd_used": 412,
+              "fd_total": 1048576,
+              "sockets_used": 300,
+              "sockets_total": 943626
+            }
+          ]
+        },
+        "queues_by_messages": {
+          "status": 200,
+          "json": {
+            "total_count": 3,
+            "page": 1,
+            "page_count": 1,
+            "page_size": 100,
+            "item_count": 3,
+            "items": [
+              {
+                "vhost": "/",
+                "name": "notifications",
+                "messages": 12000,
+                "messages_unacknowledged": 400,
+                "consumers": 0,
+                "message_stats": { "publish": 981221, "deliver_get": 969221 }
+              },
+              {
+                "vhost": "/",
+                "name": "orders",
+                "messages": 50,
+                "messages_unacknowledged": 5,
+                "consumers": 3,
+                "message_stats": { "publish": 40210, "deliver_get": 40160 }
+              },
+              {
+                "vhost": "/",
+                "name": "logs",
+                "messages": 0,
+                "messages_unacknowledged": 0,
+                "consumers": 1
+              }
+            ]
+          }
+        },
+        "queues_by_unacked": {
+          "status": 200,
+          "json": {
+            "total_count": 3,
+            "page": 1,
+            "page_count": 1,
+            "page_size": 100,
+            "item_count": 3,
+            "items": [
+              {
+                "vhost": "/",
+                "name": "notifications",
+                "messages": 12000,
+                "messages_unacknowledged": 400,
+                "consumers": 0,
+                "message_stats": { "publish": 981221, "deliver_get": 969221 }
+              },
+              {
+                "vhost": "/",
+                "name": "orders",
+                "messages": 50,
+                "messages_unacknowledged": 5,
+                "consumers": 3,
+                "message_stats": { "publish": 40210, "deliver_get": 40160 }
+              },
+              {
+                "vhost": "/",
+                "name": "logs",
+                "messages": 0,
+                "messages_unacknowledged": 0,
+                "consumers": 1
+              }
+            ]
+          }
+        }
+      },
+      "payload": {
+        "rabbitmq": {
+          "reachable": true,
+          "version": "3.13.2",
+          "node": {
+            "mem_alarm": false,
+            "disk_free_alarm": false,
+            "fd_used": 412,
+            "fd_total": 1048576,
+            "sockets_used": 300,
+            "sockets_total": 943626
+          },
+          "queues_total": 3,
+          "queues": [
+            {
+              "vhost": "/",
+              "name": "notifications",
+              "messages": 12000,
+              "messages_unacked": 400,
+              "consumers": 0,
+              "publish_total": 981221,
+              "deliver_total": 969221
+            },
+            {
+              "vhost": "/",
+              "name": "orders",
+              "messages": 50,
+              "messages_unacked": 5,
+              "consumers": 3,
+              "publish_total": 40210,
+              "deliver_total": 40160
+            },
+            {
+              "vhost": "/",
+              "name": "logs",
+              "messages": 0,
+              "messages_unacked": 0,
+              "consumers": 1
+            }
+          ]
+        }
+      }
+    },
+    "node_mem_alarm": {
+      "description": "Memory high-watermark alarm raised (mem_alarm true) with fd/socket usage climbing toward the limits -- the node-health half of the feature. Publishers are blocked cluster-wide; the server drives a node alarm from this independent of any per-queue trigger. One queue keeps the payload complete.",
+      "config": {
+        "rabbitmq": {
+          "url": "http://127.0.0.1:15672",
+          "username": "fivenines",
+          "password": "secret",
+          "vhost": null,
+          "include_queues": []
+        }
+      },
+      "responses": {
+        "overview": { "status": 200, "json": { "rabbitmq_version": "3.13.2", "node": "rabbit@node1" } },
+        "nodes": {
+          "status": 200,
+          "json": [
+            {
+              "name": "rabbit@node1",
+              "mem_alarm": true,
+              "disk_free_alarm": false,
+              "fd_used": 1040000,
+              "fd_total": 1048576,
+              "sockets_used": 900000,
+              "sockets_total": 943626
+            }
+          ]
+        },
+        "queues_by_messages": {
+          "status": 200,
+          "json": {
+            "total_count": 1,
+            "page": 1,
+            "page_count": 1,
+            "page_size": 100,
+            "item_count": 1,
+            "items": [
+              {
+                "vhost": "/",
+                "name": "events",
+                "messages": 500,
+                "messages_unacknowledged": 0,
+                "consumers": 2,
+                "message_stats": { "publish": 5000, "deliver_get": 5000 }
+              }
+            ]
+          }
+        },
+        "queues_by_unacked": {
+          "status": 200,
+          "json": {
+            "total_count": 1,
+            "page": 1,
+            "page_count": 1,
+            "page_size": 100,
+            "item_count": 1,
+            "items": [
+              {
+                "vhost": "/",
+                "name": "events",
+                "messages": 500,
+                "messages_unacknowledged": 0,
+                "consumers": 2,
+                "message_stats": { "publish": 5000, "deliver_get": 5000 }
+              }
+            ]
+          }
+        }
+      },
+      "payload": {
+        "rabbitmq": {
+          "reachable": true,
+          "version": "3.13.2",
+          "node": {
+            "mem_alarm": true,
+            "disk_free_alarm": false,
+            "fd_used": 1040000,
+            "fd_total": 1048576,
+            "sockets_used": 900000,
+            "sockets_total": 943626
+          },
+          "queues_total": 1,
+          "queues": [
+            {
+              "vhost": "/",
+              "name": "events",
+              "messages": 500,
+              "messages_unacked": 0,
+              "consumers": 2,
+              "publish_total": 5000,
+              "deliver_total": 5000
+            }
+          ]
+        }
+      }
+    },
+    "unreachable": {
+      "description": "The broker is down: the first request (/api/overview) fails at the network layer. Collapses to the unreachable envelope with error_type connection_refused and NO queues/node/version key -- the server skips ingestion so open backlog incidents cannot false-resolve. error_message is the agent-generated exception string (the server treats it as opaque; only error_type is semantic).",
+      "config": {
+        "rabbitmq": {
+          "url": "http://127.0.0.1:15672",
+          "username": "fivenines",
+          "password": "secret",
+          "vhost": null,
+          "include_queues": []
+        }
+      },
+      "responses": {
+        "overview": { "error": "connection_refused", "message": "Connection refused" }
+      },
+      "payload": {
+        "rabbitmq": {
+          "reachable": false,
+          "error_type": "connection_refused",
+          "error_message": "Connection refused"
+        }
+      }
+    },
+    "auth_failure": {
+      "description": "Wrong credentials: /api/overview returns HTTP 401. Collapses to the unreachable envelope with error_type auth_failed -- the server routes this to a config_error (fix the credentials) rather than a broker outage. NO queues key.",
+      "config": {
+        "rabbitmq": {
+          "url": "http://127.0.0.1:15672",
+          "username": "fivenines",
+          "password": "wrong",
+          "vhost": null,
+          "include_queues": []
+        }
+      },
+      "responses": {
+        "overview": { "status": 401 }
+      },
+      "payload": {
+        "rabbitmq": {
+          "reachable": false,
+          "error_type": "auth_failed",
+          "error_message": "HTTP 401"
+        }
+      }
+    },
+    "cap_overflow": {
+      "description": "A broker with 184 queues, of which only a bounded set is shipped: queues_total 184 > 3 rows (the SNMP interface_count precedent). Also pins the ranked UNION: the messages page returns the two deepest queues; the unacked page surfaces 'dlq.orders' -- a low-depth (300) but fully-stuck (unacked 300, consumers 0, deliver 0) dead-letter queue that misses top-N-by-messages yet is the exact zero-consumer-backlog case the trigger exists for. The union is [messages page..., then unacked-only additions], deduped by (vhost, name).",
+      "config": {
+        "rabbitmq": {
+          "url": "http://127.0.0.1:15672",
+          "username": "fivenines",
+          "password": "secret",
+          "vhost": null,
+          "include_queues": []
+        }
+      },
+      "responses": {
+        "overview": { "status": 200, "json": { "rabbitmq_version": "3.13.2", "node": "rabbit@node1" } },
+        "nodes": {
+          "status": 200,
+          "json": [
+            {
+              "name": "rabbit@node1",
+              "mem_alarm": false,
+              "disk_free_alarm": false,
+              "fd_used": 5000,
+              "fd_total": 1048576,
+              "sockets_used": 4000,
+              "sockets_total": 943626
+            }
+          ]
+        },
+        "queues_by_messages": {
+          "status": 200,
+          "json": {
+            "total_count": 184,
+            "page": 1,
+            "page_count": 2,
+            "page_size": 100,
+            "item_count": 100,
+            "items": [
+              {
+                "vhost": "/",
+                "name": "ingest.high",
+                "messages": 900000,
+                "messages_unacknowledged": 100,
+                "consumers": 5,
+                "message_stats": { "publish": 5000000, "deliver_get": 4100000 }
+              },
+              {
+                "vhost": "/",
+                "name": "ingest.mid",
+                "messages": 800000,
+                "messages_unacknowledged": 50,
+                "consumers": 5,
+                "message_stats": { "publish": 4200000, "deliver_get": 3400000 }
+              }
+            ]
+          }
+        },
+        "queues_by_unacked": {
+          "status": 200,
+          "json": {
+            "total_count": 184,
+            "page": 1,
+            "page_count": 2,
+            "page_size": 100,
+            "item_count": 100,
+            "items": [
+              {
+                "vhost": "/",
+                "name": "dlq.orders",
+                "messages": 300,
+                "messages_unacknowledged": 300,
+                "consumers": 0,
+                "message_stats": { "publish": 300, "deliver_get": 0 }
+              },
+              {
+                "vhost": "/",
+                "name": "ingest.high",
+                "messages": 900000,
+                "messages_unacknowledged": 100,
+                "consumers": 5,
+                "message_stats": { "publish": 5000000, "deliver_get": 4100000 }
+              }
+            ]
+          }
+        }
+      },
+      "payload": {
+        "rabbitmq": {
+          "reachable": true,
+          "version": "3.13.2",
+          "node": {
+            "mem_alarm": false,
+            "disk_free_alarm": false,
+            "fd_used": 5000,
+            "fd_total": 1048576,
+            "sockets_used": 4000,
+            "sockets_total": 943626
+          },
+          "queues_total": 184,
+          "queues": [
+            {
+              "vhost": "/",
+              "name": "ingest.high",
+              "messages": 900000,
+              "messages_unacked": 100,
+              "consumers": 5,
+              "publish_total": 5000000,
+              "deliver_total": 4100000
+            },
+            {
+              "vhost": "/",
+              "name": "ingest.mid",
+              "messages": 800000,
+              "messages_unacked": 50,
+              "consumers": 5,
+              "publish_total": 4200000,
+              "deliver_total": 3400000
+            },
+            {
+              "vhost": "/",
+              "name": "dlq.orders",
+              "messages": 300,
+              "messages_unacked": 300,
+              "consumers": 0,
+              "publish_total": 300,
+              "deliver_total": 0
+            }
+          ]
+        }
+      }
+    },
+    "include_below_cap": {
+      "description": "A 184-queue broker where the two ranked pages surface only the two deepest queues. 'dlq.watch' is a stuck dead-letter queue (consumers 0, all unacked) that has dropped below the ranked cap, but the server echoes it in include_queues so it is force-fetched by exact identity and APPENDED to the array -- keeping its row alive so its open rabbitmq_queue_backlog incident can still resolve. Pins the include_queues wiring (config -> single-queue GET -> appended row) and that queues_total (184) still reflects the broker total, not the shipped count (3).",
+      "config": {
+        "rabbitmq": {
+          "url": "http://127.0.0.1:15672",
+          "username": "fivenines",
+          "password": "secret",
+          "vhost": null,
+          "include_queues": ["dlq.watch"]
+        }
+      },
+      "responses": {
+        "overview": { "status": 200, "json": { "rabbitmq_version": "3.13.2", "node": "rabbit@node1" } },
+        "nodes": {
+          "status": 200,
+          "json": [
+            {
+              "name": "rabbit@node1",
+              "mem_alarm": false,
+              "disk_free_alarm": false,
+              "fd_used": 6000,
+              "fd_total": 1048576,
+              "sockets_used": 5000,
+              "sockets_total": 943626
+            }
+          ]
+        },
+        "queues_by_messages": {
+          "status": 200,
+          "json": {
+            "total_count": 184,
+            "page": 1,
+            "page_count": 2,
+            "page_size": 100,
+            "item_count": 100,
+            "items": [
+              {
+                "vhost": "/",
+                "name": "orders",
+                "messages": 5000,
+                "messages_unacknowledged": 40,
+                "consumers": 4,
+                "message_stats": { "publish": 120000, "deliver_get": 115000 }
+              },
+              {
+                "vhost": "/",
+                "name": "events",
+                "messages": 4000,
+                "messages_unacknowledged": 10,
+                "consumers": 6,
+                "message_stats": { "publish": 90000, "deliver_get": 89000 }
+              }
+            ]
+          }
+        },
+        "queues_by_unacked": {
+          "status": 200,
+          "json": {
+            "total_count": 184,
+            "page": 1,
+            "page_count": 2,
+            "page_size": 100,
+            "item_count": 100,
+            "items": [
+              {
+                "vhost": "/",
+                "name": "orders",
+                "messages": 5000,
+                "messages_unacknowledged": 40,
+                "consumers": 4,
+                "message_stats": { "publish": 120000, "deliver_get": 115000 }
+              },
+              {
+                "vhost": "/",
+                "name": "events",
+                "messages": 4000,
+                "messages_unacknowledged": 10,
+                "consumers": 6,
+                "message_stats": { "publish": 90000, "deliver_get": 89000 }
+              }
+            ]
+          }
+        },
+        "single_queue": {
+          "status": 200,
+          "json": {
+            "vhost": "/",
+            "name": "dlq.watch",
+            "messages": 3,
+            "messages_unacknowledged": 3,
+            "consumers": 0,
+            "message_stats": { "publish": 3, "deliver_get": 0 }
+          }
+        }
+      },
+      "payload": {
+        "rabbitmq": {
+          "reachable": true,
+          "version": "3.13.2",
+          "node": {
+            "mem_alarm": false,
+            "disk_free_alarm": false,
+            "fd_used": 6000,
+            "fd_total": 1048576,
+            "sockets_used": 5000,
+            "sockets_total": 943626
+          },
+          "queues_total": 184,
+          "queues": [
+            {
+              "vhost": "/",
+              "name": "orders",
+              "messages": 5000,
+              "messages_unacked": 40,
+              "consumers": 4,
+              "publish_total": 120000,
+              "deliver_total": 115000
+            },
+            {
+              "vhost": "/",
+              "name": "events",
+              "messages": 4000,
+              "messages_unacked": 10,
+              "consumers": 6,
+              "publish_total": 90000,
+              "deliver_total": 89000
+            },
+            {
+              "vhost": "/",
+              "name": "dlq.watch",
+              "messages": 3,
+              "messages_unacked": 3,
+              "consumers": 0,
+              "publish_total": 3,
+              "deliver_total": 0
+            }
+          ]
+        }
+      }
+    }
+  }
+}
