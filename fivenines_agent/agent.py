@@ -25,6 +25,12 @@ from fivenines_agent.collectors import (
     collect_metrics,
 )
 from fivenines_agent.debug import log
+from fivenines_agent.docker_image_inventory import (
+    ImageInventoryCoordinator,
+    ImageInventoryUploader,
+    build_image_inventory,
+    select_and_enqueue,
+)
 from fivenines_agent.env import (
     config_dir,
     dry_run,
@@ -58,6 +64,11 @@ load_dotenv(dotenv_path=env_file())
 exit_event = Event()
 # Event to signal permission refresh needed
 refresh_permissions_event = Event()
+
+# Seconds to wait for the image-inventory uploader at shutdown before
+# abandoning it. Bounded so a wedged/slow Docker daemon cannot hold the agent
+# past systemd's stop timeout (which would escalate SIGTERM to SIGKILL).
+IMAGE_INVENTORY_JOIN_TIMEOUT = 10
 
 # Sentinel for "no permissions_recheck_token observed yet", so the first
 # observation (including a real token already set when the agent restarts)
@@ -93,6 +104,13 @@ _DRY_RUN_CONFIG = {
     "redis": {"port": 6379},
     "fail2ban": True,
     "disk_health": True,
+    # True (not a dict) -> docker_metrics() runs with default socket resolution.
+    # Without this key, --dry-run never exercised the Docker collector at all.
+    # Gated on the "docker" capability, so it is a no-op where the socket is
+    # unreachable. Image inventory is intentionally NOT enabled here: it uploads
+    # off the collection loop and dry-run has no synchronizer, mirroring how
+    # capture_logs is absent from this config.
+    "docker": True,
     # Dict (not bare True) because systemd_metrics takes **kwargs; scan=False
     # exercises the per-tick health surface without the inventory POST (skipped
     # in dry-run anyway, since there's no synchronizer to dispatch through).
@@ -184,6 +202,27 @@ class Agent:
             )
             self.log_uploader.start()
 
+        # Dedicated channel for Docker image OS-package inventory (image vuln
+        # scanning phase 1), kept off the metric path like the log-capture channel
+        # above: N archive fetches + tar parsing + a POST must never stretch a
+        # tick. The coordinator tracks done digests on disk so each immutable
+        # image is extracted exactly once, forever.
+        self.image_inventory_queue = SynchronizationQueue(maxsize=20)
+        self.image_inventory_coordinator = ImageInventoryCoordinator(
+            os.path.join(CONFIG_DIR, "image_inventory_done")
+        )
+        if self.synchronizer is None:
+            self.image_inventory_uploader = None
+        else:
+            self.image_inventory_uploader = ImageInventoryUploader(
+                self.image_inventory_queue,
+                build_image_inventory,
+                self.synchronizer.send_image_packages,
+                on_success=self.image_inventory_coordinator.mark_done,
+                on_failure=self.image_inventory_coordinator.mark_failed,
+            )
+            self.image_inventory_uploader.start()
+
         # Set to True after SIGHUP so the next systemd_inventory_sync resends
         # the full snapshot regardless of hash equality.
         self._systemd_force_resend = False
@@ -245,6 +284,7 @@ class Agent:
                 self._telemetry = {}
 
                 self._collect_metrics(data)
+                self._handle_image_inventory(data)
 
                 if wd is not None:
                     # Second feed before the synchronous POST phase: packages +
@@ -354,6 +394,49 @@ class Agent:
             return
         evaluate_and_enqueue(self.capture_coordinator, self.log_queue, config)
 
+    def _image_container_map(self, data):
+        """{image_id: container_id} for the distinct image digests seen running
+        this tick, derived from the already-collected data["docker"] payload (no
+        second daemon call). A digest maps to the first container that runs it --
+        any container of that image can serve as the archive reader, since we
+        read the image's layers, not the container's writable state. Empty when
+        Docker metrics were absent or collection failed (data["docker"] is None /
+        not a dict), which correctly skips inventory for that tick."""
+        docker_data = data.get("docker")
+        if not isinstance(docker_data, dict):
+            return {}
+        result = {}
+        for container_id, entry in docker_data.get("containers", {}).items():
+            image_id = entry.get("image_id")
+            if image_id and image_id not in result:
+                result[image_id] = container_id
+        return result
+
+    def _handle_image_inventory(self, data):
+        """Enqueue OS-package extraction jobs for image digests newly seen on the
+        host. This selects at most 3 not-yet-done digests and enqueues them; the
+        heavy work (archive fetch + tar parse + POST) runs on the dedicated
+        ImageInventoryUploader thread, so a 3-image tick does not extend the tick.
+        No-op when the feature is disabled (top-level config key -- never nested
+        under config["docker"]) or uploading is off (dry-run / no synchronizer)."""
+        if self.image_inventory_uploader is None:
+            return
+        if not self.config.get("image_inventory"):
+            return
+        image_map = self._image_container_map(data)
+        if not image_map:
+            return
+        docker_cfg = self.config.get("docker")
+        socket_url = (
+            docker_cfg.get("socket_url") if isinstance(docker_cfg, dict) else None
+        )
+        select_and_enqueue(
+            self.image_inventory_coordinator,
+            self.image_inventory_queue,
+            image_map,
+            socket_url,
+        )
+
     def _systemd_inventory_sync_with_telemetry(self):
         # POSTs to /systemd_inventory; skip in --dry-run (no synchronizer to
         # dispatch through), mirroring _packages_sync_with_telemetry.
@@ -414,6 +497,14 @@ class Agent:
           gap re-probe (only enabled-but-missing capabilities) on the throttle
           cadence (default: every tick).
         """
+        # Tell the probe which socket the Docker collector will actually use, so
+        # _can_access_docker checks a configured/rootless socket_url instead of a
+        # hardcoded /var/run/docker.sock. Set before any (re)probe below so the
+        # very next probe honors it.
+        docker_cfg = config.get("docker")
+        self.permissions.set_docker_socket_url(
+            docker_cfg.get("socket_url") if isinstance(docker_cfg, dict) else None
+        )
         if self._recheck_token_changed(config.get("permissions_recheck_token")):
             self.permissions.force_refresh()
             pending = self._pending_capabilities(config)
@@ -562,6 +653,21 @@ class Agent:
             self.log_uploader.stop()
             self.log_queue.put(None)
             self.log_uploader.join()
+        if self.image_inventory_uploader is not None:
+            self.image_inventory_uploader.stop()
+            self.image_inventory_queue.put(None)
+            # Bounded join: this thread can be parked inside container.get_archive
+            # streaming from the daemon (docker-py's default client timeout is 60s
+            # per request, and one extraction makes several calls). An unbounded
+            # join would let a degraded daemon hold shutdown past systemd's stop
+            # timeout and turn a clean SIGTERM into a SIGKILL.
+            self.image_inventory_uploader.join(IMAGE_INVENTORY_JOIN_TIMEOUT)
+            if self.image_inventory_uploader.is_alive():
+                log(
+                    "Image inventory uploader still running at shutdown; "
+                    "abandoning it (extraction will not resume)",
+                    "info",
+                )
         # Tear down the persistent MQTT clients (loop_stop + disconnect) so no
         # paho network threads leak past shutdown. No-op when MQTT was never
         # configured (the manager singleton is still None).

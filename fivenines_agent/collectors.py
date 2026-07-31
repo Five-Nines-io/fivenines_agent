@@ -34,6 +34,7 @@ from fivenines_agent.smart_storage import (
 )
 from fivenines_agent.systemd import systemd_metrics
 from fivenines_agent.temperatures import temperatures
+from fivenines_agent.tsdb import tsdb_metrics
 from fivenines_agent.zfs import zfs_storage_health
 
 # Registry of metric collectors.
@@ -102,6 +103,12 @@ COLLECTORS = [
     ("qemu", [("qemu", qemu_metrics, True)]),
     ("fail2ban", [("fail2ban", fail2ban_metrics, False)]),
     ("caddy", [("caddy", caddy_metrics, True)]),
+    # TSDB (Prometheus / VictoriaMetrics) server health: config-driven HTTP
+    # scrape, no capability gate (nginx/apache posture). config["tsdb"] is
+    # unpacked (pass_kwargs) into tsdb_metrics(url=..., ...). Emits a
+    # reachability envelope -- NEVER None -- so the server distinguishes "TSDB
+    # unreachable" (the signal) from "collector disabled".
+    ("tsdb", [("tsdb", tsdb_metrics, True)]),
     ("postgresql", [("postgresql", postgresql_metrics, True)]),
     ("mysql", [("mysql", mysql_metrics, True)]),
     # RabbitMQ: config-driven management-API poll (nginx/apache/postgresql
