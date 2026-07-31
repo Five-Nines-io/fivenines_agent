@@ -164,9 +164,14 @@ poetry export --without-hashes -o requirements.txt || {
 }
 
 #
-# Build libpython3.10.so from source for PyInstaller
+# Build libpython3.10.so from source for PyInstaller.
+# Normally a no-op in CI: the builder Docker image (Dockerfile / Dockerfile.arm)
+# pre-bakes this shared library into /opt/python/cp310-cp310/lib, so the guard
+# below finds it and skips the multi-minute compile. This block is the fallback
+# for local/non-image builds and MUST stay in sync with the Dockerfile step
+# (same CPython 3.10.18, same configure flags, same install layout).
 #
-echo "=== Building libpython3.10.so from source ==="
+echo "=== Building libpython3.10.so from source (skipped if pre-baked in image) ==="
 
 PYTHON_LIB_DIR="/opt/python/cp310-cp310/lib"
 LIBPYTHON_PATH="$PYTHON_LIB_DIR/libpython3.10.so"

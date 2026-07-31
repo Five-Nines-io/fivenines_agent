@@ -108,6 +108,39 @@ RUN echo "=== Configuring libcrypt for PyInstaller ===" && \
     echo "libcrypt configuration complete" && \
     ls -la /usr/lib64/libcrypt.so*
 
+# Pre-build libpython3.10.so (shared) so py2exe.sh's runtime guard skips the
+# multi-minute compile on every build job. manylinux2014 ships only a static
+# libpython; PyInstaller needs the shared object. Doing it once here (cached in
+# the image and the registry buildcache) instead of on each of the 4 Linux
+# build jobs (amd64/arm64 x standard/Synology) is the main build-time win.
+# Kept in sync with the fallback build block in py2exe.sh: same CPython 3.10.18,
+# same configure flags, same install layout (real .so + .so.1.0 symlink) so the
+# `find -name "libpython3.10.so*" -type f` in py2exe.sh resolves the real file.
+RUN echo "=== Pre-building libpython3.10.so (shared) ===" && \
+    PYTHON_LIB_DIR="/opt/python/cp310-cp310/lib" && \
+    cd /tmp && \
+    wget -q --timeout=30 "https://www.python.org/ftp/python/3.10.18/Python-3.10.18.tgz" && \
+    tar xzf Python-3.10.18.tgz && \
+    cd Python-3.10.18 && \
+    ./configure \
+        --enable-shared \
+        --disable-test-modules \
+        --prefix=/tmp/python-shared \
+        --quiet \
+        --without-ensurepip \
+        --without-static-libpython \
+        --with-system-ffi \
+        --enable-loadable-sqlite-extensions \
+        ac_cv_working_openssl_hashlib_md5=yes \
+        ac_cv_working_openssl_ssl=yes && \
+    make libpython3.10.so -j"$(nproc)" && \
+    cp libpython3.10.so "$PYTHON_LIB_DIR/libpython3.10.so" && \
+    ln -sf libpython3.10.so "$PYTHON_LIB_DIR/libpython3.10.so.1.0" && \
+    echo "$PYTHON_LIB_DIR" > /etc/ld.so.conf.d/python-shared.conf && \
+    ldconfig && \
+    ls -la "$PYTHON_LIB_DIR"/libpython3.10.so* && \
+    cd / && rm -rf /tmp/Python-3.10.18*
+
 # Set environment variables
 ENV BASH_ENV=/etc/profile
 ENV PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/lib64/pkgconfig"
