@@ -369,6 +369,14 @@ if [ -f "/etc/cloudlinux-release" ]; then
 fi
 
 mkdir -p /etc/fivenines_agent
+# The agent runs as the fivenines user and must be able to CREATE files in
+# this directory (MACHINE_ID and other persisted state), not just rewrite the
+# TOKEN file. Without ownership the machine id can never persist, and every
+# bulk (enrollment-token) install enrolls a duplicate host because the server
+# has no dedup key. 750 rather than 755: the directory holds TOKEN and
+# MACHINE_ID, and nothing outside root/fivenines needs to read it.
+chown fivenines:fivenines /etc/fivenines_agent
+chmod 750 /etc/fivenines_agent
 # Save the client token in appropriate location
 if [ "$SYSTEM_TYPE" = "unraid" ]; then
   mkdir -p /boot/config/custom/fivenines_agent

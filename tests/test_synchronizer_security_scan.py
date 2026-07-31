@@ -13,6 +13,7 @@ def make_synchronizer():
     sync = Synchronizer.__new__(Synchronizer)
     sync._stop_event = Event()
     sync.config_lock = __import__("threading").Lock()
+    sync._config_fetch_lock = __import__("threading").Lock()
     sync.token = "test-token"
     sync.config = {
         "enabled": True,
