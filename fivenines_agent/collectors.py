@@ -25,6 +25,7 @@ from fivenines_agent.postgresql import postgresql_metrics
 from fivenines_agent.processes import processes
 from fivenines_agent.proxmox import proxmox_metrics
 from fivenines_agent.qemu import qemu_metrics
+from fivenines_agent.rabbitmq import rabbitmq_metrics
 from fivenines_agent.raid_storage import raid_storage_health
 from fivenines_agent.redis import redis_metrics
 from fivenines_agent.smart_storage import (
@@ -110,6 +111,13 @@ COLLECTORS = [
     ("tsdb", [("tsdb", tsdb_metrics, True)]),
     ("postgresql", [("postgresql", postgresql_metrics, True)]),
     ("mysql", [("mysql", mysql_metrics, True)]),
+    # RabbitMQ: config-driven management-API poll (nginx/apache/postgresql
+    # posture, no capability gate). config["rabbitmq"] == {url, username,
+    # password, vhost, include_queues} is unpacked (pass_kwargs) into
+    # rabbitmq_metrics(...). Emits a reachability envelope: reachable:true with
+    # node health + a bounded queues array + queues_total, or reachable:false
+    # (a dead broker / partial listing) so the server never prunes queue rows.
+    ("rabbitmq", [("rabbitmq", rabbitmq_metrics, True)]),
     ("proxmox", [("proxmox", proxmox_metrics, True)]),
     ("systemd", [("systemd", systemd_metrics, True)]),
     # Windows-only: gated by the disk_health capability, only present in the
