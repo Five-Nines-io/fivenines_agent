@@ -155,6 +155,55 @@ def test_handle_inventory_socket_url_none_when_docker_not_dict(tmp_path):
     assert job["socket_url"] is None
 
 
+# --- config["rescan_images"]: server-driven re-inventory (server issue #676) ---
+
+
+def test_handle_inventory_honours_rescan_images(tmp_path):
+    """End-to-end through the Agent hook: a digest already marked done is
+    re-enqueued on the SAME tick the server asks for it, not the next one."""
+    agent = _inventory_agent(
+        tmp_path,
+        {"image_inventory": True, "rescan_images": ["sha256:a"]},
+        uploader=MagicMock(),
+    )
+    agent.image_inventory_coordinator.mark_done("sha256:a")
+
+    agent._handle_image_inventory(_DATA)
+
+    assert agent.image_inventory_queue.qsize() == 1
+    assert agent.image_inventory_queue.get_nowait()["image_id"] == "sha256:a"
+
+
+def test_handle_inventory_without_rescan_leaves_a_done_digest_alone(tmp_path):
+    """The mirror image: without the directive a done digest stays done. This is
+    what makes the test above prove the directive, not the selection path."""
+    agent = _inventory_agent(
+        tmp_path, {"image_inventory": True}, uploader=MagicMock()
+    )
+    agent.image_inventory_coordinator.mark_done("sha256:a")
+
+    agent._handle_image_inventory(_DATA)
+
+    assert agent.image_inventory_queue.qsize() == 0
+
+
+def test_handle_inventory_rescan_runs_before_the_feature_gate_is_passed(tmp_path):
+    """The directive must not be honoured when image inventory is off -- the
+    server should never mutate agent state the operator disabled."""
+    agent = _inventory_agent(
+        tmp_path,
+        {"rescan_images": ["sha256:a"]},
+        uploader=MagicMock(),
+    )
+    agent.image_inventory_coordinator.mark_done("sha256:a")
+
+    agent._handle_image_inventory(_DATA)
+
+    assert agent.image_inventory_queue.qsize() == 0
+    # still done: the disabled feature left the coordinator untouched
+    assert agent.image_inventory_coordinator.select_jobs({"sha256:a": "c1"}, None) == []
+
+
 # --- _apply_config_driven_refresh pushes the configured socket_url ---
 
 

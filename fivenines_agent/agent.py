@@ -28,6 +28,7 @@ from fivenines_agent.debug import log
 from fivenines_agent.docker_image_inventory import (
     ImageInventoryCoordinator,
     ImageInventoryUploader,
+    apply_rescan_requests,
     build_image_inventory,
     select_and_enqueue,
 )
@@ -433,6 +434,11 @@ class Agent:
             return
         if not self.config.get("image_inventory"):
             return
+        # Server-driven re-inventory (server #676) BEFORE selection, so a digest
+        # the server re-opened is offered on THIS tick rather than the next one.
+        # Runs even when no digest is running locally: reset() only touches what
+        # it knows, and an unknown digest is a no-op.
+        apply_rescan_requests(self.image_inventory_coordinator, self.config)
         image_map = self._image_container_map(data)
         if not image_map:
             return

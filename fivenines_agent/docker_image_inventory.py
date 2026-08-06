@@ -31,6 +31,7 @@ records a structured ``errors[]`` entry, so the server renders "not scannable,
 """
 
 import io
+import os
 import tarfile
 import time
 from threading import Lock
@@ -64,6 +65,31 @@ MAX_PACKAGES = 2000
 # Max characters kept for a package name/version. Real ones are well under 100;
 # anything longer is a corrupt or hostile DB, not data worth shipping.
 MAX_FIELD_CHARS = 256
+
+# Max digests honoured from one config["rescan_images"] directive. The server
+# caps its own list at 3/tick, so this is only a guard against a malformed or
+# hostile config: without it, a huge list would re-open the whole done set and
+# turn the next ticks into a full-host re-extraction.
+MAX_RESCAN_IMAGES = 10
+
+# How many entries of an untrusted rescan_images list are even examined. The cap
+# above bounds how many digests are HONOURED; this bounds how much work parsing
+# costs, because apply_rescan_requests runs strip()/hash per entry on the
+# watchdog-bounded collection loop. Without it a hostile/buggy server could send
+# a million-entry list and force a million strip()+hash ops per tick. Same
+# posture as MAX_FILE_BYTES/MAX_PACKAGES: bound the WORK, not just the result.
+MAX_RESCAN_SCANNED = 100
+
+# Even the immediate (attempts == 0) re-open case gets a per-digest floor: once a
+# digest is re-opened at the server's request, a repeat request for it is ignored
+# for this many seconds. A stale or looping rescan_images directive -- a server
+# bug, or the last good config replayed by the Synchronizer during a /collect
+# outage -- would otherwise re-extract a clean digest (archive fetch + tar parse
+# + POST) on EVERY tick. The FIRST re-open is always immediate (no prior
+# timestamp), so a legitimate re-inventory still runs on the same tick; only
+# rapid repeats are throttled. Matches the "at most one extraction per hour" the
+# retry ladder already gives the failure case (max_retry_seconds).
+RESCAN_MIN_INTERVAL_SECONDS = 3600
 
 # C0 + C1 control characters, deleted from every field that reaches the payload
 # or a log line. str.translate mapping to None removes them; NUL is included
@@ -527,6 +553,7 @@ class ImageInventoryCoordinator:
         max_attempts=5,
         retry_base_seconds=60,
         max_retry_seconds=3600,
+        rescan_min_interval_seconds=RESCAN_MIN_INTERVAL_SECONDS,
         now_fn=time.time,
     ):
         self.state_path = state_path
@@ -535,8 +562,13 @@ class ImageInventoryCoordinator:
         self._max_attempts = max_attempts
         self._retry_base_seconds = retry_base_seconds
         self._max_retry_seconds = max_retry_seconds
+        self._rescan_min_interval = rescan_min_interval_seconds
         self._now = now_fn
         self._lock = Lock()
+        # Serializes _persist across its two writer threads (mark_done on the
+        # uploader, reset on the collection loop) so their temp-write+rename
+        # cannot interleave. Distinct from _lock, which guards in-memory state.
+        self._persist_lock = Lock()
         self._done = self._load()  # list, insertion order (for FIFO eviction)
         self._done_set = set(self._done)
         self._in_flight = set()
@@ -546,6 +578,9 @@ class ImageInventoryCoordinator:
         self._next_retry = {}
         # Digests that exhausted max_attempts this process. In-memory on purpose.
         self._gave_up = set()
+        # image_id -> epoch of the last rescan-driven re-open, so a repeated
+        # directive cannot re-extract the same digest every tick (see reset()).
+        self._last_reopen = {}
 
     def _load(self):
         try:
@@ -560,19 +595,40 @@ class ImageInventoryCoordinator:
             )
             return []
 
-    def _persist(self, done):
-        """Write the done set. Takes a snapshot rather than reading self._done so
-        the caller can release the lock first (see mark_done)."""
-        try:
-            with open(self.state_path, "w") as f:
-                f.write("\n".join(done))
-        except Exception as e:
-            # Best-effort: a write failure must not break extraction. The
-            # in-memory done set still prevents re-extraction within this process.
-            log(
-                f"ImageInventoryCoordinator: cannot persist {self.state_path}: {e}",
-                "error",
-            )
+    def _persist(self):
+        """Serialize the done set to disk, atomically.
+
+        reset() (collection loop) and mark_done()/eviction (uploader thread) are
+        BOTH writers now, which introduces two hazards this closes:
+          - lost update: each caller used to snapshot _done and write it after
+            releasing the lock, so an older snapshot could land after a newer one
+            -- silently dropping a just-done digest, or resurrecting a re-opened
+            one, on the next restart. Re-read the authoritative _done under _lock
+            HERE instead of trusting a caller's stale snapshot; whoever writes
+            last writes the latest state.
+          - torn file: a crash between truncate and write left a partial file.
+            Write a sibling temp file and os.replace() it onto state_path (atomic
+            on POSIX), so a failed write can never truncate the real file.
+        _persist_lock serializes the two threads' write+rename. _lock is held
+        only for the list() copy, never across the disk write -- select_jobs runs
+        on the collection loop and must not stall on uploader-thread I/O."""
+        with self._persist_lock:
+            with self._lock:
+                done = list(self._done)
+            tmp_path = self.state_path + ".tmp"
+            try:
+                with open(tmp_path, "w") as f:
+                    f.write("\n".join(done))
+                os.replace(tmp_path, self.state_path)
+            except Exception as e:
+                # Best-effort: a write failure must not break extraction. The
+                # in-memory done set still prevents re-extraction within this
+                # process. The real file is untouched (only the temp was written).
+                log(
+                    f"ImageInventoryCoordinator: cannot persist "
+                    f"{self.state_path}: {e}",
+                    "error",
+                )
 
     def select_jobs(self, image_container_map, socket_url):
         """Up to max_per_tick extraction jobs for digests neither done nor in
@@ -620,12 +676,13 @@ class ImageInventoryCoordinator:
             while len(self._done) > self._max_done:
                 evicted = self._done.pop(0)
                 self._done_set.discard(evicted)
-            snapshot = list(self._done)
         # Persist OUTSIDE the lock. select_jobs takes this same lock on the
         # collection loop, so holding it across a disk write (up to max_done
         # digests, ~360 KB) would let uploader-thread I/O stall a tick -- the one
         # path where this subsystem could reach the thing it exists to stay off.
-        self._persist(snapshot)
+        # _persist re-reads _done under the lock, so dropping the snapshot here
+        # does not race an interleaving reset() on the collection loop.
+        self._persist()
 
     def release(self, image_id):
         """Free the in-flight slot WITHOUT recording an attempt.
@@ -638,6 +695,90 @@ class ImageInventoryCoordinator:
             return
         with self._lock:
             self._in_flight.discard(image_id)
+
+    def reset(self, image_ids):
+        """Re-open digests the server asked to re-inventory (server issue #676).
+
+        A transient api_error still ends in a 200 -- the failure is reported IN
+        the payload, not by the status code -- so mark_done recorded the digest
+        as done forever and the image read "not scannable" for good. Digests are
+        immutable, so nothing on this side can ever re-offer it.
+        config["rescan_images"] is the server un-sticking exactly those: it lists
+        only api_error digests THIS host runs, past a 6h backoff.
+
+        Drops each digest from done and from gave_up so select_jobs offers it
+        again, and NEVER clears _attempts.
+
+        Two floors keep a stale or looping directive from re-extracting the same
+        digest every tick (a full archive fetch + tar parse + POST):
+          - a digest with a failure history is re-armed onto the retry ladder
+            (_retry_delay) rather than made immediately eligible, so one that had
+            exhausted max_attempts cannot be un-given-up, retried, and give up
+            again on EVERY tick -- the delay climbs to the cap, ~one extraction
+            per hour.
+          - EVERY re-open, including the immediate attempts == 0 case, stamps
+            _last_reopen and is skipped if it was re-opened within
+            rescan_min_interval. The main #676 case (api_error reported inside a
+            200) clears the failure history, so attempts is 0 and the ladder does
+            not apply; without this second floor a directive the server keeps
+            re-sending -- a bug, or the last config replayed by the Synchronizer
+            during a /collect outage, when the server never learns to stop --
+            would re-extract that clean digest on every tick.
+        The FIRST re-open of a digest is always immediate: it has no prior
+        _last_reopen, so a legitimate re-inventory still runs on the same tick;
+        only rapid repeats are throttled.
+
+        An in-flight digest is skipped: select_jobs would skip it anyway, and
+        clearing it would let the same extraction be enqueued twice. A digest
+        that is neither done nor given up has nothing to un-stick, so it is
+        skipped too (the normal selection path already owns it, backoff
+        included).
+
+        Returns the digests actually re-opened, for the caller to log."""
+        if not image_ids:
+            return []
+        reopened = []
+        now = self._now()
+        with self._lock:
+            removed_done = set()
+            for image_id in image_ids:
+                if not image_id or image_id in self._in_flight:
+                    continue
+                was_done = image_id in self._done_set
+                was_gave_up = image_id in self._gave_up
+                if not (was_done or was_gave_up):
+                    continue
+                # Anti-treadmill floor: skip a digest re-opened too recently, so a
+                # directive the server keeps re-sending cannot re-extract it every
+                # tick. The first re-open (no prior timestamp) always passes.
+                last_reopen = self._last_reopen.get(image_id)
+                if (
+                    last_reopen is not None
+                    and now - last_reopen < self._rescan_min_interval
+                ):
+                    continue
+                self._last_reopen[image_id] = now
+                self._gave_up.discard(image_id)
+                # Re-arm onto the retry ladder when this digest has already
+                # failed, so a re-open cannot bypass the backoff (see docstring).
+                attempts = self._attempts.get(image_id, 0)
+                if attempts:
+                    self._next_retry[image_id] = now + self._retry_delay(attempts)
+                if was_done:
+                    self._done_set.discard(image_id)
+                    removed_done.add(image_id)
+                reopened.append(image_id)
+            if removed_done:
+                # One pass rather than list.remove() per digest: _done holds up to
+                # max_done entries and this runs on the collection loop.
+                self._done = [d for d in self._done if d not in removed_done]
+        # Persist outside the lock, for the reason spelled out in mark_done.
+        # Without persisting, a restart reloads the digest as done and the
+        # server's directive is silently lost. Only a done removal touches the
+        # file; a gave-up-only re-open is in-memory, so it pays no disk write.
+        if removed_done:
+            self._persist()
+        return reopened
 
     def mark_failed(self, image_id):
         """Uploader callback on a transient failure (no payload, non-200, or
@@ -662,11 +803,69 @@ class ImageInventoryCoordinator:
                     "error",
                 )
                 return
-            delay = min(
-                self._retry_base_seconds * (2 ** (attempts - 1)),
-                self._max_retry_seconds,
-            )
-            self._next_retry[image_id] = self._now() + delay
+            self._next_retry[image_id] = self._now() + self._retry_delay(attempts)
+
+    def _retry_delay(self, attempts):
+        """Exponential backoff for the Nth consecutive failure, capped. Shared
+        with reset() so a server-driven re-open lands on the SAME ladder as an
+        ordinary retry instead of inventing a second cadence."""
+        return min(
+            self._retry_base_seconds * (2 ** (attempts - 1)),
+            self._max_retry_seconds,
+        )
+
+
+def apply_rescan_requests(coordinator, config):
+    """Glue: honour the server's TOP-LEVEL config["rescan_images"] directive.
+
+    Must run BEFORE select_and_enqueue on the same tick, so a re-opened digest is
+    offered immediately instead of waiting for the next one.
+
+    The value is untrusted input off the wire: anything that is not a list of
+    non-empty strings is ignored rather than raising. Two independent caps keep a
+    malformed or hostile config cheap on the watchdog-bounded collection loop:
+    only the first MAX_RESCAN_SCANNED entries are examined (bounding the parse
+    work) and at most MAX_RESCAN_IMAGES distinct digests are honoured (bounding
+    the re-opens); an over-long entry is dropped before strip() copies it. A
+    digest not among this host's currently-running containers is left untouched
+    by reset() (it only re-opens digests it already tracks), and select_jobs
+    offers only what data["docker"]["containers"] reported this tick.
+
+    A free function so it is testable without an Agent, mirroring
+    log_capture.evaluate_and_enqueue.
+
+    Returns the digests actually re-opened."""
+    requested = config.get("rescan_images") if isinstance(config, dict) else None
+    if not isinstance(requested, (list, tuple)):
+        return []
+
+    digests = []
+    seen = set()
+    # Slice the input so a huge list cannot force O(n) strip()/hash on the loop;
+    # reject an over-long entry BEFORE strip() (len() is O(1)) so a multi-MB
+    # string cannot allocate a copy here. See MAX_RESCAN_SCANNED.
+    for entry in requested[:MAX_RESCAN_SCANNED]:
+        if not isinstance(entry, str) or len(entry) > MAX_FIELD_CHARS:
+            continue
+        digest = entry.strip()
+        if not digest or digest in seen:
+            continue
+        seen.add(digest)
+        digests.append(digest)
+        if len(digests) >= MAX_RESCAN_IMAGES:
+            break
+
+    if not digests:
+        return []
+
+    reopened = coordinator.reset(digests)
+    if reopened:
+        log(
+            f"ImageInventory: re-opening {len(reopened)} image(s) at the "
+            f"server's request: {', '.join(reopened)}",
+            "info",
+        )
+    return reopened
 
 
 def select_and_enqueue(coordinator, queue, image_container_map, socket_url):
