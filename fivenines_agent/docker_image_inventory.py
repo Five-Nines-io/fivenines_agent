@@ -65,6 +65,12 @@ MAX_PACKAGES = 2000
 # anything longer is a corrupt or hostile DB, not data worth shipping.
 MAX_FIELD_CHARS = 256
 
+# Max digests honoured from one config["rescan_images"] directive. The server
+# caps its own list at 3/tick, so this is only a guard against a malformed or
+# hostile config: without it, a huge list would re-open the whole done set and
+# turn the next ticks into a full-host re-extraction.
+MAX_RESCAN_IMAGES = 10
+
 # C0 + C1 control characters, deleted from every field that reaches the payload
 # or a log line. str.translate mapping to None removes them; NUL is included
 # (0x00), so this subsumes the original NUL-only scrub.
@@ -639,6 +645,74 @@ class ImageInventoryCoordinator:
         with self._lock:
             self._in_flight.discard(image_id)
 
+    def reset(self, image_ids):
+        """Re-open digests the server asked to re-inventory (server issue #676).
+
+        A transient api_error still ends in a 200 -- the failure is reported IN
+        the payload, not by the status code -- so mark_done recorded the digest
+        as done forever and the image read "not scannable" for good. Digests are
+        immutable, so nothing on this side can ever re-offer it.
+        config["rescan_images"] is the server un-sticking exactly those: it lists
+        only api_error digests THIS host runs, past a 6h backoff.
+
+        Drops each digest from done and from gave_up so select_jobs offers it
+        again, and NEVER clears _attempts.
+
+        A digest with a failure history is re-armed onto the normal retry ladder
+        (_retry_delay) rather than made immediately eligible. That is what stops
+        a treadmill: when the POST itself is what fails, the server never learns
+        and keeps re-requesting the digest every tick. Without the ladder, a
+        digest that had exhausted max_attempts would be un-given-up, retried, and
+        give up again on EVERY tick -- one full archive fetch + tar parse per
+        tick, forever. With it, the delay keeps climbing to the cap, so a
+        permanently-unhappy digest costs at most one extraction per hour.
+
+        The main #676 case is unaffected and immediate: an api_error is reported
+        inside a 200, so mark_done cleared the failure history and attempts is 0.
+
+        An in-flight digest is skipped: select_jobs would skip it anyway, and
+        clearing it would let the same extraction be enqueued twice. A digest
+        that is neither done nor given up has nothing to un-stick, so it is a
+        no-op (the normal selection path already owns it, backoff included).
+
+        Returns the digests actually re-opened, for the caller to log."""
+        if not image_ids:
+            return []
+        reopened = []
+        snapshot = None
+        with self._lock:
+            removed_done = set()
+            for image_id in image_ids:
+                if not image_id or image_id in self._in_flight:
+                    continue
+                was_done = image_id in self._done_set
+                was_gave_up = image_id in self._gave_up
+                if not (was_done or was_gave_up):
+                    continue
+                self._gave_up.discard(image_id)
+                # Re-arm onto the retry ladder when this digest has already
+                # failed, so a re-open cannot bypass the backoff (see docstring).
+                attempts = self._attempts.get(image_id, 0)
+                if attempts:
+                    self._next_retry[image_id] = self._now() + self._retry_delay(
+                        attempts
+                    )
+                if was_done:
+                    self._done_set.discard(image_id)
+                    removed_done.add(image_id)
+                reopened.append(image_id)
+            if removed_done:
+                # One pass rather than list.remove() per digest: _done holds up to
+                # max_done entries and this runs on the collection loop.
+                self._done = [d for d in self._done if d not in removed_done]
+                snapshot = list(self._done)
+        # Persist outside the lock, for the reason spelled out in mark_done.
+        # Without persisting, a restart reloads the digest as done and the
+        # server's directive is silently lost.
+        if snapshot is not None:
+            self._persist(snapshot)
+        return reopened
+
     def mark_failed(self, image_id):
         """Uploader callback on a transient failure (no payload, non-200, or
         exception): free the in-flight slot and schedule the next attempt with
@@ -662,11 +736,63 @@ class ImageInventoryCoordinator:
                     "error",
                 )
                 return
-            delay = min(
-                self._retry_base_seconds * (2 ** (attempts - 1)),
-                self._max_retry_seconds,
-            )
-            self._next_retry[image_id] = self._now() + delay
+            self._next_retry[image_id] = self._now() + self._retry_delay(attempts)
+
+    def _retry_delay(self, attempts):
+        """Exponential backoff for the Nth consecutive failure, capped. Shared
+        with reset() so a server-driven re-open lands on the SAME ladder as an
+        ordinary retry instead of inventing a second cadence."""
+        return min(
+            self._retry_base_seconds * (2 ** (attempts - 1)),
+            self._max_retry_seconds,
+        )
+
+
+def apply_rescan_requests(coordinator, config):
+    """Glue: honour the server's TOP-LEVEL config["rescan_images"] directive.
+
+    Must run BEFORE select_and_enqueue on the same tick, so a re-opened digest is
+    offered immediately instead of waiting for the next one.
+
+    The value is untrusted input off the wire: anything that is not a list of
+    non-empty strings is ignored rather than raising, and the list is capped
+    (MAX_RESCAN_IMAGES) so a malformed config cannot re-open the whole done set.
+    Digests not currently running on this host are a harmless no-op -- reset()
+    only touches ones it actually knows about, and select_jobs offers only what
+    data["docker"]["containers"] reported this tick.
+
+    A free function so it is testable without an Agent, mirroring
+    log_capture.evaluate_and_enqueue.
+
+    Returns the digests actually re-opened."""
+    requested = config.get("rescan_images") if isinstance(config, dict) else None
+    if not isinstance(requested, (list, tuple)):
+        return []
+
+    digests = []
+    seen = set()
+    for entry in requested:
+        if not isinstance(entry, str):
+            continue
+        digest = entry.strip()
+        if not digest or digest in seen:
+            continue
+        seen.add(digest)
+        digests.append(digest)
+        if len(digests) >= MAX_RESCAN_IMAGES:
+            break
+
+    if not digests:
+        return []
+
+    reopened = coordinator.reset(digests)
+    if reopened:
+        log(
+            f"ImageInventory: re-opening {len(reopened)} image(s) at the "
+            f"server's request: {', '.join(reopened)}",
+            "info",
+        )
+    return reopened
 
 
 def select_and_enqueue(coordinator, queue, image_container_map, socket_url):

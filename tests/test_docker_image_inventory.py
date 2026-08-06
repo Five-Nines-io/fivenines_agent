@@ -23,6 +23,7 @@ from fivenines_agent.docker_image_inventory import (
     MAX_FIELD_CHARS,
     MAX_FILE_BYTES,
     MAX_PACKAGES,
+    MAX_RESCAN_IMAGES,
     ImageInventoryCoordinator,
     ImageInventoryUploader,
     _ArchiveError,
@@ -33,6 +34,7 @@ from fivenines_agent.docker_image_inventory import (
     _parse_dpkg_status,
     _scrub,
     _single_file_bytes,
+    apply_rescan_requests,
     build_image_inventory,
     select_and_enqueue,
 )
@@ -1014,6 +1016,197 @@ def test_select_and_enqueue_sheds_and_releases_when_full(tmp_path):
     # slot released -> the digest can be selected again next tick, with no
     # backoff (a shed is backpressure, not a failed extraction attempt)
     assert c.select_jobs({"sha256:a": "c1"}, None) != []
+
+
+# ---------------------------------------------------------------------------
+# Server-driven re-inventory: config["rescan_images"] (server issue #676)
+# ---------------------------------------------------------------------------
+
+
+def test_reset_reopens_a_done_digest(tmp_path):
+    """The whole point: an api_error extraction still ends in a 200, so the
+    digest is done forever and the image reads 'not scannable' for good. The
+    server's directive is the only thing that can re-offer it."""
+    c = _coord(tmp_path)
+    c.mark_done("sha256:a")
+    assert c.select_jobs({"sha256:a": "c1"}, None) == []
+
+    assert c.reset(["sha256:a"]) == ["sha256:a"]
+    assert c.select_jobs({"sha256:a": "c1"}, None) != []
+
+
+def test_reset_persists_so_a_restart_does_not_resurrect_done(tmp_path):
+    path = os.path.join(str(tmp_path), "done")
+    c = ImageInventoryCoordinator(path)
+    c.mark_done("sha256:a")
+    c.reset(["sha256:a"])
+
+    fresh = ImageInventoryCoordinator(path)
+    assert fresh.select_jobs({"sha256:a": "c1"}, None) != []
+
+
+def test_reset_clears_gave_up(tmp_path):
+    """Give-up is what would otherwise make the server's directive a no-op on a
+    digest that failed locally. Eligibility timing is the ladder's job, asserted
+    separately in test_reset_of_a_given_up_digest_stays_on_the_retry_ladder."""
+    clock = _Clock()
+    c = _coord(tmp_path, max_attempts=2, retry_base_seconds=1, now_fn=clock)
+    c.mark_failed("sha256:a")
+    c.mark_failed("sha256:a")
+    assert "sha256:a" in c._gave_up
+
+    assert c.reset(["sha256:a"]) == ["sha256:a"]
+    assert "sha256:a" not in c._gave_up
+    clock.advance(3600)
+    assert c.select_jobs({"sha256:a": "c1"}, None) != []
+
+
+def test_reset_of_a_clean_done_digest_is_immediate(tmp_path):
+    """The main #676 path: an api_error is reported INSIDE a 200, so mark_done
+    already cleared the failure history. Nothing should delay the re-scan."""
+    clock = _Clock()
+    c = _coord(tmp_path, retry_base_seconds=60, now_fn=clock)
+    c.mark_done("sha256:a")
+
+    c.reset(["sha256:a"])
+    assert c.select_jobs({"sha256:a": "c1"}, None) != []  # no delay at all
+
+
+def test_reset_of_a_given_up_digest_stays_on_the_retry_ladder(tmp_path):
+    """THE anti-treadmill guard, and the reason reset() re-arms _next_retry.
+
+    When the POST itself is what fails, the server never learns and keeps
+    re-requesting the digest on EVERY tick. If a re-open made a given-up digest
+    immediately eligible, each tick would run a full archive fetch + tar parse,
+    fail, and give up again -- forever. Re-arming the ladder caps that at one
+    extraction per backoff window."""
+    clock = _Clock()
+    c = _coord(tmp_path, max_attempts=3, retry_base_seconds=60, now_fn=clock)
+    for _ in range(3):
+        c.mark_failed("sha256:a")
+        clock.advance(10_000)
+    assert "sha256:a" in c._gave_up
+
+    assert c.reset(["sha256:a"]) == ["sha256:a"]
+    assert "sha256:a" not in c._gave_up
+    # Re-opened, but NOT immediately eligible: 3 prior failures -> 60 * 2^2.
+    assert c.select_jobs({"sha256:a": "c1"}, None) == []
+    clock.advance(239)
+    assert c.select_jobs({"sha256:a": "c1"}, None) == []
+    clock.advance(2)
+    assert c.select_jobs({"sha256:a": "c1"}, None) != []
+
+
+def test_repeated_reset_of_a_failing_digest_cannot_extract_every_tick(tmp_path):
+    """The treadmill, driven end-to-end: the server re-requests the digest on
+    every tick because it never receives a POST. Extractions must be paced by
+    the ladder, not by the tick."""
+    clock = _Clock()
+    c = _coord(tmp_path, max_attempts=2, retry_base_seconds=60, now_fn=clock)
+    c.mark_done("sha256:a")
+
+    selections = 0
+    for _ in range(20):  # 20 ticks, 30s apart
+        apply_rescan_requests(c, {"rescan_images": ["sha256:a"]})
+        jobs = c.select_jobs({"sha256:a": "c1"}, None)
+        if jobs:
+            selections += 1
+            c.mark_failed("sha256:a")  # the POST never lands
+        clock.advance(30)
+
+    # 10 minutes of ticks: a handful of paced attempts, not one per tick.
+    assert 1 <= selections <= 4, selections
+
+
+def test_reset_skips_an_in_flight_digest(tmp_path):
+    """Clearing in-flight would let the same extraction be enqueued twice."""
+    c = _coord(tmp_path)
+    c.select_jobs({"sha256:a": "c1"}, None)  # marks in-flight
+    assert c.reset(["sha256:a"]) == []
+    assert "sha256:a" in c._in_flight
+
+
+def test_reset_is_a_noop_for_an_unknown_digest(tmp_path):
+    """A digest neither done nor given up is already owned by the normal
+    selection path -- the server asking for it must not change anything."""
+    c = _coord(tmp_path)
+    assert c.reset(["sha256:unknown"]) == []
+    assert c._done == []
+
+
+def test_reset_handles_empty_and_duplicate_input(tmp_path):
+    c = _coord(tmp_path)
+    assert c.reset([]) == []
+    assert c.reset(None) == []
+    c.mark_done("sha256:a")
+    # A repeated digest must be reported once, not twice.
+    assert c.reset(["sha256:a", "sha256:a", ""]) == ["sha256:a"]
+
+
+def test_reset_only_rewrites_done_when_something_was_removed(tmp_path):
+    """A gave-up-only reset touches no persisted state, so it must not pay a
+    disk write on the collection loop."""
+    c = _coord(tmp_path, max_attempts=1)
+    c.mark_failed("sha256:a")  # -> gave_up, never done
+    with patch.object(c, "_persist") as persist:
+        assert c.reset(["sha256:a"]) == ["sha256:a"]
+        persist.assert_not_called()
+
+
+def test_apply_rescan_requests_resets_and_returns(tmp_path):
+    c = _coord(tmp_path)
+    c.mark_done("sha256:a")
+    reopened = apply_rescan_requests(c, {"rescan_images": ["sha256:a"]})
+    assert reopened == ["sha256:a"]
+    assert c.select_jobs({"sha256:a": "c1"}, None) != []
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {},
+        {"rescan_images": None},
+        {"rescan_images": "sha256:a"},  # a bare string is not a list
+        {"rescan_images": {"sha256:a": 1}},
+        {"rescan_images": 42},
+        None,
+    ],
+)
+def test_apply_rescan_requests_ignores_malformed_config(tmp_path, config):
+    """Untrusted input off the wire: anything that is not a list of non-empty
+    strings is ignored rather than raising."""
+    c = _coord(tmp_path)
+    c.mark_done("sha256:a")
+    assert apply_rescan_requests(c, config) == []
+    assert c.select_jobs({"sha256:a": "c1"}, None) == []  # still done
+
+
+def test_apply_rescan_requests_ignores_a_list_of_only_junk(tmp_path):
+    """A well-formed list whose every entry is unusable must short-circuit
+    without touching the coordinator at all."""
+    c = _coord(tmp_path)
+    with patch.object(c, "reset") as reset:
+        assert apply_rescan_requests(c, {"rescan_images": [None, "", "  ", 3]}) == []
+        reset.assert_not_called()
+
+
+def test_apply_rescan_requests_drops_non_string_and_blank_entries(tmp_path):
+    c = _coord(tmp_path)
+    c.mark_done("sha256:a")
+    reopened = apply_rescan_requests(
+        c, {"rescan_images": [None, 7, "", "   ", {"x": 1}, "sha256:a"]}
+    )
+    assert reopened == ["sha256:a"]
+
+
+def test_apply_rescan_requests_caps_the_list(tmp_path):
+    """A malformed or hostile config must not re-open the whole done set."""
+    c = _coord(tmp_path, max_done=1000)
+    digests = [f"sha256:{i}" for i in range(MAX_RESCAN_IMAGES + 5)]
+    for d in digests:
+        c.mark_done(d)
+    reopened = apply_rescan_requests(c, {"rescan_images": digests})
+    assert len(reopened) == MAX_RESCAN_IMAGES
 
 
 # ---------------------------------------------------------------------------
