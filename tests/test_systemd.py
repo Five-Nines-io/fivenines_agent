@@ -1141,7 +1141,12 @@ def test_collect_no_cgroup_skips_resource_read():
     """When hierarchy is None, skip cgroup reads and return units with null cgroup fields."""
     SystemdCollector._version = 252
     SystemdCollector._hierarchy = None
-    coll = SystemdCollector()
+    # __init__ re-detects a None hierarchy from the live machine, so pin the
+    # detection to None: without the patch this test only passes on hosts
+    # without cgroups (macOS) and fails on any Linux box, where
+    # /sys/fs/cgroup makes detect_hierarchy() return "v2".
+    with patch("fivenines_agent.systemd.detect_hierarchy", return_value=None):
+        coll = SystemdCollector()
     with patch.object(coll, "_list_units", return_value=(["nginx.service"], None)):
         with patch.object(
             coll,
