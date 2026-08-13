@@ -1141,7 +1141,12 @@ def test_collect_no_cgroup_skips_resource_read():
     """When hierarchy is None, skip cgroup reads and return units with null cgroup fields."""
     SystemdCollector._version = 252
     SystemdCollector._hierarchy = None
-    coll = SystemdCollector()
+    # __init__ re-detects a None hierarchy from the live machine, so pin the
+    # detection to None: without the patch this test only passes on hosts
+    # without cgroups (macOS) and fails on any Linux box, where
+    # /sys/fs/cgroup makes detect_hierarchy() return "v2".
+    with patch("fivenines_agent.systemd.detect_hierarchy", return_value=None):
+        coll = SystemdCollector()
     with patch.object(coll, "_list_units", return_value=(["nginx.service"], None)):
         with patch.object(
             coll,
@@ -1363,14 +1368,36 @@ def test_reverse_deps_centos_7_returns_none():
     SystemdCollector._version = 219
     SystemdCollector._hierarchy = "v1"
     coll = SystemdCollector()
-    assert coll._reverse_deps("nginx.service") is None
+    # Assert the GATE, not just the return value: _reverse_deps also returns
+    # None when the subprocess errors, so on a host without systemctl a
+    # regression that dropped the version check would still go green here.
+    # The return_value is a realistic failure tuple so that such a regression
+    # trips assert_not_called rather than an unpack error.
+    with patch(
+        "fivenines_agent.systemd._run_systemctl",
+        return_value=(None, {"type": "missing", "message": "x"}),
+    ) as mock_run:
+        assert coll._reverse_deps("nginx.service") is None
+    mock_run.assert_not_called()
 
 
 def test_reverse_deps_no_systemd_version():
     SystemdCollector._version = None
     SystemdCollector._hierarchy = None
-    coll = SystemdCollector()
-    assert coll._reverse_deps("nginx.service") is None
+    # Same live-machine re-detection as above, but for both caches: on a Linux
+    # box `systemctl --version` reports >= 230, which would defeat the very
+    # version gate this test exercises and let _reverse_deps shell out for real.
+    with patch("fivenines_agent.systemd._systemd_version", return_value=None):
+        with patch("fivenines_agent.systemd.detect_hierarchy", return_value=None):
+            coll = SystemdCollector()
+    # Same gate assertion as the centos-7 case above: prove no shellout, not
+    # just a None return (which subprocess failure would also produce).
+    with patch(
+        "fivenines_agent.systemd._run_systemctl",
+        return_value=(None, {"type": "missing", "message": "x"}),
+    ) as mock_run:
+        assert coll._reverse_deps("nginx.service") is None
+    mock_run.assert_not_called()
 
 
 def test_reverse_deps_subprocess_error():
