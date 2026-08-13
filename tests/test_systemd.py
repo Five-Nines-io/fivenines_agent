@@ -1374,7 +1374,12 @@ def test_reverse_deps_centos_7_returns_none():
 def test_reverse_deps_no_systemd_version():
     SystemdCollector._version = None
     SystemdCollector._hierarchy = None
-    coll = SystemdCollector()
+    # Same live-machine re-detection as above, but for both caches: on a Linux
+    # box `systemctl --version` reports >= 230, which would defeat the very
+    # version gate this test exercises and let _reverse_deps shell out for real.
+    with patch("fivenines_agent.systemd._systemd_version", return_value=None):
+        with patch("fivenines_agent.systemd.detect_hierarchy", return_value=None):
+            coll = SystemdCollector()
     assert coll._reverse_deps("nginx.service") is None
 
 
