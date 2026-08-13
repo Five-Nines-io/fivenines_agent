@@ -1368,7 +1368,17 @@ def test_reverse_deps_centos_7_returns_none():
     SystemdCollector._version = 219
     SystemdCollector._hierarchy = "v1"
     coll = SystemdCollector()
-    assert coll._reverse_deps("nginx.service") is None
+    # Assert the GATE, not just the return value: _reverse_deps also returns
+    # None when the subprocess errors, so on a host without systemctl a
+    # regression that dropped the version check would still go green here.
+    # The return_value is a realistic failure tuple so that such a regression
+    # trips assert_not_called rather than an unpack error.
+    with patch(
+        "fivenines_agent.systemd._run_systemctl",
+        return_value=(None, {"type": "missing", "message": "x"}),
+    ) as mock_run:
+        assert coll._reverse_deps("nginx.service") is None
+    mock_run.assert_not_called()
 
 
 def test_reverse_deps_no_systemd_version():
@@ -1380,7 +1390,14 @@ def test_reverse_deps_no_systemd_version():
     with patch("fivenines_agent.systemd._systemd_version", return_value=None):
         with patch("fivenines_agent.systemd.detect_hierarchy", return_value=None):
             coll = SystemdCollector()
-    assert coll._reverse_deps("nginx.service") is None
+    # Same gate assertion as the centos-7 case above: prove no shellout, not
+    # just a None return (which subprocess failure would also produce).
+    with patch(
+        "fivenines_agent.systemd._run_systemctl",
+        return_value=(None, {"type": "missing", "message": "x"}),
+    ) as mock_run:
+        assert coll._reverse_deps("nginx.service") is None
+    mock_run.assert_not_called()
 
 
 def test_reverse_deps_subprocess_error():
