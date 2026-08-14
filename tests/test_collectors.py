@@ -44,6 +44,8 @@ def test_registry_has_expected_config_keys():
         "mysql",
         "rabbitmq",
         "proxmox",
+        "wireguard",
+        "tailscale",
         "systemd",
         "disk_health",
     ]

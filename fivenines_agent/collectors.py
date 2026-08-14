@@ -35,8 +35,10 @@ from fivenines_agent.smart_storage import (
     smart_storage_identification,
 )
 from fivenines_agent.systemd import systemd_metrics
+from fivenines_agent.tailscale import tailscale_metrics
 from fivenines_agent.temperatures import temperatures
 from fivenines_agent.tsdb import tsdb_metrics
+from fivenines_agent.wireguard import wireguard_metrics
 from fivenines_agent.zfs import zfs_storage_health
 
 # Registry of metric collectors.
@@ -133,6 +135,19 @@ COLLECTORS = [
     # (a dead broker / partial listing) so the server never prunes queue rows.
     ("rabbitmq", [("rabbitmq", rabbitmq_metrics, True)]),
     ("proxmox", [("proxmox", proxmox_metrics, True)]),
+    # WireGuard peer health (#508). config["wireguard"] is a TOP-LEVEL plain
+    # boolean and the collector takes no parameters, so pass_kwargs is False --
+    # a future dict value is then ignored rather than splatted into a
+    # TypeError. LINUX-ONLY: the key is in the server's
+    # Host::WINDOWS_OMIT_CONFIG_KEYS and is stripped for Windows agents; on any
+    # host without `wg` the collector reports null anyway. No capability gate:
+    # a privilege failure must surface as data["wireguard"] = null (collection
+    # failure), not as a skipped key.
+    ("wireguard", [("wireguard", wireguard_metrics, False)]),
+    # Tailscale node + tailnet rollups (#508). Same top-level plain-boolean
+    # config posture as "wireguard", but CROSS-OS -- never stripped, since
+    # `tailscale status --json` is identical on Linux/Windows/macOS.
+    ("tailscale", [("tailscale", tailscale_metrics, False)]),
     ("systemd", [("systemd", systemd_metrics, True)]),
     # Windows-only: gated by the disk_health capability, only present in the
     # Windows-tailored capability set (D13 - permissions._build_windows_*).

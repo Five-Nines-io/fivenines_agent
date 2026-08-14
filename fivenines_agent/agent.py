@@ -116,6 +116,12 @@ _DRY_RUN_CONFIG = {
     # exercises the per-tick health surface without the inventory POST (skipped
     # in dry-run anyway, since there's no synchronizer to dispatch through).
     "systemd": {"scan": False},
+    # Host-local VPN collectors with no external config, same class as zfs and
+    # fail2ban. Both are safe no-ops where the CLI is absent (they report null),
+    # so enabling them here costs nothing and makes --dry-run actually show the
+    # WireGuard/Tailscale payload -- the docker lesson two entries up.
+    "wireguard": True,
+    "tailscale": True,
 }
 
 
