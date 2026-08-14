@@ -143,6 +143,8 @@ The agent works without sudo, but these features will be unavailable (this is al
 | systemd unit metrics | `systemd` init system (`systemctl`; `journalctl` only for failure journal tails) |
 | systemd failure journal tails | journal read access: the bundled service unit grants `SupplementaryGroups=systemd-journal`; for user installs add your user to the `systemd-journal` group (tails degrade to empty without it) |
 | Log monitoring (journald capture + signals) | journal read access (`systemd-journal` group) |
+| WireGuard peer health | root or `CAP_NET_ADMIN` (the bundled systemd unit grants `AmbientCapabilities=CAP_NET_ADMIN`) |
+| Tailscale node state | `tailscale` CLI on `PATH` + a reachable `tailscaled` (no extra privilege) |
 | Per-unit cgroup metrics | cgroup v1 or v2 mounted at `/sys/fs/cgroup` |
 | Ceph cluster status | `ceph` CLI + read-only cephx keyring (no sudo) |
 
@@ -357,6 +359,71 @@ Requires agent version **1.12.0+**. When MQTT monitoring is enabled for a host i
 2. The server sends the `mqtt` broker list to the agent via `sync_config`
 3. Each tick the agent diffs desired-vs-current and only starts, stops, or resubscribes on an actual change (it never reconnects on an unchanged config, which would re-trigger retained replays)
 4. A bounded per-topic snapshot is reported under `data["mqtt"]`; discovery is capped per monitor to bound memory under a topic storm
+
+## VPN Monitoring (WireGuard + Tailscale)
+
+Requires agent version **1.16.0+**. Both collectors are enabled per host from
+the fivenines dashboard and are off by default. They are independent: enable
+either, both, or neither.
+
+### WireGuard
+
+One `wg show all dump` per tick reports every interface and every peer:
+
+- Per peer: last handshake **age**, cumulative rx/tx bytes, endpoint, AllowedIPs
+  and the configured `PersistentKeepalive` interval
+- Per interface: name, listen port and peer count (reported even when the
+  interface has zero peers, so the per-interface rollups read an honest 0)
+
+The dashboard turns each peer into its own row so a `wireguard_peer_stale`
+incident fires per tunnel -- which is the point when a dead tunnel means blind
+monitoring of everything behind it.
+
+Two things worth knowing:
+
+- **Peers without `PersistentKeepalive` are not watched by default.** WireGuard
+  is silent by design, so an idle laptop with a three-hour-old handshake is
+  perfectly healthy. The staleness alert only watches keepalive-configured
+  peers, which are the ones that should be chattering.
+- **Secrets never leave the host.** `wg show all dump` prints the interface
+  private key and each peer's preshared key; the agent drops both and transmits
+  only the peer's *public* key, which is public by construction and is the
+  peer's durable identity.
+
+**Privilege.** `wg show all dump` reads device state over netlink, which needs
+root or `CAP_NET_ADMIN`. The bundled systemd unit grants
+`AmbientCapabilities=CAP_NET_ADMIN` (systemd >= 229) rather than running the
+agent as root; the capability is inherited by the `wg` child process. Remove
+that line if you do not monitor WireGuard. Without the privilege -- and on
+OpenRC/Alpine and user-level installs, where the agent has no way to acquire it
+short of running as root -- the collector reports a *collection failure*, never
+an empty peer list, so existing peers are preserved and no open incident is
+falsely resolved.
+
+**Peer names.** The dashboard labels peers by the `# Name = <alias>` comment
+next to the `[Peer]` block in `/etc/wireguard/<interface>.conf`, the de-facto
+convention. That file is root-only, so an agent running as `fivenines` will not
+see it and peers fall back to a short key fingerprint; nothing else in the
+config is read.
+
+### Tailscale
+
+One `tailscale status --json` per tick reports:
+
+- `backend_state` verbatim (`Running` / `Stopped` / `NeedsLogin` / ...)
+- The node's **key expiry** instant, so the dashboard can alert days ahead
+- Tailnet rollups: peers total and peers online
+
+This half exists for one failure mode: an expired node key silently drops the
+machine off the tailnet. tailscaled stays alive, flips to `NeedsLogin`, and
+nothing on the box logs an error while every tailnet-only service stops
+answering.
+
+No extra privilege is needed, and it works identically on Linux, Windows and
+macOS. Only the tailnet-wide rollups are sent, never per-peer rows: every node
+sees every peer, so per-peer series would cost hosts x peers across a fleet.
+A node whose key expiry is disabled in the admin console reports "no expiry"
+rather than a fabricated countdown.
 
 ## Ceph Cluster Monitoring
 
