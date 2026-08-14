@@ -11,6 +11,21 @@ User=fivenines
 # packaged distro. Caveat: on hand-rolled images that stripped the group,
 # systemd fails the unit with status 216/GROUP -- remove this line there.
 SupplementaryGroups=systemd-journal
+# WireGuard peer health. `wg show all dump` reads device state over netlink,
+# which needs root or CAP_NET_ADMIN; granting the one capability is strictly
+# less privilege than User=root. Ambient capabilities are inherited across
+# execve, so the `wg` child gets it too.
+#
+# Two things to know before keeping this:
+#   - It applies to EVERY install, not just WireGuard hosts. CAP_NET_ADMIN can
+#     reconfigure interfaces and firewall rules, so if you do not monitor
+#     WireGuard, deleting this line costs you nothing: the collector then
+#     reports null (a collection failure the server ignores) rather than an
+#     empty peer list, so no monitoring data is falsely resolved.
+#   - It needs systemd >= 229. Older systemd logs "Unknown key name" and
+#     ignores the line; the unit still starts, WireGuard collection just
+#     reports null.
+AmbientCapabilities=CAP_NET_ADMIN
 ExecStart=/opt/fivenines/fivenines_agent
 RestartSec=5
 Restart=always
