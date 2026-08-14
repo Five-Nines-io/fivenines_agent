@@ -67,6 +67,23 @@ _NAME_COMMENT_RE = re.compile(r"^[#;]\s*Name\s*=\s*(.*)$", re.IGNORECASE)
 _PUBLIC_KEY_RE = re.compile(r"^PublicKey\s*=\s*(\S+)\s*$", re.IGNORECASE)
 
 
+class _MalformedDump(Exception):
+    """`wg show all dump` produced something this parser does not understand.
+
+    Always fatal to the tick. Skipping the offending line instead would be the
+    single most dangerous thing this module could do: the server reads a
+    non-empty ``peers`` array as the FULL current set, so a parser that quietly
+    drops rows it cannot read ships a short list and every dropped peer is
+    vanish-pruned, auto-resolving its open incident.
+
+    The realistic trigger is not a corrupt byte, it is a FORMAT CHANGE. If
+    wireguard-tools ever appends a column, every peer line stops matching the
+    expected field count at once -- silently turning every WireGuard host in the
+    fleet into "zero peers, prune everything" on the same day. Reporting null
+    instead costs a data gap and nothing else.
+    """
+
+
 def _run_wg_dump():
     """Return `wg show all dump` stdout, or None on any failure or partial view.
 
@@ -130,17 +147,25 @@ def _clean(value):
     return trimmed
 
 
-def _to_int(value, default=None):
+def _strict_int(value, field):
+    """Parse an integer dump field, or raise _MalformedDump.
+
+    There is no lenient fallback on purpose. `wg` emits machine-generated
+    integers, so a value we cannot parse means our understanding of the format
+    is wrong -- and every lenient default is a lie in the dangerous direction: a
+    coerced 0 transfer counter reads as a reset, a coerced-away keepalive reads
+    as "operator disabled it" and drops the peer out of the stale-watch set.
+    Failing the tick is the only honest answer. See _parse_dump.
+    """
     try:
-        return int(str(value).strip())
-    except (TypeError, ValueError):
-        return default
+        return int(value.strip())
+    except (AttributeError, TypeError, ValueError):
+        raise _MalformedDump(f"non-integer {field}: {value!r}")
 
 
 def _listen_port(value):
     """UDP listen port, or None for a client interface with no fixed port."""
-    port = _to_int(value)
-    return port or None
+    return _strict_int(value, "listen-port") or None
 
 
 def _keepalive(value):
@@ -150,12 +175,14 @@ def _keepalive(value):
     be idle-but-healthy with an arbitrarily old handshake. The server's
     `wireguard_peer_stale` trigger watches only keepalive-configured peers by
     default, so mislabelling "off" as an interval would page on healthy idle
-    laptops.
+    laptops -- and, far worse, mislabelling an unparseable value as "off"
+    silently removes a genuinely watched tunnel from the watch set. Only wg's
+    real off-sentinels map to None; anything else must parse or fail the tick.
     """
-    trimmed = (value or "").strip()
+    trimmed = value.strip()
     if not trimmed or trimmed in (_OFF_SENTINEL, _NONE_SENTINEL):
         return None
-    return _to_int(trimmed) or None
+    return _strict_int(trimmed, "persistent-keepalive") or None
 
 
 def _handshake_age(value, now):
@@ -177,7 +204,7 @@ def _handshake_age(value, now):
     server keeps the true anchor, and the age keeps growing until the peer
     really does come back. Nonsense data must never outrank real data.
     """
-    timestamp = _to_int(value)
+    timestamp = _strict_int(value, "latest-handshake")
     if not timestamp:
         return None
     age = int(now) - timestamp
@@ -193,6 +220,11 @@ def _parse_dump(text, now):
     and peer lines ``name  public-key  PRESHARED-KEY  endpoint  allowed-ips
     latest-handshake  rx  tx  keepalive``. The two secret columns are indexed
     past and never read.
+
+    STRICT BY DESIGN: anything that is not exactly one of those two shapes
+    raises _MalformedDump and fails the whole tick. Read that class's docstring
+    before relaxing any check here -- "skip the line we don't understand" is the
+    one change that turns a data gap into a fleet-wide prune.
     """
     interfaces = []
     peers = []
@@ -206,7 +238,7 @@ def _parse_dump(text, now):
         if len(fields) == _INTERFACE_FIELDS:
             name = fields[0].strip()
             if not name:
-                continue
+                raise _MalformedDump("interface line with no name")
             # fields[1] is the interface PRIVATE KEY and fields[2] its public
             # key: neither is read, neither has a server column.
             entry = {
@@ -219,12 +251,17 @@ def _parse_dump(text, now):
             continue
 
         if len(fields) != _PEER_FIELDS:
-            continue
+            raise _MalformedDump(f"line has {len(fields)} fields, expected 5 or 9")
 
         interface = fields[0].strip()
         public_key = fields[1].strip()
         if not interface or not public_key:
-            continue
+            raise _MalformedDump("peer line with no interface or public key")
+        if interface not in by_name:
+            # Every peer follows its own interface line in `wg show all dump`.
+            # A peer without one means we are looking at a partial view, which
+            # is exactly what must never be reported as a full set.
+            raise _MalformedDump(f"peer on undeclared interface {interface!r}")
         # fields[2] is the peer PRESHARED KEY: not read, never transmitted.
         peers.append(
             {
@@ -234,13 +271,13 @@ def _parse_dump(text, now):
                 "endpoint": _clean(fields[3]),
                 "allowed_ips": _clean(fields[4]),
                 "last_handshake_age_seconds": _handshake_age(fields[5], now),
-                "rx_bytes": _to_int(fields[6], 0),
-                "tx_bytes": _to_int(fields[7], 0),
+                "rx_bytes": _strict_int(fields[6], "transfer-rx"),
+                "tx_bytes": _strict_int(fields[7], "transfer-tx"),
                 "persistent_keepalive": _keepalive(fields[8]),
             }
         )
-        if interface in by_name:
-            by_name[interface]["peer_count"] += 1
+        # Guaranteed present: the undeclared-interface check above raises.
+        by_name[interface]["peer_count"] += 1
 
     return interfaces, peers
 
@@ -375,6 +412,15 @@ def wireguard_metrics():
     if stdout is None:
         return None
 
-    interfaces, peers = _parse_dump(stdout, time.time())
+    try:
+        interfaces, peers = _parse_dump(stdout, time.time())
+    except _MalformedDump as e:
+        # A dump we cannot fully parse is a partial view, and a partial view
+        # reported as a full set is the fleet-wide prune this collector exists
+        # to avoid. Error level so it reaches backend telemetry rather than
+        # leaving the host silently dark.
+        log(f"WireGuard: unparseable `wg show all dump` output: {e}", "error")
+        return None
+
     _apply_aliases(peers)
     return {"interfaces": interfaces, "peers": peers}

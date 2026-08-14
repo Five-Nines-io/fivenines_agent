@@ -173,9 +173,9 @@ def test_client_interface_without_a_fixed_port(wg):
     assert wireguard_metrics()["interfaces"][0]["listen_port"] is None
 
 
-def test_unparseable_listen_port_is_null(wg):
+def test_unparseable_listen_port_is_a_collection_failure(wg):
     wg(stdout=_dump("\t".join(["wg0", PRIVATE_KEY, IFACE_PUBLIC, "-", "off"])))
-    assert wireguard_metrics()["interfaces"][0]["listen_port"] is None
+    assert wireguard_metrics() is None
 
 
 def test_never_handshaked_peer_reports_null_not_zero(wg):
@@ -185,9 +185,9 @@ def test_never_handshaked_peer_reports_null_not_zero(wg):
     assert wireguard_metrics()["peers"][0]["last_handshake_age_seconds"] is None
 
 
-def test_unparseable_handshake_reports_null(wg):
+def test_unparseable_handshake_is_a_collection_failure(wg):
     wg(stdout=_dump(_iface_line(), _peer_line(handshake="soon")))
-    assert wireguard_metrics()["peers"][0]["last_handshake_age_seconds"] is None
+    assert wireguard_metrics() is None
 
 
 def test_future_handshake_reports_null_not_zero(wg):
@@ -208,18 +208,21 @@ def test_handshake_exactly_now_is_zero(wg):
 
 @pytest.mark.parametrize(
     "value,expected",
-    [
-        ("off", None),
-        ("(none)", None),
-        ("", None),
-        ("0", None),
-        ("nope", None),
-        ("25", 25),
-    ],
+    [("off", None), ("(none)", None), ("", None), ("0", None), ("25", 25)],
 )
 def test_persistent_keepalive_values(wg, value, expected):
     wg(stdout=_dump(_iface_line(), _peer_line(keepalive=value)))
     assert wireguard_metrics()["peers"][0]["persistent_keepalive"] == expected
+
+
+def test_unparseable_keepalive_is_a_collection_failure(wg):
+    """The nastiest lenient-default of the set. None means "operator turned
+    keepalive off", which drops the peer out of the server's default
+    stale-watch set -- so coercing an unparseable value to None would silently
+    UNWATCH a monitored tunnel while still reporting a successful full-set
+    read. Only wg's real off-sentinels may map to None."""
+    wg(stdout=_dump(_iface_line(), _peer_line(keepalive="nope")))
+    assert wireguard_metrics() is None
 
 
 def test_roaming_peer_has_no_endpoint(wg):
@@ -232,37 +235,38 @@ def test_blank_allowed_ips_is_null(wg):
     assert wireguard_metrics()["peers"][0]["allowed_ips"] is None
 
 
-def test_unparseable_transfer_counters_fall_back_to_zero(wg):
+def test_unparseable_transfer_counters_are_a_collection_failure(wg):
     wg(stdout=_dump(_iface_line(), _peer_line(rx="x", tx="y")))
-    peer = wireguard_metrics()["peers"][0]
-    assert (peer["rx_bytes"], peer["tx_bytes"]) == (0, 0)
+    assert wireguard_metrics() is None
 
 
-def test_blank_and_malformed_lines_are_skipped(wg):
-    wg(
-        stdout=_dump(
-            "",
-            "   ",
-            "not\ta\tdump\tline",
-            _iface_line(),
-            "\t".join(["", PRIVATE_KEY, IFACE_PUBLIC, "51821", "off"]),
-            _peer_line(),
-            _peer_line(iface=""),
-            _peer_line(key=""),
-        )
-    )
-    payload = wireguard_metrics()
-    assert [i["name"] for i in payload["interfaces"]] == ["wg0"]
-    assert len(payload["peers"]) == 1
+def test_blank_lines_are_skipped_but_malformed_ones_are_fatal(wg):
+    """Blank lines are just the dump's trailing newline. Everything else must
+    parse."""
+    wg(stdout=_dump("", "   ", _iface_line(), _peer_line()))
+    assert len(wireguard_metrics()["peers"]) == 1
 
 
-def test_peer_on_an_undeclared_interface_still_travels(wg):
-    """A peer whose interface line never printed is still a real peer; only the
-    (RESERVED) peer_count rollup misses it."""
-    wg(stdout=_dump(_iface_line(), _peer_line(iface="wg9")))
-    payload = wireguard_metrics()
-    assert payload["interfaces"][0]["peer_count"] == 0
-    assert payload["peers"][0]["interface"] == "wg9"
+@pytest.mark.parametrize(
+    "bad_line",
+    [
+        "not\ta\tdump\tline",  # 4 fields: neither shape
+        "\t".join(["", PRIVATE_KEY, IFACE_PUBLIC, "51821", "off"]),  # no iface name
+        _peer_line(iface=""),  # peer with no interface
+        _peer_line(key=""),  # peer with no public key
+        _peer_line(iface="wg9"),  # peer whose interface never declared itself
+        "\t".join([_peer_line(), "extra-tenth-column"]),  # a future wg format
+    ],
+)
+def test_any_unparseable_line_fails_the_whole_tick(wg, bad_line):
+    """THE most dangerous thing this parser could do is skip a row it does not
+    understand: the server reads a non-empty peers array as the FULL current
+    set, so a short list vanish-prunes every dropped peer and resolves its open
+    incident. The realistic trigger is a wireguard-tools format change, which
+    would break every peer line on every host at once -- turning the whole fleet
+    into "zero peers, prune everything" on the same day. null instead."""
+    wg(stdout=_dump(_iface_line(), _peer_line(), bad_line))
+    assert wireguard_metrics() is None
 
 
 def test_multiple_interfaces_count_their_own_peers(wg):

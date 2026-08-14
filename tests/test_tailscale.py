@@ -166,13 +166,15 @@ def test_backend_state_travels_verbatim(ts):
     assert tailscale_metrics()["backend_state"] == "SomeFutureState"
 
 
-def test_missing_self_block_still_yields_a_read(ts):
-    ts(document=_status(Self=None))
-    assert tailscale_metrics()["self"] == {
-        "hostname": None,
-        "key_expiry": None,
-        "online": None,
-    }
+@pytest.mark.parametrize("self_block", [None, "junk", []])
+def test_missing_self_block_is_a_collection_failure(ts, self_block):
+    """key_expiry: null contractually means "expiry is DISABLED for this node",
+    NOT "we could not read it". Publishing a null-everything Self on a degraded
+    document would silently switch OFF expiry monitoring for a node whose key is
+    about to expire -- the exact outage this collector exists to catch. No Self
+    means no reading, so the server keeps the last known good block."""
+    ts(document=_status(Self=self_block))
+    assert tailscale_metrics() is None
 
 
 def test_non_dict_peer_map_reads_zero(ts):

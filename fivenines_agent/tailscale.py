@@ -123,6 +123,18 @@ def _run_status():
         log("Tailscale: status document carried no BackendState", "error")
         return None
 
+    # Self is required, not optional. tailscaled always includes it when it
+    # answers at all -- even logged out. Accepting a document without it would
+    # publish key_expiry: null, and null contractually means "expiry is DISABLED
+    # for this node", not "we could not read it". A shape change or a degraded
+    # response would then silently switch OFF expiry monitoring on nodes whose
+    # keys are about to expire, which is the one outage this collector exists to
+    # catch. No Self means no reading: report null and let the server keep the
+    # last known good block.
+    if not isinstance(parsed.get("Self"), dict):
+        log("Tailscale: status document carried no Self block", "error")
+        return None
+
     return parsed
 
 
@@ -190,9 +202,8 @@ def tailscale_metrics():
     if status is None:
         return None
 
-    self_raw = status.get("Self")
-    if not isinstance(self_raw, dict):
-        self_raw = {}
+    # _run_status has already established that Self is a dict.
+    self_raw = status["Self"]
 
     peers = status.get("Peer")
     if not isinstance(peers, dict):
