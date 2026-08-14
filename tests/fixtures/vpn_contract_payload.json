@@ -1,0 +1,450 @@
+{
+  "description": "Shared WireGuard + Tailscale contract fixture between fivenines-agent and fivenines-server (#508). Source of truth: fivenines-agent tests/fixtures/vpn_contract_payload.json, asserted end-to-end there (only the `wg show all dump` / `tailscale status --json` subprocess is mocked -- each scenario's 'raw' output is fed back and the collector must produce scenario['payload']). The server's spec/requests/api_collect_vpn_spec.rb posts scenario['payload'] under data['wireguard'] / data['tailscale'] through /collect and asserts Ingesters::Agent ingests each shape (object / empty / null). 'config' and 'raw' are agent-side inputs the server ignores. Change the payload shape only in lockstep across both repos, keeping the two copies byte-identical. Authored server-first and reconciled with the agent PR: each scenario's 'raw' now carries the actual `wg show all dump` / `tailscale status --json` inputs the round-trip feeds back in (see raw_contract).",
+  "agent_min_version": "1.16.0",
+  "_agent_min_version_note": "VPN monitoring has NO server version gate (no FEATURES_SUPPORTED_VERSIONS entry -- purely config-driven, wireguard_enabled / tailscale_enabled default false, so the settings toggles render for every eligible host and an old agent simply never sends the data['wireguard'] / data['tailscale'] keys). Both config keys are TOP-LEVEL, so an agent without the collectors ignores them (no splat hazard). This number documents which agent first ships the collectors for the two-repo lockstep; nothing on the server gates on it.",
+  "config_contract": "The server emits config['wireguard'] and config['tailscale'] on every /collect (api_controller). config['wireguard'] is LINUX-ONLY -- the key is in Host::WINDOWS_OMIT_CONFIG_KEYS, so it is STRIPPED for Windows agents (the `wg` CLI and its dump format are the Linux/BSD userspace tools). config['tailscale'] is CROSS-OS (tailscaled and `tailscale status --json` are identical on Linux/Windows/macOS) and is never stripped. Both are plain booleans -- the collectors take no parameters: `wg show all dump` and `tailscale status --json` are fixed commands, and the peer aliases come from the local wg-quick configs, not from server state.",
+  "privilege_contract": "`wg show all dump` requires root or CAP_NET_ADMIN. The packaged agent unit should grant AmbientCapabilities=CAP_NET_ADMIN rather than run as root. When the agent lacks the privilege the collector MUST report data['wireguard'] = null (collection failure), never an empty peer list -- an empty list is the documented prune-all and would mass-false-resolve every open wireguard_peer_stale incident.",
+  "secret_contract": "`wg show all dump` prints the interface PRIVATE KEY (first field of each interface line) and each peer's PRESHARED KEY. The agent MUST strip both and never transmit them; the server has no column for either and would drop them. Only the PUBLIC key travels -- it is public by construction (that is the point of the handshake) and is the peer's durable identity. Even so the server never RENDERS a raw public key (issue AC: 'peers labeled by config alias/hostname, never raw public keys'); WireguardPeer#display_name shows the alias or a short fingerprint.",
+  "null_contract": "data['wireguard'] is one of THREE outcomes and the server MUST branch on them (dispatch gate: is_a?(Hash)): (a) null (JSON null / Python None) = COLLECTION FAILURE -- `wg` is missing, the agent lacks CAP_NET_ADMIN, or the command timed out. The server MUST NOT prune wireguard_peers rows or auto-resolve wireguard_peer_stale incidents on null: a host whose `wg` invocation merely failed has not had its tunnels removed, and treating it as recovery is a false-resolve bug. (b) an object with 'peers':[] = `wg` succeeded and there are genuinely ZERO peers -- safe to prune all rows. NOTE: `interfaces` MUST still list every configured interface on a zero-peer tick (see the zero_peers scenario). It is the ONLY source of names for the per-interface rollup gauges when there are no peer rows to derive them from, so sending `interfaces: []` alongside `peers: []` makes wireguard_peers_total/_active VANISH from the chart instead of reading an honest 0. (c) an object with a non-empty 'peers' array = the FULL current set (`wg show all dump` reports every interface and every peer), so a peer absent from a non-empty tick is genuinely gone and DOES vanish-prune (the systemd/docker/haproxy full-set discipline, guarded against a corrupted partial tick). data['tailscale'] follows the same null rule: null = the CLI/daemon could not be reached at all, so the server preserves the last-known denormalized block rather than clearing it. A tailscaled that IS reachable but off the tailnet reports backend_state 'Stopped' / 'NeedsLogin' -- that is a successful read carrying the real signal, not a failure.",
+  "raw_contract": "Agent-side inputs the server ignores (it reads only 'payload'). Each scenario's 'raw' is fed straight back into the collectors in the agent round-trip test, with ONLY the subprocess boundary mocked: 'wg_show_all_dump' is verbatim `wg show all dump` stdout (null = the command failed / the agent lacks CAP_NET_ADMIN, which must produce data['wireguard'] = null), 'wg_quick_configs' maps an interface name to its /etc/wireguard/<name>.conf contents for the peer-alias parse (absent = unreadable, which is the normal case for a non-root agent and leaves peers[].name null), 'tailscale_status_json' is verbatim `tailscale status --json` stdout as an object (null = the CLI/daemon could not be reached). 'now' is the epoch second the agent's clock is pinned to so last_handshake_age_seconds is deterministic; the raw dump carries ABSOLUTE latest-handshake timestamps, exactly as `wg` prints them. The wg fixtures deliberately carry a real-shaped interface PRIVATE KEY and peer PRESHARED KEYS so the round-trip proves they are stripped: neither string may appear anywhere in 'payload'.",
+  "field_contract": {
+    "wireguard.interfaces[].name": "The local WireGuard interface name (wg0). Reported even when the interface has zero peers, so the per-interface rollup gauges read an honest 0 instead of vanishing.",
+    "wireguard.interfaces[].listen_port": "The UDP listen port, or null for a client-only interface with no fixed port. RESERVED: transmitted but NOT read by the server today (no column, no series) - kept in the contract so a future UI can surface it without an agent change.",
+    "wireguard.interfaces[].peer_count": "Number of peers configured on this interface (agent-computed). RESERVED: transmitted but NOT read by the server today - it derives every count from the peers array itself. There is deliberately NO cross-check against this value; do not assume payload drift is guarded by one.",
+    "wireguard.peers[].interface": "The parent interface name -- a peer public key is unique only WITHIN an interface.",
+    "wireguard.peers[].public_key": "The peer's base64 PUBLIC key. The durable identity (renaming a peer in wg0.conf must not mint a new peer). NEVER the private or preshared key.",
+    "wireguard.peers[].name": "The operator alias parsed from the wg-quick config -- the '# Name = ...' comment line immediately preceding the [Peer] block, the de-facto convention. null when the config carries none; the server then displays a short key fingerprint.",
+    "wireguard.peers[].endpoint": "The last known remote endpoint 'host:port', or null when the peer has never been reached (a roaming client that has not dialled in).",
+    "wireguard.peers[].allowed_ips": "Comma-separated AllowedIPs, verbatim. Informational.",
+    "wireguard.peers[].last_handshake_age_seconds": "SECONDS since the last completed handshake, computed AGENT-SIDE from its own clock (the server anchors it to received_at -- the mqtt/qemu/systemd clock-discipline rule: agents report ages, the server derives absolute times). null when `wg` reports latest-handshake=0, i.e. the peer has NEVER completed a handshake since the interface came up.",
+    "wireguard.peers[].rx_bytes": "CUMULATIVE bytes received from this peer. Resets when the interface is recreated (rate() detects the reset natively).",
+    "wireguard.peers[].tx_bytes": "CUMULATIVE bytes sent to this peer. Same reset semantics.",
+    "wireguard.peers[].persistent_keepalive": "Keepalive interval in seconds, or null/0 when off. LOAD-BEARING: WireGuard is silent by design, so a peer WITHOUT keepalive can be idle-but-healthy with an arbitrarily old handshake. The wireguard_peer_stale trigger watches only keepalive-configured peers by default for exactly this reason.",
+    "tailscale.backend_state": "tailscaled's own BackendState verbatim: 'Running' / 'Stopped' / 'NeedsLogin' / 'NeedsMachineAuth' / 'Starting' / 'NoState'. Stored as a STRING, never an enum -- the vocabulary is tailscale's and it extends it. 'NeedsLogin' is the state an EXPIRED node key lands in.",
+    "tailscale.self.hostname": "This node's tailnet hostname (Self.HostName).",
+    "tailscale.self.key_expiry": "ISO-8601 UTC instant at which this node's key expires, or null when key expiry is DISABLED for the node (a legitimate admin-console setting -- null means 'never expires', not 'unknown'). THE signal this half of the feature exists for: an expired key silently drops the node off the tailnet with no error anywhere.",
+    "tailscale.self.online": "Self.Online -- whether the COORDINATION SERVER currently considers this node online. RESERVED: transmitted but NOT read by the server today (no column, no series). Deliberately NOT the same signal as tailscale_up, which is derived from backend_state (the local daemon's own view) - so its presence here must not be read as coverage of the coordination-server view.",
+    "tailscale.peers_total": "Number of peers in the tailnet as this node sees them (agent-computed from the Peer map).",
+    "tailscale.peers_online": "How many of those peers are currently Online. The server stores the ROLLUP only, never per-peer rows or series: every node sees every tailnet peer, so per-peer series would cost hosts x peers cardinality across a fleet (the systemd #562 rollup precedent)."
+  },
+  "scenarios": {
+    "healthy_and_stale": {
+      "description": "One host, one interface, four peers exercising every trigger classification. 'office-router' is HEALTHY (fresh handshake, keepalive on). 'branch-nyc' is STALE (keepalive on, last handshake 22 minutes ago) -- a real dead tunnel, fires. 'laptop-roaming' is IDLE-BUT-HEALTHY (NO keepalive, handshake 3 hours old) -- WireGuard is silent by design, so this MUST NOT fire under the default require_keepalive watch set (issue AC #1). 'new-site' has NEVER handshaked (null age, keepalive on) -- the server anchors its age to first_seen_at, so it reads ~0 on the tick it first appears and only fires once it has been silent past the threshold.",
+      "config": {
+        "wireguard": true,
+        "tailscale": true
+      },
+      "raw": {
+        "now": 1786708800,
+        "wg_show_all_dump": "wg0\tYWdlbnQtbXVzdC1uZXZlci10cmFuc21pdC10aGlzISE=\td2cwLWludGVyZmFjZS1wdWJsaWMta2V5LTMyYnl0ZXM=\t51820\toff\nwg0\txTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=\tcHJlc2hhcmVkLWtleS1tdXN0LW5ldmVyLXRyYXZlbDE=\t203.0.113.5:51820\t10.100.0.2/32\t1786708758\t918273645\t546372819\t25\nwg0\tHIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=\tcHJlc2hhcmVkLWtleS1tdXN0LW5ldmVyLXRyYXZlbDI=\t198.51.100.44:51820\t10.100.0.3/32,192.168.20.0/24\t1786707480\t12045\t30112\t25\nwg0\tTrMvSoP4jYQlY6RIzBgbssQqY3vxI2Pi+y71lOWWXX0=\t(none)\t(none)\t10.100.0.4/32\t1786698000\t8830000\t4410000\toff\nwg0\tqBpDnBnRC5FMYcJvT0RXK1zaP4TfvW5tNBRRlXjxTGM=\t(none)\t(none)\t10.100.0.5/32\t0\t0\t0\t25\n",
+        "wg_quick_configs": {
+          "wg0": "[Interface]\nAddress = 10.100.0.1/24\nListenPort = 51820\nPrivateKey = YWdlbnQtbXVzdC1uZXZlci10cmFuc21pdC10aGlzISE=\n\n# Name = office-router\n[Peer]\nPublicKey = xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=\nPresharedKey = cHJlc2hhcmVkLWtleS1tdXN0LW5ldmVyLXRyYXZlbDE=\nAllowedIPs = 10.100.0.2/32\nPersistentKeepalive = 25\n\n# Name = branch-nyc\n[Peer]\nPublicKey = HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=\nPresharedKey = cHJlc2hhcmVkLWtleS1tdXN0LW5ldmVyLXRyYXZlbDI=\nAllowedIPs = 10.100.0.3/32, 192.168.20.0/24\nPersistentKeepalive = 25\n\n[Peer]\n# Name = laptop-roaming\nPublicKey = TrMvSoP4jYQlY6RIzBgbssQqY3vxI2Pi+y71lOWWXX0=\nAllowedIPs = 10.100.0.4/32\n\n[Peer]\nPublicKey = qBpDnBnRC5FMYcJvT0RXK1zaP4TfvW5tNBRRlXjxTGM=\nAllowedIPs = 10.100.0.5/32\nPersistentKeepalive = 25\n"
+        },
+        "tailscale_status_json": {
+          "Version": "1.86.2-t01e4dc5f2",
+          "TUN": true,
+          "BackendState": "Running",
+          "TailscaleIPs": [
+            "100.101.102.103",
+            "fd7a:115c:a1e0::1"
+          ],
+          "MagicDNSSuffix": "tailnet-4c1f.ts.net",
+          "Self": {
+            "ID": "nSelf01",
+            "PublicKey": "nodekey:abababababababababababababababababababababababababababababababab",
+            "HostName": "edge-01",
+            "DNSName": "edge-01.tailnet-4c1f.ts.net.",
+            "OS": "linux",
+            "TailscaleIPs": [
+              "100.101.102.103",
+              "fd7a:115c:a1e0::1"
+            ],
+            "Online": true,
+            "KeyExpiry": "2026-09-15T10:00:00Z"
+          },
+          "Peer": {
+            "nodekey:0101010101010101010101010101010101010101010101010101010101010101": {
+              "HostName": "peer-01",
+              "OS": "linux",
+              "Online": true
+            },
+            "nodekey:0202020202020202020202020202020202020202020202020202020202020202": {
+              "HostName": "peer-02",
+              "OS": "macOS",
+              "Online": true
+            },
+            "nodekey:0303030303030303030303030303030303030303030303030303030303030303": {
+              "HostName": "peer-03",
+              "OS": "linux",
+              "Online": true
+            },
+            "nodekey:0404040404040404040404040404040404040404040404040404040404040404": {
+              "HostName": "peer-04",
+              "OS": "macOS",
+              "Online": true
+            },
+            "nodekey:0505050505050505050505050505050505050505050505050505050505050505": {
+              "HostName": "peer-05",
+              "OS": "linux",
+              "Online": true
+            },
+            "nodekey:0606060606060606060606060606060606060606060606060606060606060606": {
+              "HostName": "peer-06",
+              "OS": "macOS",
+              "Online": true
+            },
+            "nodekey:0707070707070707070707070707070707070707070707070707070707070707": {
+              "HostName": "peer-07",
+              "OS": "linux",
+              "Online": true
+            },
+            "nodekey:0808080808080808080808080808080808080808080808080808080808080808": {
+              "HostName": "peer-08",
+              "OS": "macOS",
+              "Online": true
+            },
+            "nodekey:0909090909090909090909090909090909090909090909090909090909090909": {
+              "HostName": "peer-09",
+              "OS": "linux",
+              "Online": true
+            },
+            "nodekey:1010101010101010101010101010101010101010101010101010101010101010": {
+              "HostName": "peer-10",
+              "OS": "macOS",
+              "Online": true
+            },
+            "nodekey:1111111111111111111111111111111111111111111111111111111111111111": {
+              "HostName": "peer-11",
+              "OS": "linux",
+              "Online": true
+            },
+            "nodekey:1212121212121212121212121212121212121212121212121212121212121212": {
+              "HostName": "peer-12",
+              "OS": "macOS",
+              "Online": false
+            }
+          }
+        }
+      },
+      "payload": {
+        "wireguard": {
+          "interfaces": [
+            {
+              "name": "wg0",
+              "listen_port": 51820,
+              "peer_count": 4
+            }
+          ],
+          "peers": [
+            {
+              "interface": "wg0",
+              "public_key": "xTIBA5rboUvnH4htodjb6e697QjLERt1NAB4mZqp8Dg=",
+              "name": "office-router",
+              "endpoint": "203.0.113.5:51820",
+              "allowed_ips": "10.100.0.2/32",
+              "last_handshake_age_seconds": 42,
+              "rx_bytes": 918273645,
+              "tx_bytes": 546372819,
+              "persistent_keepalive": 25
+            },
+            {
+              "interface": "wg0",
+              "public_key": "HIgo9xNzJMWLKASShiTqIybxZ0U3wGLiUeJ1PKf8ykw=",
+              "name": "branch-nyc",
+              "endpoint": "198.51.100.44:51820",
+              "allowed_ips": "10.100.0.3/32,192.168.20.0/24",
+              "last_handshake_age_seconds": 1320,
+              "rx_bytes": 12045,
+              "tx_bytes": 30112,
+              "persistent_keepalive": 25
+            },
+            {
+              "interface": "wg0",
+              "public_key": "TrMvSoP4jYQlY6RIzBgbssQqY3vxI2Pi+y71lOWWXX0=",
+              "name": "laptop-roaming",
+              "endpoint": null,
+              "allowed_ips": "10.100.0.4/32",
+              "last_handshake_age_seconds": 10800,
+              "rx_bytes": 8830000,
+              "tx_bytes": 4410000,
+              "persistent_keepalive": null
+            },
+            {
+              "interface": "wg0",
+              "public_key": "qBpDnBnRC5FMYcJvT0RXK1zaP4TfvW5tNBRRlXjxTGM=",
+              "name": null,
+              "endpoint": null,
+              "allowed_ips": "10.100.0.5/32",
+              "last_handshake_age_seconds": null,
+              "rx_bytes": 0,
+              "tx_bytes": 0,
+              "persistent_keepalive": 25
+            }
+          ]
+        },
+        "tailscale": {
+          "backend_state": "Running",
+          "self": {
+            "hostname": "edge-01",
+            "key_expiry": "2026-09-15T10:00:00Z",
+            "online": true
+          },
+          "peers_total": 12,
+          "peers_online": 11
+        }
+      }
+    },
+    "key_expiring": {
+      "description": "Tailscale node whose key expires in under a day and a tailnet with several peers offline. Drives the tailscale_key_expiry_days metric_threshold recipe and the host card's amber expiry state. WireGuard is not configured on this host, so its key is absent from the payload entirely.",
+      "config": {
+        "wireguard": false,
+        "tailscale": true
+      },
+      "raw": {
+        "tailscale_status_json": {
+          "Version": "1.86.2-t01e4dc5f2",
+          "TUN": true,
+          "BackendState": "Running",
+          "TailscaleIPs": [
+            "100.101.102.103",
+            "fd7a:115c:a1e0::1"
+          ],
+          "MagicDNSSuffix": "tailnet-4c1f.ts.net",
+          "Self": {
+            "ID": "nSelf02",
+            "PublicKey": "nodekey:abababababababababababababababababababababababababababababababab",
+            "HostName": "edge-02",
+            "DNSName": "edge-02.tailnet-4c1f.ts.net.",
+            "OS": "linux",
+            "TailscaleIPs": [
+              "100.101.102.103",
+              "fd7a:115c:a1e0::1"
+            ],
+            "Online": true,
+            "KeyExpiry": "2026-08-14T06:00:00.482913741Z"
+          },
+          "Peer": {
+            "nodekey:0101010101010101010101010101010101010101010101010101010101010101": {
+              "HostName": "peer-01",
+              "OS": "linux",
+              "Online": true
+            },
+            "nodekey:0202020202020202020202020202020202020202020202020202020202020202": {
+              "HostName": "peer-02",
+              "OS": "macOS",
+              "Online": true
+            },
+            "nodekey:0303030303030303030303030303030303030303030303030303030303030303": {
+              "HostName": "peer-03",
+              "OS": "linux",
+              "Online": true
+            },
+            "nodekey:0404040404040404040404040404040404040404040404040404040404040404": {
+              "HostName": "peer-04",
+              "OS": "macOS",
+              "Online": true
+            },
+            "nodekey:0505050505050505050505050505050505050505050505050505050505050505": {
+              "HostName": "peer-05",
+              "OS": "linux",
+              "Online": true
+            },
+            "nodekey:0606060606060606060606060606060606060606060606060606060606060606": {
+              "HostName": "peer-06",
+              "OS": "macOS",
+              "Online": true
+            },
+            "nodekey:0707070707070707070707070707070707070707070707070707070707070707": {
+              "HostName": "peer-07",
+              "OS": "linux",
+              "Online": true
+            },
+            "nodekey:0808080808080808080808080808080808080808080808080808080808080808": {
+              "HostName": "peer-08",
+              "OS": "macOS",
+              "Online": false
+            },
+            "nodekey:0909090909090909090909090909090909090909090909090909090909090909": {
+              "HostName": "peer-09",
+              "OS": "linux",
+              "Online": false
+            },
+            "nodekey:1010101010101010101010101010101010101010101010101010101010101010": {
+              "HostName": "peer-10",
+              "OS": "macOS",
+              "Online": false
+            },
+            "nodekey:1111111111111111111111111111111111111111111111111111111111111111": {
+              "HostName": "peer-11",
+              "OS": "linux",
+              "Online": false
+            },
+            "nodekey:1212121212121212121212121212121212121212121212121212121212121212": {
+              "HostName": "peer-12",
+              "OS": "macOS",
+              "Online": false
+            }
+          }
+        }
+      },
+      "payload": {
+        "tailscale": {
+          "backend_state": "Running",
+          "self": {
+            "hostname": "edge-02",
+            "key_expiry": "2026-08-14T06:00:00Z",
+            "online": true
+          },
+          "peers_total": 12,
+          "peers_online": 7
+        }
+      }
+    },
+    "needs_login": {
+      "description": "The silent killer this half of the feature exists for: the node key EXPIRED, so tailscaled is alive but sitting in NeedsLogin, off the tailnet, with no error surfaced anywhere on the box. A SUCCESSFUL read (not a collection failure) -- backend_state carries the signal, tailscale_up reads 0, and key_expiry is in the past. peers_* are 0 because a logged-out node sees no tailnet.",
+      "config": {
+        "wireguard": false,
+        "tailscale": true
+      },
+      "raw": {
+        "tailscale_status_json": {
+          "Version": "1.86.2-t01e4dc5f2",
+          "TUN": true,
+          "BackendState": "NeedsLogin",
+          "TailscaleIPs": [
+            "100.101.102.103",
+            "fd7a:115c:a1e0::1"
+          ],
+          "MagicDNSSuffix": "tailnet-4c1f.ts.net",
+          "Self": {
+            "ID": "nSelf03",
+            "PublicKey": "nodekey:abababababababababababababababababababababababababababababababab",
+            "HostName": "edge-03",
+            "DNSName": "edge-03.tailnet-4c1f.ts.net.",
+            "OS": "linux",
+            "TailscaleIPs": [
+              "100.101.102.103",
+              "fd7a:115c:a1e0::1"
+            ],
+            "Online": false,
+            "KeyExpiry": "2026-08-01T00:00:00Z"
+          },
+          "Peer": null
+        }
+      },
+      "payload": {
+        "tailscale": {
+          "backend_state": "NeedsLogin",
+          "self": {
+            "hostname": "edge-03",
+            "key_expiry": "2026-08-01T00:00:00Z",
+            "online": false
+          },
+          "peers_total": 0,
+          "peers_online": 0
+        }
+      }
+    },
+    "no_expiry": {
+      "description": "Key expiry DISABLED for this node in the admin console. key_expiry is null, which means 'never expires' -- NOT 'unknown'. The server stores nil and emits NO tailscale_key_expiry_days sample (an honest gap; a fabricated large number would read as a real countdown).",
+      "config": {
+        "wireguard": false,
+        "tailscale": true
+      },
+      "raw": {
+        "tailscale_status_json": {
+          "Version": "1.86.2-t01e4dc5f2",
+          "TUN": true,
+          "BackendState": "Running",
+          "TailscaleIPs": [
+            "100.101.102.103",
+            "fd7a:115c:a1e0::1"
+          ],
+          "MagicDNSSuffix": "tailnet-4c1f.ts.net",
+          "Self": {
+            "ID": "nSelf04",
+            "PublicKey": "nodekey:abababababababababababababababababababababababababababababababab",
+            "HostName": "edge-04",
+            "DNSName": "edge-04.tailnet-4c1f.ts.net.",
+            "OS": "linux",
+            "TailscaleIPs": [
+              "100.101.102.103",
+              "fd7a:115c:a1e0::1"
+            ],
+            "Online": true
+          },
+          "Peer": {
+            "nodekey:0101010101010101010101010101010101010101010101010101010101010101": {
+              "HostName": "peer-01",
+              "OS": "linux",
+              "Online": true
+            },
+            "nodekey:0202020202020202020202020202020202020202020202020202020202020202": {
+              "HostName": "peer-02",
+              "OS": "macOS",
+              "Online": true
+            },
+            "nodekey:0303030303030303030303030303030303030303030303030303030303030303": {
+              "HostName": "peer-03",
+              "OS": "linux",
+              "Online": true
+            }
+          }
+        }
+      },
+      "payload": {
+        "tailscale": {
+          "backend_state": "Running",
+          "self": {
+            "hostname": "edge-04",
+            "key_expiry": null,
+            "online": true
+          },
+          "peers_total": 3,
+          "peers_online": 3
+        }
+      }
+    },
+    "zero_peers": {
+      "description": "`wg` succeeded and the host genuinely has an interface with no peers configured. The empty peers array is the documented PRUNE-ALL, and the interface still reports so wireguard_peers_total{wg0} reads an honest 0.",
+      "config": {
+        "wireguard": true,
+        "tailscale": false
+      },
+      "raw": {
+        "now": 1786708800,
+        "wg_show_all_dump": "wg0\tYWdlbnQtbXVzdC1uZXZlci10cmFuc21pdC10aGlzISE=\td2cwLWludGVyZmFjZS1wdWJsaWMta2V5LTMyYnl0ZXM=\t51820\toff\n",
+        "wg_quick_configs": {}
+      },
+      "payload": {
+        "wireguard": {
+          "interfaces": [
+            {
+              "name": "wg0",
+              "listen_port": 51820,
+              "peer_count": 0
+            }
+          ],
+          "peers": []
+        }
+      }
+    },
+    "collection_failure": {
+      "description": "`wg` is missing / the agent lacks CAP_NET_ADMIN / the command timed out, AND tailscaled's socket is unreachable. BOTH keys are null. The server MUST touch nothing: no peer prune, no denormalized-Tailscale write, no false-resolve of an open wireguard_peer_stale incident.",
+      "config": {
+        "wireguard": true,
+        "tailscale": true
+      },
+      "raw": {
+        "now": 1786708800,
+        "wg_show_all_dump": null,
+        "wg_quick_configs": {},
+        "tailscale_status_json": null
+      },
+      "payload": {
+        "wireguard": null,
+        "tailscale": null
+      }
+    }
+  }
+}
