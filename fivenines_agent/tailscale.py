@@ -131,8 +131,28 @@ def _run_status():
     # keys are about to expire, which is the one outage this collector exists to
     # catch. No Self means no reading: report null and let the server keep the
     # last known good block.
-    if not isinstance(parsed.get("Self"), dict):
+    self_raw = parsed.get("Self")
+    if not isinstance(self_raw, dict):
         log("Tailscale: status document carried no Self block", "error")
+        return None
+
+    # Same argument one level down. ABSENT or null KeyExpiry is the legitimate
+    # "expiry disabled" reading (Go's omitempty on a nil *time.Time). But a
+    # KeyExpiry that is PRESENT and not a string is a shape change, and mapping
+    # it to None would again publish "expiry disabled" for a node that may be
+    # days from dropping off the tailnet.
+    expiry = self_raw.get("KeyExpiry")
+    if expiry is not None and not isinstance(expiry, str):
+        log(f"Tailscale: KeyExpiry was {type(expiry).__name__}, not a string", "error")
+        return None
+
+    # And once more for the peer map. Absent or null Peer is the legitimate
+    # logged-out reading (0/0). A Peer that is present but not an object is a
+    # shape change, and silently counting it as zero would report an empty
+    # tailnet the node cannot actually see.
+    peers = parsed.get("Peer")
+    if peers is not None and not isinstance(peers, dict):
+        log(f"Tailscale: Peer was {type(peers).__name__}, not an object", "error")
         return None
 
     return parsed
@@ -202,12 +222,10 @@ def tailscale_metrics():
     if status is None:
         return None
 
-    # _run_status has already established that Self is a dict.
+    # _run_status has already established that Self is a dict, that KeyExpiry
+    # is absent/null/str, and that Peer is absent/null/dict.
     self_raw = status["Self"]
-
-    peers = status.get("Peer")
-    if not isinstance(peers, dict):
-        peers = {}
+    peers = status.get("Peer") or {}
     peers_online = sum(
         1 for peer in peers.values() if isinstance(peer, dict) and peer.get("Online")
     )

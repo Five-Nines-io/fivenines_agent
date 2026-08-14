@@ -177,10 +177,23 @@ def test_missing_self_block_is_a_collection_failure(ts, self_block):
     assert tailscale_metrics() is None
 
 
-def test_non_dict_peer_map_reads_zero(ts):
-    ts(document=_status(Peer=["unexpected"]))
-    payload = tailscale_metrics()
-    assert (payload["peers_total"], payload["peers_online"]) == (0, 0)
+@pytest.mark.parametrize("peer_block", [["unexpected"], "junk", 7])
+def test_non_dict_peer_map_is_a_collection_failure(ts, peer_block):
+    """Absent/null Peer is the legitimate logged-out reading (0/0, see
+    needs_login). A Peer that is present but not an object is a shape change,
+    and counting it as zero would report an empty tailnet the node cannot
+    actually see."""
+    ts(document=_status(Peer=peer_block))
+    assert tailscale_metrics() is None
+
+
+@pytest.mark.parametrize("expiry", [1786708800, {"at": "soon"}, []])
+def test_non_string_key_expiry_is_a_collection_failure(ts, expiry):
+    """Absent/null KeyExpiry means expiry is DISABLED. A present-but-wrong-type
+    KeyExpiry is a shape change, and mapping it to None would publish "expiry
+    disabled" for a node that may be days from dropping off the tailnet."""
+    ts(document=_status(Self={"HostName": "edge", "Online": True, "KeyExpiry": expiry}))
+    assert tailscale_metrics() is None
 
 
 def test_non_dict_peer_entries_are_not_counted_online(ts):
