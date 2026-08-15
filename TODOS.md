@@ -1,5 +1,27 @@
 # TODOS
 
+## P1: Reconcile the server's copy of vpn_contract_payload.json
+
+The VPN contract fixture (#127 / server #508) was authored server-first with the
+scenario `raw` blocks as PLACEHOLDER STRINGS, and its own description says
+"reconcile byte-for-byte with the agent PR before the agent ships". The agent PR
+filled them in with the real `wg show all dump` / `tailscale status --json`
+inputs, added a `raw_contract` key documenting them, and updated one sentence of
+`description`. Everything the server actually READS (`agent_min_version`, the
+five contract docs, and every scenario's `description` / `config` / `payload`)
+is already byte-identical and was verified programmatically, so nothing is
+broken today -- but the two copies have drifted in the agent-side inputs and the
+lockstep discipline says they must not.
+
+Fix: copy `tests/fixtures/vpn_contract_payload.json` over
+`fivenines-server/spec/fixtures/vpn_contract_payload.json`. The server's
+`spec/requests/api_collect_vpn_spec.rb` only reads `scenarios.*.payload`, so the
+copy cannot break its suite.
+
+- **Effort:** XS (human) / XS (CC)
+- **Depends on:** agent PR for #127 merged
+- **Files:** `fivenines-server/spec/fixtures/vpn_contract_payload.json` (NOT this repo)
+
 ## P2: Log monitoring - flat-file (non-journald) source (E2)
 
 Deferred from `ceo-plans/2026-06-30-log-file-monitoring.md` at the Codex

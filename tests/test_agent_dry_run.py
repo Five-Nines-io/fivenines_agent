@@ -76,6 +76,16 @@ def test_dry_run_config_includes_zfs():
     assert _DRY_RUN_CONFIG.get("zfs")  # present and truthy
 
 
+def test_dry_run_config_includes_vpn_collectors():
+    """WireGuard and Tailscale are host-local collectors with no external config
+    (the zfs/fail2ban class), so --dry-run must exercise them. Same regression
+    class as systemd/zfs/docker: without the key, collect_metrics' `if not
+    config_value` gate silently skips them and `--dry-run` -- the documented way
+    to see what the agent collects -- shows no VPN payload at all."""
+    assert _DRY_RUN_CONFIG.get("wireguard")  # present and truthy
+    assert _DRY_RUN_CONFIG.get("tailscale")  # present and truthy
+
+
 def test_dry_run_config_includes_docker():
     """The Docker collector had NO key in _DRY_RUN_CONFIG, so --dry-run never
     exercised it. Must be truthy (not {}, which collect_metrics' `if not
