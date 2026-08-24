@@ -341,6 +341,50 @@ is to actually decide them with the server side.
 - **Depends on:** server `/image_packages` ingester shipped
 - **Files:** `fivenines_agent/docker_image_inventory.py` (`_payload`), `tests/fixtures/docker_image_inventory_contract_payload.json`, server ingester
 
+## P2: Surface package-inventory staleness (a host that stopped sending)
+
+Raised by the adversarial pass on #123. `packages_sync` deliberately sends
+NOTHING when a package read is untrustworthy (a corrupt rpmdb, a format change,
+a broken header): stale-but-honest inventory beats a short list, because
+`Osv::ScanHostJob` deletes the findings that no longer match and a dropped row
+reads as "fixed". The cost is that such a host goes QUIET, and today nothing
+notices -- the server ignores the agent's `_telemetry` block entirely, and
+`last_packages_received_at` is only read to decide whether to re-request a
+scan, never rendered.
+
+So the honest failure mode is currently an invisible one. The data already
+exists server-side; it needs surfacing: flag a host whose
+`last_packages_received_at` is older than N days on /security (and/or ingest
+`_telemetry[*].errors`, which is where the agent already reports the reason).
+
+- **Effort:** S (human) / S (CC)
+- **Depends on:** nothing
+- **Files:** fivenines_server (`/security` view, `Host#last_packages_received_at`), optionally `_telemetry` ingestion
+
+## P2: Verify RHEL-family CVE scanning end to end on a live host
+
+Agent #123 shipped epoch-qualified `rpm -qa` collection, and the server side
+(#736 stack, fivenines_server #739-#742) has been merged and dormant for a
+while. The only part of the issue that could not be verified pre-merge is the
+one that needs both halves running: a real RHEL/Alma/Rocky host with a known
+vulnerable package should produce findings on /security, and a package whose
+only fix is EUS/AUS-gated should render "requires subscription" rather than a
+bare affected.
+
+The comparator half WAS verified locally by running the server's own
+`Osv::PackageScanner.version_compare` against the agent's output: a patched
+host reads VULNERABLE under the old epoch-less format and clear under the new
+one. What remains is the live round trip.
+
+Note the one-time effect on upgrade: every RHEL-family host's `packages_hash`
+changes on the first tick after 1.17.x (epochs enter the string), so each one
+re-POSTs its inventory once and re-scans. Expected, and it is what clears the
+stale false positives.
+
+- **Effort:** S (human) / S (CC)
+- **Depends on:** agent 1.17.x reaching a RHEL host
+- **Files:** none in this repo -- verification only (`/security` page, `Osv::SecurityScan`)
+
 ## P3: RPM package extraction for image inventory (phase 1.5)
 
 Phase 1 covers dpkg + apk. RPM images (AlmaLinux, Rocky, RHEL, Fedora, Amazon
