@@ -1,0 +1,326 @@
+{
+  "description": "Shared Ubuntu Pro attachment contract fixture between fivenines-agent and fivenines-server (server #746, the #736 follow-up). Authored SERVER-FIRST as the specification and reconciled with the agent PR (agent #125), which is now the SOURCE OF TRUTH: each scenario's 'raw' is fed back through the real collector with ONLY the subprocess / status-file boundary mocked, and must produce scenario['payload']. The server's spec/requests/api_collect_ubuntu_pro_spec.rb posts scenario['payload'] under data['ubuntu_pro'] through /collect and asserts the resulting hosts.ubuntu_pro_* columns. 'raw' is an agent-side input the server ignores. Keep the two copies byte-identical and change the payload shape only in lockstep.",
+  "agent_min_version": "1.16.1",
+  "_agent_min_version_note": "The agent release that FIRST ships the collector. Nothing gates on it: there is no FEATURES_SUPPORTED_VERSIONS entry and no config key, so an older agent simply never sends data['ubuntu_pro'] and the server preserves NULL (= 'never reported', which behaves exactly like pre-#746). The server could therefore ship first, in any order, and did.",
+  "_reconciliation_note": "Two deliberate divergences from the server-authored draft, both agent-verified against the real `pro` client. (1) agent_min_version 1.15.1 -> 1.16.1. (2) attached_full services ['esm-infra','esm-apps'] -> ['esm-apps','esm-infra']: u.pro.status.enabled_services.v1 returns `sorted(enabled_services, key=lambda x: x.name)` and the collector sorts again so the payload is stable across `pro` versions and across the two collection sources. api_collect_ubuntu_pro_spec.rb hard-codes %w[esm-infra esm-apps] in five examples and needs the same flip.",
+  "collection_contract": "The agent reads `pro api u.pro.status.is_attached.v1` and `pro api u.pro.status.enabled_services.v1` (falling back to /var/lib/ubuntu-advantage/status.json) and reports BOTH: attachment alone is not enough, because a machine can be attached with every service disabled and each OSV Ubuntu Pro ecosystem maps to a specific archive pocket that a specific SERVICE opens (esm-infra does not unlock a FIPS-only fix). Values are the `pro` service names verbatim, lowercase: esm-infra, esm-apps, fips, fips-updates, fips-preview, realtime-kernel, usg, livepatch, cis, ros, ros-updates, anbox-cloud, landscape, cc-eal. ONLY ENABLED services are listed - an entitled-but-disabled service opens no pocket, and neither does one in the 'warning' state. The server matches them against Osv::SubscriptionEcosystems and ignores anything it does not recognise, so the agent must never filter the list to a known set.",
+  "null_contract": "data['ubuntu_pro'] = null means COULD NOT DETERMINE (the `pro` CLI is absent, timed out, or errored) and the server PRESERVES the stored columns - it never writes false. The same is true of an absent key (a pre-#746 agent). Only an explicit boolean `attached` is written. This is the never-prune-on-null discipline applied to a boolean: a timed-out `pro status` is not evidence a machine detached, and treating it as one would bounce that host's ESM findings between the work queue and the subscription bucket on every hiccup - each flip a digest change, a findings rewrite, and a rescan. Agent-side the same rule runs one level deeper: a successful attachment read whose SERVICE LIST could not be read is also null, never {'attached': true, 'services': []} - that shape is a real state ('attached, everything disabled') and sending it for an unread list would silently keep a Pro customer's installable fixes filed as unfixable.",
+  "cadence_note": "This rides /collect (every interval), not /packages. The agent MUST cache the `pro` result and re-read it at most every few minutes rather than shelling out per tick - the value changes about once in a machine's lifetime, and /collect runs every 15-60s. The agent caches for 900s, FAILURES INCLUDED, so a wedged `pro` cannot be re-spawned every tick. The server reads the stored columns at scan time (Host#subscription_services), so a few minutes of staleness costs nothing.",
+  "raw_contract": "Agent-side inputs the server ignores (it reads only 'payload'). Each scenario is round-tripped TWICE, once per collection source, and both must produce the same payload. 'pro_api' maps an endpoint to the JSON envelope `pro api <endpoint>` prints on stdout (null for the whole object = `pro` is not on PATH); u.pro.status.enabled_services.v1 is ABSENT from a detached scenario on purpose, because the collector must not spawn a second process once is_attached says false - the endpoint itself short-circuits on the same check. 'status_json' is the content of /var/lib/ubuntu-advantage/status.json, the fallback source for a client too old to implement the endpoints or a `pro` off the agent's PATH (null = the file is absent). The two `pro api` envelopes are verbatim-shaped, including the fields the collector ignores (meta, warnings, contract_remaining_days, variant_enabled), so a future shape change shows up here.",
+  "field_contract": {
+    "ubuntu_pro": "The whole block, or null for COULD NOT DETERMINE. Never {'attached': false} on a collection failure, and never emitted at all by a Windows agent.",
+    "ubuntu_pro.attached": "A real JSON boolean - whether this machine is attached to an Ubuntu Pro subscription. The server refuses anything else and preserves instead of guessing, so a truthy STRING can never read as attached.",
+    "ubuntu_pro.services": "The `pro` names of the services that are ENABLED, lowercased, deduped and sorted. Empty for a detached machine, and empty for an attached one with every service disabled - the two are distinguished by `attached`, not by this list. Not filtered to a known set: an unrecognised token is inert server-side, which is what keeps a service Canonical adds later from needing an agent release."
+  },
+  "scenarios": {
+    "attached_full": {
+      "description": "The common shape: a machine attached to Ubuntu Pro with the two services `pro attach` enables by default. The server writes attached=true + both services; an Ubuntu:Pro:<release>:LTS fix then partitions as installable and its findings move into the work queue.",
+      "raw": {
+        "pro_api": {
+          "u.pro.status.is_attached.v1": {
+            "_schema_version": "v1",
+            "data": {
+              "attributes": {
+                "contract_remaining_days": 360,
+                "contract_status": "active",
+                "is_attached": true,
+                "is_attached_and_contract_valid": true
+              },
+              "meta": {
+                "environment_vars": []
+              },
+              "type": "IsAttached"
+            },
+            "errors": [],
+            "result": "success",
+            "version": "35.1",
+            "warnings": []
+          },
+          "u.pro.status.enabled_services.v1": {
+            "_schema_version": "v1",
+            "data": {
+              "attributes": {
+                "enabled_services": [
+                  {
+                    "name": "esm-apps",
+                    "variant_enabled": false,
+                    "variant_name": null
+                  },
+                  {
+                    "name": "esm-infra",
+                    "variant_enabled": false,
+                    "variant_name": null
+                  }
+                ]
+              },
+              "meta": {
+                "environment_vars": []
+              },
+              "type": "EnabledServices"
+            },
+            "errors": [],
+            "result": "success",
+            "version": "35.1",
+            "warnings": []
+          }
+        },
+        "status_json": {
+          "_schema_version": "0.1",
+          "attached": true,
+          "version": "35.1",
+          "execution_status": "inactive",
+          "services": [
+            {
+              "name": "anbox-cloud",
+              "available": "no",
+              "entitled": "no",
+              "status": "n/a"
+            },
+            {
+              "name": "esm-apps",
+              "available": "yes",
+              "entitled": "yes",
+              "status": "enabled"
+            },
+            {
+              "name": "esm-infra",
+              "available": "yes",
+              "entitled": "yes",
+              "status": "enabled"
+            },
+            {
+              "name": "fips-updates",
+              "available": "yes",
+              "entitled": "yes",
+              "status": "disabled"
+            },
+            {
+              "name": "livepatch",
+              "available": "yes",
+              "entitled": "yes",
+              "status": "disabled"
+            },
+            {
+              "name": "usg",
+              "available": "yes",
+              "entitled": "yes",
+              "status": "disabled"
+            }
+          ]
+        }
+      },
+      "payload": {
+        "attached": true,
+        "services": ["esm-apps", "esm-infra"]
+      }
+    },
+    "attached_fips_only": {
+      "description": "Attached with a FIPS service but WITHOUT esm-infra/esm-apps - the granularity case the issue calls out, in its harder direction. Ubuntu:Pro:FIPS-updates:<release> fixes become installable; plain Ubuntu:Pro:<release> ESM fixes stay gated.",
+      "raw": {
+        "pro_api": {
+          "u.pro.status.is_attached.v1": {
+            "_schema_version": "v1",
+            "data": {
+              "attributes": {
+                "contract_remaining_days": 712,
+                "contract_status": "active",
+                "is_attached": true,
+                "is_attached_and_contract_valid": true
+              },
+              "meta": {
+                "environment_vars": []
+              },
+              "type": "IsAttached"
+            },
+            "errors": [],
+            "result": "success",
+            "version": "35.1",
+            "warnings": []
+          },
+          "u.pro.status.enabled_services.v1": {
+            "_schema_version": "v1",
+            "data": {
+              "attributes": {
+                "enabled_services": [
+                  {
+                    "name": "fips-updates",
+                    "variant_enabled": false,
+                    "variant_name": null
+                  }
+                ]
+              },
+              "meta": {
+                "environment_vars": []
+              },
+              "type": "EnabledServices"
+            },
+            "errors": [],
+            "result": "success",
+            "version": "35.1",
+            "warnings": []
+          }
+        },
+        "status_json": {
+          "_schema_version": "0.1",
+          "attached": true,
+          "version": "35.1",
+          "execution_status": "inactive",
+          "services": [
+            {
+              "name": "esm-apps",
+              "available": "yes",
+              "entitled": "yes",
+              "status": "disabled"
+            },
+            {
+              "name": "esm-infra",
+              "available": "yes",
+              "entitled": "yes",
+              "status": "disabled"
+            },
+            {
+              "name": "fips",
+              "available": "yes",
+              "entitled": "yes",
+              "status": "disabled"
+            },
+            {
+              "name": "fips-updates",
+              "available": "yes",
+              "entitled": "yes",
+              "status": "enabled"
+            }
+          ]
+        }
+      },
+      "payload": {
+        "attached": true,
+        "services": ["fips-updates"]
+      }
+    },
+    "attached_no_services": {
+      "description": "Attached but every service disabled (`pro disable esm-infra esm-apps`). Attachment alone unlocks NOTHING: no pocket is open, so every gated finding stays in the subscription bucket. This is why the server keys on the service list rather than on the boolean. Note this is the one payload an agent must NEVER fabricate: it is what an unread service list would look like.",
+      "raw": {
+        "pro_api": {
+          "u.pro.status.is_attached.v1": {
+            "_schema_version": "v1",
+            "data": {
+              "attributes": {
+                "contract_remaining_days": 88,
+                "contract_status": "active",
+                "is_attached": true,
+                "is_attached_and_contract_valid": true
+              },
+              "meta": {
+                "environment_vars": []
+              },
+              "type": "IsAttached"
+            },
+            "errors": [],
+            "result": "success",
+            "version": "35.1",
+            "warnings": []
+          },
+          "u.pro.status.enabled_services.v1": {
+            "_schema_version": "v1",
+            "data": {
+              "attributes": {
+                "enabled_services": []
+              },
+              "meta": {
+                "environment_vars": []
+              },
+              "type": "EnabledServices"
+            },
+            "errors": [],
+            "result": "success",
+            "version": "35.1",
+            "warnings": []
+          }
+        },
+        "status_json": {
+          "_schema_version": "0.1",
+          "attached": true,
+          "version": "35.1",
+          "execution_status": "inactive",
+          "services": [
+            {
+              "name": "esm-apps",
+              "available": "yes",
+              "entitled": "yes",
+              "status": "disabled"
+            },
+            {
+              "name": "esm-infra",
+              "available": "yes",
+              "entitled": "yes",
+              "status": "disabled"
+            }
+          ]
+        }
+      },
+      "payload": {
+        "attached": true,
+        "services": []
+      }
+    },
+    "detached": {
+      "description": "`pro` is installed and reports the machine is not attached. Written as false, which is distinct from NULL: the host card can say 'not attached' rather than stay silent, and the effect on findings is identical to pre-#746. The enabled_services endpoint is absent from 'raw' on purpose - the collector must answer from the attachment call alone.",
+      "raw": {
+        "pro_api": {
+          "u.pro.status.is_attached.v1": {
+            "_schema_version": "v1",
+            "data": {
+              "attributes": {
+                "contract_remaining_days": 0,
+                "contract_status": null,
+                "is_attached": false,
+                "is_attached_and_contract_valid": false
+              },
+              "meta": {
+                "environment_vars": []
+              },
+              "type": "IsAttached"
+            },
+            "errors": [],
+            "result": "success",
+            "version": "35.1",
+            "warnings": []
+          }
+        },
+        "status_json": {
+          "_schema_version": "0.1",
+          "attached": false,
+          "version": "35.1",
+          "execution_status": "inactive",
+          "services": [
+            {
+              "name": "esm-apps",
+              "available": "yes",
+              "entitled": "no",
+              "status": "n/a"
+            },
+            {
+              "name": "esm-infra",
+              "available": "yes",
+              "entitled": "no",
+              "status": "n/a"
+            }
+          ]
+        }
+      },
+      "payload": {
+        "attached": false,
+        "services": []
+      }
+    },
+    "collection_failure": {
+      "description": "`pro` is absent (not an Ubuntu host, or ubuntu-advantage-tools not installed) and there is no status cache on disk either - or the calls failed. The whole key is null and the server leaves the stored columns untouched.",
+      "raw": {
+        "pro_api": null,
+        "status_json": null
+      },
+      "payload": null
+    }
+  }
+}

@@ -1,5 +1,36 @@
 # TODOS
 
+## P1: Reconcile the server's copy of ubuntu_pro_contract_payload.json
+
+**Tracked server-side as fivenines_server#855** -- the work happens in that repo,
+this entry is the agent-side record of why.
+
+The Ubuntu Pro fixture (#125 / server #746) was authored server-first as the
+specification, with no `raw` block and its own description saying "copy the
+agent's over this file BYTE-FOR-BYTE when the agent PR lands". The agent PR added
+the `raw` inputs (real `pro api` envelopes + status-cache content), a
+`raw_contract` and a `field_contract`, and reconciled two values that the server
+copy got wrong:
+
+- `agent_min_version` 1.15.1 (marked PROVISIONAL there) -> `1.16.1`.
+- `attached_full.payload.services` `["esm-infra","esm-apps"]` ->
+  `["esm-apps","esm-infra"]`. `u.pro.status.enabled_services.v1` returns
+  `sorted(enabled_services, key=lambda x: x.name)` and the collector sorts again
+  for stability, so the server draft's order is not one a real host can produce.
+
+Fix: copy `tests/fixtures/ubuntu_pro_contract_payload.json` over
+`fivenines-server/spec/fixtures/ubuntu_pro_contract_payload.json`, then flip the
+five hard-coded `%w[esm-infra esm-apps]` assertions in
+`spec/requests/api_collect_ubuntu_pro_spec.rb` to `%w[esm-apps esm-infra]`.
+Nothing is broken until then -- the server reads only `scenarios.*.payload` and
+its assertions are literals, not fixture-derived -- but the two copies have
+drifted and the lockstep discipline says they must not.
+
+- **Effort:** XS (human) / XS (CC)
+- **Depends on:** agent PR for #125 merged
+- **Files:** `fivenines-server/spec/fixtures/ubuntu_pro_contract_payload.json`,
+  `fivenines-server/spec/requests/api_collect_ubuntu_pro_spec.rb` (NOT this repo)
+
 ## P1: Reconcile the server's copy of vpn_contract_payload.json
 
 The VPN contract fixture (#127 / server #508) was authored server-first with the
