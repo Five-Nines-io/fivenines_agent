@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
+from fivenines_agent.debug import start_log_capture, stop_log_capture
 from fivenines_agent.packages import (
     _get_packages_apk,
     _get_packages_dpkg,
@@ -157,13 +158,153 @@ def test_get_packages_dpkg_empty_lines(mock_run, mock_env):
 def test_get_packages_rpm_success(mock_run, mock_env):
     mock_run.return_value = MagicMock(
         returncode=0,
-        stdout="openssl\t3.0.11-1.el9\nbash\t5.2.15-3.el9\n",
+        stdout="openssl\t1\t3.0.7-24.el9\nbash\t(none)\t5.2.15-3.el9\n",
     )
     result = _get_packages_rpm()
     assert result == [
-        {"name": "openssl", "version": "3.0.11-1.el9"},
+        {"name": "openssl", "version": "1:3.0.7-24.el9"},
         {"name": "bash", "version": "5.2.15-3.el9"},
     ]
+    mock_run.assert_called_once()
+    args = mock_run.call_args
+    assert args[0][0] == [
+        "rpm",
+        "-qa",
+        "--queryformat",
+        "%{NAME}\t%{EPOCH}\t%{VERSION}-%{RELEASE}\n",
+    ]
+    assert args[1]["timeout"] == 30
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_rpm_pins_the_locale(mock_run, mock_env):
+    """The parser matches rpm's "(none)" byte-for-byte and get_clean_env passes
+    the host's LANG/LC_* through, so the locale is pinned at the call site. A
+    localized sentinel would fail every no-epoch line -- i.e. every package."""
+    mock_run.return_value = MagicMock(returncode=0, stdout="bash\t(none)\t5.2.15-3.el9\n")
+    _get_packages_rpm()
+    assert mock_run.call_args[1]["env"]["LC_ALL"] == "C"
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_rpm_keeps_epoch(mock_run, mock_env):
+    """An epoch-carrying package MUST ship its epoch: the RHEL advisory feeds
+    quote fix versions as '2:8.2.2637-21.el9' and the server compares a missing
+    epoch as 0, so dropping it pins the package below every fix forever."""
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout="vim-enhanced\t2\t8.2.2637-21.el9\n",
+    )
+    assert _get_packages_rpm() == [
+        {"name": "vim-enhanced", "version": "2:8.2.2637-21.el9"}
+    ]
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_rpm_omits_zero_epoch(mock_run, mock_env):
+    """'(none)' and an explicit '0' are the same version to RPM and to the
+    server, so both send the short form -- one canonical spelling per package."""
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout="zlib\t0\t1.2.11-40.el9\nglibc\t(none)\t2.34-125.el9\n",
+    )
+    assert _get_packages_rpm() == [
+        {"name": "zlib", "version": "1.2.11-40.el9"},
+        {"name": "glibc", "version": "2.34-125.el9"},
+    ]
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_rpm_skips_gpg_pubkey(mock_run, mock_env):
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout=(
+            "gpg-pubkey\t(none)\t3228467c-613798eb\n"
+            "gpg-pubkey\t(none)\tfd431d51-4ae0493b\n"
+            "bash\t(none)\t5.2.15-3.el9\n"
+        ),
+    )
+    assert _get_packages_rpm() == [{"name": "bash", "version": "5.2.15-3.el9"}]
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_rpm_collapses_multiarch_duplicates(mock_run, mock_env):
+    """glibc.i686 + glibc.x86_64 at the same NEVR are one package once arch is
+    dropped; a partially-updated pair keeps both rows."""
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout=(
+            "glibc\t(none)\t2.34-125.el9\n"
+            "glibc\t(none)\t2.34-125.el9\n"
+            "libstdc++\t(none)\t11.4.1-3.el9\n"
+            "libstdc++\t(none)\t11.4.1-2.el9\n"
+        ),
+    )
+    assert _get_packages_rpm() == [
+        {"name": "glibc", "version": "2.34-125.el9"},
+        {"name": "libstdc++", "version": "11.4.1-3.el9"},
+        {"name": "libstdc++", "version": "11.4.1-2.el9"},
+    ]
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_rpm_keeps_multiple_kernels(mock_run, mock_env):
+    """An old kernel that is still installed is still a finding."""
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout="kernel\t(none)\t5.14.0-284.el9\nkernel\t(none)\t5.14.0-362.el9\n",
+    )
+    assert _get_packages_rpm() == [
+        {"name": "kernel", "version": "5.14.0-284.el9"},
+        {"name": "kernel", "version": "5.14.0-362.el9"},
+    ]
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_rpm_blank_lines_are_tolerated(mock_run, mock_env):
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout="\nbash\t(none)\t5.2.15-3.el9\n\n",
+    )
+    assert _get_packages_rpm() == [{"name": "bash", "version": "5.2.15-3.el9"}]
+
+
+@pytest.mark.parametrize(
+    "stdout",
+    [
+        # A dropped field (a format change, or a truncated read).
+        "bash\t5.2.15-3.el9\nopenssl\t1\t3.0.7-24.el9\n",
+        # An extra field.
+        "bash\t(none)\t5.2.15-3.el9\tx86_64\nopenssl\t1\t3.0.7-24.el9\n",
+        # An epoch that is not a plain integer.
+        "bash\tnot-an-epoch\t5.2.15-3.el9\n",
+        # Non-ASCII digits (superscript two): str.isdigit() alone accepts these.
+        # Spelled with chr() to keep this file ASCII-only, as the repo requires.
+        "bash\t" + chr(0xB2) + "\t5.2.15-3.el9\n",
+        # An empty name or version.
+        "\t(none)\t5.2.15-3.el9\n",
+        "bash\t(none)\t\n",
+        # A broken header printing rpm's unset sentinel where a version belongs.
+        "bash\t(none)\t(none)-(none)\n",
+    ],
+)
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_rpm_discards_whole_read_on_malformed_line(
+    mock_run, mock_env, stdout
+):
+    """One unparseable line fails the whole read. The server replaces a host's
+    package set with whatever arrives, so shipping the lines we did understand
+    would auto-resolve the vulnerabilities of the ones we did not."""
+    mock_run.return_value = MagicMock(returncode=0, stdout=stdout)
+    assert _get_packages_rpm() == []
 
 
 @patch("fivenines_agent.packages.get_clean_env", return_value={})
@@ -172,6 +313,63 @@ def test_get_packages_rpm_failure(mock_run, mock_env):
     mock_run.return_value = MagicMock(returncode=1, stderr="error")
     result = _get_packages_rpm()
     assert result == []
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_rpm_bounds_the_stderr_it_logs(mock_run, mock_env):
+    """rpm against a corrupt Berkeley DB prints one error line per package, and
+    this message rides the telemetry payload like the parse rejection above."""
+    mock_run.return_value = MagicMock(returncode=1, stderr="boom\n" * 20_000)
+    start_log_capture()
+    try:
+        assert _get_packages_rpm() == []
+        errors = stop_log_capture()
+    finally:
+        stop_log_capture()
+    assert len(errors) == 1
+    assert len(errors[0]) < 300
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_rpm_empty(mock_run, mock_env):
+    mock_run.return_value = MagicMock(returncode=0, stdout="")
+    assert _get_packages_rpm() == []
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_rpm_bounds_the_rejected_line_it_logs(mock_run, mock_env):
+    """The rejection message is captured into _telemetry["packages_sync"]
+    ["errors"] and shipped in the next tick's payload, so a corrupt rpmdb
+    emitting a huge line must not inflate the metrics POST."""
+    mock_run.return_value = MagicMock(returncode=0, stdout="x" * 100_000 + "\n")
+    start_log_capture()
+    try:
+        assert _get_packages_rpm() == []
+        errors = stop_log_capture()
+    finally:
+        stop_log_capture()
+    assert len(errors) == 1
+    # 200 chars of payload + repr quotes + the fixed prefix, nowhere near 100k.
+    assert len(errors[0]) < 300
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_rpm_trusts_a_read_that_warned_on_stderr(mock_run, mock_env):
+    """Deliberately NOT the wireguard rule (there, any stderr means a partial
+    dump). rpm routinely warns on stderr while exiting 0 with a complete list
+    -- 'found bdb Packages database while attempting sqlite backend' being the
+    common one -- and discarding those reads would blind whole distro
+    generations. Exit code and the parse are the gates, not stderr."""
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout="bash\t(none)\t5.2.15-3.el9\n",
+        stderr="warning: Found bdb Packages database while attempting sqlite backend\n",
+    )
+    assert _get_packages_rpm() == [{"name": "bash", "version": "5.2.15-3.el9"}]
 
 
 # --- _get_packages_apk ---
@@ -364,6 +562,24 @@ def test_get_installed_packages_synopkg(mock_synopkg, mock_which):
     mock_synopkg.return_value = [{"name": "ContainerManager", "version": "20.10.0-1001"}]
     result = get_installed_packages()
     assert result == [{"name": "ContainerManager", "version": "20.10.0-1001"}]
+
+
+@patch("fivenines_agent.packages.shutil.which")
+@patch("fivenines_agent.packages._get_packages_rpm")
+def test_get_installed_packages_sorts_same_name_by_version(mock_rpm, mock_which):
+    """rpm -qa does not order its output, so a repeated name (several kernels)
+    must be ordered by version too or the delta hash flaps between ticks."""
+    mock_which.side_effect = lambda cmd: "/usr/bin/rpm" if cmd == "rpm" else None
+    mock_rpm.return_value = [
+        {"name": "kernel", "version": "5.14.0-362.el9"},
+        {"name": "bash", "version": "5.2.15-3.el9"},
+        {"name": "kernel", "version": "5.14.0-284.el9"},
+    ]
+    assert get_installed_packages() == [
+        {"name": "bash", "version": "5.2.15-3.el9"},
+        {"name": "kernel", "version": "5.14.0-284.el9"},
+        {"name": "kernel", "version": "5.14.0-362.el9"},
+    ]
 
 
 @patch("fivenines_agent.packages.shutil.which", return_value=None)
