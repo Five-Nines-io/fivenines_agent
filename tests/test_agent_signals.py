@@ -1,8 +1,9 @@
-"""Tests for setup_signals() and the OS-aware file-handles dispatch.
+"""Tests for setup_signals() and the OS-aware collector dispatch.
 
 SIGHUP must be guarded so the agent imports and runs on Windows. The
 _collect_file_handles dispatch (D2 + D10) emits Linux file-nr keys on Linux
-and the Windows handle-count key on Windows - never both."""
+and the Windows handle-count key on Windows - never both. The Ubuntu Pro
+block rides the same Linux-only branch."""
 
 import signal as real_signal
 import sys
@@ -95,3 +96,46 @@ def test_collect_file_handles_windows_emits_handle_count_only():
     assert data["handle_count"] == 12345
     assert "file_handles_used" not in data
     assert "file_handles_limit" not in data
+
+
+# --- Ubuntu Pro dispatch (server #746) ---
+
+
+def _run_collect_metrics(windows, reading):
+    """Run _collect_metrics with every other collector stubbed out."""
+    agent = _bare_agent()
+    agent.config = {}
+    agent.permissions = MagicMock()
+    agent.permissions.get_all.return_value = {}
+    data = {}
+    with patch("fivenines_agent.agent.is_windows", return_value=windows), \
+         patch("fivenines_agent.agent.load_average", return_value=[0.0, 0.0, 0.0]), \
+         patch("fivenines_agent.agent.handle_count", return_value=1), \
+         patch("fivenines_agent.agent.file_handles_used", return_value=1), \
+         patch("fivenines_agent.agent.file_handles_limit", return_value=2), \
+         patch("fivenines_agent.agent.collect_metrics"), \
+         patch("fivenines_agent.agent.mqtt_metrics", return_value=None), \
+         patch("fivenines_agent.agent.ubuntu_pro_status", return_value=reading):
+        agent._collect_metrics(data)
+    return data
+
+
+def test_ubuntu_pro_is_collected_unconditionally_on_linux():
+    """No config key, no capability gate, no version gate: an empty config must
+    still produce the block, or the feature is silently off fleet-wide."""
+    reading = {"attached": True, "services": ["esm-infra"]}
+    assert _run_collect_metrics(windows=False, reading=reading)["ubuntu_pro"] == reading
+
+
+def test_ubuntu_pro_collection_failure_travels_as_null():
+    """null is the documented "could not determine" the server PRESERVES on. It
+    must reach the payload rather than being swallowed, so a host that stops
+    being readable is distinguishable from one that was never checked."""
+    data = _run_collect_metrics(windows=False, reading=None)
+    assert "ubuntu_pro" in data
+    assert data["ubuntu_pro"] is None
+
+
+def test_ubuntu_pro_is_absent_on_windows():
+    """`pro` is an Ubuntu tool; a Windows agent must not carry the key at all."""
+    assert "ubuntu_pro" not in _run_collect_metrics(windows=True, reading=None)
