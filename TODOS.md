@@ -2,6 +2,9 @@
 
 ## P1: Reconcile the server's copy of ubuntu_pro_contract_payload.json
 
+**Tracked server-side as fivenines_server#855** -- the work happens in that repo,
+this entry is the agent-side record of why.
+
 The Ubuntu Pro fixture (#125 / server #746) was authored server-first as the
 specification, with no `raw` block and its own description saying "copy the
 agent's over this file BYTE-FOR-BYTE when the agent PR lands". The agent PR added
