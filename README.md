@@ -145,6 +145,7 @@ The agent works without sudo, but these features will be unavailable (this is al
 | Log monitoring (journald capture + signals) | journal read access (`systemd-journal` group) |
 | WireGuard peer health | root or `CAP_NET_ADMIN` (the bundled systemd unit grants `AmbientCapabilities=CAP_NET_ADMIN`) |
 | Tailscale node state | `tailscale` CLI on `PATH` + a reachable `tailscaled` (no extra privilege) |
+| Ubuntu Pro entitlement | `pro` CLI on `PATH` (ubuntu-advantage-tools), or a readable `/var/lib/ubuntu-advantage/status.json` (no extra privilege) |
 | Per-unit cgroup metrics | cgroup v1 or v2 mounted at `/sys/fs/cgroup` |
 | Ceph cluster status | `ceph` CLI + read-only cephx keyring (no sudo) |
 
@@ -424,6 +425,39 @@ macOS. Only the tailnet-wide rollups are sent, never per-peer rows: every node
 sees every peer, so per-peer series would cost hosts x peers across a fleet.
 A node whose key expiry is disabled in the admin console reports "no expiry"
 rather than a fabricated countdown.
+
+## Ubuntu Pro Entitlement
+
+Requires agent version **1.16.1+**. On Linux hosts the agent reports whether the
+machine is attached to an Ubuntu Pro subscription and **which Pro services are
+actually enabled** on it. There is nothing to configure and nothing to turn on:
+collection is unconditional and a host without the `pro` client simply reports
+"could not determine".
+
+This exists for the vulnerability scanner. When the only published patch for a
+CVE lives in an Ubuntu Pro archive (ESM, FIPS), the finding is filed under
+"fixable only with a subscription" instead of in the work queue. That is correct
+for a machine that is not attached, and needlessly pessimistic for one that is --
+an attached host can `apt install` the fix today. This signal is what lets the
+dashboard tell the two apart.
+
+The service list is the load-bearing half, not the attachment flag. A machine
+can be attached with every service disabled (`pro disable esm-infra` is one
+command), and each Ubuntu Pro archive pocket is opened by one specific service --
+`esm-infra` does not unlock a FIPS-only fix. Only services reported as **enabled**
+are sent.
+
+Read from `pro api u.pro.status.is_attached.v1` and
+`pro api u.pro.status.enabled_services.v1`, falling back to
+`/var/lib/ubuntu-advantage/status.json` for clients too old to implement those
+endpoints. **No extra privilege is needed** -- the agent reads the world-readable
+machine token, not the root-only one. The reading is cached for 15 minutes, since
+it changes about once in a machine's lifetime.
+
+A `pro` that is missing, times out or errors reports "could not determine" and
+the dashboard keeps whatever it last knew. It is never reported as "not
+attached": a hiccup is not evidence that a machine detached, and treating it as
+one would bounce that host's findings between the two buckets on every miss.
 
 ## Ceph Cluster Monitoring
 

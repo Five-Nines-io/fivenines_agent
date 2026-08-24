@@ -57,6 +57,7 @@ from fivenines_agent.systemd import (
     refresh_runtime_caches,
     systemd_inventory_sync,
 )
+from fivenines_agent.ubuntu_pro import ubuntu_pro_status
 
 CONFIG_DIR = config_dir()
 load_dotenv(dotenv_path=env_file())
@@ -339,6 +340,12 @@ class Agent:
         # than ship a value that's more misleading than informative.
         if not is_windows():
             data["load_average"] = self._collect("load_average", load_average)
+            # Ubuntu Pro entitlement (server #746). Unconditional: no config
+            # key, no capability gate, no version gate -- the server preserves
+            # its stored columns on the null every non-Ubuntu host reports, so
+            # there is nothing to switch on. Internally cached, so this costs a
+            # dict lookup on all but one tick in fifteen minutes.
+            data["ubuntu_pro"] = self._collect("ubuntu_pro", ubuntu_pro_status)
         self._collect_file_handles(data)
 
         # Conditional metrics via registry, gated by capability where available
