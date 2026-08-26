@@ -40,6 +40,7 @@ def test_registry_has_expected_config_keys():
         "fail2ban",
         "caddy",
         "tsdb",
+        "vllm",
         "postgresql",
         "mysql",
         "rabbitmq",
