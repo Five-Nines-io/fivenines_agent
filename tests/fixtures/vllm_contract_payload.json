@@ -1,0 +1,238 @@
+{
+  "description": "Shared vLLM inference-serving contract fixture between fivenines-agent and fivenines-server (server #887). Source of truth: fivenines-agent tests/fixtures/vllm_contract_payload.json, asserted end-to-end by tests/test_vllm.py::test_contract_fixture_round_trip -- only requests.get is mocked, each scenario's 'response' is fed back as the single GET on metrics_url ('body' as response.text) or its 'raise' entry makes that GET raise the named transport exception, and vllm_metrics(**scenario['config']) must equal scenario['payload']. The server's spec/requests/api_collect_vllm_spec.rb posts scenario['payload'] under data['vllm'] through /collect and asserts Ingesters::Agent ingests each shape (reachable true/false). 'config', 'response' and 'raise' are agent-side inputs the server ignores. Change the payload shape only in lockstep across both repos, keeping the two copies byte-identical.",
+  "agent_min_version": "1.17.0",
+  "_agent_min_version_note": "vLLM is config-driven with NO server version gate (vllm_enabled defaults false; the FEATURES_SUPPORTED_VERSIONS entry the server adds is only an 'agent too old' hint), so this number is free. Ships as 1.17.0, the next minor after 1.16.2. Nothing gates on this number, and it is asserted here against a frozen literal -- never against the live pyproject version, which a later bump would break.",
+  "reachability_contract": "data['vllm'] is a reachability ENVELOPE and MUST NEVER be null (contrast the php_fpm/zfs null contract): here UNREACHABLE IS THE SIGNAL -- the alert this feature exists for is 'vLLM crashed OOM while every GPU still reads green'. (a) {reachable:true, models:[...]} = vLLM answered GET metrics_url with a 2xx. reachable is true even when the exposition carries zero vllm:* metrics (--disable-log-stats, or an upstream rename the whitelist misses): models is then [] (THE SHARP EDGE: an agent-side parse bug must never page 'your vLLM is down'). (b) {reachable:false, error_type, error_message} = a connection-level failure on that GET (refused/timeout/tls/auth/non-2xx). error_type in {connection_refused, timeout, tls_error, auth_failed, http_error}; the server maps auth/tls -> config_error and the rest -> unreachable. Every *_total field and every histogram _sum/_count is a RAW cumulative counter (the server rate()s them; never diff/reset agent-side); kv_cache_usage ships verbatim as the 0-1 fraction vLLM exposes; a metric absent from the exposition omits its key, never fabricates 0. One models[] entry per model_name label value, sorted by name; series with no model_name label are dropped, never renamed. Remaining label dimensions (engine, finished_reason) are SUMMED, except kv_cache_usage which takes the MAX -- summing a 0-1 fraction across data-parallel engines would ship >1 and render as >100%. An optional read_warnings array rides the payload ONLY when this tick is not a clean, complete snapshot of one local vLLM; it is absent on every normal tick. Values: foreign_labels (the exposition carries a label dimension a single vLLM never emits -- instance/job/pod -- so metrics_url is aimed at a Prometheus or scrape proxy and the reduction merged series that are not this host's), models_capped (more than 50 distinct model_name values; first-seen win), body_truncated (the body exceeded the 8 MB cap or the read deadline, so models is [] rather than a partial list), invalid_values (a sample was impossible for its field -- negative, when every quantity here is non-negative, or non-integral for an integer field like a queue depth or a histogram _count -- so it was dropped rather than truncated toward a believable 0; vLLM never emits either, an averaging proxy in front of it does), unlabelled_series (a whitelisted vllm:* metric carried no model_name, so it could not be attributed; the likely causes are a proxy stripping labels or an upstream rename of the label itself, which would blind every host at once). NaN / +Inf samples are deliberately NOT warned: Prometheus uses NaN as a legitimate 'no observations yet'. The server's rule is the SAME for all of them: do not treat models[] as authoritative, and above all do not vanish-prune the model rows missing from it.",
+  "alias_table": "Version drift: upstream vLLM PR #18354 dropped the gpu_ prefix from metrics that are not GPU specific, and ITL was renamed. The whitelist folds aliases onto one canonical key, first-present-wins with the NEWEST name first so a deprecation window (which exposes BOTH spellings) is read once, not double-counted. kv_cache_usage <- vllm:kv_cache_usage_perc | vllm:gpu_cache_usage_perc. prefix_cache_{queries,hits}_total <- vllm:prefix_cache_* | vllm:gpu_prefix_cache_* (the deprecated vllm:gpu_prefix_cache_hit_rate GAUGE is NOT a substitute: when the counters are absent the keys are omitted). itl_{sum_seconds,count} <- vllm:inter_token_latency_seconds | vllm:time_per_output_token_seconds (NOT vllm:request_time_per_output_token_seconds, a different histogram). ttft <- vllm:time_to_first_token_seconds, e2e_latency <- vllm:e2e_request_latency_seconds, requests_{running,waiting} <- vllm:num_requests_{running,waiting}, preemptions_total <- vllm:num_preemptions_total -- all stable. v0-only vllm:num_requests_swapped and vllm:cpu_cache_usage_perc are deliberately not collected.",
+  "scenarios": {
+    "healthy": {
+      "description": "A healthy single-model, single-engine vLLM v1 server on the current metric names. Pins the whole canonical field set, the finished_reason label sum on request_success_total (44000 stop + 1230 length = 45230), raw-counter passthrough of e-notation values, and the histogram _sum/_count pair reads. The body deliberately carries decoys the whitelist must ignore: _bucket series, a _created series, vllm:prompt_tokens_cached_total, vllm:iteration_tokens_total_{sum,count} (a histogram whose base name itself ends in _total), vllm:request_time_per_output_token_seconds_{sum,count} (a near-miss that is NOT the itl alias -- its 77.7 must not appear anywhere in the payload), and the label-only vllm:cache_config_info / vllm:lora_requests_info gauges that carry no model_name.",
+      "config": {
+        "metrics_url": "http://127.0.0.1:8000/metrics",
+        "auth_header_name": null,
+        "auth_header_value": null,
+        "verify_ssl": true
+      },
+      "response": {
+        "status": 200,
+        "body": "# HELP python_gc_objects_collected_total Objects collected during gc\n# TYPE python_gc_objects_collected_total counter\npython_gc_objects_collected_total{generation=\"0\"} 41283.0\n# HELP process_resident_memory_bytes Resident memory size in bytes.\n# TYPE process_resident_memory_bytes gauge\nprocess_resident_memory_bytes 1.8253824e+10\n# HELP vllm:cache_config_info Information of the LLMEngine CacheConfig\n# TYPE vllm:cache_config_info gauge\nvllm:cache_config_info{block_size=\"16\",gpu_memory_utilization=\"0.9\",num_gpu_blocks=\"45312\"} 1.0\n# HELP vllm:num_requests_running Number of requests in model execution batches.\n# TYPE vllm:num_requests_running gauge\nvllm:num_requests_running{engine=\"0\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 4.0\n# HELP vllm:num_requests_waiting Number of requests waiting to be processed.\n# TYPE vllm:num_requests_waiting gauge\nvllm:num_requests_waiting{engine=\"0\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 12.0\n# HELP vllm:kv_cache_usage_perc KV-cache usage. 1 means 100 percent usage.\n# TYPE vllm:kv_cache_usage_perc gauge\nvllm:kv_cache_usage_perc{engine=\"0\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 0.87\n# HELP vllm:prefix_cache_queries Prefix cache queries, in terms of number of queried tokens.\n# TYPE vllm:prefix_cache_queries counter\nvllm:prefix_cache_queries_total{engine=\"0\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 500000.0\n# HELP vllm:prefix_cache_hits Prefix cache hits, in terms of number of cached tokens.\n# TYPE vllm:prefix_cache_hits counter\nvllm:prefix_cache_hits_total{engine=\"0\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 410000.0\n# HELP vllm:num_preemptions Cumulative number of preemption from the engine.\n# TYPE vllm:num_preemptions counter\nvllm:num_preemptions_total{engine=\"0\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 17.0\n# HELP vllm:prompt_tokens Number of prefill tokens processed.\n# TYPE vllm:prompt_tokens counter\nvllm:prompt_tokens_total{engine=\"0\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 1.23456789e+08\nvllm:prompt_tokens_created{engine=\"0\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 1.7532096e+09\n# HELP vllm:generation_tokens Number of generation tokens processed.\n# TYPE vllm:generation_tokens counter\nvllm:generation_tokens_total{engine=\"0\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 9.87654321e+08\n# HELP vllm:prompt_tokens_cached Number of cached prompt tokens.\n# TYPE vllm:prompt_tokens_cached counter\nvllm:prompt_tokens_cached_total{engine=\"0\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 4.1e+05\n# HELP vllm:request_success Count of successfully processed requests.\n# TYPE vllm:request_success counter\nvllm:request_success_total{engine=\"0\",finished_reason=\"stop\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 44000.0\nvllm:request_success_total{engine=\"0\",finished_reason=\"length\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 1230.0\n# HELP vllm:time_to_first_token_seconds histogram\n# TYPE vllm:time_to_first_token_seconds histogram\nvllm:time_to_first_token_seconds_bucket{engine=\"0\",le=\"0.1\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 12034.0\nvllm:time_to_first_token_seconds_bucket{engine=\"0\",le=\"0.5\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 39871.0\nvllm:time_to_first_token_seconds_bucket{engine=\"0\",le=\"1.0\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 44120.0\nvllm:time_to_first_token_seconds_bucket{engine=\"0\",le=\"+Inf\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 45230.0\nvllm:time_to_first_token_seconds_sum{engine=\"0\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 1234.5\nvllm:time_to_first_token_seconds_count{engine=\"0\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 45230.0\n# HELP vllm:inter_token_latency_seconds histogram\n# TYPE vllm:inter_token_latency_seconds histogram\nvllm:inter_token_latency_seconds_bucket{engine=\"0\",le=\"0.01\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 7.1e+06\nvllm:inter_token_latency_seconds_bucket{engine=\"0\",le=\"0.05\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 8.94e+06\nvllm:inter_token_latency_seconds_bucket{engine=\"0\",le=\"+Inf\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 9e+06\nvllm:inter_token_latency_seconds_sum{engine=\"0\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 8899.2\nvllm:inter_token_latency_seconds_count{engine=\"0\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 9e+06\n# HELP vllm:e2e_request_latency_seconds histogram\n# TYPE vllm:e2e_request_latency_seconds histogram\nvllm:e2e_request_latency_seconds_bucket{engine=\"0\",le=\"1.0\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 8021.0\nvllm:e2e_request_latency_seconds_bucket{engine=\"0\",le=\"10.0\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 41002.0\nvllm:e2e_request_latency_seconds_bucket{engine=\"0\",le=\"+Inf\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 45230.0\nvllm:e2e_request_latency_seconds_sum{engine=\"0\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 56789.0\nvllm:e2e_request_latency_seconds_count{engine=\"0\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 45230.0\n# HELP vllm:request_time_per_output_token_seconds histogram\n# TYPE vllm:request_time_per_output_token_seconds histogram\nvllm:request_time_per_output_token_seconds_bucket{engine=\"0\",le=\"+Inf\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 45230.0\nvllm:request_time_per_output_token_seconds_sum{engine=\"0\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 77.7\nvllm:request_time_per_output_token_seconds_count{engine=\"0\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 45230.0\n# HELP vllm:iteration_tokens_total Histogram of number of tokens per engine_step.\n# TYPE vllm:iteration_tokens_total histogram\nvllm:iteration_tokens_total_bucket{engine=\"0\",le=\"+Inf\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 3.1e+06\nvllm:iteration_tokens_total_sum{engine=\"0\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 1.1e+09\nvllm:iteration_tokens_total_count{engine=\"0\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 3.1e+06\n# HELP vllm:lora_requests_info Running stats on lora requests.\n# TYPE vllm:lora_requests_info gauge\nvllm:lora_requests_info{max_lora=\"0\",running_lora_adapters=\"\",waiting_lora_adapters=\"\"} 1.0\n"
+      },
+      "payload": {
+        "reachable": true,
+        "models": [
+          {
+            "name": "meta-llama/Llama-3.1-70B-Instruct",
+            "requests_running": 4,
+            "requests_waiting": 12,
+            "kv_cache_usage": 0.87,
+            "prompt_tokens_total": 123456789,
+            "generation_tokens_total": 987654321,
+            "request_success_total": 45230,
+            "preemptions_total": 17,
+            "prefix_cache_queries_total": 500000,
+            "prefix_cache_hits_total": 410000,
+            "ttft_sum_seconds": 1234.5,
+            "ttft_count": 45230,
+            "itl_sum_seconds": 8899.2,
+            "itl_count": 9000000,
+            "e2e_latency_sum_seconds": 56789.0,
+            "e2e_latency_count": 45230
+          }
+        ]
+      }
+    },
+    "healthy_legacy_names": {
+      "description": "THE ALIAS TABLE. The same server one vLLM major earlier: gpu_cache_usage_perc instead of kv_cache_usage_perc, gpu_prefix_cache_{queries,hits}_total instead of the unprefixed counters, time_per_output_token_seconds instead of inter_token_latency_seconds, and no engine label at all (only model_name). Same numbers as 'healthy', so the payload must be byte-identical to it -- that identity IS the assertion. The body also carries the v0-only metrics we deliberately do not collect (num_requests_swapped, cpu_cache_usage_perc) and the deprecated gpu_prefix_cache_hit_rate GAUGE, which must NOT be used to synthesise the prefix-cache keys.",
+      "config": {
+        "metrics_url": "http://127.0.0.1:8000/metrics",
+        "auth_header_name": null,
+        "auth_header_value": null,
+        "verify_ssl": true
+      },
+      "response": {
+        "status": 200,
+        "body": "# HELP python_gc_objects_collected_total Objects collected during gc\n# TYPE python_gc_objects_collected_total counter\npython_gc_objects_collected_total{generation=\"0\"} 41283.0\n# HELP process_resident_memory_bytes Resident memory size in bytes.\n# TYPE process_resident_memory_bytes gauge\nprocess_resident_memory_bytes 1.8253824e+10\n# HELP vllm:num_requests_running Number of requests currently running on GPU.\n# TYPE vllm:num_requests_running gauge\nvllm:num_requests_running{model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 4.0\n# HELP vllm:num_requests_waiting Number of requests waiting to be processed.\n# TYPE vllm:num_requests_waiting gauge\nvllm:num_requests_waiting{model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 12.0\n# HELP vllm:num_requests_swapped Number of requests swapped to CPU.\n# TYPE vllm:num_requests_swapped gauge\nvllm:num_requests_swapped{model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 3.0\n# HELP vllm:gpu_cache_usage_perc GPU KV-cache usage. 1 means 100 percent usage.\n# TYPE vllm:gpu_cache_usage_perc gauge\nvllm:gpu_cache_usage_perc{model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 0.87\n# HELP vllm:cpu_cache_usage_perc CPU KV-cache usage. 1 means 100 percent usage.\n# TYPE vllm:cpu_cache_usage_perc gauge\nvllm:cpu_cache_usage_perc{model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 0.02\n# HELP vllm:gpu_prefix_cache_hit_rate GPU prefix cache block hit rate.\n# TYPE vllm:gpu_prefix_cache_hit_rate gauge\nvllm:gpu_prefix_cache_hit_rate{model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 0.82\n# HELP vllm:gpu_prefix_cache_queries GPU prefix cache queries, in terms of number of queried tokens.\n# TYPE vllm:gpu_prefix_cache_queries counter\nvllm:gpu_prefix_cache_queries_total{model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 500000.0\n# HELP vllm:gpu_prefix_cache_hits GPU prefix cache hits, in terms of number of cached tokens.\n# TYPE vllm:gpu_prefix_cache_hits counter\nvllm:gpu_prefix_cache_hits_total{model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 410000.0\n# HELP vllm:num_preemptions_total Cumulative number of preemption from the engine.\n# TYPE vllm:num_preemptions_total counter\nvllm:num_preemptions_total{model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 17.0\n# HELP vllm:prompt_tokens_total Number of prefill tokens processed.\n# TYPE vllm:prompt_tokens_total counter\nvllm:prompt_tokens_total{model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 1.23456789e+08\n# HELP vllm:generation_tokens_total Number of generation tokens processed.\n# TYPE vllm:generation_tokens_total counter\nvllm:generation_tokens_total{model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 9.87654321e+08\n# HELP vllm:request_success_total Count of successfully processed requests.\n# TYPE vllm:request_success_total counter\nvllm:request_success_total{finished_reason=\"stop\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 44000.0\nvllm:request_success_total{finished_reason=\"length\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 1230.0\n# HELP vllm:time_to_first_token_seconds histogram\n# TYPE vllm:time_to_first_token_seconds histogram\nvllm:time_to_first_token_seconds_bucket{le=\"+Inf\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 45230.0\nvllm:time_to_first_token_seconds_sum{model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 1234.5\nvllm:time_to_first_token_seconds_count{model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 45230.0\n# HELP vllm:time_per_output_token_seconds histogram\n# TYPE vllm:time_per_output_token_seconds histogram\nvllm:time_per_output_token_seconds_bucket{le=\"+Inf\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 9e+06\nvllm:time_per_output_token_seconds_sum{model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 8899.2\nvllm:time_per_output_token_seconds_count{model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 9e+06\n# HELP vllm:e2e_request_latency_seconds histogram\n# TYPE vllm:e2e_request_latency_seconds histogram\nvllm:e2e_request_latency_seconds_bucket{le=\"+Inf\",model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 45230.0\nvllm:e2e_request_latency_seconds_sum{model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 56789.0\nvllm:e2e_request_latency_seconds_count{model_name=\"meta-llama/Llama-3.1-70B-Instruct\"} 45230.0\n"
+      },
+      "payload": {
+        "reachable": true,
+        "models": [
+          {
+            "name": "meta-llama/Llama-3.1-70B-Instruct",
+            "requests_running": 4,
+            "requests_waiting": 12,
+            "kv_cache_usage": 0.87,
+            "prompt_tokens_total": 123456789,
+            "generation_tokens_total": 987654321,
+            "request_success_total": 45230,
+            "preemptions_total": 17,
+            "prefix_cache_queries_total": 500000,
+            "prefix_cache_hits_total": 410000,
+            "ttft_sum_seconds": 1234.5,
+            "ttft_count": 45230,
+            "itl_sum_seconds": 8899.2,
+            "itl_count": 9000000,
+            "e2e_latency_sum_seconds": 56789.0,
+            "e2e_latency_count": 45230
+          }
+        ]
+      }
+    },
+    "saturated": {
+      "description": "The alert shape: 1873 requests queued behind 64 running, kv_cache_usage 0.97, and preemptions climbing past 48k -- the server's queue/KV-cache saturation thresholds fire on this while every NVIDIA GPU metric still reads green. request_success_total sums a finished_reason='abort' series alongside 'stop' (1284000 + 9310). The num_requests_waiting_by_reason breakdown in the body is NOT collected: its name is not num_requests_waiting, so its 1801/72 split must not leak into requests_waiting.",
+      "config": {
+        "metrics_url": "http://10.0.4.11:8000/metrics",
+        "auth_header_name": "Authorization",
+        "auth_header_value": "Bearer vllm-api-key",
+        "verify_ssl": true
+      },
+      "response": {
+        "status": 200,
+        "body": "# HELP vllm:num_requests_running Number of requests in model execution batches.\n# TYPE vllm:num_requests_running gauge\nvllm:num_requests_running{engine=\"0\",model_name=\"mistralai/Mixtral-8x7B-Instruct-v0.1\"} 64.0\n# HELP vllm:num_requests_waiting Number of requests waiting to be processed.\n# TYPE vllm:num_requests_waiting gauge\nvllm:num_requests_waiting{engine=\"0\",model_name=\"mistralai/Mixtral-8x7B-Instruct-v0.1\"} 1873.0\n# HELP vllm:num_requests_waiting_by_reason Number of requests waiting, by reason.\n# TYPE vllm:num_requests_waiting_by_reason gauge\nvllm:num_requests_waiting_by_reason{engine=\"0\",model_name=\"mistralai/Mixtral-8x7B-Instruct-v0.1\",reason=\"capacity\"} 1801.0\nvllm:num_requests_waiting_by_reason{engine=\"0\",model_name=\"mistralai/Mixtral-8x7B-Instruct-v0.1\",reason=\"deferred\"} 72.0\n# HELP vllm:kv_cache_usage_perc KV-cache usage. 1 means 100 percent usage.\n# TYPE vllm:kv_cache_usage_perc gauge\nvllm:kv_cache_usage_perc{engine=\"0\",model_name=\"mistralai/Mixtral-8x7B-Instruct-v0.1\"} 0.97\n# HELP vllm:num_preemptions Cumulative number of preemption from the engine.\n# TYPE vllm:num_preemptions counter\nvllm:num_preemptions_total{engine=\"0\",model_name=\"mistralai/Mixtral-8x7B-Instruct-v0.1\"} 48211.0\n# HELP vllm:prefix_cache_queries Prefix cache queries.\n# TYPE vllm:prefix_cache_queries counter\nvllm:prefix_cache_queries_total{engine=\"0\",model_name=\"mistralai/Mixtral-8x7B-Instruct-v0.1\"} 9.1e+07\n# HELP vllm:prefix_cache_hits Prefix cache hits.\n# TYPE vllm:prefix_cache_hits counter\nvllm:prefix_cache_hits_total{engine=\"0\",model_name=\"mistralai/Mixtral-8x7B-Instruct-v0.1\"} 1.2e+07\n# HELP vllm:prompt_tokens Number of prefill tokens processed.\n# TYPE vllm:prompt_tokens counter\nvllm:prompt_tokens_total{engine=\"0\",model_name=\"mistralai/Mixtral-8x7B-Instruct-v0.1\"} 8.812345e+09\n# HELP vllm:generation_tokens Number of generation tokens processed.\n# TYPE vllm:generation_tokens counter\nvllm:generation_tokens_total{engine=\"0\",model_name=\"mistralai/Mixtral-8x7B-Instruct-v0.1\"} 2.20321e+09\n# HELP vllm:request_success Count of successfully processed requests.\n# TYPE vllm:request_success counter\nvllm:request_success_total{engine=\"0\",finished_reason=\"stop\",model_name=\"mistralai/Mixtral-8x7B-Instruct-v0.1\"} 1.284e+06\nvllm:request_success_total{engine=\"0\",finished_reason=\"abort\",model_name=\"mistralai/Mixtral-8x7B-Instruct-v0.1\"} 9310.0\n# HELP vllm:time_to_first_token_seconds histogram\n# TYPE vllm:time_to_first_token_seconds histogram\nvllm:time_to_first_token_seconds_bucket{engine=\"0\",le=\"+Inf\",model_name=\"mistralai/Mixtral-8x7B-Instruct-v0.1\"} 1.29331e+06\nvllm:time_to_first_token_seconds_sum{engine=\"0\",model_name=\"mistralai/Mixtral-8x7B-Instruct-v0.1\"} 412887.25\nvllm:time_to_first_token_seconds_count{engine=\"0\",model_name=\"mistralai/Mixtral-8x7B-Instruct-v0.1\"} 1.29331e+06\n# HELP vllm:inter_token_latency_seconds histogram\n# TYPE vllm:inter_token_latency_seconds histogram\nvllm:inter_token_latency_seconds_bucket{engine=\"0\",le=\"+Inf\",model_name=\"mistralai/Mixtral-8x7B-Instruct-v0.1\"} 2.20321e+09\nvllm:inter_token_latency_seconds_sum{engine=\"0\",model_name=\"mistralai/Mixtral-8x7B-Instruct-v0.1\"} 1988330.5\nvllm:inter_token_latency_seconds_count{engine=\"0\",model_name=\"mistralai/Mixtral-8x7B-Instruct-v0.1\"} 2.20321e+09\n# HELP vllm:e2e_request_latency_seconds histogram\n# TYPE vllm:e2e_request_latency_seconds histogram\nvllm:e2e_request_latency_seconds_bucket{engine=\"0\",le=\"+Inf\",model_name=\"mistralai/Mixtral-8x7B-Instruct-v0.1\"} 1.29331e+06\nvllm:e2e_request_latency_seconds_sum{engine=\"0\",model_name=\"mistralai/Mixtral-8x7B-Instruct-v0.1\"} 9911842.0\nvllm:e2e_request_latency_seconds_count{engine=\"0\",model_name=\"mistralai/Mixtral-8x7B-Instruct-v0.1\"} 1.29331e+06\n"
+      },
+      "payload": {
+        "reachable": true,
+        "models": [
+          {
+            "name": "mistralai/Mixtral-8x7B-Instruct-v0.1",
+            "requests_running": 64,
+            "requests_waiting": 1873,
+            "kv_cache_usage": 0.97,
+            "prompt_tokens_total": 8812345000,
+            "generation_tokens_total": 2203210000,
+            "request_success_total": 1293310,
+            "preemptions_total": 48211,
+            "prefix_cache_queries_total": 91000000,
+            "prefix_cache_hits_total": 12000000,
+            "ttft_sum_seconds": 412887.25,
+            "ttft_count": 1293310,
+            "itl_sum_seconds": 1988330.5,
+            "itl_count": 2203210000,
+            "e2e_latency_sum_seconds": 9911842.0,
+            "e2e_latency_count": 1293310
+          }
+        ]
+      }
+    },
+    "data_parallel_multi_engine": {
+      "description": "THE REDUCTION RULES. Two models on one server, the Llama one running 4 data-parallel engines. Counts and counters SUM across the engine label (running 2+3+1+4=10, waiting 0+7+0+2=9 -- a present-but-zero engine still ships its 0, prompt_tokens 1000+2000+3000+4000=10000, preemptions 0+5+0+1=6, ttft_sum 10.5+20.25+30+40.25=101.0 and ttft_count 100+200+300+400=1000). kv_cache_usage takes the MAX (0.92, the most saturated engine): the sum would be 1.85, which the server would render as 185%. models[] is sorted by name, so 'Qwen/...' precedes 'meta-llama/...' (uppercase sorts first) regardless of exposition order. The Qwen model exposes no preemption or prefix-cache series at all, so those keys are absent from ITS entry while present on the other -- omit-not-zero is per model.",
+      "config": {
+        "metrics_url": "http://127.0.0.1:8000/metrics",
+        "auth_header_name": null,
+        "auth_header_value": null,
+        "verify_ssl": true
+      },
+      "response": {
+        "status": 200,
+        "body": "# HELP vllm:num_requests_running Number of requests in model execution batches.\n# TYPE vllm:num_requests_running gauge\nvllm:num_requests_running{engine=\"0\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 2.0\nvllm:num_requests_running{engine=\"1\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 3.0\nvllm:num_requests_running{engine=\"2\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 1.0\nvllm:num_requests_running{engine=\"3\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 4.0\nvllm:num_requests_running{engine=\"0\",model_name=\"Qwen/Qwen2.5-Coder-32B-Instruct\"} 1.0\n# HELP vllm:num_requests_waiting Number of requests waiting to be processed.\n# TYPE vllm:num_requests_waiting gauge\nvllm:num_requests_waiting{engine=\"0\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 0.0\nvllm:num_requests_waiting{engine=\"1\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 7.0\nvllm:num_requests_waiting{engine=\"2\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 0.0\nvllm:num_requests_waiting{engine=\"3\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 2.0\nvllm:num_requests_waiting{engine=\"0\",model_name=\"Qwen/Qwen2.5-Coder-32B-Instruct\"} 0.0\n# HELP vllm:kv_cache_usage_perc KV-cache usage. 1 means 100 percent usage.\n# TYPE vllm:kv_cache_usage_perc gauge\nvllm:kv_cache_usage_perc{engine=\"0\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 0.31\nvllm:kv_cache_usage_perc{engine=\"1\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 0.44\nvllm:kv_cache_usage_perc{engine=\"2\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 0.92\nvllm:kv_cache_usage_perc{engine=\"3\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 0.18\nvllm:kv_cache_usage_perc{engine=\"0\",model_name=\"Qwen/Qwen2.5-Coder-32B-Instruct\"} 0.05\n# HELP vllm:prompt_tokens Number of prefill tokens processed.\n# TYPE vllm:prompt_tokens counter\nvllm:prompt_tokens_total{engine=\"0\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 1000.0\nvllm:prompt_tokens_total{engine=\"1\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 2000.0\nvllm:prompt_tokens_total{engine=\"2\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 3000.0\nvllm:prompt_tokens_total{engine=\"3\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 4000.0\nvllm:prompt_tokens_total{engine=\"0\",model_name=\"Qwen/Qwen2.5-Coder-32B-Instruct\"} 55.0\n# HELP vllm:num_preemptions Cumulative number of preemption from the engine.\n# TYPE vllm:num_preemptions counter\nvllm:num_preemptions_total{engine=\"0\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 0.0\nvllm:num_preemptions_total{engine=\"1\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 5.0\nvllm:num_preemptions_total{engine=\"2\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 0.0\nvllm:num_preemptions_total{engine=\"3\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 1.0\n# HELP vllm:time_to_first_token_seconds histogram\n# TYPE vllm:time_to_first_token_seconds histogram\nvllm:time_to_first_token_seconds_sum{engine=\"0\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 10.5\nvllm:time_to_first_token_seconds_count{engine=\"0\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 100.0\nvllm:time_to_first_token_seconds_sum{engine=\"1\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 20.25\nvllm:time_to_first_token_seconds_count{engine=\"1\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 200.0\nvllm:time_to_first_token_seconds_sum{engine=\"2\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 30.0\nvllm:time_to_first_token_seconds_count{engine=\"2\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 300.0\nvllm:time_to_first_token_seconds_sum{engine=\"3\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 40.25\nvllm:time_to_first_token_seconds_count{engine=\"3\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 400.0\nvllm:time_to_first_token_seconds_sum{engine=\"0\",model_name=\"Qwen/Qwen2.5-Coder-32B-Instruct\"} 3.5\nvllm:time_to_first_token_seconds_count{engine=\"0\",model_name=\"Qwen/Qwen2.5-Coder-32B-Instruct\"} 7.0\n"
+      },
+      "payload": {
+        "reachable": true,
+        "models": [
+          {
+            "name": "Qwen/Qwen2.5-Coder-32B-Instruct",
+            "requests_running": 1,
+            "requests_waiting": 0,
+            "kv_cache_usage": 0.05,
+            "prompt_tokens_total": 55,
+            "ttft_sum_seconds": 3.5,
+            "ttft_count": 7
+          },
+          {
+            "name": "meta-llama/Llama-3.1-8B-Instruct",
+            "requests_running": 10,
+            "requests_waiting": 9,
+            "kv_cache_usage": 0.92,
+            "prompt_tokens_total": 10000,
+            "preemptions_total": 6,
+            "ttft_sum_seconds": 101.0,
+            "ttft_count": 1000
+          }
+        ]
+      }
+    },
+    "stats_disabled": {
+      "description": "THE SHARP EDGE. vLLM started with --disable-log-stats still serves /metrics, but the body carries only the default prometheus_client collectors and zero vllm:* series. That is a SUCCESSFUL read: reachable stays true with an empty models array, never a reachable:false that would page the customer with 'your vLLM is down'. The same shape results from a future upstream rename the whitelist misses -- an agent-side blind spot must degrade to no-data, not to a false outage.",
+      "config": {
+        "metrics_url": "http://127.0.0.1:8000/metrics",
+        "auth_header_name": null,
+        "auth_header_value": null,
+        "verify_ssl": true
+      },
+      "response": {
+        "status": 200,
+        "body": "# HELP python_gc_objects_collected_total Objects collected during gc\n# TYPE python_gc_objects_collected_total counter\npython_gc_objects_collected_total{generation=\"0\"} 41283.0\n# HELP process_resident_memory_bytes Resident memory size in bytes.\n# TYPE process_resident_memory_bytes gauge\nprocess_resident_memory_bytes 1.8253824e+10\n# HELP python_info Python platform information\n# TYPE python_info gauge\npython_info{implementation=\"CPython\",major=\"3\",minor=\"12\"} 1.0\n# HELP process_cpu_seconds_total Total user and system CPU time spent in seconds.\n# TYPE process_cpu_seconds_total counter\nprocess_cpu_seconds_total 88213.44\n"
+      },
+      "payload": {
+        "reachable": true,
+        "models": []
+      }
+    },
+    "unreachable_connection_refused": {
+      "description": "The vLLM process is dead (OOM-killed mid-generation, the exact failure this collector exists to catch): the GET raises a transport-level ConnectionError. UNREACHABLE IS THE SIGNAL, so the payload is a reachable:false envelope and MUST NOT be null. error_message is the transport error text, truncated to 200 chars.",
+      "config": {
+        "metrics_url": "http://127.0.0.1:8000/metrics",
+        "auth_header_name": null,
+        "auth_header_value": null,
+        "verify_ssl": true
+      },
+      "raise": {
+        "type": "connection_refused",
+        "message": "Connection refused"
+      },
+      "payload": {
+        "reachable": false,
+        "error_type": "connection_refused",
+        "error_message": "Connection refused"
+      }
+    },
+    "auth_failure": {
+      "description": "vLLM was started with --api-key but the configured auth header is wrong or missing, so the GET returns HTTP 401. A non-2xx is a reachability failure; 401/403 map to error_type auth_failed, which the server folds into config_error rather than an outage. Still never null.",
+      "config": {
+        "metrics_url": "https://vllm.internal.example.com/metrics",
+        "auth_header_name": "Authorization",
+        "auth_header_value": "Bearer wrong-key",
+        "verify_ssl": true
+      },
+      "response": {
+        "status": 401,
+        "body": "Unauthorized"
+      },
+      "payload": {
+        "reachable": false,
+        "error_type": "auth_failed",
+        "error_message": "HTTP 401 on /metrics"
+      }
+    },
+    "aggregating_endpoint": {
+      "description": "THE PLAUSIBLE-LIE GUARD. metrics_url was pointed at a Prometheus scraping three vLLM nodes rather than at the local vLLM API server, so every series carries instance/job labels a single vLLM never emits. The reduction cannot know which series is the local one, so it still ships what parsed -- requests_running 4+7=11 for the Llama model, kv_cache_usage max 0.95 -- but read_warnings names foreign_labels so the server knows these numbers describe the FLEET, not this host, and must not treat models[] as this host's authoritative set. Without this flag the payload is indistinguishable from a genuinely busy local server: that silent-but-wrong outcome is the one this collector must never produce. reachable stays true throughout -- the endpoint answered.",
+      "config": {
+        "metrics_url": "http://10.0.4.10:9090/metrics",
+        "auth_header_name": null,
+        "auth_header_value": null,
+        "verify_ssl": true
+      },
+      "response": {
+        "status": 200,
+        "body": "# HELP vllm:num_requests_running Number of requests in model execution batches.\n# TYPE vllm:num_requests_running gauge\nvllm:num_requests_running{engine=\"0\",instance=\"10.0.4.11:8000\",job=\"vllm\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 4.0\nvllm:num_requests_running{engine=\"0\",instance=\"10.0.4.12:8000\",job=\"vllm\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 7.0\nvllm:num_requests_running{engine=\"0\",instance=\"10.0.4.13:8000\",job=\"vllm\",model_name=\"mistralai/Mistral-7B-Instruct-v0.3\"} 1.0\n# HELP vllm:kv_cache_usage_perc KV-cache usage. 1 means 100 percent usage.\n# TYPE vllm:kv_cache_usage_perc gauge\nvllm:kv_cache_usage_perc{engine=\"0\",instance=\"10.0.4.11:8000\",job=\"vllm\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 0.22\nvllm:kv_cache_usage_perc{engine=\"0\",instance=\"10.0.4.12:8000\",job=\"vllm\",model_name=\"meta-llama/Llama-3.1-8B-Instruct\"} 0.95\nvllm:kv_cache_usage_perc{engine=\"0\",instance=\"10.0.4.13:8000\",job=\"vllm\",model_name=\"mistralai/Mistral-7B-Instruct-v0.3\"} 0.10\n"
+      },
+      "payload": {
+        "reachable": true,
+        "models": [
+          {
+            "name": "meta-llama/Llama-3.1-8B-Instruct",
+            "requests_running": 11,
+            "kv_cache_usage": 0.95
+          },
+          {
+            "name": "mistralai/Mistral-7B-Instruct-v0.3",
+            "requests_running": 1,
+            "kv_cache_usage": 0.1
+          }
+        ],
+        "read_warnings": [
+          "foreign_labels"
+        ]
+      }
+    }
+  }
+}
