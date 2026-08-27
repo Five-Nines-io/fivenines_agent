@@ -1,0 +1,193 @@
+{
+  "description": "Shared SGLang inference-serving contract fixture between fivenines-agent and fivenines-server (server #893). Source of truth: fivenines-agent tests/fixtures/sglang_contract_payload.json, asserted end-to-end by tests/test_sglang.py::test_contract_fixture_round_trip -- only requests.get is mocked, each scenario's 'response' is fed back as the single GET on metrics_url ('body' as the response body) or its 'raise' entry makes that GET raise the named transport exception, and sglang_metrics(**scenario['config']) must equal scenario['payload']. The server's spec/requests/api_collect_sglang_spec.rb posts scenario['payload'] under data['sglang'] through /collect and asserts Ingesters::Agent ingests each shape (reachable true/false). 'config', 'response' and 'raise' are agent-side inputs the server ignores. Change the payload shape only in lockstep across both repos, keeping the two copies byte-identical. The sibling fixture is vllm_contract_payload.json (server #887): the two collectors share one implementation (fivenines_agent/inference_metrics.py) and therefore one envelope, one error_type vocabulary and one read_warnings vocabulary.",
+  "agent_min_version": "1.17.1",
+  "_agent_min_version_note": "SGLang is config-driven with NO server version gate (sglang_enabled defaults false; the FEATURES_SUPPORTED_VERSIONS entry the server adds is only an 'agent too old' hint), so this number is free. Ships as 1.17.1, the patch after the vLLM sibling's 1.17.0 -- the same 1.17.x release train. Nothing gates on this number, and it is asserted here against a frozen literal -- never against the live pyproject version, which a later bump would break.",
+  "reachability_contract": "data['sglang'] is a reachability ENVELOPE and MUST NEVER be null (contrast the php_fpm/zfs null contract): here UNREACHABLE IS THE SIGNAL -- the alert this feature exists for is 'SGLang crashed while every GPU still reads green'. (a) {reachable:true, models:[...]} = SGLang answered GET metrics_url with a 2xx. (b) {reachable:false, error_type, error_message} = a connection-level failure on that GET (refused/timeout/tls/auth/non-2xx). error_type in {connection_refused, timeout, tls_error, auth_failed, http_error}; the server maps auth/tls -> config_error and the rest -> unreachable. THE SGLANG-SPECIFIC EDGE: SGLang only publishes sglang:* samples when it was launched with --enable-metrics, so a 2xx carrying zero of them is the EXPECTED stock-launch state, not an edge case -- it ships reachable:true with models:[] and the server renders the 'add --enable-metrics to your launch command' hint from it. The same shape covers an upstream rename the whitelist misses; an agent-side blind spot must degrade to no-data, never to a false outage. Every *_total field and every histogram _sum/_count is a RAW cumulative counter (the server rate()s them; never diff/reset agent-side). gen_throughput and cache_hit_rate are GAUGES SGLang computes itself and must NOT be rate()d (the Caddy num_requests mistake). token_usage and cache_hit_rate ship verbatim as 0-1 fractions; the server converts to 0-100 pct. A metric absent from the exposition omits its key, never fabricates 0. One models[] entry per model_name label value, sorted by name; series with no model_name label are dropped, never renamed. An optional read_warnings array rides the payload ONLY when this tick is not a clean, complete snapshot of one local SGLang; it is absent on every normal tick. Values: foreign_labels (a label dimension a single SGLang never emits -- instance/job/pod -- so metrics_url is aimed at a Prometheus or scrape proxy and the reduction merged series that are not this host's), models_capped (more than 50 distinct model_name values; first-seen win), body_truncated (the body exceeded the 8 MB cap or the read deadline, so models is [] rather than a partial list), invalid_values (a negative sample, or a fractional value on an integer field, was dropped), unlabelled_series (a whitelisted sample carried no model_name). The server's rule for ALL of them is identical: do not treat models[] as authoritative, and above all do not vanish-prune the model rows missing from it.",
+  "fold_rules": "SGLang stamps engine_type plus tp_rank / pp_rank (and dp_rank) alongside model_name, and the motivating fleet runs TP=8, so multi-rank series are the NORMAL exposition rather than an oddity. Every series for one model_name folds onto ONE models[] entry. GAUGES (running_requests, queue_requests, token_usage, cache_hit_rate, gen_throughput) take the MAX, because the ranks REPLICATE one scheduler's reading rather than partitioning it: summing gen_throughput across 8 tp_ranks would report 8x the real tokens/s, and summing token_usage would ship 8.0 for a cache that is merely full. COUNTERS and histogram _sum/_count SUM, the correct reduction whenever an engine really does partition the work across a label dimension. Where the dimension is absent (a single-GPU box) max is identity and every value ships verbatim, so the two rules agree there. This is the one place the SGLang whitelist genuinely differs from the vLLM one, whose 'engine' label is DATA parallelism -- separate schedulers whose counts really do add up.",
+  "not_collected_in_v1": "sglang:num_used_tokens (token_usage already carries the ratio the saturation threshold is about), sglang:cached_tokens_total, sglang:num_requests_total, sglang:spec_accept_length and the other speculative-decoding gauges, sglang:func_latency_seconds, and the --enable-mfu-metrics FLOPs/bytes counters. All of these appear in the healthy scenario's body as decoys the whitelist must ignore, alongside the _bucket and _created series prometheus_client emits.",
+  "scenarios": {
+    "healthy": {
+      "description": "A healthy single-node SGLang launched with --enable-metrics, one model, one scheduler. Pins the whole canonical field set, raw-counter passthrough of e-notation values, and the histogram _sum/_count pair reads. The body deliberately carries decoys the whitelist must ignore: _bucket series (whose 'le' label would trip foreign_labels if buckets were ever whitelisted), the _created series prometheus_client emits beside every counter, sglang:num_used_tokens, sglang:cached_tokens_total, sglang:num_requests_total, sglang:spec_accept_length, and sglang:func_latency_seconds (which carries a 'name' label and NO model_name, so it must be dropped without warning rather than counted as an unlabelled series).",
+      "config": {
+        "metrics_url": "http://127.0.0.1:30000/metrics",
+        "auth_header_name": null,
+        "auth_header_value": null,
+        "verify_ssl": true
+      },
+      "response": {
+        "status": 200,
+        "body": "# HELP python_gc_objects_collected_total Objects collected during gc\n# TYPE python_gc_objects_collected_total counter\npython_gc_objects_collected_total{generation=\"0\"} 52144.0\n# HELP process_resident_memory_bytes Resident memory size in bytes.\n# TYPE process_resident_memory_bytes gauge\nprocess_resident_memory_bytes 2.4117248e+10\n# HELP python_info Python platform information\n# TYPE python_info gauge\npython_info{implementation=\"CPython\",major=\"3\",minor=\"12\"} 1.0\n# HELP process_cpu_seconds_total Total user and system CPU time spent in seconds.\n# TYPE process_cpu_seconds_total counter\nprocess_cpu_seconds_total 41276.91\n# HELP sglang:num_running_reqs The number of running requests.\n# TYPE sglang:num_running_reqs gauge\nsglang:num_running_reqs{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\"} 6.0\n# HELP sglang:num_used_tokens The number of used tokens.\n# TYPE sglang:num_used_tokens gauge\nsglang:num_used_tokens{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\"} 148231.0\n# HELP sglang:token_usage The token usage.\n# TYPE sglang:token_usage gauge\nsglang:token_usage{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\"} 0.91\n# HELP sglang:gen_throughput The generation throughput (token/s).\n# TYPE sglang:gen_throughput gauge\nsglang:gen_throughput{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\"} 1843.5\n# HELP sglang:num_queue_reqs The number of requests in the waiting queue.\n# TYPE sglang:num_queue_reqs gauge\nsglang:num_queue_reqs{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\"} 22.0\n# HELP sglang:cache_hit_rate The prefix cache hit rate.\n# TYPE sglang:cache_hit_rate gauge\nsglang:cache_hit_rate{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\"} 0.42\n# HELP sglang:spec_accept_length The average acceptance length of speculative decoding.\n# TYPE sglang:spec_accept_length gauge\nsglang:spec_accept_length{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\"} 3.14\n# HELP sglang:prompt_tokens_total Number of prefill tokens processed.\n# TYPE sglang:prompt_tokens_total counter\nsglang:prompt_tokens_total{model_name=\"deepseek-ai/DeepSeek-V3\"} 1.23456789e+08\nsglang:prompt_tokens_created{model_name=\"deepseek-ai/DeepSeek-V3\"} 1.7508672e+09\n# HELP sglang:generation_tokens_total Number of generation tokens processed.\n# TYPE sglang:generation_tokens_total counter\nsglang:generation_tokens_total{model_name=\"deepseek-ai/DeepSeek-V3\"} 9.87654321e+08\nsglang:generation_tokens_created{model_name=\"deepseek-ai/DeepSeek-V3\"} 1.7508672e+09\n# HELP sglang:cached_tokens_total Number of cached prompt tokens.\n# TYPE sglang:cached_tokens_total counter\nsglang:cached_tokens_total{model_name=\"deepseek-ai/DeepSeek-V3\"} 5.1851901e+07\n# HELP sglang:num_requests_total Number of requests processed.\n# TYPE sglang:num_requests_total counter\nsglang:num_requests_total{model_name=\"deepseek-ai/DeepSeek-V3\"} 45230.0\n# HELP sglang:time_to_first_token_seconds Histogram of time to first token in seconds.\n# TYPE sglang:time_to_first_token_seconds histogram\nsglang:time_to_first_token_seconds_bucket{le=\"0.1\",model_name=\"deepseek-ai/DeepSeek-V3\"} 12040.0\nsglang:time_to_first_token_seconds_bucket{le=\"1.0\",model_name=\"deepseek-ai/DeepSeek-V3\"} 41890.0\nsglang:time_to_first_token_seconds_bucket{le=\"+Inf\",model_name=\"deepseek-ai/DeepSeek-V3\"} 45230.0\nsglang:time_to_first_token_seconds_sum{model_name=\"deepseek-ai/DeepSeek-V3\"} 1234.5\nsglang:time_to_first_token_seconds_count{model_name=\"deepseek-ai/DeepSeek-V3\"} 45230.0\n# HELP sglang:time_per_output_token_seconds Histogram of time per output token in seconds.\n# TYPE sglang:time_per_output_token_seconds histogram\nsglang:time_per_output_token_seconds_bucket{le=\"0.01\",model_name=\"deepseek-ai/DeepSeek-V3\"} 7200000.0\nsglang:time_per_output_token_seconds_bucket{le=\"+Inf\",model_name=\"deepseek-ai/DeepSeek-V3\"} 9000000.0\nsglang:time_per_output_token_seconds_sum{model_name=\"deepseek-ai/DeepSeek-V3\"} 8899.2\nsglang:time_per_output_token_seconds_count{model_name=\"deepseek-ai/DeepSeek-V3\"} 9000000.0\n# HELP sglang:e2e_request_latency_seconds Histogram of end-to-end request latency in seconds.\n# TYPE sglang:e2e_request_latency_seconds histogram\nsglang:e2e_request_latency_seconds_bucket{le=\"10.0\",model_name=\"deepseek-ai/DeepSeek-V3\"} 38110.0\nsglang:e2e_request_latency_seconds_bucket{le=\"+Inf\",model_name=\"deepseek-ai/DeepSeek-V3\"} 45230.0\nsglang:e2e_request_latency_seconds_sum{model_name=\"deepseek-ai/DeepSeek-V3\"} 56789.0\nsglang:e2e_request_latency_seconds_count{model_name=\"deepseek-ai/DeepSeek-V3\"} 45230.0\n# HELP sglang:func_latency_seconds Function latency in seconds.\n# TYPE sglang:func_latency_seconds histogram\nsglang:func_latency_seconds_sum{name=\"generate_request\"} 331.7\nsglang:func_latency_seconds_count{name=\"generate_request\"} 45230.0\n"
+      },
+      "payload": {
+        "reachable": true,
+        "models": [
+          {
+            "name": "deepseek-ai/DeepSeek-V3",
+            "running_requests": 6,
+            "queue_requests": 22,
+            "token_usage": 0.91,
+            "cache_hit_rate": 0.42,
+            "gen_throughput": 1843.5,
+            "prompt_tokens_total": 123456789,
+            "generation_tokens_total": 987654321,
+            "ttft_sum_seconds": 1234.5,
+            "ttft_count": 45230,
+            "itl_sum_seconds": 8899.2,
+            "itl_count": 9000000,
+            "e2e_latency_sum_seconds": 56789.0,
+            "e2e_latency_count": 45230
+          }
+        ]
+      }
+    },
+    "healthy_tp_multirank": {
+      "description": "THE FOLD RULES. The customer's exact shape: one model served TP=8, launched with --enable-metrics-for-all-schedulers so every rank's scheduler reports. The eight per-rank gauge series (engine_type + tp_rank + pp_rank) fold onto ONE models[] entry by MAX: gen_throughput stays 1843.5 where the sum would be 14748.0 (exactly 8x -- the multiplication this rule exists to prevent), running_requests stays 6 where the sum would be 48, and token_usage / cache_hit_rate take their peak rank (0.93 at tp_rank 3, 0.45 at tp_rank 6 -- deliberately neither the first nor the last series, so a first-wins or last-wins bug cannot pass). The tokenizer-side counters and histograms come from the single tokenizer manager process, so they carry model_name only and pass through unchanged; they SUM whenever a deployment does spread them across a dimension. Note the payload is identical to 'healthy' except for the two peaked fractions: one model is one row no matter how many ranks report it.",
+      "config": {
+        "metrics_url": "http://127.0.0.1:30000/metrics",
+        "auth_header_name": null,
+        "auth_header_value": null,
+        "verify_ssl": true
+      },
+      "response": {
+        "status": 200,
+        "body": "# HELP python_gc_objects_collected_total Objects collected during gc\n# TYPE python_gc_objects_collected_total counter\npython_gc_objects_collected_total{generation=\"0\"} 52144.0\n# HELP process_resident_memory_bytes Resident memory size in bytes.\n# TYPE process_resident_memory_bytes gauge\nprocess_resident_memory_bytes 2.4117248e+10\n# HELP python_info Python platform information\n# TYPE python_info gauge\npython_info{implementation=\"CPython\",major=\"3\",minor=\"12\"} 1.0\n# HELP process_cpu_seconds_total Total user and system CPU time spent in seconds.\n# TYPE process_cpu_seconds_total counter\nprocess_cpu_seconds_total 41276.91\nsglang:num_running_reqs{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"0\",pp_rank=\"0\"} 6.0\nsglang:num_used_tokens{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"0\",pp_rank=\"0\"} 148231.0\nsglang:token_usage{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"0\",pp_rank=\"0\"} 0.90\nsglang:gen_throughput{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"0\",pp_rank=\"0\"} 1843.5\nsglang:num_queue_reqs{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"0\",pp_rank=\"0\"} 22.0\nsglang:cache_hit_rate{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"0\",pp_rank=\"0\"} 0.42\nsglang:num_running_reqs{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"1\",pp_rank=\"0\"} 6.0\nsglang:num_used_tokens{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"1\",pp_rank=\"0\"} 148231.0\nsglang:token_usage{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"1\",pp_rank=\"0\"} 0.90\nsglang:gen_throughput{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"1\",pp_rank=\"0\"} 1843.5\nsglang:num_queue_reqs{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"1\",pp_rank=\"0\"} 22.0\nsglang:cache_hit_rate{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"1\",pp_rank=\"0\"} 0.42\nsglang:num_running_reqs{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"2\",pp_rank=\"0\"} 6.0\nsglang:num_used_tokens{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"2\",pp_rank=\"0\"} 148231.0\nsglang:token_usage{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"2\",pp_rank=\"0\"} 0.90\nsglang:gen_throughput{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"2\",pp_rank=\"0\"} 1843.5\nsglang:num_queue_reqs{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"2\",pp_rank=\"0\"} 22.0\nsglang:cache_hit_rate{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"2\",pp_rank=\"0\"} 0.42\nsglang:num_running_reqs{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"3\",pp_rank=\"0\"} 6.0\nsglang:num_used_tokens{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"3\",pp_rank=\"0\"} 148231.0\nsglang:token_usage{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"3\",pp_rank=\"0\"} 0.93\nsglang:gen_throughput{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"3\",pp_rank=\"0\"} 1843.5\nsglang:num_queue_reqs{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"3\",pp_rank=\"0\"} 22.0\nsglang:cache_hit_rate{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"3\",pp_rank=\"0\"} 0.42\nsglang:num_running_reqs{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"4\",pp_rank=\"0\"} 6.0\nsglang:num_used_tokens{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"4\",pp_rank=\"0\"} 148231.0\nsglang:token_usage{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"4\",pp_rank=\"0\"} 0.90\nsglang:gen_throughput{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"4\",pp_rank=\"0\"} 1843.5\nsglang:num_queue_reqs{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"4\",pp_rank=\"0\"} 22.0\nsglang:cache_hit_rate{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"4\",pp_rank=\"0\"} 0.42\nsglang:num_running_reqs{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"5\",pp_rank=\"0\"} 6.0\nsglang:num_used_tokens{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"5\",pp_rank=\"0\"} 148231.0\nsglang:token_usage{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"5\",pp_rank=\"0\"} 0.90\nsglang:gen_throughput{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"5\",pp_rank=\"0\"} 1843.5\nsglang:num_queue_reqs{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"5\",pp_rank=\"0\"} 22.0\nsglang:cache_hit_rate{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"5\",pp_rank=\"0\"} 0.42\nsglang:num_running_reqs{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"6\",pp_rank=\"0\"} 6.0\nsglang:num_used_tokens{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"6\",pp_rank=\"0\"} 148231.0\nsglang:token_usage{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"6\",pp_rank=\"0\"} 0.90\nsglang:gen_throughput{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"6\",pp_rank=\"0\"} 1843.5\nsglang:num_queue_reqs{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"6\",pp_rank=\"0\"} 22.0\nsglang:cache_hit_rate{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"6\",pp_rank=\"0\"} 0.45\nsglang:num_running_reqs{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"7\",pp_rank=\"0\"} 6.0\nsglang:num_used_tokens{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"7\",pp_rank=\"0\"} 148231.0\nsglang:token_usage{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"7\",pp_rank=\"0\"} 0.90\nsglang:gen_throughput{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"7\",pp_rank=\"0\"} 1843.5\nsglang:num_queue_reqs{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"7\",pp_rank=\"0\"} 22.0\nsglang:cache_hit_rate{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\",tp_rank=\"7\",pp_rank=\"0\"} 0.42\n# HELP sglang:prompt_tokens_total Number of prefill tokens processed.\n# TYPE sglang:prompt_tokens_total counter\nsglang:prompt_tokens_total{model_name=\"deepseek-ai/DeepSeek-V3\"} 1.23456789e+08\nsglang:prompt_tokens_created{model_name=\"deepseek-ai/DeepSeek-V3\"} 1.7508672e+09\n# HELP sglang:generation_tokens_total Number of generation tokens processed.\n# TYPE sglang:generation_tokens_total counter\nsglang:generation_tokens_total{model_name=\"deepseek-ai/DeepSeek-V3\"} 9.87654321e+08\nsglang:generation_tokens_created{model_name=\"deepseek-ai/DeepSeek-V3\"} 1.7508672e+09\n# HELP sglang:cached_tokens_total Number of cached prompt tokens.\n# TYPE sglang:cached_tokens_total counter\nsglang:cached_tokens_total{model_name=\"deepseek-ai/DeepSeek-V3\"} 5.1851901e+07\n# HELP sglang:num_requests_total Number of requests processed.\n# TYPE sglang:num_requests_total counter\nsglang:num_requests_total{model_name=\"deepseek-ai/DeepSeek-V3\"} 45230.0\n# HELP sglang:time_to_first_token_seconds Histogram of time to first token in seconds.\n# TYPE sglang:time_to_first_token_seconds histogram\nsglang:time_to_first_token_seconds_bucket{le=\"0.1\",model_name=\"deepseek-ai/DeepSeek-V3\"} 12040.0\nsglang:time_to_first_token_seconds_bucket{le=\"1.0\",model_name=\"deepseek-ai/DeepSeek-V3\"} 41890.0\nsglang:time_to_first_token_seconds_bucket{le=\"+Inf\",model_name=\"deepseek-ai/DeepSeek-V3\"} 45230.0\nsglang:time_to_first_token_seconds_sum{model_name=\"deepseek-ai/DeepSeek-V3\"} 1234.5\nsglang:time_to_first_token_seconds_count{model_name=\"deepseek-ai/DeepSeek-V3\"} 45230.0\n# HELP sglang:time_per_output_token_seconds Histogram of time per output token in seconds.\n# TYPE sglang:time_per_output_token_seconds histogram\nsglang:time_per_output_token_seconds_bucket{le=\"0.01\",model_name=\"deepseek-ai/DeepSeek-V3\"} 7200000.0\nsglang:time_per_output_token_seconds_bucket{le=\"+Inf\",model_name=\"deepseek-ai/DeepSeek-V3\"} 9000000.0\nsglang:time_per_output_token_seconds_sum{model_name=\"deepseek-ai/DeepSeek-V3\"} 8899.2\nsglang:time_per_output_token_seconds_count{model_name=\"deepseek-ai/DeepSeek-V3\"} 9000000.0\n# HELP sglang:e2e_request_latency_seconds Histogram of end-to-end request latency in seconds.\n# TYPE sglang:e2e_request_latency_seconds histogram\nsglang:e2e_request_latency_seconds_bucket{le=\"10.0\",model_name=\"deepseek-ai/DeepSeek-V3\"} 38110.0\nsglang:e2e_request_latency_seconds_bucket{le=\"+Inf\",model_name=\"deepseek-ai/DeepSeek-V3\"} 45230.0\nsglang:e2e_request_latency_seconds_sum{model_name=\"deepseek-ai/DeepSeek-V3\"} 56789.0\nsglang:e2e_request_latency_seconds_count{model_name=\"deepseek-ai/DeepSeek-V3\"} 45230.0\n# HELP sglang:func_latency_seconds Function latency in seconds.\n# TYPE sglang:func_latency_seconds histogram\nsglang:func_latency_seconds_sum{name=\"generate_request\"} 331.7\nsglang:func_latency_seconds_count{name=\"generate_request\"} 45230.0\n"
+      },
+      "payload": {
+        "reachable": true,
+        "models": [
+          {
+            "name": "deepseek-ai/DeepSeek-V3",
+            "running_requests": 6,
+            "queue_requests": 22,
+            "token_usage": 0.93,
+            "cache_hit_rate": 0.45,
+            "gen_throughput": 1843.5,
+            "prompt_tokens_total": 123456789,
+            "generation_tokens_total": 987654321,
+            "ttft_sum_seconds": 1234.5,
+            "ttft_count": 45230,
+            "itl_sum_seconds": 8899.2,
+            "itl_count": 9000000,
+            "e2e_latency_sum_seconds": 56789.0,
+            "e2e_latency_count": 45230
+          }
+        ]
+      }
+    },
+    "saturated": {
+      "description": "The alert state: 512 requests queued behind 48 running, token_usage 0.97 and a cache_hit_rate collapsed to 0.08, with gen_throughput down to 212.4 tokens/s. Pins that the 0-1 fractions ship VERBATIM (0.97, not 97) and that gen_throughput is a gauge shipped as-is -- the server must render the percentages itself and must never rate() the throughput.",
+      "config": {
+        "metrics_url": "http://127.0.0.1:30000/metrics",
+        "auth_header_name": null,
+        "auth_header_value": null,
+        "verify_ssl": true
+      },
+      "response": {
+        "status": 200,
+        "body": "# HELP python_gc_objects_collected_total Objects collected during gc\n# TYPE python_gc_objects_collected_total counter\npython_gc_objects_collected_total{generation=\"0\"} 52144.0\n# HELP process_resident_memory_bytes Resident memory size in bytes.\n# TYPE process_resident_memory_bytes gauge\nprocess_resident_memory_bytes 2.4117248e+10\n# HELP python_info Python platform information\n# TYPE python_info gauge\npython_info{implementation=\"CPython\",major=\"3\",minor=\"12\"} 1.0\n# HELP process_cpu_seconds_total Total user and system CPU time spent in seconds.\n# TYPE process_cpu_seconds_total counter\nprocess_cpu_seconds_total 41276.91\n# HELP sglang:num_running_reqs The number of running requests.\n# TYPE sglang:num_running_reqs gauge\nsglang:num_running_reqs{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\"} 48.0\n# HELP sglang:num_used_tokens The number of used tokens.\n# TYPE sglang:num_used_tokens gauge\nsglang:num_used_tokens{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\"} 1015808.0\n# HELP sglang:token_usage The token usage.\n# TYPE sglang:token_usage gauge\nsglang:token_usage{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\"} 0.97\n# HELP sglang:gen_throughput The generation throughput (token/s).\n# TYPE sglang:gen_throughput gauge\nsglang:gen_throughput{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\"} 212.4\n# HELP sglang:num_queue_reqs The number of requests in the waiting queue.\n# TYPE sglang:num_queue_reqs gauge\nsglang:num_queue_reqs{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\"} 512.0\n# HELP sglang:cache_hit_rate The prefix cache hit rate.\n# TYPE sglang:cache_hit_rate gauge\nsglang:cache_hit_rate{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\"} 0.08\n# HELP sglang:spec_accept_length The average acceptance length of speculative decoding.\n# TYPE sglang:spec_accept_length gauge\nsglang:spec_accept_length{engine_type=\"unified\",model_name=\"deepseek-ai/DeepSeek-V3\"} 3.14\n# HELP sglang:prompt_tokens_total Number of prefill tokens processed.\n# TYPE sglang:prompt_tokens_total counter\nsglang:prompt_tokens_total{model_name=\"deepseek-ai/DeepSeek-V3\"} 2.46813579e+09\nsglang:prompt_tokens_created{model_name=\"deepseek-ai/DeepSeek-V3\"} 1.7508672e+09\n# HELP sglang:generation_tokens_total Number of generation tokens processed.\n# TYPE sglang:generation_tokens_total counter\nsglang:generation_tokens_total{model_name=\"deepseek-ai/DeepSeek-V3\"} 1.975308642e+09\nsglang:generation_tokens_created{model_name=\"deepseek-ai/DeepSeek-V3\"} 1.7508672e+09\n# HELP sglang:cached_tokens_total Number of cached prompt tokens.\n# TYPE sglang:cached_tokens_total counter\nsglang:cached_tokens_total{model_name=\"deepseek-ai/DeepSeek-V3\"} 5.1851901e+07\n# HELP sglang:num_requests_total Number of requests processed.\n# TYPE sglang:num_requests_total counter\nsglang:num_requests_total{model_name=\"deepseek-ai/DeepSeek-V3\"} 120400.0\n# HELP sglang:time_to_first_token_seconds Histogram of time to first token in seconds.\n# TYPE sglang:time_to_first_token_seconds histogram\nsglang:time_to_first_token_seconds_bucket{le=\"0.1\",model_name=\"deepseek-ai/DeepSeek-V3\"} 12040.0\nsglang:time_to_first_token_seconds_bucket{le=\"1.0\",model_name=\"deepseek-ai/DeepSeek-V3\"} 41890.0\nsglang:time_to_first_token_seconds_bucket{le=\"+Inf\",model_name=\"deepseek-ai/DeepSeek-V3\"} 120400.0\nsglang:time_to_first_token_seconds_sum{model_name=\"deepseek-ai/DeepSeek-V3\"} 98765.4\nsglang:time_to_first_token_seconds_count{model_name=\"deepseek-ai/DeepSeek-V3\"} 120400.0\n# HELP sglang:time_per_output_token_seconds Histogram of time per output token in seconds.\n# TYPE sglang:time_per_output_token_seconds histogram\nsglang:time_per_output_token_seconds_bucket{le=\"0.01\",model_name=\"deepseek-ai/DeepSeek-V3\"} 7200000.0\nsglang:time_per_output_token_seconds_bucket{le=\"+Inf\",model_name=\"deepseek-ai/DeepSeek-V3\"} 21000000.0\nsglang:time_per_output_token_seconds_sum{model_name=\"deepseek-ai/DeepSeek-V3\"} 44880.6\nsglang:time_per_output_token_seconds_count{model_name=\"deepseek-ai/DeepSeek-V3\"} 21000000.0\n# HELP sglang:e2e_request_latency_seconds Histogram of end-to-end request latency in seconds.\n# TYPE sglang:e2e_request_latency_seconds histogram\nsglang:e2e_request_latency_seconds_bucket{le=\"10.0\",model_name=\"deepseek-ai/DeepSeek-V3\"} 38110.0\nsglang:e2e_request_latency_seconds_bucket{le=\"+Inf\",model_name=\"deepseek-ai/DeepSeek-V3\"} 120400.0\nsglang:e2e_request_latency_seconds_sum{model_name=\"deepseek-ai/DeepSeek-V3\"} 1234567.8\nsglang:e2e_request_latency_seconds_count{model_name=\"deepseek-ai/DeepSeek-V3\"} 120400.0\n# HELP sglang:func_latency_seconds Function latency in seconds.\n# TYPE sglang:func_latency_seconds histogram\nsglang:func_latency_seconds_sum{name=\"generate_request\"} 331.7\nsglang:func_latency_seconds_count{name=\"generate_request\"} 45230.0\n"
+      },
+      "payload": {
+        "reachable": true,
+        "models": [
+          {
+            "name": "deepseek-ai/DeepSeek-V3",
+            "running_requests": 48,
+            "queue_requests": 512,
+            "token_usage": 0.97,
+            "cache_hit_rate": 0.08,
+            "gen_throughput": 212.4,
+            "prompt_tokens_total": 2468135790,
+            "generation_tokens_total": 1975308642,
+            "ttft_sum_seconds": 98765.4,
+            "ttft_count": 120400,
+            "itl_sum_seconds": 44880.6,
+            "itl_count": 21000000,
+            "e2e_latency_sum_seconds": 1234567.8,
+            "e2e_latency_count": 120400
+          }
+        ]
+      }
+    },
+    "metrics_not_enabled": {
+      "description": "THE SGLANG SHARP EDGE, and the EXPECTED first-run state rather than an edge case: SGLang exposes sglang:* samples only when launched with --enable-metrics, so a stock server answers /metrics 2xx with nothing but the default prometheus_client collectors. That is a SUCCESSFUL read -- reachable stays true with an empty models array, and the server renders the 'add --enable-metrics to your launch command' hint from it. It must NEVER be conflated with unreachable, which would page the customer with 'your SGLang is down' for a server that is serving traffic perfectly. The same shape covers a future upstream rename the whitelist misses.",
+      "config": {
+        "metrics_url": "http://127.0.0.1:30000/metrics",
+        "auth_header_name": null,
+        "auth_header_value": null,
+        "verify_ssl": true
+      },
+      "response": {
+        "status": 200,
+        "body": "# HELP python_gc_objects_collected_total Objects collected during gc\n# TYPE python_gc_objects_collected_total counter\npython_gc_objects_collected_total{generation=\"0\"} 52144.0\n# HELP process_resident_memory_bytes Resident memory size in bytes.\n# TYPE process_resident_memory_bytes gauge\nprocess_resident_memory_bytes 2.4117248e+10\n# HELP python_info Python platform information\n# TYPE python_info gauge\npython_info{implementation=\"CPython\",major=\"3\",minor=\"12\"} 1.0\n# HELP process_cpu_seconds_total Total user and system CPU time spent in seconds.\n# TYPE process_cpu_seconds_total counter\nprocess_cpu_seconds_total 41276.91\n"
+      },
+      "payload": {
+        "reachable": true,
+        "models": []
+      }
+    },
+    "unreachable_connection_refused": {
+      "description": "The SGLang process is dead (OOM-killed mid-generation, the exact failure this collector exists to catch): the GET raises a transport-level ConnectionError. UNREACHABLE IS THE SIGNAL, so the payload is a reachable:false envelope and MUST NOT be null. error_message is the transport error text, truncated to 200 chars.",
+      "config": {
+        "metrics_url": "http://127.0.0.1:30000/metrics",
+        "auth_header_name": null,
+        "auth_header_value": null,
+        "verify_ssl": true
+      },
+      "raise": {
+        "type": "connection_refused",
+        "message": "Connection refused"
+      },
+      "payload": {
+        "reachable": false,
+        "error_type": "connection_refused",
+        "error_message": "Connection refused"
+      }
+    },
+    "auth_failure": {
+      "description": "SGLang was started with --api-key but the configured auth header is wrong or missing, so the GET returns HTTP 401. A non-2xx is a reachability failure; 401/403 map to error_type auth_failed, which the server folds into config_error rather than an outage. Still never null.",
+      "config": {
+        "metrics_url": "https://sglang.internal.example.com/metrics",
+        "auth_header_name": "Authorization",
+        "auth_header_value": "Bearer wrong-key",
+        "verify_ssl": true
+      },
+      "response": {
+        "status": 401,
+        "body": "Unauthorized"
+      },
+      "payload": {
+        "reachable": false,
+        "error_type": "auth_failed",
+        "error_message": "HTTP 401 on /metrics"
+      }
+    },
+    "aggregating_endpoint": {
+      "description": "metrics_url is pointed at a Prometheus scraping two SGLang nodes rather than at one local server, so every series carries instance/job labels the engine itself never emits. The fold cannot know which series is this host's, so it still ships what parsed -- but read_warnings names the read as non-authoritative. Look at what the numbers would otherwise claim: the 480-deep queue and the 0.98 token_usage belong to the OTHER node, and prompt_tokens_total is genuinely two hosts added together. The server's rule: do not treat models[] as authoritative and do not vanish-prune against it. Identical in shape and meaning to the vLLM fixture's scenario of the same name, because both collectors share one implementation.",
+      "config": {
+        "metrics_url": "http://127.0.0.1:30000/metrics",
+        "auth_header_name": null,
+        "auth_header_value": null,
+        "verify_ssl": true
+      },
+      "response": {
+        "status": 200,
+        "body": "# HELP sglang:num_running_reqs The number of running requests.\n# TYPE sglang:num_running_reqs gauge\nsglang:num_running_reqs{instance=\"10.0.7.21:30000\",job=\"sglang\",model_name=\"deepseek-ai/DeepSeek-V3\"} 6.0\nsglang:num_running_reqs{instance=\"10.0.7.22:30000\",job=\"sglang\",model_name=\"deepseek-ai/DeepSeek-V3\"} 31.0\n# HELP sglang:num_queue_reqs The number of requests in the waiting queue.\n# TYPE sglang:num_queue_reqs gauge\nsglang:num_queue_reqs{instance=\"10.0.7.21:30000\",job=\"sglang\",model_name=\"deepseek-ai/DeepSeek-V3\"} 0.0\nsglang:num_queue_reqs{instance=\"10.0.7.22:30000\",job=\"sglang\",model_name=\"deepseek-ai/DeepSeek-V3\"} 480.0\n# HELP sglang:token_usage The token usage.\n# TYPE sglang:token_usage gauge\nsglang:token_usage{instance=\"10.0.7.21:30000\",job=\"sglang\",model_name=\"deepseek-ai/DeepSeek-V3\"} 0.11\nsglang:token_usage{instance=\"10.0.7.22:30000\",job=\"sglang\",model_name=\"deepseek-ai/DeepSeek-V3\"} 0.98\n# HELP sglang:prompt_tokens_total Number of prefill tokens processed.\n# TYPE sglang:prompt_tokens_total counter\nsglang:prompt_tokens_total{instance=\"10.0.7.21:30000\",job=\"sglang\",model_name=\"deepseek-ai/DeepSeek-V3\"} 1000.0\nsglang:prompt_tokens_total{instance=\"10.0.7.22:30000\",job=\"sglang\",model_name=\"deepseek-ai/DeepSeek-V3\"} 2000.0\n"
+      },
+      "payload": {
+        "reachable": true,
+        "models": [
+          {
+            "name": "deepseek-ai/DeepSeek-V3",
+            "running_requests": 31,
+            "queue_requests": 480,
+            "token_usage": 0.98,
+            "prompt_tokens_total": 3000
+          }
+        ],
+        "read_warnings": [
+          "foreign_labels"
+        ]
+      }
+    }
+  }
+}
