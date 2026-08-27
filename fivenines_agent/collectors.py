@@ -30,6 +30,7 @@ from fivenines_agent.qemu import qemu_metrics
 from fivenines_agent.rabbitmq import rabbitmq_metrics
 from fivenines_agent.raid_storage import raid_storage_health
 from fivenines_agent.redis import redis_metrics
+from fivenines_agent.sglang import sglang_metrics
 from fivenines_agent.smart_storage import (
     smart_storage_health,
     smart_storage_identification,
@@ -134,6 +135,15 @@ COLLECTORS = [
     # server distinguishes "vLLM crashed" (the signal, and the whole point:
     # every GPU still reads green) from "collector disabled".
     ("vllm", [("vllm", vllm_metrics, True)]),
+    # SGLang inference serving health (server #893): the vLLM sibling, same
+    # config-driven HTTP scrape and same never-None reachability envelope,
+    # sharing every helper via inference_metrics.py. config["sglang"] ==
+    # {metrics_url, auth_header_name, auth_header_value, verify_ssl} is
+    # unpacked (pass_kwargs) into sglang_metrics(...). Note that SGLang only
+    # publishes sglang:* samples when launched with --enable-metrics, so a
+    # reachable tick carrying models: [] is the expected stock-launch state,
+    # never an outage.
+    ("sglang", [("sglang", sglang_metrics, True)]),
     ("postgresql", [("postgresql", postgresql_metrics, True)]),
     ("mysql", [("mysql", mysql_metrics, True)]),
     # RabbitMQ: config-driven management-API poll (nginx/apache/postgresql

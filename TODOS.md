@@ -53,6 +53,41 @@ copy cannot break its suite.
 - **Depends on:** agent PR for #127 merged
 - **Files:** `fivenines-server/spec/fixtures/vpn_contract_payload.json` (NOT this repo)
 
+## P1: Vendor the AI-inference contract fixtures into the server repo
+
+**Tracked server-side as fivenines_server#887 (vLLM) and #893 (SGLang)** -- the
+work happens in that repo, this entry is the agent-side record of why.
+
+Unlike the ubuntu_pro and vpn entries above, these two were authored
+AGENT-FIRST: `tests/fixtures/vllm_contract_payload.json` (v1.17.0) and
+`tests/fixtures/sglang_contract_payload.json` (v1.17.1) are the source of truth
+and the server has no copy at all yet (verified: no `sglang`/`vllm` references
+in `fivenines-server/app` or `lib`, no fixture in `spec/fixtures/`).
+
+The failure mode to avoid is specific and has bitten this pair of repos before:
+hand-authoring the server's copy to match the server code instead of VENDORING
+the agent's file. Ceph #615 shipped six dead gauges that way -- the ingester read
+key names the agent has never sent. Vendor with:
+
+    gh api repos/Five-Nines-io/fivenines_agent/contents/tests/fixtures/sglang_contract_payload.json \
+      -q .content | base64 -d > spec/fixtures/sglang_contract_payload.json
+
+Two agent-side decisions the server must sign off on while implementing, both
+pinned in the fixtures and neither specified in the original issues:
+
+- an optional `read_warnings` array (`foreign_labels`, `models_capped`,
+  `body_truncated`, `invalid_values`, `unlabelled_series`). One rule for all of
+  them: do not treat `models[]` as authoritative, and above all do not
+  vanish-prune the rows missing from it.
+- gauges reduce by MAX across label dimensions, not SUM. For SGLang this is ALL
+  FIVE gauges (tp_rank replicates one scheduler's reading, so summing
+  `gen_throughput` across 8 ranks reports 8x the real tokens/s); for vLLM it is
+  `kv_cache_usage` only.
+
+- **Effort:** XS (human) / XS (CC)
+- **Depends on:** agent PRs for #133 (merged) and #135
+- **Files:** `fivenines-server/spec/fixtures/{vllm,sglang}_contract_payload.json` (NOT this repo)
+
 ## P2: Log monitoring - flat-file (non-journald) source (E2)
 
 Deferred from `ceo-plans/2026-06-30-log-file-monitoring.md` at the Codex
