@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
-from fivenines_agent import vllm
+from fivenines_agent import inference_metrics, vllm
 from fivenines_agent.vllm import vllm_metrics
 
 
@@ -34,7 +34,10 @@ def _resp(status=200, text="", chunks=None):
 
 def _collect(body, status=200, **config):
     """Run the collector against one canned /metrics body."""
-    with patch("fivenines_agent.vllm.requests.get", return_value=_resp(status, body)):
+    with patch(
+        "fivenines_agent.inference_metrics.requests.get",
+        return_value=_resp(status, body),
+    ):
         return vllm_metrics(**config)
 
 
@@ -63,7 +66,7 @@ def test_metrics_url_headers_and_verify_passed_through():
         captured.update(kwargs)
         return _resp(200, "")
 
-    with patch("fivenines_agent.vllm.requests.get", side_effect=fake_get):
+    with patch("fivenines_agent.inference_metrics.requests.get", side_effect=fake_get):
         vllm_metrics(
             metrics_url="https://vllm.local:8000/metrics",
             auth_header_name="Authorization",
@@ -76,7 +79,7 @@ def test_metrics_url_headers_and_verify_passed_through():
     assert captured["url"] == "https://vllm.local:8000/metrics"
     assert captured["headers"]["Authorization"] == "Bearer k"
     assert captured["verify"] is False
-    assert captured["timeout"] == vllm._TIMEOUT
+    assert captured["timeout"] == inference_metrics._TIMEOUT
 
 
 def test_default_metrics_url_is_the_local_api_server():
@@ -86,7 +89,7 @@ def test_default_metrics_url_is_the_local_api_server():
         captured["url"] = url
         return _resp(200, "")
 
-    with patch("fivenines_agent.vllm.requests.get", side_effect=fake_get):
+    with patch("fivenines_agent.inference_metrics.requests.get", side_effect=fake_get):
         vllm_metrics()
 
     assert captured["url"] == "http://127.0.0.1:8000/metrics"
@@ -106,7 +109,7 @@ def test_partial_auth_header_is_ignored(kwargs):
         captured.update(kw)
         return _resp(200, "")
 
-    with patch("fivenines_agent.vllm.requests.get", side_effect=fake_get):
+    with patch("fivenines_agent.inference_metrics.requests.get", side_effect=fake_get):
         vllm_metrics(metrics_url="http://x/metrics", **kwargs)
 
     # Half a header pair is not a header (only the transport header remains).
@@ -116,7 +119,9 @@ def test_partial_auth_header_is_ignored(kwargs):
 def test_unknown_config_keys_are_tolerated():
     # Forward compatibility: the backend pushing a key this agent version does
     # not know must not raise into a None payload.
-    with patch("fivenines_agent.vllm.requests.get", return_value=_resp(200, "")):
+    with patch(
+        "fivenines_agent.inference_metrics.requests.get", return_value=_resp(200, "")
+    ):
         out = vllm_metrics(metrics_url="http://x/metrics", future_key="whatever")
     assert out == {"reachable": True, "models": []}
 
@@ -128,7 +133,7 @@ def _raising(exc):
     def boom(url, **kwargs):
         raise exc
 
-    return patch("fivenines_agent.vllm.requests.get", side_effect=boom)
+    return patch("fivenines_agent.inference_metrics.requests.get", side_effect=boom)
 
 
 def test_connection_error_is_connection_refused():
@@ -214,9 +219,11 @@ def test_204_is_reachable():
 def test_parse_bug_stays_reachable():
     # Force an unexpected exception AFTER the 2xx: reachable must stay true and
     # degrade to an empty models list, never page "your vLLM is down".
-    with patch("fivenines_agent.vllm.requests.get", return_value=_resp(200, "x")):
+    with patch(
+        "fivenines_agent.inference_metrics.requests.get", return_value=_resp(200, "x")
+    ):
         with patch(
-            "fivenines_agent.vllm._parse_exposition",
+            "fivenines_agent.inference_metrics._parse_exposition",
             side_effect=RuntimeError("boom"),
         ):
             out = vllm_metrics(metrics_url="http://x/metrics")
@@ -342,8 +349,8 @@ def test_kv_cache_usage_takes_the_max_not_the_sum():
 
 
 def test_reducers_are_pure_functions_over_their_series():
-    assert vllm._sum_values([1.0, 2.5]) == 3.5
-    assert vllm._max_value([0.2, 0.9, 0.4]) == 0.9
+    assert inference_metrics.sum_values([1.0, 2.5]) == 3.5
+    assert inference_metrics.max_value([0.2, 0.9, 0.4]) == 0.9
 
 
 def test_models_are_sorted_by_name():
@@ -392,10 +399,10 @@ def test_bucket_series_are_never_read_as_the_sum_or_count():
 def test_models_cap_truncates_and_flags():
     body = "".join(
         _series("vllm:num_requests_running", "1.0", model=f"model-{i}")
-        for i in range(vllm._MAX_MODELS + 5)
+        for i in range(inference_metrics._MAX_MODELS + 5)
     )
     out = _collect(body)
-    assert len(out["models"]) == vllm._MAX_MODELS
+    assert len(out["models"]) == inference_metrics._MAX_MODELS
     # A truncation the server can SEE -- never a silently short list.
     assert out["read_warnings"] == ["models_capped"]
     # First-seen models win, so the cap is deterministic for a given body.
@@ -436,7 +443,7 @@ def test_documented_reducible_labels_are_not_foreign(label):
 def test_both_warnings_ride_together_sorted():
     body = "".join(
         _series("vllm:num_requests_running", "1.0", model=f"m-{i}", pod=f"p-{i}")
-        for i in range(vllm._MAX_MODELS + 2)
+        for i in range(inference_metrics._MAX_MODELS + 2)
     )
     assert _collect(body)["read_warnings"] == ["foreign_labels", "models_capped"]
 
@@ -447,9 +454,9 @@ def test_both_warnings_ride_together_sorted():
 def test_oversized_body_is_truncated_and_publishes_nothing():
     # Half an exposition parses cleanly into a SHORT models list; a server that
     # prunes what is missing would vanish every model past the cut. Ship none.
-    big = b"x" * (vllm._MAX_RESPONSE_BYTES + 1)
+    big = b"x" * (inference_metrics._MAX_RESPONSE_BYTES + 1)
     with patch(
-        "fivenines_agent.vllm.requests.get",
+        "fivenines_agent.inference_metrics.requests.get",
         return_value=_resp(200, chunks=[big]),
     ):
         out = vllm_metrics(metrics_url="http://x/metrics")
@@ -463,9 +470,12 @@ def test_oversized_body_is_truncated_and_publishes_nothing():
 def test_body_read_deadline_truncates():
     body = _series("vllm:num_requests_running", "1.0").encode()
     ticks = iter([0.0, 1e9, 1e9])  # start, then far past the deadline
-    with patch("fivenines_agent.vllm.time.monotonic", side_effect=lambda: next(ticks)):
+    with patch(
+        "fivenines_agent.inference_metrics.time.monotonic",
+        side_effect=lambda: next(ticks),
+    ):
         with patch(
-            "fivenines_agent.vllm.requests.get",
+            "fivenines_agent.inference_metrics.requests.get",
             return_value=_resp(200, chunks=[body, body]),
         ):
             out = vllm_metrics(metrics_url="http://x/metrics")
@@ -477,7 +487,7 @@ def test_empty_chunks_are_skipped_and_body_still_parses():
     # requests can yield keep-alive empty chunks; they must not end the read.
     body = _series("vllm:num_requests_running", "2.0").encode()
     with patch(
-        "fivenines_agent.vllm.requests.get",
+        "fivenines_agent.inference_metrics.requests.get",
         return_value=_resp(200, chunks=[b"", body, b""]),
     ):
         out = vllm_metrics(metrics_url="http://x/metrics")
@@ -491,7 +501,7 @@ def test_transport_is_streamed_non_redirecting_and_uncompressed():
         captured.update(kwargs)
         return _resp(200, "")
 
-    with patch("fivenines_agent.vllm.requests.get", side_effect=fake_get):
+    with patch("fivenines_agent.inference_metrics.requests.get", side_effect=fake_get):
         vllm_metrics(metrics_url="http://x/metrics")
 
     # stream: the body is bounded, not buffered whole.
@@ -505,7 +515,7 @@ def test_transport_is_streamed_non_redirecting_and_uncompressed():
 def test_response_is_closed_even_when_the_body_read_raises():
     resp = _resp(200, "")
     resp.iter_content.side_effect = requests.exceptions.ConnectionError("reset")
-    with patch("fivenines_agent.vllm.requests.get", return_value=resp):
+    with patch("fivenines_agent.inference_metrics.requests.get", return_value=resp):
         out = vllm_metrics(metrics_url="http://x/metrics")
     # A mid-body reset is a transport failure -> the unreachable envelope...
     assert out["reachable"] is False
@@ -611,35 +621,39 @@ def test_negative_series_does_not_shrink_a_sum():
 
 def test_parse_metric_line_variants():
     # comment, blank, lone token, unclosed brace -> all None
-    assert vllm._parse_metric_line("# HELP foo bar") is None
-    assert vllm._parse_metric_line("   ") is None
-    assert vllm._parse_metric_line("loneword") is None
-    assert vllm._parse_metric_line("weird{unclosed 5") is None
+    assert inference_metrics._parse_metric_line("# HELP foo bar") is None
+    assert inference_metrics._parse_metric_line("   ") is None
+    assert inference_metrics._parse_metric_line("loneword") is None
+    assert inference_metrics._parse_metric_line("weird{unclosed 5") is None
     # value-less metric (empty rest after labels) -> value None
-    assert vllm._parse_metric_line('foo{a="b"}') == ("foo", {"a": "b"}, None)
+    assert inference_metrics._parse_metric_line('foo{a="b"}') == (
+        "foo",
+        {"a": "b"},
+        None,
+    )
     # unlabelled metric
-    assert vllm._parse_metric_line("foo 5") == ("foo", {}, 5.0)
+    assert inference_metrics._parse_metric_line("foo 5") == ("foo", {}, 5.0)
 
 
 def test_parse_value_edges():
     # trailing timestamp is ignored; scientific notation parses; NaN/Inf -> None
-    assert vllm._parse_value("42 1620000000000") == 42.0
-    assert vllm._parse_value("1.23456789e+08") == 123456789.0
-    assert vllm._parse_value("notanumber") is None
-    assert vllm._parse_value("NaN") is None
-    assert vllm._parse_value("+Inf") is None
-    assert vllm._parse_value("") is None
+    assert inference_metrics._parse_value("42 1620000000000") == 42.0
+    assert inference_metrics._parse_value("1.23456789e+08") == 123456789.0
+    assert inference_metrics._parse_value("notanumber") is None
+    assert inference_metrics._parse_value("NaN") is None
+    assert inference_metrics._parse_value("+Inf") is None
+    assert inference_metrics._parse_value("") is None
 
 
 def test_parse_labels_honours_escaped_quotes():
-    labels = vllm._parse_labels(r'model_name="a\"b",engine="0"')
+    labels = inference_metrics._parse_labels(r'model_name="a\"b",engine="0"')
     assert labels["engine"] == "0"
     assert labels["model_name"] == r"a\"b"
 
 
 def test_summed_returns_none_when_absent():
-    assert vllm._summed({"a": [1.0, 2.0]}, "a") == 3.0
-    assert vllm._summed({}, "a") is None
+    assert inference_metrics._summed({"a": [1.0, 2.0]}, "a") == 3.0
+    assert inference_metrics._summed({}, "a") is None
 
 
 def test_whitelist_covers_every_declared_alias():
@@ -712,7 +726,8 @@ def test_contract_fixture_round_trip(name):
     """
     scenario = _FIXTURE["scenarios"][name]
     with patch(
-        "fivenines_agent.vllm.requests.get", side_effect=_fake_get_for(scenario)
+        "fivenines_agent.inference_metrics.requests.get",
+        side_effect=_fake_get_for(scenario),
     ):
         out = vllm_metrics(**scenario["config"])
     assert out == scenario["payload"]
