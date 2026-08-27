@@ -41,6 +41,7 @@ def test_registry_has_expected_config_keys():
         "caddy",
         "tsdb",
         "vllm",
+        "sglang",
         "postgresql",
         "mysql",
         "rabbitmq",
