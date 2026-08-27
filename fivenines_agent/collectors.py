@@ -38,6 +38,7 @@ from fivenines_agent.systemd import systemd_metrics
 from fivenines_agent.tailscale import tailscale_metrics
 from fivenines_agent.temperatures import temperatures
 from fivenines_agent.tsdb import tsdb_metrics
+from fivenines_agent.vllm import vllm_metrics
 from fivenines_agent.wireguard import wireguard_metrics
 from fivenines_agent.zfs import zfs_storage_health
 
@@ -125,6 +126,14 @@ COLLECTORS = [
     # reachability envelope -- NEVER None -- so the server distinguishes "TSDB
     # unreachable" (the signal) from "collector disabled".
     ("tsdb", [("tsdb", tsdb_metrics, True)]),
+    # vLLM inference serving health (server #887): config-driven HTTP scrape of
+    # the vLLM server's native Prometheus endpoint, no capability gate (the
+    # tsdb/nginx posture). config["vllm"] == {metrics_url, auth_header_name,
+    # auth_header_value, verify_ssl} is unpacked (pass_kwargs) into
+    # vllm_metrics(...). Emits a reachability envelope -- NEVER None -- so the
+    # server distinguishes "vLLM crashed" (the signal, and the whole point:
+    # every GPU still reads green) from "collector disabled".
+    ("vllm", [("vllm", vllm_metrics, True)]),
     ("postgresql", [("postgresql", postgresql_metrics, True)]),
     ("mysql", [("mysql", mysql_metrics, True)]),
     # RabbitMQ: config-driven management-API poll (nginx/apache/postgresql
