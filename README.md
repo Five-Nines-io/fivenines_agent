@@ -2,15 +2,57 @@
 
 This agent collects server metrics from the monitored host and sends it to the [fivenines](https://fivenines.io) API.
 
+Runs on **Linux** (glibc + musl, amd64 + arm64), **Windows** (Server 2019+,
+Windows 10/11), **Synology DSM 7** and **UNRAID**.
+
+## Contents
+
+- [Installation](#installation)
+  - [Standard Installation (Linux)](#standard-installation-linux)
+  - [User-Level Installation (No Sudo/Root Access)](#user-level-installation-no-sudoroot-access)
+  - [Windows Installation](#windows-installation)
+  - [Alpine Linux (OpenRC)](#alpine-linux-openrc)
+  - [UNRAID](#unraid)
+  - [Synology Installation (DSM 7+)](#synology-installation-dsm-7)
+  - [Cloning VMs or building golden images](#cloning-vms-or-building-golden-images)
+- [Update](#update) / [Remove](#remove) / [Debug](#debug)
+- [Permissions](#permissions)
+- **Host and platform monitoring**
+  - [Docker Monitoring](#docker-monitoring) (container states + image vulnerability scanning)
+  - [Proxmox VE Monitoring](#proxmox-ve-monitoring)
+  - [systemd Unit Monitoring](#systemd-unit-monitoring)
+  - [Log Monitoring](#log-monitoring)
+  - [ZFS Pool Health](#zfs-pool-health)
+  - [Ceph Cluster Monitoring](#ceph-cluster-monitoring)
+  - [Ubuntu Pro Entitlement](#ubuntu-pro-entitlement)
+- **Network and devices**
+  - [SNMP Network Device Monitoring](#snmp-network-device-monitoring)
+  - [MQTT Broker Monitoring](#mqtt-broker-monitoring)
+  - [VPN Monitoring (WireGuard + Tailscale)](#vpn-monitoring-wireguard--tailscale)
+- **Applications**
+  - [AI Inference Serving (vLLM and SGLang)](#ai-inference-serving-vllm-and-sglang)
+  - [Application Integrations](#application-integrations): [Apache](#apache),
+    [Caddy](#caddy), [Nginx](#nginx), [HAProxy](#haproxy), [PHP-FPM](#php-fpm),
+    [PostgreSQL](#postgresql), [MySQL / MariaDB](#mysql--mariadb),
+    [Redis / Valkey](#redis--valkey), [Memcached](#memcached),
+    [RabbitMQ](#rabbitmq), [Prometheus / VictoriaMetrics](#prometheus--victoriametrics)
+- [Contribute](#contribute) / [Contact](#contact)
+
 ## Installation
 
-### Standard Installation (Recommended)
+### Standard Installation (Linux)
 
 Requires sudo/root access for initial setup. The agent runs as a dedicated `fivenines` user with limited permissions.
 
 ```bash
 wget -T 3 -q https://releases.fivenines.io/latest/fivenines_setup.sh && sudo bash fivenines_setup.sh TOKEN
 ```
+
+One script covers every Linux init system: it detects **systemd**, **OpenRC**
+(Alpine) and **UNRAID** and installs the matching service integration, and it
+detects glibc vs musl and downloads the matching binary. See
+[Alpine Linux (OpenRC)](#alpine-linux-openrc) and [UNRAID](#unraid) for the
+platform-specific notes.
 
 ### User-Level Installation (No Sudo/Root Access)
 
@@ -36,6 +78,202 @@ To auto-start on reboot, add to crontab (`crontab -e`):
 ```
 
 > **Note:** User-level installation has limited monitoring capabilities. Features requiring sudo (SMART, RAID) won't be available. See [Permissions](#permissions) section.
+
+### Windows Installation
+
+Supported: **Windows Server 2019, 2022 and 2025** and **Windows 10 / 11**, x64
+only. Windows Server 2016 is **not supported** -- it is not in the build or test
+matrix and no release artifact is validated against it.
+
+The agent ships as an MSI that does the whole install in one step: the frozen
+agent binary, a [WinSW](https://github.com/winsw/winsw) wrapper registered with
+the Service Control Manager, a dedicated low-privilege service account, and the
+ACLs and WMI delegation that account needs.
+
+From an **elevated** PowerShell session:
+
+```powershell
+iwr https://releases.fivenines.io/latest/fivenines_setup.ps1 -OutFile setup.ps1
+.\setup.ps1 -Token TOKEN
+```
+
+> **The MSI is not code-signed yet.** SmartScreen will warn on a manual
+> double-click ("Windows protected your PC" -> **More info** -> **Run anyway**),
+> and a downloaded MSI carries Mark-of-the-Web, which makes a silent `/qn`
+> install fail with no obvious error. `fivenines_setup.ps1` handles this for you
+> by calling `Unblock-File` before `msiexec`; if you deploy the MSI yourself, run
+> `Unblock-File .\fivenines-agent-windows-amd64.msi` (or use **Unblock** in the
+> file's Properties dialog) first. Authenticode signing via Azure Trusted Signing
+> is tracked in [#63](https://github.com/Five-Nines-io/fivenines_agent/issues/63).
+
+#### Silent install (GPO / SCCM / Intune)
+
+Download `fivenines-agent-windows-amd64.msi` from
+[releases.fivenines.io/latest](https://releases.fivenines.io/latest/fivenines-agent-windows-amd64.msi)
+or from a tagged [GitHub release](https://github.com/Five-Nines-io/fivenines_agent/releases),
+then:
+
+```cmd
+msiexec /i fivenines-agent-windows-amd64.msi TOKEN=xxxxx /qn /norestart
+```
+
+| MSI property | Purpose |
+|---|---|
+| `TOKEN` | Enrollment token (required). |
+| `SERVICEACCOUNT` | Use an existing **local** account instead of the MSI-managed one. Domain accounts must be pre-staged by the deployer. |
+| `SERVICEACCOUNTPASSWORD` | Required when `SERVICEACCOUNT` names an account the MSI did not create, so operator-managed credentials are never silently rotated. |
+
+`TOKEN` is declared in `MsiHiddenProperties`, so it does **not** land in the
+installer log. It is still briefly visible on the process command line and in
+your deployment tool's history -- acceptable for an enrollment-only secret,
+which the backend swaps for a per-host token on the agent's first sync.
+
+- **GPO**: assign the MSI per-machine (Computer Configuration -> Software
+  Installation). Per-user assignment will not work; the service is machine-scoped.
+- **SCCM / Intune**: use the `msiexec` line above as the install command and
+  `msiexec /x {ProductCode} /qn` as the uninstall command. Detect on the
+  `fivenines-agent` service or on `%ProgramFiles%\fivenines-agent\`.
+- Unblock the MSI on the distribution point (or repackage it) so
+  Mark-of-the-Web does not block the silent install on clients.
+
+Upgrades are in-place: the MSI carries a `MajorUpgrade` element, so installing a
+newer MSI over an older one stops and re-registers the service and rotates the
+MSI-managed service-account password automatically -- no operator credentials
+needed.
+
+#### Update and uninstall
+
+```powershell
+# Update to the latest release (refuses if the agent is not already installed)
+iwr https://releases.fivenines.io/latest/fivenines_update.ps1 -OutFile update.ps1
+.\update.ps1
+
+# Uninstall: removes the MSI, the service, the local service account,
+# its SeServiceLogonRight grant, and the config + log directories.
+# Pass -KeepAccount to leave a pre-staged account in place.
+iwr https://releases.fivenines.io/latest/fivenines_uninstall.ps1 -OutFile uninstall.ps1
+.\uninstall.ps1
+```
+
+#### Security model
+
+The Windows install is least-privilege by construction -- the agent never runs
+as `LocalSystem` and never as an administrator:
+
+- **Dedicated local service account.** The MSI creates a local account --
+  `<ComputerName>\fivenines-agent` unless you override `SERVICEACCOUNT` -- with a
+  cryptographically random 192-bit password that is never displayed and never
+  written to the install log; only the SCM's LSA secret holds it. Its only group
+  memberships are `Users` (to read the install directory) and **Performance
+  Monitor Users** (for the PDH handle-count metric), and it is granted exactly
+  one privilege: `SeServiceLogonRight`, which the SCM requires to start a service
+  under a non-built-in account. Re-installs rotate the password. If the account
+  already exists and was **not** created by the MSI, the install stops and asks
+  for `SERVICEACCOUNTPASSWORD` instead of clobbering credentials your
+  config-management system may own.
+- **Scoped WMI delegation.** Disk health reads
+  `root\Microsoft\Windows\Storage`, which is admin-only by default. Rather than
+  making the account an administrator, the installer delegates read access to
+  **that one namespace**. No other WMI namespace becomes reachable.
+- **Restrictive ACLs.** `%ProgramData%\fivenines_agent\` holds `TOKEN` and
+  `MACHINE_ID`; it is created with inheritance broken and access limited to the
+  service account, `Administrators` and `SYSTEM`. The install directory
+  `%ProgramFiles%\fivenines-agent\` is admin-write-only.
+- **Outbound HTTPS only.** The agent opens outbound TLS connections to the
+  fivenines API and never listens on a port. No inbound firewall rule is needed,
+  and the installer creates none.
+
+#### Windows-specific collectors
+
+Core metrics (CPU, memory, disk I/O, network, partitions, ports, processes) and
+every HTTP-based application integration behave the same as on Linux. Three
+things differ:
+
+- **Disk health** (the Windows counterpart to SMART) reads `MSFT_PhysicalDisk`
+  from the WMI Storage namespace for the drive inventory -- friendly name, media
+  type, bus type, size, serial, health and operational status -- and merges in
+  `MSFT_StorageReliabilityCounter` for temperature, power-on hours, read/write
+  error counts and SSD wear. It runs as a short-lived `Get-CimInstance`
+  subprocess with a hard 5s timeout, so a wedged WMI service cannot stall a
+  collection tick.
+- **Software inventory** enumerates the `Uninstall` registry keys under
+  `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall` **and** the 32-bit
+  `WOW6432Node` view, so 32-bit applications on a 64-bit host are not missed.
+  This feeds the same vulnerability scanner as the Linux package inventory.
+- **No load average**, and **handle count instead of file handles**. Windows has
+  no load-average equivalent and psutil's emulation reads zero on an idle system,
+  so the metric is omitted rather than faked. Likewise there is no
+  `/proc/sys/fs/file-nr` equivalent, so Windows reports a total kernel
+  `handle_count` under its own key rather than a used/limit pair the backend
+  would otherwise conflate with the Linux metric.
+
+Linux-only collectors (SMART via smartctl, mdadm RAID, ZFS, Ceph, fail2ban,
+QEMU/libvirt, Proxmox, systemd, journald logs, WireGuard) are absent from the
+Windows capability set entirely -- the agent sends a Windows-shaped payload
+rather than Linux keys marked unavailable.
+
+#### Service management and logs
+
+The service is registered as `fivenines-agent`, Automatic with delayed start so
+the network stack and WMI service are up before the first capability probe:
+
+```powershell
+Get-Service fivenines-agent
+Restart-Service fivenines-agent
+```
+
+Lifecycle events (started / stopped / failed) go to the Windows Event Log, so
+the agent is visible in `services.msc` and Event Viewer with no extra setup.
+Captured stdout/stderr lands in `%ProgramData%\fivenines_agent\logs\`, rotated at
+10 MB with 5 generations kept. On failure the wrapper restarts the agent after
+10s, 30s and 60s, resetting the counter after an hour of clean running.
+
+### Alpine Linux (OpenRC)
+
+Use the [standard installer](#standard-installation-linux) -- it detects musl and
+OpenRC, downloads the Alpine build, installs `/etc/init.d/fivenines-agent`, and
+runs `rc-update add fivenines-agent default`:
+
+Run it as root -- Alpine ships neither `sudo` nor `bash` by default:
+
+```bash
+wget -T 3 -q https://releases.fivenines.io/latest/fivenines_setup.sh && sh fivenines_setup.sh TOKEN
+```
+
+```bash
+rc-service fivenines-agent status
+rc-service fivenines-agent restart
+```
+
+> **Alpine 3.19 or newer is required.** The musl binary uses `pwritev2`, which
+> Alpine 3.18 and older do not provide. CI builds and tests the Alpine amd64 and
+> arm64 binaries on Alpine 3.21.
+
+Under OpenRC the agent cannot be granted ambient capabilities the way the systemd
+unit does, so WireGuard peer health is unavailable unless the agent runs as root.
+
+### UNRAID
+
+Use the [standard installer](#standard-installation-linux) -- it detects UNRAID
+(`/etc/unraid-version`) and installs to the flash drive rather than to `/opt`,
+because UNRAID's root filesystem lives in RAM and is rebuilt on every boot:
+
+```bash
+wget -T 3 -q https://releases.fivenines.io/latest/fivenines_setup.sh && bash fivenines_setup.sh TOKEN
+```
+
+What it does differently:
+
+- Installs the agent under `/boot/config/custom/fivenines_agent/` on the flash
+  drive, and symlinks the binary to `/usr/local/bin/fivenines_agent`.
+- Installs a boot script at
+  `/boot/config/custom/fivenines_agent/fivenines_boot` and appends it to
+  `/boot/config/go`, so the agent starts automatically on every boot.
+- **Persists the machine identity to flash.** `/etc` is a ramdisk on UNRAID, so
+  `TOKEN` and `MACHINE_ID` are copied from flash into `/etc/fivenines_agent` at
+  boot and copied back whenever the agent changes them. Without this, every
+  reboot would look like a brand-new machine to the backend and enroll a
+  duplicate host. Requires agent version **1.14.5+**.
 
 ### Synology Installation (DSM 7+)
 
@@ -87,6 +325,15 @@ wget -T 3 -q https://releases.fivenines.io/latest/fivenines_update.sh && sudo ba
 wget -T 3 -q https://releases.fivenines.io/latest/fivenines_update_user.sh && bash fivenines_update_user.sh
 ```
 
+### Windows Update
+
+From an elevated PowerShell session (see [Windows Installation](#windows-installation)):
+
+```powershell
+iwr https://releases.fivenines.io/latest/fivenines_update.ps1 -OutFile update.ps1
+.\update.ps1
+```
+
 ## Remove
 
 ### Standard Removal (with sudo/root)
@@ -101,6 +348,15 @@ wget -T 3 -q https://releases.fivenines.io/latest/fivenines_uninstall.sh && sudo
 wget -T 3 -q https://releases.fivenines.io/latest/fivenines_uninstall_user.sh && bash fivenines_uninstall_user.sh
 ```
 
+### Windows Removal
+
+From an elevated PowerShell session:
+
+```powershell
+iwr https://releases.fivenines.io/latest/fivenines_uninstall.ps1 -OutFile uninstall.ps1
+.\uninstall.ps1                 # add -KeepAccount to keep a pre-staged service account
+```
+
 ## Debug
 
 If you need to debug the agent collected data, you can run the following command:
@@ -111,11 +367,26 @@ sudo -u fivenines /opt/fivenines/fivenines_agent --dry-run
 
 # User-level installation
 ~/.local/fivenines/fivenines-agent-linux-*/fivenines-agent-linux-* --dry-run
+
+# UNRAID
+/usr/local/bin/fivenines_agent --dry-run
+```
+
+On Windows, run the agent binary directly as a console app (the service itself
+stays untouched):
+
+```powershell
+& "$env:ProgramFiles\fivenines-agent\fivenines-agent-windows-amd64.exe" --dry-run
 ```
 
 ## Permissions
 
 The agent runs as the `fivenines` user and automatically detects available monitoring capabilities at startup. Most metrics work without any special permissions.
+
+> This section describes the **Linux** permission model. On Windows the
+> installer provisions everything the agent needs (a dedicated low-privilege
+> service account, a scoped WMI Storage delegation, and restrictive ACLs) with
+> no manual steps -- see [Security model](#security-model).
 
 ### Full Monitoring (Recommended)
 
@@ -148,6 +419,10 @@ The agent works without sudo, but these features will be unavailable (this is al
 | Ubuntu Pro entitlement | `pro` CLI on `PATH` (ubuntu-advantage-tools), or a readable `/var/lib/ubuntu-advantage/status.json` (no extra privilege) |
 | Per-unit cgroup metrics | cgroup v1 or v2 mounted at `/sys/fs/cgroup` |
 | Ceph cluster status | `ceph` CLI + read-only cephx keyring (no sudo) |
+| Docker image vulnerability scanning | same Docker socket as container metrics (no extra privilege) |
+| HAProxy stats socket | read access to the socket (e.g. `/run/haproxy/admin.sock`); the HTTP CSV endpoint needs none |
+| Windows disk health | WMI `root\Microsoft\Windows\Storage` read access (delegated by the MSI) |
+| Windows software inventory | `HKLM\...\Uninstall` registry read access |
 
 ### Capabilities by Permission Level
 
@@ -156,12 +431,16 @@ The agent works without sudo, but these features will be unavailable (this is al
 - Memory and swap usage
 - Load average
 - Disk I/O statistics
-- Network I/O statistics
+- Network I/O statistics, per interface: byte/packet/error/drop counters plus
+  interface type (bridge / physical / virtual), link speed from
+  `/sys/class/net/<if>/speed`, and bridge member count, so the dashboard can
+  compute per-interface saturation (agent version **1.11.6+**)
 - Disk partition usage
-- Open file handles
+- Open file handles (kernel handle count on Windows)
 - Listening ports
 - Process list (own user's processes)
-- Packages
+- Installed packages (dpkg / rpm / apk / pacman / synopkg, or the Windows
+  Uninstall registry)
 
 **May Work Without Sudo/Root:**
 - Hardware temperatures (depends on `/sys/class/hwmon` permissions)
@@ -184,13 +463,17 @@ The agent works without sudo, but these features will be unavailable (this is al
 
 ### Rootless Docker
 
+This section covers how the agent reaches the Docker socket. For what it
+collects once it gets there, see [Docker Monitoring](#docker-monitoring).
+
 Two setups get called "non-root Docker", and they are not the same:
 
 - **Agent as a non-root user (`User=fivenines`) talking to a root daemon** via
   `/var/run/docker.sock` works out of the box once `fivenines` is in the
   `docker` group (see above). This is the common case and needs no extra
-  privilege for Docker image inventory (image vulnerability scanning) either --
-  it uses the same socket.
+  privilege for
+  [image vulnerability scanning](#image-vulnerability-scanning) either -- it uses
+  the same socket.
 - **Rootless Docker** (the daemon itself runs as an unprivileged user, with its
   socket at `$XDG_RUNTIME_DIR/docker.sock`, e.g. `/run/user/1000/docker.sock`)
   needs the agent pointed at that socket, because the daemon's on-disk layers
@@ -274,6 +557,7 @@ When the agent starts, it displays a banner showing which features are available
     [-] Smart Storage (requires sudo smartctl)
     [-] Raid Storage (requires sudo mdadm)
     [-] Zfs (requires zfs permissions)
+    [-] Ceph (requires ceph CLI + client keyring)
 
   Services:
     [+] Docker
@@ -296,6 +580,226 @@ When the agent starts, it displays a banner showing which features are available
 
 ============================================================
 ```
+
+Windows reports a Windows-shaped capability set rather than Linux keys marked
+unavailable -- no load average, and two native groups instead of the Linux
+storage and security ones:
+
+```
+  Core Metrics:
+    [+] Cpu
+    [+] Memory
+    [+] Io
+    [+] Network
+    [+] Partitions
+    [+] File Handles
+    [+] Ports
+    [+] Processes
+
+  Hardware Sensors:
+    [-] Temperatures (no accessible sensors)
+    [-] Fans (no accessible sensors)
+    [-] Nvidia Gpu (requires NVIDIA driver)
+
+  Storage:
+    [+] Disk Health
+
+  Inventory:
+    [+] Software Inventory
+```
+
+## Docker Monitoring
+
+Enabled per host from the fivenines dashboard. The agent talks to the Docker
+daemon over its socket -- see [Rootless Docker](#rootless-docker) for how the
+socket is resolved and what rootless setups need.
+
+### Container states and metrics
+
+Requires agent version **1.11.2+**. Every container ships an identity + state
+block on **every** tick, from its first sighting, whatever its status:
+
+- Name, image, image id, image tags and repo digests
+- `status`, `exit_code`, `oom_killed`, `restart_count`
+- `started_at` / `finished_at`, and the container's health-check state
+
+That is deliberately unconditional: "why did this container die" needs the exit
+code and the OOM flag of a container that is no longer running, so state is not
+gated behind the resource stats. **Running** containers additionally report CPU,
+memory, block I/O and per-network counters -- but only from their second tick,
+since CPU percent needs a delta between two samples.
+
+Failure and emptiness are distinct signals, which is what keeps a daemon hiccup
+from looking like a mass deletion: a genuinely empty host reports zero
+containers and the dashboard prunes its rows, while an unreachable daemon
+reports a collection failure and the dashboard changes nothing.
+
+Two bounds worth knowing: containers are capped at 500 per tick (running ones
+first, then newest-first, so a large graveyard of exited containers cannot bloat
+the payload), and a container that both starts and exits between two ticks --
+`docker run --rm` of something short-lived -- is never observed. Catching those
+needs the Docker events API and is a later phase.
+
+### Image vulnerability scanning
+
+Requires agent version **1.14.0+**, and `image_inventory` enabled for the host
+(which also requires Docker collection to be on, since the image list is derived
+from the containers). The agent extracts the **OS package list from inside each
+container image** and uploads it so the backend can match it against
+vulnerability feeds -- the same scanner that covers host packages, pointed at
+your images.
+
+Nothing runs inside your container. The agent asks the daemon to tar a path out
+of the image's layers (`GET /containers/{id}/archive`, the same call `docker cp`
+uses) and parses the package database from the stream. That choice buys four
+things:
+
+- **No binary is needed inside the image** -- no `dpkg-query`, no `rpm`, not even
+  a shell, so distroless images are covered.
+- **Stopped and never-started containers are covered.** A `created` container
+  that has never run is still scannable.
+- **Nothing executes in your container**, unlike `docker exec`.
+- **It is the only design that works under rootless / userns-remap Docker**,
+  where the on-disk layer files belong to subordinate UIDs a host process cannot
+  read at all. The daemon lives inside that namespace; the archive API is the way
+  in.
+
+Phase 1 reads **dpkg** (Debian / Ubuntu) and **apk** (Alpine). RPM-based images
+are reported as `unsupported` rather than silently empty.
+
+Because an image digest is immutable, each image is extracted **once, ever** --
+not once per tick. Completed digests are recorded on disk and survive a restart.
+All of it (the archive fetches, the tar parsing, the upload) runs on a dedicated
+worker thread, never on the collection loop, so scanning a host with many images
+cannot stretch a collection tick.
+
+> **Honesty contract.** A security feature must never emit a false all-clear, so
+> an extraction failure is never reported as an empty-and-clean package list.
+> Every failure path records a structured reason and the dashboard renders
+> `not scannable: <reason>` instead of "0 vulnerabilities".
+
+## Proxmox VE Monitoring
+
+Enabled per host from the fivenines dashboard, for Proxmox VE clusters and
+standalone nodes. Reports:
+
+- **Cluster**: status and quorum
+- **Nodes**: CPU, memory and uptime
+- **Guests**: per-VM (QEMU/KVM) and per-LXC-container metrics
+- **Storage**: per-pool usage (total / used / available / active)
+
+Authenticate with a Proxmox **API token** (`token_id` in the
+`user@realm!tokenname` form, plus `token_secret`); `host`, `port` (default 8006)
+and `verify_ssl` are configurable from the dashboard. A read-only role is enough.
+
+Each section is collected independently and carries its own completeness flag
+(agent version **1.10.0+**): if the storage call fails but the node call
+succeeds, you get node metrics plus an explicit "storage incomplete" marker
+rather than a blank tick, so a partial API failure never reads as "the cluster
+lost its VMs".
+
+Agent version **1.11.7+** adds the `pool` property to `zfspool`, `rbd` and
+`cephfs` storage entries -- the join key that lets the dashboard line a Proxmox
+storage pool up with the [ZFS pool health](#zfs-pool-health) or
+[Ceph](#ceph-cluster-monitoring) data collected from the same host.
+
+## systemd Unit Monitoring
+
+Requires agent version **1.9.1+** and a systemd host. Enabled per host from the
+dashboard; `unit_types` selects which unit types to watch (default
+`service,timer,socket`).
+
+Two surfaces:
+
+**Per-tick health.** One `systemctl list-units` plus one bulk `systemctl show`
+for *all* units (not one call per unit), giving active/sub state, load state and
+restart counts. Per-unit CPU and memory come from the unit's cgroup, read
+directly from `/sys/fs/cgroup` with no extra process spawned -- the agent
+detects a v1 or v2 hierarchy at startup and reports which one it found in the
+capabilities banner.
+
+**Failure drilldown.** When a unit newly enters a failed state, the agent
+collects a journal tail and its reverse dependencies for that unit only, so an
+alert arrives with the error text and the list of what else depends on it.
+Journal tails require journal read access; the bundled systemd unit grants
+`SupplementaryGroups=systemd-journal`. Without it, everything else still works
+and the tails are simply empty.
+
+**Inventory sync.** With `scan` enabled the agent snapshots full unit properties
+-- including **disabled** units, since a disabled unit is still configuration --
+hashes the snapshot and uploads it only when the hash changes, so a stable host
+costs nothing after the first send. Secrets are redacted from `Exec*` argv before
+the snapshot is hashed or sent. Sending `SIGHUP` forces a full resend.
+
+## Log Monitoring
+
+Requires agent version **1.11.1+** and journal read access (the `journald`
+capability -- the bundled systemd unit grants `SupplementaryGroups=systemd-journal`;
+for user installs, add your user to the `systemd-journal` group). Enabled per
+host from the dashboard, with a `units` allowlist -- the agent never reads the
+journal at large, only the units you name.
+
+**Continuous signals.** Each tick the agent scans a short window (60s by
+default) of each allowlisted unit's journal and reports per-severity error/warn
+counts plus the top error **fingerprints** -- a stable hash of the message with
+variable parts masked out, so "connection refused to 10.0.0.7:5432" and
+"connection refused to 10.0.0.9:5432" collapse to one recurring signal instead
+of two novel ones. The agent stays deliberately stateless here: it reports this
+window's counts and the backend derives new-vs-recurring from its own history.
+Units are capped at 12 per tick and each unit's scan is bounded and isolated, so
+one noisy or wedged unit never blanks the others.
+
+**Incident capture.** When the backend needs context for an incident it can ask
+for a bounded retroactive slice of a unit's journal. The agent runs one capped
+`journalctl` query, turns it into a digest, and uploads it on a dedicated worker
+thread -- never on the collection loop, so a large capture cannot stall metric
+collection or trip the systemd watchdog. Each request carries a nonce that is
+persisted to disk, so a capture fires exactly once and never replays after a
+service restart.
+
+### Redaction
+
+**Raw log lines never leave the host.** What is sent is a digest: per-severity
+counts, and for each fingerprint one *representative excerpt*, capped at 500
+characters and redacted first. The redaction pass masks PEM private-key headers,
+JWTs, AWS access keys, `Bearer` tokens, passwords embedded in connection strings
+(`scheme://user:pass@host`), generic `password=` / `secret=` / `token=` /
+`api_key=` / `authorization=` assignments, email addresses, and any opaque
+base64/hex run of 40 characters or more (key bodies, session blobs, hashes). The
+same redaction is applied to the journal tails collected by
+[systemd unit monitoring](#systemd-unit-monitoring).
+
+Redaction is best-effort by nature -- it cannot recognise a secret format it has
+never seen. The digest-only posture is the real mitigation: a novel secret format
+has to appear *inside* a chosen fingerprint's single 500-character excerpt to
+escape, rather than in any of the thousands of lines that were scanned. An
+opt-in raw-lines mode is a planned follow-up and is not available in this
+version.
+
+## ZFS Pool Health
+
+Requires agent version **1.11.3+** and the `zpool` command. Enabled per host from
+the dashboard; results are cached for 60s by default (`interval`) so a short
+collection interval does not re-run `zpool status` every tick.
+
+Per pool:
+
+- `health` verbatim (`ONLINE` / `DEGRADED` / `FAULTED` / `OFFLINE` / ...) plus a
+  stable numeric `health_code` for alerting
+- Count of degraded vdevs, and the full vdev tree with per-device state and
+  read / write / checksum error counters
+- Resilver progress and scrub error counts
+- Pool size, allocated and free bytes, capacity and fragmentation percentages,
+  and dedup ratio
+- The pool's `errors:` line as reported by `zpool status`
+
+Both `zpool` calls run with a hard 10s timeout: a SUSPENDED pool or a dying
+controller -- exactly the states this collector exists to report -- can wedge
+`zpool` indefinitely, and that must never hang the collection tick.
+
+On Proxmox hosts, pools reported here join to the Proxmox `zfspool` storage
+entries through the `pool` key (agent version **1.11.7+**), so one pool is one
+row rather than two unrelated ones.
 
 ## SNMP Network Device Monitoring
 
@@ -420,8 +924,8 @@ machine off the tailnet. tailscaled stays alive, flips to `NeedsLogin`, and
 nothing on the box logs an error while every tailnet-only service stops
 answering.
 
-No extra privilege is needed, and it works identically on Linux, Windows and
-macOS. Only the tailnet-wide rollups are sent, never per-peer rows: every node
+No extra privilege is needed, and it works identically on Linux and Windows
+(the agent has no macOS build). Only the tailnet-wide rollups are sent, never per-peer rows: every node
 sees every peer, so per-peer series would cost hosts x peers across a fleet.
 A node whose key expiry is disabled in the admin console reports "no expiry"
 rather than a fabricated countdown.
@@ -498,6 +1002,49 @@ The `use_sudo` per-cluster option is accepted but **reserved**: this version alw
 
 The capabilities banner reports Ceph as available when the `ceph` CLI is found in `PATH` (`requires ceph CLI + client keyring` otherwise). Cluster reachability and keyring validity are deliberately NOT part of the capability probe -- a cluster outage or auth failure is reported as data (an unreachable cluster with an error type), so monitoring does not go blind exactly when the cluster breaks.
 
+## AI Inference Serving (vLLM and SGLang)
+
+Requires agent version **1.17.0+** (vLLM) / **1.17.1+** (SGLang). Both are
+enabled per host from the dashboard and are plain HTTP scrapes of the inference
+server's own Prometheus endpoint -- no capability gate, no extra package, and
+they work anywhere the agent runs. Configure `metrics_url`, plus optionally
+`auth_header_name` / `auth_header_value` and `verify_ssl`.
+
+This is the serving layer *above* the [NVIDIA GPU metrics](#permissions), and it
+exists for one failure mode those cannot see: **the inference server crashed or
+wedged while every GPU still reads green**. GPU utilisation, memory and
+temperature all look healthy on a box whose vLLM process OOM-died -- only the
+serving endpoint knows.
+
+Both collectors report a reachability envelope and **never** a bare "no data", so
+the dashboard can tell "the server is down" (the signal) apart from "the
+collector is off". Per served model you get request counts and running/waiting
+queue depth, token throughput, KV-cache utilisation, prefix-cache hit rate, and
+the end-to-end / time-to-first-token / inter-token latency histograms. Counters
+and histogram sums ship raw -- the dashboard derives every rate -- and a metric
+the server does not publish simply omits its key rather than being reported as
+zero.
+
+Two edges that would otherwise read as outages:
+
+- **vLLM** (default `http://127.0.0.1:8000/metrics`). A 2xx response with zero
+  `vllm:*` metrics means `reachable`, not down: launching with
+  `--disable-log-stats` is a supported configuration. vLLM has also renamed
+  several metrics across versions and exposes both spellings during the
+  deprecation window; the agent folds each pair onto one canonical key so a
+  metric is never double-counted.
+- **SGLang** (default `http://127.0.0.1:30000/metrics`). Metrics are **opt-in**:
+  SGLang publishes `sglang:*` samples only when launched with
+  `--enable-metrics`. A reachable server reporting no models is therefore the
+  expected stock-launch state, and the dashboard prompts you to add the flag
+  rather than raising an outage.
+
+On multi-GPU deployments the two engines differ in a way that matters: vLLM's
+data-parallel engines each serve a share of the traffic, so their counters add
+up, while SGLang's tensor-parallel ranks each report the *same* scheduler
+reading, so summing them would multiply throughput by the TP degree. The agent
+reduces each accordingly.
+
 ## Application Integrations
 
 The agent can collect metrics from various applications when configured.
@@ -549,6 +1096,82 @@ location /nginx_status {
     deny all;
 }
 ```
+
+### HAProxy
+
+Reads HAProxy's `show stat` output and reports one row per **frontend**,
+**backend** and **server**:
+
+- Verbatim `status` (`UP` / `DOWN` / `MAINT` / `DRAIN` / `no check` and the
+  transitional `UP 1/3` forms)
+- Current sessions and the session limit, and current queue depth
+- Cumulative 4xx and 5xx responses, retries, and bytes in/out
+- Health-check status and check duration
+
+Available in agent version **1.14.3+**. All counters are raw cumulative values;
+the dashboard derives the rates and drives a per-backend "backend down" alert --
+with `MAINT`/`DRAIN` kept distinct from `DOWN`, so planned maintenance never
+pages.
+
+Two transports, and the **stats socket is preferred** because it needs no web
+exposure of the stats page:
+
+```
+# haproxy.cfg -- stats socket (Linux only; the agent's default path is
+# /run/haproxy/admin.sock). "level admin" is NOT required: the agent only
+# ever issues "show stat".
+global
+    stats socket /run/haproxy/admin.sock mode 660 group fivenines level operator
+```
+
+The socket must be readable by the `fivenines` user -- the `mode`/`group`
+settings above are what grant that. Otherwise, point the agent at the HTTP CSV
+endpoint instead (cross-platform, and the only option on non-Linux hosts); the
+agent appends HAProxy's `;csv` modifier itself, and HTTP basic auth is supported:
+
+```
+frontend stats
+    bind 127.0.0.1:8404
+    stats enable
+    stats uri /stats
+```
+
+An unreachable socket or endpoint is reported as a collection failure rather than
+"zero proxies", so a restarting HAProxy never resolves an open backend-down
+incident. On very large deployments `server` rows are capped at 400, sorted
+problems-first so `DOWN`/`MAINT`/`DRAIN` servers are kept ahead of healthy ones;
+a capped tick is flagged so the dashboard knows not to prune the rows it did not
+receive.
+
+### PHP-FPM
+
+Collects the FPM status page for every pool and reports per-pool saturation --
+`max children reached`, listen queue depth and its high-water mark, active /
+idle / total processes, slow requests, and accepted-connection counts. Available
+in agent version **1.13.1+**. This is the usual root cause behind "the site is
+slow": the pool is out of workers, not the database.
+
+Three ways to point the agent at it:
+
+- **HTTP** -- scrape the status page through your web server, like the Nginx and
+  Apache integrations. One URL is one pool.
+- **Direct FastCGI** -- `unix:///run/php/php8.2-fpm.sock/status` or
+  `tcp://127.0.0.1:9000/status`. The agent speaks FastCGI itself (pure Python, no
+  extra dependency), so `/status` never has to be exposed through the web server
+  at all. This is the security-friendlier setup.
+- **`auto`** -- discover every pool from the FPM `pool.d` configs
+  (`/etc/php/*/fpm/pool.d/*.conf` and the equivalents on other distributions) and
+  poll each over its own socket. Multi-pool hosts come for free.
+
+Requires `pm.status_path` to be set in each pool's config (e.g.
+`pm.status_path = /status`) and the socket to be readable by the `fivenines`
+user for the direct-FastCGI and `auto` transports.
+
+If **any** known pool fails to answer, the whole tick is reported as a collection
+failure rather than as a shorter array. A pool silently missing from the array
+would read as "the operator deleted that pool" and resolve its open saturation
+incident -- unknown is not recovered. A pool you genuinely removed simply stops
+being discovered and is pruned normally.
 
 ### PostgreSQL
 
@@ -616,6 +1239,74 @@ agent version **1.14.4+**:
 Connects to `127.0.0.1:11211` by default; set `host`/`port` to point elsewhere.
 A refused connection, timeout, or malformed reply reports as a collection
 failure, so a transient outage is never mistaken for an empty cache.
+
+### RabbitMQ
+
+Polls the RabbitMQ **management API** over HTTP (default
+`http://127.0.0.1:15672`) and reports broker health plus per-queue backlog.
+Available in agent version **1.14.2+**:
+
+- Broker version and reachability, with the failure reason (connection refused,
+  timeout, authentication failure, HTTP error) when it is down
+- Local node health: memory and disk **alarms**, file-descriptor and socket
+  usage against their limits -- the headroom metrics that predict an outage
+  before it lands
+- Per queue: `messages`, `messages_unacknowledged`, consumer count, and raw
+  cumulative publish/deliver counters
+
+Enable the management plugin and create a least-privilege monitoring user -- the
+`monitoring` tag grants read access to the API without any permission on the
+queues themselves:
+
+```bash
+rabbitmq-plugins enable rabbitmq_management
+rabbitmqctl add_user fivenines 'CHANGE_ME'
+rabbitmqctl set_user_tags fivenines monitoring
+rabbitmqctl set_permissions -p / fivenines "^$" "^$" "^$"
+```
+
+The three empty regexes deny configure, write and read on every resource: the
+`monitoring` tag alone is what the API needs, so this user can observe the broker
+but cannot publish, consume, or reconfigure anything.
+
+The queue list is **bounded** on brokers with thousands of queues: the agent
+sends the top queues by depth, the top by unacknowledged messages, and any queue
+you explicitly name -- the unacknowledged dimension is not redundant, since a
+small queue whose consumers are stuck is exactly the case an alert exists for. A
+`queues_total` field always carries the broker's true count so the dashboard can
+show that the list is a sample. A dead broker or a queue listing that came back
+incomplete is reported as unreachable rather than as a shorter list, so queue
+rows are never pruned and an open backlog incident cannot falsely resolve.
+
+### Prometheus / VictoriaMetrics
+
+Monitors the health of a **Prometheus or VictoriaMetrics server** itself
+(default `http://127.0.0.1:9090`) -- who watches the watcher. Available in agent
+version **1.14.1+**. When your TSDB dies, the whole observability stack goes dark
+silently: nothing reports the outage, because the thing that reports outages is
+the thing that is down.
+
+- Reachability, flavor (Prometheus vs VictoriaMetrics) and version
+- **Prometheus**: head series, storage bytes, WAL corruptions, rule-evaluation
+  failures, dropped alert notifications, and -- from the targets API -- how many
+  scrape targets exist and how many are down
+- **VictoriaMetrics**: free disk space (the critical one -- VM refuses inserts
+  once it drops below its threshold), data size, active series, new series
+  created, slow inserts and ignored rows
+
+Counters ship raw; the dashboard derives the rates. A metric the server does not
+publish omits its key rather than being reported as zero, and no target or rule
+keys are sent for a single-node VictoriaMetrics, which scrapes nothing.
+
+Auth is optional -- a custom header (`auth_header_name` / `auth_header_value`) or
+HTTP basic auth, with `verify_ssl` configurable.
+
+Reachability means exactly one thing: the server answered `/metrics`. A 2xx
+response yields "reachable" even if the flavor is unrecognised, no expected
+metric is present, or the follow-up targets API is locked down -- an agent-mode
+Prometheus is a normal deployment, and an agent-side parsing gap must never page
+you with "your Prometheus is down". Only a connection-level failure -- refused,
+timeout, TLS error, auth failure, non-2xx -- reports as unreachable.
 
 ## Contribute
 
