@@ -1,5 +1,5 @@
 {
-  "description": "Shared Docker IMAGE OS-package inventory contract fixture between fivenines-agent and fivenines-server (server issue #101). Source of truth: fivenines-agent tests/fixtures/docker_image_inventory_contract_payload.json, asserted end-to-end by tests/test_docker_image_inventory.py::test_contract_fixture_scenarios (only the Docker SDK boundary -- client.containers.get / container.get_archive -- is mocked). For each scenario, 'sdk' describes the container's filesystem as the agent-side test builds it (files by path, symlinks with their linkTarget, paths that 404 via 'not_found', a DB that overflows the 5 MB cap via 'oversized'); the server ignores 'sdk'. 'payload' is the EXACT body the agent POSTs to /image_packages -- the artifact the server's image-package ingester must parse; copy this file byte-identical into the server spec/fixtures and bump FEATURES_SUPPORTED_VERSIONS['docker_image_inventory'] to agent_min_version exactly. Change only in lockstep. Contract highlights: (a) packages carry {name, version, ecosystem} where ecosystem is null == 'the image OS ecosystem' (a future phase sends npm/pypi/etc. on the same endpoint, no v2); (b) packages_hash reuses the host packages path's get_packages_hash and is null on a failure payload; (c) an extraction failure is NEVER empty-and-clean -- every failure records a structured errors[] entry so the server renders 'not scannable, <reason>' instead of a false '0 vulnerabilities'; (d) the /etc/os-release symlink MUST be followed via stat['linkTarget'] or every Debian image looks unscannable; (e) the dpkg Status filter keeps only 'install ok installed'; (f) RPM is unsupported in phase 1 (reported, not empty).",
+  "description": "Shared Docker IMAGE OS-package inventory contract fixture between fivenines-agent and fivenines-server (server issue #101). Source of truth: fivenines-agent tests/fixtures/docker_image_inventory_contract_payload.json, asserted end-to-end by tests/test_docker_image_inventory.py::test_contract_fixture_scenarios (only the Docker SDK boundary -- client.containers.get / container.get_archive -- is mocked). For each scenario, 'sdk' describes the container's filesystem as the agent-side test builds it (files by path, symlinks with their linkTarget, paths that 404 via 'not_found', a DB that overflows the 5 MB cap via 'oversized'); the server ignores 'sdk'. 'payload' is the EXACT body the agent POSTs to /image_packages -- the artifact the server's image-package ingester must parse; copy this file byte-identical into the server spec/fixtures and bump FEATURES_SUPPORTED_VERSIONS['docker_image_inventory'] to agent_min_version exactly. Change only in lockstep. Contract highlights: (a) packages carry {name, version, ecosystem} where ecosystem is null == 'the image OS ecosystem' (a future phase sends npm/pypi/etc. on the same endpoint, no v2); (b) packages_hash reuses the host packages path's get_packages_hash and is null on a failure payload; (c) an extraction failure is NEVER empty-and-clean -- every failure records a structured errors[] entry so the server renders 'not scannable, <reason>' instead of a false '0 vulnerabilities'; (d) the /etc/os-release symlink MUST be followed via stat['linkTarget'] or every Debian image looks unscannable; (e) the dpkg Status filter reads only the THIRD word of the 'want eflag status' triplet and drops just the two states with no files on disk (not-installed, config-files) -- matching the whole 'install ok installed' string also filters on the WANT flag, which drops `hold ok installed` (apt-mark hold, a standard Dockerfile pinning idiom) and the unpacked/triggers states, silently and with no errors[] entry; the rule and its absent-state set are shared with the HOST /packages reader (fivenines_agent/packages.py _DPKG_STATUS_ABSENT) so the two cannot drift; (f) RPM is unsupported in phase 1 (reported, not empty).",
   "agent_min_version": "1.14.0",
   "_agent_min_version_note": "Docker image inventory ships in 1.14.0 (the first MINOR after the 1.13.x line: 1.13.0 Ceph v2, 1.13.1 PHP-FPM). The server's FEATURES_SUPPORTED_VERSIONS['docker_image_inventory'] must match this exactly.",
   "config": {
@@ -9,7 +9,9 @@
     "_requires_docker": "config['docker'] must ALSO be enabled. The agent derives the set of image digests to scan from the already-collected data['docker']['containers'] payload (no second daemon call), so with Docker collection off there are no digests to inventory.",
     "_join_key": "payload['image_id'] == data['docker']['containers'][*]['image_id'] (both are the container's attrs.Image local digest). That join is how the server turns image vulnerabilities into per-container findings.",
     "_socket_url": "config['docker']['socket_url'], when set, is reused verbatim for the archive API connection and is also what the agent's docker capability probe checks.",
-    "rescan_images": ["sha256:5555555555555555555555555555555555555555555555555555555555555555"],
+    "rescan_images": [
+      "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+    ],
     "_rescan_images_note": "SERVER-DRIVEN RE-INVENTORY (server issue #676). A bounded (<= 3/tick), TOP-LEVEL array of image_id digests the server wants re-inventoried. SAME top-level placement and splat-safety as image_inventory: it must NOT be nested under config['docker'] (the **kwargs TypeError hazard). The server emits it ONLY for digests THIS host currently runs whose last extraction failed with an api_error (a transient daemon/SDK/stream failure) - NEVER for unsupported_distro / not_found / file_over_cap / parse_error, all permanent for an immutable digest. The agent (1.15.1+) removes each listed digest from its on-disk image_inventory_done set and lets the normal selection path re-offer it; a digest not among the host's current containers, or already in flight, is left untouched. A digest with no failure history is re-offered on the SAME tick the FIRST time it is requested. A digest the agent had already GIVEN UP on locally is re-opened but re-armed onto its exponential retry ladder rather than made immediately eligible: when the POST itself is what fails the server never learns and keeps re-requesting every tick, so immediate eligibility would mean a full archive fetch + tar parse per tick forever. The directive is LEVEL-TRIGGERED and untrusted, so the agent does not depend on the server for safety: (a) it caps how much of the list it scans (MAX_RESCAN_SCANNED=100), honours (MAX_RESCAN_IMAGES=10), and reads per entry (256 chars) so a hostile/huge config cannot burn the watchdog-bounded collection loop; (b) it FLOORS repeat re-opens per digest (rescan_min_interval, default 1h) even in the immediate attempts==0 case, so a stale directive replayed by the Synchronizer during a /collect outage, or a buggy server re-sending every tick, cannot treadmill re-extraction. The server SHOULD still restamp its own backoff after a re-POST (see below), but is no longer the sole line of defence. The image is immutable, so a re-inventory that succeeds is a valid scan; one that api_errors again is re-POSTed and the server restamps its backoff, so a permanently-unhappy daemon retries a few times a day, not once per tick."
   },
   "response_contract": {
@@ -241,7 +243,7 @@
       }
     },
     "dpkg_status_with_deinstalled_entry": {
-      "description": "dpkg status with one installed package and one removed-but-config-files-remain entry ('deinstall ok config-files'). The Status filter keeps ONLY 'install ok installed', so the deinstalled entry -- which still carries a Version -- is NOT reported as installed.",
+      "description": "dpkg status with one installed package and one removed-but-config-files-remain entry ('deinstall ok config-files'). The status word 'config-files' is one of the two the filter drops, so the deinstalled entry -- which still carries a Version -- is NOT reported as installed.",
       "sdk": {
         "image_id": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
         "container_id": "2222222222222222222222222222222222222222222222222222222222222222",
@@ -258,6 +260,40 @@
           {
             "name": "openssl",
             "version": "3.0.11-1~deb12u2",
+            "ecosystem": null
+          }
+        ],
+        "errors": []
+      }
+    },
+    "dpkg_status_with_held_and_trigger_packages": {
+      "description": "The companion to dpkg_status_with_deinstalled_entry, and the reason the filter reads the status WORD rather than the whole triplet. Three packages whose files are all on disk but whose Status triplets differ in the want and error flags: a held package (`hold ok installed`, what `apt-mark hold` writes and a standard Dockerfile pinning idiom), one awaiting trigger processing (`install ok triggers-pending`), and a normal one. ALL THREE are reported. Matching 'install ok installed' would drop the first two silently, with an empty errors[] -- so the image would render as scanned and clean while the packages an author deliberately pinned to an old version, i.e. the ones most likely to carry a CVE, went unscanned.",
+      "sdk": {
+        "image_id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "container_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "files": {
+          "/etc/os-release": "PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\nNAME=\"Debian GNU/Linux\"\nID=debian\nVERSION_ID=\"12\"\nVERSION_CODENAME=bookworm\n",
+          "/var/lib/dpkg/status": "Package: bash\nStatus: install ok installed\nVersion: 5.2.15-2+b7\n\nPackage: containerd.io\nStatus: hold ok installed\nVersion: 1.7.24-1\n\nPackage: curl\nStatus: install ok triggers-pending\nVersion: 7.88.1-10+deb12u8\n"
+        }
+      },
+      "payload": {
+        "image_id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "distro": "debian:12",
+        "packages_hash": "8d909826fc1166ae595109133c642feb9c39ab24fde96043d448a12777428344",
+        "packages": [
+          {
+            "name": "bash",
+            "version": "5.2.15-2+b7",
+            "ecosystem": null
+          },
+          {
+            "name": "containerd.io",
+            "version": "1.7.24-1",
+            "ecosystem": null
+          },
+          {
+            "name": "curl",
+            "version": "7.88.1-10+deb12u8",
             "ecosystem": null
           }
         ],

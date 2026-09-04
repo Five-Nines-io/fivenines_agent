@@ -166,13 +166,12 @@ def test_get_packages_dpkg_drops_removed_but_not_purged(mock_run, mock_env):
 def test_get_packages_dpkg_keeps_both_versions_of_a_multiarch_pair(
     mock_run, mock_env
 ):
-    """The one way a NAME legitimately repeats in this output, and the reason
-    the reader must not borrow the rpm reader's dedup dict. ${Package} renders
-    without the arch qualifier, so libc6:amd64 and libc6:i386 arrive as two
-    rows sharing a name; the arches can sit at different versions (they are
-    held and upgraded independently), and both are real software on the disk.
-    Collapsing on name would keep whichever came last and delete the finding
-    for the other."""
+    """The other half of the multiarch rule, and the reason the dedup is keyed
+    on (name, version) rather than on name alone. ${Package} renders without the
+    arch qualifier, so libc6:amd64 and libc6:i386 arrive as two rows sharing a
+    name; the arches can sit at DIFFERENT versions (they are held and upgraded
+    independently), and both are real software on the disk. Collapsing on name
+    would keep whichever came last and delete the finding for the other."""
     mock_run.return_value = MagicMock(
         returncode=0,
         stdout=(
@@ -1377,3 +1376,27 @@ def test_get_installed_packages_windows_dispatches_to_registry(mock_iw):
         result = get_installed_packages()
     # Sorted by name.
     assert [p["name"] for p in result] == ["A App", "B App"]
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_dpkg_collapses_multiarch_duplicates(mock_run, mock_env):
+    """${Package} renders the name without its architecture, so a multiarch
+    install is listed once per arch under one name -- and the payload carries no
+    arch to tell the rows apart, so they are one package. Same rule and same
+    reason as the rpm reader, which has collapsed them since #123; leaving the
+    two readers on opposite policies for the identical situation, on the same
+    replace-semantics endpoint, is the part worth pinning."""
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout=(
+            "installed\tlibc6\t2.36-9\n"
+            "installed\tzlib1g\t1:1.2.13\n"
+            "installed\tlibc6\t2.36-9\n"
+            "installed\tzlib1g\t1:1.2.13\n"
+        ),
+    )
+    assert _get_packages_dpkg() == [
+        {"name": "libc6", "version": "2.36-9"},
+        {"name": "zlib1g", "version": "1:1.2.13"},
+    ]

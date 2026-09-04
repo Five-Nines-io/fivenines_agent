@@ -40,7 +40,11 @@ import docker
 
 from fivenines_agent.debug import log
 from fivenines_agent.docker import get_docker_client
-from fivenines_agent.packages import get_packages_hash, parse_os_release
+from fivenines_agent.packages import (
+    _DPKG_STATUS_ABSENT,
+    get_packages_hash,
+    parse_os_release,
+)
 from fivenines_agent.queue_uploader import QueueUploader
 
 # Paths inside the image. /etc/os-release is frequently a symlink to
@@ -299,13 +303,41 @@ def _iter_stanzas(text):
         start = end + 2
 
 
+def _dpkg_status_is_on_disk(status):
+    """Does this Status field mean the package's files are in the image?
+
+    Status is a triplet -- "want eflag status" -- and only the THIRD word
+    answers that. Reading the whole string is the trap: matching
+    "install ok installed" also filters on the WANT flag, which drops
+    `hold ok installed`, and `apt-mark hold` is a standard Dockerfile pinning
+    idiom -- so it silently dropped exactly the packages an image author froze
+    at an old version, which are the ones most likely to carry a CVE. It also
+    dropped `install ok unpacked` and `install ok triggers-pending`, whose files
+    are unpacked and executable.
+
+    So drop only the two states dpkg guarantees have no files -- shared with the
+    host reader as packages._DPKG_STATUS_ABSENT, so the two cannot drift apart
+    again -- and keep the rest. Over-reporting a package costs a finding an
+    operator can dismiss; under-reporting one renders the image "scanned and
+    clean" with no errors[] entry to say otherwise, which is this module's one
+    forbidden outcome.
+
+    A Status that is not three words is a shape this parser does not understand,
+    and its stanza is skipped as before."""
+    words = status.split()
+    if len(words) != 3:
+        return False
+    return words[2] not in _DPKG_STATUS_ABSENT
+
+
 def _parse_dpkg_status(text, limit=None):
     """Installed packages from a dpkg /var/lib/dpkg/status blob.
 
-    RFC822 stanzas split on blank lines. Keep Package + Version, but ONLY when
-    Status contains 'install ok installed' -- otherwise a removed-but-config-
-    files-remain entry ('deinstall ok config-files') is falsely reported as
-    installed. Continuation lines (leading space/tab) are skipped.
+    RFC822 stanzas split on blank lines. Keep Package + Version, but only when
+    the Status triplet says the files are on disk (_dpkg_status_is_on_disk) --
+    otherwise a removed-but-config-files-remain entry ('deinstall ok
+    config-files') is falsely reported as installed. Continuation lines (leading
+    space/tab) are skipped.
 
     Returns (packages, truncated). Parsing stops one past *limit* so the caller
     can tell "exactly limit packages" from "more than limit"; the cap is read at
@@ -326,7 +358,7 @@ def _parse_dpkg_status(text, limit=None):
                 status = line.split(":", 1)[1].strip()
             elif line.startswith("Version:"):
                 version = line.split(":", 1)[1].strip()
-        if name and version and status and "install ok installed" in status:
+        if name and version and status and _dpkg_status_is_on_disk(status):
             entry = _package(name, version)
             if entry is not None:
                 packages.append(entry)

@@ -243,7 +243,7 @@ def _get_packages_dpkg():
         # buffer this rides in. Truncation bounds the size, repr bounds content.
         log(f"dpkg-query failed: {result.stderr[:_LOG_LINE_CHARS]!r}", "error")
         return []
-    packages = []
+    packages = {}
     for line in result.stdout.splitlines():
         # `not line`, NOT `not line.strip()`. splitlines() never yields a line
         # containing its own terminator, so the only genuinely blank line is the
@@ -278,8 +278,15 @@ def _get_packages_dpkg():
         if not version:
             _log_rejected_dpkg_line("on-disk package with no version", line)
             return []
-        packages.append({"name": name, "version": version})
-    return packages
+        # Keyed, not appended: ${Package} renders the name WITHOUT its
+        # architecture, so a multiarch install (libc6:amd64 + libc6:i386) is
+        # listed twice under one name, and the payload carries no arch to tell
+        # the two rows apart -- they are one package. Same rule, same reason as
+        # _get_packages_rpm. Genuinely different versions of one name (several
+        # kernels) keep their own rows: an old vulnerable kernel still installed
+        # is still a finding.
+        packages[(name, version)] = {"name": name, "version": version}
+    return list(packages.values())
 
 
 # rpm's own spelling for a tag the package does not declare. RPM semantics --

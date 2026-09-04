@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 import docker as docker_lib
 import pytest
 
+from fivenines_agent.packages import _DPKG_STATUS_ABSENT
 from fivenines_agent.docker_image_inventory import (
     MAX_FIELD_CHARS,
     MAX_FILE_BYTES,
@@ -597,7 +598,7 @@ def test_parse_dpkg_status_filters_and_skips_continuations():
         "Package: a\nStatus: install ok installed\nVersion: 1\n"
         "Description: x\n Version: 9 (continuation, skipped)\n"
         "\n"
-        "Package: b\nStatus: hold ok installed\nVersion: 2\n"  # not 'install ok installed'
+        "Package: b\nStatus: deinstall ok config-files\nVersion: 2\n"
         "\n"
         "Package: c\nStatus: install ok installed\nVersion: 3\n"
     )
@@ -607,6 +608,91 @@ def test_parse_dpkg_status_filters_and_skips_continuations():
         {"name": "c", "version": "3", "ecosystem": None},
     ]
     assert truncated is False
+
+
+def test_parse_dpkg_status_keeps_held_packages():
+    """`apt-mark hold` renders "hold ok installed", and it is a standard
+    Dockerfile pinning idiom -- so filtering on the whole "install ok installed"
+    string dropped exactly the packages an image author froze at an old version,
+    which are the ones most likely to carry a CVE. Nothing recorded an errors[]
+    entry either, so the image rendered as scanned and clean."""
+    text = (
+        "Package: bash\nStatus: install ok installed\nVersion: 5.2.15-2\n"
+        "\n"
+        "Package: containerd.io\nStatus: hold ok installed\nVersion: 1.7.24-1\n"
+    )
+    pkgs, truncated = _parse_dpkg_status(text)
+    assert pkgs == [
+        {"name": "bash", "version": "5.2.15-2", "ecosystem": None},
+        {"name": "containerd.io", "version": "1.7.24-1", "ecosystem": None},
+    ]
+    assert truncated is False
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "install ok installed",
+        "hold ok installed",
+        "install ok unpacked",
+        "install ok half-configured",
+        "install ok triggers-awaited",
+        "install ok triggers-pending",
+        "install reinstreq half-installed",
+    ],
+)
+def test_parse_dpkg_status_keeps_every_state_whose_files_are_on_disk(status):
+    """Only the THIRD word of the Status triplet says whether the files are in
+    the image. The want flag (install/hold/deinstall) and the error flag
+    (ok/reinstreq) do not, and reading them dropped real, scannable software."""
+    text = f"Package: openssl\nStatus: {status}\nVersion: 3.0.11-1\n"
+    pkgs, truncated = _parse_dpkg_status(text)
+    assert pkgs == [{"name": "openssl", "version": "3.0.11-1", "ecosystem": None}]
+    assert truncated is False
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["deinstall ok config-files", "purge ok config-files", "unknown ok not-installed"],
+)
+def test_parse_dpkg_status_drops_the_two_states_with_no_files(status):
+    """And only those two. Both still carry a Version in the status file, which
+    is why they are indistinguishable from an installed package downstream --
+    the whole reason this filter exists."""
+    text = (
+        f"Package: python3-pip\nStatus: {status}\nVersion: 23.0.1\n"
+        "\n"
+        "Package: bash\nStatus: install ok installed\nVersion: 5.2.15-2\n"
+    )
+    pkgs, truncated = _parse_dpkg_status(text)
+    assert pkgs == [{"name": "bash", "version": "5.2.15-2", "ecosystem": None}]
+    assert truncated is False
+
+
+@pytest.mark.parametrize(
+    "status", ["installed", "install ok", "install ok installed extra", ""]
+)
+def test_parse_dpkg_status_skips_a_status_that_is_not_a_triplet(status):
+    """Status is "want eflag status" and has been for dpkg's whole life, so a
+    field with any other shape is one this parser cannot read -- and guessing
+    which word is the state would be worse than skipping the stanza. The
+    companion row proves the rest of the blob still parses: one unreadable
+    stanza is not a reason to call the image unscannable."""
+    text = (
+        f"Package: openssl\nStatus: {status}\nVersion: 3.0.11-1\n"
+        "\n"
+        "Package: bash\nStatus: install ok installed\nVersion: 5.2.15-2\n"
+    )
+    pkgs, truncated = _parse_dpkg_status(text)
+    assert pkgs == [{"name": "bash", "version": "5.2.15-2", "ecosystem": None}]
+    assert truncated is False
+
+
+def test_parse_dpkg_status_shares_the_host_readers_absent_set():
+    """One definition of "no files on disk", imported rather than restated, so
+    the host and image paths cannot drift apart the way they had (the host read
+    the status word, the image read the whole triplet)."""
+    assert _DPKG_STATUS_ABSENT == frozenset({"not-installed", "config-files"})
 
 
 def test_parse_dpkg_status_skips_partial_and_garbage():
