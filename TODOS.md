@@ -90,6 +90,9 @@ pinned in the fixtures and neither specified in the original issues:
 
 ## P1: Re-open already-scanned image digests after the dpkg status-filter fix
 
+**Tracked server-side as fivenines_server#1073** -- the work happens in that
+repo, this entry is the agent-side record of why.
+
 Agent #138 (v1.17.2) fixed `docker_image_inventory._parse_dpkg_status`, which
 matched the whole `install ok installed` Status string and so also filtered on
 the WANT flag. That silently dropped `hold ok installed` -- what `apt-mark hold`
