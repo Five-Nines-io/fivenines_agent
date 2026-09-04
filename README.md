@@ -440,7 +440,13 @@ The agent works without sudo, but these features will be unavailable (this is al
 - Listening ports
 - Process list (own user's processes)
 - Installed packages (dpkg / rpm / apk / pacman / synopkg, or the Windows
-  Uninstall registry)
+  Uninstall registry). On Debian/Ubuntu, only packages whose files are
+  actually on disk are reported: one removed with `apt remove` rather than
+  `apt purge` keeps its name and version in dpkg's database forever and used
+  to be scanned as if it were still installed -- on one Ubuntu 24.04 host,
+  eleven removed kernel ABIs accounted for about 94% of the vulnerabilities
+  reported, and no amount of `apt autoremove --purge` could clear them (agent
+  version **1.17.2+**)
 
 **May Work Without Sudo/Root:**
 - Hardware temperatures (depends on `/sys/class/hwmon` permissions)
@@ -666,6 +672,16 @@ things:
 
 Phase 1 reads **dpkg** (Debian / Ubuntu) and **apk** (Alpine). RPM-based images
 are reported as `unsupported` rather than silently empty.
+
+A package is scanned whenever its files are unpacked in the image, not only
+when its dpkg status is the exact string `install ok installed`. That
+distinction matters for pinned images: `apt-mark hold` -- a standard Dockerfile
+idiom -- records a package as `hold ok installed`, and agents before version
+**1.17.2** skipped those silently, so the packages an image author deliberately
+froze at an old version, the ones most likely to carry a CVE, went unscanned
+while the image still rendered as clean. Packages awaiting trigger processing
+are scanned for the same reason. Entries that are removed but not purged stay
+excluded -- their files are gone.
 
 Because an image digest is immutable, each image is extracted **once, ever** --
 not once per tick. Completed digests are recorded on disk and survive a restart.
