@@ -8,7 +8,7 @@ import pytest
 
 from fivenines_agent.debug import start_log_capture, stop_log_capture
 from fivenines_agent.packages import (
-    _DPKG_STATUS_INSTALLED,
+    _DPKG_STATUS_ABSENT,
     _DPKG_STATUS_KNOWN,
     _get_packages_apk,
     _get_packages_dpkg,
@@ -194,7 +194,8 @@ def test_get_packages_dpkg_drops_a_versionless_line_on_status_first(
 ):
     """A package dpkg only knows about has no files and, on the dpkg versions
     that list it at all, no version either. The status check has to come FIRST:
-    the empty version is only a hard error for a state we would have kept."""
+    the empty version is only a hard error for a state whose files are on disk,
+    so checking it earlier would fail every read on a host carrying one."""
     mock_run.return_value = MagicMock(
         returncode=0,
         stdout="not-installed\ttelnet\t\ninstalled\tbash\t5.2.21-2\n",
@@ -202,13 +203,13 @@ def test_get_packages_dpkg_drops_a_versionless_line_on_status_first(
     assert _get_packages_dpkg() == [{"name": "bash", "version": "5.2.21-2"}]
 
 
-# Every state in dpkg's vocabulary EXCEPT the one that is inventoried. Hoisted
-# out of the parametrize below so the drift guard can assert it accounts for the
-# whole vocabulary: a ninth state added to _DPKG_STATUS_KNOWN without a decided
-# disposition would otherwise become a silent drop no test ever exercises.
-_DPKG_NON_INSTALLED_STATUSES = [
-    "not-installed",
-    "config-files",
+# The six states whose files ARE unpacked on disk, and which are therefore
+# inventoried. Hoisted out of the parametrize below so the drift guard can
+# assert the two lists account for the whole vocabulary: a ninth state added to
+# _DPKG_STATUS_KNOWN without a decided disposition would otherwise land in
+# whichever branch happens to catch it, with no test exercising the choice.
+_DPKG_ON_DISK_STATUSES = [
+    "installed",
     "half-installed",
     "unpacked",
     "half-configured",
@@ -217,14 +218,35 @@ _DPKG_NON_INSTALLED_STATUSES = [
 ]
 
 
-@pytest.mark.parametrize("status", _DPKG_NON_INSTALLED_STATUSES)
+@pytest.mark.parametrize("status", _DPKG_ON_DISK_STATUSES)
 @patch("fivenines_agent.packages.get_clean_env", return_value={})
 @patch("fivenines_agent.packages.subprocess.run")
-def test_get_packages_dpkg_keeps_only_the_installed_state(mock_run, mock_env, status):
-    """Every other state dpkg defines is dropped, and dropped QUIETLY -- these
-    are known states excluded on purpose, so unlike an unrecognized status they
-    must not fail the read. The companion 'installed' line proves that: it still
-    comes back, which an aborted read would not."""
+def test_get_packages_dpkg_keeps_every_state_whose_files_are_on_disk(
+    mock_run, mock_env, status
+):
+    """Not just 'installed'. These packages are really there and really
+    scannable: triggers-pending happens on every unattended-upgrades run and
+    persists while a `dpkg --configure -a` is outstanding, and half-configured
+    and half-installed are dpkg's FAILURE states, which persist until a human
+    intervenes. Dropping one would delete the findings for software that is on
+    the disk, for as long as the host stays broken -- a false all-clear, which
+    is the one direction this must never fail in."""
+    mock_run.return_value = MagicMock(
+        returncode=0, stdout=f"{status}\topenssl\t3.0.11-1\n"
+    )
+    assert _get_packages_dpkg() == [{"name": "openssl", "version": "3.0.11-1"}]
+
+
+@pytest.mark.parametrize("status", ["not-installed", "config-files"])
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_dpkg_drops_the_two_states_with_no_files(
+    mock_run, mock_env, status
+):
+    """And only those two. They are dropped QUIETLY -- known states excluded on
+    purpose, so unlike an unrecognized status they must not fail the read. The
+    companion line proves it: it still comes back, which an aborted read would
+    not."""
     mock_run.return_value = MagicMock(
         returncode=0,
         stdout=f"{status}\topenssl\t3.0.11-1\ninstalled\tbash\t5.2.21-2\n",
@@ -233,17 +255,14 @@ def test_get_packages_dpkg_keeps_only_the_installed_state(mock_run, mock_env, st
 
 
 def test_dpkg_status_vocabulary_leaves_no_state_undecided():
-    """Every state dpkg can report has a decided, TESTED disposition: exactly
-    one is inventoried, and the parametrize above drops the rest. The status
+    """Every state dpkg can report has a decided, TESTED disposition: the two
+    with no files on disk are dropped, the other six are inventoried. The
     vocabulary is the whole safety argument for failing the read on an unknown
-    word, so a state added to the frozenset without being added there -- an
-    untested silent drop, and a silent drop is a deleted finding -- fails
-    here instead of in production."""
-    assert (
-        set(_DPKG_NON_INSTALLED_STATUSES) | {_DPKG_STATUS_INSTALLED}
-        == _DPKG_STATUS_KNOWN
-    )
-    assert _DPKG_STATUS_INSTALLED not in _DPKG_NON_INSTALLED_STATUSES
+    word, so a state added to the frozenset without being added to one of the
+    two lists above -- an untested disposition, and the wrong guess in one
+    direction is a deleted finding -- fails here instead of in production."""
+    assert set(_DPKG_ON_DISK_STATUSES) | _DPKG_STATUS_ABSENT == _DPKG_STATUS_KNOWN
+    assert not set(_DPKG_ON_DISK_STATUSES) & _DPKG_STATUS_ABSENT
 
 
 @patch("fivenines_agent.packages.get_clean_env", return_value={})
@@ -277,14 +296,34 @@ def test_get_packages_dpkg_drops_known_non_installed_states_silently(
 
 @patch("fivenines_agent.packages.get_clean_env", return_value={})
 @patch("fivenines_agent.packages.subprocess.run")
-def test_get_packages_dpkg_keeps_held_packages(mock_run, mock_env):
-    """A held package renders Status 'hold ok installed'. Filtering on the
-    status word alone keeps it; matching the whole triplet on 'install ok
-    installed' would drop a package that is installed and scannable."""
+def test_get_packages_dpkg_asks_for_the_status_word_not_the_triplet(
+    mock_run, mock_env
+):
+    """A held package renders Status 'hold ok installed', and only the third
+    word is asked for -- so the WANT flag never reaches the filter and the
+    package is kept. That property lives in the FORMAT STRING, not in the
+    output: by the time dpkg has rendered 'installed', a held package is
+    indistinguishable from any other, so asserting on a mocked line proves
+    nothing. Assert the request instead."""
     mock_run.return_value = MagicMock(
         returncode=0, stdout="installed\tcontainerd.io\t1.7.24-1\n"
     )
     assert _get_packages_dpkg() == [{"name": "containerd.io", "version": "1.7.24-1"}]
+    queryformat = mock_run.call_args[0][0][3]
+    assert "${db:Status-Status}" in queryformat
+    assert "${Status}" not in queryformat
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_dpkg_aborts_on_a_full_status_triplet(mock_run, mock_env):
+    """And if the format ever regressed to ${Status}, EVERY line would carry
+    the triplet -- outside dpkg's vocabulary, so the read fails loudly and the
+    host goes quiet, rather than shipping a manufactured empty set."""
+    mock_run.return_value = MagicMock(
+        returncode=0, stdout="hold ok installed\tcontainerd.io\t1.7.24-1\n"
+    )
+    assert _get_packages_dpkg() == []
 
 
 @patch("fivenines_agent.packages.get_clean_env", return_value={})
@@ -348,6 +387,22 @@ def test_get_packages_dpkg_discards_whole_read_on_malformed_line(
 
 @patch("fivenines_agent.packages.get_clean_env", return_value={})
 @patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_dpkg_row_with_all_fields_empty_is_not_silently_skipped(
+    mock_run, mock_env
+):
+    """A row that carries its separators but rendered every field empty is a
+    ROW, not a blank line, and it means dpkg answered nothing for a package it
+    listed. The blank-line guard must not eat it: `not line.strip()` would,
+    because strip() takes tabs, and the surviving lines would then ship as a
+    short list -- the one failure /packages turns into deleted findings."""
+    mock_run.return_value = MagicMock(
+        returncode=0, stdout="installed\tbash\t5.2.21-2\n\t\t\n"
+    )
+    assert _get_packages_dpkg() == []
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
 def test_get_packages_dpkg_unrecognized_status_aborts_it_does_not_skip_the_line(
     mock_run, mock_env
 ):
@@ -374,7 +429,7 @@ def test_get_packages_dpkg_unrecognized_status_aborts_it_does_not_skip_the_line(
 
 @patch("fivenines_agent.packages.get_clean_env", return_value={})
 @patch("fivenines_agent.packages.subprocess.run")
-def test_get_packages_dpkg_installed_without_a_version_aborts_it_does_not_skip(
+def test_get_packages_dpkg_on_disk_row_without_a_version_aborts_the_read(
     mock_run, mock_env
 ):
     """Same discrimination for the other hard-error branch. dpkg does not print

@@ -74,6 +74,12 @@ def get_distro():
     return "unknown"
 
 
+# How much of a rejected line (or a stderr blob) the error log quotes. Long
+# enough to diagnose a format change, short enough that a damaged package
+# database cannot inflate the telemetry payload the message rides in. Shared by
+# the dpkg and rpm readers, which both fail a read by logging what broke it.
+_LOG_LINE_CHARS = 200
+
 # dpkg's COMPLETE package-status vocabulary: the third word of the Status
 # field, and exactly what ${db:Status-Status} renders. Spellings are dpkg's own,
 # verified against statusinfos[] in lib/dpkg/pkg-namevalue.c. The set is closed
@@ -93,16 +99,27 @@ _DPKG_STATUS_KNOWN = frozenset(
     }
 )
 
-# The only state inventoried. The one it exists to exclude is config-files --
-# removed-but-not-purged, where dpkg keeps the stanza (name AND version) forever
-# while the software itself is gone.
+# The two states -- the ONLY two -- in which none of the package's program files
+# are on the machine: never installed, and removed-but-not-purged, where dpkg
+# keeps the stanza (name AND version) forever while the software itself is gone.
+# Those are dropped. Everything else is inventoried.
 #
-# It also excludes the half-done and trigger states, whose files ARE unpacked on
-# disk. That is the deliberate stricter reading: a scan landing mid-apt-run
-# omits a package it could have reported, and the server resolves its findings
-# until the next scan puts it back. Unlike an unknown status, this is a KNOWN
-# state being dropped on purpose, so it must not fail the read.
-_DPKG_STATUS_INSTALLED = "installed"
+# The question a CVE inventory asks is "are these files on this disk", and that
+# is the line dpkg's own vocabulary draws here. Filtering harder -- keeping only
+# `installed` -- would ALSO drop the half-done and trigger states, whose files
+# are unpacked and executable: `triggers-pending` occurs on every
+# unattended-upgrades run and persists while a `dpkg --configure -a` is
+# outstanding, and `half-configured`/`half-installed` are dpkg's FAILURE states,
+# which persist until a human intervenes. Dropping those would delete the
+# findings for software that is really there, for as long as the host stays
+# broken. /packages replaces the host's set and deletes what no longer matches,
+# so that is a false all-clear -- the one direction this inventory must never
+# fail in (see _get_packages_rpm), and the one the issue behind this filter
+# (#138) states outright: "false positives, never false negatives".
+#
+# Dropping a KNOWN state is deliberate, so unlike an unknown status it must not
+# fail the read.
+_DPKG_STATUS_ABSENT = frozenset({"not-installed", "config-files"})
 
 # ${db:Status-Status} is the field dpkg exposes for this (since dpkg 1.17.11,
 # 2014 -- Debian 8 and Ubuntu 16.04 already carry it, and the oldest
@@ -133,17 +150,22 @@ def _parse_dpkg_line(line):
     return status, name, version
 
 
-def _log_unparseable_dpkg_line(line):
-    """Report a line that fails the read, bounded and !r-quoted.
+def _log_rejected_dpkg_line(reason, line):
+    """Report a line that fails the read, naming the rule that rejected it.
 
-    Same reasoning as the rpm reader: this message is captured by
-    debug.start_log_capture into _telemetry["packages_sync"]["errors"] and
-    SHIPPED in the next tick's payload, so an unbounded line from a damaged
-    dpkg database would bloat the metrics POST, and a crafted package name
-    could smuggle control characters into the logs.
+    *reason* matters for diagnosis: two of the three rejections below are
+    perfectly well-SHAPED lines (an unrecognized status, an on-disk package
+    with no version), and an operator staring at a fleet-wide read failure
+    should not have to guess which rule fired.
+
+    Bounded and !r-quoted for the same reason as the rpm reader: this message is
+    captured by debug.start_log_capture into _telemetry["packages_sync"]
+    ["errors"] and SHIPPED in the next tick's payload, so an unbounded line from
+    a damaged dpkg database would bloat the metrics POST, and a crafted package
+    name could smuggle control characters into the logs.
     """
     log(
-        "dpkg-query returned an unparseable line, discarding read: "
+        f"dpkg-query line rejected ({reason}), discarding read: "
         f"{line[:_LOG_LINE_CHARS]!r}",
         "error",
     )
@@ -164,10 +186,12 @@ def _get_packages_dpkg():
     cannot clear them -- `apt autoremove --purge` correctly reports nothing to
     remove, because nothing is left to remove.
 
-    So ask dpkg for the status and keep only installed packages. This is the
-    rule the image path has always applied when it parses /var/lib/dpkg/status
-    directly (docker_image_inventory._parse_dpkg_status); the host path now
-    carries the same guarantee.
+    So ask dpkg for the status and drop the two states whose files are gone.
+    The image path applies a related rule when it parses /var/lib/dpkg/status
+    directly (docker_image_inventory._parse_dpkg_status), but not the same one:
+    it matches the whole "install ok installed" triplet, so it is stricter about
+    the state and also filters on the WANT flag, which drops a held package
+    ("hold ok installed"). This path reads the status word alone.
 
     Like the rpm reader, an unparseable line fails the WHOLE read (returns [])
     instead of being skipped. /packages replaces the host's package set and the
@@ -192,15 +216,27 @@ def _get_packages_dpkg():
         env=env,
     )
     if result.returncode != 0:
-        log(f"dpkg-query failed: {result.stderr[:_LOG_LINE_CHARS]}", "error")
+        # !r for the same reason as the rejected-line message: dpkg-query quotes
+        # content from /var/lib/dpkg/status in its own errors, so a newline or
+        # an escape sequence in a package field would otherwise reach an
+        # operator's terminal verbatim and forge extra lines in the telemetry
+        # buffer this rides in. Truncation bounds the size, repr bounds content.
+        log(f"dpkg-query failed: {result.stderr[:_LOG_LINE_CHARS]!r}", "error")
         return []
     packages = []
     for line in result.stdout.splitlines():
-        if not line.strip():
+        # `not line`, NOT `not line.strip()`. splitlines() never yields a line
+        # containing its own terminator, so the only genuinely blank line is the
+        # empty string. strip() would also swallow "\t\t" -- a row that carries
+        # its separators but rendered every field empty -- and that is a broken
+        # read, not a blank line: skipping it silently would ship the surviving
+        # lines as a short list, which is the one failure /packages turns into
+        # deleted findings. Let the parser judge anything with content in it.
+        if not line:
             continue
         parsed = _parse_dpkg_line(line)
         if parsed is None:
-            _log_unparseable_dpkg_line(line)
+            _log_rejected_dpkg_line("malformed line", line)
             return []
         status, name, version = parsed
         # A status outside dpkg's closed vocabulary means dpkg is not answering
@@ -208,14 +244,14 @@ def _get_packages_dpkg():
         # provenance on the CVE surface and dropping it would delete findings,
         # so neither guess is made and the read fails like any other drift.
         if status not in _DPKG_STATUS_KNOWN:
-            _log_unparseable_dpkg_line(line)
+            _log_rejected_dpkg_line("unrecognized status", line)
             return []
-        if status != _DPKG_STATUS_INSTALLED:
+        if status in _DPKG_STATUS_ABSENT:
             continue
-        # Only checked for the state we keep: dpkg prints no version for a
-        # package it merely knows about, and those are already gone by here.
+        # Only reached for a package whose files are on disk. dpkg prints no
+        # version for one it merely knows about, and those are already gone.
         if not version:
-            _log_unparseable_dpkg_line(line)
+            _log_rejected_dpkg_line("on-disk package with no version", line)
             return []
         packages.append({"name": name, "version": version})
     return packages
@@ -240,11 +276,6 @@ _RPM_QUERYFORMAT = "%{NAME}\t%{EPOCH}\t%{VERSION}-%{RELEASE}\n"
 # CVE-scanning surface -- so they are dropped rather than shipped as noise.
 _RPM_PSEUDO_PACKAGES = frozenset({"gpg-pubkey"})
 
-# How much of a rejected line (or a stderr blob) the error log quotes. Long
-# enough to diagnose a format change, short enough that a damaged package
-# database cannot inflate the telemetry payload the message rides in. Shared by
-# the dpkg and rpm readers, which both fail a read by logging what broke it.
-_LOG_LINE_CHARS = 200
 
 
 def _parse_rpm_line(line):
