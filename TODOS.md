@@ -88,6 +88,41 @@ pinned in the fixtures and neither specified in the original issues:
 - **Depends on:** agent PRs for #133 (merged) and #135
 - **Files:** `fivenines-server/spec/fixtures/{vllm,sglang}_contract_payload.json` (NOT this repo)
 
+## P1: Re-open already-scanned image digests after the dpkg status-filter fix
+
+Agent #138 (v1.17.2) fixed `docker_image_inventory._parse_dpkg_status`, which
+matched the whole `install ok installed` Status string and so also filtered on
+the WANT flag. That silently dropped `hold ok installed` -- what `apt-mark hold`
+writes, and a standard Dockerfile pinning idiom -- plus the `unpacked` and
+`triggers-*` states, with NO `errors[]` entry, so the image rendered as scanned
+and clean while the packages an author deliberately froze at an old version went
+unscanned.
+
+Two things have to happen for the fix to reach production data:
+
+1. **Vendor the updated fixture.** `tests/fixtures/docker_image_inventory_contract_payload.json`
+   changed in lockstep (highlight (e) reworded, a new
+   `dpkg_status_with_held_and_trigger_packages` scenario). Copy it
+   byte-identical, as always -- never hand-author the server's copy:
+
+       gh api repos/Five-Nines-io/fivenines_agent/contents/tests/fixtures/docker_image_inventory_contract_payload.json \
+         -q .content | base64 -d > spec/fixtures/docker_image_inventory_contract_payload.json
+
+   `agent_min_version` deliberately stays `1.14.0`. It is the FEATURE floor the
+   server gates `FEATURES_SUPPORTED_VERSIONS['docker_image_inventory']` on, so
+   bumping it would switch image inventory OFF for every 1.14.0-1.17.1 agent in
+   the field. The payload SHAPE did not change -- only which packages appear.
+
+2. **Re-open the digests already inventoried.** Each digest is extracted once
+   per image FOREVER (`image_inventory_done`), so every image scanned before
+   1.17.2 keeps its gap indefinitely. The escape hatch already exists: send the
+   affected digests in the top-level `rescan_images` array (server #676). Without
+   this step the fix only ever applies to images seen for the first time.
+
+- **Effort:** S (human) / S (CC)
+- **Depends on:** agent PR for #138 merged and rolled out
+- **Files:** `fivenines-server/spec/fixtures/docker_image_inventory_contract_payload.json`, the `rescan_images` emitter (NOT this repo)
+
 ## P2: Log monitoring - flat-file (non-journald) source (E2)
 
 Deferred from `ceo-plans/2026-06-30-log-file-monitoring.md` at the Codex
@@ -375,6 +410,59 @@ is to actually decide them with the server side.
 - **Effort:** S (human) / S (CC)
 - **Depends on:** server `/image_packages` ingester shipped
 - **Files:** `fivenines_agent/docker_image_inventory.py` (`_payload`), `tests/fixtures/docker_image_inventory_contract_payload.json`, server ingester
+
+## P2: packages_sync has no agent-side memory of what it last sent
+
+Raised by the red-team pass on #138. The only stop condition for a re-POST is
+the server echoing `last_package_hash` back through a `/collect` response --
+`grep` confirms it is read in exactly one place and stored nowhere on the agent.
+
+Normally harmless, but #138 ships on a day when EVERY Debian/Ubuntu host's hash
+is guaranteed to change at once. Any host whose `/collect` config echo lags --
+queue backlog, API degradation, or the very `/packages` load this release
+creates -- re-POSTs its identical full inventory on the next tick, and the next.
+The load is self-reinforcing rather than decaying, and there is no jitter
+anywhere in the agent (`grep -rn 'random|jitter' fivenines_agent/` returns
+nothing): `_post` retries are deterministic linear backoff and `_wait_interval`
+is a fixed period.
+
+`packages_sync` also runs synchronously on the collection loop that
+`WatchdogSec=90` bounds, which is the same exposure the P2 entry below
+("Inventory/packages POST retries stall the collection thread") already
+describes -- this change is what will exercise it fleet-wide.
+
+Cache the last successfully-POSTed hash agent-side (in-memory breaks the
+per-tick loop; on-disk under `config_dir` survives restarts) and treat the
+server's `last_package_hash` as an override that can force a resend. Add jitter
+to `_post`'s retry interval. Longer term, move `packages_sync` off the
+collection loop through the `QueueUploader` pattern.
+
+- **Effort:** S (human) / S (CC)
+- **Depends on:** nothing
+- **Files:** `fivenines_agent/packages.py` (`packages_sync`), `fivenines_agent/synchronizer.py` (`_post`)
+
+## P3: Package-reader hardening leftovers from the #138 review
+
+All three are PRE-EXISTING, all lean toward over-reporting (never a false
+all-clear), and none is reachable from real package-manager output -- which is
+why they were left out of #138 rather than widening a security fix. Recorded so
+the asymmetries are a decision, not an accident.
+
+- `_get_packages_rpm` still uses `if not line.strip(): continue`, which silently
+  skips a `"\t\t"` row and ships a short list. The dpkg twin was changed to
+  `if not line:` in #138 precisely because `strip()` eats tabs. rpm never
+  renders an empty `%{NAME}`, so it is unreachable today.
+- `docker_image_inventory._parse_dpkg_status` silently skips a stanza whose
+  `Status:` is not exactly three words or which has no `Version:` line -- a
+  partial list with an empty `errors[]`, where the host path aborts loudly. dpkg
+  always writes a three-word Status.
+- The host reader does not scrub control characters out of name/version the way
+  the image path does via `_scrub`, so an ESC/NUL byte in a dpkg field would
+  reach the `/packages` payload verbatim.
+
+- **Effort:** S (human) / S (CC)
+- **Depends on:** nothing
+- **Files:** `fivenines_agent/packages.py`, `fivenines_agent/docker_image_inventory.py`
 
 ## P2: Surface package-inventory staleness (a host that stopped sending)
 
