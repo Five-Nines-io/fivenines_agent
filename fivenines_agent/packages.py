@@ -74,24 +74,219 @@ def get_distro():
     return "unknown"
 
 
+# How much of a rejected line (or a stderr blob) the error log quotes. Long
+# enough to diagnose a format change, short enough that a damaged package
+# database cannot inflate the telemetry payload the message rides in. Shared by
+# the dpkg and rpm readers, which both fail a read by logging what broke it.
+_LOG_LINE_CHARS = 200
+
+# dpkg's COMPLETE package-status vocabulary: the third word of the Status
+# field, and exactly what ${db:Status-Status} renders. Spellings are dpkg's own,
+# verified against statusinfos[] in lib/dpkg/pkg-namevalue.c. The set is closed
+# -- dpkg has not added a state in two decades -- and it is enumerated in full
+# rather than implied, so a status the agent has never seen fails the read
+# LOUDLY instead of being guessed at in whichever direction happens to be wrong.
+_DPKG_STATUS_KNOWN = frozenset(
+    {
+        "not-installed",
+        "config-files",
+        "half-installed",
+        "unpacked",
+        "half-configured",
+        "triggers-awaited",
+        "triggers-pending",
+        "installed",
+    }
+)
+
+# The two states in which dpkg GUARANTEES none of the package's program files
+# are on the machine: never installed, and removed-but-not-purged, where dpkg
+# keeps the stanza (name AND version) forever while the software itself is gone.
+# Those are dropped. Every other state is inventoried.
+#
+# Not because the other six guarantee the opposite -- half-installed does not.
+# It is dpkg's state for "indeterminate", reached both by a failed unpack and
+# midway through a REMOVAL (installed -> half-configured -> half-installed, and
+# only then are the files deleted), so an interrupted `apt remove` can park a
+# package there with nothing left on disk. It is inventoried anyway, because
+# the two directions of error are not equal here: over-reporting a package
+# costs a false finding an operator can dismiss, under-reporting one deletes a
+# real finding for software that is still there.
+#
+# That asymmetry is the whole argument. Filtering harder -- keeping only
+# `installed` -- would also drop the trigger and half-done states, whose files
+# ARE unpacked and executable: `triggers-pending` occurs on every
+# unattended-upgrades run and persists while a `dpkg --configure -a` is
+# outstanding, and `half-configured` is dpkg's postinst-failed state, which
+# persists until a human intervenes. /packages replaces the host's set and
+# deletes what no longer matches, so dropping those is a false all-clear -- the
+# one direction this inventory must never fail in (see _get_packages_rpm), and
+# the one the issue behind this filter (#138) rules out in as many words:
+# "false positives, never false negatives".
+#
+# Dropping a KNOWN state is deliberate, so unlike an unknown status it must not
+# fail the read.
+_DPKG_STATUS_ABSENT = frozenset({"not-installed", "config-files"})
+
+# ${db:Status-Status} is the field dpkg exposes for this (since dpkg 1.17.11,
+# 2014 -- Debian 8 and Ubuntu 16.04 already carry it, and the oldest
+# Debian-family image the release matrix tests, Ubuntu 20.04, ships 1.19.7).
+# A dpkg too old to know the field does not fail loudly: its format printer
+# misses in fieldinfos[], then virtinfos[], then the arbitrary-field table, and
+# substitutes nothing at all -- so the line arrives with an EMPTY status rather
+# than an error. _parse_dpkg_line rejects that and the read fails, which is why
+# the empty-status case below is a hard error and not a skip.
+_DPKG_QUERYFORMAT = "${db:Status-Status}\t${Package}\t${Version}\n"
+
+# Stands in for a status field that rendered empty, so the rejection can name
+# the cause. Deliberately not a member of _DPKG_STATUS_KNOWN: it still fails the
+# read, it just fails it legibly.
+_DPKG_STATUS_MISSING = "<empty>"
+
+
+def _parse_dpkg_line(line):
+    """STATUS<TAB>NAME<TAB>VERSION -> (status, name, version).
+
+    Returns None when the line is not exactly that shape; the caller then
+    discards the WHOLE read, so this has no lenient path -- see
+    _get_packages_dpkg. An empty VERSION is accepted here and judged by the
+    caller instead: dpkg prints no version for a package it only knows about,
+    and only the status says whether that is legal.
+    """
+    fields = line.split("\t")
+    if len(fields) != 3:
+        return None
+    status, name, version = (field.strip() for field in fields)
+    if not name:
+        return None
+    if not status:
+        # Distinguished from the other rejections because it has ONE likely
+        # cause and an actionable name: a dpkg older than 1.17.11 does not know
+        # ${db:Status-Status} and substitutes nothing for it, so every line on
+        # that host arrives shaped correctly with an empty first field. Telling
+        # that operator "malformed line" would send them hunting a corrupt
+        # database instead of an unsupported dpkg.
+        return _DPKG_STATUS_MISSING, name, version
+    return status, name, version
+
+
+def _log_rejected_dpkg_line(reason, line):
+    """Report a line that fails the read, naming the rule that rejected it.
+
+    *reason* matters for diagnosis: two of the three rejections below are
+    perfectly well-SHAPED lines (an unrecognized status, an on-disk package
+    with no version), and an operator staring at a fleet-wide read failure
+    should not have to guess which rule fired.
+
+    Bounded and !r-quoted for the same reason as the rpm reader: this message is
+    captured by debug.start_log_capture into _telemetry["packages_sync"]
+    ["errors"] and SHIPPED in the next tick's payload, so an unbounded line from
+    a damaged dpkg database would bloat the metrics POST, and a crafted package
+    name could smuggle control characters into the logs.
+    """
+    log(
+        f"dpkg-query line rejected ({reason}), discarding read: "
+        f"{line[:_LOG_LINE_CHARS]!r}",
+        "error",
+    )
+
+
 def _get_packages_dpkg():
-    """Get installed packages via dpkg-query."""
+    """Get installed packages via dpkg-query, filtered on install status.
+
+    `dpkg-query -W` reports every package the dpkg database knows about, not
+    only the installed ones. A package removed with `apt remove` rather than
+    `apt purge` stays in the `config-files` state with its name and a real
+    version string intact, forever, and nothing downstream can tell it apart
+    from an installed package -- so the backend scans it and attributes CVEs to
+    software that is not on the machine. It shows up worst on kernels, which a
+    Debian-family upgrade installs alongside rather than replacing: on one
+    observed Ubuntu 24.04 host, 11 removed kernel ABIs produced roughly 90k
+    findings, about 94% of everything reported for that host. The operator
+    cannot clear them -- `apt autoremove --purge` correctly reports nothing to
+    remove, because nothing is left to remove.
+
+    So ask dpkg for the status and drop the two states whose files are gone.
+    The image path applies the SAME rule when it parses /var/lib/dpkg/status
+    directly (docker_image_inventory._parse_dpkg_status), and imports
+    _DPKG_STATUS_ABSENT from here rather than restating it -- the two had
+    drifted onto different rules once already, which is how held packages ended
+    up dropped from image inventories.
+
+    Like the rpm reader, an unparseable line fails the WHOLE read (returns [])
+    instead of being skipped. /packages replaces the host's package set and the
+    server deletes the findings that no longer match, so a silently short list
+    resolves live vulnerabilities, while an empty return is read by
+    packages_sync as "no data" and skips the send -- stale, but never a
+    manufactured all-clear.
+    """
+    # LC_ALL=C for the same reason as the rpm reader: get_clean_env() passes the
+    # host's LANG/LC_* through untouched, and this parser matches dpkg's status
+    # words byte-for-byte. Those words are bare C literals in statusinfos[] with
+    # no gettext wrapper, so this is belt-and-braces rather than load-bearing --
+    # but it is one line, and the failure it forecloses would fire fleet-wide on
+    # a single day. It also keeps the stderr quoted below readable.
+    env = get_clean_env()
+    env["LC_ALL"] = "C"
     result = subprocess.run(
-        ["dpkg-query", "-W", "-f", "${Package}\t${Version}\n"],
+        ["dpkg-query", "-W", "-f", _DPKG_QUERYFORMAT],
         capture_output=True,
         text=True,
         timeout=30,
-        env=get_clean_env(),
+        env=env,
     )
     if result.returncode != 0:
-        log(f"dpkg-query failed: {result.stderr}", "error")
+        # !r for the same reason as the rejected-line message: dpkg-query quotes
+        # content from /var/lib/dpkg/status in its own errors, so a newline or
+        # an escape sequence in a package field would otherwise reach an
+        # operator's terminal verbatim and forge extra lines in the telemetry
+        # buffer this rides in. Truncation bounds the size, repr bounds content.
+        log(f"dpkg-query failed: {result.stderr[:_LOG_LINE_CHARS]!r}", "error")
         return []
-    packages = []
-    for line in result.stdout.strip().split("\n"):
-        if "\t" in line:
-            name, version = line.split("\t", 1)
-            packages.append({"name": name, "version": version})
-    return packages
+    packages = {}
+    for line in result.stdout.splitlines():
+        # `not line`, NOT `not line.strip()`. splitlines() never yields a line
+        # containing its own terminator, so the only genuinely blank line is the
+        # empty string. strip() would also swallow "\t\t" -- a row that carries
+        # its separators but rendered every field empty -- and that is a broken
+        # read, not a blank line: skipping it silently would ship the surviving
+        # lines as a short list, which is the one failure /packages turns into
+        # deleted findings. Let the parser judge anything with content in it.
+        if not line:
+            continue
+        parsed = _parse_dpkg_line(line)
+        if parsed is None:
+            _log_rejected_dpkg_line("malformed line", line)
+            return []
+        status, name, version = parsed
+        # A status outside dpkg's closed vocabulary means dpkg is not answering
+        # the question we asked. Keeping the line would put a package of unknown
+        # provenance on the CVE surface and dropping it would delete findings,
+        # so neither guess is made and the read fails like any other drift.
+        if status not in _DPKG_STATUS_KNOWN:
+            _log_rejected_dpkg_line(
+                "dpkg too old for ${db:Status-Status}"
+                if status == _DPKG_STATUS_MISSING
+                else "unrecognized status",
+                line,
+            )
+            return []
+        if status in _DPKG_STATUS_ABSENT:
+            continue
+        # Only reached for a package whose files are on disk. dpkg prints no
+        # version for one it merely knows about, and those are already gone.
+        if not version:
+            _log_rejected_dpkg_line("on-disk package with no version", line)
+            return []
+        # Keyed, not appended: ${Package} renders the name WITHOUT its
+        # architecture, so a multiarch install (libc6:amd64 + libc6:i386) is
+        # listed twice under one name, and the payload carries no arch to tell
+        # the two rows apart -- they are one package. Same rule, same reason as
+        # _get_packages_rpm. Genuinely different versions of one name (several
+        # kernels) keep their own rows: an old vulnerable kernel still installed
+        # is still a finding.
+        packages[(name, version)] = {"name": name, "version": version}
+    return list(packages.values())
 
 
 # rpm's own spelling for a tag the package does not declare. RPM semantics --
@@ -112,11 +307,6 @@ _RPM_QUERYFORMAT = "%{NAME}\t%{EPOCH}\t%{VERSION}-%{RELEASE}\n"
 # not software, no advisory feed carries them, and the /packages inventory is a
 # CVE-scanning surface -- so they are dropped rather than shipped as noise.
 _RPM_PSEUDO_PACKAGES = frozenset({"gpg-pubkey"})
-
-# How much of a rejected line the error log quotes. Long enough to diagnose a
-# format change, short enough that a corrupt rpmdb cannot inflate the telemetry
-# payload the message rides in (see _get_packages_rpm).
-_RPM_LOG_LINE_CHARS = 200
 
 
 def _parse_rpm_line(line):
@@ -183,7 +373,10 @@ def _get_packages_rpm():
         # Bounded for the same reason as the unparseable-line message below:
         # rpm against a corrupt Berkeley DB can print one error line PER
         # package, and this string rides the next tick's telemetry payload.
-        log(f"rpm failed: {result.stderr[:_RPM_LOG_LINE_CHARS]}", "error")
+        # !r for the same reason as its dpkg twin: truncation bounds the size,
+        # repr bounds the CONTENT, and rpm quotes package names back in its
+        # own error text.
+        log(f"rpm failed: {result.stderr[:_LOG_LINE_CHARS]!r}", "error")
         return []
     packages = {}
     for line in result.stdout.splitlines():
@@ -198,7 +391,7 @@ def _get_packages_rpm():
             # package name could smuggle control characters into the logs.
             log(
                 "rpm returned an unparseable line, discarding read: "
-                f"{line[:_RPM_LOG_LINE_CHARS]!r}",
+                f"{line[:_LOG_LINE_CHARS]!r}",
                 "error",
             )
             return []
