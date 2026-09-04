@@ -99,23 +99,30 @@ _DPKG_STATUS_KNOWN = frozenset(
     }
 )
 
-# The two states -- the ONLY two -- in which none of the package's program files
+# The two states in which dpkg GUARANTEES none of the package's program files
 # are on the machine: never installed, and removed-but-not-purged, where dpkg
 # keeps the stanza (name AND version) forever while the software itself is gone.
-# Those are dropped. Everything else is inventoried.
+# Those are dropped. Every other state is inventoried.
 #
-# The question a CVE inventory asks is "are these files on this disk", and that
-# is the line dpkg's own vocabulary draws here. Filtering harder -- keeping only
-# `installed` -- would ALSO drop the half-done and trigger states, whose files
-# are unpacked and executable: `triggers-pending` occurs on every
+# Not because the other six guarantee the opposite -- half-installed does not.
+# It is dpkg's state for "indeterminate", reached both by a failed unpack and
+# midway through a REMOVAL (installed -> half-configured -> half-installed, and
+# only then are the files deleted), so an interrupted `apt remove` can park a
+# package there with nothing left on disk. It is inventoried anyway, because
+# the two directions of error are not equal here: over-reporting a package
+# costs a false finding an operator can dismiss, under-reporting one deletes a
+# real finding for software that is still there.
+#
+# That asymmetry is the whole argument. Filtering harder -- keeping only
+# `installed` -- would also drop the trigger and half-done states, whose files
+# ARE unpacked and executable: `triggers-pending` occurs on every
 # unattended-upgrades run and persists while a `dpkg --configure -a` is
-# outstanding, and `half-configured`/`half-installed` are dpkg's FAILURE states,
-# which persist until a human intervenes. Dropping those would delete the
-# findings for software that is really there, for as long as the host stays
-# broken. /packages replaces the host's set and deletes what no longer matches,
-# so that is a false all-clear -- the one direction this inventory must never
-# fail in (see _get_packages_rpm), and the one the issue behind this filter
-# (#138) states outright: "false positives, never false negatives".
+# outstanding, and `half-configured` is dpkg's postinst-failed state, which
+# persists until a human intervenes. /packages replaces the host's set and
+# deletes what no longer matches, so dropping those is a false all-clear -- the
+# one direction this inventory must never fail in (see _get_packages_rpm), and
+# the one the issue behind this filter (#138) rules out in as many words:
+# "false positives, never false negatives".
 #
 # Dropping a KNOWN state is deliberate, so unlike an unknown status it must not
 # fail the read.
@@ -131,6 +138,11 @@ _DPKG_STATUS_ABSENT = frozenset({"not-installed", "config-files"})
 # the empty-status case below is a hard error and not a skip.
 _DPKG_QUERYFORMAT = "${db:Status-Status}\t${Package}\t${Version}\n"
 
+# Stands in for a status field that rendered empty, so the rejection can name
+# the cause. Deliberately not a member of _DPKG_STATUS_KNOWN: it still fails the
+# read, it just fails it legibly.
+_DPKG_STATUS_MISSING = "<empty>"
+
 
 def _parse_dpkg_line(line):
     """STATUS<TAB>NAME<TAB>VERSION -> (status, name, version).
@@ -145,8 +157,16 @@ def _parse_dpkg_line(line):
     if len(fields) != 3:
         return None
     status, name, version = (field.strip() for field in fields)
-    if not status or not name:
+    if not name:
         return None
+    if not status:
+        # Distinguished from the other rejections because it has ONE likely
+        # cause and an actionable name: a dpkg older than 1.17.11 does not know
+        # ${db:Status-Status} and substitutes nothing for it, so every line on
+        # that host arrives shaped correctly with an empty first field. Telling
+        # that operator "malformed line" would send them hunting a corrupt
+        # database instead of an unsupported dpkg.
+        return _DPKG_STATUS_MISSING, name, version
     return status, name, version
 
 
@@ -244,7 +264,12 @@ def _get_packages_dpkg():
         # provenance on the CVE surface and dropping it would delete findings,
         # so neither guess is made and the read fails like any other drift.
         if status not in _DPKG_STATUS_KNOWN:
-            _log_rejected_dpkg_line("unrecognized status", line)
+            _log_rejected_dpkg_line(
+                "dpkg too old for ${db:Status-Status}"
+                if status == _DPKG_STATUS_MISSING
+                else "unrecognized status",
+                line,
+            )
             return []
         if status in _DPKG_STATUS_ABSENT:
             continue
@@ -275,7 +300,6 @@ _RPM_QUERYFORMAT = "%{NAME}\t%{EPOCH}\t%{VERSION}-%{RELEASE}\n"
 # not software, no advisory feed carries them, and the /packages inventory is a
 # CVE-scanning surface -- so they are dropped rather than shipped as noise.
 _RPM_PSEUDO_PACKAGES = frozenset({"gpg-pubkey"})
-
 
 
 def _parse_rpm_line(line):
@@ -342,7 +366,10 @@ def _get_packages_rpm():
         # Bounded for the same reason as the unparseable-line message below:
         # rpm against a corrupt Berkeley DB can print one error line PER
         # package, and this string rides the next tick's telemetry payload.
-        log(f"rpm failed: {result.stderr[:_LOG_LINE_CHARS]}", "error")
+        # !r for the same reason as its dpkg twin: truncation bounds the size,
+        # repr bounds the CONTENT, and rpm quotes package names back in its
+        # own error text.
+        log(f"rpm failed: {result.stderr[:_LOG_LINE_CHARS]!r}", "error")
         return []
     packages = {}
     for line in result.stdout.splitlines():

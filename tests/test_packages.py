@@ -464,6 +464,68 @@ def test_get_packages_dpkg_whitespace_only_version_aborts_the_read(mock_run, moc
     assert _get_packages_dpkg() == []
 
 
+@pytest.mark.parametrize(
+    "stdout, reason, other_reasons",
+    [
+        # Too few fields: the shape check in _parse_dpkg_line.
+        (
+            "openssl\t3.0.11-1\n",
+            "malformed line",
+            ["unrecognized status", "on-disk package with no version"],
+        ),
+        # Right shape, empty status -- what a dpkg too old to know
+        # ${db:Status-Status} prints, and the ONLY thing that prints it. It gets
+        # its own spelling rather than being folded into either neighbour: the
+        # three send an operator to three different places -- "this dpkg does
+        # not support our format string", "dpkg grew a state", "this package
+        # database is damaged" -- and it is the one cause with a known fix.
+        (
+            "\topenssl\t3.0.11-1\n",
+            "dpkg too old",
+            [
+                "unrecognized status",
+                "malformed line",
+                "on-disk package with no version",
+            ],
+        ),
+        (
+            "reinstreq\topenssl\t3.0.11-1\n",
+            "unrecognized status",
+            ["malformed line", "on-disk package with no version"],
+        ),
+        (
+            "installed\topenssl\t\n",
+            "on-disk package with no version",
+            ["malformed line", "unrecognized status"],
+        ),
+    ],
+)
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_dpkg_names_the_rule_that_rejected_the_line(
+    mock_run, mock_env, stdout, reason, other_reasons
+):
+    """Every abort says WHICH rule fired, and the four causes are not
+    interchangeable. Two of them are perfectly well-SHAPED lines, so an
+    operator reading a fleet-wide read failure out of the telemetry payload has
+    only this word to tell "dpkg is not answering the question we asked" from
+    "this host's package database is damaged" -- and the wrong word sends them
+    to the wrong investigation. The tests above only count the messages, which
+    cannot see a reason argument that is wrong, duplicated across call sites,
+    or dropped from the format string entirely."""
+    mock_run.return_value = MagicMock(returncode=0, stdout=stdout)
+    start_log_capture()
+    try:
+        assert _get_packages_dpkg() == []
+        errors = stop_log_capture()
+    finally:
+        stop_log_capture()
+    assert len(errors) == 1
+    assert reason in errors[0]
+    for other in other_reasons:
+        assert other not in errors[0]
+
+
 @patch("fivenines_agent.packages.get_clean_env", return_value={})
 @patch("fivenines_agent.packages.subprocess.run")
 def test_get_packages_dpkg_discards_read_rather_than_shipping_a_prefix(
@@ -530,6 +592,35 @@ def test_get_packages_dpkg_escapes_control_characters_in_the_rejected_line(
     control bytes themselves."""
     mock_run.return_value = MagicMock(
         returncode=0, stdout="\x1b]0;pwned\x07\t3.0.11-1\n"
+    )
+    start_log_capture()
+    try:
+        assert _get_packages_dpkg() == []
+        errors = stop_log_capture()
+    finally:
+        stop_log_capture()
+    assert len(errors) == 1
+    assert "\x1b" not in errors[0]
+    assert "\x07" not in errors[0]
+    assert "\\x1b" in errors[0]
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_dpkg_escapes_control_characters_in_the_stderr_it_logs(
+    mock_run, mock_env
+):
+    """The failed-read message needs the same escaping as the rejected line,
+    and it is the likelier carrier of the two: dpkg-query quotes package names
+    and status-file content back in its OWN errors, so a name carrying an
+    escape sequence reaches this log without ever passing the parser. The
+    length bound next door cannot see this -- repr and a bare slice are both
+    under the cap -- so dropping the !r would leave every existing assertion
+    green while control bytes went to an operator's terminal and into the
+    telemetry payload."""
+    mock_run.return_value = MagicMock(
+        returncode=1,
+        stderr="dpkg-query: error: package '\x1b]0;pwned\x07' is not installed\n",
     )
     start_log_capture()
     try:
