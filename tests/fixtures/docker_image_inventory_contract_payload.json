@@ -269,15 +269,15 @@
     "dpkg_status_with_held_and_trigger_packages": {
       "description": "The companion to dpkg_status_with_deinstalled_entry, and the reason the filter reads the status WORD rather than the whole triplet. Three packages whose files are all on disk but whose Status triplets differ in the want and error flags: a held package (`hold ok installed`, what `apt-mark hold` writes and a standard Dockerfile pinning idiom), one awaiting trigger processing (`install ok triggers-pending`), and a normal one. ALL THREE are reported. Matching 'install ok installed' would drop the first two silently, with an empty errors[] -- so the image would render as scanned and clean while the packages an author deliberately pinned to an old version, i.e. the ones most likely to carry a CVE, went unscanned.",
       "sdk": {
-        "image_id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "container_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "image_id": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+        "container_id": "6666666666666666666666666666666666666666666666666666666666666666",
         "files": {
           "/etc/os-release": "PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\nNAME=\"Debian GNU/Linux\"\nID=debian\nVERSION_ID=\"12\"\nVERSION_CODENAME=bookworm\n",
           "/var/lib/dpkg/status": "Package: bash\nStatus: install ok installed\nVersion: 5.2.15-2+b7\n\nPackage: containerd.io\nStatus: hold ok installed\nVersion: 1.7.24-1\n\nPackage: curl\nStatus: install ok triggers-pending\nVersion: 7.88.1-10+deb12u8\n"
         }
       },
       "payload": {
-        "image_id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "image_id": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
         "distro": "debian:12",
         "packages_hash": "8d909826fc1166ae595109133c642feb9c39ab24fde96043d448a12777428344",
         "packages": [

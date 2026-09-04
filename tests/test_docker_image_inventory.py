@@ -19,7 +19,6 @@ from unittest.mock import MagicMock, patch
 import docker as docker_lib
 import pytest
 
-from fivenines_agent.packages import _DPKG_STATUS_ABSENT
 from fivenines_agent.docker_image_inventory import (
     MAX_FIELD_CHARS,
     MAX_FILE_BYTES,
@@ -40,7 +39,7 @@ from fivenines_agent.docker_image_inventory import (
     build_image_inventory,
     select_and_enqueue,
 )
-from fivenines_agent.packages import get_packages_hash
+from fivenines_agent.packages import _DPKG_STATUS_ABSENT, get_packages_hash
 from fivenines_agent.synchronization_queue import SynchronizationQueue
 
 _CONTRACT_PATH = os.path.join(
@@ -1578,3 +1577,45 @@ def test_uploader_non_dict_job_id_is_none():
         on_failure=lambda i: got.append(i),
     )
     assert got == [None]
+
+
+def test_parse_dpkg_status_collapses_multiarch_duplicates():
+    """A multiarch install is two stanzas sharing one Package: and differing
+    only in Architecture:, which the payload does not carry -- so they are one
+    package, the same rule the host reader and the rpm reader apply. Left
+    duplicated they would also burn MAX_PACKAGES slots and pull `truncated`
+    forward, turning an image that fits into one the server must render as a
+    floor."""
+    text = (
+        "Package: libc6\nStatus: install ok installed\n"
+        "Architecture: amd64\nVersion: 2.36-9\n"
+        "\n"
+        "Package: libc6\nStatus: install ok installed\n"
+        "Architecture: i386\nVersion: 2.36-9\n"
+        "\n"
+        "Package: bash\nStatus: install ok installed\nVersion: 5.2.15-2\n"
+    )
+    pkgs, truncated = _parse_dpkg_status(text)
+    assert pkgs == [
+        {"name": "libc6", "version": "2.36-9", "ecosystem": None},
+        {"name": "bash", "version": "5.2.15-2", "ecosystem": None},
+    ]
+    assert truncated is False
+
+
+def test_parse_dpkg_status_keeps_multiarch_rows_at_different_versions():
+    """The other half: the arches are held and upgraded independently, so they
+    can legitimately sit at different versions. Keying on (name, version) -- not
+    on name -- keeps both, where a name-keyed collapse would keep whichever came
+    last and delete the finding for the other."""
+    text = (
+        "Package: libc6\nStatus: install ok installed\nVersion: 2.36-9+deb12u7\n"
+        "\n"
+        "Package: libc6\nStatus: install ok installed\nVersion: 2.36-9+deb12u3\n"
+    )
+    pkgs, truncated = _parse_dpkg_status(text)
+    assert pkgs == [
+        {"name": "libc6", "version": "2.36-9+deb12u7", "ecosystem": None},
+        {"name": "libc6", "version": "2.36-9+deb12u3", "ecosystem": None},
+    ]
+    assert truncated is False

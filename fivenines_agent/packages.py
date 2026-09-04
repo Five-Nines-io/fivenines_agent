@@ -207,11 +207,11 @@ def _get_packages_dpkg():
     remove, because nothing is left to remove.
 
     So ask dpkg for the status and drop the two states whose files are gone.
-    The image path applies a related rule when it parses /var/lib/dpkg/status
-    directly (docker_image_inventory._parse_dpkg_status), but not the same one:
-    it matches the whole "install ok installed" triplet, so it is stricter about
-    the state and also filters on the WANT flag, which drops a held package
-    ("hold ok installed"). This path reads the status word alone.
+    The image path applies the SAME rule when it parses /var/lib/dpkg/status
+    directly (docker_image_inventory._parse_dpkg_status), and imports
+    _DPKG_STATUS_ABSENT from here rather than restating it -- the two had
+    drifted onto different rules once already, which is how held packages ended
+    up dropped from image inventories.
 
     Like the rpm reader, an unparseable line fails the WHOLE read (returns [])
     instead of being skipped. /packages replaces the host's package set and the

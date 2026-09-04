@@ -344,7 +344,13 @@ def _parse_dpkg_status(text, limit=None):
     call time (not as a default argument) so tests can patch MAX_PACKAGES."""
     if limit is None:
         limit = MAX_PACKAGES
-    packages = []
+    # Keyed, not appended: a multiarch install is two stanzas sharing one
+    # Package: and differing only in Architecture:, which the payload does not
+    # carry -- so they are one package, exactly as in the host reader and in
+    # _get_packages_rpm. Left as a list, the duplicates would also burn
+    # MAX_PACKAGES slots and pull `truncated` forward, turning an image that
+    # fits into one the server must render as a floor.
+    packages = {}
     for stanza in _iter_stanzas(text):
         if not stanza.strip():
             continue
@@ -361,10 +367,11 @@ def _parse_dpkg_status(text, limit=None):
         if name and version and status and _dpkg_status_is_on_disk(status):
             entry = _package(name, version)
             if entry is not None:
-                packages.append(entry)
+                # Scrubbed values, since _package may rewrite either field.
+                packages[(entry["name"], entry["version"])] = entry
                 if len(packages) > limit:
-                    return packages[:limit], True
-    return packages, False
+                    return list(packages.values())[:limit], True
+    return list(packages.values()), False
 
 
 def _parse_apk_installed(text, limit=None):
