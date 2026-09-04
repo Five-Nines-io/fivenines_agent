@@ -8,6 +8,8 @@ import pytest
 
 from fivenines_agent.debug import start_log_capture, stop_log_capture
 from fivenines_agent.packages import (
+    _DPKG_STATUS_INSTALLED,
+    _DPKG_STATUS_KNOWN,
     _get_packages_apk,
     _get_packages_dpkg,
     _get_packages_pacman,
@@ -161,6 +163,32 @@ def test_get_packages_dpkg_drops_removed_but_not_purged(mock_run, mock_env):
 
 @patch("fivenines_agent.packages.get_clean_env", return_value={})
 @patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_dpkg_keeps_both_versions_of_a_multiarch_pair(
+    mock_run, mock_env
+):
+    """The one way a NAME legitimately repeats in this output, and the reason
+    the reader must not borrow the rpm reader's dedup dict. ${Package} renders
+    without the arch qualifier, so libc6:amd64 and libc6:i386 arrive as two
+    rows sharing a name; the arches can sit at different versions (they are
+    held and upgraded independently), and both are real software on the disk.
+    Collapsing on name would keep whichever came last and delete the finding
+    for the other."""
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout=(
+            "installed\tlibc6\t2.36-9+deb12u7\n"
+            "config-files\tlinux-image-6.8.0-31-generic\t6.8.0-31.31\n"
+            "installed\tlibc6\t2.36-9+deb12u3\n"
+        ),
+    )
+    assert _get_packages_dpkg() == [
+        {"name": "libc6", "version": "2.36-9+deb12u7"},
+        {"name": "libc6", "version": "2.36-9+deb12u3"},
+    ]
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
 def test_get_packages_dpkg_drops_a_versionless_line_on_status_first(
     mock_run, mock_env
 ):
@@ -174,18 +202,22 @@ def test_get_packages_dpkg_drops_a_versionless_line_on_status_first(
     assert _get_packages_dpkg() == [{"name": "bash", "version": "5.2.21-2"}]
 
 
-@pytest.mark.parametrize(
-    "status",
-    [
-        "not-installed",
-        "config-files",
-        "half-installed",
-        "unpacked",
-        "half-configured",
-        "triggers-awaited",
-        "triggers-pending",
-    ],
-)
+# Every state in dpkg's vocabulary EXCEPT the one that is inventoried. Hoisted
+# out of the parametrize below so the drift guard can assert it accounts for the
+# whole vocabulary: a ninth state added to _DPKG_STATUS_KNOWN without a decided
+# disposition would otherwise become a silent drop no test ever exercises.
+_DPKG_NON_INSTALLED_STATUSES = [
+    "not-installed",
+    "config-files",
+    "half-installed",
+    "unpacked",
+    "half-configured",
+    "triggers-awaited",
+    "triggers-pending",
+]
+
+
+@pytest.mark.parametrize("status", _DPKG_NON_INSTALLED_STATUSES)
 @patch("fivenines_agent.packages.get_clean_env", return_value={})
 @patch("fivenines_agent.packages.subprocess.run")
 def test_get_packages_dpkg_keeps_only_the_installed_state(mock_run, mock_env, status):
@@ -200,6 +232,49 @@ def test_get_packages_dpkg_keeps_only_the_installed_state(mock_run, mock_env, st
     assert _get_packages_dpkg() == [{"name": "bash", "version": "5.2.21-2"}]
 
 
+def test_dpkg_status_vocabulary_leaves_no_state_undecided():
+    """Every state dpkg can report has a decided, TESTED disposition: exactly
+    one is inventoried, and the parametrize above drops the rest. The status
+    vocabulary is the whole safety argument for failing the read on an unknown
+    word, so a state added to the frozenset without being added there -- an
+    untested silent drop, and a silent drop is a deleted finding -- fails
+    here instead of in production."""
+    assert (
+        set(_DPKG_NON_INSTALLED_STATUSES) | {_DPKG_STATUS_INSTALLED}
+        == _DPKG_STATUS_KNOWN
+    )
+    assert _DPKG_STATUS_INSTALLED not in _DPKG_NON_INSTALLED_STATUSES
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_dpkg_drops_known_non_installed_states_silently(
+    mock_run, mock_env
+):
+    """The quiet in 'dropped quietly'. These states are expected on a healthy
+    host -- the machine that motivated this fix carries eleven of them -- so
+    logging one would put a 200-char error per removed package into EVERY
+    tick's telemetry payload, forever. Only the unknown-status and malformed
+    cases below are allowed to say anything."""
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout=(
+            "".join(
+                f"config-files\tlinux-image-6.8.0-{abi}-generic\t6.8.0-{abi}.{abi}\n"
+                for abi in range(31, 42)
+            )
+            + "installed\tbash\t5.2.21-2\n"
+        ),
+    )
+    start_log_capture()
+    try:
+        assert _get_packages_dpkg() == [{"name": "bash", "version": "5.2.21-2"}]
+        errors = stop_log_capture()
+    finally:
+        stop_log_capture()
+    assert errors == []
+
+
 @patch("fivenines_agent.packages.get_clean_env", return_value={})
 @patch("fivenines_agent.packages.subprocess.run")
 def test_get_packages_dpkg_keeps_held_packages(mock_run, mock_env):
@@ -210,6 +285,23 @@ def test_get_packages_dpkg_keeps_held_packages(mock_run, mock_env):
         returncode=0, stdout="installed\tcontainerd.io\t1.7.24-1\n"
     )
     assert _get_packages_dpkg() == [{"name": "containerd.io", "version": "1.7.24-1"}]
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_dpkg_normalizes_whitespace_around_every_field(
+    mock_run, mock_env
+):
+    """Each field is stripped before it is judged, and both halves of that
+    matter. A padded STATUS has to still match the vocabulary, or a cosmetic
+    change in how dpkg renders the field would fail every read on the fleet in
+    one day; a padded VERSION has to be trimmed before it lands in the payload,
+    since the server matches advisories on that string and the delta hash is
+    computed from it."""
+    mock_run.return_value = MagicMock(
+        returncode=0, stdout="  installed \t openssl \t 3.0.11-1 \n"
+    )
+    assert _get_packages_dpkg() == [{"name": "openssl", "version": "3.0.11-1"}]
 
 
 @patch("fivenines_agent.packages.get_clean_env", return_value={})
@@ -251,6 +343,69 @@ def test_get_packages_dpkg_discards_whole_read_on_malformed_line(
     /packages replaces the host's package set, so shipping the lines we did
     understand would auto-resolve the vulnerabilities of the ones we did not."""
     mock_run.return_value = MagicMock(returncode=0, stdout=stdout)
+    assert _get_packages_dpkg() == []
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_dpkg_unrecognized_status_aborts_it_does_not_skip_the_line(
+    mock_run, mock_env
+):
+    """An unrecognized status must fail the WHOLE read, and that has to be
+    proven against the quiet drop -- a bare `== []` on a one-line read cannot
+    tell 'aborted' from 'skipped', because both spell []. The good line comes
+    AFTER the bad one here, so an implementation that skipped would return it,
+    and the logged error is the second half of the distinction: a known drop
+    says nothing, an unknown status says something. Skipping is the dangerous
+    guess. dpkg is no longer answering the question we asked, and /packages
+    would delete the findings for whatever we failed to account for."""
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout="reinstreq\topenssl\t3.0.11-1\ninstalled\tbash\t5.2.21-2\n",
+    )
+    start_log_capture()
+    try:
+        assert _get_packages_dpkg() == []
+        errors = stop_log_capture()
+    finally:
+        stop_log_capture()
+    assert len(errors) == 1
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_dpkg_installed_without_a_version_aborts_it_does_not_skip(
+    mock_run, mock_env
+):
+    """Same discrimination for the other hard-error branch. dpkg does not print
+    an empty version for a package whose files are on disk, so an 'installed'
+    row without one means the output is not what we asked for -- and a package
+    we cannot version is a package the server cannot match an advisory against.
+    The companion row AFTER it proves the read stopped rather than skipping."""
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout="installed\topenssl\t\ninstalled\tbash\t5.2.21-2\n",
+    )
+    start_log_capture()
+    try:
+        assert _get_packages_dpkg() == []
+        errors = stop_log_capture()
+    finally:
+        stop_log_capture()
+    assert len(errors) == 1
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_dpkg_whitespace_only_version_aborts_the_read(mock_run, mock_env):
+    """A version that is nothing but padding is an absent version: it strips to
+    empty and fails the read like any other. It must never reach the payload as
+    version '', which the server would compare against every advisory for that
+    package name."""
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout="installed\topenssl\t   \ninstalled\tbash\t5.2.21-2\n",
+    )
     assert _get_packages_dpkg() == []
 
 
@@ -309,6 +464,32 @@ def test_get_packages_dpkg_bounds_the_rejected_line_it_logs(mock_run, mock_env):
 
 @patch("fivenines_agent.packages.get_clean_env", return_value={})
 @patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_dpkg_escapes_control_characters_in_the_rejected_line(
+    mock_run, mock_env
+):
+    """The other half of what !r buys, which the length bound above cannot see:
+    the rejected line is escaped, not interpolated raw. A package name is just
+    a string in a database, and this one travels to an operator's terminal AND
+    into the telemetry payload -- so a name carrying an xterm title-setting
+    escape sequence must arrive as the characters \\x1b and \\x07, not as the
+    control bytes themselves."""
+    mock_run.return_value = MagicMock(
+        returncode=0, stdout="\x1b]0;pwned\x07\t3.0.11-1\n"
+    )
+    start_log_capture()
+    try:
+        assert _get_packages_dpkg() == []
+        errors = stop_log_capture()
+    finally:
+        stop_log_capture()
+    assert len(errors) == 1
+    assert "\x1b" not in errors[0]
+    assert "\x07" not in errors[0]
+    assert "\\x1b" in errors[0]
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
 def test_get_packages_dpkg_empty_lines(mock_run, mock_env):
     mock_run.return_value = MagicMock(returncode=0, stdout="")
     result = _get_packages_dpkg()
@@ -320,6 +501,23 @@ def test_get_packages_dpkg_empty_lines(mock_run, mock_env):
 def test_get_packages_dpkg_blank_lines_are_tolerated(mock_run, mock_env):
     mock_run.return_value = MagicMock(
         returncode=0, stdout="\ninstalled\tbash\t5.2.21-2\n\n"
+    )
+    assert _get_packages_dpkg() == [{"name": "bash", "version": "5.2.21-2"}]
+
+
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_packages_dpkg_trusts_a_read_that_warned_on_stderr(mock_run, mock_env):
+    """The same call the rpm reader makes, and deliberately NOT the wireguard
+    rule where any stderr means a partial dump. dpkg-query exits 0 with a
+    complete list while warning about a status file it had to parse loosely,
+    which is exactly the state an interrupted upgrade leaves behind -- and
+    discarding those reads would blind the host until someone repaired the
+    database by hand. The exit code and the parse are the gates, not stderr."""
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout="installed\tbash\t5.2.21-2\n",
+        stderr="dpkg-query: warning: parsing file '/var/lib/dpkg/status' near line 4\n",
     )
     assert _get_packages_dpkg() == [{"name": "bash", "version": "5.2.21-2"}]
 
@@ -696,6 +894,60 @@ def test_get_installed_packages_dpkg(mock_dpkg, mock_which):
         {"name": "openssl", "version": "3.0"},
         {"name": "zlib", "version": "1.0"},
     ]
+
+
+@patch("fivenines_agent.packages.shutil.which")
+@patch("fivenines_agent.packages.get_clean_env", return_value={})
+@patch("fivenines_agent.packages.subprocess.run")
+def test_get_installed_packages_dpkg_end_to_end_excludes_removed_packages(
+    mock_run, mock_env, mock_which
+):
+    """The whole Debian-family chain with only dpkg-query mocked: filter, then
+    the sort, then the hash the delta sync is keyed on. It pins two things the
+    reader's own tests cannot see.
+
+    First, the payload: config-files rows are gone before the sort, so the list
+    the server REPLACES the host's package set with contains only installed
+    software. Second, the propagation. An agent upgraded onto a host that has
+    been reporting removed packages for months finds last_package_hash still
+    set to the old poisoned set's hash; the fix only reaches that host if the
+    filtered set hashes DIFFERENTLY, since packages_sync skips the send when
+    the two match. It does, because the hash is computed over name=version
+    lines and there are fewer of them -- but that is the property the fix
+    silently depends on, so it is asserted rather than assumed."""
+    mock_which.side_effect = lambda cmd: (
+        "/usr/bin/dpkg-query" if cmd == "dpkg-query" else None
+    )
+    # Unordered on purpose: nothing promises dpkg-query sorts its output.
+    mock_run.return_value = MagicMock(
+        returncode=0,
+        stdout=(
+            "installed\topenssl\t3.0.13-0ubuntu3.4\n"
+            "config-files\tlinux-image-6.8.0-31-generic\t6.8.0-31.31\n"
+            "installed\tlinux-image-6.8.0-51-generic\t6.8.0-51.52\n"
+            "installed\tbash\t5.2.21-2ubuntu4\n"
+            "config-files\tlinux-image-6.8.0-45-generic\t6.8.0-45.45\n"
+            "installed\tlinux-image-6.8.0-49-generic\t6.8.0-49.49\n"
+        ),
+    )
+
+    packages = get_installed_packages()
+
+    assert packages == [
+        {"name": "bash", "version": "5.2.21-2ubuntu4"},
+        {"name": "linux-image-6.8.0-49-generic", "version": "6.8.0-49.49"},
+        {"name": "linux-image-6.8.0-51-generic", "version": "6.8.0-51.52"},
+        {"name": "openssl", "version": "3.0.13-0ubuntu3.4"},
+    ]
+    unfiltered = sorted(
+        packages
+        + [
+            {"name": "linux-image-6.8.0-31-generic", "version": "6.8.0-31.31"},
+            {"name": "linux-image-6.8.0-45-generic", "version": "6.8.0-45.45"},
+        ],
+        key=lambda p: (p["name"], p["version"]),
+    )
+    assert get_packages_hash(packages) != get_packages_hash(unfiltered)
 
 
 @patch("fivenines_agent.packages.shutil.which")
