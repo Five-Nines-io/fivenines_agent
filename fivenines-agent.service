@@ -60,12 +60,17 @@ NotifyAccess=all
 # open(); the code additionally fchmods to 0600 to heal pre-existing files.
 UMask=0077
 # The agent itself never uses /tmp; a private one removes a whole
-# symlink/tmpfile attack class for it and every child it spawns. Caveat: it
-# also hides OTHER services' /tmp unix sockets from the agent's children --
-# a MySQL/PostgreSQL reached via a /tmp socket path (upstream-tarball
-# defaults: /tmp/mysql.sock, /tmp/.s.PGSQL.5432) will read as unreachable.
-# Such hosts should override with a drop-in: `systemctl edit fivenines-agent`
-# -> [Service] PrivateTmp=no. Distro packages use /var/run, so this is rare.
+# symlink/tmpfile attack class for it and every child it spawns. Two caveats:
+#   - It hides OTHER services' /tmp unix sockets from the agent and its
+#     children: a MySQL/PostgreSQL/PHP-FPM/HAProxy reached via a /tmp socket
+#     path (upstream-tarball defaults: /tmp/mysql.sock, /tmp/.s.PGSQL.5432;
+#     hand-written listen= paths) will read as unreachable. Distro packages
+#     use /var/run, so this is rare.
+#   - Mount-namespace setup is FATAL where namespaces are unavailable
+#     (OpenVZ/Virtuozzo-class kernels, some restricted LXC): the unit fails
+#     with status 226/NAMESPACE instead of degrading.
+# Both cases: override with a drop-in (`systemctl edit fivenines-agent` ->
+# [Service] PrivateTmp=no). Drop-ins survive the updater's unit overwrite.
 PrivateTmp=true
 # Read-only view of home directories: the agent only expanduser()s for its own
 # user context, never writes there.

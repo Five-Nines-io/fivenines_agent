@@ -54,3 +54,54 @@ def test_collect_metrics_routes_ping_through_the_cap():
         agent._collect_metrics(data)
     assert ping.call_count == MAX_PING_TARGETS
     assert sum(1 for k in data if k.startswith("ping_")) == MAX_PING_TARGETS
+
+
+def test_non_dict_ping_config_yields_empty():
+    """REGRESSION: `ping: true` (the plain-boolean shape other config keys
+    use) or garbage must yield [] -- an AttributeError here escapes the
+    collection loop and exits the agent into a Restart=always crash loop
+    against the same config."""
+    for bad in (True, "host", ["a"], 3, None):
+        assert _capped_ping_targets(bad) == []
+
+
+def test_oversized_entries_are_dropped():
+    agent_module._ping_capped_warned = False
+    ping = {"ok": "h.example", "big" * 100: "h2.example", "r": "x" * 500}
+    assert _capped_ping_targets(ping) == [("ok", "h.example")]
+
+
+def test_over_cap_rotation_gives_every_target_a_turn():
+    """The cap must not starve the same config-order tail every tick: the
+    window rotates so skipped targets get probed on later ticks."""
+    agent_module._ping_capped_warned = False
+    agent_module._ping_rotation = 0
+    ping = {f"r{i:02d}": f"h{i}.example" for i in range(MAX_PING_TARGETS * 2)}
+    first = {r for r, _ in _capped_ping_targets(ping)}
+    second = {r for r, _ in _capped_ping_targets(ping)}
+    assert first != second
+    assert first | second == set(ping.keys())
+
+
+def test_ping_loop_deadline_skips_remaining_targets():
+    """Targets past the wall-clock deadline are skipped for the tick (the
+    per-target timeout cannot preempt a hung getaddrinfo). A negative
+    deadline makes the very first check trip deterministically."""
+    from unittest.mock import patch as patch_fn
+
+    agent = agent_module.Agent.__new__(agent_module.Agent)
+    agent.config = {"enabled": True, "ping": {"a": "h1", "b": "h2"}}
+    agent._telemetry = {}
+    agent.permissions = MagicMock()
+    agent.permissions.get_all.return_value = {}
+
+    ping_fn = MagicMock(return_value=1.0)
+    with patch_fn.object(agent_module, "PING_LOOP_DEADLINE", -1), \
+         patch_fn.object(agent_module, "collect_metrics"), \
+         patch_fn.object(agent_module, "mqtt_metrics", return_value=None), \
+         patch_fn.object(agent_module, "tcp_ping", ping_fn), \
+         patch_fn.object(agent_module, "is_windows", return_value=True):
+        data = {}
+        agent._collect_metrics(data)
+    assert ping_fn.call_count == 0  # every target past the (elapsed) deadline
+    assert "ping_a" not in data and "ping_b" not in data

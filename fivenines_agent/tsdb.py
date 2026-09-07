@@ -42,8 +42,8 @@ import re
 
 import requests
 
-from fivenines_agent.http_body import read_capped_body
 from fivenines_agent.debug import debug, log
+from fivenines_agent.http_body import read_capped_body
 
 # Shared transport timeout (seconds), matching caddy.py / apache.py. A wedged
 # TSDB must never hang the whole collect tick.
@@ -55,6 +55,11 @@ _TIMEOUT = 5
 # daemon's RSS without bound. 8 MB covers very large real Prometheus
 # expositions with headroom.
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+
+# Wall-clock budget for reading one body, decoupled from the 5s connect
+# timeout: a large real exposition on a slow link must not flap the collector,
+# while a trickling endpoint is still bounded.
+_BODY_READ_DEADLINE_S = 15
 
 # The exact source metric names we read out of the text exposition, by flavor.
 # Pinned byte-for-byte against the contract fixture -- a rename upstream shows up
@@ -113,9 +118,9 @@ def _read_capped(response):
     reachable payload, /api/v1/targets to omitted target keys. The connection
     is closed either way.
     """
-    return read_capped_body(response, _MAX_RESPONSE_BYTES, _TIMEOUT).decode(
-        "utf-8", "replace"
-    )
+    return read_capped_body(
+        response, _MAX_RESPONSE_BYTES, _BODY_READ_DEADLINE_S
+    ).decode("utf-8", "replace")
 
 
 # Prometheus label matcher: name="value" pairs, honouring backslash escapes in

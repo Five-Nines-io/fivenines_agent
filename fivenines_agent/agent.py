@@ -102,13 +102,23 @@ PING_LOOP_DEADLINE = 30
 # Process-once guard for the ping-cap warning (avoids per-tick log spam).
 _ping_capped_warned = False
 
+# Rotating start offset for over-cap ping maps, so the cap/deadline never
+# starves the SAME config-order tail on every tick -- each tick begins the
+# window MAX_PING_TARGETS further along, giving every target a turn.
+_ping_rotation = 0
+
 
 def _capped_ping_targets(ping_config):
-    """The first MAX_PING_TARGETS well-formed (region, host) pairs, warning
-    once when the server-pushed map exceeds the cap. Oversized region/host
-    strings are dropped (len() is O(1); no copy of a hostile multi-MB entry
-    is ever made)."""
-    global _ping_capped_warned
+    """Up to MAX_PING_TARGETS well-formed (region, host) pairs, warning once
+    when the server-pushed map exceeds the cap. Oversized region/host strings
+    are dropped (len() is O(1); no copy of a hostile multi-MB entry is ever
+    made). A non-dict value -- the plain-boolean config shape used by other
+    keys, or garbage -- yields [] rather than crashing the loop: an
+    AttributeError here would escape _collect_metrics and exit the agent into
+    a Restart=always crash loop against the same config."""
+    global _ping_capped_warned, _ping_rotation
+    if not isinstance(ping_config, dict):
+        return []
     items = [
         (region, host)
         for region, host in ping_config.items()
@@ -117,14 +127,20 @@ def _capped_ping_targets(ping_config):
         and len(region) <= MAX_PING_FIELD_CHARS
         and len(host) <= MAX_PING_FIELD_CHARS
     ]
-    if len(items) > MAX_PING_TARGETS and not _ping_capped_warned:
+    if len(items) <= MAX_PING_TARGETS:
+        return items
+    if not _ping_capped_warned:
         log(
-            f"ping config has {len(items)} targets; honouring only the first "
-            f"{MAX_PING_TARGETS}/tick to stay under the systemd watchdog",
+            f"ping config has {len(items)} targets; honouring "
+            f"{MAX_PING_TARGETS}/tick (rotating) to stay under the systemd "
+            "watchdog",
             "error",
         )
         _ping_capped_warned = True
-    return items[:MAX_PING_TARGETS]
+    start = _ping_rotation % len(items)
+    _ping_rotation += MAX_PING_TARGETS
+    rotated = items[start:] + items[:start]
+    return rotated[:MAX_PING_TARGETS]
 
 
 # Permissive config used only in --dry-run so every collector that has the
