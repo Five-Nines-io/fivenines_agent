@@ -104,19 +104,28 @@ def test_swap_token_success(mock_config_dir, tmp_path):
     assert token_file.read_text() == "new-token-123"
 
 
-@patch("fivenines_agent.synchronizer.config_dir", return_value="/nonexistent/path")
-def test_swap_token_permission_error(mock_config_dir):
+@patch("fivenines_agent.synchronizer.config_dir")
+def test_swap_token_permission_error(mock_config_dir, tmp_path):
+    """The write goes through os.open now, so patch THAT seam (a builtins.open
+    patch no longer touches this path)."""
+    mock_config_dir.return_value = str(tmp_path)
     sync = make_synchronizer()
-    with patch("builtins.open", side_effect=PermissionError("denied")):
+    with patch(
+        "fivenines_agent.synchronizer.os.open",
+        side_effect=PermissionError("denied"),
+    ):
         sync._swap_token("new-token-456")
     # Token should still be updated in memory
     assert sync.token == "new-token-456"
 
 
-@patch("fivenines_agent.synchronizer.config_dir", return_value="/tmp/test-config")
-def test_swap_token_generic_error(mock_config_dir):
+@patch("fivenines_agent.synchronizer.config_dir")
+def test_swap_token_generic_error(mock_config_dir, tmp_path):
+    mock_config_dir.return_value = str(tmp_path)
     sync = make_synchronizer()
-    with patch("builtins.open", side_effect=OSError("disk full")):
+    with patch(
+        "fivenines_agent.synchronizer.os.open", side_effect=OSError("disk full")
+    ):
         sync._swap_token("new-token-789")
     # Token should still be updated in memory
     assert sync.token == "new-token-789"
@@ -563,7 +572,31 @@ def test_swap_token_creates_file_owner_only(mock_config_dir, tmp_path):
 
     mock_config_dir.return_value = str(tmp_path)
     sync = make_synchronizer()
-    sync._swap_token("per-host-token")
+    # Pin the umask so the assertion is deterministic: under an ambient 077 a
+    # revert to plain open() would false-pass, under an exotic 0277 correct
+    # code would false-fail.
+    old_umask = os_module.umask(0o022)
+    try:
+        sync._swap_token("per-host-token")
+    finally:
+        os_module.umask(old_umask)
     mode = os_module.stat(tmp_path / "TOKEN").st_mode & 0o777
     assert mode == 0o600
     assert (tmp_path / "TOKEN").read_text() == "per-host-token"
+
+
+@patch("fivenines_agent.synchronizer.config_dir")
+def test_swap_token_permission_error_from_os_open(mock_config_dir, tmp_path):
+    """The 0600 swap goes through os.open, which a builtins.open patch no
+    longer intercepts (test_swap_token_permission_error now exercises the
+    generic handler via FileNotFoundError). A real EACCES from os.open must
+    land in the PermissionError handler and keep the in-memory token."""
+    mock_config_dir.return_value = str(tmp_path)
+    sync = make_synchronizer()
+    with patch(
+        "fivenines_agent.synchronizer.os.open",
+        side_effect=PermissionError("denied"),
+    ):
+        sync._swap_token("tok-perm")
+    assert sync.token == "tok-perm"
+    assert not (tmp_path / "TOKEN").exists()

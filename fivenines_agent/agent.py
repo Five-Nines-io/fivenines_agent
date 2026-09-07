@@ -85,15 +85,38 @@ _RECHECK_UNSET = object()
 # as logs._MAX_SIGNAL_UNITS and the image-inventory MAX_RESCAN_* caps.
 MAX_PING_TARGETS = 10
 
+# Max chars for a ping region or host from the untrusted config. Real region
+# names and hostnames are well under this; an oversized entry would otherwise
+# become a multi-megabyte payload key (data["ping_<region>"]) or a huge
+# string fed to the resolver. Same posture as the image-inventory
+# MAX_FIELD_CHARS.
+MAX_PING_FIELD_CHARS = 200
+
+# Wall-clock budget for the whole ping loop. The count cap alone still allows
+# 10 x 5s connect timeouts = 50s, and tcp_ping's timeout does NOT cover
+# getaddrinfo (DNS resolution has no timeout), so a resolver outage could
+# stretch each target well past 5s. Targets past the deadline are skipped for
+# the tick.
+PING_LOOP_DEADLINE = 30
+
 # Process-once guard for the ping-cap warning (avoids per-tick log spam).
 _ping_capped_warned = False
 
 
 def _capped_ping_targets(ping_config):
-    """The first MAX_PING_TARGETS (region, host) pairs, warning once when the
-    server-pushed map exceeds the cap."""
+    """The first MAX_PING_TARGETS well-formed (region, host) pairs, warning
+    once when the server-pushed map exceeds the cap. Oversized region/host
+    strings are dropped (len() is O(1); no copy of a hostile multi-MB entry
+    is ever made)."""
     global _ping_capped_warned
-    items = list(ping_config.items())
+    items = [
+        (region, host)
+        for region, host in ping_config.items()
+        if isinstance(region, str)
+        and isinstance(host, str)
+        and len(region) <= MAX_PING_FIELD_CHARS
+        and len(host) <= MAX_PING_FIELD_CHARS
+    ]
     if len(items) > MAX_PING_TARGETS and not _ping_capped_warned:
         log(
             f"ping config has {len(items)} targets; honouring only the first "
@@ -399,7 +422,15 @@ class Agent:
 
         # Special-case collectors (unique dispatch patterns)
         if self.config.get("ping"):
+            ping_deadline = time.monotonic() + PING_LOOP_DEADLINE
             for region, host in _capped_ping_targets(self.config["ping"]):
+                if time.monotonic() > ping_deadline:
+                    log(
+                        f"ping loop exceeded {PING_LOOP_DEADLINE}s; skipping "
+                        "remaining targets this tick",
+                        "error",
+                    )
+                    break
                 data[f"ping_{region}"] = self._collect(f"ping_{region}", tcp_ping, host)
         if self.config.get("ipv4"):
             data["ipv4"] = self._collect("ipv4", get_ip, ipv6=False)

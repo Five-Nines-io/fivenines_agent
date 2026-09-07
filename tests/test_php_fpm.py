@@ -135,7 +135,7 @@ def test_http_non_200_returns_null(monkeypatch):
 
 
 def test_http_exception_returns_null(monkeypatch):
-    def boom(url, timeout):
+    def boom(url, **kwargs):
         raise requests.exceptions.Timeout("timed out")
 
     monkeypatch.setattr(php_fpm.requests, "get", boom)
@@ -727,3 +727,23 @@ def test_http_status_refuses_redirects(monkeypatch):
     php_fpm._http_status_body("http://127.0.0.1/status?json")
     assert captured["allow_redirects"] is False
     assert captured["stream"] is True
+
+
+def test_http_status_read_error_mid_stream_returns_none(monkeypatch):
+    """A body that dies mid-stream (connection reset after the headers) is a
+    read error -> None, and the connection is closed; the empty keep-alive
+    chunks requests can yield are skipped, never appended."""
+    resp = MagicMock()
+    resp.status_code = 200
+
+    def broken_iter(chunk_size=65536):
+        yield b""  # keep-alive chunk: skipped by the read loop
+        yield b"{"
+        raise OSError("connection reset mid-body")
+
+    resp.iter_content = broken_iter
+    monkeypatch.setattr(php_fpm.requests, "get", lambda url, **kwargs: resp)
+    assert php_fpm._http_status_body("http://127.0.0.1/status?json") is None
+    # Closed at least once (the shared reader closes in its finally, and the
+    # caller's outer finally closes again -- close() is idempotent).
+    assert resp.close.called

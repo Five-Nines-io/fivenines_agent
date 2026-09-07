@@ -233,6 +233,10 @@ class Synchronizer(Thread):
             # POST get_config and receive every service credential the config
             # carries.
             fd = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            # The os.open mode applies only when the file is CREATED; fchmod
+            # heals a pre-existing TOKEN an older agent left group/world-
+            # readable (idempotent, one syscall).
+            os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w") as f:
                 f.write(new_token)
             log("Token swapped successfully", "info")

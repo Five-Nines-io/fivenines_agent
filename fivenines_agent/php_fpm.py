@@ -49,6 +49,7 @@ from urllib.parse import parse_qs, urlsplit
 
 import requests
 
+from fivenines_agent.http_body import read_capped_body
 from fivenines_agent.debug import debug, log
 
 # Shared transport timeout (seconds), matching apache.py / nginx.py. A wedged
@@ -410,15 +411,12 @@ def _http_status_body(url):
     try:
         if response.status_code != 200:
             return None
-        chunks = bytearray()
-        for chunk in response.iter_content(chunk_size=65536):
-            if not chunk:
-                continue
-            chunks += chunk
-            if len(chunks) > _MAX_STATUS_BYTES:
-                log(f"PHP-FPM status body exceeded {_MAX_STATUS_BYTES} bytes for {url}", "error")
-                return None
-        return chunks.decode("utf-8", "replace")
+        # Byte cap AND wall-clock deadline (read_capped_body): requests'
+        # timeout is per-socket-op, so a trickling endpoint would otherwise
+        # stall the watchdog-bounded loop indefinitely.
+        return read_capped_body(response, _MAX_STATUS_BYTES, _TIMEOUT).decode(
+            "utf-8", "replace"
+        )
     except Exception as e:
         log(f"PHP-FPM HTTP read error for {url}: {e}", "error")
         return None

@@ -33,14 +33,19 @@ WatchdogSec=90
 NotifyAccess=all
 
 # --- Sandbox hardening -------------------------------------------------------
-# Conservative set only: every directive below is verified compatible with what
-# the agent (and the tools it spawns via sudo) actually does. Directives a
-# given systemd version does not know are logged as "Unknown key" and IGNORED,
-# so nothing here breaks CentOS 7-era systemd; it just gets less sandboxing.
+# MOUNT-NAMESPACE / ATTRIBUTE directives only. This is the load-bearing rule:
+# on a NON-ROOT unit (User=fivenines), every seccomp-backed directive
+# (ProtectKernelTunables/Modules/Logs, ProtectClock, RestrictRealtime,
+# LockPersonality, RestrictSUIDSGID, SystemCallFilter, ...) makes systemd
+# implicitly enable NoNewPrivileges -- seccomp without CAP_SYS_ADMIN requires
+# no_new_privs (see systemd's context_has_no_new_privileges()) -- and
+# no_new_privs breaks every `sudo -n smartctl/mdadm/fail2ban-client` spawn:
+# SMART, RAID and fail2ban monitoring would silently die fleet-wide on any
+# systemd >= 228 host. Do not add ANY directive from that family here.
 #
-# Deliberately ABSENT, do not add without re-testing:
-#   NoNewPrivileges     - breaks sudo smartctl/mdadm/fail2ban-client (setuid).
-#   CapabilityBoundingSet - same: sudo needs the full root set post-setuid for
+# Also deliberately ABSENT, for the same or adjacent reasons:
+#   NoNewPrivileges       - breaks sudo (setuid) outright.
+#   CapabilityBoundingSet - sudo needs the full root set post-setuid for
 #                           SMART ioctls and md admin.
 #   ProtectSystem=full/strict - /etc goes read-only, breaking the TOKEN swap
 #                           and the state files under /etc/fivenines_agent
@@ -50,29 +55,21 @@ NotifyAccess=all
 #                           enrollment on exactly the old-distro hosts).
 #   MemoryDenyWriteExecute - pynvml/libvirt load native code via ctypes/libffi.
 #
-# State files created by the agent (TOKEN swap, capture/inventory state) are
-# owner-only regardless of what the code passes to open().
+# State files the agent CREATES (TOKEN swap, capture/inventory state) default
+# to owner-only under this umask even if the code ever regresses to plain
+# open(); the code additionally fchmods to 0600 to heal pre-existing files.
 UMask=0077
-# The agent never uses /tmp; a private one removes a whole symlink/tmpfile
-# attack class for it and every child it spawns.
+# The agent itself never uses /tmp; a private one removes a whole
+# symlink/tmpfile attack class for it and every child it spawns. Caveat: it
+# also hides OTHER services' /tmp unix sockets from the agent's children --
+# a MySQL/PostgreSQL reached via a /tmp socket path (upstream-tarball
+# defaults: /tmp/mysql.sock, /tmp/.s.PGSQL.5432) will read as unreachable.
+# Such hosts should override with a drop-in: `systemctl edit fivenines-agent`
+# -> [Service] PrivateTmp=no. Distro packages use /var/run, so this is rare.
 PrivateTmp=true
 # Read-only view of home directories: the agent only expanduser()s for its own
 # user context, never writes there.
 ProtectHome=read-only
-# The agent only READS /proc/sys, /sys and /sys/fs/cgroup; mount them
-# read-only for the service (systemd >= 232, ignored below).
-ProtectKernelTunables=true
-ProtectControlGroups=true
-# Nothing the agent or its children do loads kernel modules, touches the
-# hardware clock, or reads /dev/kmsg (journal access goes through journalctl).
-ProtectKernelModules=true
-ProtectKernelLogs=true
-ProtectClock=true
-# No realtime scheduling, no personality(2), no new setuid FILES created
-# (executing existing setuid binaries like sudo still works).
-RestrictRealtime=true
-LockPersonality=true
-RestrictSUIDSGID=true
 
 Environment=PYTHONUNBUFFERED=1
 

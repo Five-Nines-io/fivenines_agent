@@ -462,3 +462,26 @@ def test_get_refuses_redirects_and_streams(monkeypatch):
         tsdb.tsdb_metrics(url="http://127.0.0.1:9090")
     assert captured["allow_redirects"] is False
     assert captured["stream"] is True
+
+
+def test_read_capped_skips_empty_keepalive_chunks():
+    """Empty chunks (keep-alives) are skipped, never appended -- mirrors the
+    sibling php_fpm/rabbitmq tests."""
+    raw = b"# HELP x\nprometheus_build_info{version=\"2.0\"} 1\n"
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.iter_content = lambda chunk_size=65536: iter([b"", raw])
+    with patch("fivenines_agent.tsdb.requests.get", return_value=resp):
+        out = tsdb.tsdb_metrics(url="http://127.0.0.1:9090")
+    assert out["reachable"] is True
+
+
+def test_non_2xx_streamed_response_is_closed():
+    """A locked-down Prometheus 403s every tick; the streamed response must be
+    closed on that path rather than leaking the checked-out socket to GC."""
+    resp = _resp(403, text="forbidden")
+    resp.close = MagicMock()
+    with patch("fivenines_agent.tsdb.requests.get", return_value=resp):
+        out = tsdb.tsdb_metrics(url="http://127.0.0.1:9090")
+    assert out["error_type"] == "auth_failed"
+    resp.close.assert_called_once()

@@ -192,12 +192,13 @@ def test_enqueue_handles_non_dict_logs_cfg(tmp_path):
 def test_persist_creates_state_file_owner_only(tmp_path):
     """State files under the config dir are created 0600 (umask-independent),
     matching machine_id and the TOKEN swap."""
-    import os
-
-    from fivenines_agent.log_capture import CaptureCoordinator
-
     state = tmp_path / "last_capture_id"
     coordinator = CaptureCoordinator(str(state))
-    coordinator._persist("cap-123")
+    # Pinned umask: see test_swap_token_creates_file_owner_only.
+    old_umask = os.umask(0o022)
+    try:
+        coordinator._persist("cap-123")
+    finally:
+        os.umask(old_umask)
     assert (state.read_text()) == "cap-123"
     assert os.stat(state).st_mode & 0o777 == 0o600
