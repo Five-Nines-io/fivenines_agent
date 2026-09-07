@@ -19,17 +19,24 @@ from fivenines_agent import rabbitmq
 
 
 class FakeResponse:
-    """Minimal stand-in for a requests.Response: status_code + json()."""
+    """Minimal stand-in for a requests.Response: status_code + a streamed body
+    (the collector reads via iter_content under a byte cap now, never .json())."""
 
-    def __init__(self, status=200, json_body=None, json_error=None):
+    def __init__(self, status=200, json_body=None, json_error=None, raw=None):
         self.status_code = status
-        self._json = json_body
-        self._json_error = json_error
+        if raw is not None:
+            self._raw = raw
+        elif json_error is not None:
+            self._raw = b"not json {"
+        else:
+            self._raw = json.dumps(json_body).encode("utf-8")
 
-    def json(self):
-        if self._json_error is not None:
-            raise self._json_error
-        return self._json
+    def iter_content(self, chunk_size=65536):
+        for i in range(0, len(self._raw), chunk_size):
+            yield self._raw[i:i + chunk_size]
+
+    def close(self):
+        pass
 
 
 class FakeSession:
@@ -46,7 +53,7 @@ class FakeSession:
         self.closed = False
         self.calls = []
 
-    def get(self, url, timeout=None):
+    def get(self, url, timeout=None, stream=None, allow_redirects=None):
         self.calls.append(url)
         return self._handler(url)
 
@@ -845,3 +852,26 @@ def test_fixture_reachable_and_unreachable_envelope_keys():
 def test_fixture_cap_overflow_total_exceeds_shipped():
     cap = _load_fixture()["scenarios"]["cap_overflow"]["payload"]["rabbitmq"]
     assert cap["queues_total"] > len(cap["queues"])
+
+
+def test_http_get_refuses_redirects_and_streams():
+    """The management url is server-pushed config: redirects are refused (SSRF)
+    and the body is streamed under a byte cap."""
+    captured = {}
+
+    class CapSession:
+        def get(self, url, **kwargs):
+            captured.update(kwargs)
+            return FakeResponse(200, json_body={})
+
+    rabbitmq._http_get(CapSession(), "http://broker:15672/api/overview")
+    assert captured["allow_redirects"] is False
+    assert captured["stream"] is True
+
+
+def test_parse_json_over_cap_raises_http_error(monkeypatch):
+    monkeypatch.setattr(rabbitmq, "_MAX_RESPONSE_BYTES", 16)
+    response = FakeResponse(200, raw=b"[" + b"1," * 50 + b"1]")
+    with pytest.raises(rabbitmq._RabbitError) as excinfo:
+        rabbitmq._parse_json(response)
+    assert excinfo.value.error_type == "http_error"

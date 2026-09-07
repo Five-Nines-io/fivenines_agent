@@ -187,3 +187,17 @@ def test_enqueue_handles_non_dict_logs_cfg(tmp_path):
     cfg = {"logs": "garbage", "capture_logs": _cmd()}
     assert evaluate_and_enqueue(_coord(tmp_path), q, cfg) is None
     assert q.qsize() == 0
+
+
+def test_persist_creates_state_file_owner_only(tmp_path):
+    """State files under the config dir are created 0600 (umask-independent),
+    matching machine_id and the TOKEN swap."""
+    import os
+
+    from fivenines_agent.log_capture import CaptureCoordinator
+
+    state = tmp_path / "last_capture_id"
+    coordinator = CaptureCoordinator(str(state))
+    coordinator._persist("cap-123")
+    assert (state.read_text()) == "cap-123"
+    assert os.stat(state).st_mode & 0o777 == 0o600

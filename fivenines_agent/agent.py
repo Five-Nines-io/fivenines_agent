@@ -77,6 +77,32 @@ IMAGE_INVENTORY_JOIN_TIMEOUT = 10
 # only baselines and does not fire a spurious reprobe.
 _RECHECK_UNSET = object()
 
+# Max ping targets honoured per tick. Each tcp_ping blocks up to 5s and the
+# loop runs SEQUENTIALLY on the watchdog-bounded collection loop, so an
+# unbounded server-pushed ping map (hostile config, or just a fat-fingered
+# region list) of firewalled hosts could stretch a tick past WatchdogSec=90
+# and restart-loop the whole fleet. Same bound-the-untrusted-config posture
+# as logs._MAX_SIGNAL_UNITS and the image-inventory MAX_RESCAN_* caps.
+MAX_PING_TARGETS = 10
+
+# Process-once guard for the ping-cap warning (avoids per-tick log spam).
+_ping_capped_warned = False
+
+
+def _capped_ping_targets(ping_config):
+    """The first MAX_PING_TARGETS (region, host) pairs, warning once when the
+    server-pushed map exceeds the cap."""
+    global _ping_capped_warned
+    items = list(ping_config.items())
+    if len(items) > MAX_PING_TARGETS and not _ping_capped_warned:
+        log(
+            f"ping config has {len(items)} targets; honouring only the first "
+            f"{MAX_PING_TARGETS}/tick to stay under the systemd watchdog",
+            "error",
+        )
+        _ping_capped_warned = True
+    return items[:MAX_PING_TARGETS]
+
 
 # Permissive config used only in --dry-run so every collector that has the
 # capability runs, without contacting the API. The keys mirror what the server
@@ -373,7 +399,7 @@ class Agent:
 
         # Special-case collectors (unique dispatch patterns)
         if self.config.get("ping"):
-            for region, host in self.config["ping"].items():
+            for region, host in _capped_ping_targets(self.config["ping"]):
                 data[f"ping_{region}"] = self._collect(f"ping_{region}", tcp_ping, host)
         if self.config.get("ipv4"):
             data["ipv4"] = self._collect("ipv4", get_ip, ipv6=False)

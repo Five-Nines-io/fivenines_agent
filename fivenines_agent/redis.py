@@ -4,6 +4,23 @@ import socket
 from fivenines_agent.debug import debug, log
 
 
+def _resp_command(*args):
+    """One command in RESP array framing (length-prefixed bulk strings).
+
+    Every argument is pure DATA under this framing: a CRLF inside a
+    config-supplied password is content, never a protocol line break. The
+    inline framing this replaces joined commands with \r\n, so a hostile
+    password pushed in config ("x\r\nCONFIG SET ...") injected arbitrary
+    commands into the local Redis -- and, less dramatically, any password
+    containing a space simply broke AUTH (inline args split on whitespace).
+    """
+    parts = [f"*{len(args)}\r\n".encode()]
+    for arg in args:
+        data = str(arg).encode()
+        parts.append(b"$" + str(len(data)).encode() + b"\r\n" + data + b"\r\n")
+    return b"".join(parts)
+
+
 # Exact INFO keys shipped as strings. Anything the server encodes into a gauge
 # (role master=1, master_link_status up=1, rdb_last_bgsave_status ok=1) stays a
 # raw string here -- that mapping is the server's job, not the agent's.
@@ -126,12 +143,12 @@ def redis_metrics(port=6379, password=None):
 
         commands = []
         if password:
-            commands.append(f"AUTH {password}")
-        commands.append("INFO")
-        commands.append("QUIT")
+            commands.append(_resp_command("AUTH", password))
+        commands.append(_resp_command("INFO"))
+        commands.append(_resp_command("QUIT"))
 
-        # CRLF-terminated inline commands (RESP inline protocol).
-        s.sendall(("\r\n".join(commands) + "\r\n").encode())
+        # RESP array framing, never the inline protocol: see _resp_command.
+        s.sendall(b"".join(commands))
 
         data = b""
         while True:

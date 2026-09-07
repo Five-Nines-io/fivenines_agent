@@ -61,9 +61,13 @@ def test_password_sends_auth_before_info():
     with patch("fivenines_agent.redis.socket.create_connection", return_value=sock):
         out = redis.redis_metrics(port=6379, password="s3cr3t")
     assert out == {"role": "master"}
-    wire = b"".join(sent).decode()
-    # AUTH is issued, and before INFO/QUIT.
-    assert wire.index("AUTH s3cr3t") < wire.index("INFO") < wire.index("QUIT")
+    wire = b"".join(sent)
+    # RESP array framing: AUTH carries the password as a length-prefixed bulk
+    # string (pure data -- CRLF inside a password can never become a protocol
+    # line break), and AUTH is issued before INFO/QUIT.
+    auth_frame = b"*2\r\n$4\r\nAUTH\r\n$6\r\ns3cr3t\r\n"
+    assert auth_frame in wire
+    assert wire.index(auth_frame) < wire.index(b"$4\r\nINFO") < wire.index(b"$4\r\nQUIT")
 
 
 def test_socket_error_returns_none():
@@ -238,3 +242,32 @@ def test_fixture_config_is_the_documented_shape():
         fixture = json.load(f)
     assert set(fixture["config"]) <= {"port", "password"}
     assert fixture["agent_min_version"] == "1.11.0"
+
+
+def test_crlf_in_password_cannot_inject_commands():
+    """REGRESSION (security): the old inline framing joined commands with CRLF,
+    so a hostile config-supplied password ("x\\r\\nCONFIG SET ...") injected
+    arbitrary commands into the local Redis. Under RESP array framing the
+    password travels as one length-prefixed bulk string: the CRLFs are data."""
+    sent = []
+    sock = _fake_socket(b"+OK\r\n")
+    sock.sendall.side_effect = sent.append
+    hostile = "x\r\nCONFIG SET dir /tmp\r\nSET pwn 1"
+    with patch("fivenines_agent.redis.socket.create_connection", return_value=sock):
+        redis.redis_metrics(port=6379, password=hostile)
+    wire = b"".join(sent)
+    # The whole hostile string is inside ONE bulk string whose declared length
+    # covers it entirely -- so the embedded CONFIG SET is content, not a command.
+    payload = hostile.encode()
+    assert b"$" + str(len(payload)).encode() + b"\r\n" + payload + b"\r\n" in wire
+    # And no bulk command frame for CONFIG exists (an injected command would
+    # appear as its own frame or inline line).
+    assert not wire.startswith(b"CONFIG") and b"\r\nCONFIG SET dir /tmp\r\nSET" in wire
+
+
+def test_resp_command_frames_arguments():
+    assert redis._resp_command("INFO") == b"*1\r\n$4\r\nINFO\r\n"
+    assert (
+        redis._resp_command("AUTH", "p w")
+        == b"*2\r\n$4\r\nAUTH\r\n$3\r\np w\r\n"
+    )
