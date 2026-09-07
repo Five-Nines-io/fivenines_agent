@@ -278,7 +278,7 @@ def test_gap_probe_backoff_grows_and_caps_at_backoff_max():
     # silently reverting to per-minute probing.
     import time as _time
 
-    remaining = probe._gap_probe_next_due["qemu"] - _time.time()
+    remaining = probe._gap_probe_next_due["qemu"] - _time.monotonic()
     assert perm.GAP_PROBE_BACKOFF_MAX - 5 < remaining <= perm.GAP_PROBE_BACKOFF_MAX + 1
 
 

@@ -153,3 +153,15 @@ def test_get_raid_info_passes_timeout(monkeypatch):
     assert info["raid_level"] == "raid1"
     assert captured["timeout"] == raid_storage._DATA_SUBPROCESS_TIMEOUT
     assert captured["cmd"][:3] == ["sudo", "-n", "mdadm"]
+
+
+def test_get_raid_info_timeout_propagates(monkeypatch):
+    """A timed-out mdadm --detail must FAIL the collection (propagate), not be
+    swallowed into None: filtering the wedged array out of an otherwise-healthy
+    list would report the dying array as removed exactly when it matters."""
+    def boom(cmd, **kwargs):
+        raise raid_storage.subprocess.TimeoutExpired(cmd=cmd, timeout=30)
+
+    monkeypatch.setattr(raid_storage.subprocess, "run", boom)
+    with pytest.raises(raid_storage.subprocess.TimeoutExpired):
+        raid_storage.get_raid_info("/dev/md0")

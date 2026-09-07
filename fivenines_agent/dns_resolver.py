@@ -25,8 +25,23 @@ class DNSResolver:
         self.host = host
 
     def resolve(self, record_type, timeout=5.0):
+        resolver = _get_resolver()
         try:
-            return _get_resolver().resolve(self.host, record_type, lifetime=timeout)
+            return resolver.resolve(self.host, record_type, lifetime=timeout)
         except dns.exception.DNSException as e:
             log(f"DNS error resolving {self.host} {record_type}: {e}")
+            # Flush the cache on ANY failure. dnspython caches NEGATIVE
+            # results too, and an NXDOMAIN / empty answer with no SOA gets
+            # dns.ttl.MAX_TTL (~136 years): one captive-portal answer at boot
+            # or a single spoofed UDP packet would otherwise pin the failure
+            # in the process-lifetime cache and silence the agent until a
+            # manual restart -- every retry would fail instantly from cache
+            # with zero network I/O. Flushing keeps positive caching (the
+            # whole point) while making a failure cost at most one extra
+            # lookup on the next attempt. Only two names ever live here.
+            try:
+                if resolver.cache is not None:
+                    resolver.cache.flush()
+            except Exception:
+                pass
             return None

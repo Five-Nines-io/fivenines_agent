@@ -50,8 +50,13 @@ CLIENT_TIMEOUT = 10
 # collection failure the server never prunes on) rather than a PARTIAL
 # container map, which the server would read as the missing containers having
 # been removed. Bounds a merely-slow (not down) daemon: 500 containers at
-# 200ms/call is ~100s+ of tick time without this.
-COLLECT_DEADLINE = 30
+# 200ms/call is ~100s+ of tick time without this. 25, and checked TWICE per
+# iteration (loop top + after reload): one iteration makes up to three
+# CLIENT_TIMEOUT-bounded calls (reload, image inspect, stats), so a top-only
+# check could overshoot by ~3x CLIENT_TIMEOUT; with the mid-iteration check
+# the worst case is deadline + ~2 calls, comfortably under the 90s watchdog
+# alongside the other collectors.
+COLLECT_DEADLINE = 25
 
 # Per-thread cached client. The collection loop and the image-inventory
 # uploader thread both call get_docker_client; docker-py rides on a
@@ -398,6 +403,18 @@ def docker_containers(socket_url=None):
         cid = container.id
         try:
             container.reload()
+            if time.monotonic() > deadline:
+                # Re-check between the reload and the (image inspect + stats)
+                # secondary calls: each is CLIENT_TIMEOUT-bounded, so a
+                # top-of-loop check alone could overshoot the budget by ~3
+                # timeouts on a wedged daemon.
+                log(
+                    f"Docker collection exceeded {COLLECT_DEADLINE}s budget "
+                    f"after {len(entries)} of {len(containers)} containers; "
+                    "reporting collection failure",
+                    "error",
+                )
+                return None
             entry = _build_entry(container, client, image_cache)
         except docker.errors.NotFound:
             log(f"Docker container {cid} vanished during collection, skipping", "debug")

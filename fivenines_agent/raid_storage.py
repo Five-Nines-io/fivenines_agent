@@ -216,6 +216,17 @@ def get_raid_info(device):
 
         return raid_info
 
+    except subprocess.TimeoutExpired:
+        # A wedged array (member disk in uninterruptible I/O -- the state this
+        # collector exists to report) must fail the WHOLE collection rather
+        # than be silently dropped from an otherwise-healthy list: the dying
+        # array would read as removed exactly when its data matters. The
+        # raise propagates out of the cache compute (nothing is cached) and
+        # surfaces as a collection failure (null payload) for this tick; the
+        # next tick retries. Same honesty contract as docker's
+        # COLLECT_DEADLINE.
+        log(f"mdadm --detail timed out for {device}; failing collection", 'error')
+        raise
     except Exception as e:
         log(f"Error fetching RAID info for device {device}: {e}", 'error')
         return None

@@ -29,10 +29,11 @@ REPROBE_INTERVAL = 300
 # onboarding flow: operator enables the feature, THEN installs sudoers a few
 # minutes later -- by which point the backoff has already climbed), and a cap
 # equal to REPROBE_INTERVAL would make it no better than the full probe.
-# 120s keeps worst-case detection at ~2 ticks while still cutting the
-# steady-state spawn cost ~24x vs per-tick. The first probe of a newly-pending
-# capability is always immediate; force_refresh / SIGHUP / the recheck token
-# clear the backoff (full probes recheck everything anyway).
+# 120s keeps worst-case detection at ~2 ticks while still roughly halving the
+# steady-state spawn cost at the default 60s interval (and cutting far more at
+# shorter warmup intervals). The first probe of a newly-pending capability is
+# always immediate; force_refresh / SIGHUP / the recheck token clear the
+# backoff (full probes recheck everything anyway).
 GAP_PROBE_BACKOFF_BASE = 60
 GAP_PROBE_BACKOFF_MAX = 120
 
@@ -381,7 +382,10 @@ class PermissionProbe:
         """
         specs = self._probe_specs()
         flipped = False
-        now = time.time()
+        # monotonic, not time.time(): a backward NTP step would otherwise
+        # suppress every gap probe until the wall clock catches back up
+        # (the TTLCache lesson, applied here).
+        now = time.monotonic()
         # getattr like _libvirt_probe_thread: tests build probes via __new__,
         # bypassing __init__, so the backoff dicts may not exist yet.
         next_due = getattr(self, "_gap_probe_next_due", None)

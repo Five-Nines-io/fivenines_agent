@@ -334,7 +334,17 @@ class Agent:
                     # small gzip blob per tick instead of the full payload
                     # object graph: a 100-deep backlog of raw dicts during an
                     # API outage is hundreds of MB of RSS on a busy host.
-                    self.queue.put(serialize_payload(data))
+                    # Serialization now runs on THIS loop (it used to live on
+                    # the synchronizer thread), so a non-JSON-serializable
+                    # value from one collector must drop the tick, not crash
+                    # the whole agent into a Restart=always loop.
+                    try:
+                        blob = serialize_payload(data)
+                    except (TypeError, ValueError) as e:
+                        log(f"Payload serialization failed; dropping tick: {e}", "error")
+                        blob = None
+                    if blob is not None:
+                        self.queue.put(blob)
                     self._wait_interval(running_time)
 
         except Exception as e:

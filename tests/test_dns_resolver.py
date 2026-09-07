@@ -38,3 +38,23 @@ def test_resolve_returns_none_on_dns_exception():
     fake.resolve.side_effect = dns.exception.DNSException("nxdomain")
     with patch.object(dns_resolver_module, "_get_resolver", return_value=fake):
         assert DNSResolver("api.example.org").resolve("AAAA") is None
+
+
+def test_resolve_flushes_cache_on_failure():
+    """A DNS failure must flush the resolver cache: dnspython caches NEGATIVE
+    results too, and an NXDOMAIN with no SOA gets a ~136-year TTL -- one bad
+    answer (captive portal, spoofed packet) would otherwise be served from
+    cache forever and silence the agent until restart."""
+    fake = MagicMock()
+    fake.resolve.side_effect = dns.exception.DNSException("nxdomain")
+    with patch.object(dns_resolver_module, "_get_resolver", return_value=fake):
+        assert DNSResolver("api.example.org").resolve("A") is None
+    fake.cache.flush.assert_called_once()
+
+
+def test_resolve_failure_survives_flush_error():
+    fake = MagicMock()
+    fake.resolve.side_effect = dns.exception.DNSException("timeout")
+    fake.cache.flush.side_effect = RuntimeError("no cache")
+    with patch.object(dns_resolver_module, "_get_resolver", return_value=fake):
+        assert DNSResolver("api.example.org").resolve("A") is None
