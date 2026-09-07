@@ -391,13 +391,14 @@ def test_memoized_nvme_probe_runs_underlying_check_once(monkeypatch):
 
 
 def test_health_smartctl_unavailable_returns_empty(monkeypatch):
-    """No smartctl -> empty health data, device discovery never attempted."""
-    monkeypatch.setattr(smart_storage, "smartctl_available", lambda: False)
-    list_devices = mock.Mock()
+    """No smartctl -> device discovery fails -> empty health data. There is no
+    separate smartctl_available() spawn anymore: the scan's own failure is the
+    availability signal."""
+    list_devices = mock.Mock(return_value=[])
     monkeypatch.setattr(smart_storage, "list_storage_devices", list_devices)
 
     assert smart_storage.smart_storage_health() == []
-    list_devices.assert_not_called()
+    list_devices.assert_called_once()
 
 
 def test_health_no_devices_returns_empty(monkeypatch):

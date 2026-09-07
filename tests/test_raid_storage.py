@@ -24,14 +24,15 @@ def clock(monkeypatch):
 
 
 def test_health_unavailable_returns_empty(clock):
-    with patch.multiple(raid_storage, mdadm_available=lambda: False):
+    # mdadm unusable surfaces as no devices parsed from /proc/mdstat (or a
+    # failed read); there is no separate availability spawn anymore.
+    with patch.multiple(raid_storage, list_raid_devices=lambda: []):
         assert raid_storage.raid_storage_health() == []
 
 
 def test_health_no_devices_returns_empty(clock):
     with patch.multiple(
         raid_storage,
-        mdadm_available=lambda: True,
         get_mdadm_version=lambda: "4.1",
         list_raid_devices=lambda: [],
     ):
@@ -44,7 +45,6 @@ def test_health_happy_filters_none_and_adds_version(clock):
 
     with patch.multiple(
         raid_storage,
-        mdadm_available=lambda: True,
         get_mdadm_version=lambda: "4.1",
         list_raid_devices=lambda: ["/dev/md0", "/dev/md1"],
         get_raid_info=fake_info,
@@ -63,7 +63,6 @@ def test_health_cache_hit_within_ttl(clock):
 
     with patch.multiple(
         raid_storage,
-        mdadm_available=lambda: True,
         get_mdadm_version=lambda: "4.1",
         list_raid_devices=lambda: ["/dev/md0"],
         get_raid_info=fake_info,
@@ -85,7 +84,6 @@ def test_health_recomputes_after_ttl(clock):
 
     with patch.multiple(
         raid_storage,
-        mdadm_available=lambda: True,
         get_mdadm_version=lambda: "4.1",
         list_raid_devices=lambda: ["/dev/md0"],
         get_raid_info=fake_info,

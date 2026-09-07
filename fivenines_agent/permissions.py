@@ -19,6 +19,18 @@ from fivenines_agent.subprocess_utils import get_clean_env
 # on this cadence to catch regressions and newly-relevant capabilities.
 REPROBE_INTERVAL = 300
 
+# Selective gap re-probe backoff base (seconds). A capability that is enabled
+# in server config but probed False was re-probed EVERY tick by default -- for
+# a permanently-missing one (no sudoers entry, the fleet-wide steady state on
+# many hosts) that is a sudo/subprocess spawn per capability per tick,
+# forever. After each consecutive False the next re-probe is delayed
+# exponentially from this base, capped at REPROBE_INTERVAL so the gap probe
+# never becomes slower than the full probe it exists to beat. The first probe
+# of a newly-pending capability is always immediate, and force_refresh /
+# SIGHUP / the recheck token clear the backoff (full probes recheck
+# everything anyway).
+GAP_PROBE_BACKOFF_BASE = 60
+
 # Hard timeout (seconds) for the libvirt openReadOnly probe. The probe runs in a
 # worker thread and is abandoned past this deadline: a wedged libvirt stack
 # (socket activation, daemon handshake, polkit, NSS) can otherwise block, and
@@ -132,6 +144,11 @@ class PermissionProbe:
         self._current_reason = None
         self._last_probe_time = 0
         self._last_gap_probe_time = 0
+        # Per-capability gap re-probe backoff state: consecutive False counts
+        # and the epoch before which a capability is not re-probed. Cleared by
+        # every full probe (see GAP_PROBE_BACKOFF_BASE).
+        self._gap_probe_failures = {}
+        self._gap_probe_next_due = {}
         # Tracks an in-flight libvirt probe worker so a wedged libvirt stack
         # cannot leak one stuck thread per re-probe (see _can_access_libvirt).
         self._libvirt_probe_thread = None
@@ -173,6 +190,11 @@ class PermissionProbe:
         # force_refresh / startup / SIGHUP full probe must not leave the next
         # tick re-probing the same caps (the gap branch reads this timer).
         self._last_gap_probe_time = self._last_probe_time
+        # A full probe rechecks every capability, so any accumulated gap
+        # backoff is stale; clearing it also makes force_refresh (SIGHUP,
+        # recheck token) an immediate "probe everything now" as before.
+        self._gap_probe_failures = {}
+        self._gap_probe_next_due = {}
         old_capabilities = self.capabilities.copy()
 
         if is_windows():
@@ -347,18 +369,42 @@ class PermissionProbe:
 
         Logs state flips at info level (same payload as the full probe) and
         returns True if any of the named capabilities flipped. Names not in the
-        OS probe spec are ignored.
+        OS probe spec are ignored. A capability that keeps probing False backs
+        off exponentially (GAP_PROBE_BACKOFF_BASE, capped at REPROBE_INTERVAL)
+        so a permanently-missing one stops costing a subprocess spawn on every
+        tick; a True result clears its backoff.
         """
         specs = self._probe_specs()
         flipped = False
+        now = time.time()
+        # getattr like _libvirt_probe_thread: tests build probes via __new__,
+        # bypassing __init__, so the backoff dicts may not exist yet.
+        next_due = getattr(self, "_gap_probe_next_due", None)
+        if next_due is None:
+            next_due = self._gap_probe_next_due = {}
+        gap_failures = getattr(self, "_gap_probe_failures", None)
+        if gap_failures is None:
+            gap_failures = self._gap_probe_failures = {}
         for name in only:
             spec = specs.get(name)
             if spec is None:
                 continue
+            if now < next_due.get(name, 0):
+                continue  # still backing off from consecutive False probes
             probe_callable, args = spec
             old_value = self.capabilities.get(name)
             new_value = self._probe(name, probe_callable, *args)
             self.capabilities[name] = new_value
+            if new_value:
+                gap_failures.pop(name, None)
+                next_due.pop(name, None)
+            else:
+                failures = gap_failures.get(name, 0) + 1
+                gap_failures[name] = failures
+                next_due[name] = now + min(
+                    GAP_PROBE_BACKOFF_BASE * (2 ** (failures - 1)),
+                    REPROBE_INTERVAL,
+                )
             if old_value != new_value:
                 flipped = True
                 self._log_capability_flip(name, new_value)

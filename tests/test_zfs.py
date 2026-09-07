@@ -724,10 +724,11 @@ def test_storage_health_filters_none_pool_info(monkeypatch):
     monkeypatch.setattr(zfs.shutil, "which", lambda _: "/usr/sbin/zpool")
     monkeypatch.setattr(zfs, "get_zfs_version", lambda: "zfs-2.2.2")
     monkeypatch.setattr(zfs, "list_zfs_pools", lambda: ["good", "bad"])
+    monkeypatch.setattr(zfs, "_zpool_list_summary", lambda: {})
     monkeypatch.setattr(
         zfs,
         "get_zfs_pool_info",
-        lambda name: None if name == "bad" else {"name": name},
+        lambda name, list_summary=None: None if name == "bad" else {"name": name},
     )
     data = zfs.zfs_storage_health()
     assert data == [{"name": "good", "zfs_version": "zfs-2.2.2"}]

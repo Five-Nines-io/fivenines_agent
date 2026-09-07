@@ -88,7 +88,11 @@ class TestGpuWithNvml:
         assert gpu["processes"][0] == {"pid": 1234, "memory_used": 500000000}
         assert gpu["processes"][1] == {"pid": 5678, "memory_used": 200000000}
 
-        nvml.nvmlShutdown.assert_called_once()
+        # The NVML session is kept alive across ticks: no per-tick shutdown,
+        # and a second collection reuses the existing init.
+        nvml.nvmlShutdown.assert_not_called()
+        gpu_mod.gpu_metrics()
+        nvml.nvmlInit.assert_called_once()
 
     def test_multi_gpu(self):
         """Collect metrics from multiple GPUs."""

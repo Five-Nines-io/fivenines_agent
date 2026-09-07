@@ -4,14 +4,58 @@ import json
 import os
 import socket
 import ssl
+import threading
 import time
 from threading import Event, Lock, Thread
 
 import certifi
 
-from fivenines_agent.debug import debug, log
+from fivenines_agent.debug import debug, debug_enabled, log
 from fivenines_agent.dns_resolver import DNSResolver
 from fivenines_agent.env import api_url, config_dir
+
+# gzip level for every POST body. The library default (9) is the slowest
+# setting for a ~2-5% size win on JSON; level 6 is the standard speed/ratio
+# trade and this code runs on every payload of every tick.
+GZIP_LEVEL = 6
+
+# Process-wide TLS context. Building one re-parses the whole CA bundle
+# (~200KB of PEM), which is pure per-request waste before this was cached. The
+# context is only ever used to wrap_socket, which is thread-safe.
+_ssl_context = None
+_ssl_context_lock = Lock()
+
+
+def _get_ssl_context():
+    global _ssl_context
+    with _ssl_context_lock:
+        if _ssl_context is None:
+            # Use certifi if bundled, otherwise fallback to system CA certificates
+            cert_path = certifi.where()
+            if os.path.exists(cert_path):
+                _ssl_context = ssl.create_default_context(cafile=cert_path)
+            else:
+                _ssl_context = ssl.create_default_context()
+        return _ssl_context
+
+
+def serialize_payload(data):
+    """json+gzip a payload for enqueueing.
+
+    The agent compresses metric payloads BEFORE they enter the buffering
+    queue: a 100-deep queue of raw payload dicts is hundreds of MB of Python
+    object graphs during an API outage (dict overhead is ~5-10x the JSON
+    size), while the same backlog compressed is a few MB. _post sends bytes
+    input as-is instead of re-serializing.
+    """
+    return gzip.compress(json.dumps(data).encode("utf-8"), compresslevel=GZIP_LEVEL)
+
+
+class _HTTPStatusError(Exception):
+    """Non-200 HTTP response. Distinct from transport errors so a reused
+    connection's stale-socket rebuild (free, no retry consumed) never applies
+    to a real server-side error -- that would double every request against an
+    erroring API."""
 
 
 class Synchronizer(Thread):
@@ -29,6 +73,12 @@ class Synchronizer(Thread):
         }
         self.queue = queue
         self.static_data = static_data or {}
+        # Per-thread persistent connection. _post runs on the synchronizer
+        # thread AND the uploader threads (send_logs / send_image_packages),
+        # and http.client connections are not thread-safe, so each thread
+        # keeps its own -- reused across requests to skip the per-POST DNS
+        # query + TCP connect + TLS handshake this code used to pay.
+        self._conn_local = threading.local()
 
     def run(self):
         # We fetch the config from the server before starting to collect metrics
@@ -43,18 +93,50 @@ class Synchronizer(Thread):
     def stop(self):
         self._stop_event.set()
 
+    def _acquire_conn(self):
+        """Cached connection for this thread, creating one when absent."""
+        conn = getattr(self._conn_local, "conn", None)
+        if conn is None:
+            conn = self.get_conn()
+            self._conn_local.conn = conn
+        return conn
+
+    def _has_cached_conn(self):
+        return getattr(self._conn_local, "conn", None) is not None
+
+    def _discard_conn(self):
+        """Close and forget this thread's cached connection (if any)."""
+        conn = getattr(self._conn_local, "conn", None)
+        self._conn_local.conn = None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def _post(self, endpoint, data):
-        """Generic POST with gzip, auth, and retries. Returns parsed JSON or None."""
-        log(f"Sending request to {endpoint}: {data}", "debug")
-        try_count = 0
+        """Generic POST with gzip, auth, and retries. Returns parsed JSON or None.
 
-        with debug("json_serialize") as d:
-            json_data = json.dumps(data).encode("utf-8")
-            d.result = f"{len(json_data)} bytes"
+        *data* is either a dict (serialized + compressed here) or bytes already
+        produced by serialize_payload (metric payloads are compressed at
+        enqueue time so the buffering queue stays small).
+        """
+        if isinstance(data, (bytes, bytearray)):
+            compressed_data = bytes(data)
+        else:
+            # Gate on debug_enabled: log() checks the level only after the
+            # argument is built, and str() of a full payload dict is real
+            # per-request CPU at any log level without this guard.
+            if debug_enabled():
+                log(f"Sending request to {endpoint}: {data}", "debug")
 
-        with debug("gzip_compress") as d:
-            compressed_data = gzip.compress(json_data)
-            d.result = f"{len(json_data)} -> {len(compressed_data)} bytes ({100 - len(compressed_data) * 100 // len(json_data)}% reduction)"
+            with debug("json_serialize") as d:
+                json_data = json.dumps(data).encode("utf-8")
+                d.result = f"{len(json_data)} bytes"
+
+            with debug("gzip_compress") as d:
+                compressed_data = gzip.compress(json_data, compresslevel=GZIP_LEVEL)
+                d.result = f"{len(json_data)} -> {len(compressed_data)} bytes ({100 - len(compressed_data) * 100 // len(json_data)}% reduction)"
         headers = {
             "Content-Type": "application/json",
             "Content-Encoding": "gzip",
@@ -62,10 +144,12 @@ class Synchronizer(Thread):
             "Authorization": f"Bearer {self.token}",
         }
 
+        try_count = 0
         while try_count < self.config["request_options"]["retry"]:
+            reused = self._has_cached_conn()
             try:
                 start_time = time.monotonic()
-                conn = self.get_conn()
+                conn = self._acquire_conn()
                 if conn is None:
                     raise Exception(
                         "Failed to establish connection (DNS resolution or connection setup failed)"
@@ -82,8 +166,18 @@ class Synchronizer(Thread):
                     )
                     return json.loads(body)
                 else:
-                    raise Exception(f"HTTP {res.status}: {body}")
+                    raise _HTTPStatusError(f"HTTP {res.status}: {body}")
             except Exception as e:
+                self._discard_conn()
+                if reused and not isinstance(e, _HTTPStatusError):
+                    # A kept-alive socket the server closed between requests
+                    # fails on first reuse. Rebuild once without consuming a
+                    # retry or logging an error -- this is the expected cost
+                    # of connection reuse, not a real failure. The rebuilt
+                    # attempt starts with no cached conn, so a second failure
+                    # in a row is counted normally.
+                    log(f"Reconnecting after stale connection: {e}", "debug")
+                    continue
                 try_count += 1
                 log(f"Synchronizer Error: {e}", "error")
                 sleep_time = (
@@ -159,16 +253,11 @@ class Synchronizer(Thread):
                 port = int(url.split(":")[1])
 
             resolver = DNSResolver(hostname)
-            
-            # Use certifi if bundled, otherwise fallback to system CA certificates
-            cert_path = certifi.where()
-            if os.path.exists(cert_path):
-                ssl_context = ssl.create_default_context(cafile=cert_path)
-            else:
-                ssl_context = ssl.create_default_context()
+            ssl_context = _get_ssl_context()
 
             # Try IPv4 first, then fallback to IPv6
             for record_type, af in [("A", socket.AF_INET), ("AAAA", socket.AF_INET6)]:
+                sock = None
                 try:
                     answers = resolver.resolve(record_type)
                     if not answers:
@@ -189,6 +278,14 @@ class Synchronizer(Thread):
                     log(f"Connected via {record_type} ({api_ip})", "debug")
                     return conn
                 except Exception as e:
+                    # Close the half-open socket rather than leaving the fd to
+                    # the GC: a failed connect/wrap per attempt per retry adds
+                    # up during a long API outage.
+                    if sock is not None:
+                        try:
+                            sock.close()
+                        except Exception:
+                            pass
                     log(f"Failed to connect via {record_type}: {e}", "debug")
                     continue
 

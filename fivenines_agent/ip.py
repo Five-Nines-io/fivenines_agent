@@ -27,8 +27,12 @@ def _now():
         return time.monotonic()
 
 
-# Positive cache: short TTL, just deduplicates calls within a single tick.
-POSITIVE_CACHE_TTL = 60
+# Positive cache TTL. A host's public IP changes ~never, and 60 (the previous
+# value) never actually hit at the default 60s collection interval -- ticks are
+# spaced >= interval apart, so every tick refetched: DNS + TCP + TLS to
+# ip.fivenines.io, twice with both families enabled, fleet-wide. 15 minutes
+# bounds change-detection latency (DHCP renew, failover) at 1/15th the cost.
+POSITIVE_CACHE_TTL = 900
 
 # Negative cache backoff schedule (seconds), indexed by consecutive failure
 # count. The first failure deliberately does NOT cache so a single transient
@@ -41,6 +45,17 @@ NEGATIVE_BACKOFF_SCHEDULE = (60, 120, 240, 300)
 # Maximum length of a response body we will attempt to parse as an IP.
 # IPv6 addresses fit in ~45 chars; anything longer is HTML or junk.
 MAX_RESPONSE_BODY = 64
+
+# Process-wide TLS context, built lazily: create_default_context re-parses the
+# whole CA bundle (~200KB of PEM) on every call, which was paid per fetch.
+_ssl_context = None
+
+
+def _get_ssl_context():
+    global _ssl_context
+    if _ssl_context is None:
+        _ssl_context = ssl.create_default_context(cafile=certifi.where())
+    return _ssl_context
 
 
 def _negative_backoff(failures):
@@ -165,7 +180,7 @@ def get_ip(ipv6=False):
 
     conn = None
     try:
-        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        ssl_context = _get_ssl_context()
 
         conn = CustomHTTPSConnection("ip.fivenines.io", ipv6=ipv6, context=ssl_context)
         conn.request("GET", "")

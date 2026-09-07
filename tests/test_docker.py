@@ -9,6 +9,7 @@ import pytest
 
 import fivenines_agent.docker as docker_mod
 from fivenines_agent.docker import (
+    CLIENT_TIMEOUT,
     _block_io,
     _clean_name,
     _cpu_usage_percent,
@@ -21,6 +22,7 @@ from fivenines_agent.docker import (
     docker_containers,
     docker_metrics,
     get_docker_client,
+    invalidate_docker_client,
     rootless_socket_url,
 )
 
@@ -196,7 +198,7 @@ class TestGetDockerClient:
         mock_docker.DockerClient.return_value = client
         assert get_docker_client(socket_url="unix:///var/run/docker.sock") is client
         mock_docker.DockerClient.assert_called_once_with(
-            base_url="unix:///var/run/docker.sock"
+            base_url="unix:///var/run/docker.sock", timeout=CLIENT_TIMEOUT
         )
 
     @patch("fivenines_agent.docker.docker")
@@ -259,7 +261,7 @@ class TestRootlessSocketFallback:
         ):
             assert get_docker_client() is client
         mock_docker.DockerClient.assert_called_once_with(
-            base_url="unix:///run/user/1000/docker.sock"
+            base_url="unix:///run/user/1000/docker.sock", timeout=CLIENT_TIMEOUT
         )
         mock_docker.from_env.assert_not_called()
 
@@ -272,7 +274,9 @@ class TestRootlessSocketFallback:
             return_value="unix:///run/user/1000/docker.sock",
         ):
             assert get_docker_client(socket_url="unix:///custom.sock") is client
-        mock_docker.DockerClient.assert_called_once_with(base_url="unix:///custom.sock")
+        mock_docker.DockerClient.assert_called_once_with(
+            base_url="unix:///custom.sock", timeout=CLIENT_TIMEOUT
+        )
 
 
 # ===========================================================================

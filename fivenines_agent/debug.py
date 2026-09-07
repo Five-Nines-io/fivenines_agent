@@ -60,6 +60,17 @@ def stop_log_capture():
     return buffer or []
 
 
+def debug_enabled():
+    """True when 'debug' messages would actually be emitted.
+
+    log() only checks the level AFTER its argument is built, so callers with
+    expensive-to-build messages (json.dumps of a full payload, str() of a large
+    dict) must gate on this first or they pay the serialization cost on every
+    call even when the message is discarded.
+    """
+    return LOG_LEVELS[log_level()] <= LOG_LEVELS['debug']
+
+
 def log(message, level='info'):
     if LOG_LEVELS[log_level()] <= LOG_LEVELS[level]:
         print(f"[{level.upper()}][thread#{threading.get_native_id()}] {message}")

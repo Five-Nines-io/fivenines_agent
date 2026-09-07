@@ -597,10 +597,10 @@ def smart_storage_health():
 
 
 def _compute_storage_health():
-    if not smartctl_available():
-        log("smartctl unavailable (not installed or no sudo permissions)", 'debug')
-        return []
-
+    # No separate smartctl_available() gate: that was one extra `sudo -n
+    # smartctl --version` spawn per tick duplicating both the capability gate
+    # in collectors.py and the failure handling in list_storage_devices()
+    # (which returns [] when smartctl is unusable).
     devices = list_storage_devices()
     if not devices:
         log("No storage devices found", 'error')

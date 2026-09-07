@@ -8,43 +8,38 @@ from fivenines_agent.subprocess_utils import get_clean_env
 
 _cache = TTLCache()
 
-def mdadm_available() -> bool:
-    """
-    Check if mdadm is available and we have permission to run it.
-    Uses sudo -n (non-interactive) to detect if sudoers is configured.
-    Returns False if:
-    - mdadm is not installed
-    - sudo is not configured for this user
-    - sudo would require a password
-    """
+# Data-path subprocess timeout, matching smart_storage.py. `mdadm --detail`
+# against an array with a dying member can block in uninterruptible I/O --
+# exactly the state this collector exists to report -- and an unbounded call
+# on the single-threaded collection loop would stall it into the systemd
+# watchdog (90s) and a restart loop.
+_DATA_SUBPROCESS_TIMEOUT = 30
+
+# mdadm version, cached for the process lifetime: it only changes on a package
+# upgrade (which restarts hosts/agents in practice), and fetching it was a
+# sudo spawn on every tick.
+_mdadm_version = None
+
+def get_mdadm_version():
+    """Get mdadm version information (cached per process)."""
+    global _mdadm_version
+    if _mdadm_version is not None:
+        return _mdadm_version
     try:
         result = subprocess.run(
             ["sudo", "-n", "mdadm", "--version"],
-            capture_output=True,
-            timeout=5,
-            env=get_clean_env()
-        )
-        return result.returncode == 0
-    except subprocess.TimeoutExpired:
-        log("mdadm availability check timed out", 'error')
-        return False
-    except Exception:
-        return False
-
-def get_mdadm_version():
-    """Get mdadm version information."""
-    try:
-        result = subprocess.run(
-            ["sudo", "mdadm", "--version"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             check=True,
+            timeout=_DATA_SUBPROCESS_TIMEOUT,
             env=get_clean_env()
         )
 
-        return result.stdout.split('\n')[0].strip()
+        _mdadm_version = result.stdout.split('\n')[0].strip()
+        return _mdadm_version
     except Exception as e:
+        # Not cached: a transient failure retries on the next tick.
         log(f"Error fetching mdadm version: {e}", 'error')
         return None
 
@@ -127,8 +122,9 @@ def get_raid_info(device):
         }
 
         detail_result = subprocess.run(
-            ["sudo", "mdadm", "--detail", device],
+            ["sudo", "-n", "mdadm", "--detail", device],
             capture_output=True, text=True, check=True,
+            timeout=_DATA_SUBPROCESS_TIMEOUT,
             env=get_clean_env()
         )
 
@@ -265,16 +261,17 @@ def raid_storage_health():
 
 
 def _compute_raid_storage_health():
-    if not mdadm_available():
-        log("mdadm unavailable (not installed or no sudo permissions)", 'debug')
+    # Devices first (a free /proc/mdstat read): hosts with no arrays -- the
+    # common case -- pay zero subprocess spawns per tick. The old order spawned
+    # `sudo mdadm --version` twice per tick before even looking for arrays,
+    # duplicating the sudo probe the capability gate in collectors.py already
+    # runs (raid_storage is gated on it).
+    devices = list_raid_devices()
+    if not devices:
+        log("No RAID devices found", 'debug')
         return []
 
     mdadm_version = get_mdadm_version()
-
-    devices = list_raid_devices()
-    if not devices:
-        log("No RAID devices found", 'error')
-        return []
 
     data = [get_raid_info(dev) for dev in devices]
     # Remove None values and add mdadm version

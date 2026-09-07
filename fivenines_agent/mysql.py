@@ -50,6 +50,13 @@ ERROR_DETAIL_MAX = 500
 REPLICA_STATUS_SQL = "SHOW REPLICA STATUS"
 SLAVE_STATUS_SQL = "SHOW SLAVE STATUS"
 
+# Which replication-status spelling this server accepts, remembered across
+# ticks. Without it, a server that rejects REPLICA (pre-8.0.22 MySQL /
+# pre-10.5 MariaDB) paid a guaranteed-failing CLI spawn + connect + auth on
+# EVERY tick before the SLAVE fallback ran. Reset to the preferred spelling
+# whenever the memoized one stops working (server upgrade mid-run).
+_replica_status_sql = REPLICA_STATUS_SQL
+
 # Galera / wsrep cluster state (issue #107). One extra statement on the same CLI
 # path as the rest of the collector. A non-Galera server returns zero wsrep rows,
 # so the whitelisted keys are simply absent -- Galera detection is implicit (no
@@ -372,9 +379,18 @@ def _get_replication(binary, conn):
     A failure here never flips reachable; it only drops the replication section
     (mirrors the PostgreSQL collector's per-view degradation).
     """
-    out, err, _ = _run_mysql(binary, REPLICA_STATUS_SQL + "\\G", conn, vertical=True)
+    global _replica_status_sql
+    first = _replica_status_sql
+    second = (
+        SLAVE_STATUS_SQL if first == REPLICA_STATUS_SQL else REPLICA_STATUS_SQL
+    )
+    out, err, _ = _run_mysql(binary, first + "\\G", conn, vertical=True)
     if err:
-        out, err, _ = _run_mysql(binary, SLAVE_STATUS_SQL + "\\G", conn, vertical=True)
+        out, err, _ = _run_mysql(binary, second + "\\G", conn, vertical=True)
+        if not err:
+            # The fallback spelling is the one this server speaks; lead with
+            # it next tick instead of re-running the failing one forever.
+            _replica_status_sql = second
     if err:
         return None, None
     row = _parse_vertical(out)

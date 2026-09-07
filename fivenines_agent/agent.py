@@ -24,7 +24,7 @@ from fivenines_agent.collectors import (
     _collect_with_telemetry,
     collect_metrics,
 )
-from fivenines_agent.debug import log
+from fivenines_agent.debug import debug_enabled, log
 from fivenines_agent.docker_image_inventory import (
     ImageInventoryCoordinator,
     ImageInventoryUploader,
@@ -51,7 +51,7 @@ from fivenines_agent.packages import packages_sync
 from fivenines_agent.permissions import get_permissions, print_capabilities_banner
 from fivenines_agent.ping import tcp_ping
 from fivenines_agent.synchronization_queue import SynchronizationQueue
-from fivenines_agent.synchronizer import Synchronizer
+from fivenines_agent.synchronizer import Synchronizer, serialize_payload
 from fivenines_agent.systemd import (
     force_inventory_resend,
     refresh_runtime_caches,
@@ -319,12 +319,22 @@ class Agent:
                 running_time = time.monotonic() - start
                 data["running_time"] = running_time
 
-                log(json.dumps(data, indent=2), "debug")
+                # Gate on debug_enabled: log() checks the level only after its
+                # argument is built, so an unguarded call would pretty-print
+                # the ENTIRE payload (json.dumps, indent=2) on every tick at
+                # any log level -- real CPU on hosts with many processes/
+                # containers/units, discarded immediately.
+                if debug_enabled():
+                    log(json.dumps(data, indent=2), "debug")
                 # Exit immediately in dry-run
                 if dry_run():
                     exit_event.set()
                 else:
-                    self.queue.put(data)
+                    # Compress at enqueue time so the buffering queue holds a
+                    # small gzip blob per tick instead of the full payload
+                    # object graph: a 100-deep backlog of raw dicts during an
+                    # API outage is hundreds of MB of RSS on a busy host.
+                    self.queue.put(serialize_payload(data))
                     self._wait_interval(running_time)
 
         except Exception as e:
