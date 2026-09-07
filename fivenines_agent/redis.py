@@ -1,7 +1,16 @@
 import re
 import socket
+import time
 
 from fivenines_agent.debug import debug, log
+
+# Bounds for the INFO reply read. A real INFO payload is tens of KB; the port
+# is server-pushed config, so a local listener that streams forever (RSS) or
+# trickles bytes (the 5s socket timeout is per-recv inactivity, so a trickle
+# never trips it and would stall the watchdog-bounded loop) must be cut off.
+# Same posture as http_body.read_capped_body for the HTTP collectors.
+_MAX_REPLY_BYTES = 1024 * 1024
+_READ_DEADLINE_S = 5
 
 
 def _resp_command(*args):
@@ -150,19 +159,26 @@ def redis_metrics(port=6379, password=None):
         # RESP array framing, never the inline protocol: see _resp_command.
         s.sendall(b"".join(commands))
 
-        data = b""
+        data = bytearray()
+        deadline = time.monotonic() + _READ_DEADLINE_S
         while True:
+            if time.monotonic() > deadline:
+                log("Redis INFO read exceeded deadline; truncating", "error")
+                break
             chunk = s.recv(4096)
             if not chunk:
                 break
             data += chunk
+            if len(data) > _MAX_REPLY_BYTES:
+                log("Redis INFO reply exceeded size cap; truncating", "error")
+                break
         s.close()
 
         # A denied/unparseable reply (-WRONGPASS, -NOAUTH) or an empty response
         # yields {} here (no exact key matched); the server's presence gate
         # skips an empty block. A socket/connection error raises and returns
         # None via the except path below.
-        return _parse_info(data.decode("utf-8", errors="ignore"))
+        return _parse_info(bytes(data).decode("utf-8", errors="ignore"))
 
     except Exception as e:
         log(f"Error collecting Redis metrics: {e}", "error")

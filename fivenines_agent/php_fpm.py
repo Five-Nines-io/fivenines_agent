@@ -49,8 +49,8 @@ from urllib.parse import parse_qs, urlsplit
 
 import requests
 
-from fivenines_agent.http_body import read_capped_body
 from fivenines_agent.debug import debug, log
+from fivenines_agent.http_body import read_capped_body
 
 # Shared transport timeout (seconds), matching apache.py / nginx.py. A wedged
 # pool must never hang the whole collect tick.
