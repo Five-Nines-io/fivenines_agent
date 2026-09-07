@@ -93,3 +93,63 @@ def test_health_recomputes_after_ttl(clock):
         raid_storage.raid_storage_health()
 
     assert calls == ["/dev/md0", "/dev/md0"]  # recomputed
+
+
+def test_get_mdadm_version_cached_after_first_success(monkeypatch):
+    """The version fetch is one sudo spawn; it only changes on upgrade, so the
+    first successful read is cached for the process lifetime."""
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+
+        class P:
+            stdout = "mdadm - v4.2 - 2021-12-30\nextra\n"
+
+        return P()
+
+    monkeypatch.setattr(raid_storage.subprocess, "run", fake_run)
+    assert raid_storage.get_mdadm_version() == "mdadm - v4.2 - 2021-12-30"
+    assert raid_storage.get_mdadm_version() == "mdadm - v4.2 - 2021-12-30"
+    assert len(calls) == 1
+    # sudo -n (non-interactive) and a timeout: a wedged sudo/mdadm must not
+    # stall the collection loop.
+    assert calls[0][:3] == ["sudo", "-n", "mdadm"]
+
+
+def test_get_mdadm_version_failure_not_cached(monkeypatch):
+    def boom(cmd, **kwargs):
+        raise OSError("no sudo")
+
+    monkeypatch.setattr(raid_storage.subprocess, "run", boom)
+    assert raid_storage.get_mdadm_version() is None
+
+    def ok(cmd, **kwargs):
+        class P:
+            stdout = "mdadm - v4.2\n"
+
+        return P()
+
+    monkeypatch.setattr(raid_storage.subprocess, "run", ok)
+    assert raid_storage.get_mdadm_version() == "mdadm - v4.2"  # retried
+
+
+def test_get_raid_info_passes_timeout(monkeypatch):
+    """mdadm --detail is bounded: unbounded, a dying member disk could park the
+    whole collection loop in uninterruptible I/O past the systemd watchdog."""
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["timeout"] = kwargs.get("timeout")
+
+        class P:
+            stdout = "/dev/md0:\n        Raid Level : raid1\n"
+
+        return P()
+
+    monkeypatch.setattr(raid_storage.subprocess, "run", fake_run)
+    info = raid_storage.get_raid_info("/dev/md0")
+    assert info["raid_level"] == "raid1"
+    assert captured["timeout"] == raid_storage._DATA_SUBPROCESS_TIMEOUT
+    assert captured["cmd"][:3] == ["sudo", "-n", "mdadm"]

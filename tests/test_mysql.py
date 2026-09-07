@@ -501,6 +501,39 @@ def test_get_replication_falls_back_to_slave():
     assert any("SLAVE STATUS" in s for s in calls)
 
 
+def test_get_replication_remembers_working_verb(monkeypatch):
+    """After SLAVE succeeds where REPLICA failed, the next call leads with
+    SLAVE -- no guaranteed-failing spawn per tick on old servers. A later
+    SLAVE failure falls back to REPLICA and re-memoizes."""
+    calls = []
+
+    def old_server(binary, sql, conn, vertical=False):
+        calls.append(sql)
+        if "REPLICA STATUS" in sql:
+            return None, "error", "syntax error"
+        return MARIADB_REPLICA, None, ""
+
+    with patch(f"{MY}._run_mysql", side_effect=old_server):
+        _get_replication("mysql", _conn())
+        _get_replication("mysql", _conn())
+    # Call 1: REPLICA (fails) then SLAVE; call 2: SLAVE directly.
+    assert [("SLAVE" in s2) for s2 in calls] == [False, True, True]
+
+    calls.clear()
+
+    def upgraded_server(binary, sql, conn, vertical=False):
+        calls.append(sql)
+        if "SLAVE STATUS" in sql:
+            return None, "error", "deprecated"
+        return MARIADB_REPLICA, None, ""
+
+    with patch(f"{MY}._run_mysql", side_effect=upgraded_server):
+        _get_replication("mysql", _conn())
+        _get_replication("mysql", _conn())
+    # Call 1: memoized SLAVE (fails) then REPLICA; call 2: REPLICA directly.
+    assert [("SLAVE" in s2) for s2 in calls] == [True, False, False]
+
+
 def test_get_replication_not_a_replica():
     with patch(f"{MY}._run_mysql", return_value=("", None, "")):
         assert _get_replication("mysql", _conn()) == (False, None)

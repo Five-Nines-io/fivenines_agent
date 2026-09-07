@@ -75,3 +75,46 @@ def test_run_with_watchdog_present(mock_ps, mock_cm, mock_dr):
         mock_wd_instance.notify.assert_called()
     finally:
         agent_module.systemd_watchdog = original
+
+
+@patch("fivenines_agent.agent.systemd_inventory_sync", return_value=True)
+@patch("fivenines_agent.agent.dry_run", return_value=False)
+@patch("fivenines_agent.agent.collect_metrics")
+@patch("fivenines_agent.agent.packages_sync")
+def test_run_enqueues_precompressed_payload(mock_ps, mock_cm, mock_dr, mock_sis):
+    """The metric payload is gzip-compressed at enqueue time (small blobs in
+    the outage buffer, not full object graphs) and round-trips to JSON."""
+    import gzip
+    import json
+
+    agent = make_agent()
+    agent.config = {"enabled": True, "interval": 60}
+    agent.synchronizer.get_config.return_value = agent.config
+    agent._systemd_force_resend = False
+    # Everything landing in the payload must be JSON-serializable.
+    agent.permissions.get_reasons.return_value = {}
+
+    def stop_loop(_running_time):
+        agent_module.exit_event.set()
+
+    agent._wait_interval = stop_loop
+
+    original = agent_module.systemd_watchdog
+    try:
+        agent_module.systemd_watchdog = None
+        agent_module.exit_event.clear()
+        with pytest.raises(SystemExit):
+            agent.run()
+    finally:
+        agent_module.systemd_watchdog = original
+
+    # One enqueue from the loop, then the shutdown sentinel from _cleanup.
+    payload_calls = [
+        c for c in agent.queue.put.call_args_list if c.args[0] is not None
+    ]
+    assert len(payload_calls) == 1
+    blob = payload_calls[0].args[0]
+    assert isinstance(blob, bytes)
+    decoded = json.loads(gzip.decompress(blob).decode("utf-8"))
+    assert decoded["version"] == "test"
+    assert "ts" in decoded and "running_time" in decoded

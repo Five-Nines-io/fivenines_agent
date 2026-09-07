@@ -1000,3 +1000,62 @@ def test_contract_failure_signal_is_null_payload():
     prune-safe empty dict."""
     assert _CONTRACT_SCENARIOS["daemon_unreachable"]["payload"] is None
     assert _CONTRACT_SCENARIOS["zero_containers"]["payload"] == {"containers": {}}
+
+
+# ===========================================================================
+# Collection deadline / client cache
+# ===========================================================================
+
+
+class TestCollectionDeadline:
+    def test_deadline_exceeded_returns_none_not_partial(self):
+        """A slow daemon must surface as a collection failure (None), never a
+        partial container map the server would prune against."""
+        c1 = _make_container("c1", _attrs(status="exited"))
+        c2 = _make_container("c2", _attrs(status="exited"))
+        client = _make_client([c1, c2], {"sha256:img": _make_image()})
+        with patch(
+            "fivenines_agent.docker.get_docker_client", return_value=client
+        ), patch("fivenines_agent.docker.previous_stats", {}), patch(
+            "fivenines_agent.docker.COLLECT_DEADLINE", -1
+        ):
+            assert docker_containers() is None
+
+
+class TestClientCache:
+    @patch("fivenines_agent.docker.docker")
+    def test_client_is_reused_across_calls(self, mock_docker):
+        client = MagicMock()
+        mock_docker.DockerClient.return_value = client
+        assert get_docker_client(socket_url="unix:///a.sock") is client
+        assert get_docker_client(socket_url="unix:///a.sock") is client
+        assert mock_docker.DockerClient.call_count == 1
+
+    @patch("fivenines_agent.docker.docker")
+    def test_socket_url_change_rebuilds_client(self, mock_docker):
+        old, new = MagicMock(), MagicMock()
+        mock_docker.DockerClient.side_effect = [old, new]
+        assert get_docker_client(socket_url="unix:///a.sock") is old
+        assert get_docker_client(socket_url="unix:///b.sock") is new
+        old.close.assert_called_once()
+
+    @patch("fivenines_agent.docker.docker")
+    def test_invalidate_swallows_close_errors(self, mock_docker):
+        client = MagicMock()
+        client.close.side_effect = OSError("gone")
+        mock_docker.DockerClient.return_value = client
+        get_docker_client(socket_url="unix:///a.sock")
+        invalidate_docker_client()  # must not raise
+        assert get_docker_client(socket_url="unix:///a.sock") is not None
+        assert mock_docker.DockerClient.call_count == 2
+
+    def test_list_failure_invalidates_cached_client(self):
+        client = _make_client([], list_error=RuntimeError("daemon gone"))
+        with patch(
+            "fivenines_agent.docker.get_docker_client", return_value=client
+        ) as get_client, patch(
+            "fivenines_agent.docker.invalidate_docker_client"
+        ) as invalidate:
+            assert docker_containers() is None
+        get_client.assert_called_once()
+        invalidate.assert_called_once()

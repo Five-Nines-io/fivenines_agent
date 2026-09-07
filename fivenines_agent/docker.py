@@ -80,6 +80,7 @@ def invalidate_docker_client():
         except Exception:
             pass
 
+
 # Per-tick container cap. Running containers are always kept first; the rest are
 # taken newest-first (by Created). Bounds the payload on hosts with a large
 # graveyard of exited containers.

@@ -34,9 +34,12 @@ def get_fail2ban_version() -> str:
             env=get_clean_env()
         )
         if result.returncode == 0:
-            # Output is like "Fail2Ban v0.11.2"
+            # Output is like "Fail2Ban v0.11.2" (or just "0.11.2"). Require at
+            # least one dot: the old r'v?([\d.]+)' matched the lone "2" inside
+            # the word "Fail2Ban" first and reported version "2" -- worth
+            # fixing now that the value is cached for the process lifetime.
             version = result.stdout.strip()
-            match = re.search(r'v?([\d.]+)', version)
+            match = re.search(r'v?(\d+(?:\.\d+)+)', version)
             if match:
                 _version_cache = match.group(1)
             else:
