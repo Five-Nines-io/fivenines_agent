@@ -324,23 +324,6 @@ subprocess cost; deferred until a concrete backend requirement appears.
 - **Depends on:** backend signal that v1 OOM coverage matters
 - **Files:** `fivenines_agent/systemd.py` (add fallback path), tests, fixtures
 
-## P3: Hoist net_if_addrs() out of the per-interface loop in interfaces()
-
-Pre-existing (predates the issue #50 bridge/link-speed work, flagged by its
-pre-landing review). `interfaces()` calls `psutil.net_if_addrs()` once per
-interface, and each call rebuilds the full address map for every interface --
-O(N^2). Harmless on a normal host, but the bridge-saturation feature aims
-exactly at Proxmox hosts with thousands of veth/tap interfaces, where this is
-the dominant cost each tick. Fix is a one-liner (compute the map once before the
-loop), but it touches the address-lookup try/except that
-`test_interfaces_skips_when_net_if_addrs_raises` pins, so do it deliberately
-with the test in front of you. Kept out of the #50 PR to keep that diff scoped
-to the contract.
-
-- **Effort:** S (human) / S (CC)
-- **Depends on:** nothing
-- **Files:** `fivenines_agent/network.py` (`interfaces()`), `tests/test_network.py`
-
 ## P4: Finer interface_type classification (bond / vlan / paravirtual)
 
 The issue #50 `interface_type` is a coarse three-way heuristic: bridge (has
@@ -536,3 +519,16 @@ generate one at spec time from the declared enum rather than committing it.
 - **Effort:** S (human) / S (CC)
 - **Depends on:** nothing
 - **Files:** `tests/fixtures/docker_image_inventory_contract_payload.json`, `tests/test_docker_image_inventory.py`
+
+## Completed
+
+### P3: Hoist net_if_addrs() out of the per-interface loop in interfaces()
+
+`interfaces()` called `psutil.net_if_addrs()` once per interface (a full
+getifaddrs walk each time -- O(N^2), dominant per-tick cost on Proxmox hosts
+with thousands of veth/tap interfaces). The map is now computed once before
+the loop; `test_interfaces_skips_when_net_if_addrs_raises` was replaced by
+`test_interfaces_empty_when_net_if_addrs_raises` (single-fetch semantics) plus
+a call-count pin (`test_interfaces_calls_net_if_addrs_once`).
+
+**Completed:** v1.17.3 (2026-09-07)
