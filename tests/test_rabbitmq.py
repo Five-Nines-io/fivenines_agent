@@ -875,3 +875,30 @@ def test_parse_json_over_cap_raises_http_error(monkeypatch):
     with pytest.raises(rabbitmq._RabbitError) as excinfo:
         rabbitmq._parse_json(response)
     assert excinfo.value.error_type == "http_error"
+
+
+def test_parse_json_body_read_failure_maps_to_http_error():
+    """A body that dies mid-stream (connection reset) maps to http_error so
+    the caller ships the reachable:false envelope -- never an unhandled
+    exception; empty keep-alive chunks are skipped and the response closed."""
+
+    class BrokenResponse:
+        status_code = 200
+
+        def __init__(self):
+            self.closed = False
+
+        def iter_content(self, chunk_size=65536):
+            yield b""  # keep-alive chunk: skipped by the read loop
+            yield b"["
+            raise OSError("connection reset mid-body")
+
+        def close(self):
+            self.closed = True
+
+    response = BrokenResponse()
+    with pytest.raises(rabbitmq._RabbitError) as excinfo:
+        rabbitmq._parse_json(response)
+    assert excinfo.value.error_type == "http_error"
+    assert "body read failed" in excinfo.value.message
+    assert response.closed

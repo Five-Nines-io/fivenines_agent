@@ -1648,12 +1648,13 @@ def test_build_inventory_invalidates_client_on_daemon_error():
 def test_persist_done_set_is_owner_only(tmp_path):
     """The done-set file (and its temp sibling) are created 0600; os.replace
     preserves the temp file's mode."""
-    import os
-
-    from fivenines_agent.docker_image_inventory import ImageInventoryCoordinator
-
     state = tmp_path / "image_inventory_done"
     coordinator = ImageInventoryCoordinator(str(state))
-    coordinator.mark_done("sha256:abc")
+    # Pinned umask: see test_swap_token_creates_file_owner_only.
+    old_umask = os.umask(0o022)
+    try:
+        coordinator.mark_done("sha256:abc")
+    finally:
+        os.umask(old_umask)
     assert state.read_text() == "sha256:abc"
     assert os.stat(state).st_mode & 0o777 == 0o600

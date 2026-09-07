@@ -59,6 +59,9 @@ class CaptureCoordinator:
             fd = os.open(
                 self.state_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
             )
+            # Heal a pre-existing file's mode too (os.open's mode applies only
+            # at creation).
+            os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w") as f:
                 f.write(str(capture_id))
         except Exception as e:

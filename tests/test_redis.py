@@ -271,3 +271,14 @@ def test_resp_command_frames_arguments():
         redis._resp_command("AUTH", "p w")
         == b"*2\r\n$4\r\nAUTH\r\n$3\r\np w\r\n"
     )
+
+
+def test_resp_command_uses_byte_length_for_multibyte_arguments():
+    """The bulk length MUST be the UTF-8 BYTE length, not the character count:
+    a shorter declared length would leak the password's trailing bytes
+    (attacker-controllable, CRLFs included) outside the bulk string --
+    re-opening the injection this framing exists to close."""
+    # "p\u00e9w" is 3 characters but 4 UTF-8 bytes (escape form keeps the
+    # repo ASCII-only).
+    frame = redis._resp_command("AUTH", "p\u00e9w")
+    assert frame == b"*2\r\n$4\r\nAUTH\r\n$4\r\np\xc3\xa9w\r\n"

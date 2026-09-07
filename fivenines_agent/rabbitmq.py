@@ -61,6 +61,7 @@ from urllib.parse import quote
 
 import requests
 
+from fivenines_agent.http_body import read_capped_body
 from fivenines_agent.debug import debug, log
 
 # Per-request timeout (seconds). A wedged broker must never stall the collect
@@ -240,29 +241,20 @@ def _check_status(status):
 
 
 def _parse_json(response):
-    """Parse a 200 body as JSON, mapping a malformed or oversized body to
-    http_error. The body is streamed under _MAX_RESPONSE_BYTES: a queues
-    listing on a big broker is MBs, never the unbounded stream a misdirected
-    url could produce."""
-    chunks = bytearray()
+    """Parse a 200 body as JSON, mapping a malformed, oversized or stalled
+    body to http_error. The body is streamed under _MAX_RESPONSE_BYTES and a
+    _TIMEOUT wall-clock deadline (read_capped_body): a queues listing on a big
+    broker is MBs, never the unbounded/trickling stream a misdirected url
+    could produce."""
     try:
-        for chunk in response.iter_content(chunk_size=65536):
-            if not chunk:
-                continue
-            chunks += chunk
-            if len(chunks) > _MAX_RESPONSE_BYTES:
-                raise _RabbitError(
-                    "http_error",
-                    f"response body exceeded {_MAX_RESPONSE_BYTES} bytes",
-                )
-    except _RabbitError:
-        raise
+        raw = read_capped_body(response, _MAX_RESPONSE_BYTES, _TIMEOUT)
     except Exception as e:
         raise _RabbitError("http_error", f"body read failed: {e}")
-    finally:
-        response.close()
     try:
-        return json.loads(chunks.decode("utf-8", "replace"))
+        # json.loads accepts bytes directly (a UnicodeDecodeError is a
+        # ValueError, so the invalid-JSON mapping below covers it too); no
+        # second full-body str copy at the cap boundary.
+        return json.loads(raw)
     except ValueError:
         raise _RabbitError("http_error", "invalid JSON response")
 
@@ -270,7 +262,14 @@ def _parse_json(response):
 def _request(session, url):
     """GET *url* -> parsed JSON, raising a classified _RabbitError on any failure."""
     response = _http_get(session, url)
-    _check_status(response.status_code)
+    try:
+        _check_status(response.status_code)
+    except _RabbitError:
+        # Streamed responses must be closed when the body is never read: an
+        # unread body keeps the connection checked out of the keep-alive pool
+        # (urllib3 drain semantics), forcing a fresh handshake per request.
+        response.close()
+        raise
     return _parse_json(response)
 
 
@@ -283,8 +282,15 @@ def _request_optional(session, url):
     """
     response = _http_get(session, url)
     if response.status_code == 404:
+        # A watched-but-deleted queue 404s EVERY tick; close so the keep-alive
+        # connection returns to the pool instead of leaking to GC per lookup.
+        response.close()
         return None
-    _check_status(response.status_code)
+    try:
+        _check_status(response.status_code)
+    except _RabbitError:
+        response.close()
+        raise
     return _parse_json(response)
 
 

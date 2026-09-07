@@ -42,6 +42,7 @@ import re
 
 import requests
 
+from fivenines_agent.http_body import read_capped_body
 from fivenines_agent.debug import debug, log
 
 # Shared transport timeout (seconds), matching caddy.py / apache.py. A wedged
@@ -104,26 +105,17 @@ _NAMES_OF_INTEREST = frozenset(
 
 
 def _read_capped(response):
-    """Stream a response body under _MAX_RESPONSE_BYTES; raise when exceeded.
+    """Stream a response body under _MAX_RESPONSE_BYTES and a _TIMEOUT
+    wall-clock deadline (read_capped_body); raise when exceeded.
 
-    Raising (rather than truncating) routes an oversized body through the
-    caller's existing failure handling: /metrics degrades to a bare reachable
-    payload, /api/v1/targets to omitted target keys. The connection is closed
-    either way.
+    Raising (rather than truncating) routes an oversized/stalled body through
+    the caller's existing failure handling: /metrics degrades to a bare
+    reachable payload, /api/v1/targets to omitted target keys. The connection
+    is closed either way.
     """
-    chunks = bytearray()
-    try:
-        for chunk in response.iter_content(chunk_size=65536):
-            if not chunk:
-                continue
-            chunks += chunk
-            if len(chunks) > _MAX_RESPONSE_BYTES:
-                raise ValueError(
-                    f"response body exceeded {_MAX_RESPONSE_BYTES} bytes"
-                )
-    finally:
-        response.close()
-    return chunks.decode("utf-8", "replace")
+    return read_capped_body(response, _MAX_RESPONSE_BYTES, _TIMEOUT).decode(
+        "utf-8", "replace"
+    )
 
 
 # Prometheus label matcher: name="value" pairs, honouring backslash escapes in
@@ -196,12 +188,17 @@ def tsdb_metrics(
         return _unreachable(e)
 
     if response.status_code in (401, 403):
+        # Streamed responses must be closed on every exit (a locked-down
+        # Prometheus 403s every tick; leaking the checked-out socket to GC
+        # each time is avoidable churn).
+        response.close()
         return {
             "reachable": False,
             "error_type": "auth_failed",
             "error_message": f"HTTP {response.status_code} on /metrics",
         }
     if not 200 <= response.status_code < 300:
+        response.close()
         return {
             "reachable": False,
             "error_type": "http_error",
@@ -478,6 +475,7 @@ def _fetch_targets(get):
     try:
         response = get("/api/v1/targets")
         if not 200 <= response.status_code < 300:
+            response.close()
             return None
         active = json.loads(_read_capped(response)).get("data", {}).get(
             "activeTargets"
