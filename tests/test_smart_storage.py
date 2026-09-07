@@ -133,16 +133,6 @@ def test_version_fetchers_none_on_empty_stdout(monkeypatch):
     assert smart_storage.get_nvme_cli_version() is None
 
 
-def test_smartctl_available_reflects_probe(monkeypatch):
-    """smartctl_available is True only when the sudo -n probe exits 0."""
-    monkeypatch.setattr(
-        smart_storage.subprocess, "run", lambda *_a, **_k: _proc(0, "smartctl 7.2\n")
-    )
-    assert smart_storage.smartctl_available() is True
-    monkeypatch.setattr(smart_storage.subprocess, "run", lambda *_a, **_k: _proc(1, ""))
-    assert smart_storage.smartctl_available() is False
-
-
 def test_nvme_cli_available_reflects_probe(monkeypatch):
     """nvme_cli_available is True only when the sudo -n probe exits 0."""
     monkeypatch.setattr(
@@ -323,7 +313,6 @@ def test_health_probes_nvme_availability_once_for_multi_nvme(monkeypatch):
     Devices are gated by PARSED output (current_section == nvme), and the probe
     is consulted once even though every device enriches.
     """
-    monkeypatch.setattr(smart_storage, "smartctl_available", lambda: True)
     monkeypatch.setattr(
         smart_storage,
         "list_storage_devices",
@@ -358,7 +347,6 @@ def test_health_no_nvme_section_never_probes(monkeypatch):
     not the device path, so an NVMe device under an exotic name would still be
     enriched (and an ATA device never triggers a probe).
     """
-    monkeypatch.setattr(smart_storage, "smartctl_available", lambda: True)
     monkeypatch.setattr(
         smart_storage, "list_storage_devices", lambda: ["/dev/sda", "/dev/sdb"]
     )
@@ -403,7 +391,6 @@ def test_health_smartctl_unavailable_returns_empty(monkeypatch):
 
 def test_health_no_devices_returns_empty(monkeypatch):
     """smartctl present but zero devices -> empty health data, nvme never probed."""
-    monkeypatch.setattr(smart_storage, "smartctl_available", lambda: True)
     monkeypatch.setattr(smart_storage, "list_storage_devices", lambda: [])
     nvme_available = mock.Mock()
     monkeypatch.setattr(smart_storage, "nvme_cli_available", nvme_available)
@@ -420,7 +407,6 @@ def test_health_happy_filters_none(monkeypatch):
 
     with patch.multiple(
         smart_storage,
-        smartctl_available=lambda: True,
         list_storage_devices=lambda: ["/dev/sda", "/dev/sdb"],
         get_storage_info=fake_info,
     ):
@@ -435,11 +421,11 @@ def test_health_cache_hit_skips_all_work(monkeypatch):
         60,
     )
 
-    smartctl = mock.Mock()
-    monkeypatch.setattr(smart_storage, "smartctl_available", smartctl)
+    list_devices = mock.Mock()
+    monkeypatch.setattr(smart_storage, "list_storage_devices", list_devices)
 
     assert smart_storage.smart_storage_health() == [{"device": "cached"}]
-    smartctl.assert_not_called()
+    list_devices.assert_not_called()
 
 
 def test_health_cache_hit_within_ttl(clock):
@@ -451,7 +437,6 @@ def test_health_cache_hit_within_ttl(clock):
 
     with patch.multiple(
         smart_storage,
-        smartctl_available=lambda: True,
         list_storage_devices=lambda: ["/dev/sda"],
         get_storage_info=fake_info,
     ):
@@ -472,7 +457,6 @@ def test_health_recomputes_after_ttl(clock):
 
     with patch.multiple(
         smart_storage,
-        smartctl_available=lambda: True,
         list_storage_devices=lambda: ["/dev/sda"],
         get_storage_info=fake_info,
     ):
@@ -613,7 +597,7 @@ def test_sudo_probe_passes_timeout(monkeypatch):
     monkeypatch.setattr(smart_storage.subprocess, "run", spy)
 
     smart_storage.get_smartctl_version()
-    smart_storage.smartctl_available()
+    smart_storage.nvme_cli_available()
 
     assert seen, "no probe calls were made"
     assert all(t is not None for t in seen), f"a probe call had no timeout: {seen}"

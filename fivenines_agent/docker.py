@@ -28,6 +28,7 @@ import threading
 import time
 
 import docker
+import requests
 
 from fivenines_agent.debug import debug, log
 
@@ -37,8 +38,13 @@ DEFAULT_SOCKET_PATH = "/var/run/docker.sock"
 # Per-request timeout for the Docker SDK. docker-py's default is 60s per API
 # call, and one tick makes 1 list + a reload (and stats, for running
 # containers) per container, all serial -- two wedged calls at the default
-# already exceed the systemd watchdog (90s).
-CLIENT_TIMEOUT = 5
+# already exceed the systemd watchdog (90s). 10 rather than 5: the one
+# containers.list() per tick can legitimately take several seconds on a
+# loaded daemon with a large container graveyard, and a too-tight timeout
+# there would ship docker=null on every tick (frozen container rows) for as
+# long as the load lasts. Three wedged calls still trip COLLECT_DEADLINE
+# well under the watchdog.
+CLIENT_TIMEOUT = 10
 
 # Wall-clock budget for one collection pass. When exceeded we return None (a
 # collection failure the server never prunes on) rather than a PARTIAL
@@ -396,7 +402,27 @@ def docker_containers(socket_url=None):
         except docker.errors.NotFound:
             log(f"Docker container {cid} vanished during collection, skipping", "debug")
             continue
+        except requests.exceptions.RequestException as e:
+            # Transport-level failure (read timeout on a wedged container, the
+            # daemon dying mid-pass): the daemon side is sick, not this one
+            # container. Skipping it would ship a PARTIAL map -- the server
+            # prunes containers missing from a dict payload, so a live-but-
+            # wedged container would read as removed and lose its alert state.
+            # Same contract as the deadline bail above: None, never partial.
+            # With the old 60s per-call default this path effectively never
+            # fired (the call blocked into the watchdog instead); the tighter
+            # CLIENT_TIMEOUT makes it reachable, so it must be honest.
+            log(
+                f"Docker transport error on container {cid}: {e}; "
+                "reporting collection failure",
+                "error",
+            )
+            invalidate_docker_client()
+            return None
         except Exception as e:
+            # Daemon answered but this one entry is unusable (malformed
+            # payload, a daemon-side per-container error). Per-item isolation:
+            # skip it, keep the rest.
             log(f"Error collecting Docker container {cid}: {e}", "error")
             continue
         entries[cid] = entry

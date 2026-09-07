@@ -1619,3 +1619,27 @@ def test_parse_dpkg_status_keeps_multiarch_rows_at_different_versions():
         {"name": "libc6", "version": "2.36-9+deb12u3", "ecosystem": None},
     ]
     assert truncated is False
+
+
+def test_build_inventory_invalidates_client_on_daemon_error():
+    """The uploader thread owns its per-thread docker client slot; a
+    daemon-level failure must invalidate it so the NEXT job re-resolves the
+    endpoint (a moved rootless socket would otherwise pin a dead base_url
+    until process restart)."""
+    from unittest.mock import MagicMock, patch
+
+    from fivenines_agent.docker_image_inventory import build_image_inventory
+
+    client = MagicMock()
+    client.containers.get.side_effect = RuntimeError("connection refused")
+    with patch(
+        "fivenines_agent.docker_image_inventory.get_docker_client",
+        return_value=client,
+    ), patch(
+        "fivenines_agent.docker_image_inventory.invalidate_docker_client"
+    ) as invalidate:
+        result = build_image_inventory(
+            {"image_id": "sha256:x", "container_id": "c1", "socket_url": None}
+        )
+    assert result is None
+    invalidate.assert_called_once()

@@ -89,7 +89,7 @@ def get_jail_list():
         return None
 
 
-def get_jail_status(jail_name: str) -> dict:
+def get_jail_status(jail_name: str):
     """Get detailed status for a specific jail."""
     try:
         result = subprocess.run(

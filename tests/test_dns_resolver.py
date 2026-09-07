@@ -3,19 +3,15 @@
 from unittest.mock import MagicMock, patch
 
 import dns.exception
+import dns.resolver
 
 import fivenines_agent.dns_resolver as dns_resolver_module
 from fivenines_agent.dns_resolver import DNSResolver, _get_resolver
 
 
-def _reset():
-    dns_resolver_module._resolver = None
-
-
 def test_get_resolver_is_memoized_and_has_a_cache():
     """One Resolver per process, with a TTL-honoring cache attached -- the
     whole point: the default resolve() path re-queried DNS on every POST."""
-    _reset()
     with patch.object(dns_resolver_module.dns.resolver, "Resolver") as resolver_cls:
         instance = MagicMock()
         resolver_cls.return_value = instance
@@ -23,12 +19,13 @@ def test_get_resolver_is_memoized_and_has_a_cache():
         second = _get_resolver()
     assert first is second is instance
     resolver_cls.assert_called_once()
-    # A cache object was attached (dns.resolver.Cache honors record TTLs).
-    assert instance.cache is not None
+    # A REAL cache object was attached (dns.resolver.Cache honors record
+    # TTLs). isinstance, not `is not None`: on a MagicMock instance any
+    # attribute access is truthy, so a weaker assertion could never fail.
+    assert isinstance(instance.cache, dns.resolver.Cache)
 
 
 def test_resolve_delegates_with_lifetime():
-    _reset()
     fake = MagicMock()
     fake.resolve.return_value = ["answer"]
     with patch.object(dns_resolver_module, "_get_resolver", return_value=fake):
@@ -37,7 +34,6 @@ def test_resolve_delegates_with_lifetime():
 
 
 def test_resolve_returns_none_on_dns_exception():
-    _reset()
     fake = MagicMock()
     fake.resolve.side_effect = dns.exception.DNSException("nxdomain")
     with patch.object(dns_resolver_module, "_get_resolver", return_value=fake):

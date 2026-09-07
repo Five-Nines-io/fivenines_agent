@@ -138,3 +138,25 @@ def test_collect_absorbs_extra_config_kwargs():
         units=[], posture="digest", redaction={"version": 1}, _now=lambda: 1000
     )
     assert out == {"window_s": 60, "units": {}}
+
+
+def test_signals_fingerprint_identical_lines_once(monkeypatch):
+    """Same per-call memo as build_digest: an identical repeated line (the log
+    storm this collector exists to flag) pays the fingerprint regex cost once,
+    and rates/grouping stay exact."""
+    real_fp = logs.fingerprint
+    calls = []
+
+    def counting_fp(message):
+        calls.append(message)
+        return real_fp(message)
+
+    monkeypatch.setattr(logs, "fingerprint", counting_fp)
+    entries = [{"priority": "3", "message": "oom killed worker 7"}] * 100 + [
+        {"priority": "4", "message": "slow query"}
+    ]
+    out = logs._signals_for_unit(entries)
+    assert len(calls) == 2  # once per distinct raw line, not per entry
+    assert out["error_rate"] == 100 and out["warn_rate"] == 1
+    storm = [f for f in out["fingerprints"] if f["count"] == 100][0]
+    assert storm["severity"] == "error"

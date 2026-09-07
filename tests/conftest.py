@@ -9,6 +9,7 @@ this autouse fixture resets every such cache before each test.
 
 import pytest
 
+import fivenines_agent.dns_resolver as dns_resolver_module
 import fivenines_agent.docker as docker_module
 import fivenines_agent.fail2ban as fail2ban_module
 import fivenines_agent.gpu as gpu_module
@@ -29,5 +30,6 @@ def _reset_process_caches():
     gpu_module._nvml_ready = False
     synchronizer_module._ssl_context = None
     ip_module._ssl_context = None
+    dns_resolver_module._resolver = None
     docker_module.invalidate_docker_client()
     yield

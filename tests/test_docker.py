@@ -190,7 +190,7 @@ class TestGetDockerClient:
         client = MagicMock()
         mock_docker.from_env.return_value = client
         assert get_docker_client() is client
-        mock_docker.from_env.assert_called_once()
+        mock_docker.from_env.assert_called_once_with(timeout=CLIENT_TIMEOUT)
 
     @patch("fivenines_agent.docker.docker")
     def test_with_socket_url(self, mock_docker):
@@ -1058,4 +1058,27 @@ class TestClientCache:
         ) as invalidate:
             assert docker_containers() is None
         get_client.assert_called_once()
+        invalidate.assert_called_once()
+
+
+class TestTransportErrorHonesty:
+    def test_per_container_transport_error_returns_none(self):
+        """A read timeout on ONE container means the daemon side is sick; the
+        pass must return None (never-prune), not a partial map that reads as
+        the wedged container having been removed."""
+        import requests as requests_lib
+
+        wedged = _make_container(
+            "wedged",
+            _attrs(status="running"),
+            reload_error=requests_lib.exceptions.ReadTimeout("10s elapsed"),
+        )
+        ok = _make_container("ok", _attrs(status="exited"))
+        client = _make_client([wedged, ok], {"sha256:img": _make_image()})
+        with patch(
+            "fivenines_agent.docker.get_docker_client", return_value=client
+        ), patch("fivenines_agent.docker.previous_stats", {}), patch(
+            "fivenines_agent.docker.invalidate_docker_client"
+        ) as invalidate:
+            assert docker_containers() is None
         invalidate.assert_called_once()

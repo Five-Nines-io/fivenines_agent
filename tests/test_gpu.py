@@ -189,8 +189,10 @@ class TestGpuWithNvml:
         assert gpu_mod.gpu_metrics() == []  # fresh init, zero GPUs
         assert nvml.nvmlInit.call_count == 2
 
-    def test_nvml_shutdown_called_on_exception(self):
-        """nvmlShutdown is called even when nvmlDeviceGetCount raises."""
+    def test_nvml_shutdown_called_on_session_error(self):
+        """A session-level error (nvmlDeviceGetCount raising) tears the NVML
+        session down via _reset_nvml -- the ONLY path that still calls
+        nvmlShutdown now that success keeps the session alive."""
         nvml = self.mock_nvml
         nvml.nvmlDeviceGetCount.side_effect = Exception("unexpected")
 

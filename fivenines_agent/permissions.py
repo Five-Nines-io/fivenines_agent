@@ -19,17 +19,22 @@ from fivenines_agent.subprocess_utils import get_clean_env
 # on this cadence to catch regressions and newly-relevant capabilities.
 REPROBE_INTERVAL = 300
 
-# Selective gap re-probe backoff base (seconds). A capability that is enabled
+# Selective gap re-probe backoff (seconds). A capability that is enabled
 # in server config but probed False was re-probed EVERY tick by default -- for
 # a permanently-missing one (no sudoers entry, the fleet-wide steady state on
 # many hosts) that is a sudo/subprocess spawn per capability per tick,
 # forever. After each consecutive False the next re-probe is delayed
-# exponentially from this base, capped at REPROBE_INTERVAL so the gap probe
-# never becomes slower than the full probe it exists to beat. The first probe
-# of a newly-pending capability is always immediate, and force_refresh /
-# SIGHUP / the recheck token clear the backoff (full probes recheck
-# everything anyway).
+# exponentially from the base. The cap is 120s, NOT the full-probe interval:
+# the gap probe exists so a just-granted permission appears fast (the
+# onboarding flow: operator enables the feature, THEN installs sudoers a few
+# minutes later -- by which point the backoff has already climbed), and a cap
+# equal to REPROBE_INTERVAL would make it no better than the full probe.
+# 120s keeps worst-case detection at ~2 ticks while still cutting the
+# steady-state spawn cost ~24x vs per-tick. The first probe of a newly-pending
+# capability is always immediate; force_refresh / SIGHUP / the recheck token
+# clear the backoff (full probes recheck everything anyway).
 GAP_PROBE_BACKOFF_BASE = 60
+GAP_PROBE_BACKOFF_MAX = 120
 
 # Hard timeout (seconds) for the libvirt openReadOnly probe. The probe runs in a
 # worker thread and is abandoned past this deadline: a wedged libvirt stack
@@ -370,9 +375,9 @@ class PermissionProbe:
         Logs state flips at info level (same payload as the full probe) and
         returns True if any of the named capabilities flipped. Names not in the
         OS probe spec are ignored. A capability that keeps probing False backs
-        off exponentially (GAP_PROBE_BACKOFF_BASE, capped at REPROBE_INTERVAL)
-        so a permanently-missing one stops costing a subprocess spawn on every
-        tick; a True result clears its backoff.
+        off exponentially (GAP_PROBE_BACKOFF_BASE, capped at
+        GAP_PROBE_BACKOFF_MAX) so a permanently-missing one stops costing a
+        subprocess spawn on every tick; a True result clears its backoff.
         """
         specs = self._probe_specs()
         flipped = False
@@ -403,7 +408,7 @@ class PermissionProbe:
                 gap_failures[name] = failures
                 next_due[name] = now + min(
                     GAP_PROBE_BACKOFF_BASE * (2 ** (failures - 1)),
-                    REPROBE_INTERVAL,
+                    GAP_PROBE_BACKOFF_MAX,
                 )
             if old_value != new_value:
                 flipped = True
@@ -420,8 +425,10 @@ class PermissionProbe:
           means "every call"; an empty gap set is a no-op.
 
         The gap probe is what makes a late-arriving capability (libvirtd coming
-        up, sudoers granted) appear within ~one collection interval instead of
-        waiting for the 5-minute full-probe cycle.
+        up, sudoers granted) appear within ~GAP_PROBE_BACKOFF_MAX (2 minutes)
+        worst case instead of waiting for the 5-minute full-probe cycle; the
+        recheck token / SIGHUP force an immediate probe when the operator wants
+        instant detection.
         """
         now = time.time()
         if now - self._last_probe_time >= REPROBE_INTERVAL:

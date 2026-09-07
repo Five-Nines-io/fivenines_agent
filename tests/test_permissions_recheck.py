@@ -262,7 +262,7 @@ def test_gap_probe_backs_off_after_consecutive_false():
     assert probe._gap_probe_failures["qemu"] == 1
 
 
-def test_gap_probe_backoff_grows_and_caps_at_reprobe_interval():
+def test_gap_probe_backoff_grows_and_caps_at_backoff_max():
     probe = _probe_obj({"qemu": False})
     probe._gap_probe_failures = {}
     probe._gap_probe_next_due = {}
@@ -272,11 +272,14 @@ def test_gap_probe_backoff_grows_and_caps_at_reprobe_interval():
             probe._gap_probe_next_due.pop("qemu", None)
             probe._reprobe_capabilities({"qemu"})
     assert probe._gap_probe_failures["qemu"] == 6
-    # 60 * 2^5 = 1920 would exceed the full-probe cadence; capped at 300.
+    # 60 * 2^5 = 1920 would blind onboarding for half an hour; capped at 120
+    # so a just-granted permission still appears within ~2 minutes. Assert
+    # BOTH bounds: <= cap alone would also pass for a constant 60s backoff,
+    # silently reverting to per-minute probing.
     import time as _time
 
     remaining = probe._gap_probe_next_due["qemu"] - _time.time()
-    assert remaining <= perm.REPROBE_INTERVAL + 1
+    assert perm.GAP_PROBE_BACKOFF_MAX - 5 < remaining <= perm.GAP_PROBE_BACKOFF_MAX + 1
 
 
 def test_gap_probe_success_clears_backoff():

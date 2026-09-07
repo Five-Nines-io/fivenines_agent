@@ -272,10 +272,6 @@ def _sudo_probe(args, timeout=5):
         log(f"sudo -n {args[0]} probe failed: {e}", 'debug')
         return None
 
-def smartctl_available():
-    """Whether smartctl is installed and runnable via passwordless sudo."""
-    return _sudo_probe(["smartctl", "--version"]) is not None
-
 def nvme_cli_available():
     """Whether nvme-cli is installed and runnable via passwordless sudo."""
     return _sudo_probe(["nvme", "version"]) is not None

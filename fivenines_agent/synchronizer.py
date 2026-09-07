@@ -123,6 +123,14 @@ class Synchronizer(Thread):
         """
         if isinstance(data, (bytes, bytearray)):
             compressed_data = bytes(data)
+            # Keep the in-flight request visible to a debugging operator even
+            # on the pre-compressed path (the /collect common case).
+            if debug_enabled():
+                log(
+                    f"Sending request to {endpoint}: "
+                    f"<precompressed {len(compressed_data)} bytes>",
+                    "debug",
+                )
         else:
             # Gate on debug_enabled: log() checks the level only after the
             # argument is built, and str() of a full payload dict is real
@@ -168,7 +176,18 @@ class Synchronizer(Thread):
                 else:
                     raise _HTTPStatusError(f"HTTP {res.status}: {body}")
             except Exception as e:
-                self._discard_conn()
+                if isinstance(e, _HTTPStatusError):
+                    # The error body was fully drained (res.read() above), so
+                    # the connection itself is healthy and reusable. Closing
+                    # it here would make every retry against an ERRORING API
+                    # (a 429/500 burst) pay a fresh DNS + TCP + TLS handshake
+                    # -- a fleet-wide reconnect storm against a server that is
+                    # already struggling. If the server also sent
+                    # "Connection: close", auto_open=0 surfaces that as a
+                    # transport error on the next attempt, which rebuilds.
+                    pass
+                else:
+                    self._discard_conn()
                 if reused and not isinstance(e, _HTTPStatusError):
                     # A kept-alive socket the server closed between requests
                     # fails on first reuse. Rebuild once without consuming a
@@ -275,6 +294,18 @@ class Synchronizer(Thread):
                         hostname, timeout=self.config["request_options"]["timeout"]
                     )
                     conn.sock = sock
+                    # The connection is cached and reused across requests now.
+                    # Without this, a server-side "Connection: close" leaves
+                    # sock=None on the cached conn and http.client's auto_open
+                    # silently RECONNECTS through its own connect(): system
+                    # getaddrinfo (bypassing our resolver + IPv4/IPv6
+                    # fallback), a default system-CA context (bypassing the
+                    # bundled certifi trust root the PyInstaller build relies
+                    # on) and default port 443 (ignoring a custom api_url
+                    # port). auto_open=0 makes that state raise NotConnected
+                    # instead, which flows into _post's free stale-connection
+                    # rebuild through this function's intended path.
+                    conn.auto_open = 0
                     log(f"Connected via {record_type} ({api_ip})", "debug")
                     return conn
                 except Exception as e:
