@@ -32,6 +32,48 @@ Restart=always
 WatchdogSec=90
 NotifyAccess=all
 
+# --- Sandbox hardening -------------------------------------------------------
+# Conservative set only: every directive below is verified compatible with what
+# the agent (and the tools it spawns via sudo) actually does. Directives a
+# given systemd version does not know are logged as "Unknown key" and IGNORED,
+# so nothing here breaks CentOS 7-era systemd; it just gets less sandboxing.
+#
+# Deliberately ABSENT, do not add without re-testing:
+#   NoNewPrivileges     - breaks sudo smartctl/mdadm/fail2ban-client (setuid).
+#   CapabilityBoundingSet - same: sudo needs the full root set post-setuid for
+#                           SMART ioctls and md admin.
+#   ProtectSystem=full/strict - /etc goes read-only, breaking the TOKEN swap
+#                           and the state files under /etc/fivenines_agent
+#                           (ReadWritePaths needs systemd >= 231, and on older
+#                           systemd the exception would be IGNORED while the
+#                           read-only mount still applied -- silently degraded
+#                           enrollment on exactly the old-distro hosts).
+#   MemoryDenyWriteExecute - pynvml/libvirt load native code via ctypes/libffi.
+#
+# State files created by the agent (TOKEN swap, capture/inventory state) are
+# owner-only regardless of what the code passes to open().
+UMask=0077
+# The agent never uses /tmp; a private one removes a whole symlink/tmpfile
+# attack class for it and every child it spawns.
+PrivateTmp=true
+# Read-only view of home directories: the agent only expanduser()s for its own
+# user context, never writes there.
+ProtectHome=read-only
+# The agent only READS /proc/sys, /sys and /sys/fs/cgroup; mount them
+# read-only for the service (systemd >= 232, ignored below).
+ProtectKernelTunables=true
+ProtectControlGroups=true
+# Nothing the agent or its children do loads kernel modules, touches the
+# hardware clock, or reads /dev/kmsg (journal access goes through journalctl).
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+# No realtime scheduling, no personality(2), no new setuid FILES created
+# (executing existing setuid binaries like sudo still works).
+RestrictRealtime=true
+LockPersonality=true
+RestrictSUIDSGID=true
+
 Environment=PYTHONUNBUFFERED=1
 
 [Install]

@@ -552,3 +552,18 @@ def test_get_conn_disables_auto_open(mock_resolver, mock_socket, mock_api_url):
         conn = sync.get_conn()
     assert conn is not None
     assert conn.auto_open == 0
+
+
+@patch("fivenines_agent.synchronizer.config_dir")
+def test_swap_token_creates_file_owner_only(mock_config_dir, tmp_path):
+    """A freshly-created TOKEN must be 0600 regardless of umask: a reader with
+    the token can POST get_config and receive every service credential the
+    config carries."""
+    import os as os_module
+
+    mock_config_dir.return_value = str(tmp_path)
+    sync = make_synchronizer()
+    sync._swap_token("per-host-token")
+    mode = os_module.stat(tmp_path / "TOKEN").st_mode & 0o777
+    assert mode == 0o600
+    assert (tmp_path / "TOKEN").read_text() == "per-host-token"

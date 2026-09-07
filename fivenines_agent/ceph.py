@@ -36,6 +36,7 @@ import subprocess
 import time
 
 from fivenines_agent.cache import TTLCache
+from fivenines_agent.logs import redact
 from fivenines_agent.debug import log
 from fivenines_agent.subprocess_utils import get_clean_env
 
@@ -332,7 +333,15 @@ def _run_ceph(base, cmd, name):
 
     if proc.returncode != 0:
         stderr = (proc.stderr or "").strip()
-        return None, {"type": _classify_error(stderr), "message": stderr[:500]}
+        # Redact before the message rides the payload to the server: the
+        # config-supplied conf/keyring paths mean ceph may quote lines of
+        # whatever file it was pointed at into its parse errors (and legit
+        # ceph stderr can embed credentials from a broken conf). Classify on
+        # the RAW stderr so redaction can never change the error type.
+        return None, {
+            "type": _classify_error(stderr),
+            "message": redact(stderr)[:500],
+        }
 
     try:
         parsed = json.loads(proc.stdout)

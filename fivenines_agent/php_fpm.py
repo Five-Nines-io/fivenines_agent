@@ -55,6 +55,11 @@ from fivenines_agent.debug import debug, log
 # pool must never hang the whole collect tick.
 _TIMEOUT = 5
 
+# Byte cap for a status body (streamed read). A real `?json&full` page is a few
+# KB even with hundreds of workers; 1 MB is generous headroom while bounding a
+# misdirected URL.
+_MAX_STATUS_BYTES = 1024 * 1024
+
 # Sentinel status_page_url that switches the collector into pool.d
 # auto-discovery mode (case-insensitive).
 _AUTO = "auto"
@@ -391,14 +396,34 @@ def _fetch_status_body(endpoint):
 
 
 def _http_status_body(url):
+    # Streamed, redirects refused, byte-capped (the inference_metrics posture):
+    # the url is server-pushed config, so a hostile/mistaken value must not be
+    # able to bounce the agent to an internal address or stream an unbounded
+    # body into the long-lived daemon. A real FPM status page is a few KB.
     try:
-        response = requests.get(url, timeout=_TIMEOUT)
+        response = requests.get(
+            url, timeout=_TIMEOUT, stream=True, allow_redirects=False
+        )
     except Exception as e:
         log(f"PHP-FPM HTTP error for {url}: {e}", "error")
         return None
-    if response.status_code != 200:
+    try:
+        if response.status_code != 200:
+            return None
+        chunks = bytearray()
+        for chunk in response.iter_content(chunk_size=65536):
+            if not chunk:
+                continue
+            chunks += chunk
+            if len(chunks) > _MAX_STATUS_BYTES:
+                log(f"PHP-FPM status body exceeded {_MAX_STATUS_BYTES} bytes for {url}", "error")
+                return None
+        return chunks.decode("utf-8", "replace")
+    except Exception as e:
+        log(f"PHP-FPM HTTP read error for {url}: {e}", "error")
         return None
-    return response.text
+    finally:
+        response.close()
 
 
 def _normalize_pool(status):

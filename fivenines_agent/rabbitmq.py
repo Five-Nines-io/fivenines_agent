@@ -55,6 +55,7 @@ counters -- the server rate()s them; never diff or reset agent-side (#97 lesson)
 A queue with no ``message_stats`` (idle, never published) omits both keys.
 """
 
+import json
 import time
 from urllib.parse import quote
 
@@ -65,6 +66,12 @@ from fivenines_agent.debug import debug, log
 # Per-request timeout (seconds). A wedged broker must never stall the collect
 # loop; also bounds connection establishment on a dead host.
 _TIMEOUT = 5
+
+# Byte cap on any management-API response body (streamed read; see
+# _parse_json). The per-queue columns filter keeps real bodies small, but the
+# url is server-pushed config and a 50k-queue broker's unfiltered listing (or a
+# misdirected url) must not grow the daemon's RSS without bound.
+_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 
 # Wall-clock budget (seconds) for the whole collector's HTTP work. The four
 # fixed requests are each _TIMEOUT-bounded (~20s worst case), but the
@@ -206,7 +213,13 @@ def _http_get(session, url):
     Response is returned for the caller to interpret its status code.
     """
     try:
-        return session.get(url, timeout=_TIMEOUT)
+        # Streamed with redirects refused (the inference_metrics posture): the
+        # management url is server-pushed config, so it must not be able to
+        # bounce the agent to an internal address; the body is read under a
+        # byte cap in _parse_json rather than buffered unbounded.
+        return session.get(
+            url, timeout=_TIMEOUT, stream=True, allow_redirects=False
+        )
     except requests.exceptions.Timeout as e:
         raise _RabbitError("timeout", str(e))
     except requests.exceptions.ConnectionError as e:
@@ -227,9 +240,29 @@ def _check_status(status):
 
 
 def _parse_json(response):
-    """Parse a 200 body as JSON, mapping a malformed body to http_error."""
+    """Parse a 200 body as JSON, mapping a malformed or oversized body to
+    http_error. The body is streamed under _MAX_RESPONSE_BYTES: a queues
+    listing on a big broker is MBs, never the unbounded stream a misdirected
+    url could produce."""
+    chunks = bytearray()
     try:
-        return response.json()
+        for chunk in response.iter_content(chunk_size=65536):
+            if not chunk:
+                continue
+            chunks += chunk
+            if len(chunks) > _MAX_RESPONSE_BYTES:
+                raise _RabbitError(
+                    "http_error",
+                    f"response body exceeded {_MAX_RESPONSE_BYTES} bytes",
+                )
+    except _RabbitError:
+        raise
+    except Exception as e:
+        raise _RabbitError("http_error", f"body read failed: {e}")
+    finally:
+        response.close()
+    try:
+        return json.loads(chunks.decode("utf-8", "replace"))
     except ValueError:
         raise _RabbitError("http_error", "invalid JSON response")
 

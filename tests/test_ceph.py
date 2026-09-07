@@ -1204,3 +1204,22 @@ def test_contract_fixture_round_trip(clock):
             "osd_df_ok",
             "error",
         }
+
+
+def test_run_ceph_redacts_stderr_before_payload(monkeypatch):
+    """CLI stderr rides the payload to the server; the config-supplied
+    conf/keyring paths mean ceph may quote lines of whatever file it was
+    pointed at into its parse errors, so secrets are redacted first."""
+
+    class P:
+        returncode = 1
+        stdout = ""
+        stderr = "parse error near 'password=SuperSecret123' in /some/file"
+
+    monkeypatch.setattr(
+        ceph.subprocess, "run", lambda *a, **k: P()
+    )
+    parsed, error = ceph._run_ceph([], ["status"], "cluster1")
+    assert parsed is None
+    assert "SuperSecret123" not in error["message"]
+    assert "[REDACTED]" in error["message"]
