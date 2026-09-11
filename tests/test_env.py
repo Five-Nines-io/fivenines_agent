@@ -11,6 +11,7 @@ from fivenines_agent.env import (
     get_user_context,
     is_windows,
     os_family,
+    restrict_to_owner,
 )
 
 
@@ -187,3 +188,34 @@ def test_get_user_context_windows_getuser_fallback():
          patch.dict(os.environ, {"USERNAME": "envuser"}, clear=False):
         result = get_user_context(r"C:\x")
     assert result["username"] == "envuser"
+
+
+# --- restrict_to_owner -----------------------------------------------------
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="os.fchmod does not exist on Windows"
+)
+def test_restrict_to_owner_sets_0600_on_posix(tmp_path):
+    path = tmp_path / "state"
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT, 0o666)
+    try:
+        restrict_to_owner(fd)
+    finally:
+        os.close(fd)
+    assert os.stat(path).st_mode & 0o777 == 0o600
+
+
+def test_restrict_to_owner_is_a_noop_without_fchmod(tmp_path, monkeypatch):
+    """The Windows path: os.fchmod does not exist, so the helper must do
+    nothing rather than raise -- every caller is mid-write on a file it has
+    already truncated, and an exception there loses the file's contents."""
+    monkeypatch.delattr(os, "fchmod", raising=False)
+    path = tmp_path / "state"
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        restrict_to_owner(fd)  # must not raise
+        os.write(fd, b"still written")
+    finally:
+        os.close(fd)
+    assert path.read_bytes() == b"still written"

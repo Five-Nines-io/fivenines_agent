@@ -36,6 +36,27 @@ def config_dir():
 def env_file():
   return os.path.join(config_dir(), '.env')
 
+def restrict_to_owner(fd):
+  """Best-effort owner-only (0600) mode on an ALREADY-OPEN fd.
+
+  Shared by every config-dir state file the agent writes itself: the TOKEN
+  swap, the log-capture nonce and the image-inventory done set. Each one opens
+  with os.open(..., 0o600), which only applies the mode when the file is
+  CREATED, so this call is what heals a pre-existing file an older agent left
+  group/world-readable.
+
+  It has to be guarded, because os.fchmod is Unix-only and does not exist at
+  all on Windows. Calling it unguarded raised AttributeError from inside the
+  write path -- AFTER the O_TRUNC open had already emptied the file and BEFORE
+  the write -- so on Windows a token swap left an EMPTY TOKEN behind and the
+  agent lost its credential on the next restart. Skipping it there is correct
+  and not a compromise: Windows file security is ACL-based (POSIX modes are not
+  enforced), and the MSI provisions the config dir with util:PermissionEx for
+  Administrators + SYSTEM + the service account only.
+  """
+  if hasattr(os, 'fchmod'):
+    os.fchmod(fd, 0o600)
+
 def dry_run():
   # Check environment variable first
   if os.environ.get('DRY_RUN') == 'true':
