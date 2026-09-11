@@ -12,7 +12,7 @@ import certifi
 
 from fivenines_agent.debug import debug, debug_enabled, log
 from fivenines_agent.dns_resolver import DNSResolver
-from fivenines_agent.env import api_url, config_dir
+from fivenines_agent.env import api_url, config_dir, restrict_to_owner
 
 # gzip level for every POST body. The library default (9) is the slowest
 # setting for a ~2-5% size win on JSON; level 6 is the standard speed/ratio
@@ -233,10 +233,11 @@ class Synchronizer(Thread):
             # POST get_config and receive every service credential the config
             # carries.
             fd = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            # The os.open mode applies only when the file is CREATED; fchmod
+            # The os.open mode applies only when the file is CREATED; this
             # heals a pre-existing TOKEN an older agent left group/world-
-            # readable (idempotent, one syscall).
-            os.fchmod(fd, 0o600)
+            # readable (idempotent, one syscall, no-op where the platform has
+            # no POSIX modes -- see restrict_to_owner).
+            restrict_to_owner(fd)
             with os.fdopen(fd, "w") as f:
                 f.write(new_token)
             log("Token swapped successfully", "info")

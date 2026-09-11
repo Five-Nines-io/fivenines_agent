@@ -1,4 +1,4 @@
-"""Tests for the WireGuard peer health collector (#508 / agent #127).
+"""Tests for the WireGuard peer health collector (#508 / agent #127, #144).
 
 Only the subprocess boundary is mocked: every case feeds canned `wg show all
 dump` stdout back through the real parse -> payload pipeline, and the wg-quick
@@ -6,11 +6,15 @@ alias parse reads real files from tmp_path. The cross-repo round-trip lives in
 test_vpn_contract.py.
 """
 
+import os
 import subprocess
+from unittest.mock import patch
 
 import pytest
 
 from fivenines_agent import wireguard
+from fivenines_agent.permissions import PermissionProbe
+from fivenines_agent.subprocess_utils import get_clean_env
 from fivenines_agent.wireguard import wireguard_metrics
 
 NOW = 1786708800  # 2026-08-14T12:00:00Z
@@ -48,23 +52,272 @@ def _dump(*lines):
 def wg(monkeypatch, tmp_path):
     """Pin the clock, point the alias parse at tmp_path, install a fake `wg`.
 
-    Returns a callable that arms the next `wg show all dump` invocation.
+    Returns a callable that arms the next dump invocation; the argv of every
+    call the collector makes lands in `wg.calls`.
     """
-    monkeypatch.setattr(wireguard.shutil, "which", lambda _: "/usr/bin/wg")
+    looked_up = []
+
+    def fake_which(name):
+        # Honours its argument on purpose: a stub that ignores it lets the
+        # pre-check be keyed on the wrong binary (say `sudo`) with every test
+        # still green -- see test_only_wg_is_looked_up.
+        looked_up.append(name)
+        return "/usr/bin/wg" if name == "wg" else None
+
+    monkeypatch.setattr(wireguard.shutil, "which", fake_which)
     monkeypatch.setattr(wireguard.time, "time", lambda: NOW)
     monkeypatch.setattr(wireguard, "_WG_CONFIG_DIR", str(tmp_path))
 
+    calls = []
+    spawn_kwargs = []
+
     def install(stdout="", returncode=0, stderr="", raises=None):
-        def fake_run(*_args, **_kwargs):
+        def fake_run(cmd, *_args, **kwargs):
+            calls.append(list(cmd))
+            spawn_kwargs.append(kwargs)
             if raises is not None:
                 raise raises
             return subprocess.CompletedProcess(
-                ["wg", "show", "all", "dump"], returncode, stdout=stdout, stderr=stderr
+                cmd, returncode, stdout=stdout, stderr=stderr
             )
 
         monkeypatch.setattr(wireguard.subprocess, "run", fake_run)
 
+    install.calls = calls
+    install.kwargs = spawn_kwargs
+    install.looked_up = looked_up
     return install
+
+
+# --- privilege: one sudo-scoped command, not an ambient capability (#144) ---
+
+
+SUDO_ARGV = ["sudo", "-n", "wg", "show", "all", "dump"]
+
+
+def test_dump_is_read_through_sudo_with_the_exact_argv(wg):
+    """The argv is contract, not an implementation detail.
+
+    The rule operators are told to add pins the FULL command line
+
+        fivenines ALL=(root) NOPASSWD: /usr/bin/wg show all dump
+
+    deliberately, so that it grants this one read-only dump and denies `wg set`
+    and everything else. sudo matches it verbatim: an extra flag or a reordered
+    word here silently invalidates every deployed /etc/sudoers.d/fivenines and,
+    because sudo then refuses, turns every WireGuard host in the fleet dark on
+    one upgrade.
+
+    Until 1.17.6 this ran bare `wg` and leaned on
+    AmbientCapabilities=CAP_NET_ADMIN in the packaged unit -- granted to EVERY
+    install whether or not it monitored WireGuard, and inherited across execve
+    by every process the agent spawned.
+    """
+    wg(stdout=_dump(_iface_line(), _peer_line()))
+    assert wireguard_metrics() is not None
+    assert wg.calls == [SUDO_ARGV]
+
+
+def test_missing_sudoers_rule_is_a_collection_failure(wg):
+    """What an existing WireGuard host looks like immediately after upgrading,
+    before the operator adds the rule: `sudo -n` refuses instead of prompting.
+
+    It must read as a collection failure (null), never as {"peers": []} -- the
+    documented prune-all, which would mass-false-resolve every open
+    wireguard_peer_stale incident across a fleet whose tunnels are all fine.
+    """
+    wg(returncode=1, stderr="sudo: a password is required\n")
+    assert wireguard_metrics() is None
+
+
+def test_sudo_rule_for_a_different_command_is_a_collection_failure(wg):
+    """A rule that does not cover this exact argv (or covers another binary)
+    is refused by sudo with a non-zero exit, same null."""
+    wg(
+        returncode=1,
+        stderr=(
+            "Sorry, user fivenines is not allowed to execute "
+            "'/usr/bin/wg show all dump' as root on host.\n"
+        ),
+    )
+    assert wireguard_metrics() is None
+
+
+def test_sudo_not_installed_is_a_collection_failure(wg):
+    """Alpine ships no sudo by default, so the spawn itself raises. The
+    collector must swallow it into the same null rather than let an OSError out
+    of the tick."""
+    wg(raises=FileNotFoundError(2, "No such file or directory: 'sudo'"))
+    assert wireguard_metrics() is None
+
+
+def test_missing_wg_is_answered_without_spawning_sudo(monkeypatch, wg):
+    """No wireguard-tools is a definitive answer on its own, and it is the
+    state of nearly every host in a fleet -- none of them should pay a sudo
+    spawn per tick to be told so."""
+    wg(stdout="")
+    monkeypatch.setattr(wireguard.shutil, "which", lambda _: None)
+    assert wireguard_metrics() is None
+    assert wg.calls == []
+
+
+def test_sudo_own_warning_does_not_poison_a_good_read(wg):
+    """sudo can warn on a run it then completes successfully.
+
+    "sudo: unable to resolve host <name>" is printed on EVERY sudo call on a
+    box whose hostname is missing from /etc/hosts -- common on cloud images and
+    renamed VMs -- and the dump it prefixes is perfectly good. This collector
+    treats any stderr as a poisoned view, so without separating sudo's chatter
+    from wg's, moving the read behind sudo would have turned every such host
+    (working fine on 1.17.5) permanently null with a correct sudoers rule in
+    place.
+    """
+    wg(
+        stdout=_dump(_iface_line(), _peer_line()),
+        stderr="sudo: unable to resolve host wg-gw: Name or service not known\n",
+    )
+    payload = wireguard_metrics()
+    assert payload is not None
+    assert len(payload["peers"]) == 1
+
+
+def test_wg_stderr_alongside_sudo_noise_still_fails_the_tick(wg):
+    """Only sudo's own lines are excused. A line from `wg` about an interface
+    it could not read still means a partial view, hence null -- the excuse must
+    not become a hole in rule 2."""
+    wg(
+        stdout=_dump(_iface_line()),
+        stderr=(
+            "sudo: unable to resolve host wg-gw: Name or service not known\n"
+            "Unable to access interface wg1: Operation not permitted\n"
+        ),
+    )
+    assert wireguard_metrics() is None
+
+
+@pytest.mark.parametrize(
+    "stderr,expected",
+    [
+        (None, ("", "")),
+        ("", ("", "")),
+        ("   \n\n", ("", "")),
+        ("sudo: a password is required\n", ("", "sudo: a password is required")),
+        ("Unable to access interface wg0\n", ("Unable to access interface wg0", "")),
+        (
+            "sudo: unable to send audit message\nUnable to access interface wg0\n",
+            ("Unable to access interface wg0", "sudo: unable to send audit message"),
+        ),
+    ],
+)
+def test_split_sudo_stderr_separates_sudo_from_the_command(stderr, expected):
+    assert wireguard.split_sudo_stderr(stderr) == expected
+
+
+def test_dump_is_spawned_with_a_clean_env_and_a_timeout(wg):
+    """The spawn kwargs are contract, not decoration.
+
+    Dropping `env=get_clean_env()` is the nastiest silent regression available
+    here: under the PyInstaller binary -- the only shipped form -- the bundle's
+    LD_LIBRARY_PATH leaks into the sudo child, the loader complains on stderr
+    WITHOUT a `sudo:` prefix, `_split_stderr` therefore reads it as `wg` output,
+    and every host reports null forever with a green test suite. Dropping the
+    timeout un-bounds a tick that the systemd watchdog is counting.
+    """
+    wg(stdout=_dump(_iface_line(), _peer_line()))
+    assert wireguard_metrics() is not None
+    kwargs = wg.kwargs[0]
+    assert kwargs["timeout"] == wireguard.WG_DUMP_TIMEOUT
+    assert kwargs["env"] == get_clean_env()
+    assert "LD_LIBRARY_PATH" not in kwargs["env"]
+
+
+def test_only_wg_is_looked_up(wg):
+    """The pre-check must be keyed on wireguard-tools, not on sudo.
+
+    Keying it on `sudo` is a plausible slip now that the argv starts with sudo,
+    and it inverts the check: every wg-less host in the fleet would pay a sudo
+    spawn (and an error log) per tick, while an Alpine box that has `wg` but no
+    sudo would give up before trying.
+    """
+    wg(stdout=_dump(_iface_line(), _peer_line()))
+    assert wireguard_metrics() is not None
+    assert wg.looked_up == ["wg"]
+
+
+def test_missing_sudoers_rule_logs_at_error(wg):
+    """Error level, not debug: on a host that upgraded without the rule this
+    log line is the only local explanation for why WireGuard went dark, and the
+    default LOG_LEVEL hides debug."""
+    wg(returncode=1, stderr="sudo: a password is required\n")
+    with patch("fivenines_agent.wireguard.log") as mock_log:
+        assert wireguard_metrics() is None
+    level = mock_log.call_args[0][1]
+    message = mock_log.call_args[0][0]
+    assert level == "error"
+    assert "sudo" in message
+
+
+def test_a_wg_line_that_mentions_sudo_is_not_excused(wg):
+    """The classifier boundary, not just its two happy shapes.
+
+    `_split_stderr` excuses sudo's own diagnostics, which is a hole punched in
+    the load-bearing "any stderr means a poisoned view" rule -- so the hole has
+    to stay exactly one prefix wide. Relaxing `startswith` to a substring test
+    (the kind of tidy-up that reads harmless) would let a partial dump whose
+    EPERM line merely mentions sudo through as a full set, and the server
+    vanish-prunes every peer it could not see.
+    """
+    wg(
+        stdout=_dump(_iface_line()),
+        stderr="Unable to access interface sudo: Operation not permitted\n",
+    )
+    assert wireguard_metrics() is None
+    # The colon is part of the prefix: "sudo" alone would also excuse a `wg`
+    # line about an interface named sudo0.
+    assert wireguard._SUDO_STDERR_PREFIX.endswith(":")
+
+
+def test_readme_documents_the_exact_sudoers_command():
+    """The argv operators must grant lives in the README; a change here that
+    does not reach it ships a rule sudo will never match -- a host that reports
+    null WITH a rule installed, which is the hardest shape of this bug to
+    diagnose."""
+    readme = os.path.join(os.path.dirname(os.path.dirname(__file__)), "README.md")
+    with open(readme) as handle:
+        text = handle.read()
+    # Tag-agnostic on purpose: NOPASSWD/NOLOG_OUTPUT are operator policy and
+    # may gain entries, but the COMMAND sudo has to match is the collector's
+    # argv and nothing else.
+    assert f"/usr/bin/{' '.join(wireguard.WG_DUMP_ARGV)}" in text
+
+
+def test_probe_and_collector_run_the_same_command(wg):
+    """The capability probe and the collector must agree on the argv.
+
+    They are two literals in two modules and sudo matches the whole command
+    line, so drift is silent and one-sided: probing something SHORTER (say `wg
+    --version`) reports the capability AVAILABLE on a host where the real dump
+    is denied, and the dashboard shows a granted capability with no data behind
+    it -- the exact confusion the probe was added to remove.
+    """
+    probe = PermissionProbe.__new__(PermissionProbe)  # no __init__: probes nothing
+    method, args = probe._linux_probe_specs()["wireguard"]
+    # A partial over the shared helper, carrying the secret-output contract
+    # (stdout to DEVNULL, and the command's own stderr fails the probe) and the
+    # collector's own deadline -- a stricter probe would report a slow but
+    # healthy host as pending forever.
+    assert method.func == probe._can_run_sudo
+    assert method.keywords == {
+        "secret_output": True,
+        "timeout": wireguard.WG_DUMP_TIMEOUT,
+    }
+    # Not merely equal to the collector's argv: the SAME object. The probe
+    # imports the constant, so the two cannot drift apart at all.
+    assert args is wireguard.WG_DUMP_ARGV
+
+    wg(stdout="")
+    wireguard_metrics()
+    assert wg.calls == [["sudo", "-n", *args]]
 
 
 # --- collection failure vs honest empty ------------------------------------
@@ -98,7 +351,7 @@ def test_nonzero_exit_without_stderr_is_a_collection_failure(wg):
 def test_stderr_on_a_zero_exit_is_a_collection_failure(wg):
     """The privilege trap this collector is shaped around.
 
-    Without CAP_NET_ADMIN `wg` can still enumerate interface NAMES (an
+    Without the privilege `wg` can still enumerate interface NAMES (an
     unprivileged rtnetlink call) but not read them, so it prints a per-interface
     EPERM line and can still exit 0 having emitted a PARTIAL dump. The server
     reads a non-empty peers array as the FULL current set, so shipping that
@@ -323,8 +576,10 @@ def test_alias_absent_leaves_name_null(wg, tmp_path):
 
 
 def test_unreadable_config_leaves_name_null(wg):
-    """The normal case for an agent running as `fivenines` with only
-    CAP_NET_ADMIN: /etc/wireguard is 0700 root. Aliases degrade, peers do not."""
+    """The normal case for an agent running as `fivenines`: /etc/wireguard is
+    0700 root, and the sudoers rule grants one read-only dump command, not the
+    ability to read a directory full of private keys. Aliases degrade, peers do
+    not."""
     wg(stdout=_dump(_iface_line(), _peer_line()))
     assert wireguard_metrics()["peers"][0]["name"] is None
 

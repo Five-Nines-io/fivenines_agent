@@ -4,7 +4,7 @@ import subprocess
 import time
 import re
 from fivenines_agent.debug import debug, log
-from fivenines_agent.subprocess_utils import get_clean_env
+from fivenines_agent.subprocess_utils import get_clean_env, run_privileged
 
 _fail2ban_cache = {
     "timestamp": 0,
@@ -26,7 +26,7 @@ def get_fail2ban_version() -> str:
     if _version_cache is not None:
         return _version_cache
     try:
-        result = subprocess.run(
+        result = run_privileged(
             ["sudo", "-n", "fail2ban-client", "version"],
             capture_output=True,
             text=True,
@@ -63,7 +63,7 @@ def get_jail_list():
     every tick for no information this call does not already return.
     """
     try:
-        result = subprocess.run(
+        result = run_privileged(
             ["sudo", "-n", "fail2ban-client", "status"],
             capture_output=True,
             text=True,
@@ -92,7 +92,7 @@ def get_jail_list():
 def get_jail_status(jail_name: str):
     """Get detailed status for a specific jail."""
     try:
-        result = subprocess.run(
+        result = run_privileged(
             ["sudo", "-n", "fail2ban-client", "status", jail_name],
             capture_output=True,
             text=True,

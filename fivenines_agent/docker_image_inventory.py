@@ -40,6 +40,7 @@ import docker
 
 from fivenines_agent.debug import log
 from fivenines_agent.docker import get_docker_client, invalidate_docker_client
+from fivenines_agent.env import restrict_to_owner
 from fivenines_agent.packages import (
     _DPKG_STATUS_ABSENT,
     get_packages_hash,
@@ -670,7 +671,7 @@ class ImageInventoryCoordinator:
                 fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
                 # Heal a stale temp file's mode (os.open's mode applies only
                 # at creation; os.replace carries the temp's mode over).
-                os.fchmod(fd, 0o600)
+                restrict_to_owner(fd)
                 with os.fdopen(fd, "w") as f:
                     f.write("\n".join(done))
                 os.replace(tmp_path, self.state_path)

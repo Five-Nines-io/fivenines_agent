@@ -6,7 +6,7 @@
 #          semodule -i fivenines_agent.pp -X 100
 # Then:    restorecon -Rv /opt/fivenines /etc/fivenines_agent
 
-policy_module(fivenines_agent, 1.2)
+policy_module(fivenines_agent, 1.3)
 
 ########################################################################
 # Required base-policy types (single block to avoid typeattributeset
@@ -72,7 +72,7 @@ allow fivenines_agent_t usr_t:dir { getattr search open read };
 allow fivenines_agent_t usr_t:file { getattr open read };
 allow fivenines_agent_t usr_t:lnk_file { getattr read };
 
-# sudo (for smartctl, mdadm, fail2ban-client, nvme)
+# sudo (for smartctl, mdadm, fail2ban-client, nvme, wg show all dump)
 allow fivenines_agent_t sudo_exec_t:file { getattr open read execute execute_no_trans map };
 
 ########################################################################
@@ -156,6 +156,29 @@ allow fivenines_agent_t dns_port_t:udp_socket name_bind;
 
 # Netlink for interface enumeration (psutil net_if_addrs, routing)
 allow fivenines_agent_t self:netlink_route_socket { create bind getattr read write nlmsg_read };
+
+########################################################################
+# WireGuard netlink read (#144)
+########################################################################
+# `sudo` changes the Unix credentials, not the SELinux domain. With the
+# execute_no_trans grants above, the `wg` child runs as root but stays confined
+# as fivenines_agent_t, so the kernel evaluates its CAP_NET_ADMIN check and its
+# GENERIC netlink socket against THIS domain. Without both rules the dump is
+# denied under enforcing even with a correct /etc/sudoers.d/fivenines rule, and
+# the collector reports null forever with no hint as to why.
+#
+# Scope caveat, deliberately recorded: SELinux capability rules are per-DOMAIN,
+# so this grants net_admin to the agent's domain rather than to `wg` alone --
+# less tight than the sudoers rule it accompanies. Narrowing it further needs a
+# dedicated transition domain for the privileged child (tracked in TODOS.md).
+# The Linux capability itself is still held only by the sudo child for the
+# duration of one read; the agent process never has it.
+allow fivenines_agent_t self:capability net_admin;
+# No nlmsg_* here: those message-level permissions exist only on the netlink
+# classes that carry them (netlink_route_socket above does), and checkmodule
+# rejects the whole policy with "permission nlmsg_read is not defined for class
+# netlink_generic_socket" -- which is how CI caught it.
+allow fivenines_agent_t self:netlink_generic_socket { create bind getattr setopt getopt read write };
 
 ########################################################################
 # Unix domain sockets (systemd notify, nscd, subprocess pipes)

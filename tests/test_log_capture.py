@@ -6,6 +6,9 @@ the disk persistence that makes it survive a Restart=always restart.
 """
 
 import os
+import sys
+
+import pytest
 
 from fivenines_agent.log_capture import CaptureCoordinator, evaluate_and_enqueue
 from fivenines_agent.synchronization_queue import SynchronizationQueue
@@ -189,6 +192,16 @@ def test_enqueue_handles_non_dict_logs_cfg(tmp_path):
     assert q.qsize() == 0
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "POSIX modes are not enforced on Windows (os.fchmod does not even "
+        "exist there); the config dir is protected by the MSI's "
+        "util:PermissionEx instead. The cross-platform half of this contract "
+        "-- that the file is still written when the mode cannot be set -- is "
+        "asserted by the companion test below."
+    ),
+)
 def test_persist_creates_state_file_owner_only(tmp_path):
     """State files under the config dir are created 0600 (umask-independent),
     matching machine_id and the TOKEN swap."""
@@ -202,3 +215,16 @@ def test_persist_creates_state_file_owner_only(tmp_path):
         os.umask(old_umask)
     assert (state.read_text()) == "cap-123"
     assert os.stat(state).st_mode & 0o777 == 0o600
+
+
+def test_persist_writes_the_file_where_fchmod_does_not_exist(tmp_path, monkeypatch):
+    """The Windows shape, reproduced on any platform.
+
+    os.fchmod is Unix-only. Called unguarded it raised AttributeError AFTER the
+    O_TRUNC open had emptied the file and BEFORE the write, so the nonce file
+    ended up EMPTY and every backend capture command replayed after a restart.
+    """
+    monkeypatch.delattr(os, "fchmod", raising=False)
+    state = tmp_path / "last_capture_id"
+    CaptureCoordinator(str(state))._persist("cap-123")
+    assert state.read_text() == "cap-123"

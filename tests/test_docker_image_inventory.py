@@ -12,6 +12,7 @@ import json
 import lzma
 import os
 import re
+import sys
 import tarfile
 import time
 from unittest.mock import MagicMock, patch
@@ -1645,6 +1646,16 @@ def test_build_inventory_invalidates_client_on_daemon_error():
     invalidate.assert_called_once()
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "POSIX modes are not enforced on Windows (os.fchmod does not even "
+        "exist there); the config dir is protected by the MSI's "
+        "util:PermissionEx instead. The cross-platform half of this contract "
+        "-- that the file is still written when the mode cannot be set -- is "
+        "asserted by the companion test below."
+    ),
+)
 def test_persist_done_set_is_owner_only(tmp_path):
     """The done-set file (and its temp sibling) are created 0600; os.replace
     preserves the temp file's mode."""
@@ -1658,3 +1669,13 @@ def test_persist_done_set_is_owner_only(tmp_path):
         os.umask(old_umask)
     assert state.read_text() == "sha256:abc"
     assert os.stat(state).st_mode & 0o777 == 0o600
+
+
+def test_persist_writes_the_file_where_fchmod_does_not_exist(tmp_path, monkeypatch):
+    """The Windows shape, reproduced on any platform: an unguarded os.fchmod
+    aborted the write, so the done set never persisted and every image was
+    re-extracted after a restart (see restrict_to_owner)."""
+    monkeypatch.delattr(os, "fchmod", raising=False)
+    state = tmp_path / "image_inventory_done"
+    ImageInventoryCoordinator(str(state)).mark_done("sha256:abc")
+    assert state.read_text() == "sha256:abc"
