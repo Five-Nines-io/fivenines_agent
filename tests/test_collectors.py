@@ -224,9 +224,13 @@ def test_collect_metrics_without_telemetry_unchanged():
 
 
 def _reset_skip_log():
-    from fivenines_agent.collectors import _logged_capability_skips
+    from fivenines_agent.collectors import (
+        _logged_capability_nulls,
+        _logged_capability_skips,
+    )
 
     _logged_capability_skips.clear()
+    _logged_capability_nulls.clear()
 
 
 def test_capability_false_skips_collector():
@@ -324,19 +328,21 @@ def test_capability_overrides_logs_journald():
     mock_fn.assert_not_called()
 
 
-def test_wireguard_capability_false_does_not_skip_collection():
-    """wireguard is probed (#144) but never gated: an enabled collector must
+def test_wireguard_capability_false_still_contributes_a_null_key():
+    """wireguard is probed (#144) but never GATED: an enabled collector must
     contribute its key even when the privilege is missing.
 
     data["wireguard"] = null is a COLLECTION FAILURE the server skips; an
     absent key is a different statement, and the contract fixture pins the
-    presence of the key to the config flag, not to the privilege. The collector
-    re-reads sudo every tick and reports the honest failure, so gating here
-    would only add a way for a stale or raced 5s probe to blank a host whose
-    tunnels are fine.
+    presence of the key to the config flag, not to the privilege.
+
+    What the agent does NOT do is run the collector anyway: the spawn is
+    guaranteed to be refused, and each refusal writes a sudo authentication
+    failure to the auth log (~1440/day, a fail2ban/Wazuh signature) on exactly
+    the VPN gateways this collects from. Same payload, no doomed spawn.
     """
     _reset_skip_log()
-    mock_fn = MagicMock(return_value=None)
+    mock_fn = MagicMock(return_value={"peers": []})
     registry = [("wireguard", [("wireguard", mock_fn, False)])]
     config = {"wireguard": True}
     permissions = {"wireguard": False}
@@ -345,8 +351,54 @@ def test_wireguard_capability_false_does_not_skip_collection():
     with patch("fivenines_agent.collectors.COLLECTORS", registry):
         collect_metrics(config, data, permissions=permissions)
 
-    mock_fn.assert_called_once()
+    mock_fn.assert_not_called()
     assert data == {"wireguard": None}
+
+
+def test_wireguard_runs_normally_when_the_capability_is_available():
+    """The skip is keyed on a KNOWN-False capability, nothing else: with the
+    rule granted the collector runs and its real payload travels."""
+    _reset_skip_log()
+    mock_fn = MagicMock(return_value={"peers": []})
+    registry = [("wireguard", [("wireguard", mock_fn, False)])]
+    data = {}
+
+    with patch("fivenines_agent.collectors.COLLECTORS", registry):
+        collect_metrics({"wireguard": True}, data, permissions={"wireguard": True})
+
+    mock_fn.assert_called_once()
+    assert data == {"wireguard": {"peers": []}}
+
+
+def test_capability_null_is_logged_once_per_process():
+    """Same reason the skip log is throttled: this fires on every tick of every
+    unconfigured host, and the state it reports does not change tick to tick."""
+    _reset_skip_log()
+    registry = [("wireguard", [("wireguard", MagicMock(), False)])]
+    config = {"wireguard": True}
+    permissions = {"wireguard": False}
+
+    with patch("fivenines_agent.collectors.COLLECTORS", registry):
+        with patch("fivenines_agent.collectors.log") as mock_log:
+            for _ in range(3):
+                collect_metrics(config, {}, permissions=permissions)
+
+    null_logs = [c for c in mock_log.call_args_list if "as null" in c.args[0]]
+    assert len(null_logs) == 1
+
+
+def test_gate_exempt_null_needs_the_capability_to_be_present_and_false():
+    """An absent capability key (Windows, or a probe that never ran) must NOT
+    suppress the collector -- only a probe that actually said False does."""
+    _reset_skip_log()
+    mock_fn = MagicMock(return_value={"peers": []})
+    registry = [("wireguard", [("wireguard", mock_fn, False)])]
+    data = {}
+
+    with patch("fivenines_agent.collectors.COLLECTORS", registry):
+        collect_metrics({"wireguard": True}, data, permissions={"cpu": True})
+
+    mock_fn.assert_called_once()
 
 
 def test_wireguard_is_the_only_gate_exempt_key():

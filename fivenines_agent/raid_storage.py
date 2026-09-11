@@ -3,7 +3,7 @@ import subprocess
 
 from fivenines_agent.cache import TTLCache
 from fivenines_agent.debug import debug, log
-from fivenines_agent.subprocess_utils import get_clean_env
+from fivenines_agent.subprocess_utils import get_clean_env, run_privileged
 
 
 _cache = TTLCache()
@@ -26,7 +26,7 @@ def get_mdadm_version():
     if _mdadm_version is not None:
         return _mdadm_version
     try:
-        result = subprocess.run(
+        result = run_privileged(
             ["sudo", "-n", "mdadm", "--version"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -121,7 +121,7 @@ def get_raid_info(device):
             "physical_disks": None
         }
 
-        detail_result = subprocess.run(
+        detail_result = run_privileged(
             ["sudo", "-n", "mdadm", "--detail", device],
             capture_output=True, text=True, check=True,
             timeout=_DATA_SUBPROCESS_TIMEOUT,

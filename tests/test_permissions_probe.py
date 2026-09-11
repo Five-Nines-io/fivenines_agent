@@ -167,6 +167,110 @@ def test_capability_hints_keys_are_known_capabilities():
         ), f"hint {hint_key!r} has no matching capability"
 
 
+def test_wireguard_probe_never_logs_the_dump_it_read():
+    """The probe runs the real `wg show all dump`, whose first line carries the
+    interface PRIVATE KEY and whose peer lines carry every PRESHARED KEY.
+
+    _can_run_sudo debug-logs a command's stdout, and env.log_level() returns
+    "debug" for the whole of --dry-run -- the command the README tells
+    operators to run and paste into a support ticket. So logging this one
+    probe's output would put a live private key on their terminal and in the
+    journal, defeating the stripping wireguard.py exists to do. Length only.
+    """
+    import subprocess as subprocess_module
+
+    from fivenines_agent.permissions import SECRET_OUTPUT_PROBES
+    from fivenines_agent.wireguard import WG_DUMP_ARGV
+
+    assert WG_DUMP_ARGV in SECRET_OUTPUT_PROBES
+
+    completed = MagicMock(returncode=0)
+    completed.stdout = None  # what DEVNULL yields
+    completed.stderr = b""
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen.update(kwargs)
+        return completed
+
+    probe = _new_probe_with({})
+    with patch(
+        "fivenines_agent.permissions.shutil.which", return_value="/usr/bin/wg"
+    ), patch("fivenines_agent.permissions.subprocess.run", fake_run), patch(
+        "fivenines_agent.permissions.log"
+    ):
+        assert probe._can_run_sudo(*WG_DUMP_ARGV, secret_output=True) is True
+
+    # The key never enters the process at all -- not captured, so it cannot be
+    # logged, cored, or read out of the agent's heap.
+    assert seen["stdout"] is subprocess_module.DEVNULL
+    assert seen["stderr"] is subprocess_module.PIPE
+
+
+def test_wireguard_probe_fails_on_a_partial_read_like_the_collector_does():
+    """`wg` exits 0 while printing a per-interface EPERM line when it can
+    enumerate interfaces but not read them. The collector calls that a poisoned
+    view and ships null, so the probe must not call it AVAILABLE -- otherwise
+    the dashboard shows a granted capability with no data behind it, which is
+    the confusion the probe was added to remove."""
+    from fivenines_agent.wireguard import WG_DUMP_ARGV
+
+    completed = MagicMock(returncode=0)
+    completed.stdout = None
+    completed.stderr = b"Unable to access interface wg0: Operation not permitted\n"
+
+    probe = _new_probe_with({})
+    probe._current_reason = None
+    with patch(
+        "fivenines_agent.permissions.shutil.which", return_value="/usr/bin/wg"
+    ), patch(
+        "fivenines_agent.permissions.subprocess.run", return_value=completed
+    ), patch(
+        "fivenines_agent.permissions.log"
+    ):
+        assert probe._can_run_sudo(*WG_DUMP_ARGV, secret_output=True) is False
+    assert "Operation not permitted" in probe._current_reason
+
+
+def test_wireguard_probe_tolerates_sudos_own_warning():
+    """The mirror image: sudo warns ("unable to resolve host" on a box whose
+    hostname is not in /etc/hosts) and still runs the command. The collector
+    tolerates that, so the probe must too -- otherwise the capability reads
+    UNAVAILABLE on a host that collects perfectly."""
+    from fivenines_agent.wireguard import WG_DUMP_ARGV
+
+    completed = MagicMock(returncode=0)
+    completed.stdout = None
+    completed.stderr = b"sudo: unable to resolve host wg-gw: Name or service not known\n"
+
+    probe = _new_probe_with({})
+    with patch(
+        "fivenines_agent.permissions.shutil.which", return_value="/usr/bin/wg"
+    ), patch(
+        "fivenines_agent.permissions.subprocess.run", return_value=completed
+    ), patch(
+        "fivenines_agent.permissions.log"
+    ):
+        assert probe._can_run_sudo(*WG_DUMP_ARGV, secret_output=True) is True
+
+
+def test_non_secret_sudo_probe_still_logs_its_stdout():
+    """The suppression is per-argv, not a blanket loss of diagnostics: a
+    version string is exactly what makes the other probes debuggable."""
+    completed = MagicMock(returncode=0)
+    completed.stdout = b"smartctl 7.4 2023-08-01 r5530"
+    completed.stderr = b""
+
+    probe = _new_probe_with({})
+    with patch("fivenines_agent.permissions.shutil.which", return_value="/usr/sbin/smartctl"), \
+         patch("fivenines_agent.permissions.subprocess.run", return_value=completed), \
+         patch("fivenines_agent.permissions.log") as mock_log:
+        assert probe._can_run_sudo("smartctl", "--version") is True
+
+    logged = " ".join(str(call.args[0]) for call in mock_log.call_args_list)
+    assert "smartctl 7.4" in logged
+
+
 def test_banner_lists_wireguard_with_its_sudoers_hint(capsys):
     """The reason wireguard is probed at all (#144).
 

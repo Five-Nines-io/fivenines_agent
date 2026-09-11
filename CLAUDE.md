@@ -185,6 +185,22 @@ from fivenines_agent.subprocess_utils import get_clean_env
 result = subprocess.run(cmd, env=get_clean_env(), ...)
 ```
 
+**Anything behind `sudo` goes through `run_privileged` instead** (#144):
+```python
+from fivenines_agent.subprocess_utils import run_privileged
+result = run_privileged(["sudo", "-n", *ARGV], timeout=10, stdout=..., text=True)
+```
+`subprocess.run(timeout=...)` does NOT bound a sudo child: sudo switches to
+full root before its sudoers lookup, so the kill CPython issues after the
+timeout returns EPERM, that PermissionError escapes the `TimeoutExpired`
+handler, and `Popen.__exit__` then waits with no timeout at all -- a wedged
+sudoers backend (LDAP/sssd) pins the single-threaded collection loop until the
+systemd watchdog SIGABRTs the agent into a `Restart=always` loop. Killing the
+process group does not help (root-owned too); NOT WAITING does. `run_privileged`
+runs the call in a daemon worker, abandons it at `timeout + 2s`, and raises the
+`TimeoutExpired` the caller was promised -- the `LIBVIRT_PROBE_TIMEOUT` pattern.
+Used by wireguard, smart_storage, raid_storage, fail2ban and `_can_run_sudo`.
+
 ### Config-Dir State Files
 Create owner-only and heal a pre-existing file's mode; never plain `open(path, "w")`:
 ```python

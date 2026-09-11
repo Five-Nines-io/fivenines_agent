@@ -61,6 +61,29 @@ copy cannot break its suite.
 - **Depends on:** agent PR for #127 merged (done); agent PR for #144 merged
 - **Files:** `fivenines-server/spec/fixtures/vpn_contract_payload.json` (NOT this repo)
 
+## P3: Narrow the SELinux net_admin grant to the privileged child (#144)
+
+`selinux/fivenines_agent.te` (v1.3) now grants `fivenines_agent_t`
+`self:capability net_admin` plus a `netlink_generic_socket` rule, because
+`sudo` changes Unix credentials but NOT the SELinux domain: with
+`execute_no_trans`, the `wg` child stays confined as `fivenines_agent_t`, so
+the kernel checks CAP_NET_ADMIN against that domain. Without those rules an
+enforcing RHEL/Rocky host reports null however correct its sudoers rule is.
+
+The grant is wider than the sudoers rule beside it: SELinux capability rules
+are per-domain, so the agent's whole domain carries net_admin even though only
+the `wg` child ever holds the Linux capability. Tightening it means a dedicated
+domain for the privileged child (`type fivenines_wg_t`, a transition on
+`wg_exec_t`, net_admin granted there only).
+
+Blocked on test capability, not on design: `ci/test-selinux-vm.sh` builds and
+loads the module but never exercises WireGuard, so neither the current rules
+nor a transition domain are verified against real AVCs. Do this together with
+an enforcing-mode WireGuard case in that VM job.
+
+- **Effort:** M (human) / M (CC), needs an enforcing VM
+- **Files:** `selinux/fivenines_agent.te`, `ci/test-selinux-vm.sh`
+
 ## P1: Server-side rollout for the WireGuard sudoers requirement (#144)
 
 Agent 1.17.6 drops `AmbientCapabilities=CAP_NET_ADMIN` from the packaged unit
@@ -85,8 +108,17 @@ timing is tied to the RELEASE, not to this merge: `fivenines_update.sh` pulls
 both the binary and `fivenines-agent.service` from R2 `latest/`, which the
 `sync-to-r2` job populates on a `v*` tag (GitHub raw `main` is only the
 fallback for an unreachable R2 -- and that URL was 404ing until #148 fixed it).
-So unit and binary arrive together in one update, with no skew window, and the
+So on the R2 path unit and binary arrive together in one update and the
 operator's only warning is whatever the dashboard and release notes say.
+
+One caveat that is NOT no-skew: `download_with_fallback` falls back to
+raw.githubusercontent `/main` when R2 is unreachable, and `main` updates at
+MERGE while R2 `latest/` updates at TAG. A host whose R2 fetch fails inside
+that window gets the new capability-less unit next to the old binary, which
+calls bare `wg` and has no sudo path at all -- it goes dark, and adding the
+sudoers rule does not fix it (the old binary never uses sudo). Tag promptly
+after merging, or point the unit fallback at `releases/latest/download`
+instead of `main`.
 
 - **Effort:** S (human) / S (CC)
 - **Depends on:** agent PR for #144 merged

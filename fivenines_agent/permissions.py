@@ -8,13 +8,19 @@ import shutil
 import subprocess
 import threading
 import time
+from functools import partial
 
 import psutil
 
 from fivenines_agent.debug import log
 from fivenines_agent.env import is_windows
 from fivenines_agent.qemu import DEFAULT_LIBVIRT_URI
-from fivenines_agent.subprocess_utils import get_clean_env
+from fivenines_agent.subprocess_utils import get_clean_env, run_privileged
+from fivenines_agent.wireguard import (
+    WG_DUMP_ARGV,
+    WG_DUMP_TIMEOUT,
+    split_sudo_stderr,
+)
 
 # Full re-probe interval in seconds (5 minutes): every capability is re-checked
 # on this cadence to catch regressions and newly-relevant capabilities.
@@ -47,6 +53,19 @@ LIBVIRT_PROBE_TIMEOUT = 3
 
 # Max chars for stdout/stderr in debug logs
 DEBUG_OUTPUT_LIMIT = 500
+
+# Default deadline for a `sudo -n` capability probe. A probe that reads a
+# version string answers instantly; the ceiling only exists so a slow sudoers
+# backend cannot stall the collection loop.
+SUDO_PROBE_TIMEOUT = 5
+
+# Probe argvs declared secret_output=True below: their STDOUT is key material.
+# `wg show all dump` prints the interface PRIVATE KEY as the second field of
+# every interface line and each peer's PRESHARED KEY as the third field of
+# every peer line -- exactly the two values wireguard.py strips before anything
+# can travel. Every other sudo probe reads a version string; this is the first
+# whose output is a secret.
+SECRET_OUTPUT_PROBES = frozenset({WG_DUMP_ARGV})
 
 # Endpoint schemes docker-py can actually dial. A configured socket_url or
 # DOCKER_HOST outside this set is a misconfiguration, not a remote daemon, and
@@ -282,14 +301,27 @@ class PermissionProbe:
             # SNMP polling - needs net-snmp CLI tools
             "snmp": (self._has_snmpget, ()),
             # WireGuard - needs passwordless sudo for the netlink dump (#144).
-            # The args are the EXACT argv the collector runs, because the
-            # sudoers rule pins the full command line (no wildcard): probing
-            # anything shorter, e.g. `wg --version`, would report available on
-            # a host where the real dump is denied. INFORMATIONAL ONLY -- this
-            # capability never gates collection (collectors.CAPABILITY_GATE_EXEMPT),
-            # it exists so a host missing the rule shows up as a pending
-            # capability with a hint instead of a silent null.
-            "wireguard": (self._can_run_sudo, ("wg", "show", "all", "dump")),
+            # The argv is IMPORTED from the collector, not re-spelled here: the
+            # sudoers rule pins the full command line (no wildcard), so probing
+            # anything shorter (e.g. `wg --version`) would report available on
+            # a host where the real dump is denied. Its stdout is key material
+            # and is never logged -- see SECRET_STDOUT_PROBES. INFORMATIONAL
+            # ONLY: this capability never gates collection (see
+            # collectors.CAPABILITY_GATE_EXEMPT), it exists so a host missing
+            # the rule shows up as a pending capability with a hint instead of
+            # a silent null.
+            "wireguard": (
+                partial(
+                    self._can_run_sudo,
+                    secret_output=True,
+                    # The collector's deadline, not the shorter probe default:
+                    # a hub whose dump legitimately takes 6s collects fine, and
+                    # a stricter probe would report it as a PENDING capability
+                    # forever while its data arrived normally.
+                    timeout=WG_DUMP_TIMEOUT,
+                ),
+                WG_DUMP_ARGV,
+            ),
             # Log monitoring - needs journald read access (systemd-journal group)
             "journald": (self._can_read_journal, ()),
             # systemd unit collection - needs systemd init + systemctl
@@ -484,10 +516,33 @@ class PermissionProbe:
             self._set_reason(f"{path}: {type(e).__name__}: {e}")
             return False
 
-    def _can_run_sudo(self, cmd, *args):
+    def _can_run_sudo(
+        self, cmd, *args, secret_output=False, timeout=SUDO_PROBE_TIMEOUT
+    ):
         """
         Check if we can run a command with sudo non-interactively.
         Uses sudo -n which fails immediately if password is required.
+
+        secret_output=True is for a command whose STDOUT is key material (today
+        only `wg show all dump`, see SECRET_OUTPUT_PROBES). It changes two
+        things, both for the same reason -- the probe needs a verdict, not the
+        data:
+
+        - stdout goes to DEVNULL, so the secret never enters the agent's memory
+          and cannot reach the debug log. env.log_level() is "debug" for the
+          whole of --dry-run, the command the README tells operators to run and
+          paste into a support ticket, and a LOG_LEVEL=debug host would have
+          written the key to its journal every full probe.
+        - stderr the COMMAND itself wrote fails the probe, not just a non-zero
+          exit. `wg` exits 0 while printing "Unable to access interface X:
+          Operation not permitted" for interfaces it can enumerate but not
+          read; the collector turns that partial view into null, so a probe
+          keyed on the exit status alone would advertise the capability as
+          AVAILABLE on a host whose every tick ships null -- the exact "granted
+          capability with no data behind it" confusion this probe exists to
+          remove. sudo's OWN diagnostics are split off first (a warning like
+          "sudo: unable to resolve host" accompanies a perfectly good run),
+          using the collector's own classifier so the two cannot disagree.
         """
         cmd_path = shutil.which(cmd)
         full_cmd = ["sudo", "-n", cmd, *args]
@@ -502,10 +557,18 @@ class PermissionProbe:
         log(f"_can_run_sudo: running '{full_cmd_str}'", "debug")
 
         try:
-            result = subprocess.run(
-                full_cmd, capture_output=True, timeout=5, env=get_clean_env()
+            result = run_privileged(
+                full_cmd,
+                timeout=timeout,
+                stdout=subprocess.DEVNULL if secret_output else subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=get_clean_env(),
             )
-            stdout = result.stdout.decode("utf-8", errors="ignore").strip()
+            stdout = (
+                ""
+                if secret_output
+                else result.stdout.decode("utf-8", errors="ignore").strip()
+            )
             stderr = result.stderr.decode("utf-8", errors="ignore").strip()
 
             log(f"_can_run_sudo: '{cmd}' returned code {result.returncode}", "debug")
@@ -521,21 +584,30 @@ class PermissionProbe:
                 )
 
             success = result.returncode == 0
+            command_stderr = ""
+            if success and secret_output:
+                # Same rule the collector applies: only what the COMMAND wrote
+                # counts against it, never sudo's own chatter.
+                command_stderr, _ = split_sudo_stderr(stderr)
+                if command_stderr:
+                    success = False
             log(
                 f"_can_run_sudo: '{cmd}' -> {'AVAILABLE' if success else 'UNAVAILABLE'}",
                 "debug",
             )
             if not success:
+                # Prefer what the command said over sudo's wrapper noise: on a
+                # partial read that IS the reason, and it is what the dashboard
+                # shows the operator.
+                said = command_stderr or stderr
                 detail = (
-                    stderr.splitlines()[0]
-                    if stderr
-                    else f"returncode {result.returncode}"
+                    said.splitlines()[0] if said else f"returncode {result.returncode}"
                 )
                 self._set_reason(f"sudo -n {cmd}: {detail}")
             return success
         except subprocess.TimeoutExpired:
-            log(f"_can_run_sudo: '{cmd}' timed out after 5s", "debug")
-            self._set_reason(f"sudo -n {cmd} timed out after 5s")
+            log(f"_can_run_sudo: '{cmd}' timed out after {timeout}s", "debug")
+            self._set_reason(f"sudo -n {cmd} timed out after {timeout}s")
             return False
         except Exception as e:
             log(f"_can_run_sudo: '{cmd}' exception: {type(e).__name__}: {e}", "debug")

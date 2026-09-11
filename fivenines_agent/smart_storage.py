@@ -3,7 +3,7 @@ import subprocess
 
 from fivenines_agent.cache import TTLCache
 from fivenines_agent.debug import debug, log
-from fivenines_agent.subprocess_utils import get_clean_env
+from fivenines_agent.subprocess_utils import get_clean_env, run_privileged
 
 
 _cache = TTLCache()
@@ -259,7 +259,7 @@ def _sudo_probe(args, timeout=5):
     sudoers is configured without ever prompting for a password.
     """
     try:
-        result = subprocess.run(
+        result = run_privileged(
             ["sudo", "-n", *args],
             capture_output=True, text=True, timeout=timeout,
             env=get_clean_env()
@@ -290,7 +290,7 @@ def list_storage_devices():
     """List all storage devices using smartctl."""
     devices = []
     try:
-        result = subprocess.run(
+        result = run_privileged(
             ['sudo', 'smartctl', '--scan'],
             capture_output=True, timeout=_DATA_SUBPROCESS_TIMEOUT,
             env=get_clean_env()
@@ -312,7 +312,7 @@ def is_nvme_device(device):
 def get_nvme_enhanced_info(device):
     """Get additional NVMe-specific information using nvme-cli."""
     try:
-        result = subprocess.run(
+        result = run_privileged(
             ["sudo", "nvme", "smart-log", device, "-o", "json"],
             capture_output=True, text=True, check=True,
             timeout=_DATA_SUBPROCESS_TIMEOUT,
@@ -348,7 +348,7 @@ def get_storage_info(device, nvme_available=lambda: False):
         results = {
             "device": device.split('/')[-1]
         }
-        proc_result = subprocess.run(
+        proc_result = run_privileged(
             ['sudo', 'smartctl', '-A', '-H', device],
             capture_output=True, text=True,
             timeout=_DATA_SUBPROCESS_TIMEOUT,
@@ -494,7 +494,7 @@ def get_nvme_cli_version():
 def get_storage_identification(device):
     """Get storage device identification using smartctl."""
     try:
-        result = subprocess.run(
+        result = run_privileged(
             ["sudo", "smartctl", "-i", device],
             capture_output=True, text=True, check=True,
             timeout=_DATA_SUBPROCESS_TIMEOUT,

@@ -98,7 +98,7 @@ To auto-start on reboot, add to crontab (`crontab -e`):
 @reboot ~/.local/fivenines/start.sh
 ```
 
-> **Note:** User-level installation has limited monitoring capabilities. Features requiring sudo (SMART, RAID) won't be available. See [Permissions](#permissions) section.
+> **Note:** User-level installation has limited monitoring capabilities. Features requiring sudo (SMART, RAID, fail2ban, WireGuard) are unavailable unless you add a sudoers rule naming your own user. See [Permissions](#permissions) section.
 
 ### Windows Installation
 
@@ -270,8 +270,12 @@ rc-service fivenines-agent restart
 > Alpine 3.18 and older do not provide. CI builds and tests the Alpine amd64 and
 > arm64 binaries on Alpine 3.21.
 
-Under OpenRC the agent cannot be granted ambient capabilities the way the systemd
-unit does, so WireGuard peer health is unavailable unless the agent runs as root.
+WireGuard peer health works here as it does on systemd (agent **1.17.6+**): the
+dump is read through a `sudo` rule rather than a process capability, so install
+`sudo` (Alpine ships none) and add the rule from
+[Full Monitoring](#full-monitoring-recommended). Before 1.17.6 it depended on
+an ambient capability that OpenRC cannot grant to a non-root user, and was
+unavailable here unless the agent ran as root.
 
 ### UNRAID
 
@@ -282,6 +286,13 @@ because UNRAID's root filesystem lives in RAM and is rebuilt on every boot:
 ```bash
 wget -T 3 -q https://releases.fivenines.io/latest/fivenines_setup.sh && bash fivenines_setup.sh TOKEN
 ```
+
+> **Note:** UNRAID rebuilds `/etc` from RAM on every boot, so a sudoers rule
+> written to `/etc/sudoers.d/fivenines` (see [Permissions](#permissions))
+> survives until the next reboot and then silently disappears -- SMART, RAID,
+> fail2ban and WireGuard would go back to reporting unavailable. Keep the rule
+> on the flash drive and re-install it at boot from `/boot/config/go`,
+> validating with `visudo -cf` before copying it into place.
 
 What it does differently:
 
@@ -422,7 +433,7 @@ Two optional rules, only if you monitor these features:
 
 ```
 fivenines ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client
-fivenines ALL=(root) NOPASSWD: /usr/bin/wg show all dump
+fivenines ALL=(root) NOPASSWD:NOLOG_OUTPUT: /usr/bin/wg show all dump
 ```
 
 The WireGuard rule pins the **exact command**, on purpose: `sudo` matches the
@@ -432,10 +443,21 @@ rule for `/usr/bin/wg` alone would hand over the ability to reconfigure
 tunnels, and a rule with different arguments is simply not matched (the agent
 then reports a collection failure, never an empty peer list).
 
+`NOLOG_OUTPUT` matters only if your sudoers enables I/O logging
+(`Defaults log_output`, common in audited environments): `wg show all dump`
+prints the interface private key and every peer's preshared key, and sudo's
+I/O log would capture that output to disk before the agent ever sees it. The
+agent itself never stores or transmits those keys. Keep the tag even if you do
+not log I/O today -- it costs nothing and survives someone enabling it later.
+(Needs sudo 1.8.7+, which every supported distribution ships.)
+
 Check the binary paths on your distribution and adjust if needed
 (`command -v wg`, `command -v smartctl`); `wg` is `/usr/bin/wg` on
-Debian/Ubuntu, RHEL-family and Alpine. Note that `sudo` itself must be
-installed -- Alpine does not ship it by default.
+Debian/Ubuntu, RHEL-family and Alpine. Confirm the path you use is root-owned
+and in a root-only directory -- a rule pointing at a group-writable location
+(some hand-rolled `/usr/local/bin` setups) would let anyone who can write there
+run their own code as root. Note that `sudo` itself must be installed -- Alpine
+does not ship it by default.
 
 > **Upgrading from an agent older than 1.17.6?** The WireGuard rule is new in
 > **1.17.6**. Before that release the packaged systemd unit granted
@@ -1019,12 +1041,14 @@ for `smartctl`, `mdadm` and `fail2ban-client`. Add one rule to
 `/etc/sudoers.d/fivenines`:
 
 ```
-fivenines ALL=(root) NOPASSWD: /usr/bin/wg show all dump
+fivenines ALL=(root) NOPASSWD:NOLOG_OUTPUT: /usr/bin/wg show all dump
 ```
 
 `sudo` matches the full argument list, so that grants exactly this one
 read-only command and denies `wg set` and everything else. The agent process
-itself gets no capability.
+itself gets no capability. `NOLOG_OUTPUT` keeps the dump -- which contains the
+interface private key and every peer preshared key -- out of sudo's I/O log on
+hosts that enable one; see [Full Monitoring](#full-monitoring-recommended).
 
 Until 1.17.6 the bundled systemd unit granted
 `AmbientCapabilities=CAP_NET_ADMIN` instead. That line is gone: it applied to

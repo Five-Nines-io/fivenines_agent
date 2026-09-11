@@ -206,6 +206,9 @@ CAPABILITY_GATE_EXEMPT = frozenset({"wireguard"})
 # as skipped this process, to avoid per-tick log spam.
 _logged_capability_skips = set()
 
+# Same, for gate-exempt collectors reported as null without being run.
+_logged_capability_nulls = set()
+
 
 def _capability_key_for(config_key):
     return CAPABILITY_KEY_OVERRIDES.get(config_key, config_key)
@@ -221,6 +224,40 @@ def _is_capability_gated(config_key, permissions):
     if cap_key not in permissions:
         return False
     return not permissions[cap_key]
+
+
+def _gate_exempt_null(config_key, permissions):
+    """True when a gate-exempt collector's capability is already known False.
+
+    A gate-exempt collector must always contribute its key, so it cannot be
+    skipped the way a gated one is -- but RUNNING it on a host whose capability
+    the probe has already read as False buys nothing. The WireGuard collector
+    would spawn `sudo -n` every tick just to be refused, and each refusal
+    writes a sudo authentication failure to the auth log: ~1440/day, which is a
+    standard fail2ban/Wazuh/OSSEC alert signature, on exactly the VPN gateways
+    this collector exists for (and on Debian defaults it can mail root too).
+
+    So: emit the null the contract requires, skip the spawn. Nothing about the
+    payload changes -- the key is present and null either way, which is the
+    whole point of CAPABILITY_GATE_EXEMPT. The probe keeps re-checking on its
+    own backoff ladder, so a newly-granted sudoers rule is picked up within
+    ~2 minutes without the collector hammering sudo in the meantime.
+    """
+    if not permissions or config_key not in CAPABILITY_GATE_EXEMPT:
+        return False
+    cap_key = _capability_key_for(config_key)
+    return cap_key in permissions and not permissions[cap_key]
+
+
+def _log_capability_null_once(config_key):
+    if config_key in _logged_capability_nulls:
+        return
+    _logged_capability_nulls.add(config_key)
+    log(
+        f"Reporting '{config_key}' as null: capability unavailable "
+        "(not spawning the privileged command until the probe says otherwise)",
+        "info",
+    )
 
 
 def _log_capability_skip_once(config_key):
@@ -274,6 +311,13 @@ def collect_metrics(config, data, telemetry=None, permissions=None):
             continue
         if _is_capability_gated(config_key, permissions):
             _log_capability_skip_once(config_key)
+            continue
+        if _gate_exempt_null(config_key, permissions):
+            # The key must still travel (see CAPABILITY_GATE_EXEMPT); only the
+            # doomed privileged spawn is skipped.
+            _log_capability_null_once(config_key)
+            for data_key, _fn, _pass_kwargs in collectors:
+                data[data_key] = None
             continue
         for data_key, fn, pass_kwargs in collectors:
             if pass_kwargs and isinstance(config_value, dict):

@@ -53,20 +53,25 @@ import subprocess
 import time
 
 from fivenines_agent.debug import debug, log
-from fivenines_agent.subprocess_utils import get_clean_env
+from fivenines_agent.subprocess_utils import get_clean_env, run_privileged
 
 # Hard subprocess timeout (seconds). `wg` reads kernel state over netlink and
 # answers in milliseconds, so 10s is generous; the ceiling exists only so a
 # wedged call can never eat into the watchdog-bounded collect tick. Mirrors the
-# zfs/ceph SUBPROCESS_TIMEOUT posture.
-_SUBPROCESS_TIMEOUT = 10
+# zfs/ceph SUBPROCESS_TIMEOUT posture. PUBLIC so the capability probe can
+# share it: a probe stricter than the read it describes would report a slow
+# but healthy host as a pending capability forever.
+WG_DUMP_TIMEOUT = 10
 
 # The privileged read, as one argv. sudoers matches the full command line, so
 # this tuple IS the rule operators must grant (no wildcard, unlike the
 # `smartctl *` rules): changing it invalidates every deployed
-# /etc/sudoers.d/fivenines. permissions.py probes the same argv -- the two are
-# pinned together by test_probe_and_collector_run_the_same_command.
-_WG_DUMP_ARGV = ("wg", "show", "all", "dump")
+# /etc/sudoers.d/fivenines. PUBLIC because permissions.py imports it for the
+# capability probe -- the probe MUST run the identical argv (anything shorter,
+# e.g. `wg --version`, would report the capability available on a host where
+# the real dump is denied), so this is one definition rather than two literals
+# and a test hoping they stay equal.
+WG_DUMP_ARGV = ("wg", "show", "all", "dump")
 
 # wg-quick config location, read best-effort for the operator alias only.
 _WG_CONFIG_DIR = "/etc/wireguard"
@@ -129,7 +134,8 @@ def _run_wg_dump():
     - a non-zero exit, which is what a MISSING SUDOERS RULE looks like: `sudo
       -n` prints "sudo: a password is required" (or "not allowed to execute")
       and exits 1 without ever prompting;
-    - ANY output on stderr.
+    - ANY output on stderr that `wg` itself wrote (sudo's own diagnostics are
+      split off first -- see below).
 
     That last rule is the load-bearing one. Without the privilege, `wg` can
     still enumerate interface NAMES (an unprivileged rtnetlink call) but not
@@ -137,9 +143,9 @@ def _run_wg_dump():
     permitted" per interface and can still exit 0 with empty or PARTIAL stdout.
     Treating that as a successful read would ship a short peer list, which the
     server is contractually required to read as a full set and vanish-prune.
-    Any stderr chatter therefore means "this view is not trustworthy" and the
-    tick reports null: a data gap is recoverable, a false prune resolves live
-    incidents. It also covers the one shape a privileged `wg` shares with an
+    Any stderr chatter FROM `wg` therefore means "this view is not trustworthy"
+    and the tick reports null: a data gap is recoverable, a false prune
+    resolves live incidents. It also covers the one shape a privileged `wg` shares with an
     unprivileged one: a partially-readable dump.
 
     The one thing that rule must NOT swallow is sudo's own chatter. sudo can
@@ -161,13 +167,13 @@ def _run_wg_dump():
         return None
 
     try:
-        result = subprocess.run(
-            ["sudo", "-n", *_WG_DUMP_ARGV],
+        result = run_privileged(
+            ["sudo", "-n", *WG_DUMP_ARGV],
+            timeout=WG_DUMP_TIMEOUT,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             check=False,
-            timeout=_SUBPROCESS_TIMEOUT,
             env=get_clean_env(),
         )
     except (OSError, subprocess.SubprocessError) as e:
@@ -186,7 +192,7 @@ def _run_wg_dump():
         )
         return None
 
-    stderr, sudo_noise = _split_stderr(result.stderr)
+    stderr, sudo_noise = split_sudo_stderr(result.stderr)
     if sudo_noise:
         # Harmless on its own (sudo ran the command anyway), but worth a line:
         # it is the thing an operator would otherwise see quoted in a scarier
@@ -199,11 +205,15 @@ def _run_wg_dump():
     return result.stdout or ""
 
 
-def _split_stderr(stderr):
-    """Split a dump's stderr into (what `wg` said, what sudo said).
+def split_sudo_stderr(stderr):
+    """Split a sudo-wrapped command's stderr into (from the command, from sudo).
 
-    Only the first half decides the tick. See _run_wg_dump: sudo's own
-    diagnostics can accompany a successful run, `wg`'s cannot.
+    Only the first half decides the outcome. See _run_wg_dump: sudo's own
+    diagnostics can accompany a successful run, `wg`'s cannot. PUBLIC because
+    permissions.py applies the identical rule in the capability probe -- a
+    probe that keyed on the exit status alone would report the capability
+    AVAILABLE on a host where `wg` exits 0 with a partial view, i.e. where
+    every tick ships null.
     """
     from_wg = []
     from_sudo = []
