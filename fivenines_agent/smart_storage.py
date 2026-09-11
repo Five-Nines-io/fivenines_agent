@@ -272,10 +272,6 @@ def _sudo_probe(args, timeout=5):
         log(f"sudo -n {args[0]} probe failed: {e}", 'debug')
         return None
 
-def smartctl_available():
-    """Whether smartctl is installed and runnable via passwordless sudo."""
-    return _sudo_probe(["smartctl", "--version"]) is not None
-
 def nvme_cli_available():
     """Whether nvme-cli is installed and runnable via passwordless sudo."""
     return _sudo_probe(["nvme", "version"]) is not None
@@ -597,10 +593,10 @@ def smart_storage_health():
 
 
 def _compute_storage_health():
-    if not smartctl_available():
-        log("smartctl unavailable (not installed or no sudo permissions)", 'debug')
-        return []
-
+    # No separate smartctl_available() gate: that was one extra `sudo -n
+    # smartctl --version` spawn per tick duplicating both the capability gate
+    # in collectors.py and the failure handling in list_storage_devices()
+    # (which returns [] when smartctl is unusable).
     devices = list_storage_devices()
     if not devices:
         log("No storage devices found", 'error')

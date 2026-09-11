@@ -320,3 +320,41 @@ def test_debian_host_sends_nothing_when_dpkg_output_is_untrustworthy(
         packages_sync({"enabled": True, "packages": PACKAGES_CONFIG}, send_fn)
 
     send_fn.assert_not_called()
+
+
+# --- package-read TTL throttle ---
+
+
+@patch("fivenines_agent.packages.dry_run", return_value=False)
+@patch("fivenines_agent.packages.get_installed_packages")
+@patch("fivenines_agent.packages.get_distro")
+def test_package_read_throttled_within_ttl(mock_distro, mock_pkgs, mock_dry):
+    """Two ticks inside PACKAGES_REFRESH_INTERVAL share one package-DB read:
+    the expensive spawn+parse+sort+hash used to run before the unchanged-hash
+    short-circuit on EVERY tick."""
+    mock_distro.return_value = "debian:12"
+    mock_pkgs.return_value = [{"name": "openssl", "version": "3.0"}]
+    send_fn = MagicMock(return_value={"status": "queued"})
+    config = {"enabled": True, "packages": {"scan": True}}
+
+    packages_sync(config, send_fn)
+    packages_sync(config, send_fn)
+
+    mock_pkgs.assert_called_once()
+
+
+@patch("fivenines_agent.packages.dry_run", return_value=False)
+@patch("fivenines_agent.packages.get_installed_packages")
+@patch("fivenines_agent.packages.get_distro")
+def test_package_read_failure_not_cached(mock_distro, mock_pkgs, mock_dry):
+    """An empty/failed read must not be cached, or recovery would wait out the
+    whole TTL."""
+    mock_distro.return_value = "debian:12"
+    mock_pkgs.side_effect = [[], [{"name": "openssl", "version": "3.0"}]]
+    send_fn = MagicMock(return_value={"status": "queued"})
+    config = {"enabled": True, "packages": {"scan": True}}
+
+    packages_sync(config, send_fn)
+    send_fn.assert_not_called()
+    packages_sync(config, send_fn)  # retried immediately, not TTL-suppressed
+    send_fn.assert_called_once()

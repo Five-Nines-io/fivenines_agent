@@ -35,6 +35,14 @@ def interfaces():
     family = os_family()
     if family in ('linux', 'windows'):
         all_interfaces = psutil.net_if_stats()
+        # One getifaddrs(3) walk for the whole loop. Calling net_if_addrs()
+        # per interface was O(N^2): each call enumerates EVERY interface's
+        # addresses, so a Docker/K8s host with hundreds of veths paid hundreds
+        # of full walks per tick.
+        try:
+            addrs_map = psutil.net_if_addrs()
+        except Exception:
+            addrs_map = {}
         working_interfaces = []
 
         for interface, stats in all_interfaces.items():
@@ -42,11 +50,7 @@ def interfaces():
                 continue
             if _is_loopback(interface):
                 continue
-            try:
-                addrs = psutil.net_if_addrs().get(interface, [])
-                if not addrs:
-                    continue
-            except Exception:
+            if not addrs_map.get(interface):
                 continue
 
             working_interfaces.append(interface)

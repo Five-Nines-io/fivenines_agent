@@ -5,9 +5,21 @@ import json
 import shutil
 import subprocess
 
+from fivenines_agent.cache import TTLCache
 from fivenines_agent.debug import debug, log
 from fivenines_agent.env import dry_run, is_windows
 from fivenines_agent.subprocess_utils import get_clean_env
+
+# How often the full package database is re-read (seconds). packages_sync runs
+# every tick, but the expensive part -- spawning dpkg-query/rpm and parsing +
+# sorting + hashing ~2000 entries -- was paid BEFORE the unchanged-hash
+# short-circuit, i.e. ~1440 full reads/day for roughly one real change. The
+# TTL bounds change-detection latency at 15 minutes (fine for CVE inventory,
+# which the server processes on a slower cadence anyway) at 1/15th the cost.
+# Only successful reads are cached, so a transient failure retries next tick.
+PACKAGES_REFRESH_INTERVAL = 900
+
+_packages_cache = TTLCache()
 
 
 def packages_available():
@@ -572,6 +584,16 @@ def get_packages_hash(packages):
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+def _packages_with_hash():
+    """(packages, hash) for the current package set; ([], None) on a failed or
+    empty read. The tuple is what the TTL cache stores, so the hash is computed
+    once per refresh instead of once per tick."""
+    packages = get_installed_packages()
+    if not packages:
+        return [], None
+    return packages, get_packages_hash(packages)
+
+
 def packages_sync(config, send_packages_fn):
     """Sync installed packages if backend requests it via packages.scan."""
     packages_config = config.get("packages")
@@ -581,12 +603,18 @@ def packages_sync(config, send_packages_fn):
         return
 
     distro = get_distro()
-    packages = get_installed_packages()
+    packages, packages_hash = _packages_cache.get_or_compute(
+        "packages",
+        PACKAGES_REFRESH_INTERVAL,
+        _packages_with_hash,
+        # Never cache a failed/empty read: an empty list would suppress
+        # re-reads for the whole TTL and delay recovery after a transient
+        # package-manager error.
+        store_if=lambda value: value[1] is not None,
+    )
     if not packages:
         log("Packages synchronization: no packages found", "debug")
         return
-
-    packages_hash = get_packages_hash(packages)
     if packages_hash == packages_config.get("last_package_hash"):
         log("Packages synchronization: packages unchanged, skipping", "debug")
         return

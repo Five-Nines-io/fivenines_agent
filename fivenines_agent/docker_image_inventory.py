@@ -39,7 +39,7 @@ from threading import Lock
 import docker
 
 from fivenines_agent.debug import log
-from fivenines_agent.docker import get_docker_client
+from fivenines_agent.docker import get_docker_client, invalidate_docker_client
 from fivenines_agent.packages import (
     _DPKG_STATUS_ABSENT,
     get_packages_hash,
@@ -555,6 +555,14 @@ def build_image_inventory(job):
         return None
     except Exception as e:
         log(f"ImageInventory: cannot load container {container_id}: {e}", "error")
+        # The docker client cache is per-thread, and THIS thread (the uploader)
+        # is the only one that can heal its own slot: the collection loop's
+        # invalidate-on-failure cannot reach it. Without this, a daemon whose
+        # endpoint moved (rootless restart with a new XDG runtime dir) leaves
+        # the uploader pinned to the dead base_url forever -- every extraction
+        # fails until the digests burn max_attempts and image inventory
+        # silently dies until process restart.
+        invalidate_docker_client()
         return None
 
     return _build_payload(container, image_id)

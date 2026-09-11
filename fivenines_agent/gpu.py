@@ -14,6 +14,38 @@ except ImportError:
 # only once per agent process, not on every collection tick.
 _import_logged = False
 
+# NVML session state. nvmlInit/nvmlShutdown per tick costs a driver attach
+# every collection (~10-50ms) for no benefit; NVML is designed for a
+# long-lived session. Init once and keep it; on a session-level failure
+# (driver reload, GPU reset) _reset_nvml tears it down so the next tick
+# re-initializes cleanly. NVML init is reference-counted, so the 5-minute
+# permission probe's own init/shutdown cycle cannot close this session.
+_nvml_ready = False
+
+
+def _ensure_nvml():
+    """Initialize NVML once per process. True when the session is usable."""
+    global _nvml_ready
+    if _nvml_ready:
+        return True
+    try:
+        pynvml.nvmlInit()
+    except Exception:
+        return False
+    _nvml_ready = True
+    return True
+
+
+def _reset_nvml():
+    """Drop the NVML session after a session-level error so the next tick
+    starts fresh instead of reusing a dead handle forever."""
+    global _nvml_ready
+    _nvml_ready = False
+    try:
+        pynvml.nvmlShutdown()
+    except Exception:
+        pass
+
 
 def _safe(fn, *args):
     """Call an NVML function, returning None on any error."""
@@ -53,9 +85,7 @@ def gpu_metrics():
             log("pynvml not installed; NVIDIA GPU collection disabled", "info")
         return None
 
-    try:
-        pynvml.nvmlInit()
-    except Exception:
+    if not _ensure_nvml():
         return None
 
     try:
@@ -110,6 +140,7 @@ def gpu_metrics():
                 log(f"gpu: error collecting GPU {i}: {e!r}", "error")
         return gpus
     except Exception:
+        # A failure at this level (device count unreadable) means the session
+        # itself is broken -- driver reload, GPU reset. Re-init next tick.
+        _reset_nvml()
         return None
-    finally:
-        pynvml.nvmlShutdown()

@@ -97,8 +97,10 @@ def test_get_ip_cache_expired(mock_conn_cls):
 
     # First call populates the cache
     get_ip(ipv6=False)
-    # Expire the cache
-    ip_module._ip_v4_cache["timestamp"] = ip_module._now() - 120
+    # Expire the cache (positive TTL is 15 minutes)
+    ip_module._ip_v4_cache["timestamp"] = ip_module._now() - (
+        ip_module.POSITIVE_CACHE_TTL + 60
+    )
 
     get_ip(ipv6=False)
     assert mock_conn_cls.call_count == 2

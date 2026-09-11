@@ -244,3 +244,66 @@ def test_libvirt_probe_times_out():
         assert probe._current_reason == "libvirt probe timed out"
     finally:
         release.set()  # let the abandoned daemon worker finish
+
+
+# --- gap re-probe backoff ---
+
+
+def test_gap_probe_backs_off_after_consecutive_false():
+    """A capability that keeps probing False is not re-probed on the next call
+    (a sudo/subprocess spawn per tick, forever, without this)."""
+    probe = _probe_obj({"qemu": False})
+    with patch.object(
+        PermissionProbe, "_can_access_libvirt", return_value=False
+    ) as libvirt:
+        probe._reprobe_capabilities({"qemu"})
+        probe._reprobe_capabilities({"qemu"})  # inside the 60s backoff window
+    libvirt.assert_called_once()
+    assert probe._gap_probe_failures["qemu"] == 1
+
+
+def test_gap_probe_backoff_grows_and_caps_at_backoff_max():
+    probe = _probe_obj({"qemu": False})
+    probe._gap_probe_failures = {}
+    probe._gap_probe_next_due = {}
+    with patch.object(PermissionProbe, "_can_access_libvirt", return_value=False):
+        for _ in range(6):
+            # Force each attempt due by clearing the schedule's future stamp.
+            probe._gap_probe_next_due.pop("qemu", None)
+            probe._reprobe_capabilities({"qemu"})
+    assert probe._gap_probe_failures["qemu"] == 6
+    # 60 * 2^5 = 1920 would blind onboarding for half an hour; capped at 120
+    # so a just-granted permission still appears within ~2 minutes. Assert
+    # BOTH bounds: <= cap alone would also pass for a constant 60s backoff,
+    # silently reverting to per-minute probing.
+    import time as _time
+
+    remaining = probe._gap_probe_next_due["qemu"] - _time.monotonic()
+    assert perm.GAP_PROBE_BACKOFF_MAX - 5 < remaining <= perm.GAP_PROBE_BACKOFF_MAX + 1
+
+
+def test_gap_probe_success_clears_backoff():
+    probe = _probe_obj({"qemu": False})
+    with patch.object(PermissionProbe, "_can_access_libvirt", return_value=False):
+        probe._reprobe_capabilities({"qemu"})
+    assert "qemu" in probe._gap_probe_next_due
+    probe._gap_probe_next_due["qemu"] = 0  # due again
+    with patch.object(PermissionProbe, "_can_access_libvirt", return_value=True):
+        assert probe._reprobe_capabilities({"qemu"}) is True
+    assert "qemu" not in probe._gap_probe_next_due
+    assert "qemu" not in probe._gap_probe_failures
+
+
+def test_full_probe_clears_gap_backoff():
+    """force_refresh / the 5-minute full probe recheck everything, so stale
+    backoff must not suppress the very next gap probe."""
+    probe = _probe_obj({"qemu": False})
+    with patch.object(PermissionProbe, "_can_access_libvirt", return_value=False):
+        probe._reprobe_capabilities({"qemu"})
+    assert probe._gap_probe_next_due
+    with patch.object(
+        PermissionProbe, "_build_linux_capabilities", return_value={"qemu": False}
+    ):
+        probe._probe_all()
+    assert probe._gap_probe_next_due == {}
+    assert probe._gap_probe_failures == {}

@@ -9,6 +9,7 @@ import pytest
 
 import fivenines_agent.docker as docker_mod
 from fivenines_agent.docker import (
+    CLIENT_TIMEOUT,
     _block_io,
     _clean_name,
     _cpu_usage_percent,
@@ -21,6 +22,7 @@ from fivenines_agent.docker import (
     docker_containers,
     docker_metrics,
     get_docker_client,
+    invalidate_docker_client,
     rootless_socket_url,
 )
 
@@ -188,7 +190,7 @@ class TestGetDockerClient:
         client = MagicMock()
         mock_docker.from_env.return_value = client
         assert get_docker_client() is client
-        mock_docker.from_env.assert_called_once()
+        mock_docker.from_env.assert_called_once_with(timeout=CLIENT_TIMEOUT)
 
     @patch("fivenines_agent.docker.docker")
     def test_with_socket_url(self, mock_docker):
@@ -196,7 +198,7 @@ class TestGetDockerClient:
         mock_docker.DockerClient.return_value = client
         assert get_docker_client(socket_url="unix:///var/run/docker.sock") is client
         mock_docker.DockerClient.assert_called_once_with(
-            base_url="unix:///var/run/docker.sock"
+            base_url="unix:///var/run/docker.sock", timeout=CLIENT_TIMEOUT
         )
 
     @patch("fivenines_agent.docker.docker")
@@ -259,7 +261,7 @@ class TestRootlessSocketFallback:
         ):
             assert get_docker_client() is client
         mock_docker.DockerClient.assert_called_once_with(
-            base_url="unix:///run/user/1000/docker.sock"
+            base_url="unix:///run/user/1000/docker.sock", timeout=CLIENT_TIMEOUT
         )
         mock_docker.from_env.assert_not_called()
 
@@ -272,7 +274,9 @@ class TestRootlessSocketFallback:
             return_value="unix:///run/user/1000/docker.sock",
         ):
             assert get_docker_client(socket_url="unix:///custom.sock") is client
-        mock_docker.DockerClient.assert_called_once_with(base_url="unix:///custom.sock")
+        mock_docker.DockerClient.assert_called_once_with(
+            base_url="unix:///custom.sock", timeout=CLIENT_TIMEOUT
+        )
 
 
 # ===========================================================================
@@ -996,3 +1000,85 @@ def test_contract_failure_signal_is_null_payload():
     prune-safe empty dict."""
     assert _CONTRACT_SCENARIOS["daemon_unreachable"]["payload"] is None
     assert _CONTRACT_SCENARIOS["zero_containers"]["payload"] == {"containers": {}}
+
+
+# ===========================================================================
+# Collection deadline / client cache
+# ===========================================================================
+
+
+class TestCollectionDeadline:
+    def test_deadline_exceeded_returns_none_not_partial(self):
+        """A slow daemon must surface as a collection failure (None), never a
+        partial container map the server would prune against."""
+        c1 = _make_container("c1", _attrs(status="exited"))
+        c2 = _make_container("c2", _attrs(status="exited"))
+        client = _make_client([c1, c2], {"sha256:img": _make_image()})
+        with patch(
+            "fivenines_agent.docker.get_docker_client", return_value=client
+        ), patch("fivenines_agent.docker.previous_stats", {}), patch(
+            "fivenines_agent.docker.COLLECT_DEADLINE", -1
+        ):
+            assert docker_containers() is None
+
+
+class TestClientCache:
+    @patch("fivenines_agent.docker.docker")
+    def test_client_is_reused_across_calls(self, mock_docker):
+        client = MagicMock()
+        mock_docker.DockerClient.return_value = client
+        assert get_docker_client(socket_url="unix:///a.sock") is client
+        assert get_docker_client(socket_url="unix:///a.sock") is client
+        assert mock_docker.DockerClient.call_count == 1
+
+    @patch("fivenines_agent.docker.docker")
+    def test_socket_url_change_rebuilds_client(self, mock_docker):
+        old, new = MagicMock(), MagicMock()
+        mock_docker.DockerClient.side_effect = [old, new]
+        assert get_docker_client(socket_url="unix:///a.sock") is old
+        assert get_docker_client(socket_url="unix:///b.sock") is new
+        old.close.assert_called_once()
+
+    @patch("fivenines_agent.docker.docker")
+    def test_invalidate_swallows_close_errors(self, mock_docker):
+        client = MagicMock()
+        client.close.side_effect = OSError("gone")
+        mock_docker.DockerClient.return_value = client
+        get_docker_client(socket_url="unix:///a.sock")
+        invalidate_docker_client()  # must not raise
+        assert get_docker_client(socket_url="unix:///a.sock") is not None
+        assert mock_docker.DockerClient.call_count == 2
+
+    def test_list_failure_invalidates_cached_client(self):
+        client = _make_client([], list_error=RuntimeError("daemon gone"))
+        with patch(
+            "fivenines_agent.docker.get_docker_client", return_value=client
+        ) as get_client, patch(
+            "fivenines_agent.docker.invalidate_docker_client"
+        ) as invalidate:
+            assert docker_containers() is None
+        get_client.assert_called_once()
+        invalidate.assert_called_once()
+
+
+class TestTransportErrorHonesty:
+    def test_per_container_transport_error_returns_none(self):
+        """A read timeout on ONE container means the daemon side is sick; the
+        pass must return None (never-prune), not a partial map that reads as
+        the wedged container having been removed."""
+        import requests as requests_lib
+
+        wedged = _make_container(
+            "wedged",
+            _attrs(status="running"),
+            reload_error=requests_lib.exceptions.ReadTimeout("10s elapsed"),
+        )
+        ok = _make_container("ok", _attrs(status="exited"))
+        client = _make_client([wedged, ok], {"sha256:img": _make_image()})
+        with patch(
+            "fivenines_agent.docker.get_docker_client", return_value=client
+        ), patch("fivenines_agent.docker.previous_stats", {}), patch(
+            "fivenines_agent.docker.invalidate_docker_client"
+        ) as invalidate:
+            assert docker_containers() is None
+        invalidate.assert_called_once()

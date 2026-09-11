@@ -14,28 +14,17 @@ _fail2ban_cache = {
 CACHE_TTL = 60  # seconds
 
 
-def fail2ban_available() -> bool:
-    """
-    Check if fail2ban-client is available and we have permission to run it.
-    Uses sudo -n (non-interactive) to detect if sudoers is configured.
-    """
-    try:
-        result = subprocess.run(
-            ["sudo", "-n", "fail2ban-client", "status"],
-            capture_output=True,
-            timeout=5,
-            env=get_clean_env()
-        )
-        return result.returncode == 0
-    except subprocess.TimeoutExpired:
-        log("fail2ban-client availability check timed out", 'error')
-        return False
-    except Exception:
-        return False
+# fail2ban version, cached for the process lifetime once read successfully:
+# it only changes on a package upgrade, and every fetch is a sudo spawn of a
+# full Python CLI (~150-400ms).
+_version_cache = None
 
 
 def get_fail2ban_version() -> str:
-    """Get fail2ban version string."""
+    """Get fail2ban version string (cached per process)."""
+    global _version_cache
+    if _version_cache is not None:
+        return _version_cache
     try:
         result = subprocess.run(
             ["sudo", "-n", "fail2ban-client", "version"],
@@ -45,19 +34,34 @@ def get_fail2ban_version() -> str:
             env=get_clean_env()
         )
         if result.returncode == 0:
-            # Output is like "Fail2Ban v0.11.2"
+            # Output is like "Fail2Ban v0.11.2" (or just "0.11.2"). Require at
+            # least one dot: the old r'v?([\d.]+)' matched the lone "2" inside
+            # the word "Fail2Ban" first and reported version "2" -- worth
+            # fixing now that the value is cached for the process lifetime.
             version = result.stdout.strip()
-            match = re.search(r'v?([\d.]+)', version)
+            match = re.search(r'v?(\d+(?:\.\d+)+)', version)
             if match:
-                return match.group(1)
-            return version
+                _version_cache = match.group(1)
+            else:
+                _version_cache = version
+            return _version_cache
     except Exception as e:
         log(f"Error getting fail2ban version: {e}", 'debug')
+    # Not cached: a transient failure retries on the next fetch.
     return "unknown"
 
 
-def get_jail_list() -> list:
-    """Get list of active jails."""
+def get_jail_list():
+    """Get the list of active jails.
+
+    Returns a list ([] when fail2ban runs with zero jails) or None when
+    fail2ban-client itself is unusable (not installed, no sudo, daemon down).
+    The None/[] split lets the caller keep the payload contract ({} =
+    unavailable vs {"jails": []} = zero jails) WITHOUT a separate
+    fail2ban_available() probe -- that probe ran the exact same
+    `fail2ban-client status` command, doubling the sudo + CLI startup cost of
+    every tick for no information this call does not already return.
+    """
     try:
         result = subprocess.run(
             ["sudo", "-n", "fail2ban-client", "status"],
@@ -68,7 +72,7 @@ def get_jail_list() -> list:
         )
         if result.returncode != 0:
             log(f"fail2ban-client status failed: {result.stderr}", 'error')
-            return []
+            return None
 
         # Parse output like:
         # Status
@@ -82,10 +86,10 @@ def get_jail_list() -> list:
         return []
     except Exception as e:
         log(f"Error getting jail list: {e}", 'error')
-        return []
+        return None
 
 
-def get_jail_status(jail_name: str) -> dict:
+def get_jail_status(jail_name: str):
     """Get detailed status for a specific jail."""
     try:
         result = subprocess.run(
@@ -164,28 +168,27 @@ def fail2ban_metrics():
     if now - _fail2ban_cache["timestamp"] < CACHE_TTL:
         return _fail2ban_cache["data"]
 
-    if not fail2ban_available():
+    jails = get_jail_list()
+    if jails is None:
         log("fail2ban unavailable (not installed or no sudo permissions)", 'debug')
         data = {}
+    elif not jails:
+        log("No fail2ban jails found", 'debug')
+        data = {
+            "version": get_fail2ban_version(),
+            "jails": []
+        }
     else:
-        jails = get_jail_list()
-        if not jails:
-            log("No fail2ban jails found", 'debug')
-            data = {
-                "version": get_fail2ban_version(),
-                "jails": []
-            }
-        else:
-            jail_data = []
-            for jail in jails:
-                status = get_jail_status(jail)
-                if status:
-                    jail_data.append(status)
+        jail_data = []
+        for jail in jails:
+            status = get_jail_status(jail)
+            if status:
+                jail_data.append(status)
 
-            data = {
-                "version": get_fail2ban_version(),
-                "jails": jail_data
-            }
+        data = {
+            "version": get_fail2ban_version(),
+            "jails": jail_data
+        }
 
     _fail2ban_cache["timestamp"] = now
     _fail2ban_cache["data"] = data

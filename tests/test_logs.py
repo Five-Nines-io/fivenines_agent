@@ -418,3 +418,29 @@ def test_bundle_with_entries_builds_digest():
     assert bundle["digest"]["counts"]["error"] == 1
     assert bundle["digest"]["fingerprints"][0]["severity"] == "error"
     assert bundle["truncated"] is False
+
+
+# --- fingerprint memo (identical repeated lines) ---
+
+
+def test_build_digest_fingerprints_identical_lines_once(monkeypatch):
+    """Log storms repeat one raw line thousands of times; the per-call memo
+    must run the ~15-regex fingerprint pass once per distinct raw line while
+    keeping counts and grouping exact."""
+    real_fp = logs.fingerprint
+    calls = []
+
+    def counting_fp(message):
+        calls.append(message)
+        return real_fp(message)
+
+    monkeypatch.setattr(logs, "fingerprint", counting_fp)
+    entries = [{"priority": "3", "message": "disk full on /dev/sda1"}] * 200 + [
+        {"priority": "4", "message": "cache miss"}
+    ]
+    digest, truncated = build_digest(entries)
+    assert truncated is False
+    assert len(calls) == 2  # once per distinct raw line, not per entry
+    assert digest["counts"] == {"error": 200, "warn": 1, "info": 0}
+    storm = [f for f in digest["fingerprints"] if f["count"] == 200][0]
+    assert storm["severity"] == "error"

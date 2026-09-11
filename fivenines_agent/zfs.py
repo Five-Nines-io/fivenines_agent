@@ -365,10 +365,18 @@ def _zpool_list_summary():
     return res
 
 
-def get_zfs_pool_info(pool_name):
-    """Collect the health contract for a single ZFS pool."""
+def get_zfs_pool_info(pool_name, list_summary=None):
+    """Collect the health contract for a single ZFS pool.
+
+    *list_summary* is the (pool-keyed) result of _zpool_list_summary(); the
+    caller computes it once per tick and passes it down, since `zpool list`
+    reports ALL pools in one call -- re-running it per pool multiplied the
+    subprocess count by the pool count for identical output. None (tests,
+    direct calls) falls back to a fresh fetch.
+    """
     try:
-        list_summary = _zpool_list_summary()
+        if list_summary is None:
+            list_summary = _zpool_list_summary()
 
         # -p (parseable) is unsupported on very old ZFS; fall back to -PLv.
         status_cp = _run(["zpool", "status", "-pPLv", pool_name])
@@ -462,7 +470,9 @@ def _collect_zfs_pools():
         return []
 
     zfs_version = get_zfs_version()
-    infos = [get_zfs_pool_info(pool) for pool in pools]
+    # One `zpool list` for every pool this tick; it reports all pools anyway.
+    list_summary = _zpool_list_summary()
+    infos = [get_zfs_pool_info(pool, list_summary) for pool in pools]
     infos = [d for d in infos if d is not None]
     if not infos:
         # Pools exist but not one could be read -> collection failure.

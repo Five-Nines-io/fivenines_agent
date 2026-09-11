@@ -24,13 +24,73 @@ API, which is a later phase.
 """
 
 import os
+import threading
+import time
 
 import docker
+import requests
 
 from fivenines_agent.debug import debug, log
 
 # The rootful socket docker-py falls back to when DOCKER_HOST is unset.
 DEFAULT_SOCKET_PATH = "/var/run/docker.sock"
+
+# Per-request timeout for the Docker SDK. docker-py's default is 60s per API
+# call, and one tick makes 1 list + a reload (and stats, for running
+# containers) per container, all serial -- two wedged calls at the default
+# already exceed the systemd watchdog (90s). 10 rather than 5: the one
+# containers.list() per tick can legitimately take several seconds on a
+# loaded daemon with a large container graveyard, and a too-tight timeout
+# there would ship docker=null on every tick (frozen container rows) for as
+# long as the load lasts. Three wedged calls still trip COLLECT_DEADLINE
+# well under the watchdog.
+CLIENT_TIMEOUT = 10
+
+# Wall-clock budget for one collection pass. When exceeded we return None (a
+# collection failure the server never prunes on) rather than a PARTIAL
+# container map, which the server would read as the missing containers having
+# been removed. Bounds a merely-slow (not down) daemon: 500 containers at
+# 200ms/call is ~100s+ of tick time without this. 25, and checked TWICE per
+# iteration (loop top + after reload): one iteration makes up to three
+# CLIENT_TIMEOUT-bounded calls (reload, image inspect, stats), so a top-only
+# check could overshoot by ~3x CLIENT_TIMEOUT; with the mid-iteration check
+# the worst case is deadline + ~2 calls, comfortably under the 90s watchdog
+# alongside the other collectors.
+COLLECT_DEADLINE = 25
+
+# Per-thread cached client. The collection loop and the image-inventory
+# uploader thread both call get_docker_client; docker-py rides on a
+# requests.Session, so each thread keeps its own client rather than sharing
+# one. Rebuilding per call paid a client construction PLUS an API version
+# negotiation round-trip (docker-py resolves the server version on first use
+# with version=None) on every tick, and the old client's connection pool was
+# abandoned to the GC.
+_local = threading.local()
+
+
+def _client_key(socket_url):
+    """Cache key: the inputs that change which endpoint we would dial."""
+    return (
+        socket_url,
+        os.environ.get("DOCKER_HOST"),
+        os.environ.get("XDG_RUNTIME_DIR"),
+    )
+
+
+def invalidate_docker_client():
+    """Drop this thread's cached client so the next call reconnects fresh.
+    Called after daemon-level failures; requests would reconnect transparently
+    for most errors, but a full rebuild also re-runs socket resolution (the
+    daemon may have moved, e.g. rootless restart with a new XDG dir)."""
+    client = getattr(_local, "client", None)
+    _local.client = None
+    _local.client_key = None
+    if client is not None:
+        try:
+            client.close()
+        except Exception:
+            pass
+
 
 # Per-tick container cap. Running containers are always kept first; the rest are
 # taken newest-first (by Created). Bounds the payload on hosts with a large
@@ -81,17 +141,28 @@ def rootless_socket_url():
 
 
 def get_docker_client(socket_url=None):
+    key = _client_key(socket_url)
+    cached = getattr(_local, "client", None)
+    if cached is not None and getattr(_local, "client_key", None) == key:
+        return cached
+    # Endpoint inputs changed (or first call): drop any stale client first.
+    invalidate_docker_client()
     try:
         if socket_url:
-            return docker.DockerClient(base_url=socket_url)
-        rootless = rootless_socket_url()
-        if rootless:
-            log(f"Connecting to rootless Docker socket {rootless}", "debug")
-            return docker.DockerClient(base_url=rootless)
-        return docker.from_env()
+            client = docker.DockerClient(base_url=socket_url, timeout=CLIENT_TIMEOUT)
+        else:
+            rootless = rootless_socket_url()
+            if rootless:
+                log(f"Connecting to rootless Docker socket {rootless}", "debug")
+                client = docker.DockerClient(base_url=rootless, timeout=CLIENT_TIMEOUT)
+            else:
+                client = docker.from_env(timeout=CLIENT_TIMEOUT)
     except docker.errors.DockerException as e:
         log(f"Error connecting to Docker daemon: {e}", "error")
         return None
+    _local.client = client
+    _local.client_key = key
+    return client
 
 
 def _clean_name(name):
@@ -306,22 +377,69 @@ def docker_containers(socket_url=None):
         containers = client.containers.list(all=True, sparse=True)
     except Exception as e:
         log(f"Error listing Docker containers: {e}", "error")
+        # Rebuild the client next call: the daemon may have restarted or the
+        # socket may have moved, and a fresh client re-runs endpoint resolution.
+        invalidate_docker_client()
         return None
 
     containers = _cap_containers(containers)
 
+    deadline = time.monotonic() + COLLECT_DEADLINE
     entries = {}
     seen_ids = set()
     image_cache = {}
     for container in containers:
+        if time.monotonic() > deadline:
+            # A partial map must never ship: the server prunes containers
+            # missing from a dict payload, so a slow daemon would read as a
+            # mass container removal. None is the never-prune failure signal.
+            log(
+                f"Docker collection exceeded {COLLECT_DEADLINE}s budget after "
+                f"{len(entries)} of {len(containers)} containers; "
+                "reporting collection failure",
+                "error",
+            )
+            return None
         cid = container.id
         try:
             container.reload()
+            if time.monotonic() > deadline:
+                # Re-check between the reload and the (image inspect + stats)
+                # secondary calls: each is CLIENT_TIMEOUT-bounded, so a
+                # top-of-loop check alone could overshoot the budget by ~3
+                # timeouts on a wedged daemon.
+                log(
+                    f"Docker collection exceeded {COLLECT_DEADLINE}s budget "
+                    f"after {len(entries)} of {len(containers)} containers; "
+                    "reporting collection failure",
+                    "error",
+                )
+                return None
             entry = _build_entry(container, client, image_cache)
         except docker.errors.NotFound:
             log(f"Docker container {cid} vanished during collection, skipping", "debug")
             continue
+        except requests.exceptions.RequestException as e:
+            # Transport-level failure (read timeout on a wedged container, the
+            # daemon dying mid-pass): the daemon side is sick, not this one
+            # container. Skipping it would ship a PARTIAL map -- the server
+            # prunes containers missing from a dict payload, so a live-but-
+            # wedged container would read as removed and lose its alert state.
+            # Same contract as the deadline bail above: None, never partial.
+            # With the old 60s per-call default this path effectively never
+            # fired (the call blocked into the watchdog instead); the tighter
+            # CLIENT_TIMEOUT makes it reachable, so it must be honest.
+            log(
+                f"Docker transport error on container {cid}: {e}; "
+                "reporting collection failure",
+                "error",
+            )
+            invalidate_docker_client()
+            return None
         except Exception as e:
+            # Daemon answered but this one entry is unusable (malformed
+            # payload, a daemon-side per-container error). Per-item isolation:
+            # skip it, keep the rest.
             log(f"Error collecting Docker container {cid}: {e}", "error")
             continue
         entries[cid] = entry

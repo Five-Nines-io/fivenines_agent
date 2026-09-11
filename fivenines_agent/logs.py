@@ -138,11 +138,18 @@ def build_digest(entries):
     counts = {"error": 0, "warn": 0, "info": 0}
     groups = {}
     order = []
+    # Per-call memo: fingerprint() runs ~15 regex passes per message, and log
+    # storms repeat the same line thousands of times in one window. Keyed by
+    # the raw message, so identical lines pay the regex cost once per call.
+    fp_memo = {}
     for e in entries:
         sev = severity_from_priority(e.get("priority"))
         counts[sev] += 1
         message = e.get("message") or ""
-        fp = fingerprint(message)
+        fp = fp_memo.get(message)
+        if fp is None:
+            fp = fingerprint(message)
+            fp_memo[message] = fp
         group = groups.get(fp)
         if group is None:
             groups[fp] = {"count": 1, "severity": sev, "message": message}
@@ -335,13 +342,19 @@ def _signals_for_unit(entries):
     counts = {"error": 0, "warn": 0}
     groups = {}
     order = []
+    # Same per-call fingerprint memo as build_digest (repeated lines dominate
+    # exactly the windows this collector exists to flag).
+    fp_memo = {}
     for e in entries:
         sev = severity_from_priority(e.get("priority"))
         if sev not in counts:
             continue  # signals track error/warn only; info is dropped for size
         counts[sev] += 1
         message = e.get("message") or ""
-        fp = fingerprint(message)
+        fp = fp_memo.get(message)
+        if fp is None:
+            fp = fingerprint(message)
+            fp_memo[message] = fp
         group = groups.get(fp)
         if group is None:
             groups[fp] = {"count": 1, "severity": sev, "message": message}

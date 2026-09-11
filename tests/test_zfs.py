@@ -724,10 +724,11 @@ def test_storage_health_filters_none_pool_info(monkeypatch):
     monkeypatch.setattr(zfs.shutil, "which", lambda _: "/usr/sbin/zpool")
     monkeypatch.setattr(zfs, "get_zfs_version", lambda: "zfs-2.2.2")
     monkeypatch.setattr(zfs, "list_zfs_pools", lambda: ["good", "bad"])
+    monkeypatch.setattr(zfs, "_zpool_list_summary", lambda: {})
     monkeypatch.setattr(
         zfs,
         "get_zfs_pool_info",
-        lambda name: None if name == "bad" else {"name": name},
+        lambda name, list_summary=None: None if name == "bad" else {"name": name},
     )
     data = zfs.zfs_storage_health()
     assert data == [{"name": "good", "zfs_version": "zfs-2.2.2"}]
@@ -755,3 +756,19 @@ def test_storage_health_negative_interval_uses_default(monkeypatch):
     monkeypatch.setattr(zfs, "_run", _contract_run)
     data = zfs.zfs_storage_health(interval=-5)
     assert [p["name"] for p in data] == ["rpool", "tank"]
+
+
+def test_collect_calls_zpool_list_summary_once_for_all_pools(monkeypatch):
+    """One `zpool list` per tick regardless of pool count -- the whole point of
+    passing list_summary down; a regression to per-pool refetch would multiply
+    the subprocess count by the pool count for identical output."""
+    calls = []
+    monkeypatch.setattr(zfs.shutil, "which", lambda _: "/usr/sbin/zpool")
+    monkeypatch.setattr(zfs, "get_zfs_version", lambda: "zfs-2.2.2")
+    monkeypatch.setattr(zfs, "list_zfs_pools", lambda: ["rpool", "tank"])
+    monkeypatch.setattr(zfs, "_zpool_list_summary", lambda: calls.append(1) or {})
+    monkeypatch.setattr(
+        zfs, "get_zfs_pool_info", lambda name, list_summary=None: {"name": name}
+    )
+    zfs.zfs_storage_health()
+    assert len(calls) == 1

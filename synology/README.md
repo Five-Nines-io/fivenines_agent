@@ -44,7 +44,7 @@ The SPK is written to `./dist/synology/fivenines-agent-<version>-<arch>.spk`.
 1. Open Synology Package Center
 2. Click **Manual Install**
 3. Upload the `.spk` file
-4. Follow the wizard — enter your fivenines.io API token when prompted
+4. Follow the wizard -- enter your fivenines.io API token when prompted
 5. The agent starts automatically after installation
 
 The token is stored at `/var/packages/fivenines-agent/etc/TOKEN`.

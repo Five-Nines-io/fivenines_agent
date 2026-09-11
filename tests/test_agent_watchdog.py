@@ -75,3 +75,117 @@ def test_run_with_watchdog_present(mock_ps, mock_cm, mock_dr):
         mock_wd_instance.notify.assert_called()
     finally:
         agent_module.systemd_watchdog = original
+
+
+@patch("fivenines_agent.agent.systemd_inventory_sync", return_value=True)
+@patch("fivenines_agent.agent.dry_run", return_value=False)
+@patch("fivenines_agent.agent.collect_metrics")
+@patch("fivenines_agent.agent.packages_sync")
+def test_run_enqueues_precompressed_payload(mock_ps, mock_cm, mock_dr, mock_sis):
+    """The metric payload is gzip-compressed at enqueue time (small blobs in
+    the outage buffer, not full object graphs) and round-trips to JSON."""
+    import gzip
+    import json
+
+    agent = make_agent()
+    agent.config = {"enabled": True, "interval": 60}
+    agent.synchronizer.get_config.return_value = agent.config
+    agent._systemd_force_resend = False
+    # Everything landing in the payload must be JSON-serializable.
+    agent.permissions.get_reasons.return_value = {}
+
+    def stop_loop(_running_time):
+        agent_module.exit_event.set()
+
+    agent._wait_interval = stop_loop
+
+    original = agent_module.systemd_watchdog
+    try:
+        agent_module.systemd_watchdog = None
+        agent_module.exit_event.clear()
+        with pytest.raises(SystemExit):
+            agent.run()
+    finally:
+        agent_module.systemd_watchdog = original
+
+    # One enqueue from the loop, then the shutdown sentinel from _cleanup.
+    payload_calls = [c for c in agent.queue.put.call_args_list if c.args[0] is not None]
+    assert len(payload_calls) == 1
+    blob = payload_calls[0].args[0]
+    assert isinstance(blob, bytes)
+    decoded = json.loads(gzip.decompress(blob).decode("utf-8"))
+    assert decoded["version"] == "test"
+    assert "ts" in decoded and "running_time" in decoded
+
+
+@patch("fivenines_agent.agent.systemd_inventory_sync", return_value=True)
+@patch("fivenines_agent.agent.dry_run", return_value=False)
+@patch("fivenines_agent.agent.collect_metrics")
+@patch("fivenines_agent.agent.packages_sync")
+def test_run_dumps_payload_only_at_debug_level(
+    mock_ps, mock_cm, mock_dr, mock_sis, capsys
+):
+    """The per-tick pretty-printed payload dump (json.dumps, indent=2) is gated
+    on debug_enabled(): emitted at debug level, skipped at the default level
+    (where it would burn CPU building a message log() then discards)."""
+    agent = make_agent()
+    agent.config = {"enabled": True, "interval": 60}
+    agent.synchronizer.get_config.return_value = agent.config
+    agent._systemd_force_resend = False
+    agent.permissions.get_reasons.return_value = {}
+
+    def stop_loop(_running_time):
+        agent_module.exit_event.set()
+
+    agent._wait_interval = stop_loop
+
+    original = agent_module.systemd_watchdog
+    try:
+        agent_module.systemd_watchdog = None
+        agent_module.exit_event.clear()
+        with patch("fivenines_agent.debug.log_level", return_value="debug"):
+            with pytest.raises(SystemExit):
+                agent.run()
+    finally:
+        agent_module.systemd_watchdog = original
+
+    out = capsys.readouterr().out
+    assert '"version": "test"' in out  # the indent=2 payload dump made it out
+
+
+@patch("fivenines_agent.agent.systemd_inventory_sync", return_value=True)
+@patch("fivenines_agent.agent.dry_run", return_value=False)
+@patch("fivenines_agent.agent.collect_metrics")
+@patch("fivenines_agent.agent.packages_sync")
+def test_run_survives_unserializable_payload(mock_ps, mock_cm, mock_dr, mock_sis):
+    """A collector that leaks a non-JSON-serializable value must cost one
+    dropped tick, not the whole agent (serialization moved onto the main loop
+    with compress-at-enqueue)."""
+    agent = make_agent()
+    agent.config = {"enabled": True, "interval": 60}
+    agent.synchronizer.get_config.return_value = agent.config
+    agent._systemd_force_resend = False
+    agent.permissions.get_reasons.return_value = {}
+
+    def poison(config, data, telemetry=None, permissions=None):
+        data["bad"] = object()  # not JSON-serializable
+
+    mock_cm.side_effect = poison
+
+    def stop_loop(_running_time):
+        agent_module.exit_event.set()
+
+    agent._wait_interval = stop_loop
+
+    original = agent_module.systemd_watchdog
+    try:
+        agent_module.systemd_watchdog = None
+        agent_module.exit_event.clear()
+        with pytest.raises(SystemExit) as exc_info:
+            agent.run()
+        assert exc_info.value.code == 0  # clean shutdown, not a crash
+    finally:
+        agent_module.systemd_watchdog = original
+
+    payload_calls = [c for c in agent.queue.put.call_args_list if c.args[0] is not None]
+    assert payload_calls == []  # tick dropped, nothing enqueued

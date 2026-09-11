@@ -88,7 +88,11 @@ class TestGpuWithNvml:
         assert gpu["processes"][0] == {"pid": 1234, "memory_used": 500000000}
         assert gpu["processes"][1] == {"pid": 5678, "memory_used": 200000000}
 
-        nvml.nvmlShutdown.assert_called_once()
+        # The NVML session is kept alive across ticks: no per-tick shutdown,
+        # and a second collection reuses the existing init.
+        nvml.nvmlShutdown.assert_not_called()
+        gpu_mod.gpu_metrics()
+        nvml.nvmlInit.assert_called_once()
 
     def test_multi_gpu(self):
         """Collect metrics from multiple GPUs."""
@@ -173,8 +177,22 @@ class TestGpuWithNvml:
         assert "bad index" in error_calls[0].args[0]
         assert "GPU 0" in error_calls[0].args[0]
 
-    def test_nvml_shutdown_called_on_exception(self):
-        """nvmlShutdown is called even when nvmlDeviceGetCount raises."""
+    def test_session_error_resets_and_reinits_next_call(self):
+        """A session-level failure re-inits NVML on the next tick, and a
+        shutdown that itself raises is swallowed (best-effort teardown)."""
+        nvml = self.mock_nvml
+        nvml.nvmlDeviceGetCount.side_effect = [Exception("gpu reset"), 0]
+        nvml.nvmlShutdown.side_effect = Exception("also broken")
+
+        gpu_mod = self._import_gpu()
+        assert gpu_mod.gpu_metrics() is None  # error -> session reset
+        assert gpu_mod.gpu_metrics() == []  # fresh init, zero GPUs
+        assert nvml.nvmlInit.call_count == 2
+
+    def test_nvml_shutdown_called_on_session_error(self):
+        """A session-level error (nvmlDeviceGetCount raising) tears the NVML
+        session down via _reset_nvml -- the ONLY path that still calls
+        nvmlShutdown now that success keeps the session alive."""
         nvml = self.mock_nvml
         nvml.nvmlDeviceGetCount.side_effect = Exception("unexpected")
 

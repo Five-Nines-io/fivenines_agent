@@ -86,24 +86,28 @@ def test_interfaces_unknown_os_returns_empty():
         assert interfaces() == []
 
 
-def test_interfaces_skips_when_net_if_addrs_raises():
-    """A net_if_addrs lookup that raises continues to the next interface."""
-    stats = {"eth0": _ifstats(True), "broken": _ifstats(True)}
-
-    def fake_addrs():
-        # The implementation calls .get(name, []) on the dict, so we wrap
-        # in a class whose .get raises for 'broken'.
-        class _D(dict):
-            def get(self, k, default=None):
-                if k == "broken":
-                    raise OSError("nope")
-                return super().get(k, default)
-        return _D({"eth0": [object()]})
+def test_interfaces_empty_when_net_if_addrs_raises():
+    """net_if_addrs is fetched ONCE for the whole loop (the per-interface call
+    was O(N^2)); if that single fetch raises, no interface has a known address
+    and the list is empty."""
+    stats = {"eth0": _ifstats(True), "eth1": _ifstats(True)}
 
     with patch("fivenines_agent.network.os_family", return_value="linux"), \
          patch("fivenines_agent.network.psutil.net_if_stats", return_value=stats), \
-         patch("fivenines_agent.network.psutil.net_if_addrs", side_effect=fake_addrs):
-        assert interfaces() == ["eth0"]
+         patch("fivenines_agent.network.psutil.net_if_addrs", side_effect=OSError("nope")):
+        assert interfaces() == []
+
+
+def test_interfaces_calls_net_if_addrs_once():
+    """One getifaddrs walk per tick regardless of interface count."""
+    stats = {f"eth{i}": _ifstats(True) for i in range(5)}
+    addrs = {f"eth{i}": [object()] for i in range(5)}
+
+    with patch("fivenines_agent.network.os_family", return_value="linux"), \
+         patch("fivenines_agent.network.psutil.net_if_stats", return_value=stats), \
+         patch("fivenines_agent.network.psutil.net_if_addrs", return_value=addrs) as mock_addrs:
+        assert sorted(interfaces()) == sorted(stats.keys())
+    assert mock_addrs.call_count == 1
 
 
 # --- network() backward-compat (non-Linux: no sysfs enrichment) ---
