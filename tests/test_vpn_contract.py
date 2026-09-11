@@ -34,10 +34,21 @@ SCENARIOS = [
     "collection_failure",
 ]
 
-# What a real unprivileged / missing-interface `wg` invocation looks like. The
-# fixture expresses the failure as wg_show_all_dump: null; this is the stdout /
-# stderr / exit code that produces it.
-_WG_FAILURE_STDERR = "Unable to access interface wg0: Operation not permitted\n"
+# The exact argv the collector must run. Since #144 the dump goes through
+# `sudo -n` and the documented sudoers rule pins the FULL command line (no
+# wildcard), so this list is also the rule operators have to grant -- a change
+# here is a change to every deployed /etc/sudoers.d/fivenines.
+_WG_ARGV = ["sudo", "-n", "wg", "show", "all", "dump"]
+
+# What a real failed invocation looks like. The fixture expresses the failure as
+# wg_show_all_dump: null; this is the stdout / stderr / exit code that produces
+# it. Since #144 the canonical shape is sudo refusing for want of the sudoers
+# rule -- which is exactly what an existing WireGuard host looks like after
+# upgrading and before the operator adds it. (The other shapes -- an
+# unprivileged `wg` exiting 0 with a partial dump plus "Operation not
+# permitted" on stderr, a missing binary, a timeout -- are covered in
+# test_wireguard.py and all land on the same null.)
+_WG_FAILURE_STDERR = "sudo: a password is required\n"
 _TS_FAILURE_STDERR = (
     "failed to connect to local tailscaled; it doesn't appear to be running\n"
 )
@@ -52,19 +63,21 @@ def _completed(cmd, returncode, stdout, stderr):
     return subprocess.CompletedProcess(cmd, returncode, stdout=stdout, stderr=stderr)
 
 
-def _fake_run(expected_argv0, result):
-    """A subprocess.run stand-in pinned to one binary.
+def _fake_run(expected_argv, result):
+    """A subprocess.run stand-in pinned to one command line.
 
     `wireguard.subprocess` and `tailscale.subprocess` are the SAME module
     object, so patching one patches both. The helpers below re-patch
     immediately before each call, which is correct but leaves the ordering
     implicit -- this assertion makes it explicit, so a future refactor that
-    hoists both patches fails on the wrong-binary assert instead of on a
-    confusing payload mismatch.
+    hoists both patches fails on the wrong-command assert instead of on a
+    confusing payload mismatch. It compares the leading argv, so the WireGuard
+    side also pins the privileged command the sudoers rule must match.
     """
 
     def run(cmd, *_args, **_kwargs):
-        assert cmd[0] == expected_argv0, f"expected {expected_argv0}, got {cmd[0]}"
+        head = list(cmd[: len(expected_argv)])
+        assert head == list(expected_argv), f"expected {expected_argv}, got {cmd}"
         return result
 
     return run
@@ -78,14 +91,14 @@ def _run_wireguard(scenario, monkeypatch, tmp_path):
         (tmp_path / f"{name}.conf").write_text(text)
 
     if dump is None:
-        result = _completed(["wg"], 1, "", _WG_FAILURE_STDERR)
+        result = _completed(_WG_ARGV, 1, "", _WG_FAILURE_STDERR)
     else:
-        result = _completed(["wg"], 0, dump, "")
+        result = _completed(_WG_ARGV, 0, dump, "")
 
     monkeypatch.setattr(wireguard.shutil, "which", lambda _: "/usr/bin/wg")
     monkeypatch.setattr(wireguard.time, "time", lambda: raw["now"])
     monkeypatch.setattr(wireguard, "_WG_CONFIG_DIR", str(tmp_path))
-    monkeypatch.setattr(wireguard.subprocess, "run", _fake_run("wg", result))
+    monkeypatch.setattr(wireguard.subprocess, "run", _fake_run(_WG_ARGV, result))
     return wireguard.wireguard_metrics()
 
 
@@ -99,7 +112,7 @@ def _run_tailscale(scenario, monkeypatch):
 
     monkeypatch.setattr(tailscale.shutil, "which", lambda _: "/usr/bin/tailscale")
     monkeypatch.setattr(
-        tailscale.subprocess, "run", _fake_run("/usr/bin/tailscale", result)
+        tailscale.subprocess, "run", _fake_run(["/usr/bin/tailscale"], result)
     )
     return tailscale.tailscale_metrics()
 

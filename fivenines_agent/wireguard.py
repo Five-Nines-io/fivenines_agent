@@ -15,7 +15,7 @@ tests/fixtures/vpn_contract_payload.json):
    travels -- it is public by construction and is the peer's durable identity.
 
 2. null AND [] MEAN OPPOSITE THINGS. ``None`` is a COLLECTION FAILURE (`wg`
-   missing, no CAP_NET_ADMIN, timeout, a partial view) and the server touches
+   missing, sudo refused, timeout, a partial view) and the server touches
    nothing. ``{"peers": []}`` is a successful read of a host with genuinely zero
    peers and is the documented PRUNE-ALL. Reporting `[]` on a privilege failure
    would mass-false-resolve every open `wireguard_peer_stale` incident, so every
@@ -25,8 +25,25 @@ tests/fixtures/vpn_contract_payload.json):
    agent's own clock and anchored server-side to `received_at`, so a skewed
    agent clock can never make a dead tunnel look fresh.
 
-PRIVILEGE: `wg show all dump` needs root or CAP_NET_ADMIN. The packaged systemd
-unit grants ``AmbientCapabilities=CAP_NET_ADMIN`` rather than running as root.
+PRIVILEGE (agent #144): the WireGuard netlink GET needs root or CAP_NET_ADMIN,
+so the dump is read through ``sudo -n wg show all dump`` -- the same
+operator-granted, command-scoped pattern the agent already uses for smartctl,
+mdadm and fail2ban-client. sudo matches the FULL argv, so the documented rule
+
+    fivenines ALL=(root) NOPASSWD: /usr/bin/wg show all dump
+
+grants exactly this one read-only command and denies `wg set` and everything
+else. Until 1.17.6 the packaged systemd unit granted
+``AmbientCapabilities=CAP_NET_ADMIN`` instead, which (a) applied to EVERY
+install whether or not it monitored WireGuard and (b) being AMBIENT, was
+inherited across execve by every process the agent spawned -- "network root"
+(interfaces, routes, firewall rules, tc) left latent in the agent's whole
+process tree on exactly the hosts where it hurts most (VPN gateways,
+hypervisors). The privilege now exists only for the duration of one read.
+
+Without the sudoers rule `sudo -n` refuses immediately ("a password is
+required" on stderr, non-zero exit), which rule 2 and _run_wg_dump already
+resolve to null -- a collection failure, never an empty peer list.
 """
 
 import os
@@ -36,13 +53,25 @@ import subprocess
 import time
 
 from fivenines_agent.debug import debug, log
-from fivenines_agent.subprocess_utils import get_clean_env
+from fivenines_agent.subprocess_utils import get_clean_env, run_privileged
 
 # Hard subprocess timeout (seconds). `wg` reads kernel state over netlink and
 # answers in milliseconds, so 10s is generous; the ceiling exists only so a
 # wedged call can never eat into the watchdog-bounded collect tick. Mirrors the
-# zfs/ceph SUBPROCESS_TIMEOUT posture.
-_SUBPROCESS_TIMEOUT = 10
+# zfs/ceph SUBPROCESS_TIMEOUT posture. PUBLIC so the capability probe can
+# share it: a probe stricter than the read it describes would report a slow
+# but healthy host as a pending capability forever.
+WG_DUMP_TIMEOUT = 10
+
+# The privileged read, as one argv. sudoers matches the full command line, so
+# this tuple IS the rule operators must grant (no wildcard, unlike the
+# `smartctl *` rules): changing it invalidates every deployed
+# /etc/sudoers.d/fivenines. PUBLIC because permissions.py imports it for the
+# capability probe -- the probe MUST run the identical argv (anything shorter,
+# e.g. `wg --version`, would report the capability available on a host where
+# the real dump is denied), so this is one definition rather than two literals
+# and a test hoping they stay equal.
+WG_DUMP_ARGV = ("wg", "show", "all", "dump")
 
 # wg-quick config location, read best-effort for the operator alias only.
 _WG_CONFIG_DIR = "/etc/wireguard"
@@ -55,6 +84,15 @@ _MAX_CONFIG_BYTES = 1024 * 1024
 # interface name, so an interface line carries 5 fields and a peer line 9.
 _INTERFACE_FIELDS = 5
 _PEER_FIELDS = 9
+
+# sudo prefixes its OWN diagnostics with this. They have to be separated from
+# whatever `wg` wrote, because this collector treats any stderr as a poisoned
+# read (see _run_wg_dump) and sudo is perfectly capable of warning on a run it
+# then completes successfully -- "sudo: unable to resolve host <name>" on a box
+# whose hostname is not in /etc/hosts is the common one, and it would otherwise
+# have turned a working WireGuard host permanently null the moment the read
+# moved behind sudo.
+_SUDO_STDERR_PREFIX = "sudo:"
 
 # wg's sentinels for "unset".
 _NONE_SENTINEL = "(none)"
@@ -85,58 +123,106 @@ class _MalformedDump(Exception):
 
 
 def _run_wg_dump():
-    """Return `wg show all dump` stdout, or None on any failure or partial view.
+    """Return `sudo -n wg show all dump` stdout, or None on any failure.
 
     None is returned for four distinct outcomes, all of which are collection
     failures under the contract:
 
     - `wg` is not installed;
-    - the process could not be spawned, or timed out;
-    - a non-zero exit;
-    - ANY output on stderr.
+    - the process could not be spawned, or timed out (which covers a host with
+      no `sudo` at all -- Alpine ships none by default);
+    - a non-zero exit, which is what a MISSING SUDOERS RULE looks like: `sudo
+      -n` prints "sudo: a password is required" (or "not allowed to execute")
+      and exits 1 without ever prompting;
+    - ANY output on stderr that `wg` itself wrote (sudo's own diagnostics are
+      split off first -- see below).
 
-    That last rule is the load-bearing one. Without CAP_NET_ADMIN, `wg` can
+    That last rule is the load-bearing one. Without the privilege, `wg` can
     still enumerate interface NAMES (an unprivileged rtnetlink call) but not
     read them, so it prints "Unable to access interface wg0: Operation not
     permitted" per interface and can still exit 0 with empty or PARTIAL stdout.
     Treating that as a successful read would ship a short peer list, which the
     server is contractually required to read as a full set and vanish-prune.
-    Any stderr chatter therefore means "this view is not trustworthy" and the
-    tick reports null: a data gap is recoverable, a false prune resolves live
-    incidents.
+    Any stderr chatter FROM `wg` therefore means "this view is not trustworthy"
+    and the tick reports null: a data gap is recoverable, a false prune
+    resolves live incidents. It also covers the one shape a privileged `wg` shares with an
+    unprivileged one: a partially-readable dump.
+
+    The one thing that rule must NOT swallow is sudo's own chatter. sudo can
+    warn and still run the command to completion -- "sudo: unable to resolve
+    host <name>" on a host whose hostname is missing from /etc/hosts is common
+    -- and reading that as a poisoned dump would take a WireGuard host that
+    worked before this release and make it permanently null. Anything sudo
+    itself failed at is a NON-ZERO exit (handled above) and its diagnostics are
+    prefixed; every line `wg` writes about an interface it could not read is
+    not, and still fails the tick.
+
+    `wg` itself is looked up before sudo is spawned. It is a definitive answer
+    on its own (no wireguard-tools, no data) and it keeps the overwhelming
+    majority of hosts -- which have no WireGuard at all -- from paying a sudo
+    spawn per tick just to be told so.
     """
     if shutil.which("wg") is None:
         log("WireGuard: `wg` not found in PATH", "debug")
         return None
 
     try:
-        result = subprocess.run(
-            ["wg", "show", "all", "dump"],
+        result = run_privileged(
+            ["sudo", "-n", *WG_DUMP_ARGV],
+            timeout=WG_DUMP_TIMEOUT,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             check=False,
-            timeout=_SUBPROCESS_TIMEOUT,
             env=get_clean_env(),
         )
     except (OSError, subprocess.SubprocessError) as e:
-        log(f"WireGuard: `wg show all dump` failed: {e}", "error")
+        log(f"WireGuard: `sudo -n wg show all dump` failed: {e}", "error")
         return None
 
     if result.returncode != 0:
+        # The missing-sudoers-rule path. Error level (not debug) so an operator
+        # who enabled WireGuard monitoring but has not granted the rule sees
+        # why the host is dark; the capability probe reports the same thing as
+        # a pending capability with a hint.
         log(
-            "WireGuard: `wg show all dump` exited "
+            "WireGuard: `sudo -n wg show all dump` exited "
             f"{result.returncode}: {(result.stderr or '').strip() or 'no output'}",
             "error",
         )
         return None
 
-    stderr = (result.stderr or "").strip()
+    stderr, sudo_noise = split_sudo_stderr(result.stderr)
+    if sudo_noise:
+        # Harmless on its own (sudo ran the command anyway), but worth a line:
+        # it is the thing an operator would otherwise see quoted in a scarier
+        # error log, and on a host that also has a real problem both appear.
+        log(f"WireGuard: ignoring sudo diagnostics: {sudo_noise}", "debug")
     if stderr:
         log(f"WireGuard: incomplete `wg show all dump` view: {stderr}", "error")
         return None
 
     return result.stdout or ""
+
+
+def split_sudo_stderr(stderr):
+    """Split a sudo-wrapped command's stderr into (from the command, from sudo).
+
+    Only the first half decides the outcome. See _run_wg_dump: sudo's own
+    diagnostics can accompany a successful run, `wg`'s cannot. PUBLIC because
+    permissions.py applies the identical rule in the capability probe -- a
+    probe that keyed on the exit status alone would report the capability
+    AVAILABLE on a host where `wg` exits 0 with a partial view, i.e. where
+    every tick ships null.
+    """
+    from_wg = []
+    from_sudo = []
+    for line in (stderr or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        (from_sudo if line.startswith(_SUDO_STDERR_PREFIX) else from_wg).append(line)
+    return "\n".join(from_wg), "\n".join(from_sudo)
 
 
 def _clean(value):
@@ -286,10 +372,12 @@ def _read_wg_quick_config(interface):
     """Best-effort read of /etc/wireguard/<interface>.conf, or None.
 
     wg-quick configs are mode 0600 in a 0700 directory because they carry the
-    interface PRIVATE KEY, so an agent running as `fivenines` with only
-    CAP_NET_ADMIN gets None here and every peer alias stays null -- the server
-    then renders a short key fingerprint. That degradation is intentional: the
-    alias is a nicety, the peer's public key is its identity.
+    interface PRIVATE KEY, so an agent running as `fivenines` gets None here
+    and every peer alias stays null -- the server then renders a short key
+    fingerprint. That degradation is intentional: the alias is a nicety, the
+    peer's public key is its identity. This read is deliberately NOT routed
+    through sudo: the sudoers rule grants one read-only dump, not the ability
+    to read a file full of private keys.
     """
     if not interface or os.sep in interface or (os.altsep and os.altsep in interface):
         return None

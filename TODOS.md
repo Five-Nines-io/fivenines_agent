@@ -40,9 +40,17 @@ filled them in with the real `wg show all dump` / `tailscale status --json`
 inputs, added a `raw_contract` key documenting them, and updated one sentence of
 `description`. Everything the server actually READS (`agent_min_version`, the
 five contract docs, and every scenario's `description` / `config` / `payload`)
-is already byte-identical and was verified programmatically, so nothing is
+was byte-identical and verified programmatically, so nothing is
 broken today -- but the two copies have drifted in the agent-side inputs and the
 lockstep discipline says they must not.
+
+**Widened by #144 (agent 1.17.6).** Moving the WireGuard read to `sudo -n wg
+show all dump` changed no payload byte, but it did rewrite the prose the server
+copy also carries: `privilege_contract` (now the sudoers rule, not
+`AmbientCapabilities=CAP_NET_ADMIN`), the CAP_NET_ADMIN clauses in
+`null_contract` and `raw_contract`, and the `collection_failure` scenario
+`description`. Those are keys the server reads, so the drift is no longer
+confined to the agent-side inputs.
 
 Fix: copy `tests/fixtures/vpn_contract_payload.json` over
 `fivenines-server/spec/fixtures/vpn_contract_payload.json`. The server's
@@ -50,8 +58,57 @@ Fix: copy `tests/fixtures/vpn_contract_payload.json` over
 copy cannot break its suite.
 
 - **Effort:** XS (human) / XS (CC)
-- **Depends on:** agent PR for #127 merged
+- **Depends on:** agent PR for #127 merged (done); agent PR for #144 merged
 - **Files:** `fivenines-server/spec/fixtures/vpn_contract_payload.json` (NOT this repo)
+
+## P3: Narrow the SELinux net_admin grant to the privileged child (#144)
+
+`selinux/fivenines_agent.te` (v1.3) now grants `fivenines_agent_t`
+`self:capability net_admin` plus a `netlink_generic_socket` rule, because
+`sudo` changes Unix credentials but NOT the SELinux domain: with
+`execute_no_trans`, the `wg` child stays confined as `fivenines_agent_t`, so
+the kernel checks CAP_NET_ADMIN against that domain. Without those rules an
+enforcing RHEL/Rocky host reports null however correct its sudoers rule is.
+
+The grant is wider than the sudoers rule beside it: SELinux capability rules
+are per-domain, so the agent's whole domain carries net_admin even though only
+the `wg` child ever holds the Linux capability. Tightening it means a dedicated
+domain for the privileged child (`type fivenines_wg_t`, a transition on
+`wg_exec_t`, net_admin granted there only).
+
+Blocked on test capability, not on design: `ci/test-selinux-vm.sh` builds and
+loads the module but never exercises WireGuard, so neither the current rules
+nor a transition domain are verified against real AVCs. Do this together with
+an enforcing-mode WireGuard case in that VM job.
+
+- **Effort:** M (human) / M (CC), needs an enforcing VM
+- **Files:** `selinux/fivenines_agent.te`, `ci/test-selinux-vm.sh`
+
+## P2: Unit/binary skew through the GitHub raw fallback (#144)
+
+`fivenines_update.sh` fetches BOTH the binary and `fivenines-agent.service`
+via `download_with_fallback`: R2 `latest/` first, then
+raw.githubusercontent `/main`. Those two sources are versioned differently --
+R2 `latest/` is populated by the tag-triggered `sync-to-r2` job, `main`
+updates at merge -- so a host whose R2 fetch fails inside a merge-to-tag
+window can get a NEW unit next to an OLD binary.
+
+That combination is now load-bearing rather than cosmetic: since 1.17.6 the
+unit grants no capability and the binary is what supplies the `sudo -n` path.
+New unit + old binary means the old binary calls bare `wg` with no privilege
+and no sudo path, so WireGuard goes dark -- and adding the sudoers rule does
+NOT fix it, because that binary never uses sudo.
+
+Fix either way round: point the unit fallback at `releases/latest/download`
+(tag-gated, like the binary) instead of `/main`, or keep tagging immediately
+after merge so the window stays short. The first is the real fix; the second
+is what we rely on today.
+
+Found by the adversarial pass on #146, which also corrected the claim that
+unit and binary always travel together -- true only on the R2 path.
+
+- **Effort:** XS (human) / XS (CC)
+- **Files:** `fivenines_update.sh`, `fivenines_setup.sh`
 
 ## P1: Vendor the AI-inference contract fixtures into the server repo
 
