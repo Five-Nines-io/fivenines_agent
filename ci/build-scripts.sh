@@ -24,11 +24,14 @@ if [ ! -f "$COMMON" ]; then
     exit 1
 fi
 
-# Functions that must be byte-identical in every install script. The
-# checksum helpers are on this list deliberately: they are what stands
-# between a tampered tarball and a root-level extract, so a copy that
-# quietly drifts in one script is a security regression, not a style nit.
-SHARED_FUNCTIONS="detect_libc compute_sha256 sha256_from_sums verify_sha256 verify_agent_tarball"
+# Functions that must be byte-identical in every install script. The checksum
+# and signature helpers are on this list deliberately: they are what stands
+# between a tampered tarball and a root-level extract, so a copy that quietly
+# drifts in one script is a security regression, not a style nit.
+# release_signing_pubkey is here for the same reason - a public key pasted
+# into three scripts out of four leaves the fourth verifying nothing.
+SHARED_FUNCTIONS="detect_libc compute_sha256 sha256_from_sums verify_sha256 \
+release_signing_pubkey verify_sums_signature verify_agent_tarball"
 
 ERRORS=0
 

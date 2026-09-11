@@ -340,11 +340,15 @@ both mirrors:
 - the `SHA256SUMS` asset on the matching
   [GitHub release](https://github.com/Five-Nines-io/fivenines_agent/releases)
 
+A detached `SHA256SUMS.sig` is published next to each manifest; see
+[Signatures](#signatures) below.
+
 **The install and update scripts already do this for you** (install scripts
 from release **v1.17.7** onward -- the check lives in the scripts, so an older
-agent picks it up as soon as it is updated). Before anything is unpacked as root they fetch `SHA256SUMS` from
-the same mirror that served the tarball, compare the digest, and abort -- with
-the existing installation left exactly where it was -- if it does not match.
+agent picks it up as soon as it is updated). Before anything is unpacked as
+root they fetch `SHA256SUMS` and its signature from the same mirror that served
+the tarball, check the signature, compare the digest, and abort -- with the
+existing installation left exactly where it was -- if either does not match.
 There is no quiet "carry on anyway" path: a `SHA256SUMS` that cannot be
 downloaded, or that does not list the tarball, aborts the install too, so the
 check cannot be silently downgraded by suppressing one request.
@@ -365,16 +369,49 @@ the install scripts themselves -- so the `grep` narrows the check to the one
 file you downloaded. `sha256sum -c SHA256SUMS` without it reports every file
 you did not download as missing.
 
-#### What the checksum proves, and what it does not
+#### Signatures
 
-The manifest is served by the same origin as the artifact. It proves the bytes
-you received are the bytes that origin published, which catches a truncated
-download, a half-finished mirror sync, and a swapped or mislabelled asset. It
-is **not** a signature: on its own it does not defend against an attacker who
-controls the bucket or the GitHub release, since such an attacker could rewrite
-both files. End-to-end authenticity needs a detached signature verified against
-a public key embedded in the installer, which is the follow-up half of
-[#143](https://github.com/Five-Nines-io/fivenines_agent/issues/143).
+`SHA256SUMS` is itself signed. Each release publishes a detached
+`SHA256SUMS.sig` next to it -- ECDSA P-256 over SHA-256, chosen over Ed25519
+because OpenSSL 1.0.2 on CentOS 7 cannot verify Ed25519 -- and the install
+scripts check it against a public key embedded in the script before they trust
+any digest in the manifest. The signing key lives in a repository secret and
+never touches the release bucket, so a mirror that rewrote `SHA256SUMS` cannot
+re-sign it.
+
+Once a public key is embedded, **stripping the signature is not a way around
+it**: a missing or empty `SHA256SUMS.sig` aborts the install exactly like a bad
+one.
+
+To check a signature by hand:
+
+```bash
+wget -q https://releases.fivenines.io/latest/SHA256SUMS
+wget -q https://releases.fivenines.io/latest/SHA256SUMS.sig
+
+openssl dgst -sha256 -verify fivenines-release.pub \
+  -signature SHA256SUMS.sig SHA256SUMS
+# Verified OK
+```
+
+> **Status:** the release signing key is not in place yet, so releases
+> currently ship with checksum verification only. Until it is, the installers
+> say so on every run (`Release signature not checked - falling back to the
+> published checksum`) rather than passing silently.
+> `FIVENINES_REQUIRE_SIGNATURE=1` turns that warning into a hard failure, and
+> is the setting to use once signing is armed if you want the guarantee
+> enforced fleet-wide.
+
+A host with no `openssl` reports the same "could not check" outcome and falls
+back to the checksum. That is not a hole an attacker can open: whoever controls
+the release bucket does not get to uninstall `openssl` from your servers.
+
+#### What each layer proves
+
+| Layer | Catches | Does not catch |
+|-------|---------|----------------|
+| `SHA256SUMS` digest | Truncated download, half-finished mirror sync, swapped or mislabelled asset | An attacker who owns the mirror -- they rewrite the manifest too |
+| `SHA256SUMS.sig` | An attacker who owns the mirror or the GitHub release | A compromise of the signing key itself |
 
 #### Installing a custom or pre-release build
 
@@ -396,6 +433,7 @@ continues.
 | Variable | Effect |
 |----------|--------|
 | `FIVENINES_AGENT_SHA256` | Expected SHA-256 of the tarball. Overrides the published `SHA256SUMS`, and is the only way to verify a `FIVENINES_AGENT_URL` download. |
+| `FIVENINES_REQUIRE_SIGNATURE=1` | Abort unless the release signature over `SHA256SUMS` verifies. Default is to warn and fall back to the checksum. |
 | `FIVENINES_SKIP_VERIFY=1` | Install without verifying anything. Unsupported; intended only for a host that has no `sha256sum`, `shasum` or `openssl` at all. |
 
 On Windows the artifact to verify is the MSI, which `SHA256SUMS` also covers;

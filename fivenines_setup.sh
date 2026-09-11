@@ -9,6 +9,8 @@
 #   FIVENINES_AGENT_SHA256 - Expected SHA-256 of the tarball. Overrides the published
 #                            SHA256SUMS; the only way to verify a custom URL.
 #   FIVENINES_SKIP_VERIFY  - Set to 1 to install WITHOUT verifying the tarball. Unsupported.
+#   FIVENINES_REQUIRE_SIGNATURE - Set to 1 to abort unless the release signature over
+#                            SHA256SUMS verifies (default: warn and fall back to the checksum).
 #
 # Example with custom build:
 #   FIVENINES_AGENT_URL="https://github.com/Five-Nines-io/fivenines_agent/releases/download/feature-branch-abc1234/fivenines-agent-linux-amd64.tar.gz" bash fivenines_setup.sh YOUR_TOKEN
@@ -143,33 +145,97 @@ verify_sha256() {
     return 0
 }
 
-# SHA256SUMS has to come from the SAME mirror that served the tarball. The two
-# mirrors are written by different steps of the release job, so during a
-# release they can briefly hold different versions, and a digest read from the
-# other mirror would then reject a perfectly good download.
-download_sums() {
-  output="$1"
+# Public key the release signature is checked against. ECDSA P-256 with
+# SHA-256 rather than Ed25519: OpenSSL 1.0.2 on CentOS 7 cannot verify
+# Ed25519, and CentOS 7 is in the support matrix.
+#
+# EMPTY output means signature verification is not armed yet: the installers
+# fall back to checksum-only and say so out loud. Filling this in arms
+# signature verification fleet-wide on the next release. To arm it:
+#
+#   openssl ecparam -name prime256v1 -genkey -noout -out fivenines-release.key
+#   openssl ec -in fivenines-release.key -pubout
+#
+# Put the PRIVATE key in the RELEASE_SIGNING_KEY repository secret, and paste
+# the public key PEM between the PUBKEY markers below - in this file and in
+# all four install scripts. ci/build-scripts.sh --check enforces that the
+# five copies stay identical, so a key pasted into only some of them fails CI.
+release_signing_pubkey() {
+    cat <<'PUBKEY'
+PUBKEY
+}
+
+# Verify the detached signature over SHA256SUMS. Three outcomes, and the
+# difference between the last two is the whole point:
+#   0 - verified against the embedded public key
+#   1 - a signature was expected and did NOT verify. Always fatal.
+#   2 - cannot be checked here (no key embedded yet, or no openssl on this
+#       host). The caller decides; by default that is a warning, because an
+#       attacker who owns the release bucket does not get to uninstall
+#       openssl from the target host - the two are independent.
+verify_sums_signature() {
+    sums_file="$1"
+    sig_file="$2"
+
+    pubkey=$(release_signing_pubkey)
+    if [ -z "$pubkey" ]; then
+        return 2
+    fi
+
+    if ! command -v openssl > /dev/null 2>&1; then
+        print_warning "No openssl on this host: the release signature cannot be checked."
+        return 2
+    fi
+
+    if [ ! -s "$sig_file" ]; then
+        print_error "SHA256SUMS.sig is missing or empty: this release should carry a signature."
+        return 1
+    fi
+
+    pubkey_file="${sums_file}.pub"
+    printf '%s\n' "$pubkey" > "$pubkey_file"
+
+    if openssl dgst -sha256 -verify "$pubkey_file" -signature "$sig_file" "$sums_file" > /dev/null 2>&1; then
+        rm -f "$pubkey_file"
+        print_success "Release signature verified against the embedded public key."
+        return 0
+    fi
+
+    rm -f "$pubkey_file"
+    print_error "Release signature does NOT verify against the embedded public key."
+    print_error "Someone may be serving you artifacts that fivenines.io did not publish."
+    return 1
+}
+
+# SHA256SUMS and its signature have to come from the SAME mirror that served
+# the tarball. The two mirrors are written by different steps of the release
+# job, so during a release they can briefly hold different versions, and a
+# manifest read from the other mirror would reject a perfectly good download.
+download_release_file() {
+  remote="$1"
+  output="$2"
 
   case "${DOWNLOAD_SOURCE:-}" in
-    r2) sums_url="${R2_BASE_URL}/SHA256SUMS" ;;
-    github) sums_url="${GITHUB_RELEASES_URL}/SHA256SUMS" ;;
+    r2) url="${R2_BASE_URL}/${remote}" ;;
+    github) url="${GITHUB_RELEASES_URL}/${remote}" ;;
     *) return 1 ;;
   esac
 
-  wget -T 10 -q "$sums_url" -O "$output" 2>/dev/null
+  wget -T 10 -q "$url" -O "$output" 2>/dev/null
 }
 
 # Check an agent tarball before it is unpacked. The expected digest comes from
 # FIVENINES_AGENT_SHA256 when the operator pinned one, otherwise from the
-# SHA256SUMS the same mirror publishes next to the tarball (download_sums).
-# A non-zero return means the tarball must not be installed.
+# SHA256SUMS the same mirror publishes next to the tarball, which is itself
+# checked against the embedded release public key. A non-zero return means the
+# tarball must not be installed.
 #
-# What this buys and what it does not: the digest proves the bytes arrived
-# intact and are the ones the release published, which catches a truncated
-# download, a half-finished mirror sync and a swapped asset. It is not a
-# signature - it is served by the same origin as the tarball - so on its own
-# it does not defend against an attacker who owns that origin. Signature
-# verification with an embedded public key is the follow-up (issue #143).
+# The two layers do different jobs. The digest alone proves the bytes arrived
+# intact and are the ones that mirror published - a truncated download, a
+# half-finished mirror sync, a swapped asset. It cannot catch an attacker who
+# owns the mirror, because they would rewrite SHA256SUMS too. The signature
+# is what closes that: the signing key lives in a repository secret, not in
+# the bucket, so a manifest the attacker rewrote will not verify (issue #143).
 verify_agent_tarball() {
     tarball="$1"
     asset_name="$2"
@@ -180,6 +246,8 @@ verify_agent_tarball() {
     fi
 
     if [ -n "${FIVENINES_AGENT_SHA256:-}" ]; then
+        # An out-of-band digest from the operator: there is no manifest in
+        # play, so there is nothing for the signature to cover.
         if verify_sha256 "$tarball" "$FIVENINES_AGENT_SHA256" "$asset_name"; then
             return 0
         fi
@@ -197,14 +265,39 @@ verify_agent_tarball() {
     fi
 
     sums_path="${tarball}.SHA256SUMS"
-    rm -f "$sums_path"
-    if ! download_sums "$sums_path"; then
+    sig_path="${sums_path}.sig"
+    rm -f "$sums_path" "$sig_path"
+
+    if ! download_release_file "SHA256SUMS" "$sums_path"; then
         print_error "Could not download SHA256SUMS from the mirror that served ${asset_name}."
+        rm -f "$sums_path" "$sig_path"
         return 1
     fi
 
+    # Fetch the signature unconditionally. Whether its absence is fatal is
+    # verify_sums_signature's decision, not the download's - otherwise an
+    # attacker could downgrade the check by dropping one request.
+    download_release_file "SHA256SUMS.sig" "$sig_path" || true
+
+    sig_status=0
+    verify_sums_signature "$sums_path" "$sig_path" || sig_status=$?
+
+    if [ "$sig_status" -eq 1 ]; then
+        rm -f "$sums_path" "$sig_path"
+        return 1
+    fi
+
+    if [ "$sig_status" -eq 2 ]; then
+        if [ "${FIVENINES_REQUIRE_SIGNATURE:-}" = "1" ]; then
+            print_error "FIVENINES_REQUIRE_SIGNATURE=1, but the release signature could not be checked."
+            rm -f "$sums_path" "$sig_path"
+            return 1
+        fi
+        print_warning "Release signature not checked - falling back to the published checksum."
+    fi
+
     expected_sha256=$(sha256_from_sums "$sums_path" "$asset_name" || true)
-    rm -f "$sums_path"
+    rm -f "$sums_path" "$sig_path"
 
     if [ -z "$expected_sha256" ]; then
         print_error "${asset_name} is not listed in the published SHA256SUMS."
