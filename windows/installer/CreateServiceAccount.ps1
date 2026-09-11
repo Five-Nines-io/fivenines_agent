@@ -48,18 +48,82 @@ if ($bareName.Contains('\')) {
 
 $MSI_MANAGED_DESCRIPTION = "Fivenines monitoring agent service account"
 
+# Uniform index in [0, Bound) from a CSPRNG. Bound is never above 64 here, so
+# one byte is enough; the rejection loop keeps (byte % Bound) from
+# over-weighting the first (256 % Bound) values. .NET Framework has no
+# RandomNumberGenerator.GetInt32, and this custom action runs under
+# powershell.exe (5.1), so the sampling is hand-rolled rather than borrowed.
+function Get-RandomIndex {
+    param(
+        [int]$Bound,
+        [System.Security.Cryptography.RandomNumberGenerator]$Rng
+    )
+
+    $limit = 256 - (256 % $Bound)
+    $buf = New-Object byte[] 1
+    do {
+        $Rng.GetBytes($buf)
+    } while ($buf[0] -ge $limit)
+    return [int]($buf[0] % $Bound)
+}
+
+function Get-RandomChar {
+    param(
+        [string]$Alphabet,
+        [System.Security.Cryptography.RandomNumberGenerator]$Rng
+    )
+
+    return $Alphabet[(Get-RandomIndex $Alphabet.Length $Rng)]
+}
+
 function New-RandomPassword {
-    # URL-safe base64 - sc.exe is fine with [A-Za-z0-9_-], but the standard
-    # '/' and '+' characters can trip up command-line parsing in tools that
-    # see the password later (e.g. log scrapers).
-    $bytes = New-Object byte[] 24
+    # URL-safe alphabet - sc.exe is fine with [A-Za-z0-9_-], but the standard
+    # base64 '/' and '+' characters can trip up command-line parsing in tools
+    # that see the password later (e.g. log scrapers).
+    #
+    # Every character class is drawn EXPLICITLY rather than left to chance.
+    # Windows' complexity policy wants at least three of {upper, lower, digit,
+    # non-alphanumeric}, and a purely random 32-character draw over this
+    # 64-symbol alphabet contains neither a digit nor a '-'/'_' about once in
+    # 770 tries ((52/64)^32). When that happened New-LocalUser threw
+    # InvalidPasswordException, this custom action returned 1603 and the whole
+    # MSI rolled back: a rare but real failed install on a customer machine,
+    # not merely a flaky CI run. It stayed hidden because the E2E smoke job
+    # was gated behind a test job that was itself failing.
+    $upper   = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+    $lower   = 'abcdefghijklmnopqrstuvwxyz'
+    $digit   = '0123456789'
+    $special = '-_'
+    $all     = $upper + $lower + $digit + $special
+
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
     try {
-        $rng.GetBytes($bytes)
+        # One guaranteed character per class, then fill to 32. Pinning four
+        # positions costs almost nothing against a 64-symbol alphabet: this is
+        # still well over 180 bits, against 192 for a wholly free draw.
+        $chars = @(
+            (Get-RandomChar $upper $rng),
+            (Get-RandomChar $lower $rng),
+            (Get-RandomChar $digit $rng),
+            (Get-RandomChar $special $rng)
+        )
+        while ($chars.Count -lt 32) {
+            $chars += (Get-RandomChar $all $rng)
+        }
+
+        # Fisher-Yates with the same CSPRNG, so the four guaranteed characters
+        # do not always sit in the first four positions in a fixed class order.
+        for ($i = $chars.Count - 1; $i -gt 0; $i--) {
+            $j = Get-RandomIndex ($i + 1) $rng
+            $tmp = $chars[$i]
+            $chars[$i] = $chars[$j]
+            $chars[$j] = $tmp
+        }
+
+        return (-join $chars)
     } finally {
         $rng.Dispose()
     }
-    return [System.Convert]::ToBase64String($bytes).Replace('/', '_').Replace('+', '-').Replace('=', '')
 }
 
 $existing = Get-LocalUser -Name $bareName -ErrorAction SilentlyContinue

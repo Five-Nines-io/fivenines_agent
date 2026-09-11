@@ -23,6 +23,7 @@ OUTPUT_DIR="${TEST_OUTPUT_DIR:-/tmp}"
 
 BINARY_NAME="fivenines-agent-${BINARY_VARIANT}"
 AGENT_EXECUTABLE="${AGENT_DIR}/${BINARY_NAME}/${BINARY_NAME}"
+TARBALL_PATH="/tmp/${BINARY_NAME}.tar.gz"
 
 # Install minimal dependencies for testing.
 #
@@ -99,6 +100,41 @@ record_result() {
   esac
   RESULTS="${RESULTS}| ${test_name} | ${status} | ${detail} |\n"
   echo "[${status}] ${test_name} ${detail}"
+}
+
+# Digest tool for the fixture pin. Same fallback chain the install scripts
+# use, so an image with none of them is an unmet PRECONDITION rather than a
+# regression: the scripts would correctly refuse to install there too, and
+# the two checksum tests below SKIP instead of failing.
+test_sha256() {
+  if command -v sha256sum > /dev/null 2>&1; then
+    sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+  elif command -v shasum > /dev/null 2>&1; then
+    shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1
+  elif command -v openssl > /dev/null 2>&1; then
+    openssl dgst -sha256 "$1" 2>/dev/null | sed 's/^.*= *//'
+  fi
+}
+
+if [ -n "$(test_sha256 /dev/null)" ]; then
+  HAVE_SHA256=1
+else
+  HAVE_SHA256=0
+  echo "WARNING: no sha256sum, shasum or openssl in this image"
+  echo "         the checksum tests will SKIP (the install scripts refuse to"
+  echo "         install without a digest tool, which is correct behaviour)"
+fi
+
+# Rebuild the tarball the install scripts consume, and pin its digest via
+# FIVENINES_AGENT_SHA256. The pin is what makes the scripts run their real
+# verification path here: without it they take the "this source publishes no
+# checksum" branch and check nothing, so every distro in the matrix would
+# silently skip verification. gzip output is not guaranteed byte-stable, so
+# the digest is recomputed on every rebuild.
+make_tarball() {
+  ( cd "$AGENT_DIR" && tar -czf "$TARBALL_PATH" "${BINARY_NAME}/" )
+  FIVENINES_AGENT_SHA256=$(test_sha256 "$TARBALL_PATH")
+  export FIVENINES_AGENT_SHA256
 }
 
 # ---------------------------------------------------------------
@@ -187,8 +223,7 @@ echo "=== Test 4: System install script ==="
 
 # Create a local tarball and pre-place it where install scripts expect it.
 # In test mode, scripts skip the download and use the pre-placed tarball directly.
-TARBALL_PATH="/tmp/fivenines-agent-${BINARY_VARIANT}.tar.gz"
-(cd "$AGENT_DIR" && tar -czf "$TARBALL_PATH" "${BINARY_NAME}/")
+make_tarball
 
 export FIVENINES_TEST_MODE=1
 
@@ -197,6 +232,19 @@ if timeout 120 sh "${SCRIPTS_DIR}/fivenines_setup.sh" "test-token-ci-setup" > "$
 else
   EXIT_CODE=$?
   record_result "system-install" "FAIL" "exit code $EXIT_CODE"
+  echo "--- setup output ---"
+  cat "${OUTPUT_DIR}/setup_output" 2>/dev/null || true
+  echo "--- end output ---"
+fi
+
+# The install must have checked the digest, not just succeeded. Without this
+# a regression that skips verification entirely would still pass Test 4.
+if [ "$HAVE_SHA256" = "0" ]; then
+  record_result "checksum-verified" "SKIP" "no digest tool in image"
+elif grep -q "Verified ${BINARY_NAME}.tar.gz" "${OUTPUT_DIR}/setup_output" 2>/dev/null; then
+  record_result "checksum-verified" "PASS" "install verified the tarball digest"
+else
+  record_result "checksum-verified" "FAIL" "install did not verify the tarball digest"
   echo "--- setup output ---"
   cat "${OUTPUT_DIR}/setup_output" 2>/dev/null || true
   echo "--- end output ---"
@@ -272,7 +320,7 @@ if [ -f "$TOKEN_FILE" ]; then
 fi
 
 # Re-create tarball (setup script deletes it after extraction)
-(cd "$AGENT_DIR" && tar -czf "$TARBALL_PATH" "${BINARY_NAME}/")
+make_tarball
 
 if timeout 120 sh "${SCRIPTS_DIR}/fivenines_update.sh" > "${OUTPUT_DIR}/update_output" 2>&1; then
   # Verify TOKEN preserved
@@ -294,10 +342,38 @@ else
 fi
 
 # ---------------------------------------------------------------
-# Test 7: System uninstall script
+# Test 7: Checksum mismatch aborts without touching the install
 # ---------------------------------------------------------------
 echo ""
-echo "=== Test 7: System uninstall ==="
+echo "=== Test 7: Checksum mismatch ==="
+
+make_tarball
+# A well-formed digest that cannot match any real tarball.
+BAD_SHA256=$(printf '%064d' 0)
+
+if [ "$HAVE_SHA256" = "0" ]; then
+  record_result "checksum-mismatch" "SKIP" "no digest tool in image"
+elif FIVENINES_AGENT_SHA256="$BAD_SHA256" timeout 120 sh "${SCRIPTS_DIR}/fivenines_update.sh" > "${OUTPUT_DIR}/mismatch_output" 2>&1; then
+  record_result "checksum-mismatch" "FAIL" "update installed a tarball with the wrong digest"
+  echo "--- mismatch output ---"
+  cat "${OUTPUT_DIR}/mismatch_output" 2>/dev/null || true
+  echo "--- end output ---"
+elif [ ! -f "$INSTALLED_BINARY" ]; then
+  record_result "checksum-mismatch" "FAIL" "aborted but destroyed the existing install"
+elif ! grep -q "Checksum mismatch" "${OUTPUT_DIR}/mismatch_output" 2>/dev/null; then
+  record_result "checksum-mismatch" "FAIL" "aborted for some other reason than the digest"
+  echo "--- mismatch output ---"
+  cat "${OUTPUT_DIR}/mismatch_output" 2>/dev/null || true
+  echo "--- end output ---"
+else
+  record_result "checksum-mismatch" "PASS" "aborted, existing install intact"
+fi
+
+# ---------------------------------------------------------------
+# Test 8: System uninstall script
+# ---------------------------------------------------------------
+echo ""
+echo "=== Test 8: System uninstall ==="
 
 if timeout 120 sh "${SCRIPTS_DIR}/fivenines_uninstall.sh" > "${OUTPUT_DIR}/uninstall_output" 2>&1; then
   # Verify cleanup
@@ -314,14 +390,14 @@ else
 fi
 
 # ---------------------------------------------------------------
-# Test 8: User-level install script
+# Test 9: User-level install script
 # ---------------------------------------------------------------
 echo ""
-echo "=== Test 8: User-level install ==="
+echo "=== Test 9: User-level install ==="
 
 # Create a non-root user for user-level tests (if running as root)
 # Re-create tarball for user install tests
-(cd "$AGENT_DIR" && tar -czf "$TARBALL_PATH" "${BINARY_NAME}/")
+make_tarball
 
 if [ "$(id -u)" = "0" ]; then
   # Create test user (handle both glibc and Alpine)
@@ -351,6 +427,7 @@ elif [ "$(id -u)" = "0" ] && id testuser > /dev/null 2>&1; then
   chmod 644 "$TARBALL_PATH" 2>/dev/null || true
   if timeout 120 su -s /bin/sh testuser -c "
     export FIVENINES_TEST_MODE=1
+    export FIVENINES_AGENT_SHA256='${FIVENINES_AGENT_SHA256}'
     export FIVENINES_INSTALL_DIR='${USER_INSTALL_DIR}'
     export FIVENINES_CONFIG_DIR='${USER_CONFIG_DIR}'
     sh '${SCRIPTS_DIR}/fivenines_setup_user.sh' 'test-token-user-ci'
@@ -367,13 +444,13 @@ else
 fi
 
 # ---------------------------------------------------------------
-# Test 9: User-level update script (TOKEN preservation)
+# Test 10: User-level update script (TOKEN preservation)
 # ---------------------------------------------------------------
 echo ""
-echo "=== Test 9: User-level update ==="
+echo "=== Test 10: User-level update ==="
 
 # Re-create tarball for user update test
-(cd "$AGENT_DIR" && tar -czf "$TARBALL_PATH" "${BINARY_NAME}/")
+make_tarball
 
 USER_TOKEN_FILE="${USER_CONFIG_DIR}/TOKEN"
 USER_TOKEN_BEFORE=""
@@ -384,6 +461,7 @@ fi
 if [ "$(id -u)" = "0" ] && id testuser > /dev/null 2>&1 && [ -d "$USER_INSTALL_DIR" ]; then
   if timeout 120 su -s /bin/sh testuser -c "
     export FIVENINES_TEST_MODE=1
+    export FIVENINES_AGENT_SHA256='${FIVENINES_AGENT_SHA256}'
     export FIVENINES_INSTALL_DIR='${USER_INSTALL_DIR}'
     export FIVENINES_CONFIG_DIR='${USER_CONFIG_DIR}'
     sh '${SCRIPTS_DIR}/fivenines_update_user.sh'
@@ -410,14 +488,15 @@ else
 fi
 
 # ---------------------------------------------------------------
-# Test 10: User-level uninstall script
+# Test 11: User-level uninstall script
 # ---------------------------------------------------------------
 echo ""
-echo "=== Test 10: User-level uninstall ==="
+echo "=== Test 11: User-level uninstall ==="
 
 if [ "$(id -u)" = "0" ] && id testuser > /dev/null 2>&1 && [ -d "$USER_INSTALL_DIR" ]; then
   if timeout 120 su -s /bin/sh testuser -c "
     export FIVENINES_TEST_MODE=1
+    export FIVENINES_AGENT_SHA256='${FIVENINES_AGENT_SHA256}'
     export FIVENINES_INSTALL_DIR='${USER_INSTALL_DIR}'
     export FIVENINES_CONFIG_DIR='${USER_CONFIG_DIR}'
     sh '${SCRIPTS_DIR}/fivenines_uninstall_user.sh'

@@ -72,6 +72,51 @@ jobs:
             --cov-report=xml:coverage-windows.xml `
             --cov-report=term-missing
 
+      # The MSI's password generator, exercised against the real PowerShell.
+      # The bug this guards used to fail roughly one install in 770 - rare
+      # enough to look like CI flake, frequent enough to be a customer's
+      # failed install - and the E2E smoke job that eventually caught it only
+      # runs after the MSI is built, so it never fenced the generator itself.
+      # The function is extracted rather than dot-sourced because the script
+      # is a custom action with mandatory parameters and Windows-only cmdlets.
+      - name: Verify service-account password generation
+        shell: pwsh
+        run: |
+          $src = Get-Content windows/installer/CreateServiceAccount.ps1 -Raw
+          foreach ($fn in 'Get-RandomIndex', 'Get-RandomChar', 'New-RandomPassword') {
+            $m = [regex]::Match($src, "(?ms)^function $fn \{.*?^\}")
+            if (-not $m.Success) { throw "$fn not found in CreateServiceAccount.ps1" }
+            Invoke-Expression $m.Value
+          }
+
+          # New-LocalUser enforces the machine password policy, which wants at
+          # least three of {upper, lower, digit, non-alphanumeric}. Assert all
+          # four on every draw, so a regression cannot reintroduce a rare miss.
+          $seen = @{}
+          for ($i = 0; $i -lt 2000; $i++) {
+            $pw = New-RandomPassword
+            if ($pw.Length -ne 32) { throw "length $($pw.Length), expected 32: $pw" }
+            if ($pw -notmatch '[A-Z]')      { throw "no uppercase: $pw" }
+            if ($pw -notmatch '[a-z]')      { throw "no lowercase: $pw" }
+            if ($pw -notmatch '[0-9]')      { throw "no digit: $pw" }
+            if ($pw -notmatch '[-_]')       { throw "no non-alphanumeric: $pw" }
+            if ($pw -match '[^A-Za-z0-9_-]') { throw "character outside the sc.exe-safe alphabet: $pw" }
+            $seen[$pw] = $true
+          }
+          if ($seen.Count -ne 2000) { throw "generated a duplicate password in 2000 draws" }
+
+          # The guaranteed characters must not sit in a fixed order at the
+          # front: that would leak four positions of the password's structure.
+          $firstDigitPositions = @{}
+          for ($i = 0; $i -lt 500; $i++) {
+            $firstDigitPositions[(New-RandomPassword).IndexOfAny('0123456789'.ToCharArray())] = $true
+          }
+          if ($firstDigitPositions.Count -lt 10) {
+            throw "first digit landed in only $($firstDigitPositions.Count) distinct positions - is the shuffle running?"
+          }
+
+          Write-Host "2000 passwords: length 32, all four character classes, no duplicates, shuffled."
+
       - name: Upload Windows coverage
         uses: actions/upload-artifact@v4
         with:

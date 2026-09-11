@@ -15,6 +15,7 @@ Windows 10/11), **Synology DSM 7** and **UNRAID**.
   - [UNRAID](#unraid)
   - [Synology Installation (DSM 7+)](#synology-installation-dsm-7)
   - [Cloning VMs or building golden images](#cloning-vms-or-building-golden-images)
+  - [Verifying a release artifact](#verifying-a-release-artifact)
 - [Update](#update) / [Remove](#remove) / [Debug](#debug)
 - [Permissions](#permissions)
 - **Host and platform monitoring**
@@ -342,6 +343,122 @@ sudo rm -f /etc/fivenines_agent/TOKEN /etc/fivenines_agent/MACHINE_ID
 Use `~/.config/fivenines_agent` for a user-level install or
 `/boot/config/custom/fivenines_agent` on UNRAID. Each clone then needs the
 agent re-enrolled with a fresh token.
+
+### Verifying a release artifact
+
+Every release publishes a `SHA256SUMS` manifest alongside the artifacts, on
+both mirrors:
+
+- `https://releases.fivenines.io/latest/SHA256SUMS` (and
+  `https://releases.fivenines.io/v<version>/SHA256SUMS` for one specific release)
+- the `SHA256SUMS` asset on the matching
+  [GitHub release](https://github.com/Five-Nines-io/fivenines_agent/releases)
+
+A detached `SHA256SUMS.sig` is published next to each manifest; see
+[Signatures](#signatures) below.
+
+**The install and update scripts already do this for you** (install scripts
+from release **v1.17.7** onward -- the check lives in the scripts, so an older
+agent picks it up as soon as it is updated). Before anything is unpacked as
+root they fetch `SHA256SUMS` and its signature from the same mirror that served
+the tarball, check the signature, compare the digest, and abort -- with the
+existing installation left exactly where it was -- if either does not match.
+There is no quiet "carry on anyway" path: a `SHA256SUMS` that cannot be
+downloaded, or that does not list the tarball, aborts the install too, so the
+check cannot be silently downgraded by suppressing one request.
+
+To check an artifact by hand:
+
+```bash
+wget -q https://releases.fivenines.io/latest/fivenines-agent-linux-amd64.tar.gz
+wget -q https://releases.fivenines.io/latest/SHA256SUMS
+
+grep ' fivenines-agent-linux-amd64.tar.gz$' SHA256SUMS | sha256sum -c -
+# fivenines-agent-linux-amd64.tar.gz: OK
+```
+
+`SHA256SUMS` covers everything published at that location -- the four Linux
+tarballs, both Synology `.spk` packages, the Windows MSI, the service units and
+the install scripts themselves -- so the `grep` narrows the check to the one
+file you downloaded. `sha256sum -c SHA256SUMS` without it reports every file
+you did not download as missing.
+
+#### Signatures
+
+`SHA256SUMS` is itself signed. Each release publishes a detached
+`SHA256SUMS.sig` next to it -- ECDSA P-256 over SHA-256, chosen over Ed25519
+because OpenSSL 1.0.2 on CentOS 7 cannot verify Ed25519 -- and the install
+scripts check it against a public key embedded in the script before they trust
+any digest in the manifest. The signing key lives in a repository secret and
+never touches the release bucket, so a mirror that rewrote `SHA256SUMS` cannot
+re-sign it.
+
+Once a public key is embedded, **stripping the signature is not a way around
+it**: a missing or empty `SHA256SUMS.sig` aborts the install exactly like a bad
+one.
+
+The public key releases are signed with, so you can verify one yourself:
+
+```
+-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEYEeNw0yIcXeLpQifrLGT7iU02K9R
+36O9k+TrWYiVYF2xyCrykF3qFkwOOAl+gbFmi6c/9oFsMFcuinr8p9UJtw==
+-----END PUBLIC KEY-----
+```
+
+It is the same key embedded in the install scripts -- you can read it out of
+`fivenines_setup.sh` on any host and compare. `FIVENINES_REQUIRE_SIGNATURE=1`
+turns a signature that could not be checked into a hard failure, which is the
+setting to use if you want the guarantee enforced fleet-wide.
+
+To check a signature by hand:
+
+```bash
+wget -q https://releases.fivenines.io/latest/SHA256SUMS
+wget -q https://releases.fivenines.io/latest/SHA256SUMS.sig
+
+# with the key above saved as fivenines-release.pub
+openssl dgst -sha256 -verify fivenines-release.pub \
+  -signature SHA256SUMS.sig SHA256SUMS
+# Verified OK
+```
+
+A host with no `openssl` reports the same "could not check" outcome and falls
+back to the checksum. That is not a hole an attacker can open: whoever controls
+the release bucket does not get to uninstall `openssl` from your servers.
+
+#### What each layer proves
+
+| Layer | Catches | Does not catch |
+|-------|---------|----------------|
+| `SHA256SUMS` digest | Truncated download, half-finished mirror sync, swapped or mislabelled asset | An attacker who owns the mirror -- they rewrite the manifest too |
+| `SHA256SUMS.sig` | An attacker who owns the mirror or the GitHub release | A compromise of the signing key itself |
+
+#### Installing a custom or pre-release build
+
+`FIVENINES_AGENT_URL` points the installer at an arbitrary tarball, which by
+definition has no published `SHA256SUMS` to check it against. **That path is a
+development escape hatch and is unverified** unless you pin the digest
+yourself:
+
+```bash
+sudo FIVENINES_AGENT_URL="https://github.com/.../fivenines-agent-linux-amd64.tar.gz" \
+     FIVENINES_AGENT_SHA256="<expected sha256>" \
+     bash fivenines_update.sh
+```
+
+Pre-release builds list their digests in the GitHub release notes. Without
+`FIVENINES_AGENT_SHA256` the installer prints an `UNVERIFIED` warning and
+continues.
+
+| Variable | Effect |
+|----------|--------|
+| `FIVENINES_AGENT_SHA256` | Expected SHA-256 of the tarball. Overrides the published `SHA256SUMS`, and is the only way to verify a `FIVENINES_AGENT_URL` download. |
+| `FIVENINES_REQUIRE_SIGNATURE=1` | Abort unless the release signature over `SHA256SUMS` verifies. Default is to warn and fall back to the checksum. |
+| `FIVENINES_SKIP_VERIFY=1` | Install without verifying anything. Unsupported; intended only for a host that has no `sha256sum`, `shasum` or `openssl` at all. |
+
+On Windows the artifact to verify is the MSI, which `SHA256SUMS` also covers;
+`fivenines_setup.ps1` does not yet check it.
 
 ## Update
 

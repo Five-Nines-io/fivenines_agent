@@ -544,10 +544,16 @@ jobs:
             fivenines_uninstall_user.sh \
             fivenines_common.sh \
             ci/test-distro.sh \
-            ci/test-selinux-vm.sh
+            ci/test-selinux-vm.sh \
+            ci/test-signing.sh
 
+      - name: Verify release-signature checking
+        run: sh ci/test-signing.sh
+
+      # Blocking: the list now covers the SHA-256 verification helpers, and a
+      # drifted copy of those in one installer is a security regression.
       - name: Verify shared functions are in sync
-        run: sh ci/build-scripts.sh --check || echo "Warning - shared functions out of sync (non-blocking)"
+        run: sh ci/build-scripts.sh --check
 
   # Distro regression testing
   test-distro-matrix:
@@ -794,6 +800,68 @@ jobs:
           echo "SPK_X86=$SPK_X86" >> $GITHUB_OUTPUT
           echo "SPK_ARM=$SPK_ARM" >> $GITHUB_OUTPUT
 
+      - name: Generate SHA256SUMS
+        id: checksums
+        working-directory: release
+        run: |
+          # One sha256sum-format manifest over every published asset, sorted
+          # so the file is stable across runs. SHA256SUMS cannot list itself.
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\0' \
+            | sort -z \
+            | xargs -0 sha256sum > SHA256SUMS
+          cat SHA256SUMS
+          {
+            echo 'SUMS<<CHECKSUMS_EOF'
+            cat SHA256SUMS
+            echo 'CHECKSUMS_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      # Detached ECDSA P-256 signature over SHA256SUMS. The private key lives
+      # in a repository secret, never in the release bucket - that is the whole
+      # point: a mirror that rewrites the manifest cannot re-sign it. Skipped
+      # when the secret is not configured (forks, or before the key exists),
+      # the same shape as the Authenticode step above.
+      - name: Sign SHA256SUMS
+        if: env.RELEASE_SIGNING_KEY != ''
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        working-directory: release
+        run: |
+          KEY="$RUNNER_TEMP/release-signing.key"
+          PUB="$RUNNER_TEMP/release-signing.pub"
+          ( umask 077; printf '%s\n' "$RELEASE_SIGNING_KEY" > "$KEY" )
+
+          openssl dgst -sha256 -sign "$KEY" -out SHA256SUMS.sig SHA256SUMS
+
+          # A signature that does not verify must never ship: every installer
+          # with the key armed would refuse to install.
+          openssl ec -in "$KEY" -pubout -out "$PUB" 2>/dev/null
+          openssl dgst -sha256 -verify "$PUB" -signature SHA256SUMS.sig SHA256SUMS
+
+          # A valid signature made with the WRONG key is worse than no
+          # signature: every agent embeds one public key verbatim and would
+          # refuse the release outright. Compare the key derived from the
+          # secret against the one the installers actually carry, in DER so
+          # PEM line-wrapping cannot make two identical keys look different.
+          EMBEDDED="$RUNNER_TEMP/embedded.pub"
+          sed -n '/-----BEGIN PUBLIC KEY-----/,/-----END PUBLIC KEY-----/p' \
+            "$GITHUB_WORKSPACE/fivenines_common.sh" > "$EMBEDDED"
+          if [ -s "$EMBEDDED" ]; then
+            if ! cmp -s \
+              <(openssl pkey -pubin -in "$PUB" -outform DER) \
+              <(openssl pkey -pubin -in "$EMBEDDED" -outform DER); then
+              echo "::error::RELEASE_SIGNING_KEY does not match the public key embedded in the install scripts. Every agent would refuse this release."
+              rm -f "$KEY" "$PUB" "$EMBEDDED"
+              exit 1
+            fi
+            echo "Signing key matches the public key embedded in the install scripts."
+          else
+            echo "::warning::No public key is embedded in the install scripts, so nothing verifies this signature yet."
+          fi
+
+          rm -f "$KEY" "$PUB" "$EMBEDDED"
+          echo "Signed SHA256SUMS ($(wc -c < SHA256SUMS.sig) byte signature)"
+
       - name: Delete existing pre-release with same tag (if exists)
         run: |
           gh release delete "${{ steps.release_info.outputs.TAG_NAME }}" --yes || true
@@ -862,6 +930,20 @@ jobs:
             # Windows Server 2019/2022/2025, Windows 10/11 (AMD64) - MSI installer
             https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-windows-amd64.msi
             ```
+
+            ### Checksums
+            ```
+            ${{ steps.checksums.outputs.SUMS }}
+            ```
+
+            A pre-release is not published under `latest/`, so the install
+            scripts have no `SHA256SUMS` to look up for it. Pin the digest
+            yourself to get the same verification a normal install gets:
+            ```bash
+            FIVENINES_AGENT_URL="https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-linux-amd64.tar.gz" \
+            FIVENINES_AGENT_SHA256="<digest from the list above>" \
+            bash fivenines_update.sh
+            ```
           files: |
             release/fivenines-agent-linux-amd64.tar.gz
             release/fivenines-agent-linux-arm64.tar.gz
@@ -869,6 +951,8 @@ jobs:
             release/fivenines-agent-alpine-arm64.tar.gz
             release/*.spk
             release/fivenines-agent-windows-amd64.msi
+            release/SHA256SUMS
+            release/SHA256SUMS.sig
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -922,6 +1006,85 @@ jobs:
             exit 1
           fi
 
+      - name: Generate SHA256SUMS
+        id: checksums
+        working-directory: release
+        run: |
+          # One sha256sum-format manifest over every published asset, sorted
+          # so the file is stable across runs. SHA256SUMS cannot list itself.
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\0' \
+            | sort -z \
+            | xargs -0 sha256sum > SHA256SUMS
+          cat SHA256SUMS
+          {
+            echo 'SUMS<<CHECKSUMS_EOF'
+            cat SHA256SUMS
+            echo 'CHECKSUMS_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      # Detached ECDSA P-256 signature over SHA256SUMS. The private key lives
+      # in a repository secret, never in the release bucket - that is the whole
+      # point: a mirror that rewrites the manifest cannot re-sign it. Skipped
+      # when the secret is not configured (forks, or before the key exists),
+      # the same shape as the Authenticode step above.
+      - name: Sign SHA256SUMS
+        if: env.RELEASE_SIGNING_KEY != ''
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        working-directory: release
+        run: |
+          KEY="$RUNNER_TEMP/release-signing.key"
+          PUB="$RUNNER_TEMP/release-signing.pub"
+          ( umask 077; printf '%s\n' "$RELEASE_SIGNING_KEY" > "$KEY" )
+
+          openssl dgst -sha256 -sign "$KEY" -out SHA256SUMS.sig SHA256SUMS
+
+          # A signature that does not verify must never ship: every installer
+          # with the key armed would refuse to install.
+          openssl ec -in "$KEY" -pubout -out "$PUB" 2>/dev/null
+          openssl dgst -sha256 -verify "$PUB" -signature SHA256SUMS.sig SHA256SUMS
+
+          # A valid signature made with the WRONG key is worse than no
+          # signature: every agent embeds one public key verbatim and would
+          # refuse the release outright. Compare the key derived from the
+          # secret against the one the installers actually carry, in DER so
+          # PEM line-wrapping cannot make two identical keys look different.
+          EMBEDDED="$RUNNER_TEMP/embedded.pub"
+          sed -n '/-----BEGIN PUBLIC KEY-----/,/-----END PUBLIC KEY-----/p' \
+            "$GITHUB_WORKSPACE/fivenines_common.sh" > "$EMBEDDED"
+          if [ -s "$EMBEDDED" ]; then
+            if ! cmp -s \
+              <(openssl pkey -pubin -in "$PUB" -outform DER) \
+              <(openssl pkey -pubin -in "$EMBEDDED" -outform DER); then
+              echo "::error::RELEASE_SIGNING_KEY does not match the public key embedded in the install scripts. Every agent would refuse this release."
+              rm -f "$KEY" "$PUB" "$EMBEDDED"
+              exit 1
+            fi
+            echo "Signing key matches the public key embedded in the install scripts."
+          else
+            echo "::warning::No public key is embedded in the install scripts, so nothing verifies this signature yet."
+          fi
+
+          rm -f "$KEY" "$PUB" "$EMBEDDED"
+          echo "Signed SHA256SUMS ($(wc -c < SHA256SUMS.sig) byte signature)"
+
+      # The embedded public key and the published signature have to move
+      # together. A key in the scripts with no signature on the mirror makes
+      # every install warn, and hard-fail under FIVENINES_REQUIRE_SIGNATURE=1.
+      - name: Check release signing is coherent
+        run: |
+          if grep -q 'BEGIN PUBLIC KEY' fivenines_common.sh; then
+            if [ ! -s release/SHA256SUMS.sig ]; then
+              echo "::error::The install scripts embed a release signing public key, but no SHA256SUMS.sig was produced. Set the RELEASE_SIGNING_KEY secret, or remove the embedded key."
+              exit 1
+            fi
+            echo "Release signing is armed: public key embedded, SHA256SUMS.sig published."
+          elif [ -s release/SHA256SUMS.sig ]; then
+            echo "::warning::SHA256SUMS.sig is published but the install scripts embed no public key, so no installer verifies it yet. Paste the public key into fivenines_common.sh and the four install scripts to arm it."
+          else
+            echo "::warning::Release signing is NOT armed: no public key embedded and no SHA256SUMS.sig published. Artifacts ship with checksum-only verification."
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -929,6 +1092,14 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
+          body: |
+            ### Checksums
+            ```
+            ${{ steps.checksums.outputs.SUMS }}
+            ```
+            The install scripts verify these automatically. To check an
+            artifact by hand, see
+            [Verifying a release artifact](https://github.com/${{ github.repository }}#verifying-a-release-artifact).
           files: |
             release/fivenines-agent-linux-amd64.tar.gz
             release/fivenines-agent-linux-arm64.tar.gz
@@ -936,6 +1107,8 @@ jobs:
             release/fivenines-agent-alpine-arm64.tar.gz
             release/*.spk
             release/fivenines-agent-windows-amd64.msi
+            release/SHA256SUMS
+            release/SHA256SUMS.sig
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -992,7 +1165,62 @@ jobs:
           cp fivenines_update.ps1 r2-upload/latest/
           cp fivenines_uninstall.ps1 r2-upload/latest/
 
+          # Manifest over everything this prefix serves, so the installers
+          # (and operators) can verify whatever they pulled from R2. It is
+          # generated here rather than copied from the release job because
+          # R2 also carries the install scripts and service units.
+          ( cd r2-upload/latest && find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\0' \
+              | sort -z \
+              | xargs -0 sha256sum > SHA256SUMS )
+
           ls -la r2-upload/latest/
+          cat r2-upload/latest/SHA256SUMS
+
+      # Detached ECDSA P-256 signature over SHA256SUMS. The private key lives
+      # in a repository secret, never in the release bucket - that is the whole
+      # point: a mirror that rewrites the manifest cannot re-sign it. Skipped
+      # when the secret is not configured (forks, or before the key exists),
+      # the same shape as the Authenticode step above.
+      - name: Sign SHA256SUMS
+        if: env.RELEASE_SIGNING_KEY != ''
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        working-directory: r2-upload/latest
+        run: |
+          KEY="$RUNNER_TEMP/release-signing.key"
+          PUB="$RUNNER_TEMP/release-signing.pub"
+          ( umask 077; printf '%s\n' "$RELEASE_SIGNING_KEY" > "$KEY" )
+
+          openssl dgst -sha256 -sign "$KEY" -out SHA256SUMS.sig SHA256SUMS
+
+          # A signature that does not verify must never ship: every installer
+          # with the key armed would refuse to install.
+          openssl ec -in "$KEY" -pubout -out "$PUB" 2>/dev/null
+          openssl dgst -sha256 -verify "$PUB" -signature SHA256SUMS.sig SHA256SUMS
+
+          # A valid signature made with the WRONG key is worse than no
+          # signature: every agent embeds one public key verbatim and would
+          # refuse the release outright. Compare the key derived from the
+          # secret against the one the installers actually carry, in DER so
+          # PEM line-wrapping cannot make two identical keys look different.
+          EMBEDDED="$RUNNER_TEMP/embedded.pub"
+          sed -n '/-----BEGIN PUBLIC KEY-----/,/-----END PUBLIC KEY-----/p' \
+            "$GITHUB_WORKSPACE/fivenines_common.sh" > "$EMBEDDED"
+          if [ -s "$EMBEDDED" ]; then
+            if ! cmp -s \
+              <(openssl pkey -pubin -in "$PUB" -outform DER) \
+              <(openssl pkey -pubin -in "$EMBEDDED" -outform DER); then
+              echo "::error::RELEASE_SIGNING_KEY does not match the public key embedded in the install scripts. Every agent would refuse this release."
+              rm -f "$KEY" "$PUB" "$EMBEDDED"
+              exit 1
+            fi
+            echo "Signing key matches the public key embedded in the install scripts."
+          else
+            echo "::warning::No public key is embedded in the install scripts, so nothing verifies this signature yet."
+          fi
+
+          rm -f "$KEY" "$PUB" "$EMBEDDED"
+          echo "Signed SHA256SUMS ($(wc -c < SHA256SUMS.sig) byte signature)"
 
       - name: Install rclone
         run: |
@@ -1033,3 +1261,7 @@ jobs:
           echo "  - https://releases.fivenines.io/latest/fivenines-agent.service"
           echo "  - https://releases.fivenines.io/latest/fivenines-agent.openrc"
           echo "  - https://releases.fivenines.io/latest/fivenines_script.sh"
+          echo "  - https://releases.fivenines.io/latest/SHA256SUMS"
+          if [ -s r2-upload/latest/SHA256SUMS.sig ]; then
+            echo "  - https://releases.fivenines.io/latest/SHA256SUMS.sig"
+          fi
