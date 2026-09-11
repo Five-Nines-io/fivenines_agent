@@ -74,7 +74,10 @@ check "stripping the signature is fatal, not a downgrade" "$?" "1"
 
 # Emptying the block is the documented rotation escape hatch, and it must
 # report "cannot check" (2) rather than "verified" (0).
-# shellcheck disable=SC2329  # called indirectly, from verify_sums_signature
+# Both codes: shellcheck 0.9 (what CI installs from apt) reports SC2317 here,
+# newer releases report SC2329. Either way the override IS reached - through
+# verify_sums_signature, which shellcheck cannot follow.
+# shellcheck disable=SC2317,SC2329
 release_signing_pubkey() { :; }
 verify_sums_signature "$WORK/SHA256SUMS" "$WORK/SHA256SUMS.sig" > /dev/null 2>&1
 check "an empty key reports 'cannot check', never 'ok'" "$?" "2"
