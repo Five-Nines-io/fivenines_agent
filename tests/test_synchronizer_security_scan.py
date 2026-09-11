@@ -2,8 +2,11 @@
 
 import gzip
 import json
+import sys
 from threading import Event
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 import fivenines_agent.synchronizer as synchronizer_module
 from fivenines_agent.synchronizer import Synchronizer, serialize_payload
@@ -563,6 +566,16 @@ def test_get_conn_disables_auto_open(mock_resolver, mock_socket, mock_api_url):
     assert conn.auto_open == 0
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason=(
+        "POSIX modes are not enforced on Windows (os.fchmod does not even "
+        "exist there); the config dir is protected by the MSI's "
+        "util:PermissionEx instead. The cross-platform half of this contract "
+        "-- that the token is still written when the mode cannot be set -- is "
+        "asserted by the companion test below."
+    ),
+)
 @patch("fivenines_agent.synchronizer.config_dir")
 def test_swap_token_creates_file_owner_only(mock_config_dir, tmp_path):
     """A freshly-created TOKEN must be 0600 regardless of umask: a reader with
@@ -583,6 +596,28 @@ def test_swap_token_creates_file_owner_only(mock_config_dir, tmp_path):
     mode = os_module.stat(tmp_path / "TOKEN").st_mode & 0o777
     assert mode == 0o600
     assert (tmp_path / "TOKEN").read_text() == "per-host-token"
+
+
+@patch("fivenines_agent.synchronizer.config_dir")
+def test_swap_token_writes_the_token_where_fchmod_does_not_exist(
+    mock_config_dir, tmp_path, monkeypatch
+):
+    """The one that mattered: on Windows os.fchmod does not exist, and calling
+    it unguarded raised AFTER the O_TRUNC open had emptied TOKEN and BEFORE the
+    write. The agent logged "Error saving token" and left an EMPTY file, so the
+    host lost its credential on the next restart and could not authenticate.
+
+    Reproduced on any platform by removing the attribute; the mode assertion
+    above still covers the POSIX side.
+    """
+    import os as os_module
+
+    monkeypatch.delattr(os_module, "fchmod", raising=False)
+    mock_config_dir.return_value = str(tmp_path)
+    sync = make_synchronizer()
+    sync._swap_token("new-token-123")
+    assert sync.token == "new-token-123"
+    assert (tmp_path / "TOKEN").read_text() == "new-token-123"
 
 
 @patch("fivenines_agent.synchronizer.config_dir")

@@ -27,6 +27,7 @@ import threading
 import time
 
 from fivenines_agent.debug import log
+from fivenines_agent.env import restrict_to_owner
 
 
 class CaptureCoordinator:
@@ -61,7 +62,7 @@ class CaptureCoordinator:
             )
             # Heal a pre-existing file's mode too (os.open's mode applies only
             # at creation).
-            os.fchmod(fd, 0o600)
+            restrict_to_owner(fd)
             with os.fdopen(fd, "w") as f:
                 f.write(str(capture_id))
         except Exception as e:
