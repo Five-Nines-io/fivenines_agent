@@ -30,7 +30,7 @@ fi
 # drifts in one script is a security regression, not a style nit.
 # release_signing_pubkey is here for the same reason - a public key pasted
 # into three scripts out of four leaves the fourth verifying nothing.
-SHARED_FUNCTIONS="detect_libc compute_sha256 sha256_from_sums verify_sha256 \
+SHARED_FUNCTIONS="detect_libc make_work_dir compute_sha256 sha256_from_sums verify_sha256 \
 release_signing_pubkey verify_sums_signature verify_agent_tarball"
 
 ERRORS=0

@@ -67,6 +67,18 @@ download_with_fallback() {
     return 1
 }
 
+# Everything downloaded before it has been verified lands in a private
+# directory. /tmp is world-writable and these files are written as root under
+# predictable names, so a local user who pre-creates one as a symlink turns a
+# download into an arbitrary root-owned overwrite. mktemp -d hands back a
+# fresh 0700 directory that nobody else can have staged in advance.
+make_work_dir() {
+    dir=$(mktemp -d 2>/dev/null) || return 1
+    [ -d "$dir" ] || return 1
+    chmod 700 "$dir" 2>/dev/null || true
+    printf '%s' "$dir"
+}
+
 # Portable SHA-256 of a file. Prints the lowercase hex digest on stdout, or
 # nothing at all when the host has no digest tool. sha256sum covers coreutils
 # and BusyBox (so every distro in the support matrix); shasum and openssl are

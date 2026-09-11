@@ -136,6 +136,18 @@ download_with_fallback() {
     return 1
 }
 
+# Everything downloaded before it has been verified lands in a private
+# directory. /tmp is world-writable and these files are written as root under
+# predictable names, so a local user who pre-creates one as a symlink turns a
+# download into an arbitrary root-owned overwrite. mktemp -d hands back a
+# fresh 0700 directory that nobody else can have staged in advance.
+make_work_dir() {
+    dir=$(mktemp -d 2>/dev/null) || return 1
+    [ -d "$dir" ] || return 1
+    chmod 700 "$dir" 2>/dev/null || true
+    printf '%s' "$dir"
+}
+
 # Portable SHA-256 of a file. Prints the lowercase hex digest on stdout, or
 # nothing at all when the host has no digest tool. sha256sum covers coreutils
 # and BusyBox (so every distro in the support matrix); shasum and openssl are
@@ -429,15 +441,23 @@ download_agent() {
     echo "Downloading agent..."
 
     tarball_name="${BINARY_NAME}.tar.gz"
-    tarball_path="/tmp/${tarball_name}"
+
+    # See make_work_dir: /tmp is world-writable, so the download lands
+    # somewhere only this process can reach. The CI harness still pre-places
+    # a tarball at the old path, which is copied in rather than used in place.
+    preplaced_tarball="/tmp/${tarball_name}"
+    WORK_DIR=$(make_work_dir) || exit_with_error "Failed to create a private temporary directory"
+    trap 'rm -rf "$WORK_DIR"' EXIT
+    tarball_path="${WORK_DIR}/${tarball_name}"
 
     # Only download_with_fallback sets this; an empty value means the tarball
     # did not come from a mirror that publishes a checksum.
     DOWNLOAD_SOURCE=""
 
     # Use custom URL if provided, otherwise use fallback mechanism
-    if [ "${FIVENINES_TEST_MODE:-}" = "1" ] && [ -f "$tarball_path" ]; then
-        print_warning "Using pre-placed tarball at $tarball_path (test mode)"
+    if [ "${FIVENINES_TEST_MODE:-}" = "1" ] && [ -f "$preplaced_tarball" ]; then
+        print_warning "Using pre-placed tarball at $preplaced_tarball (test mode)"
+        cp "$preplaced_tarball" "$tarball_path" || exit_with_error "Failed to stage the pre-placed tarball"
     elif [ -n "${FIVENINES_AGENT_URL:-}" ]; then
         print_warning "Using custom agent URL: $FIVENINES_AGENT_URL"
         download_file "$FIVENINES_AGENT_URL" "$tarball_path" || exit_with_error "Failed to download agent from custom URL"

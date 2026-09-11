@@ -72,6 +72,18 @@ download_with_fallback() {
   return 1
 }
 
+# Everything downloaded before it has been verified lands in a private
+# directory. /tmp is world-writable and these files are written as root under
+# predictable names, so a local user who pre-creates one as a symlink turns a
+# download into an arbitrary root-owned overwrite. mktemp -d hands back a
+# fresh 0700 directory that nobody else can have staged in advance.
+make_work_dir() {
+    dir=$(mktemp -d 2>/dev/null) || return 1
+    [ -d "$dir" ] || return 1
+    chmod 700 "$dir" 2>/dev/null || true
+    printf '%s' "$dir"
+}
+
 # Portable SHA-256 of a file. Prints the lowercase hex digest on stdout, or
 # nothing at all when the host has no digest tool. sha256sum covers coreutils
 # and BusyBox (so every distro in the support matrix); shasum and openssl are
@@ -387,7 +399,14 @@ else
 fi
 
 TARBALL_NAME="${BINARY_NAME}.tar.gz"
-TARBALL_PATH="/tmp/${TARBALL_NAME}"
+
+# The CI harness pre-places a tarball at the old, predictable path; it is
+# copied into the private work directory rather than used in place, so the
+# verified-then-extracted file is one nothing else can swap underneath us.
+PREPLACED_TARBALL="/tmp/${TARBALL_NAME}"
+WORK_DIR=$(make_work_dir) || exit_with_error "Failed to create a private temporary directory"
+trap 'rm -rf "$WORK_DIR"' EXIT
+TARBALL_PATH="${WORK_DIR}/${TARBALL_NAME}"
 AGENT_DIR="${INSTALL_DIR}/${BINARY_NAME}"
 AGENT_EXECUTABLE="${AGENT_DIR}/${BINARY_NAME}"
 
@@ -395,8 +414,9 @@ AGENT_EXECUTABLE="${AGENT_DIR}/${BINARY_NAME}"
 # not come from a mirror that publishes a checksum.
 DOWNLOAD_SOURCE=""
 
-if [ "${FIVENINES_TEST_MODE:-}" = "1" ] && [ -f "$TARBALL_PATH" ]; then
-    print_warning "Using pre-placed tarball at $TARBALL_PATH (test mode)"
+if [ "${FIVENINES_TEST_MODE:-}" = "1" ] && [ -f "$PREPLACED_TARBALL" ]; then
+    print_warning "Using pre-placed tarball at $PREPLACED_TARBALL (test mode)"
+    cp "$PREPLACED_TARBALL" "$TARBALL_PATH" || exit_with_error "Failed to stage the pre-placed tarball"
 elif [ -n "${FIVENINES_AGENT_URL:-}" ]; then
     print_warning "Using custom agent URL: $FIVENINES_AGENT_URL"
     wget -T 10 -q "$FIVENINES_AGENT_URL" -O "$TARBALL_PATH" || exit_with_error "Failed to download from custom URL"
