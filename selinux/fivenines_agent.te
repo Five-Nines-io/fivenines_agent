@@ -174,7 +174,11 @@ allow fivenines_agent_t self:netlink_route_socket { create bind getattr read wri
 # The Linux capability itself is still held only by the sudo child for the
 # duration of one read; the agent process never has it.
 allow fivenines_agent_t self:capability net_admin;
-allow fivenines_agent_t self:netlink_generic_socket { create bind getattr setopt getopt read write nlmsg_read };
+# No nlmsg_* here: those message-level permissions exist only on the netlink
+# classes that carry them (netlink_route_socket above does), and checkmodule
+# rejects the whole policy with "permission nlmsg_read is not defined for class
+# netlink_generic_socket" -- which is how CI caught it.
+allow fivenines_agent_t self:netlink_generic_socket { create bind getattr setopt getopt read write };
 
 ########################################################################
 # Unix domain sockets (systemd notify, nscd, subprocess pipes)
