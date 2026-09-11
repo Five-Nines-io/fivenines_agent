@@ -12,7 +12,7 @@
 # Mirror URLs (R2 is IPv6-compatible, GitHub is fallback)
 R2_BASE_URL="https://releases.fivenines.io/latest"
 GITHUB_RELEASES_URL="https://github.com/Five-Nines-io/fivenines_agent/releases/latest/download"
-GITHUB_RAW_URL="https://raw.githubusercontent.com/Five-Nines-io/five_nines_agent/main"
+GITHUB_RAW_URL="https://raw.githubusercontent.com/Five-Nines-io/fivenines_agent/main"
 
 # Colors for output
 RED='\033[0;31m'

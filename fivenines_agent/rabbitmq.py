@@ -55,16 +55,30 @@ counters -- the server rate()s them; never diff or reset agent-side (#97 lesson)
 A queue with no ``message_stats`` (idle, never published) omits both keys.
 """
 
+import json
 import time
 from urllib.parse import quote
 
 import requests
 
 from fivenines_agent.debug import debug, log
+from fivenines_agent.http_body import read_capped_body
 
 # Per-request timeout (seconds). A wedged broker must never stall the collect
 # loop; also bounds connection establishment on a dead host.
 _TIMEOUT = 5
+
+# Byte cap on any management-API response body (streamed read; see
+# _parse_json). The per-queue columns filter keeps real bodies small, but the
+# url is server-pushed config and a 50k-queue broker's unfiltered listing (or a
+# misdirected url) must not grow the daemon's RSS without bound.
+_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
+
+# Wall-clock budget for reading ONE body, decoupled from the 5s connect
+# timeout: a legitimate multi-MB queues listing over a slow link must not be
+# misclassified as an http_error (reachable:false pages the customer), while
+# a trickling endpoint is still cut off well inside the per-tick deadline.
+_BODY_READ_DEADLINE_S = 20
 
 # Wall-clock budget (seconds) for the whole collector's HTTP work. The four
 # fixed requests are each _TIMEOUT-bounded (~20s worst case), but the
@@ -206,7 +220,13 @@ def _http_get(session, url):
     Response is returned for the caller to interpret its status code.
     """
     try:
-        return session.get(url, timeout=_TIMEOUT)
+        # Streamed with redirects refused (the inference_metrics posture): the
+        # management url is server-pushed config, so it must not be able to
+        # bounce the agent to an internal address; the body is read under a
+        # byte cap in _parse_json rather than buffered unbounded.
+        return session.get(
+            url, timeout=_TIMEOUT, stream=True, allow_redirects=False
+        )
     except requests.exceptions.Timeout as e:
         raise _RabbitError("timeout", str(e))
     except requests.exceptions.ConnectionError as e:
@@ -227,9 +247,20 @@ def _check_status(status):
 
 
 def _parse_json(response):
-    """Parse a 200 body as JSON, mapping a malformed body to http_error."""
+    """Parse a 200 body as JSON, mapping a malformed, oversized or stalled
+    body to http_error. The body is streamed under _MAX_RESPONSE_BYTES and a
+    _TIMEOUT wall-clock deadline (read_capped_body): a queues listing on a big
+    broker is MBs, never the unbounded/trickling stream a misdirected url
+    could produce."""
     try:
-        return response.json()
+        raw = read_capped_body(response, _MAX_RESPONSE_BYTES, _BODY_READ_DEADLINE_S)
+    except Exception as e:
+        raise _RabbitError("http_error", f"body read failed: {e}")
+    try:
+        # json.loads accepts bytes directly (a UnicodeDecodeError is a
+        # ValueError, so the invalid-JSON mapping below covers it too); no
+        # second full-body str copy at the cap boundary.
+        return json.loads(raw)
     except ValueError:
         raise _RabbitError("http_error", "invalid JSON response")
 
@@ -237,7 +268,14 @@ def _parse_json(response):
 def _request(session, url):
     """GET *url* -> parsed JSON, raising a classified _RabbitError on any failure."""
     response = _http_get(session, url)
-    _check_status(response.status_code)
+    try:
+        _check_status(response.status_code)
+    except _RabbitError:
+        # Streamed responses must be closed when the body is never read: an
+        # unread body keeps the connection checked out of the keep-alive pool
+        # (urllib3 drain semantics), forcing a fresh handshake per request.
+        response.close()
+        raise
     return _parse_json(response)
 
 
@@ -250,8 +288,15 @@ def _request_optional(session, url):
     """
     response = _http_get(session, url)
     if response.status_code == 404:
+        # A watched-but-deleted queue 404s EVERY tick; close so the keep-alive
+        # connection returns to the pool instead of leaking to GC per lookup.
+        response.close()
         return None
-    _check_status(response.status_code)
+    try:
+        _check_status(response.status_code)
+    except _RabbitError:
+        response.close()
+        raise
     return _parse_json(response)
 
 
