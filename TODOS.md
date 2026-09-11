@@ -84,50 +84,31 @@ an enforcing-mode WireGuard case in that VM job.
 - **Effort:** M (human) / M (CC), needs an enforcing VM
 - **Files:** `selinux/fivenines_agent.te`, `ci/test-selinux-vm.sh`
 
-## P1: Server-side rollout for the WireGuard sudoers requirement (#144)
+## P2: Unit/binary skew through the GitHub raw fallback (#144)
 
-Agent 1.17.6 drops `AmbientCapabilities=CAP_NET_ADMIN` from the packaged unit
-and reads WireGuard through `sudo -n wg show all dump`, so every host that
-already monitors WireGuard reports `data["wireguard"] = null` after upgrading
-until its operator adds
+`fivenines_update.sh` fetches BOTH the binary and `fivenines-agent.service`
+via `download_with_fallback`: R2 `latest/` first, then
+raw.githubusercontent `/main`. Those two sources are versioned differently --
+R2 `latest/` is populated by the tag-triggered `sync-to-r2` job, `main`
+updates at merge -- so a host whose R2 fetch fails inside a merge-to-tag
+window can get a NEW unit next to an OLD binary.
 
-```
-fivenines ALL=(root) NOPASSWD: /usr/bin/wg show all dump
-```
+That combination is now load-bearing rather than cosmetic: since 1.17.6 the
+unit grants no capability and the binary is what supplies the `sudo -n` path.
+New unit + old binary means the old binary calls bare `wg` with no privilege
+and no sudo path, so WireGuard goes dark -- and adding the sudoers rule does
+NOT fix it, because that binary never uses sudo.
 
-Nothing false is produced (null is the lost-visibility freeze: no peer prune, no
-auto-resolve), but the host goes dark silently unless the server says so. The
-agent now reports a `wireguard` capability -- probed with that exact argv -- in
-`capabilities` / `pending_capabilities`, with the reason string and the hint
-`requires sudo wg show all dump`, which is what the dashboard's
-pending-capability panel needs to render the snippet.
+Fix either way round: point the unit fallback at `releases/latest/download`
+(tag-gated, like the binary) instead of `/main`, or keep tagging immediately
+after merge so the window stays short. The first is the real fix; the second
+is what we rely on today.
 
-Tracked server-side as **fivenines_server#1101** (settings snippet +
-pending-capability wiring + SetupGuides + docs/vpn.md). The `NOLOG_OUTPUT`
-correction, the "the hint does not travel, use capability_reasons" note and the
-SELinux module-reinstall caveat are posted as a comment there.
+Found by the adversarial pass on #146, which also corrected the claim that
+unit and binary always travel together -- true only on the R2 path.
 
-Server-side work: render the `wireguard` pending capability with the copy-paste
-rule, and warn admins of WireGuard-enabled hosts BEFORE they upgrade. The
-timing is tied to the RELEASE, not to this merge: `fivenines_update.sh` pulls
-both the binary and `fivenines-agent.service` from R2 `latest/`, which the
-`sync-to-r2` job populates on a `v*` tag (GitHub raw `main` is only the
-fallback for an unreachable R2 -- and that URL was 404ing until #148 fixed it).
-So on the R2 path unit and binary arrive together in one update and the
-operator's only warning is whatever the dashboard and release notes say.
-
-One caveat that is NOT no-skew: `download_with_fallback` falls back to
-raw.githubusercontent `/main` when R2 is unreachable, and `main` updates at
-MERGE while R2 `latest/` updates at TAG. A host whose R2 fetch fails inside
-that window gets the new capability-less unit next to the old binary, which
-calls bare `wg` and has no sudo path at all -- it goes dark, and adding the
-sudoers rule does not fix it (the old binary never uses sudo). Tag promptly
-after merging, or point the unit fallback at `releases/latest/download`
-instead of `main`.
-
-- **Effort:** S (human) / S (CC)
-- **Depends on:** agent PR for #144 merged
-- **Files:** fivenines-server (NOT this repo)
+- **Effort:** XS (human) / XS (CC)
+- **Files:** `fivenines_update.sh`, `fivenines_setup.sh`
 
 ## P1: Vendor the AI-inference contract fixtures into the server repo
 
