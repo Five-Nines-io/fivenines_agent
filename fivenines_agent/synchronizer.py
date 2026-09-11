@@ -225,7 +225,19 @@ class Synchronizer(Thread):
         self.token = new_token
         token_path = os.path.join(config_dir(), "TOKEN")
         try:
-            with open(token_path, "w") as f:
+            # 0600 at creation, not chmod-after: the installer pre-creates
+            # TOKEN at 600 so open("w") normally preserves that, but on the
+            # one path where the file is absent (user installs, a wiped config
+            # dir) a plain open() would inherit the umask and could leave the
+            # per-host token group/world-readable. A reader with the token can
+            # POST get_config and receive every service credential the config
+            # carries.
+            fd = os.open(token_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            # The os.open mode applies only when the file is CREATED; fchmod
+            # heals a pre-existing TOKEN an older agent left group/world-
+            # readable (idempotent, one syscall).
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as f:
                 f.write(new_token)
             log("Token swapped successfully", "info")
         except PermissionError:

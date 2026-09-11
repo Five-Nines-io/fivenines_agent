@@ -32,6 +32,50 @@ Restart=always
 WatchdogSec=90
 NotifyAccess=all
 
+# --- Sandbox hardening -------------------------------------------------------
+# MOUNT-NAMESPACE / ATTRIBUTE directives only. This is the load-bearing rule:
+# on a NON-ROOT unit (User=fivenines), every seccomp-backed directive
+# (ProtectKernelTunables/Modules/Logs, ProtectClock, RestrictRealtime,
+# LockPersonality, RestrictSUIDSGID, SystemCallFilter, ...) makes systemd
+# implicitly enable NoNewPrivileges -- seccomp without CAP_SYS_ADMIN requires
+# no_new_privs (see systemd's context_has_no_new_privileges()) -- and
+# no_new_privs breaks every `sudo -n smartctl/mdadm/fail2ban-client` spawn:
+# SMART, RAID and fail2ban monitoring would silently die fleet-wide on any
+# systemd >= 228 host. Do not add ANY directive from that family here.
+#
+# Also deliberately ABSENT, for the same or adjacent reasons:
+#   NoNewPrivileges       - breaks sudo (setuid) outright.
+#   CapabilityBoundingSet - sudo needs the full root set post-setuid for
+#                           SMART ioctls and md admin.
+#   ProtectSystem=full/strict - /etc goes read-only, breaking the TOKEN swap
+#                           and the state files under /etc/fivenines_agent
+#                           (ReadWritePaths needs systemd >= 231, and on older
+#                           systemd the exception would be IGNORED while the
+#                           read-only mount still applied -- silently degraded
+#                           enrollment on exactly the old-distro hosts).
+#   MemoryDenyWriteExecute - pynvml/libvirt load native code via ctypes/libffi.
+#
+# State files the agent CREATES (TOKEN swap, capture/inventory state) default
+# to owner-only under this umask even if the code ever regresses to plain
+# open(); the code additionally fchmods to 0600 to heal pre-existing files.
+UMask=0077
+# The agent itself never uses /tmp; a private one removes a whole
+# symlink/tmpfile attack class for it and every child it spawns. Two caveats:
+#   - It hides OTHER services' /tmp unix sockets from the agent and its
+#     children: a MySQL/PostgreSQL/PHP-FPM/HAProxy reached via a /tmp socket
+#     path (upstream-tarball defaults: /tmp/mysql.sock, /tmp/.s.PGSQL.5432;
+#     hand-written listen= paths) will read as unreachable. Distro packages
+#     use /var/run, so this is rare.
+#   - Mount-namespace setup is FATAL where namespaces are unavailable
+#     (OpenVZ/Virtuozzo-class kernels, some restricted LXC): the unit fails
+#     with status 226/NAMESPACE instead of degrading.
+# Both cases: override with a drop-in (`systemctl edit fivenines-agent` ->
+# [Service] PrivateTmp=no). Drop-ins survive the updater's unit overwrite.
+PrivateTmp=true
+# Read-only view of home directories: the agent only expanduser()s for its own
+# user context, never writes there.
+ProtectHome=read-only
+
 Environment=PYTHONUNBUFFERED=1
 
 [Install]

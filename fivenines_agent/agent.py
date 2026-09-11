@@ -77,6 +77,71 @@ IMAGE_INVENTORY_JOIN_TIMEOUT = 10
 # only baselines and does not fire a spurious reprobe.
 _RECHECK_UNSET = object()
 
+# Max ping targets honoured per tick. Each tcp_ping blocks up to 5s and the
+# loop runs SEQUENTIALLY on the watchdog-bounded collection loop, so an
+# unbounded server-pushed ping map (hostile config, or just a fat-fingered
+# region list) of firewalled hosts could stretch a tick past WatchdogSec=90
+# and restart-loop the whole fleet. Same bound-the-untrusted-config posture
+# as logs._MAX_SIGNAL_UNITS and the image-inventory MAX_RESCAN_* caps.
+MAX_PING_TARGETS = 10
+
+# Max chars for a ping region or host from the untrusted config. Real region
+# names and hostnames are well under this; an oversized entry would otherwise
+# become a multi-megabyte payload key (data["ping_<region>"]) or a huge
+# string fed to the resolver. Same posture as the image-inventory
+# MAX_FIELD_CHARS.
+MAX_PING_FIELD_CHARS = 200
+
+# Wall-clock budget for the whole ping loop. The count cap alone still allows
+# 10 x 5s connect timeouts = 50s, and tcp_ping's timeout does NOT cover
+# getaddrinfo (DNS resolution has no timeout), so a resolver outage could
+# stretch each target well past 5s. Targets past the deadline are skipped for
+# the tick.
+PING_LOOP_DEADLINE = 30
+
+# Process-once guard for the ping-cap warning (avoids per-tick log spam).
+_ping_capped_warned = False
+
+# Rotating start offset for over-cap ping maps, so the cap/deadline never
+# starves the SAME config-order tail on every tick -- each tick begins the
+# window MAX_PING_TARGETS further along, giving every target a turn.
+_ping_rotation = 0
+
+
+def _capped_ping_targets(ping_config):
+    """Up to MAX_PING_TARGETS well-formed (region, host) pairs, warning once
+    when the server-pushed map exceeds the cap. Oversized region/host strings
+    are dropped (len() is O(1); no copy of a hostile multi-MB entry is ever
+    made). A non-dict value -- the plain-boolean config shape used by other
+    keys, or garbage -- yields [] rather than crashing the loop: an
+    AttributeError here would escape _collect_metrics and exit the agent into
+    a Restart=always crash loop against the same config."""
+    global _ping_capped_warned, _ping_rotation
+    if not isinstance(ping_config, dict):
+        return []
+    items = [
+        (region, host)
+        for region, host in ping_config.items()
+        if isinstance(region, str)
+        and isinstance(host, str)
+        and len(region) <= MAX_PING_FIELD_CHARS
+        and len(host) <= MAX_PING_FIELD_CHARS
+    ]
+    if len(items) <= MAX_PING_TARGETS:
+        return items
+    if not _ping_capped_warned:
+        log(
+            f"ping config has {len(items)} targets; honouring "
+            f"{MAX_PING_TARGETS}/tick (rotating) to stay under the systemd "
+            "watchdog",
+            "error",
+        )
+        _ping_capped_warned = True
+    start = _ping_rotation % len(items)
+    _ping_rotation += MAX_PING_TARGETS
+    rotated = items[start:] + items[:start]
+    return rotated[:MAX_PING_TARGETS]
+
 
 # Permissive config used only in --dry-run so every collector that has the
 # capability runs, without contacting the API. The keys mirror what the server
@@ -373,7 +438,15 @@ class Agent:
 
         # Special-case collectors (unique dispatch patterns)
         if self.config.get("ping"):
-            for region, host in self.config["ping"].items():
+            ping_deadline = time.monotonic() + PING_LOOP_DEADLINE
+            for region, host in _capped_ping_targets(self.config["ping"]):
+                if time.monotonic() > ping_deadline:
+                    log(
+                        f"ping loop exceeded {PING_LOOP_DEADLINE}s; skipping "
+                        "remaining targets this tick",
+                        "error",
+                    )
+                    break
                 data[f"ping_{region}"] = self._collect(f"ping_{region}", tcp_ping, host)
         if self.config.get("ipv4"):
             data["ipv4"] = self._collect("ipv4", get_ip, ipv6=False)

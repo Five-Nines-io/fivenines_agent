@@ -36,16 +36,30 @@ absent from the exposition OMITS its payload key (the server treats a missing
 key as no-data) -- we never fabricate a ``0``.
 """
 
+import json
 import math
 import re
 
 import requests
 
 from fivenines_agent.debug import debug, log
+from fivenines_agent.http_body import read_capped_body
 
 # Shared transport timeout (seconds), matching caddy.py / apache.py. A wedged
 # TSDB must never hang the whole collect tick.
 _TIMEOUT = 5
+
+# Byte cap on any response body we read (streamed; see _read_capped). The
+# metrics_url is server-pushed config: without a cap, pointing it at an
+# endpoint that streams forever (or a multi-GB file) grows the long-lived
+# daemon's RSS without bound. 8 MB covers very large real Prometheus
+# expositions with headroom.
+_MAX_RESPONSE_BYTES = 8 * 1024 * 1024
+
+# Wall-clock budget for reading one body, decoupled from the 5s connect
+# timeout: a large real exposition on a slow link must not flap the collector,
+# while a trickling endpoint is still bounded.
+_BODY_READ_DEADLINE_S = 15
 
 # The exact source metric names we read out of the text exposition, by flavor.
 # Pinned byte-for-byte against the contract fixture -- a rename upstream shows up
@@ -93,6 +107,21 @@ _NAMES_OF_INTEREST = frozenset(
         _VM_APP_VERSION,
     }
 )
+
+
+def _read_capped(response):
+    """Stream a response body under _MAX_RESPONSE_BYTES and a _TIMEOUT
+    wall-clock deadline (read_capped_body); raise when exceeded.
+
+    Raising (rather than truncating) routes an oversized/stalled body through
+    the caller's existing failure handling: /metrics degrades to a bare
+    reachable payload, /api/v1/targets to omitted target keys. The connection
+    is closed either way.
+    """
+    return read_capped_body(
+        response, _MAX_RESPONSE_BYTES, _BODY_READ_DEADLINE_S
+    ).decode("utf-8", "replace")
+
 
 # Prometheus label matcher: name="value" pairs, honouring backslash escapes in
 # the value so a stray quote does not truncate the scan. We only ever read the
@@ -145,12 +174,18 @@ def tsdb_metrics(
             auth = (basic_auth_username, basic_auth_password or "")
 
         def get(path):
+            # Streamed with redirects refused (the inference_metrics/haproxy
+            # posture): a misconfigured or hostile url cannot bounce the agent
+            # to an internal address (SSRF), and the body is read under a byte
+            # cap by _read_capped rather than buffered unbounded.
             return requests.get(
                 base + path,
                 headers=headers,
                 auth=auth,
                 timeout=_TIMEOUT,
                 verify=verify_ssl,
+                stream=True,
+                allow_redirects=False,
             )
 
         response = get("/metrics")
@@ -158,12 +193,17 @@ def tsdb_metrics(
         return _unreachable(e)
 
     if response.status_code in (401, 403):
+        # Streamed responses must be closed on every exit (a locked-down
+        # Prometheus 403s every tick; leaking the checked-out socket to GC
+        # each time is avoidable churn).
+        response.close()
         return {
             "reachable": False,
             "error_type": "auth_failed",
             "error_message": f"HTTP {response.status_code} on /metrics",
         }
     if not 200 <= response.status_code < 300:
+        response.close()
         return {
             "reachable": False,
             "error_type": "http_error",
@@ -174,7 +214,7 @@ def tsdb_metrics(
     # matter what parsing or the targets probe do below (the sharp edge). A
     # parse bug degrades to a bare reachable payload, it never pages the customer.
     try:
-        return _build_payload(response.text, get)
+        return _build_payload(_read_capped(response), get)
     except Exception as e:
         log(f"TSDB parse error (staying reachable): {e}", "error")
         return {"reachable": True, "flavor": None, "version": None}
@@ -440,8 +480,11 @@ def _fetch_targets(get):
     try:
         response = get("/api/v1/targets")
         if not 200 <= response.status_code < 300:
+            response.close()
             return None
-        active = response.json().get("data", {}).get("activeTargets")
+        active = json.loads(_read_capped(response)).get("data", {}).get(
+            "activeTargets"
+        )
         if not isinstance(active, list):
             return None
         total = len(active)

@@ -54,6 +54,23 @@ detects glibc vs musl and downloads the matching binary. See
 [Alpine Linux (OpenRC)](#alpine-linux-openrc) and [UNRAID](#unraid) for the
 platform-specific notes.
 
+On systemd hosts the bundled unit is sandbox-hardened (agent version
+**1.17.4+**): `UMask=0077` (state files the agent writes -- the per-host
+token, capture and inventory state -- are owner-only, `0600`), `PrivateTmp=true`
+and `ProtectHome=read-only`. Heavier directives (`NoNewPrivileges`, seccomp
+filters, `ProtectSystem`) are deliberately absent: they would silently break
+the sudo-based collectors (SMART, RAID, fail2ban) and the enrollment token
+swap.
+
+> **Note:** `PrivateTmp` gives the agent a private `/tmp`. A service monitored
+> through a `/tmp` unix-socket path (upstream-tarball defaults like
+> `/tmp/mysql.sock` or `/tmp/.s.PGSQL.5432`; distro packages use `/var/run`,
+> so this is rare) will read as unreachable, and on kernels without mount
+> namespaces (OpenVZ/Virtuozzo-class, some restricted LXC) the unit fails to
+> start with status `226/NAMESPACE`. Both are fixed with a drop-in, which
+> survives agent updates: `sudo systemctl edit fivenines-agent`, then add
+> `[Service]` and `PrivateTmp=no`.
+
 ### User-Level Installation (No Sudo/Root Access)
 
 For environments where you don't have sudo/root access (shared hosting, managed VPS, etc.):
@@ -780,10 +797,15 @@ counts, and for each fingerprint one *representative excerpt*, capped at 500
 characters and redacted first. The redaction pass masks PEM private-key headers,
 JWTs, AWS access keys, `Bearer` tokens, passwords embedded in connection strings
 (`scheme://user:pass@host`), generic `password=` / `secret=` / `token=` /
-`api_key=` / `authorization=` assignments, email addresses, and any opaque
-base64/hex run of 40 characters or more (key bodies, session blobs, hashes). The
+`api_key=` / `authorization=` assignments, Ceph keyring material
+(`key = AQ...`), email addresses, and any opaque base64/hex run of 38
+characters or more (key bodies, session blobs, hashes -- 38 is the exact
+length of a cephx key's base64 body, so one can never slip under it). The
 same redaction is applied to the journal tails collected by
-[systemd unit monitoring](#systemd-unit-monitoring).
+[systemd unit monitoring](#systemd-unit-monitoring) and, from agent version
+**1.17.4**, to the stderr quoted into [Ceph](#ceph-cluster-monitoring) error
+reports -- `ceph` can echo lines of a broken config or keyring into its own
+parse errors.
 
 Redaction is best-effort by nature -- it cannot recognise a secret format it has
 never seen. The digest-only posture is the real mitigation: a novel secret format
@@ -1170,7 +1192,8 @@ slow": the pool is out of workers, not the database.
 Three ways to point the agent at it:
 
 - **HTTP** -- scrape the status page through your web server, like the Nginx and
-  Apache integrations. One URL is one pool.
+  Apache integrations. One URL is one pool. Redirects are not followed (agent
+  version **1.17.4+**) -- point the agent at the status page's final URL.
 - **Direct FastCGI** -- `unix:///run/php/php8.2-fpm.sock/status` or
   `tcp://127.0.0.1:9000/status`. The agent speaks FastCGI itself (pure Python, no
   extra dependency), so `/status` never has to be exposed through the web server
@@ -1237,7 +1260,9 @@ Redis and [Valkey](https://valkey.io) (the collector also reports
   state/offset/lag (master) and link status/lag (replica)
 - Persistence: last RDB save time, last background-save status, AOF enabled
 
-Connects to `localhost:6379` by default; an optional password is supported. All
+Connects to `localhost:6379` by default; an optional password is supported and
+is sent with length-prefixed protocol framing (agent version **1.17.4+**), so a
+password containing spaces or other special characters works verbatim. All
 derived values (memory usage %, hit ratio, RDB age, replication lag) are
 computed server-side from these raw fields.
 
@@ -1294,6 +1319,10 @@ show that the list is a sample. A dead broker or a queue listing that came back
 incomplete is reported as unreachable rather than as a shorter list, so queue
 rows are never pruned and an open backlog incident cannot falsely resolve.
 
+Management-API responses are read under a size cap and a wall-clock deadline,
+and redirects are not followed (agent version **1.17.4+**) -- point `url` at
+the management API's final address.
+
 ### Prometheus / VictoriaMetrics
 
 Monitors the health of a **Prometheus or VictoriaMetrics server** itself
@@ -1322,7 +1351,11 @@ response yields "reachable" even if the flavor is unrecognised, no expected
 metric is present, or the follow-up targets API is locked down -- an agent-mode
 Prometheus is a normal deployment, and an agent-side parsing gap must never page
 you with "your Prometheus is down". Only a connection-level failure -- refused,
-timeout, TLS error, auth failure, non-2xx -- reports as unreachable.
+timeout, TLS error, auth failure, non-2xx -- reports as unreachable. Redirects
+count as non-2xx: the agent never follows them (agent version **1.17.4+**), so
+the configured `url` must be the final address. Response bodies are read under a size
+cap and a wall-clock deadline, so a misdirected URL can neither grow the
+agent's memory without bound nor stall its collection loop.
 
 ## Contribute
 

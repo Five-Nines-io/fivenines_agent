@@ -22,6 +22,7 @@ forward-plumbed into the job for the raw posture; V1 ships digest only, whose si
 is already bounded by the fingerprint/excerpt caps in logs.py.
 """
 
+import os
 import threading
 import time
 
@@ -52,7 +53,16 @@ class CaptureCoordinator:
 
     def _persist(self, capture_id):
         try:
-            with open(self.state_path, "w") as f:
+            # 0600 at creation (umask-independent), matching machine_id and the
+            # TOKEN swap: state files under the config dir default to
+            # owner-only rather than trusting the process umask.
+            fd = os.open(
+                self.state_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
+            )
+            # Heal a pre-existing file's mode too (os.open's mode applies only
+            # at creation).
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as f:
                 f.write(str(capture_id))
         except Exception as e:
             # Best-effort: a write failure must not break capture. The in-memory

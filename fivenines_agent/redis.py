@@ -1,7 +1,33 @@
 import re
 import socket
+import time
 
 from fivenines_agent.debug import debug, log
+
+# Bounds for the INFO reply read. A real INFO payload is tens of KB; the port
+# is server-pushed config, so a local listener that streams forever (RSS) or
+# trickles bytes (the 5s socket timeout is per-recv inactivity, so a trickle
+# never trips it and would stall the watchdog-bounded loop) must be cut off.
+# Same posture as http_body.read_capped_body for the HTTP collectors.
+_MAX_REPLY_BYTES = 1024 * 1024
+_READ_DEADLINE_S = 5
+
+
+def _resp_command(*args):
+    """One command in RESP array framing (length-prefixed bulk strings).
+
+    Every argument is pure DATA under this framing: a CRLF inside a
+    config-supplied password is content, never a protocol line break. The
+    inline framing this replaces joined commands with \r\n, so a hostile
+    password pushed in config ("x\r\nCONFIG SET ...") injected arbitrary
+    commands into the local Redis -- and, less dramatically, any password
+    containing a space simply broke AUTH (inline args split on whitespace).
+    """
+    parts = [f"*{len(args)}\r\n".encode()]
+    for arg in args:
+        data = str(arg).encode()
+        parts.append(b"$" + str(len(data)).encode() + b"\r\n" + data + b"\r\n")
+    return b"".join(parts)
 
 
 # Exact INFO keys shipped as strings. Anything the server encodes into a gauge
@@ -126,26 +152,33 @@ def redis_metrics(port=6379, password=None):
 
         commands = []
         if password:
-            commands.append(f"AUTH {password}")
-        commands.append("INFO")
-        commands.append("QUIT")
+            commands.append(_resp_command("AUTH", password))
+        commands.append(_resp_command("INFO"))
+        commands.append(_resp_command("QUIT"))
 
-        # CRLF-terminated inline commands (RESP inline protocol).
-        s.sendall(("\r\n".join(commands) + "\r\n").encode())
+        # RESP array framing, never the inline protocol: see _resp_command.
+        s.sendall(b"".join(commands))
 
-        data = b""
+        data = bytearray()
+        deadline = time.monotonic() + _READ_DEADLINE_S
         while True:
+            if time.monotonic() > deadline:
+                log("Redis INFO read exceeded deadline; truncating", "error")
+                break
             chunk = s.recv(4096)
             if not chunk:
                 break
             data += chunk
+            if len(data) > _MAX_REPLY_BYTES:
+                log("Redis INFO reply exceeded size cap; truncating", "error")
+                break
         s.close()
 
         # A denied/unparseable reply (-WRONGPASS, -NOAUTH) or an empty response
         # yields {} here (no exact key matched); the server's presence gate
         # skips an empty block. A socket/connection error raises and returns
         # None via the except path below.
-        return _parse_info(data.decode("utf-8", errors="ignore"))
+        return _parse_info(bytes(data).decode("utf-8", errors="ignore"))
 
     except Exception as e:
         log(f"Error collecting Redis metrics: {e}", "error")

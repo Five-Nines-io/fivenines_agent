@@ -46,14 +46,26 @@ _SEVERITY_RANK = {"info": 0, "warn": 1, "error": 2}
 # generic key=value rule. Documented as best-effort - it WILL miss novel formats.
 _REDACTIONS = [
     (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), "[REDACTED_PRIVATE_KEY]"),
+    # Long opaque base64/hex run: PEM key bodies, API tokens, hashes, session
+    # blobs. SECOND on purpose, before every other pattern: several later
+    # rules backtrack quadratically on long unbroken alnum runs (measured:
+    # seconds of CPU on a 100KB token), and redact() runs on the
+    # watchdog-bounded collection loop -- collapsing every long run to a
+    # marker first bounds them all to short tokens. Cosmetic cost: a >=38-char
+    # JWT/AWS-key run reads [REDACTED_BLOB] instead of its specific marker;
+    # it is redacted either way. 38 (not 40): a cephx secret is 38 base64
+    # chars plus '==' padding and must not slip under the threshold.
+    (re.compile(r"[A-Za-z0-9+/]{38,}={0,2}"), "[REDACTED_BLOB]"),
     (
         re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),
         "[REDACTED_JWT]",
     ),
     (re.compile(r"AKIA[0-9A-Z]{16}"), "[REDACTED_AWS_KEY]"),
     (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]+"), "Bearer [REDACTED]"),
-    # password inside a connection string user:pass@host
-    (re.compile(r"(\w+://[^:@\s/]+:)[^@\s/]+(@)"), r"\1[REDACTED]\2"),
+    # password inside a connection string user:pass@host. The \b anchor is
+    # load-bearing: without it, `\w+://` re-tries the scheme match at every
+    # offset of a long token (quadratic); with it, only at word starts.
+    (re.compile(r"\b(\w+://[^:@\s/]+:)[^@\s/]+(@)"), r"\1[REDACTED]\2"),
     # generic secret assignment: key=value / key: value
     (
         re.compile(
@@ -62,14 +74,18 @@ _REDACTIONS = [
         ),
         r"\1=[REDACTED]",
     ),
+    # cephx keyring material: `key = AQ...` / `key: AQ...`. A bare "key" label
+    # is too common for the generic rule above, so this one additionally
+    # requires a base64-looking value (>=20 chars) -- the shape ceph writes in
+    # keyrings and quotes into its own parse errors.
+    (
+        re.compile(r"(?i)\bkey\s*[=:]\s*[\"']?[A-Za-z0-9+/]{20,}={0,2}"),
+        "key=[REDACTED]",
+    ),
     (
         re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"),
         "[REDACTED_EMAIL]",
     ),
-    # Long opaque base64/hex run (>=40 chars): PEM key bodies, API tokens, hashes,
-    # session blobs. Higher threshold than the fingerprint mask so readable
-    # excerpts are not over-redacted.
-    (re.compile(r"[A-Za-z0-9+/]{40,}={0,2}"), "[REDACTED_BLOB]"),
 ]
 
 # Fingerprint masking: collapse volatile tokens so the same error template hashes
