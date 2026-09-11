@@ -397,24 +397,31 @@ Once a public key is embedded, **stripping the signature is not a way around
 it**: a missing or empty `SHA256SUMS.sig` aborts the install exactly like a bad
 one.
 
+The public key releases are signed with, so you can verify one yourself:
+
+```
+-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEYEeNw0yIcXeLpQifrLGT7iU02K9R
+36O9k+TrWYiVYF2xyCrykF3qFkwOOAl+gbFmi6c/9oFsMFcuinr8p9UJtw==
+-----END PUBLIC KEY-----
+```
+
+It is the same key embedded in the install scripts -- you can read it out of
+`fivenines_setup.sh` on any host and compare. `FIVENINES_REQUIRE_SIGNATURE=1`
+turns a signature that could not be checked into a hard failure, which is the
+setting to use if you want the guarantee enforced fleet-wide.
+
 To check a signature by hand:
 
 ```bash
 wget -q https://releases.fivenines.io/latest/SHA256SUMS
 wget -q https://releases.fivenines.io/latest/SHA256SUMS.sig
 
+# with the key above saved as fivenines-release.pub
 openssl dgst -sha256 -verify fivenines-release.pub \
   -signature SHA256SUMS.sig SHA256SUMS
 # Verified OK
 ```
-
-> **Status:** the release signing key is not in place yet, so releases
-> currently ship with checksum verification only. Until it is, the installers
-> say so on every run (`Release signature not checked - falling back to the
-> published checksum`) rather than passing silently.
-> `FIVENINES_REQUIRE_SIGNATURE=1` turns that warning into a hard failure, and
-> is the setting to use once signing is armed if you want the guarantee
-> enforced fleet-wide.
 
 A host with no `openssl` reports the same "could not check" outcome and falls
 back to the checksum. That is not a hole an attacker can open: whoever controls

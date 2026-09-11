@@ -169,19 +169,30 @@ verify_sha256() {
 # SHA-256 rather than Ed25519: OpenSSL 1.0.2 on CentOS 7 cannot verify
 # Ed25519, and CentOS 7 is in the support matrix.
 #
-# EMPTY output means signature verification is not armed yet: the installers
-# fall back to checksum-only and say so out loud. Filling this in arms
-# signature verification fleet-wide on the next release. To arm it:
+# The matching PRIVATE key lives only in the RELEASE_SIGNING_KEY repository
+# secret - never in the release bucket - which is what makes this worth
+# anything: a mirror that rewrites SHA256SUMS cannot re-sign it.
+#
+# ROTATION IS A BREAKING CHANGE. Every installed agent carries the key below
+# verbatim, so a release signed with a different key is REJECTED by every
+# host until it picks up a new installer. To rotate: publish the installer
+# carrying the new key first, let the fleet take it, and only then switch
+# RELEASE_SIGNING_KEY. Emptying this block is the escape hatch - it drops
+# back to checksum-only verification, loudly, rather than failing closed.
 #
 #   openssl ecparam -name prime256v1 -genkey -noout -out fivenines-release.key
 #   openssl ec -in fivenines-release.key -pubout
 #
-# Put the PRIVATE key in the RELEASE_SIGNING_KEY repository secret, and paste
-# the public key PEM between the PUBKEY markers below - in this file and in
-# all four install scripts. ci/build-scripts.sh --check enforces that the
-# five copies stay identical, so a key pasted into only some of them fails CI.
+# The key must be identical here and in all four install scripts;
+# ci/build-scripts.sh --check fails if they drift, because a key pasted into
+# three scripts out of four leaves the fourth verifying nothing. CI also
+# refuses to sign a release whose key does not match this block.
 release_signing_pubkey() {
     cat <<'PUBKEY'
+-----BEGIN PUBLIC KEY-----
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEYEeNw0yIcXeLpQifrLGT7iU02K9R
+36O9k+TrWYiVYF2xyCrykF3qFkwOOAl+gbFmi6c/9oFsMFcuinr8p9UJtw==
+-----END PUBLIC KEY-----
 PUBKEY
 }
 

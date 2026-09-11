@@ -838,7 +838,28 @@ jobs:
           openssl ec -in "$KEY" -pubout -out "$PUB" 2>/dev/null
           openssl dgst -sha256 -verify "$PUB" -signature SHA256SUMS.sig SHA256SUMS
 
-          rm -f "$KEY" "$PUB"
+          # A valid signature made with the WRONG key is worse than no
+          # signature: every agent embeds one public key verbatim and would
+          # refuse the release outright. Compare the key derived from the
+          # secret against the one the installers actually carry, in DER so
+          # PEM line-wrapping cannot make two identical keys look different.
+          EMBEDDED="$RUNNER_TEMP/embedded.pub"
+          sed -n '/-----BEGIN PUBLIC KEY-----/,/-----END PUBLIC KEY-----/p' \
+            "$GITHUB_WORKSPACE/fivenines_common.sh" > "$EMBEDDED"
+          if [ -s "$EMBEDDED" ]; then
+            if ! cmp -s \
+              <(openssl pkey -pubin -in "$PUB" -outform DER) \
+              <(openssl pkey -pubin -in "$EMBEDDED" -outform DER); then
+              echo "::error::RELEASE_SIGNING_KEY does not match the public key embedded in the install scripts. Every agent would refuse this release."
+              rm -f "$KEY" "$PUB" "$EMBEDDED"
+              exit 1
+            fi
+            echo "Signing key matches the public key embedded in the install scripts."
+          else
+            echo "::warning::No public key is embedded in the install scripts, so nothing verifies this signature yet."
+          fi
+
+          rm -f "$KEY" "$PUB" "$EMBEDDED"
           echo "Signed SHA256SUMS ($(wc -c < SHA256SUMS.sig) byte signature)"
 
       - name: Delete existing pre-release with same tag (if exists)
@@ -1023,7 +1044,28 @@ jobs:
           openssl ec -in "$KEY" -pubout -out "$PUB" 2>/dev/null
           openssl dgst -sha256 -verify "$PUB" -signature SHA256SUMS.sig SHA256SUMS
 
-          rm -f "$KEY" "$PUB"
+          # A valid signature made with the WRONG key is worse than no
+          # signature: every agent embeds one public key verbatim and would
+          # refuse the release outright. Compare the key derived from the
+          # secret against the one the installers actually carry, in DER so
+          # PEM line-wrapping cannot make two identical keys look different.
+          EMBEDDED="$RUNNER_TEMP/embedded.pub"
+          sed -n '/-----BEGIN PUBLIC KEY-----/,/-----END PUBLIC KEY-----/p' \
+            "$GITHUB_WORKSPACE/fivenines_common.sh" > "$EMBEDDED"
+          if [ -s "$EMBEDDED" ]; then
+            if ! cmp -s \
+              <(openssl pkey -pubin -in "$PUB" -outform DER) \
+              <(openssl pkey -pubin -in "$EMBEDDED" -outform DER); then
+              echo "::error::RELEASE_SIGNING_KEY does not match the public key embedded in the install scripts. Every agent would refuse this release."
+              rm -f "$KEY" "$PUB" "$EMBEDDED"
+              exit 1
+            fi
+            echo "Signing key matches the public key embedded in the install scripts."
+          else
+            echo "::warning::No public key is embedded in the install scripts, so nothing verifies this signature yet."
+          fi
+
+          rm -f "$KEY" "$PUB" "$EMBEDDED"
           echo "Signed SHA256SUMS ($(wc -c < SHA256SUMS.sig) byte signature)"
 
       # The embedded public key and the published signature have to move
@@ -1156,7 +1198,28 @@ jobs:
           openssl ec -in "$KEY" -pubout -out "$PUB" 2>/dev/null
           openssl dgst -sha256 -verify "$PUB" -signature SHA256SUMS.sig SHA256SUMS
 
-          rm -f "$KEY" "$PUB"
+          # A valid signature made with the WRONG key is worse than no
+          # signature: every agent embeds one public key verbatim and would
+          # refuse the release outright. Compare the key derived from the
+          # secret against the one the installers actually carry, in DER so
+          # PEM line-wrapping cannot make two identical keys look different.
+          EMBEDDED="$RUNNER_TEMP/embedded.pub"
+          sed -n '/-----BEGIN PUBLIC KEY-----/,/-----END PUBLIC KEY-----/p' \
+            "$GITHUB_WORKSPACE/fivenines_common.sh" > "$EMBEDDED"
+          if [ -s "$EMBEDDED" ]; then
+            if ! cmp -s \
+              <(openssl pkey -pubin -in "$PUB" -outform DER) \
+              <(openssl pkey -pubin -in "$EMBEDDED" -outform DER); then
+              echo "::error::RELEASE_SIGNING_KEY does not match the public key embedded in the install scripts. Every agent would refuse this release."
+              rm -f "$KEY" "$PUB" "$EMBEDDED"
+              exit 1
+            fi
+            echo "Signing key matches the public key embedded in the install scripts."
+          else
+            echo "::warning::No public key is embedded in the install scripts, so nothing verifies this signature yet."
+          fi
+
+          rm -f "$KEY" "$PUB" "$EMBEDDED"
           echo "Signed SHA256SUMS ($(wc -c < SHA256SUMS.sig) byte signature)"
 
       - name: Install rclone
