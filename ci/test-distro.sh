@@ -102,6 +102,29 @@ record_result() {
   echo "[${status}] ${test_name} ${detail}"
 }
 
+# Digest tool for the fixture pin. Same fallback chain the install scripts
+# use, so an image with none of them is an unmet PRECONDITION rather than a
+# regression: the scripts would correctly refuse to install there too, and
+# the two checksum tests below SKIP instead of failing.
+test_sha256() {
+  if command -v sha256sum > /dev/null 2>&1; then
+    sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+  elif command -v shasum > /dev/null 2>&1; then
+    shasum -a 256 "$1" 2>/dev/null | cut -d' ' -f1
+  elif command -v openssl > /dev/null 2>&1; then
+    openssl dgst -sha256 "$1" 2>/dev/null | sed 's/^.*= *//'
+  fi
+}
+
+if [ -n "$(test_sha256 /dev/null)" ]; then
+  HAVE_SHA256=1
+else
+  HAVE_SHA256=0
+  echo "WARNING: no sha256sum, shasum or openssl in this image"
+  echo "         the checksum tests will SKIP (the install scripts refuse to"
+  echo "         install without a digest tool, which is correct behaviour)"
+fi
+
 # Rebuild the tarball the install scripts consume, and pin its digest via
 # FIVENINES_AGENT_SHA256. The pin is what makes the scripts run their real
 # verification path here: without it they take the "this source publishes no
@@ -110,12 +133,8 @@ record_result() {
 # the digest is recomputed on every rebuild.
 make_tarball() {
   ( cd "$AGENT_DIR" && tar -czf "$TARBALL_PATH" "${BINARY_NAME}/" )
-  FIVENINES_AGENT_SHA256=$(sha256sum "$TARBALL_PATH" | cut -d' ' -f1)
+  FIVENINES_AGENT_SHA256=$(test_sha256 "$TARBALL_PATH")
   export FIVENINES_AGENT_SHA256
-  if [ -z "$FIVENINES_AGENT_SHA256" ]; then
-    echo "FATAL: could not compute a digest for $TARBALL_PATH"
-    exit 1
-  fi
 }
 
 # ---------------------------------------------------------------
@@ -220,7 +239,9 @@ fi
 
 # The install must have checked the digest, not just succeeded. Without this
 # a regression that skips verification entirely would still pass Test 4.
-if grep -q "Verified ${BINARY_NAME}.tar.gz" "${OUTPUT_DIR}/setup_output" 2>/dev/null; then
+if [ "$HAVE_SHA256" = "0" ]; then
+  record_result "checksum-verified" "SKIP" "no digest tool in image"
+elif grep -q "Verified ${BINARY_NAME}.tar.gz" "${OUTPUT_DIR}/setup_output" 2>/dev/null; then
   record_result "checksum-verified" "PASS" "install verified the tarball digest"
 else
   record_result "checksum-verified" "FAIL" "install did not verify the tarball digest"
@@ -330,7 +351,9 @@ make_tarball
 # A well-formed digest that cannot match any real tarball.
 BAD_SHA256=$(printf '%064d' 0)
 
-if FIVENINES_AGENT_SHA256="$BAD_SHA256" timeout 120 sh "${SCRIPTS_DIR}/fivenines_update.sh" > "${OUTPUT_DIR}/mismatch_output" 2>&1; then
+if [ "$HAVE_SHA256" = "0" ]; then
+  record_result "checksum-mismatch" "SKIP" "no digest tool in image"
+elif FIVENINES_AGENT_SHA256="$BAD_SHA256" timeout 120 sh "${SCRIPTS_DIR}/fivenines_update.sh" > "${OUTPUT_DIR}/mismatch_output" 2>&1; then
   record_result "checksum-mismatch" "FAIL" "update installed a tarball with the wrong digest"
   echo "--- mismatch output ---"
   cat "${OUTPUT_DIR}/mismatch_output" 2>/dev/null || true
