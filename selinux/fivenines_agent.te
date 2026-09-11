@@ -72,7 +72,7 @@ allow fivenines_agent_t usr_t:dir { getattr search open read };
 allow fivenines_agent_t usr_t:file { getattr open read };
 allow fivenines_agent_t usr_t:lnk_file { getattr read };
 
-# sudo (for smartctl, mdadm, fail2ban-client, nvme)
+# sudo (for smartctl, mdadm, fail2ban-client, nvme, wg show all dump)
 allow fivenines_agent_t sudo_exec_t:file { getattr open read execute execute_no_trans map };
 
 ########################################################################

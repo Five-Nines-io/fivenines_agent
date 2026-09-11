@@ -159,9 +159,11 @@ COLLECTORS = [
     # a future dict value is then ignored rather than splatted into a
     # TypeError. LINUX-ONLY: the key is in the server's
     # Host::WINDOWS_OMIT_CONFIG_KEYS and is stripped for Windows agents; on any
-    # host without `wg` the collector reports null anyway. No capability gate:
-    # a privilege failure must surface as data["wireguard"] = null (collection
-    # failure), not as a skipped key.
+    # host without `wg` the collector reports null anyway. There IS a
+    # "wireguard" capability (sudo wg show all dump, #144), but it deliberately
+    # does NOT gate this entry -- see CAPABILITY_GATE_EXEMPT below: a privilege
+    # failure must surface as data["wireguard"] = null (collection failure),
+    # not as a skipped key.
     ("wireguard", [("wireguard", wireguard_metrics, False)]),
     # Tailscale node + tailnet rollups (#508). Same top-level plain-boolean
     # config posture as "wireguard", but CROSS-OS -- never stripped, since
@@ -186,6 +188,20 @@ CAPABILITY_KEY_OVERRIDES = {
     "logs": "journald",
 }
 
+# Config keys whose capability is INFORMATIONAL ONLY: probed, banner-listed and
+# reported as pending, but never used to skip collection.
+#
+# wireguard is here because its contract is that a privilege failure surfaces
+# as data["wireguard"] = null -- a collection failure the server skips -- and
+# NOT as a missing key (tests/fixtures/vpn_contract_payload.json: an enabled
+# collector always contributes its key). The collector re-reads the privilege
+# itself on every tick and reports the honest failure with its real reason; the
+# 5-minute probe exists only so the dashboard can name the missing sudoers rule
+# (#144). Gating on it would let a stale or transient probe result -- a sudo
+# spawn that lost a 5s race under load -- drop the key entirely on a host whose
+# tunnels are fine.
+CAPABILITY_GATE_EXEMPT = frozenset({"wireguard"})
+
 # Tracks (config_key, capability_value) pairs that have already been logged
 # as skipped this process, to avoid per-tick log spam.
 _logged_capability_skips = set()
@@ -198,6 +214,8 @@ def _capability_key_for(config_key):
 def _is_capability_gated(config_key, permissions):
     """Return True if collection should be skipped due to a False capability."""
     if not permissions:
+        return False
+    if config_key in CAPABILITY_GATE_EXEMPT:
         return False
     cap_key = _capability_key_for(config_key)
     if cap_key not in permissions:

@@ -11,21 +11,14 @@ User=fivenines
 # packaged distro. Caveat: on hand-rolled images that stripped the group,
 # systemd fails the unit with status 216/GROUP -- remove this line there.
 SupplementaryGroups=systemd-journal
-# WireGuard peer health. `wg show all dump` reads device state over netlink,
-# which needs root or CAP_NET_ADMIN; granting the one capability is strictly
-# less privilege than User=root. Ambient capabilities are inherited across
-# execve, so the `wg` child gets it too.
-#
-# Two things to know before keeping this:
-#   - It applies to EVERY install, not just WireGuard hosts. CAP_NET_ADMIN can
-#     reconfigure interfaces and firewall rules, so if you do not monitor
-#     WireGuard, deleting this line costs you nothing: the collector then
-#     reports null (a collection failure the server ignores) rather than an
-#     empty peer list, so no monitoring data is falsely resolved.
-#   - It needs systemd >= 229. Older systemd logs "Unknown key name" and
-#     ignores the line; the unit still starts, WireGuard collection just
-#     reports null.
-AmbientCapabilities=CAP_NET_ADMIN
+# This unit grants NO capability on purpose. The one collector that needs
+# privileged kernel access (WireGuard: `wg show all dump` reads device state
+# over netlink) goes through `sudo -n`, the same operator-granted,
+# command-scoped pattern as smartctl/mdadm/fail2ban-client -- see
+# /etc/sudoers.d/fivenines in the README. Until 1.17.6 this unit set
+# AmbientCapabilities=CAP_NET_ADMIN, which applied to EVERY install whether or
+# not it monitored WireGuard and, being ambient, was inherited across execve by
+# every process the agent spawned.
 ExecStart=/opt/fivenines/fivenines_agent
 RestartSec=5
 Restart=always
@@ -39,14 +32,20 @@ NotifyAccess=all
 # LockPersonality, RestrictSUIDSGID, SystemCallFilter, ...) makes systemd
 # implicitly enable NoNewPrivileges -- seccomp without CAP_SYS_ADMIN requires
 # no_new_privs (see systemd's context_has_no_new_privileges()) -- and
-# no_new_privs breaks every `sudo -n smartctl/mdadm/fail2ban-client` spawn:
-# SMART, RAID and fail2ban monitoring would silently die fleet-wide on any
-# systemd >= 228 host. Do not add ANY directive from that family here.
+# no_new_privs breaks every `sudo -n smartctl/mdadm/fail2ban-client/wg` spawn:
+# SMART, RAID, fail2ban and WireGuard monitoring would silently die fleet-wide
+# on any systemd >= 228 host. Do not add ANY directive from that family here.
+# That list grew with 1.17.6 (WireGuard moved from AmbientCapabilities to a
+# sudoers rule, see above), which is the whole reason it is spelled out: every
+# privileged read this agent does is now one `sudo -n` away from these
+# directives.
 #
 # Also deliberately ABSENT, for the same or adjacent reasons:
 #   NoNewPrivileges       - breaks sudo (setuid) outright.
 #   CapabilityBoundingSet - sudo needs the full root set post-setuid for
-#                           SMART ioctls and md admin.
+#                           SMART ioctls, md admin and the WireGuard netlink
+#                           GET (CAP_NET_ADMIN, held by the `wg` child for the
+#                           length of one read -- never by the agent).
 #   ProtectSystem=full/strict - /etc goes read-only, breaking the TOKEN swap
 #                           and the state files under /etc/fivenines_agent
 #                           (ReadWritePaths needs systemd >= 231, and on older

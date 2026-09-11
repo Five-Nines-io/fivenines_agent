@@ -5,7 +5,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from fivenines_agent.permissions import CAPABILITY_HINTS, PermissionProbe
+from fivenines_agent.permissions import (
+    CAPABILITY_HINTS,
+    PermissionProbe,
+    print_capabilities_banner,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -54,6 +58,7 @@ _ALL_TRUE_CAPS = {
     "proxmox": True,
     "packages": True,
     "snmp": True,
+    "wireguard": True,
 }
 
 
@@ -160,6 +165,31 @@ def test_capability_hints_keys_are_known_capabilities():
         assert (
             hint_key in all_keys
         ), f"hint {hint_key!r} has no matching capability"
+
+
+def test_banner_lists_wireguard_with_its_sudoers_hint(capsys):
+    """The reason wireguard is probed at all (#144).
+
+    The collector reports null with or without a probe, so the probe's only job
+    is to turn that silence into something actionable: the banner (and the
+    dashboard's pending-capability panel, which reads the same hint) names the
+    command the operator has to grant. Collection itself is NOT gated on it --
+    see collectors.CAPABILITY_GATE_EXEMPT.
+    """
+
+    class FakeProbe:
+        def get_all(self):
+            return {"snmp": True, "wireguard": False}
+
+        def get_unavailable(self):
+            return ["wireguard"]
+
+    with patch("fivenines_agent.permissions.get_permissions", return_value=FakeProbe()):
+        print_capabilities_banner()
+
+    out = capsys.readouterr().out
+    assert "[-] Wireguard (requires sudo wg show all dump)" in out
+    assert "[+] Snmp" in out
 
 
 # --- Reason capture ---

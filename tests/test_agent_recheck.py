@@ -222,6 +222,21 @@ def test_pending_cgroup_not_added_when_present():
     assert "cgroup" not in agent._pending_capabilities({"systemd": True})
 
 
+def test_pending_includes_wireguard_when_the_sudoers_rule_is_missing():
+    # The user-visible payoff of probing wireguard (#144): the host shows up in
+    # the dashboard's pending-capability panel, with the reason, instead of
+    # reporting a silent null forever. Collection is deliberately NOT gated on
+    # the capability (collectors.CAPABILITY_GATE_EXEMPT), so pending is the only
+    # thing this flag drives.
+    agent = _agent({"wireguard": False})
+    assert agent._pending_capabilities({"wireguard": True}) == ["wireguard"]
+
+
+def test_pending_wireguard_not_added_when_available():
+    agent = _agent({"wireguard": True})
+    assert agent._pending_capabilities({"wireguard": True}) == []
+
+
 def test_pending_cgroup_not_added_when_systemd_disabled():
     agent = _agent({"systemd": True, "cgroup": None})
     assert agent._pending_capabilities({}) == []

@@ -60,8 +60,11 @@ On systemd hosts the bundled unit is sandbox-hardened (agent version
 token, capture and inventory state -- are owner-only, `0600`), `PrivateTmp=true`
 and `ProtectHome=read-only`. Heavier directives (`NoNewPrivileges`, seccomp
 filters, `ProtectSystem`) are deliberately absent: they would silently break
-the sudo-based collectors (SMART, RAID, fail2ban) and the enrollment token
-swap.
+the sudo-based collectors (SMART, RAID, fail2ban, and WireGuard since
+**1.17.6**) and the enrollment token swap. The unit grants the agent **no
+capability**; the one collector that needs privileged kernel access reads it
+through a single-command sudoers rule -- see
+[Full Monitoring](#full-monitoring-recommended).
 
 > **Note:** `PrivateTmp` gives the agent a private `/tmp`. A service monitored
 > through a `/tmp` unix-socket path (upstream-tarball defaults like
@@ -415,6 +418,33 @@ fivenines ALL=(ALL) NOPASSWD: /usr/sbin/smartctl
 fivenines ALL=(ALL) NOPASSWD: /sbin/mdadm
 ```
 
+Two optional rules, only if you monitor these features:
+
+```
+fivenines ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client
+fivenines ALL=(root) NOPASSWD: /usr/bin/wg show all dump
+```
+
+The WireGuard rule pins the **exact command**, on purpose: `sudo` matches the
+full argument list, so this grants one read-only dump and denies `wg set` and
+everything else. Do not add a wildcard, and keep the arguments verbatim -- a
+rule for `/usr/bin/wg` alone would hand over the ability to reconfigure
+tunnels, and a rule with different arguments is simply not matched (the agent
+then reports a collection failure, never an empty peer list).
+
+Check the binary paths on your distribution and adjust if needed
+(`command -v wg`, `command -v smartctl`); `wg` is `/usr/bin/wg` on
+Debian/Ubuntu, RHEL-family and Alpine. Note that `sudo` itself must be
+installed -- Alpine does not ship it by default.
+
+> **Upgrading from an agent older than 1.17.6?** The WireGuard rule is new in
+> **1.17.6**. Before that release the packaged systemd unit granted
+> `AmbientCapabilities=CAP_NET_ADMIN` to the whole agent process; it no longer
+> grants any capability. If you monitor WireGuard, add the rule above -- until
+> you do, WireGuard reports a collection failure (your existing peers and
+> incidents are preserved, but no new peer data arrives). Nothing to do on
+> hosts that do not monitor WireGuard.
+
 ### Limited Monitoring (No Sudo)
 
 The agent works without sudo, but these features will be unavailable (this is also the default behavior for the Synology DSM 7 `sc-fivenines-agent` package):
@@ -432,7 +462,7 @@ The agent works without sudo, but these features will be unavailable (this is al
 | systemd unit metrics | `systemd` init system (`systemctl`; `journalctl` only for failure journal tails) |
 | systemd failure journal tails | journal read access: the bundled service unit grants `SupplementaryGroups=systemd-journal`; for user installs add your user to the `systemd-journal` group (tails degrade to empty without it) |
 | Log monitoring (journald capture + signals) | journal read access (`systemd-journal` group) |
-| WireGuard peer health | root or `CAP_NET_ADMIN` (the bundled systemd unit grants `AmbientCapabilities=CAP_NET_ADMIN`) |
+| WireGuard peer health | `sudo wg show all dump` -- one exact-argv sudoers rule, no capability granted to the agent itself (agent version **1.17.6+**) |
 | Tailscale node state | `tailscale` CLI on `PATH` + a reachable `tailscaled` (no extra privilege) |
 | Ubuntu Pro entitlement | `pro` CLI on `PATH` (ubuntu-advantage-tools), or a readable `/var/lib/ubuntu-advantage/status.json` (no extra privilege) |
 | Per-unit cgroup metrics | cgroup v1 or v2 mounted at `/sys/fs/cgroup` |
@@ -486,6 +516,8 @@ The agent works without sudo, but these features will be unavailable (this is al
 **Requires Sudo Configuration:**
 - SMART storage health monitoring
 - RAID (mdadm) array monitoring
+- Fail2ban jail status
+- WireGuard peer health (one exact-argv rule: `wg show all dump`)
 
 ### Rootless Docker
 
@@ -598,6 +630,7 @@ When the agent starts, it displays a banner showing which features are available
 
   Networking:
     [+] Snmp
+    [-] Wireguard (requires sudo wg show all dump)
 
   Logs:
     [+] Journald
@@ -979,21 +1012,44 @@ Two things worth knowing:
   only the peer's *public* key, which is public by construction and is the
   peer's durable identity.
 
-**Privilege.** `wg show all dump` reads device state over netlink, which needs
-root or `CAP_NET_ADMIN`. The bundled systemd unit grants
-`AmbientCapabilities=CAP_NET_ADMIN` (systemd >= 229) rather than running the
-agent as root; the capability is inherited by the `wg` child process. Remove
-that line if you do not monitor WireGuard. Without the privilege -- and on
-OpenRC/Alpine and user-level installs, where the agent has no way to acquire it
-short of running as root -- the collector reports a *collection failure*, never
-an empty peer list, so existing peers are preserved and no open incident is
-falsely resolved.
+**Privilege (changed in 1.17.6).** `wg show all dump` reads device state over
+netlink, which needs root or `CAP_NET_ADMIN`, so the agent runs it through
+`sudo -n` -- the same operator-granted, command-scoped pattern it already uses
+for `smartctl`, `mdadm` and `fail2ban-client`. Add one rule to
+`/etc/sudoers.d/fivenines`:
+
+```
+fivenines ALL=(root) NOPASSWD: /usr/bin/wg show all dump
+```
+
+`sudo` matches the full argument list, so that grants exactly this one
+read-only command and denies `wg set` and everything else. The agent process
+itself gets no capability.
+
+Until 1.17.6 the bundled systemd unit granted
+`AmbientCapabilities=CAP_NET_ADMIN` instead. That line is gone: it applied to
+every install whether or not it monitored WireGuard, and an *ambient*
+capability is inherited across `execve` by every process the agent spawns --
+effectively leaving "network root" (interfaces, routes, firewall rules, `tc`)
+latent in the agent's whole process tree, on precisely the hosts where it
+matters most. **If you already monitor WireGuard, add the sudoers rule when you
+upgrade**: until you do, the collector reports a *collection failure*, never an
+empty peer list, so existing peers and open incidents are preserved but no new
+peer data arrives.
+
+One upside of the change: WireGuard monitoring now works anywhere the sudoers
+rule can be granted -- including OpenRC/Alpine (install `sudo`; Alpine ships
+none) and user-level installs, which previously had no way to acquire the
+capability short of running the agent as root. Name the account the agent
+actually runs as in the rule: `fivenines` for a system install, your own user
+for a user-level one.
 
 **Peer names.** The dashboard labels peers by the `# Name = <alias>` comment
 next to the `[Peer]` block in `/etc/wireguard/<interface>.conf`, the de-facto
-convention. That file is root-only, so an agent running as `fivenines` will not
-see it and peers fall back to a short key fingerprint; nothing else in the
-config is read.
+convention. That file is root-only and is read directly, never through `sudo`
+(the rule grants one dump command, not read access to a directory full of
+private keys), so an agent running as `fivenines` will not see it and peers
+fall back to a short key fingerprint; nothing else in the config is read.
 
 ### Tailscale
 

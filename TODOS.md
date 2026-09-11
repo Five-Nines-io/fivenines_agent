@@ -40,9 +40,17 @@ filled them in with the real `wg show all dump` / `tailscale status --json`
 inputs, added a `raw_contract` key documenting them, and updated one sentence of
 `description`. Everything the server actually READS (`agent_min_version`, the
 five contract docs, and every scenario's `description` / `config` / `payload`)
-is already byte-identical and was verified programmatically, so nothing is
+was byte-identical and verified programmatically, so nothing is
 broken today -- but the two copies have drifted in the agent-side inputs and the
 lockstep discipline says they must not.
+
+**Widened by #144 (agent 1.17.6).** Moving the WireGuard read to `sudo -n wg
+show all dump` changed no payload byte, but it did rewrite the prose the server
+copy also carries: `privilege_contract` (now the sudoers rule, not
+`AmbientCapabilities=CAP_NET_ADMIN`), the CAP_NET_ADMIN clauses in
+`null_contract` and `raw_contract`, and the `collection_failure` scenario
+`description`. Those are keys the server reads, so the drift is no longer
+confined to the agent-side inputs.
 
 Fix: copy `tests/fixtures/vpn_contract_payload.json` over
 `fivenines-server/spec/fixtures/vpn_contract_payload.json`. The server's
@@ -50,8 +58,39 @@ Fix: copy `tests/fixtures/vpn_contract_payload.json` over
 copy cannot break its suite.
 
 - **Effort:** XS (human) / XS (CC)
-- **Depends on:** agent PR for #127 merged
+- **Depends on:** agent PR for #127 merged (done); agent PR for #144 merged
 - **Files:** `fivenines-server/spec/fixtures/vpn_contract_payload.json` (NOT this repo)
+
+## P1: Server-side rollout for the WireGuard sudoers requirement (#144)
+
+Agent 1.17.6 drops `AmbientCapabilities=CAP_NET_ADMIN` from the packaged unit
+and reads WireGuard through `sudo -n wg show all dump`, so every host that
+already monitors WireGuard reports `data["wireguard"] = null` after upgrading
+until its operator adds
+
+```
+fivenines ALL=(root) NOPASSWD: /usr/bin/wg show all dump
+```
+
+Nothing false is produced (null is the lost-visibility freeze: no peer prune, no
+auto-resolve), but the host goes dark silently unless the server says so. The
+agent now reports a `wireguard` capability -- probed with that exact argv -- in
+`capabilities` / `pending_capabilities`, with the reason string and the hint
+`requires sudo wg show all dump`, which is what the dashboard's
+pending-capability panel needs to render the snippet.
+
+Server-side work: render the `wireguard` pending capability with the copy-paste
+rule, and warn admins of WireGuard-enabled hosts BEFORE they upgrade. The
+timing is tied to the RELEASE, not to this merge: `fivenines_update.sh` pulls
+both the binary and `fivenines-agent.service` from R2 `latest/`, which the
+`sync-to-r2` job populates on a `v*` tag (GitHub raw `main` is only the
+fallback for an unreachable R2 -- and that URL was 404ing until #148 fixed it).
+So unit and binary arrive together in one update, with no skew window, and the
+operator's only warning is whatever the dashboard and release notes say.
+
+- **Effort:** S (human) / S (CC)
+- **Depends on:** agent PR for #144 merged
+- **Files:** fivenines-server (NOT this repo)
 
 ## P1: Vendor the AI-inference contract fixtures into the server repo
 

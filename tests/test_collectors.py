@@ -324,6 +324,40 @@ def test_capability_overrides_logs_journald():
     mock_fn.assert_not_called()
 
 
+def test_wireguard_capability_false_does_not_skip_collection():
+    """wireguard is probed (#144) but never gated: an enabled collector must
+    contribute its key even when the privilege is missing.
+
+    data["wireguard"] = null is a COLLECTION FAILURE the server skips; an
+    absent key is a different statement, and the contract fixture pins the
+    presence of the key to the config flag, not to the privilege. The collector
+    re-reads sudo every tick and reports the honest failure, so gating here
+    would only add a way for a stale or raced 5s probe to blank a host whose
+    tunnels are fine.
+    """
+    _reset_skip_log()
+    mock_fn = MagicMock(return_value=None)
+    registry = [("wireguard", [("wireguard", mock_fn, False)])]
+    config = {"wireguard": True}
+    permissions = {"wireguard": False}
+    data = {}
+
+    with patch("fivenines_agent.collectors.COLLECTORS", registry):
+        collect_metrics(config, data, permissions=permissions)
+
+    mock_fn.assert_called_once()
+    assert data == {"wireguard": None}
+
+
+def test_wireguard_is_the_only_gate_exempt_key():
+    """Guard on the exemption set itself: it suppresses a real safety check, so
+    a new entry must be a deliberate contract decision, not a convenient way to
+    silence a failing capability probe."""
+    from fivenines_agent.collectors import CAPABILITY_GATE_EXEMPT
+
+    assert CAPABILITY_GATE_EXEMPT == frozenset({"wireguard"})
+
+
 def test_skip_logged_only_once_per_process():
     """Subsequent skipped invocations do not re-log."""
     _reset_skip_log()

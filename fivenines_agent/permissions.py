@@ -73,6 +73,7 @@ CAPABILITY_HINTS = {
     "qemu": "requires libvirt group",
     "proxmox": "requires Proxmox VE host",
     "fail2ban": "requires sudo fail2ban-client",
+    "wireguard": "requires sudo wg show all dump",
     "packages": "requires dpkg-query, rpm, apk, pacman, or synopkg",
     "zfs": "requires zfs permissions",
     "nvidia_gpu": "requires NVIDIA driver",
@@ -108,7 +109,7 @@ LINUX_BANNER_GROUPS = [
     # collector's per-unit resource metrics (kernel surface, not a sensor).
     ("Services", ["docker", "qemu", "proxmox", "systemd", "cgroup"]),
     ("Security", ["fail2ban", "packages"]),
-    ("Networking", ["snmp"]),
+    ("Networking", ["snmp", "wireguard"]),
     ("Logs", ["journald"]),
 ]
 
@@ -280,6 +281,15 @@ class PermissionProbe:
             "packages": (self._can_list_packages, ()),
             # SNMP polling - needs net-snmp CLI tools
             "snmp": (self._has_snmpget, ()),
+            # WireGuard - needs passwordless sudo for the netlink dump (#144).
+            # The args are the EXACT argv the collector runs, because the
+            # sudoers rule pins the full command line (no wildcard): probing
+            # anything shorter, e.g. `wg --version`, would report available on
+            # a host where the real dump is denied. INFORMATIONAL ONLY -- this
+            # capability never gates collection (collectors.CAPABILITY_GATE_EXEMPT),
+            # it exists so a host missing the rule shows up as a pending
+            # capability with a hint instead of a silent null.
+            "wireguard": (self._can_run_sudo, ("wg", "show", "all", "dump")),
             # Log monitoring - needs journald read access (systemd-journal group)
             "journald": (self._can_read_journal, ()),
             # systemd unit collection - needs systemd init + systemctl
