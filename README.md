@@ -408,7 +408,7 @@ The agent works without sudo, but these features will be unavailable (this is al
 | RAID array status | `sudo mdadm` |
 | Fail2ban status | `sudo fail2ban-client` |
 | Docker containers | `docker` group membership |
-| QEMU/KVM VMs | `libvirt` group membership |
+| QEMU/KVM VMs | `libvirt` group membership for the default `qemu:///system` URI; a `qemu:///session` URI instead needs that user's own session daemon already running (the agent never auto-spawns it) |
 | ZFS pools | ZFS delegation or permissions |
 | NVIDIA GPU metrics | NVIDIA driver + pynvml library |
 | SNMP device polling | `net-snmp` tools (`snmpget`, `snmpbulkwalk`) |
@@ -463,6 +463,8 @@ The agent works without sudo, but these features will be unavailable (this is al
   ```bash
   sudo usermod -aG libvirt fivenines
   ```
+  The connection URI is also checked against an agent-side allowlist before the
+  agent connects -- see [QEMU/KVM VM Monitoring](#qemukvm-vm-monitoring).
 
 **Requires Sudo Configuration:**
 - SMART storage health monitoring
@@ -726,8 +728,9 @@ Enabled per host from the fivenines dashboard, for hosts running VMs under
 libvirt. The agent opens a **read-only** libvirt connection and reports, per
 VM: state and uptime, vCPU/CPU time, memory (assigned, balloon, RSS, swap),
 per-disk I/O and per-interface network counters, plus hypervisor-level
-vCPU/memory/domain totals. It needs `libvirt` group membership (see
-[Permissions](#permissions)).
+vCPU/memory/domain totals. With the default `qemu:///system` URI it needs
+`libvirt` group membership (see [Permissions](#permissions)); a
+`qemu:///session` URI sees only the VMs of the account the agent runs as.
 
 The **libvirt URI** defaults to `qemu:///system` and is configurable from the
 dashboard, but the agent enforces its own allowlist before connecting
@@ -746,8 +749,10 @@ open a network/SSH connection (`qemu+ssh://`, `qemu+tcp://`, `qemu+tls://`,
 
 Everything else -- any other scheme (spelled exactly as libvirt matches it),
 any URI with a host component (`qemu://HOST/system` is an implicit TLS
-connection), `qemu:///embed`, any other query parameter, a `;` in the query,
-a URI longer than 512 characters -- is refused: the agent logs the reason once
+connection), `qemu:///embed`, any other query parameter, a `;` in the query, a
+fragment, a URI longer than 512 characters, and an empty URI (which would
+otherwise fall back to `LIBVIRT_DEFAULT_URI` or `libvirt.conf`, and so could
+resolve to any of the above) -- is refused: the agent logs the reason once
 (never the URI itself, so a credential embedded in a hostile URI cannot reach
 the journal), makes no libvirt call at all, and reports `null` for QEMU, which
 the dashboard shows as a collection failure rather than as zero VMs. A failed
