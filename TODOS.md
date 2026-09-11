@@ -102,6 +102,11 @@ agent now reports a `wireguard` capability -- probed with that exact argv -- in
 `requires sudo wg show all dump`, which is what the dashboard's
 pending-capability panel needs to render the snippet.
 
+Tracked server-side as **fivenines_server#1101** (settings snippet +
+pending-capability wiring + SetupGuides + docs/vpn.md). The `NOLOG_OUTPUT`
+correction, the "the hint does not travel, use capability_reasons" note and the
+SELinux module-reinstall caveat are posted as a comment there.
+
 Server-side work: render the `wireguard` pending capability with the copy-paste
 rule, and warn admins of WireGuard-enabled hosts BEFORE they upgrade. The
 timing is tied to the RELEASE, not to this merge: `fivenines_update.sh` pulls
