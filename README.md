@@ -20,6 +20,7 @@ Windows 10/11), **Synology DSM 7** and **UNRAID**.
 - **Host and platform monitoring**
   - [Docker Monitoring](#docker-monitoring) (container states + image vulnerability scanning)
   - [Proxmox VE Monitoring](#proxmox-ve-monitoring)
+  - [QEMU/KVM VM Monitoring](#qemukvm-vm-monitoring)
   - [systemd Unit Monitoring](#systemd-unit-monitoring)
   - [Log Monitoring](#log-monitoring)
   - [ZFS Pool Health](#zfs-pool-health)
@@ -718,6 +719,46 @@ Agent version **1.11.7+** adds the `pool` property to `zfspool`, `rbd` and
 `cephfs` storage entries -- the join key that lets the dashboard line a Proxmox
 storage pool up with the [ZFS pool health](#zfs-pool-health) or
 [Ceph](#ceph-cluster-monitoring) data collected from the same host.
+
+## QEMU/KVM VM Monitoring
+
+Enabled per host from the fivenines dashboard, for hosts running VMs under
+libvirt. The agent opens a **read-only** libvirt connection and reports, per
+VM: state and uptime, vCPU/CPU time, memory (assigned, balloon, RSS, swap),
+per-disk I/O and per-interface network counters, plus hypervisor-level
+vCPU/memory/domain totals. It needs `libvirt` group membership (see
+[Permissions](#permissions)).
+
+The **libvirt URI** defaults to `qemu:///system` and is configurable from the
+dashboard, but the agent enforces its own allowlist before connecting
+(agent **1.17.5+**). A libvirt URI selects a *transport* as well as a
+hypervisor, and some transports execute a local command (`qemu+ext://`) or
+open a network/SSH connection (`qemu+ssh://`, `qemu+tcp://`, `qemu+tls://`,
+`qemu+libssh://`) regardless of the connection being read-only. Accepted:
+
+- `qemu:///system`, `qemu:///session`, `qemu+unix:///system`,
+  `qemu+unix:///session` -- each optionally with `?socket=<path>` and/or
+  `?mode=auto|direct|legacy`, the only two parameters the local socket
+  transport reads. `socket=` must point at a file inside a libvirt socket
+  directory (`/run/libvirt/`, `/var/run/libvirt/` or
+  `$XDG_RUNTIME_DIR/libvirt/`), because the collector's connection has no
+  timeout and any other local socket could stall a collection tick.
+
+Everything else -- any other scheme (spelled exactly as libvirt matches it),
+any URI with a host component (`qemu://HOST/system` is an implicit TLS
+connection), `qemu:///embed`, any other query parameter, a `;` in the query,
+a URI longer than 512 characters -- is refused: the agent logs the reason once
+(never the URI itself, so a credential embedded in a hostile URI cannot reach
+the journal), makes no libvirt call at all, and reports `null` for QEMU, which
+the dashboard shows as a collection failure rather than as zero VMs. A failed
+connection or domain listing also reports `null` (agent **1.17.5+**); `[]`
+now means libvirt answered and listed zero VMs.
+
+The agent also never starts a hypervisor daemon on your behalf: it sets
+`LIBVIRT_AUTOSTART=0` at startup, so a `qemu:///session` URI needs the session
+daemon already running or socket-activated (`systemctl --user enable --now
+virtqemud.socket`). Set `LIBVIRT_AUTOSTART=1` in the service environment to
+restore libvirt's default auto-spawn if you really want it.
 
 ## systemd Unit Monitoring
 
