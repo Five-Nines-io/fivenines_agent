@@ -9,7 +9,9 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import fivenines_agent.permissions as perm
+import fivenines_agent.qemu as qemu
 from fivenines_agent.permissions import PermissionProbe
+from fivenines_agent.qemu import libvirt_uri_rejection
 
 
 @pytest.fixture(autouse=True)
@@ -167,6 +169,30 @@ def test_libvirt_probe_connects():
         assert probe._can_access_libvirt() is True
     fake_libvirt.openReadOnly.assert_called_once_with("qemu:///system")
     conn.close.assert_called_once()
+
+
+def test_libvirt_probe_default_uri_passes_allowlist():
+    """The probe opens the collector's own default (the imported constant,
+    not a re-spelled literal), and that default is on the collector's URI
+    allowlist (agent #142)."""
+    assert perm.DEFAULT_LIBVIRT_URI is qemu.DEFAULT_LIBVIRT_URI == "qemu:///system"
+    assert libvirt_uri_rejection(perm.DEFAULT_LIBVIRT_URI) is None
+
+
+def test_libvirt_probe_opens_the_default_uri_constant():
+    """openReadOnly reads DEFAULT_LIBVIRT_URI rather than a literal, so the
+    constant the allowlist test above pins is the one actually opened."""
+    probe = _probe_obj({})
+    fake_libvirt = MagicMock()
+    conn = MagicMock()
+    fake_libvirt.openReadOnly.return_value = conn
+    with patch.dict("sys.modules", {"libvirt": fake_libvirt}), patch.object(
+        perm, "DEFAULT_LIBVIRT_URI", "qemu:///session"
+    ):
+        assert probe._can_access_libvirt() is True
+    fake_libvirt.openReadOnly.assert_called_once_with("qemu:///session")
+    conn.close.assert_called_once()
+    assert probe._current_reason is None
 
 
 def test_libvirt_probe_returns_none():

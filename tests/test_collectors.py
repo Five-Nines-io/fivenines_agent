@@ -354,3 +354,62 @@ def test_no_permissions_no_gating():
         collect_metrics(config, data)
 
     mock_fn.assert_called_once()
+
+
+def test_qemu_refused_uri_reaches_payload_as_null(fake_libvirt, quiet_qemu_log):
+    """End to end through the real registry: a config-driven qemu URI outside
+    the local-socket allowlist (agent #142) never reaches libvirt and lands in
+    the payload as data["qemu"] = None -- a collection failure the server
+    skips -- not [] (zero VMs, which would prune every VM row)."""
+    config = {"qemu": {"uri": "qemu+ext:///system?command=/tmp/evil"}}
+    data = {}
+
+    collect_metrics(config, data, permissions={"qemu": True})
+
+    assert "qemu" in data
+    assert data["qemu"] is None
+    fake_libvirt.openReadOnly.assert_not_called()
+
+
+def test_qemu_config_shapes_open_the_expected_uri_through_registry(make_fake_libvirt):
+    """Regression guard for the shipped configurations, end to end through the
+    real registry: the plain boolean splats no kwargs and still opens the
+    collector's qemu:///system default, and a dashboard-configured URI on the
+    allowlist is opened verbatim. Both report [] (zero VMs) -- never None --
+    so the allowlist is inert for every accepted shape."""
+    for config_value, expected_uri in [
+        (True, "qemu:///system"),
+        ({"uri": "qemu:///session"}, "qemu:///session"),
+        (
+            {"uri": "qemu+unix:///system?socket=/run/libvirt/libvirt-sock"},
+            "qemu+unix:///system?socket=/run/libvirt/libvirt-sock",
+        ),
+    ]:
+        fake_libvirt = make_fake_libvirt()
+        conn = fake_libvirt.openReadOnly.return_value
+        data = {}
+
+        with patch("fivenines_agent.qemu.libvirt", fake_libvirt):
+            collect_metrics({"qemu": config_value}, data, permissions={"qemu": True})
+
+        fake_libvirt.openReadOnly.assert_called_once_with(expected_uri)
+        assert data["qemu"] == []
+        conn.close.assert_called_once()
+
+
+def test_qemu_refused_uri_is_still_capability_gated_through_registry(
+    fake_libvirt, quiet_qemu_log
+):
+    """The allowlist sits BEHIND the capability gate, not in front of it: when
+    the qemu capability is unavailable the collector is skipped entirely and
+    the key stays absent, so a refused URI cannot turn a skipped collector
+    into a null row."""
+    _reset_skip_log()
+    data = {}
+    collect_metrics(
+        {"qemu": {"uri": "qemu+ssh://root@host/system"}},
+        data,
+        permissions={"qemu": False},
+    )
+    assert "qemu" not in data
+    fake_libvirt.openReadOnly.assert_not_called()

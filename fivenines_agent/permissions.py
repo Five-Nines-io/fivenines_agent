@@ -13,6 +13,7 @@ import psutil
 
 from fivenines_agent.debug import log
 from fivenines_agent.env import is_windows
+from fivenines_agent.qemu import DEFAULT_LIBVIRT_URI
 from fivenines_agent.subprocess_utils import get_clean_env
 
 # Full re-probe interval in seconds (5 minutes): every capability is re-checked
@@ -838,12 +839,14 @@ class PermissionProbe:
 
     def _can_access_libvirt(self):
         """Probe QEMU/libvirt the way the collector connects: attempt
-        libvirt.openReadOnly("qemu:///system").
+        libvirt.openReadOnly(DEFAULT_LIBVIRT_URI).
 
-        This mirrors qemu.py exactly, so True means the collector can actually
-        connect - no guessing about socket paths or permission bits, which had
-        diverged from the collector (os.access(R_OK) vs the read-only connect)
-        and missed the modular-daemon socket layout (virtqemud/virtproxyd).
+        This mirrors the collector's URI and read-only open (not its
+        LIBVIRT_AUTOSTART guard, which only matters for /session), so True
+        means the collector can actually connect - no guessing about socket
+        paths or permission bits, which had diverged from the collector
+        (os.access(R_OK) vs the read-only connect) and missed the
+        modular-daemon socket layout (virtqemud/virtproxyd).
 
         The connection runs in a worker thread with a hard timeout: a wedged
         libvirt stack can block indefinitely, and this probe runs synchronously
@@ -872,7 +875,12 @@ class PermissionProbe:
         def attempt():
             conn = None
             try:
-                conn = libvirt.openReadOnly("qemu:///system")
+                # The collector's own default, pinned against its URI
+                # allowlist in tests (agent #142). If this ever becomes
+                # configurable (the set_docker_socket_url precedent), route
+                # the value through qemu.libvirt_uri_rejection and the
+                # LIBVIRT_AUTOSTART guard here too.
+                conn = libvirt.openReadOnly(DEFAULT_LIBVIRT_URI)
                 result["ok"] = conn is not None
                 if conn is None:
                     result["reason"] = "openReadOnly returned None"
