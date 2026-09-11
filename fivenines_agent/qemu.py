@@ -1,6 +1,8 @@
 import os
+import posixpath
 import time
 import xml.etree.ElementTree as ET
+from urllib.parse import unquote, urlsplit
 
 try:
     import libvirt
@@ -16,12 +18,250 @@ STATE_MAP = {
     4: "shutdown", 5: "shutoff", 6: "crashed", 7: "pmsuspended", 8: "last"
 }
 
+# --- libvirt connection URI allowlist (agent #142) --------------------------
+#
+# A libvirt URI selects a TRANSPORT as well as a hypervisor, and several
+# transports do far more than open a socket: `ext` runs an arbitrary local
+# command (`?command=`), `ssh`/`libssh`/`libssh2` spawn ssh or link in an SSH
+# client (with `command=`/`netcat=`/`proxy=` knobs of their own), and
+# `tcp`/`tls` dial a network host. openReadOnly() only narrows the RPC surface
+# once connected; it says nothing about how the connection is made. The backend
+# restricts qemu_uri before sending it, but the agent must not stake its own
+# process on a single upstream control, so the collector independently refuses
+# to open anything but the local hypervisor socket:
+#
+#   accepted  qemu:///system, qemu:///session, qemu+unix:///system,
+#             qemu+unix:///session -- optionally with ?socket=<path> and/or
+#             ?mode=auto|direct|legacy, the only two parameters the unix
+#             transport reads. socket= must be a normalized absolute path
+#             inside a libvirt socket directory (LIBVIRT_SOCKET_DIRS): the
+#             collector's open has no timeout, and a peer that reads and
+#             waits (docker.sock, a socket-activated service) would stall
+#             the tick past the systemd watchdog.
+#   refused   every other scheme (qemu+ext, qemu+ssh, qemu+libssh[2],
+#             qemu+tcp, qemu+tls, test, xen, lxc, ...); any URI with an
+#             authority component (qemu://HOST/system is an implicit TLS
+#             connection to HOST); qemu:///embed (runs the QEMU driver
+#             in-process); any other query parameter (command=, netcat=,
+#             proxy=, name=, ...); and an empty or non-string URI, which
+#             would defer to LIBVIRT_DEFAULT_URI / libvirt.conf and could
+#             resolve to any of the above.
+#
+# On refusal the collector never calls into libvirt at all and qemu_metrics
+# reports None, which the server treats as a collection failure (no data,
+# no pruning). The same None is reported when the connection or the domain
+# enumeration fails; [] means libvirt answered and listed zero domains (the
+# docker/zfs "report everything or null" contract). The refusal log names
+# the REASON only, never the URI or any value taken from it: those lines
+# reach the journal and the error telemetry sent back to the backend, a
+# hostile URI can carry a credential anywhere (userinfo, path, a parameter
+# value), and redacting it in place proved a losing game -- every rewrite
+# opened a new hole or a quadratic regex. The one echoed token is the
+# scheme, and only when it is a libvirt spelling (qemu, or qemu+<transport>,
+# any case); anything else is reported as "(unrecognized)". The agent never
+# echoes the URI on the ACCEPTED path either; libvirt's own connect-failure
+# message is logged verbatim there because it is the only diagnostic an
+# operator has, and it may quote the configured socket path.
+#
+# Query parsing is kept IDENTICAL to libvirt's rather than merely stricter:
+# libvirt splits on "&" and treats ";" as a separator only when no "&"
+# remains, so a query mixing the two is read differently by the two parsers
+# (?mode=auto;mode=direct&socket=... is two valid modes to a naive splitter
+# and one invalid mode to libvirt). Any ";" in the query is therefore
+# refused outright; with "&" alone both parsers agree. Decoded parameter
+# values must be printable with no whitespace, because libvirt decodes them
+# too and its own connect error echoes the socket path.
+#
+# One more thing an accepted URI must not do: for a non-root agent, opening
+# qemu:///session makes the libvirt client fork libvirt's own session daemon
+# (virtqemud --timeout=120) whenever no socket is listening, and again each
+# time it idles out. A monitoring agent connects or fails; it never spawns
+# the hypervisor daemon, so LIBVIRT_AUTOSTART=0 is set once at import (on
+# the main thread, before any libvirt thread exists; libvirt reads it at
+# every open) unless the operator's service environment already sets it.
+# User installs therefore need the session daemon running or
+# socket-activated (systemctl --user enable --now virtqemud.socket).
+LIBVIRT_ALLOWED_SCHEMES = ("qemu", "qemu+unix")
+LIBVIRT_ALLOWED_PATHS = ("/system", "/session")
+LIBVIRT_ALLOWED_PARAMS = ("socket", "mode")
+LIBVIRT_ALLOWED_MODES = ("auto", "direct", "legacy")
+# Every transport libvirt's remote driver knows. A refused scheme is echoed
+# in the reason only when it spells qemu or qemu+<one of these> (in any
+# case), so the echo is drawn from a fixed vocabulary, never from the URI.
+LIBVIRT_TRANSPORTS = ("unix", "tcp", "tls", "ssh", "ext", "libssh", "libssh2")
+_LIBVIRT_SCHEME_SPELLINGS = frozenset(
+    ["qemu"] + ["qemu+" + transport for transport in LIBVIRT_TRANSPORTS]
+)
+# Where libvirt puts its sockets: the system daemons (monolithic
+# libvirt-sock and modular virtqemud-sock alike) and, for session daemons,
+# $XDG_RUNTIME_DIR/libvirt/ (resolved at check time).
+LIBVIRT_SOCKET_DIRS = ("/run/libvirt/", "/var/run/libvirt/")
+# Longest URI the allowlist will even parse. The longest acceptable URI is
+# about 150 characters (qemu+unix:///session?socket=<107-char sun_path>
+# &mode=legacy); the cap bounds every per-tick parse cost -- urlsplit's NFKC
+# pass, per-parameter unquote -- to O(512) regardless of stdlib internals,
+# so a hostile config cannot stretch the collection tick.
+LIBVIRT_URI_MAX_CHARS = 512
+
+# The collector's default, and the URI the permissions probe opens (it
+# imports this name) -- one spelling, so the two cannot drift.
+DEFAULT_LIBVIRT_URI = "qemu:///system"
+
+
+def _disable_session_autostart():
+    """LIBVIRT_AUTOSTART=0 unless the operator's environment already sets it
+    (see the header). Called once at import, on the main thread, before any
+    libvirt worker exists; the call in _connect is a no-op safety net that
+    never reaches setenv while the variable is present."""
+    os.environ.setdefault("LIBVIRT_AUTOSTART", "0")
+
+
+_disable_session_autostart()
+
+
+def _libvirt_socket_dirs():
+    dirs = list(LIBVIRT_SOCKET_DIRS)
+    xdg = os.environ.get("XDG_RUNTIME_DIR", "")
+    # posixpath on purpose (the cgroup.py precedent): a unix socket path is
+    # always POSIX, and ntpath.normpath would rewrite every one of these with
+    # backslashes when the suite runs on Windows.
+    if xdg.startswith("/") and xdg == posixpath.normpath(xdg):
+        dirs.append(xdg + "/libvirt/")
+    return dirs
+
+
+def libvirt_uri_rejection(uri):
+    """Return why *uri* falls outside the local-socket allowlist, or None when
+    it may be opened. Pure function: never touches libvirt."""
+    if not isinstance(uri, str) or not uri:
+        return (
+            "URI must be a non-empty string (an empty URI defers to "
+            "LIBVIRT_DEFAULT_URI / libvirt.conf)"
+        )
+    if len(uri) > LIBVIRT_URI_MAX_CHARS:
+        return f"URI is longer than {LIBVIRT_URI_MAX_CHARS} characters"
+    if " " in uri or not uri.isprintable():
+        return "URI contains whitespace or control characters"
+    try:
+        parts = urlsplit(uri)
+    except ValueError:
+        # Never echo the parser's message: CPython builds it from the RAW
+        # netloc, userinfo included.
+        return "URI does not parse"
+    # urlsplit lowercases the scheme, but libvirt matches the driver name
+    # case-sensitively (only the transport after "+" is folded), so compare
+    # the raw spelling: the agent must accept no spelling libvirt would not.
+    scheme = uri[: len(parts.scheme)]
+    if scheme not in LIBVIRT_ALLOWED_SCHEMES:
+        if scheme.lower() in _LIBVIRT_SCHEME_SPELLINGS:
+            shown = repr(scheme)
+        else:
+            shown = "(none)" if not scheme else "(unrecognized)"
+        return (
+            f"scheme {shown} is not a local qemu transport "
+            f"(allowed: {', '.join(LIBVIRT_ALLOWED_SCHEMES)})"
+        )
+    # From here on nothing from the URI is echoed (see the header): the
+    # authority, the path and every parameter can carry a credential.
+    if parts.netloc:
+        return (
+            "URI carries an authority component (a remote host); only "
+            f"{' and '.join(s + ':///' for s in LIBVIRT_ALLOWED_SCHEMES)} are allowed"
+        )
+    if parts.path not in LIBVIRT_ALLOWED_PATHS:
+        return f"path is not one of {', '.join(LIBVIRT_ALLOWED_PATHS)}"
+    if parts.fragment:
+        return "URI carries a fragment"
+    if ";" in parts.query:
+        return "query contains ';' (libvirt and the agent would split it differently)"
+    for name, value in _split_query(parts.query):
+        if name not in LIBVIRT_ALLOWED_PARAMS:
+            return (
+                "query parameter is not one of "
+                f"{', '.join(p + '=' for p in LIBVIRT_ALLOWED_PARAMS)}"
+            )
+        if " " in value or not value.isprintable():
+            return "query parameter value contains whitespace or control characters"
+        if name == "socket" and not _is_libvirt_socket_path(value):
+            return (
+                "socket= is not a normalized absolute path inside a libvirt "
+                "socket directory"
+            )
+        if name == "mode" and value not in LIBVIRT_ALLOWED_MODES:
+            return f"mode= is not one of {', '.join(LIBVIRT_ALLOWED_MODES)}"
+    return None
+
+
+def _is_libvirt_socket_path(value):
+    """True when *value* is an absolute, already-normalized path (no "..",
+    "//" or "." segments -- the kernel would resolve them past the directory)
+    to a file inside one of the libvirt socket directories."""
+    if not value.startswith("/") or value != posixpath.normpath(value):
+        return False
+    return any(
+        value.startswith(d) and len(value) > len(d) for d in _libvirt_socket_dirs()
+    )
+
+
+def _split_query(query):
+    """Yield (name, value) pairs the way libvirt's virURIParseParams reads a
+    query that contains no ";" (the caller refuses one that does): "&"
+    separates parameters, splitting happens before decoding, names and
+    values are percent-decoded, and "+" is literal (no form decoding). A
+    nameless "=value" segment is yielded with an empty name so the caller
+    refuses it (libvirt would silently drop it: stricter, never looser)."""
+    for part in query.split("&"):
+        if not part:
+            continue
+        name, _, value = part.partition("=")
+        yield unquote(name), unquote(value)
+
+
+# The refused URI most recently logged at error level. A refused URI comes
+# back on every tick (the collector is re-instantiated per tick and the
+# config is level-triggered), so the error is logged once per CHANGE of
+# refused URI and demoted to debug while it repeats; an accepted URI clears
+# the register, so a bad URI that was fixed and later re-introduced is an
+# error again. The per-tick signal is the None payload. The empty register
+# is a private sentinel, not None: None is itself a refusable value (a
+# backend can send {"uri": null}), and its first refusal must be an error.
+_NEVER_REFUSED = object()
+_last_refused_uri = _NEVER_REFUSED
+
+
+def _log_refusal(uri, reason):
+    """Log the reason -- never the URI (see the allowlist header). The raw
+    URI is only ever compared for equality against the register."""
+    global _last_refused_uri
+    level = "debug" if uri == _last_refused_uri else "error"
+    _last_refused_uri = uri
+    log(
+        f"Refusing configured libvirt URI: {reason}; not connecting, "
+        "QEMU metrics report null",
+        level,
+    )
+
+
+def _clear_refusal():
+    global _last_refused_uri
+    _last_refused_uri = _NEVER_REFUSED
+
+
 class QEMUCollector:
-    def __init__(self, uri="qemu:///system"):
+    def __init__(self, uri=DEFAULT_LIBVIRT_URI):
         self.uri = uri
         self.conn = None
-        self._connect()
-        self._setup_error_handler()
+        # The allowlist is the one gate, before ANY libvirt call (not even
+        # the global error-handler registration): a refused URI keeps its
+        # reason here, no connection is attempted, and qemu_metrics reports
+        # None instead of [] (zero VMs).
+        self.refused = libvirt_uri_rejection(uri)
+        if self.refused:
+            _log_refusal(uri, self.refused)
+        else:
+            _clear_refusal()
+            self._connect()
+            self._setup_error_handler()
 
     def _setup_error_handler(self):
         """Setup custom error handler to suppress known cgroup v2 warnings."""
@@ -48,6 +288,9 @@ class QEMUCollector:
             except AttributeError:
                 log("libvirt.getLibVersion() not available in this version", 'debug')
 
+            # Connect or fail: never let libvirt fork a session daemon on the
+            # agent's behalf (set at import; this is the no-op safety net).
+            _disable_session_autostart()
             self.conn = libvirt.openReadOnly(self.uri)
             if self.conn is None:
                 log("libvirt.openReadOnly returned None", 'error')
@@ -60,7 +303,10 @@ class QEMUCollector:
                 except Exception as e:
                     log(f"Error getting connection info: {e}", 'debug')
         except Exception as e:
-            log(f"Cannot connect to libvirt at {self.uri}: {e}", 'error')
+            # The URI is never echoed (see the header). libvirt's own message
+            # is kept -- it is THE diagnostic for a real connect failure --
+            # and may quote the configured socket path.
+            log(f"Cannot connect to libvirt: {e}", 'error')
 
     def _xml_devices(self, dom):
         disks, ifaces = [], []
@@ -322,11 +568,17 @@ class QEMUCollector:
             log(f"Error collecting metrics for domain: {ex}", 'error')
 
     def collect(self):
-        data = []
-
+        """The domain metric list; [] only when libvirt answered and listed
+        zero domains. None -- a collection failure the server skips -- on a
+        refused URI, a failed connection or a failed enumeration, so an
+        outage never reads as "all VMs are gone"."""
+        if self.refused:
+            return None
         if not self.conn:
             log("No libvirt connection available", 'error')
-            return data
+            return None
+
+        data = []
 
         try:
             doms = self.conn.listAllDomains()
@@ -346,7 +598,7 @@ class QEMUCollector:
 
         except Exception as e:
             log(f"listAllDomains failed: {e}", 'error')
-            return data
+            return None
 
         for dom in doms:
             self._collect_domain_metrics(dom, data)
@@ -363,10 +615,10 @@ class QEMUCollector:
 
 
 @debug('qemu_metrics')
-def qemu_metrics(uri="qemu:///system"):
+def qemu_metrics(uri=DEFAULT_LIBVIRT_URI):
     if libvirt is None:
         log("libvirt not available, skipping QEMU metrics", "debug")
-        return []
+        return None
     collector = QEMUCollector(uri)
     try:
         return collector.collect()
