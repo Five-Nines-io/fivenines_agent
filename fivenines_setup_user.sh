@@ -6,9 +6,13 @@
 # Usage: bash fivenines_setup_user.sh YOUR_TOKEN
 #
 # Environment variables:
-#   FIVENINES_AGENT_URL   - Custom download URL for the agent tarball (e.g., feature branch builds)
-#   FIVENINES_INSTALL_DIR - Custom install directory (default: ~/.local/fivenines)
-#   FIVENINES_CONFIG_DIR  - Custom config directory (default: ~/.config/fivenines_agent)
+#   FIVENINES_AGENT_URL    - Custom download URL for the agent tarball (e.g., feature branch builds).
+#                            Unverified unless FIVENINES_AGENT_SHA256 is also set.
+#   FIVENINES_AGENT_SHA256 - Expected SHA-256 of the tarball. Overrides the published
+#                            SHA256SUMS; the only way to verify a custom URL.
+#   FIVENINES_SKIP_VERIFY  - Set to 1 to install WITHOUT verifying the tarball. Unsupported.
+#   FIVENINES_INSTALL_DIR  - Custom install directory (default: ~/.local/fivenines)
+#   FIVENINES_CONFIG_DIR   - Custom config directory (default: ~/.config/fivenines_agent)
 #
 # Example with custom build:
 #   FIVENINES_AGENT_URL="https://github.com/Five-Nines-io/fivenines_agent/releases/download/feature-branch/fivenines-agent-linux-amd64.tar.gz" bash fivenines_setup_user.sh YOUR_TOKEN
@@ -108,8 +112,13 @@ download_with_fallback() {
     r2_url="${R2_BASE_URL}/${filename}"
     github_url="${GITHUB_RELEASES_URL}/${filename}"
 
+    # Record which mirror served the file: the checksum has to be read from
+    # that same mirror (see download_sums).
+    DOWNLOAD_SOURCE=""
+
     # Try R2 first (IPv6 compatible)
     if download_file "$r2_url" "$output" 2>/dev/null; then
+        DOWNLOAD_SOURCE="r2"
         print_success "Downloaded from releases.fivenines.io"
         return 0
     fi
@@ -117,11 +126,143 @@ download_with_fallback() {
     # Fallback to GitHub
     print_warning "R2 mirror unavailable, trying GitHub..."
     if download_file "$github_url" "$output" 2>/dev/null; then
+        DOWNLOAD_SOURCE="github"
         print_success "Downloaded from GitHub"
         return 0
     fi
 
     return 1
+}
+
+# Portable SHA-256 of a file. Prints the lowercase hex digest on stdout, or
+# nothing at all when the host has no digest tool. sha256sum covers coreutils
+# and BusyBox (so every distro in the support matrix); shasum and openssl are
+# fallbacks for stripped-down images.
+compute_sha256() {
+    file="$1"
+
+    if command -v sha256sum > /dev/null 2>&1; then
+        sha256sum "$file" 2>/dev/null | cut -d' ' -f1
+    elif command -v shasum > /dev/null 2>&1; then
+        shasum -a 256 "$file" 2>/dev/null | cut -d' ' -f1
+    elif command -v openssl > /dev/null 2>&1; then
+        # "SHA256(file)= <hex>" on every OpenSSL back to 1.0.2 (CentOS 7).
+        openssl dgst -sha256 "$file" 2>/dev/null | sed 's/^.*= *//'
+    fi
+}
+
+# Look up one file's expected digest in a sha256sum-format SHA256SUMS file.
+# The name is matched exactly, and against the whole field: a substring or
+# suffix match would let the arm64 line answer a request for the amd64
+# tarball. "*name" is the binary-mode spelling of the same entry. Prints
+# nothing and returns non-zero when the file is not listed.
+sha256_from_sums() {
+    sums_file="$1"
+    wanted="$2"
+
+    awk -v want="$wanted" '
+        $2 == want || $2 == "*" want { print $1; found = 1; exit }
+        END { exit !found }
+    ' "$sums_file" 2>/dev/null
+}
+
+# Compare a downloaded file against an expected digest. Returns 0 only on a
+# proven match: a host with no digest tool returns non-zero exactly like a
+# mismatch does, because "could not check it" and "checked it and it is
+# wrong" must not install different amounts of code.
+verify_sha256() {
+    file="$1"
+    expected=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
+    label="$3"
+
+    actual=$(compute_sha256 "$file" | tr '[:upper:]' '[:lower:]')
+
+    if [ -z "$actual" ]; then
+        print_error "Cannot verify ${label}: this host has no sha256sum, shasum or openssl."
+        print_error "Install coreutils and re-run, or see the README to override deliberately."
+        return 1
+    fi
+
+    if [ "$actual" != "$expected" ]; then
+        print_error "Checksum mismatch for ${label}"
+        print_error "  expected: ${expected}"
+        print_error "  actual:   ${actual}"
+        return 1
+    fi
+
+    print_success "Verified ${label} (sha256 ${actual})"
+    return 0
+}
+
+# SHA256SUMS has to come from the SAME mirror that served the tarball. The two
+# mirrors are written by different steps of the release job, so during a
+# release they can briefly hold different versions, and a digest read from the
+# other mirror would then reject a perfectly good download.
+download_sums() {
+    output="$1"
+
+    case "${DOWNLOAD_SOURCE:-}" in
+        r2) sums_url="${R2_BASE_URL}/SHA256SUMS" ;;
+        github) sums_url="${GITHUB_RELEASES_URL}/SHA256SUMS" ;;
+        *) return 1 ;;
+    esac
+
+    download_file "$sums_url" "$output" 2>/dev/null
+}
+
+# Check an agent tarball before it is unpacked. The expected digest comes from
+# FIVENINES_AGENT_SHA256 when the operator pinned one, otherwise from the
+# SHA256SUMS the same mirror publishes next to the tarball (download_sums).
+# A non-zero return means the tarball must not be installed.
+#
+# What this buys and what it does not: the digest proves the bytes arrived
+# intact and are the ones the release published, which catches a truncated
+# download, a half-finished mirror sync and a swapped asset. It is not a
+# signature - it is served by the same origin as the tarball - so on its own
+# it does not defend against an attacker who owns that origin. Signature
+# verification with an embedded public key is the follow-up (issue #143).
+verify_agent_tarball() {
+    tarball="$1"
+    asset_name="$2"
+
+    if [ "${FIVENINES_SKIP_VERIFY:-}" = "1" ]; then
+        print_warning "FIVENINES_SKIP_VERIFY=1 - installing an UNVERIFIED agent tarball."
+        return 0
+    fi
+
+    if [ -n "${FIVENINES_AGENT_SHA256:-}" ]; then
+        if verify_sha256 "$tarball" "$FIVENINES_AGENT_SHA256" "$asset_name"; then
+            return 0
+        fi
+        return 1
+    fi
+
+    if [ -z "${DOWNLOAD_SOURCE:-}" ]; then
+        # No mirror served this file: a custom FIVENINES_AGENT_URL, or a
+        # tarball pre-placed by the CI test harness. There is no published
+        # digest to check it against, so say so plainly rather than letting
+        # silence imply it was checked.
+        print_warning "UNVERIFIED agent tarball: this source publishes no checksum."
+        print_warning "Pass FIVENINES_AGENT_SHA256=<sha256> to verify a custom build."
+        return 0
+    fi
+
+    sums_path="${tarball}.SHA256SUMS"
+    rm -f "$sums_path"
+    if ! download_sums "$sums_path"; then
+        print_error "Could not download SHA256SUMS from the mirror that served ${asset_name}."
+        return 1
+    fi
+
+    expected_sha256=$(sha256_from_sums "$sums_path" "$asset_name" || true)
+    rm -f "$sums_path"
+
+    if [ -z "$expected_sha256" ]; then
+        print_error "${asset_name} is not listed in the published SHA256SUMS."
+        return 1
+    fi
+
+    verify_sha256 "$tarball" "$expected_sha256" "$asset_name"
 }
 
 detect_libc() {
@@ -197,10 +338,9 @@ download_agent() {
     tarball_name="${BINARY_NAME}.tar.gz"
     tarball_path="/tmp/${tarball_name}"
 
-    # Remove old installation if exists
-    if [ -d "$INSTALL_DIR/$BINARY_NAME" ]; then
-        rm -rf "${INSTALL_DIR:?}/${BINARY_NAME:?}"
-    fi
+    # Only download_with_fallback sets this; an empty value means the tarball
+    # did not come from a mirror that publishes a checksum.
+    DOWNLOAD_SOURCE=""
 
     # Use custom URL if provided, otherwise use fallback mechanism
     if [ "${FIVENINES_TEST_MODE:-}" = "1" ] && [ -f "$tarball_path" ]; then
@@ -211,6 +351,17 @@ download_agent() {
         print_success "Downloaded from custom URL"
     else
         download_with_fallback "$tarball_name" "$tarball_path" || exit_with_error "Failed to download agent"
+    fi
+
+    if ! verify_agent_tarball "$tarball_path" "$tarball_name"; then
+        rm -f "$tarball_path"
+        exit_with_error "Refusing to install an unverified agent tarball. No agent binary was unpacked; any existing installation is untouched."
+    fi
+
+    # Remove the old installation only once the replacement has been verified,
+    # so a rejected tarball cannot leave the user with no agent at all.
+    if [ -d "$INSTALL_DIR/$BINARY_NAME" ]; then
+        rm -rf "${INSTALL_DIR:?}/${BINARY_NAME:?}"
     fi
 
     tar -xzf "$tarball_path" -C "$INSTALL_DIR" || exit_with_error "Failed to extract agent"

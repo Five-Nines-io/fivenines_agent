@@ -2,8 +2,9 @@
 # Verify that shared shell functions are consistent across install scripts.
 # fivenines_common.sh is the source of truth for shared functions.
 #
-# This script checks that key functions (detect_libc, detect_system, etc.)
-# in each install script match the canonical versions in fivenines_common.sh.
+# This script checks that key functions (detect_libc, the SHA-256 verification
+# helpers, etc.) in each install script match the canonical versions in
+# fivenines_common.sh.
 #
 # Usage: sh ci/build-scripts.sh [--check]
 #   --check: Exit with error if functions are out of sync (CI mode)
@@ -23,30 +24,45 @@ if [ ! -f "$COMMON" ]; then
     exit 1
 fi
 
-# Extract the canonical detect_libc function from common.sh
-CANONICAL_DETECT_LIBC=$(sed -n '/^detect_libc()/,/^}/p' "$COMMON")
+# Functions that must be byte-identical in every install script. The
+# checksum helpers are on this list deliberately: they are what stands
+# between a tampered tarball and a root-level extract, so a copy that
+# quietly drifts in one script is a security regression, not a style nit.
+SHARED_FUNCTIONS="detect_libc compute_sha256 sha256_from_sums verify_sha256 verify_agent_tarball"
 
 ERRORS=0
 
-# Check each script that contains detect_libc
-for script in \
-    "$SCRIPT_DIR/fivenines_setup.sh" \
-    "$SCRIPT_DIR/fivenines_update.sh" \
-    "$SCRIPT_DIR/fivenines_setup_user.sh" \
-    "$SCRIPT_DIR/fivenines_update_user.sh"; do
+for func in $SHARED_FUNCTIONS; do
+    CANONICAL=$(sed -n "/^${func}()/,/^}/p" "$COMMON")
 
-    if [ ! -f "$script" ]; then
+    if [ -z "$CANONICAL" ]; then
+        echo "ERROR: ${func}() not found in fivenines_common.sh"
+        ERRORS=$((ERRORS + 1))
         continue
     fi
 
-    SCRIPT_DETECT_LIBC=$(sed -n '/^detect_libc()/,/^}/p' "$script")
+    for script in \
+        "$SCRIPT_DIR/fivenines_setup.sh" \
+        "$SCRIPT_DIR/fivenines_update.sh" \
+        "$SCRIPT_DIR/fivenines_setup_user.sh" \
+        "$SCRIPT_DIR/fivenines_update_user.sh"; do
 
-    if [ "$CANONICAL_DETECT_LIBC" != "$SCRIPT_DETECT_LIBC" ]; then
-        echo "WARNING: detect_libc() in $(basename "$script") differs from fivenines_common.sh"
-        ERRORS=$((ERRORS + 1))
-    else
-        echo "OK: detect_libc() in $(basename "$script")"
-    fi
+        if [ ! -f "$script" ]; then
+            continue
+        fi
+
+        COPY=$(sed -n "/^${func}()/,/^}/p" "$script")
+
+        if [ -z "$COPY" ]; then
+            echo "MISSING: ${func}() in $(basename "$script")"
+            ERRORS=$((ERRORS + 1))
+        elif [ "$CANONICAL" != "$COPY" ]; then
+            echo "WARNING: ${func}() in $(basename "$script") differs from fivenines_common.sh"
+            ERRORS=$((ERRORS + 1))
+        else
+            echo "OK: ${func}() in $(basename "$script")"
+        fi
+    done
 done
 
 if [ "$ERRORS" -gt 0 ]; then

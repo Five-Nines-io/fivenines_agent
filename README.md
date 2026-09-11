@@ -15,6 +15,7 @@ Windows 10/11), **Synology DSM 7** and **UNRAID**.
   - [UNRAID](#unraid)
   - [Synology Installation (DSM 7+)](#synology-installation-dsm-7)
   - [Cloning VMs or building golden images](#cloning-vms-or-building-golden-images)
+  - [Verifying a release artifact](#verifying-a-release-artifact)
 - [Update](#update) / [Remove](#remove) / [Debug](#debug)
 - [Permissions](#permissions)
 - **Host and platform monitoring**
@@ -328,6 +329,77 @@ sudo rm -f /etc/fivenines_agent/TOKEN /etc/fivenines_agent/MACHINE_ID
 Use `~/.config/fivenines_agent` for a user-level install or
 `/boot/config/custom/fivenines_agent` on UNRAID. Each clone then needs the
 agent re-enrolled with a fresh token.
+
+### Verifying a release artifact
+
+Every release publishes a `SHA256SUMS` manifest alongside the artifacts, on
+both mirrors:
+
+- `https://releases.fivenines.io/latest/SHA256SUMS` (and
+  `https://releases.fivenines.io/v<version>/SHA256SUMS` for one specific release)
+- the `SHA256SUMS` asset on the matching
+  [GitHub release](https://github.com/Five-Nines-io/fivenines_agent/releases)
+
+**The install and update scripts already do this for you** (install scripts
+from release **v1.17.7** onward -- the check lives in the scripts, so an older
+agent picks it up as soon as it is updated). Before anything is unpacked as root they fetch `SHA256SUMS` from
+the same mirror that served the tarball, compare the digest, and abort -- with
+the existing installation left exactly where it was -- if it does not match.
+There is no quiet "carry on anyway" path: a `SHA256SUMS` that cannot be
+downloaded, or that does not list the tarball, aborts the install too, so the
+check cannot be silently downgraded by suppressing one request.
+
+To check an artifact by hand:
+
+```bash
+wget -q https://releases.fivenines.io/latest/fivenines-agent-linux-amd64.tar.gz
+wget -q https://releases.fivenines.io/latest/SHA256SUMS
+
+grep ' fivenines-agent-linux-amd64.tar.gz$' SHA256SUMS | sha256sum -c -
+# fivenines-agent-linux-amd64.tar.gz: OK
+```
+
+`SHA256SUMS` covers everything published at that location -- the four Linux
+tarballs, both Synology `.spk` packages, the Windows MSI, the service units and
+the install scripts themselves -- so the `grep` narrows the check to the one
+file you downloaded. `sha256sum -c SHA256SUMS` without it reports every file
+you did not download as missing.
+
+#### What the checksum proves, and what it does not
+
+The manifest is served by the same origin as the artifact. It proves the bytes
+you received are the bytes that origin published, which catches a truncated
+download, a half-finished mirror sync, and a swapped or mislabelled asset. It
+is **not** a signature: on its own it does not defend against an attacker who
+controls the bucket or the GitHub release, since such an attacker could rewrite
+both files. End-to-end authenticity needs a detached signature verified against
+a public key embedded in the installer, which is the follow-up half of
+[#143](https://github.com/Five-Nines-io/fivenines_agent/issues/143).
+
+#### Installing a custom or pre-release build
+
+`FIVENINES_AGENT_URL` points the installer at an arbitrary tarball, which by
+definition has no published `SHA256SUMS` to check it against. **That path is a
+development escape hatch and is unverified** unless you pin the digest
+yourself:
+
+```bash
+sudo FIVENINES_AGENT_URL="https://github.com/.../fivenines-agent-linux-amd64.tar.gz" \
+     FIVENINES_AGENT_SHA256="<expected sha256>" \
+     bash fivenines_update.sh
+```
+
+Pre-release builds list their digests in the GitHub release notes. Without
+`FIVENINES_AGENT_SHA256` the installer prints an `UNVERIFIED` warning and
+continues.
+
+| Variable | Effect |
+|----------|--------|
+| `FIVENINES_AGENT_SHA256` | Expected SHA-256 of the tarball. Overrides the published `SHA256SUMS`, and is the only way to verify a `FIVENINES_AGENT_URL` download. |
+| `FIVENINES_SKIP_VERIFY=1` | Install without verifying anything. Unsupported; intended only for a host that has no `sha256sum`, `shasum` or `openssl` at all. |
+
+On Windows the artifact to verify is the MSI, which `SHA256SUMS` also covers;
+`fivenines_setup.ps1` does not yet check it.
 
 ## Update
 

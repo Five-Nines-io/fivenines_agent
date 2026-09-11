@@ -546,8 +546,10 @@ jobs:
             ci/test-distro.sh \
             ci/test-selinux-vm.sh
 
+      # Blocking: the list now covers the SHA-256 verification helpers, and a
+      # drifted copy of those in one installer is a security regression.
       - name: Verify shared functions are in sync
-        run: sh ci/build-scripts.sh --check || echo "Warning - shared functions out of sync (non-blocking)"
+        run: sh ci/build-scripts.sh --check
 
   # Distro regression testing
   test-distro-matrix:
@@ -794,6 +796,22 @@ jobs:
           echo "SPK_X86=$SPK_X86" >> $GITHUB_OUTPUT
           echo "SPK_ARM=$SPK_ARM" >> $GITHUB_OUTPUT
 
+      - name: Generate SHA256SUMS
+        id: checksums
+        working-directory: release
+        run: |
+          # One sha256sum-format manifest over every published asset, sorted
+          # so the file is stable across runs. SHA256SUMS cannot list itself.
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\0' \
+            | sort -z \
+            | xargs -0 sha256sum > SHA256SUMS
+          cat SHA256SUMS
+          {
+            echo 'SUMS<<CHECKSUMS_EOF'
+            cat SHA256SUMS
+            echo 'CHECKSUMS_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Delete existing pre-release with same tag (if exists)
         run: |
           gh release delete "${{ steps.release_info.outputs.TAG_NAME }}" --yes || true
@@ -862,6 +880,20 @@ jobs:
             # Windows Server 2019/2022/2025, Windows 10/11 (AMD64) - MSI installer
             https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-windows-amd64.msi
             ```
+
+            ### Checksums
+            ```
+            ${{ steps.checksums.outputs.SUMS }}
+            ```
+
+            A pre-release is not published under `latest/`, so the install
+            scripts have no `SHA256SUMS` to look up for it. Pin the digest
+            yourself to get the same verification a normal install gets:
+            ```bash
+            FIVENINES_AGENT_URL="https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-linux-amd64.tar.gz" \
+            FIVENINES_AGENT_SHA256="<digest from the list above>" \
+            bash fivenines_update.sh
+            ```
           files: |
             release/fivenines-agent-linux-amd64.tar.gz
             release/fivenines-agent-linux-arm64.tar.gz
@@ -869,6 +901,7 @@ jobs:
             release/fivenines-agent-alpine-arm64.tar.gz
             release/*.spk
             release/fivenines-agent-windows-amd64.msi
+            release/SHA256SUMS
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -922,6 +955,22 @@ jobs:
             exit 1
           fi
 
+      - name: Generate SHA256SUMS
+        id: checksums
+        working-directory: release
+        run: |
+          # One sha256sum-format manifest over every published asset, sorted
+          # so the file is stable across runs. SHA256SUMS cannot list itself.
+          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\0' \
+            | sort -z \
+            | xargs -0 sha256sum > SHA256SUMS
+          cat SHA256SUMS
+          {
+            echo 'SUMS<<CHECKSUMS_EOF'
+            cat SHA256SUMS
+            echo 'CHECKSUMS_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -929,6 +978,14 @@ jobs:
           draft: false
           prerelease: false
           generate_release_notes: true
+          body: |
+            ### Checksums
+            ```
+            ${{ steps.checksums.outputs.SUMS }}
+            ```
+            The install scripts verify these automatically. To check an
+            artifact by hand, see
+            [Verifying a release artifact](https://github.com/${{ github.repository }}#verifying-a-release-artifact).
           files: |
             release/fivenines-agent-linux-amd64.tar.gz
             release/fivenines-agent-linux-arm64.tar.gz
@@ -936,6 +993,7 @@ jobs:
             release/fivenines-agent-alpine-arm64.tar.gz
             release/*.spk
             release/fivenines-agent-windows-amd64.msi
+            release/SHA256SUMS
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -992,7 +1050,16 @@ jobs:
           cp fivenines_update.ps1 r2-upload/latest/
           cp fivenines_uninstall.ps1 r2-upload/latest/
 
+          # Manifest over everything this prefix serves, so the installers
+          # (and operators) can verify whatever they pulled from R2. It is
+          # generated here rather than copied from the release job because
+          # R2 also carries the install scripts and service units.
+          ( cd r2-upload/latest && find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\0' \
+              | sort -z \
+              | xargs -0 sha256sum > SHA256SUMS )
+
           ls -la r2-upload/latest/
+          cat r2-upload/latest/SHA256SUMS
 
       - name: Install rclone
         run: |
@@ -1033,3 +1100,4 @@ jobs:
           echo "  - https://releases.fivenines.io/latest/fivenines-agent.service"
           echo "  - https://releases.fivenines.io/latest/fivenines-agent.openrc"
           echo "  - https://releases.fivenines.io/latest/fivenines_script.sh"
+          echo "  - https://releases.fivenines.io/latest/SHA256SUMS"
