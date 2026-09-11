@@ -9,6 +9,7 @@ Restart=always, a restart loop.
 """
 
 import subprocess
+import sys
 import threading
 import time
 
@@ -18,8 +19,12 @@ from fivenines_agent.subprocess_utils import run_command, run_privileged
 
 
 def test_returns_the_completed_process_on_the_normal_path():
+    # sys.executable, not /bin/echo: the Windows job runs this whole suite.
     result = run_privileged(
-        ["/bin/echo", "hello"], timeout=5, stdout=subprocess.PIPE, text=True
+        [sys.executable, "-c", "print('hello')"],
+        timeout=30,
+        stdout=subprocess.PIPE,
+        text=True,
     )
     assert result.returncode == 0
     assert result.stdout.strip() == "hello"
