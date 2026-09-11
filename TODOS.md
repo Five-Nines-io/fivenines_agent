@@ -520,7 +520,57 @@ generate one at spec time from the declared enum rather than committing it.
 - **Depends on:** nothing
 - **Files:** `tests/fixtures/docker_image_inventory_contract_payload.json`, `tests/test_docker_image_inventory.py`
 
+## P3: Bound the QEMU collector's libvirt connection with a timeout
+
+`QEMUCollector._connect` calls `libvirt.openReadOnly` with no deadline, on the
+collection thread. The permissions probe already wraps its own open in a worker
+with `LIBVIRT_PROBE_TIMEOUT` (3s) for exactly this reason: a wedged libvirt
+stack (socket activation, daemon handshake, polkit, NSS) blocks indefinitely,
+and the collection loop is bounded by `WatchdogSec=90`.
+
+Agent #142 closed the backend-steerable half of this by constraining
+`?socket=` to libvirt's own socket directories, so a hostile config can no
+longer point the agent at a peer that reads and waits (docker.sock, a
+socket-activated service). What remains is the honest case: a real libvirt that
+hangs. The fix mirrors `_can_access_libvirt` -- worker thread, hard timeout,
+single-flight so a hung open cannot leak one thread per tick -- and reports
+`None` on timeout (a collection failure, which the collector now distinguishes
+from `[]`).
+
+- **Effort:** M (human) / S (CC)
+- **Files:** `fivenines_agent/qemu.py`, `tests/test_qemu.py`
+
+## P3: Thread the configured QEMU URI through the capability probe
+
+`permissions._can_access_libvirt` opens `DEFAULT_LIBVIRT_URI` while the
+allowlist accepts `/session`, `?socket=` and `?mode=`. `collectors._is_capability_gated`
+skips the `qemu` collector whenever the default socket does not open, so a host
+configured with a non-default URI is gated out even when its own URI works;
+conversely the capability reads AVAILABLE while the configured URI fails every
+tick. The docker precedent already exists: `set_docker_socket_url` pushes the
+configured endpoint into the probe each tick. Doing the same for `qemu.uri`
+means routing the configured value through `qemu.libvirt_uri_rejection` in the
+probe as well (the check removed in #142 as unreachable becomes reachable).
+
+- **Effort:** M (human) / S (CC)
+- **Files:** `fivenines_agent/permissions.py`, `fivenines_agent/agent.py`, `tests/test_permissions_recheck.py`
+
 ## Completed
+
+### P1: QEMU collector - enforce an agent-side allowlist of libvirt URI schemes (#142)
+
+A libvirt URI selects a TRANSPORT as well as a hypervisor, and `ext` runs a
+local command while `ssh`/`libssh`/`tcp`/`tls` spawn SSH or dial a network
+host -- independently of `openReadOnly()`. `qemu.libvirt_uri_rejection` now
+refuses anything but `qemu:///system|session` and `qemu+unix:///system|session`
+(no authority, `?socket=` inside a libvirt socket directory, `?mode=` from a
+fixed set, no `;`, printable decoded values, 512-char cap) BEFORE any libvirt
+call; a refused URI logs its reason only -- never the URI -- and reports
+`None`. The collector also reports `None` on a failed open or enumeration
+(`[]` now means libvirt listed zero domains), and sets `LIBVIRT_AUTOSTART=0`
+at import so a `qemu:///session` URI never forks the session daemon.
+
+**Completed:** v1.17.5 (2026-09-11)
 
 ### P3: Hoist net_if_addrs() out of the per-interface loop in interfaces()
 
