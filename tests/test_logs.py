@@ -444,3 +444,36 @@ def test_build_digest_fingerprints_identical_lines_once(monkeypatch):
     assert digest["counts"] == {"error": 200, "warn": 1, "info": 0}
     storm = [f for f in digest["fingerprints"] if f["count"] == 200][0]
     assert storm["severity"] == "error"
+
+
+def test_redact_catches_cephx_key_material():
+    """cephx secrets are 38 base64 chars + '==' padding, written as
+    `key = AQ...` in keyrings and quoted into ceph's own parse errors. Both
+    the labeled shape and the bare-blob shape must redact."""
+    from fivenines_agent.logs import redact
+
+    key = "AQ" + "a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8" + "=="
+    labeled = f"    key = {key}"
+    out = redact(labeled)
+    assert key not in out
+    assert "REDACTED" in out  # blob rule (position 2) or the key-labeled rule
+    # Bare quoted shape ("failed to decode key '<KEY>'") via the blob rule.
+    quoted = f"failed to decode key '{key}'"
+    out = redact(quoted)
+    assert key not in out
+
+
+def test_redact_blob_rule_runs_before_email_rule():
+    """The blob rule collapses long unbroken runs BEFORE the email regex sees
+    them: the email pattern backtracks quadratically on long tokens, and
+    redact() runs on the watchdog-bounded collection loop."""
+    import time as time_module
+
+    from fivenines_agent.logs import redact
+
+    long_token = "A" * 200000
+    start = time_module.monotonic()
+    out = redact(f"prefix {long_token} suffix")
+    elapsed = time_module.monotonic() - start
+    assert "[REDACTED_BLOB]" in out
+    assert elapsed < 2  # quadratic behavior measured in tens of seconds

@@ -20,14 +20,17 @@ from fivenines_agent.tsdb import tsdb_metrics
 
 
 def _resp(status=200, text="", json_data=None):
-    """A stand-in requests.Response: status_code, text, and a json() method."""
+    """A stand-in requests.Response. The collector streams bodies via
+    iter_content under a byte cap now (never .text/.json())."""
     resp = MagicMock()
     resp.status_code = status
-    resp.text = text
-    if json_data is None:
-        resp.json.side_effect = ValueError("no json")
+    if json_data is not None:
+        raw = json.dumps(json_data).encode("utf-8")
     else:
-        resp.json.return_value = json_data
+        raw = text.encode("utf-8")
+    resp.iter_content = lambda chunk_size=65536: iter(
+        raw[i:i + chunk_size] for i in range(0, len(raw), chunk_size)
+    )
     return resp
 
 
@@ -433,3 +436,52 @@ def test_fixture_reachable_scenarios_never_null_and_have_flag():
     for scenario in _FIXTURE["scenarios"].values():
         assert isinstance(scenario["payload"], dict)
         assert "reachable" in scenario["payload"]
+
+
+def test_metrics_body_over_cap_degrades_to_bare_reachable(monkeypatch):
+    """An oversized /metrics body (misdirected or hostile URL) is refused by
+    the streamed byte cap instead of buffered unbounded; the 2xx keeps
+    reachable True with a bare payload."""
+    monkeypatch.setattr(tsdb, "_MAX_RESPONSE_BYTES", 64)
+    big = _resp(200, text="x" * 200)
+    with patch("fivenines_agent.tsdb.requests.get", return_value=big):
+        out = tsdb.tsdb_metrics(url="http://127.0.0.1:9090")
+    assert out == {"reachable": True, "flavor": None, "version": None}
+
+
+def test_get_refuses_redirects_and_streams(monkeypatch):
+    """The fetch must refuse redirects (SSRF via a server-pushed url) and
+    stream (byte cap applies while reading, not after buffering)."""
+    captured = {}
+
+    def cap(url, **kwargs):
+        captured.update(kwargs)
+        return _resp(200, text="")
+
+    with patch("fivenines_agent.tsdb.requests.get", side_effect=cap):
+        tsdb.tsdb_metrics(url="http://127.0.0.1:9090")
+    assert captured["allow_redirects"] is False
+    assert captured["stream"] is True
+
+
+def test_read_capped_skips_empty_keepalive_chunks():
+    """Empty chunks (keep-alives) are skipped, never appended -- mirrors the
+    sibling php_fpm/rabbitmq tests."""
+    raw = b"# HELP x\nprometheus_build_info{version=\"2.0\"} 1\n"
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.iter_content = lambda chunk_size=65536: iter([b"", raw])
+    with patch("fivenines_agent.tsdb.requests.get", return_value=resp):
+        out = tsdb.tsdb_metrics(url="http://127.0.0.1:9090")
+    assert out["reachable"] is True
+
+
+def test_non_2xx_streamed_response_is_closed():
+    """A locked-down Prometheus 403s every tick; the streamed response must be
+    closed on that path rather than leaking the checked-out socket to GC."""
+    resp = _resp(403, text="forbidden")
+    resp.close = MagicMock()
+    with patch("fivenines_agent.tsdb.requests.get", return_value=resp):
+        out = tsdb.tsdb_metrics(url="http://127.0.0.1:9090")
+    assert out["error_type"] == "auth_failed"
+    resp.close.assert_called_once()

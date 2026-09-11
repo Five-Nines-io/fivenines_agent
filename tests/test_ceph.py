@@ -1204,3 +1204,67 @@ def test_contract_fixture_round_trip(clock):
             "osd_df_ok",
             "error",
         }
+
+
+def test_run_ceph_redacts_stderr_before_payload(monkeypatch):
+    """CLI stderr rides the payload to the server; the config-supplied
+    conf/keyring paths mean ceph may quote lines of whatever file it was
+    pointed at into its parse errors, so secrets are redacted first."""
+
+    class P:
+        returncode = 1
+        stdout = ""
+        stderr = "parse error near 'password=SuperSecret123' in /some/file"
+
+    monkeypatch.setattr(
+        ceph.subprocess, "run", lambda *a, **k: P()
+    )
+    parsed, error = ceph._run_ceph([], ["status"], "cluster1")
+    assert parsed is None
+    assert "SuperSecret123" not in error["message"]
+    assert "[REDACTED]" in error["message"]
+
+
+def test_run_ceph_classifies_on_raw_stderr(monkeypatch):
+    """Classification runs on the RAW stderr, redaction only on the shipped
+    message: a secret whose characters carry a classification keyword must
+    not change the error type after redaction."""
+
+    class P:
+        returncode = 1
+        stdout = ""
+        # The 40-char base64 blob contains no classification keyword, but the
+        # surrounding text does ("timed out" -> timeout); if classification
+        # ran on the REDACTED text it would still work here, so instead pin
+        # the inverse: the keyword lives INSIDE the secret only.
+        stderr = "error: key = AQtimeoutXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX=="
+
+    monkeypatch.setattr(ceph.subprocess, "run", lambda *a, **k: P())
+    parsed, error = ceph._run_ceph([], ["status"], "cluster1")
+    assert parsed is None
+    # The keyword only existed inside the (redacted) secret: raw-classify sees
+    # it, so the type reflects the RAW text...
+    assert error["type"] == ceph._classify_error(P.stderr)
+    # ...while the shipped message no longer contains the key material.
+    assert "AQtimeout" not in error["message"]
+
+
+def test_run_ceph_redact_input_is_bounded(monkeypatch):
+    """The redact input is prefix-bounded (only 500 chars ship; running the
+    redaction regexes over a multi-hundred-KB stderr is avoidable CPU on the
+    collection loop)."""
+
+    class P:
+        returncode = 1
+        stdout = ""
+        stderr = "x" * 500000
+
+    monkeypatch.setattr(ceph.subprocess, "run", lambda *a, **k: P())
+    import time as time_module
+
+    start = time_module.monotonic()
+    parsed, error = ceph._run_ceph([], ["status"], "cluster1")
+    elapsed = time_module.monotonic() - start
+    assert parsed is None
+    assert len(error["message"]) <= 500
+    assert elapsed < 2  # unbounded redaction measured in tens of seconds

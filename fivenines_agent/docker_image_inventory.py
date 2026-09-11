@@ -664,7 +664,14 @@ class ImageInventoryCoordinator:
                 done = list(self._done)
             tmp_path = self.state_path + ".tmp"
             try:
-                with open(tmp_path, "w") as f:
+                # 0600 at creation (umask-independent): os.replace preserves
+                # the temp file's mode, so this is what the state file ends up
+                # with. Same owner-only default as the other config-dir state.
+                fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                # Heal a stale temp file's mode (os.open's mode applies only
+                # at creation; os.replace carries the temp's mode over).
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w") as f:
                     f.write("\n".join(done))
                 os.replace(tmp_path, self.state_path)
             except Exception as e:

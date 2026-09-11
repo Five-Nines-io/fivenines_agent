@@ -76,9 +76,13 @@ def _fcgi_stream(body, header="Content-type: application/json\r\n\r\n", split=No
 
 
 def _http_response(text="", status=200):
+    """Streamed-body stand-in (the collector reads iter_content, capped)."""
     resp = MagicMock()
     resp.status_code = status
-    resp.text = text
+    raw = text.encode("utf-8")
+    resp.iter_content = lambda chunk_size=65536: iter(
+        raw[i:i + chunk_size] for i in range(0, len(raw), chunk_size)
+    )
     return resp
 
 
@@ -118,20 +122,20 @@ _NORM_WWW = {
 
 def test_http_single_pool(monkeypatch):
     monkeypatch.setattr(
-        php_fpm.requests, "get", lambda url, timeout: _http_response(json.dumps(_RAW_WWW))
+        php_fpm.requests, "get", lambda url, **kwargs: _http_response(json.dumps(_RAW_WWW))
     )
     assert php_fpm.php_fpm_metrics(status_page_url="http://127.0.0.1/status?json") == [_NORM_WWW]
 
 
 def test_http_non_200_returns_null(monkeypatch):
     monkeypatch.setattr(
-        php_fpm.requests, "get", lambda url, timeout: _http_response("x", status=500)
+        php_fpm.requests, "get", lambda url, **kwargs: _http_response("x", status=500)
     )
     assert php_fpm.php_fpm_metrics(status_page_url="http://127.0.0.1/status?json") is None
 
 
 def test_http_exception_returns_null(monkeypatch):
-    def boom(url, timeout):
+    def boom(url, **kwargs):
         raise requests.exceptions.Timeout("timed out")
 
     monkeypatch.setattr(php_fpm.requests, "get", boom)
@@ -139,19 +143,19 @@ def test_http_exception_returns_null(monkeypatch):
 
 
 def test_http_malformed_json_returns_null(monkeypatch):
-    monkeypatch.setattr(php_fpm.requests, "get", lambda url, timeout: _http_response("not json"))
+    monkeypatch.setattr(php_fpm.requests, "get", lambda url, **kwargs: _http_response("not json"))
     assert php_fpm.php_fpm_metrics(status_page_url="http://127.0.0.1/status?json") is None
 
 
 def test_http_non_dict_json_returns_null(monkeypatch):
-    monkeypatch.setattr(php_fpm.requests, "get", lambda url, timeout: _http_response("[1, 2]"))
+    monkeypatch.setattr(php_fpm.requests, "get", lambda url, **kwargs: _http_response("[1, 2]"))
     assert php_fpm.php_fpm_metrics(status_page_url="http://127.0.0.1/status?json") is None
 
 
 def test_default_url_used_when_unset(monkeypatch):
     captured = {}
 
-    def cap(url, timeout):
+    def cap(url, timeout, **kwargs):
         captured["url"] = url
         captured["timeout"] = timeout
         return _http_response(json.dumps(_RAW_WWW))
@@ -165,7 +169,7 @@ def test_default_url_used_when_unset(monkeypatch):
 def test_json_query_appended_through_metrics(monkeypatch):
     captured = {}
 
-    def cap(url, timeout):
+    def cap(url, timeout, **kwargs):
         captured["url"] = url
         return _http_response(json.dumps(_RAW_WWW))
 
@@ -700,3 +704,46 @@ def test_fixture_config_is_documented_shape():
     fixture = _load_fixture()
     for scenario in fixture["scenarios"].values():
         assert set(scenario["config"]) == {"status_page_url"}
+
+
+def test_http_status_body_over_cap_returns_none(monkeypatch):
+    """A status body past the byte cap is refused (None), never buffered
+    unbounded into the long-lived daemon."""
+    monkeypatch.setattr(php_fpm, "_MAX_STATUS_BYTES", 32)
+    monkeypatch.setattr(
+        php_fpm.requests, "get", lambda url, **kwargs: _http_response("y" * 100)
+    )
+    assert php_fpm._http_status_body("http://127.0.0.1/status?json") is None
+
+
+def test_http_status_refuses_redirects(monkeypatch):
+    captured = {}
+
+    def cap(url, **kwargs):
+        captured.update(kwargs)
+        return _http_response("{}")
+
+    monkeypatch.setattr(php_fpm.requests, "get", cap)
+    php_fpm._http_status_body("http://127.0.0.1/status?json")
+    assert captured["allow_redirects"] is False
+    assert captured["stream"] is True
+
+
+def test_http_status_read_error_mid_stream_returns_none(monkeypatch):
+    """A body that dies mid-stream (connection reset after the headers) is a
+    read error -> None, and the connection is closed; the empty keep-alive
+    chunks requests can yield are skipped, never appended."""
+    resp = MagicMock()
+    resp.status_code = 200
+
+    def broken_iter(chunk_size=65536):
+        yield b""  # keep-alive chunk: skipped by the read loop
+        yield b"{"
+        raise OSError("connection reset mid-body")
+
+    resp.iter_content = broken_iter
+    monkeypatch.setattr(php_fpm.requests, "get", lambda url, **kwargs: resp)
+    assert php_fpm._http_status_body("http://127.0.0.1/status?json") is None
+    # Closed at least once (the shared reader closes in its finally, and the
+    # caller's outer finally closes again -- close() is idempotent).
+    assert resp.close.called
