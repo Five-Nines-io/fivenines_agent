@@ -24,20 +24,59 @@ OUTPUT_DIR="${TEST_OUTPUT_DIR:-/tmp}"
 BINARY_NAME="fivenines-agent-${BINARY_VARIANT}"
 AGENT_EXECUTABLE="${AGENT_DIR}/${BINARY_NAME}/${BINARY_NAME}"
 
-# Install minimal dependencies for testing
+# Install minimal dependencies for testing.
+#
+# These are TEST prerequisites, not agent dependencies: python3 runs the mock
+# API server and wget satisfies the downloader that fivenines_setup_user.sh
+# requires. The frozen binary needs neither -- that is what tests 1 to 7 prove.
+#
+# Best-effort by design, because an EOL image's package metadata rots: when a
+# distro release goes end-of-life its last Release file keeps a Valid-Until a
+# few days out and then stops being refreshed, after which apt rejects the
+# whole repository. Debian 11's bullseye-security expired on 2026-09-07, three
+# days after the last green matrix run, and took debian:11 (and, with it, the
+# whole "Build and Release" run) red.
+#
+# What must NOT happen is failing SILENTLY, which is what `|| true` plus
+# /dev/null used to do: the missing wget surfaced two tests later as
+# "user-install FAIL | exit code 1", which reads like an agent regression and
+# is not one. Log the real error, and let the tests that need a prerequisite
+# skip on a missing one.
+install_test_deps() {
+  if command -v apk > /dev/null 2>&1; then
+    # Alpine
+    apk add --no-cache python3 wget shadow
+  elif command -v dnf > /dev/null 2>&1; then
+    # Fedora / Rocky 9+
+    dnf install -y -q python3 wget util-linux
+  elif command -v yum > /dev/null 2>&1; then
+    # CentOS 7
+    yum install -y -q python3 wget
+  elif command -v apt-get > /dev/null 2>&1; then
+    # Debian / Ubuntu. Check-Valid-Until=false accepts an expired Release file,
+    # which is the difference between a usable and an unusable EOL image; it is
+    # safe here and nowhere near a real install (throwaway container, packages
+    # still signature-checked, nothing from these repos reaches the agent under
+    # test). The option is repeated inline rather than held in a variable so
+    # that the lint job sees no unquoted word splitting.
+    apt-get -o Acquire::Check-Valid-Until=false update -qq \
+      && apt-get -o Acquire::Check-Valid-Until=false install -y -qq python3 wget
+  else
+    echo "no supported package manager found"
+    return 1
+  fi
+}
+
 echo "Installing test dependencies..."
-if command -v apk > /dev/null 2>&1; then
-  # Alpine
-  apk add --no-cache python3 wget shadow > /dev/null 2>&1 || true
-elif command -v dnf > /dev/null 2>&1; then
-  # Fedora / Rocky 9+
-  dnf install -y -q python3 wget util-linux > /dev/null 2>&1 || true
-elif command -v yum > /dev/null 2>&1; then
-  # CentOS 7
-  yum install -y -q python3 wget > /dev/null 2>&1 || true
-elif command -v apt-get > /dev/null 2>&1; then
-  # Debian / Ubuntu
-  { apt-get update -qq > /dev/null 2>&1 && apt-get install -y -qq python3 wget > /dev/null 2>&1; } || true
+DEPS_LOG="${OUTPUT_DIR}/test_deps.log"
+if install_test_deps > "$DEPS_LOG" 2>&1; then
+  echo "Test dependencies installed"
+else
+  echo "WARNING: test dependency install FAILED - tests needing python3 or a"
+  echo "         downloader will SKIP (the agent binary itself needs neither)"
+  echo "--- dependency install output (last 20 lines) ---"
+  tail -20 "$DEPS_LOG" 2>/dev/null | sed 's/^/  | /' || true
+  echo "--- end output ---"
 fi
 
 # Background process PID (for cleanup)
@@ -299,7 +338,15 @@ fi
 USER_INSTALL_DIR="/home/testuser/.local/fivenines"
 USER_CONFIG_DIR="/home/testuser/.config/fivenines_agent"
 
-if [ "$(id -u)" = "0" ] && id testuser > /dev/null 2>&1; then
+if ! command -v wget > /dev/null 2>&1 && ! command -v curl > /dev/null 2>&1; then
+  # fivenines_setup_user.sh needs a downloader (it fetches the agent tarball and
+  # talks to the API), so on an image that ships neither -- and where the
+  # best-effort prerequisite install above could not add one -- the script's
+  # refusal is CORRECT production behaviour, not a regression. Record the unmet
+  # precondition instead of a failure; every other exit code still FAILs, and
+  # the reason why the install failed is in test_deps.log above.
+  record_result "user-install" "SKIP" "no wget/curl in image"
+elif [ "$(id -u)" = "0" ] && id testuser > /dev/null 2>&1; then
   # Ensure testuser can access the scripts and tarball
   chmod 644 "$TARBALL_PATH" 2>/dev/null || true
   if timeout 120 su -s /bin/sh testuser -c "
