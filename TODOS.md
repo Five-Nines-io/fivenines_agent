@@ -61,6 +61,59 @@ copy cannot break its suite.
 - **Depends on:** agent PR for #127 merged (done); agent PR for #144 merged
 - **Files:** `fivenines-server/spec/fixtures/vpn_contract_payload.json` (NOT this repo)
 
+## P1: Vendor openvpn_contract_payload.json into the server (#145 / server #1103)
+
+Authored agent-first this time, so the server copy does not exist yet. Copy
+`tests/fixtures/openvpn_contract_payload.json` into the server's spec fixtures
+byte-for-byte when server #1103 lands, and add `openvpn` to
+`Host::WINDOWS_OMIT_CONFIG_KEYS` (Linux-only: OpenVPN on Windows exposes TCP
+management only, which the collector deliberately does not read).
+
+Six things the server side needs to know, because they are decisions the issue
+did not settle or settled against what a real host does:
+
+- **`null` vs `{"instances": []}` now hangs on the process table.** The issue
+  said "the glob found no socket" was the empty/prune-all case, but its own
+  acceptance criteria said a host missing the two config lines must report
+  `null`. Both are reachable with zero sockets, so the collector consults the
+  process table: an `openvpn` process running with no readable socket is a
+  collection failure, and only "no socket AND no process" prunes.
+- **Setup instructions need a per-distro branch, and BOTH families need a
+  step.** Measured from the openvpn package's tmpfiles.d (no unit uses
+  `RuntimeDirectory=`): RHEL-family ships `/run/openvpn-{server,client}` as
+  `0750 root:openvpn`, fixed with `usermod -aG openvpn fivenines`. Debian and
+  Ubuntu ship them as `0710 root:root` -- **no group to join at all** -- so the
+  socket must go under `/run/openvpn` (`0755`) or the operator must add a
+  `/etc/tmpfiles.d` drop-in. The dashboard's setup copy cannot show one recipe.
+- **`management-client-group` matches the PRIMARY group only.** It is checked
+  from the peer's credentials at accept time, not against the supplementary set,
+  so any UI copy telling an operator to `usermod -aG` for this is wrong. A
+  system install is already correct (`fivenines` is the agent's primary group);
+  a user-level install has to name whatever `id -gn` prints.
+- **Client identity is Common Name, THEN Username.** A `--verify-client-cert
+  none` server (username/password auth) writes OpenVPN's `UNDEF` sentinel into
+  the Common Name column for EVERY session and puts the real identity in
+  `Username`, so the agent falls back to it -- exactly what OpenVPN's own
+  `--username-as-common-name` would have written. Keying a row on the CN alone
+  gives every session on such a server the same key. A row with an identity in
+  neither column is refused rather than keyed on an empty string.
+- **Rows key on `socket`, never on `name`.** `name` is the socket's basename and
+  is NOT unique: a host running `openvpn-server@office` and
+  `openvpn-client@office` reports two instances both named `office`. Keying a row
+  on the name makes them fight over one row and flap `mode` every tick. `socket`
+  is unique by construction, stable across restarts (it is a literal in the
+  daemon config), and is already in the payload. The fixture's `field_contract`
+  now says so on both keys.
+- **`""` and `null` are different in the client fields.** `""` means the daemon
+  reported no value (its `UNDEF` sentinel); `null` means that OpenVPN version
+  has no such column at all (pre-2.5 has no `Data Channel Cipher`). The server
+  should not coalesce them -- they are different operator actions.
+
+- **Effort:** XS (human) / XS (CC)
+- **Depends on:** agent PR for #145 merged
+- **Files:** `fivenines-server` spec fixtures + `Host::WINDOWS_OMIT_CONFIG_KEYS`
+  (NOT this repo)
+
 ## P3: Narrow the SELinux net_admin grant to the privileged child (#144)
 
 `selinux/fivenines_agent.te` (v1.3) now grants `fivenines_agent_t`
