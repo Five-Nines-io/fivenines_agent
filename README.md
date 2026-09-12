@@ -230,9 +230,11 @@ things differ:
   would otherwise conflate with the Linux metric.
 
 Linux-only collectors (SMART via smartctl, mdadm RAID, ZFS, Ceph, fail2ban,
-QEMU/libvirt, Proxmox, systemd, journald logs, WireGuard) are absent from the
-Windows capability set entirely -- the agent sends a Windows-shaped payload
-rather than Linux keys marked unavailable.
+QEMU/libvirt, Proxmox, systemd, journald logs, WireGuard, OpenVPN) are absent
+from the Windows capability set entirely -- the agent sends a Windows-shaped
+payload rather than Linux keys marked unavailable. OpenVPN is Linux-only
+because this collector reads the management **unix socket**, and OpenVPN on
+Windows exposes TCP management only.
 
 #### Service management and logs
 
@@ -775,6 +777,7 @@ When the agent starts, it displays a banner showing which features are available
   Networking:
     [+] Snmp
     [-] Wireguard (requires sudo wg show all dump)
+    [-] Openvpn (requires management <path> unix + management-client-group <agent group> on each instance)
 
   Logs:
     [+] Journald
@@ -1327,6 +1330,15 @@ one broken instance never invalidates the others. A host where OpenVPN is
 running but no instance exposes a socket reports a *collection failure*, never
 "zero instances", so forgetting the two lines above can never look like every
 tunnel having been torn down.
+
+Two bounds matter if you run many instances on one box. The instance loop shares
+a **25-second budget** and starts from a rotating position each tick, so a
+wedged daemon costs the instances behind it on *that* tick (they are listed with
+a timeout reason, frozen rather than cleared) but never permanently: over a few
+ticks every instance gets its turn. And past **64** management sockets the whole
+tick is reported as a collection failure rather than a truncated list, because a
+short list is indistinguishable from a shrunken one and everything past the cut
+would be pruned. Both are logged at error level.
 
 Sessions sharing a common name (`duplicate-cn`, or a site reconnecting before
 its old session times out) are reported as **one client with a session count**,
