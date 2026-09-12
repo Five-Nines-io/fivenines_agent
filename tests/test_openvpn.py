@@ -114,6 +114,18 @@ def _management(sock, budget=5):
     return openvpn._Management(sock, time.monotonic() + budget)
 
 
+# Windows ignores POSIX mode bits on directories: chmod(0o000) succeeds and
+# os.access(dir, R_OK | X_OK) still returns True, so nothing is ever "blind"
+# there. These tests exercise the collector's blind-vs-empty rule, which is a
+# POSIX filesystem concept -- and the collector is Linux-only by design (its
+# RUNTIME_DIRS are /run/... and the server strips the key for Windows agents).
+# The full suite runs on windows-latest in CI, so the guard has to be explicit.
+_needs_posix_permissions = pytest.mark.skipif(
+    os.name != "posix",
+    reason="directory permission bits are POSIX-only; Windows ignores chmod on dirs",
+)
+
+
 @pytest.fixture(autouse=True)
 def _reset_module_state():
     """The process-scan cache and the rotation counter are module state.
@@ -1143,6 +1155,13 @@ def test_probe_is_bounded_by_a_wall_clock_budget(monkeypatch):
     watchdog-bounded loop as collection. Per-socket-only bounding costs
     _SOCKET_TIMEOUT x _MAX_INSTANCES (64 x 5s = 320s), past WatchdogSec=90.
     """
+    # AF_UNIX is injected rather than relied on: this exercises _connect's real
+    # spent-budget bail, and on Windows (where the full suite runs in CI) the
+    # absent-AF_UNIX guard would fire first and the budget path would never run.
+    monkeypatch.setattr(openvpn.socket, "AF_UNIX", 1, raising=False)
+    monkeypatch.setattr(
+        openvpn.socket, "socket", lambda *_a, **_k: pytest.fail("must not connect")
+    )
     monkeypatch.setattr(openvpn, "_PROBE_DEADLINE", -1)
     paths = [f"/run/openvpn-server/i{i}.sock" for i in range(5)]
     monkeypatch.setattr(openvpn, "_discover_sockets", lambda: (paths, []))
@@ -1157,7 +1176,8 @@ def test_probe_is_bounded_by_a_wall_clock_budget(monkeypatch):
     available, reason = openvpn.probe_management_access()
     assert available is False
     # Every socket is still ATTEMPTED (the budget bounds work, not coverage),
-    # but each gives up immediately instead of burning _SOCKET_TIMEOUT.
+    # but each gives up immediately instead of burning _PROBE_SOCKET_TIMEOUT --
+    # the socket is never even opened, which the stub above asserts.
     assert len(attempted) == len(paths)
     assert "timed out" in reason
 
@@ -1444,6 +1464,7 @@ def test_probe_keeps_the_first_reason_when_no_socket_is_openvpn(monkeypatch):
     assert reason.startswith(f"{first}: ")
 
 
+@_needs_posix_permissions
 def test_an_unreadable_runtime_directory_is_blind_not_empty(tmp_path, monkeypatch):
     """glob.glob swallows EACCES and returns [], which is the SAME answer it
     gives for a host with no OpenVPN -- and that answer is the prune-all.
@@ -1747,6 +1768,7 @@ def test_rotating_an_empty_list_is_a_no_op():
     assert openvpn._rotated([]) == []
 
 
+@_needs_posix_permissions
 def test_an_unreadable_directory_does_not_discard_sockets_from_the_others(
     tmp_path, monkeypatch
 ):
@@ -1769,6 +1791,7 @@ def test_an_unreadable_directory_does_not_discard_sockets_from_the_others(
         blind.chmod(0o755)
 
 
+@_needs_posix_permissions
 def test_every_directory_blind_and_nothing_found_is_still_a_failure(
     tmp_path, monkeypatch
 ):
@@ -1856,6 +1879,7 @@ def test_a_username_never_folds_into_a_same_spelled_certificate_cn():
     assert sorted(c["bytes_received"] for c in clients) == [100, 300]
 
 
+@_needs_posix_permissions
 def test_a_blind_directory_is_reported_not_silently_dropped(tmp_path, monkeypatch):
     """Finding a socket elsewhere does not make an unreadable directory
     harmless: the instances inside it would vanish from an array the server
@@ -1891,6 +1915,7 @@ def test_a_blind_directory_is_reported_not_silently_dropped(tmp_path, monkeypatc
     assert "clients" not in blind_entry
 
 
+@_needs_posix_permissions
 def test_a_blind_directory_is_reported_at_error_level(tmp_path, monkeypatch):
     """The default log level is info, so a debug line would never reach the
     operator whose action is required."""
@@ -1913,6 +1938,7 @@ def test_a_blind_directory_is_reported_at_error_level(tmp_path, monkeypatch):
     assert any(level == "error" and "not readable" in msg for level, msg in levels)
 
 
+@_needs_posix_permissions
 def test_the_probe_names_an_unreadable_directory(tmp_path, monkeypatch):
     blind = tmp_path / "openvpn-server"
     blind.mkdir()
