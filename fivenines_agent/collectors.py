@@ -20,6 +20,7 @@ from fivenines_agent.memory import memory, swap
 from fivenines_agent.mysql import mysql_metrics
 from fivenines_agent.network import network
 from fivenines_agent.nginx import nginx_metrics
+from fivenines_agent.openvpn import openvpn_metrics
 from fivenines_agent.partitions import partitions_metadata, partitions_usage
 from fivenines_agent.php_fpm import php_fpm_metrics
 from fivenines_agent.ports import listening_ports
@@ -169,6 +170,13 @@ COLLECTORS = [
     # config posture as "wireguard", but CROSS-OS -- never stripped, since
     # `tailscale status --json` is identical on Linux/Windows/macOS.
     ("tailscale", [("tailscale", tailscale_metrics, False)]),
+    # OpenVPN per-instance health (#145 / server #1103), the other half of the
+    # VPN axis. Same top-level plain-boolean posture as "wireguard" and the same
+    # pass_kwargs=False splat safety; LINUX-ONLY, because OpenVPN on Windows has
+    # TCP management only and this collector reads the unix socket. Its
+    # capability is gate-exempt, but UNLIKE wireguard it is deliberately absent
+    # from CAPABILITY_NULL_WHEN_UNAVAILABLE -- see there.
+    ("openvpn", [("openvpn", openvpn_metrics, False)]),
     ("systemd", [("systemd", systemd_metrics, True)]),
     # Windows-only: gated by the disk_health capability, only present in the
     # Windows-tailored capability set (D13 - permissions._build_windows_*).
@@ -200,7 +208,25 @@ CAPABILITY_KEY_OVERRIDES = {
 # (#144). Gating on it would let a stale or transient probe result -- a sudo
 # spawn that lost a 5s race under load -- drop the key entirely on a host whose
 # tunnels are fine.
-CAPABILITY_GATE_EXEMPT = frozenset({"wireguard"})
+# openvpn is here for the same reason, and its own contract makes the point
+# sharper: data["openvpn"] distinguishes null (a collection failure -- the glob
+# failed, or a daemon is running with no readable socket) from {"instances": []}
+# (a host with genuinely no OpenVPN, the documented prune-all). Gating on the
+# capability would collapse both into a MISSING key, which says neither.
+CAPABILITY_GATE_EXEMPT = frozenset({"wireguard", "openvpn"})
+
+# The subset of CAPABILITY_GATE_EXEMPT whose collector is additionally SKIPPED
+# (reported as a bare null) once the probe has read its capability as False.
+#
+# This is a cost optimisation, not a contract, and it only applies where running
+# the collector anyway would be actively harmful. For wireguard it is: each
+# doomed `sudo -n` writes an authentication failure to the auth log (see
+# _gate_exempt_null). openvpn is deliberately NOT in this set -- its read is a
+# glob plus a connect, with nothing to spam, and skipping it would be WRONG
+# rather than merely wasteful: only the collector itself can tell "no OpenVPN
+# here" ([]) from "OpenVPN running, no socket" (null), and the probe reports
+# False for both.
+CAPABILITY_NULL_WHEN_UNAVAILABLE = frozenset({"wireguard"})
 
 # Tracks (config_key, capability_value) pairs that have already been logged
 # as skipped this process, to avoid per-tick log spam.
@@ -227,11 +253,13 @@ def _is_capability_gated(config_key, permissions):
 
 
 def _gate_exempt_null(config_key, permissions):
-    """True when a gate-exempt collector's capability is already known False.
+    """True when a CAPABILITY_NULL_WHEN_UNAVAILABLE collector is probed False.
 
-    A gate-exempt collector must always contribute its key, so it cannot be
-    skipped the way a gated one is -- but RUNNING it on a host whose capability
-    the probe has already read as False buys nothing. The WireGuard collector
+    Note the narrower set: this is NOT every gate-exempt collector. Both must
+    always contribute their key, but only the ones listed there gain nothing
+    from running once the probe has read their capability as False -- openvpn is
+    gate-exempt and must still RUN, because only the collector can tell
+    "no OpenVPN here" from "OpenVPN running, no readable socket". The WireGuard collector
     would spawn `sudo -n` every tick just to be refused, and each refusal
     writes a sudo authentication failure to the auth log: ~1440/day, which is a
     standard fail2ban/Wazuh/OSSEC alert signature, on exactly the VPN gateways
@@ -243,7 +271,7 @@ def _gate_exempt_null(config_key, permissions):
     own backoff ladder, so a newly-granted sudoers rule is picked up within
     ~2 minutes without the collector hammering sudo in the meantime.
     """
-    if not permissions or config_key not in CAPABILITY_GATE_EXEMPT:
+    if not permissions or config_key not in CAPABILITY_NULL_WHEN_UNAVAILABLE:
         return False
     cap_key = _capability_key_for(config_key)
     return cap_key in permissions and not permissions[cap_key]
