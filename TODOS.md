@@ -61,6 +61,29 @@ copy cannot break its suite.
 - **Depends on:** agent PR for #127 merged (done); agent PR for #144 merged
 - **Files:** `fivenines-server/spec/fixtures/vpn_contract_payload.json` (NOT this repo)
 
+## P1: Vendor openvpn_contract_payload.json into the server (#145 / server #1103)
+
+**Tracked server-side as fivenines_server#1103** -- the work happens in that
+repo, this entry is the agent-side record of why.
+
+Authored agent-first, so the server copy does not exist yet. The full handoff --
+the byte-identical vendoring command and its sha256, the eight fixture
+scenarios, `Host::WINDOWS_OMIT_CONFIG_KEYS`, the null contract, the six
+decisions the issue did not settle, and the nullability the schema must allow --
+is posted on that issue:
+https://github.com/Five-Nines-io/fivenines_server/issues/1103#issuecomment-5646448580
+
+Kept here rather than duplicated: the fixture at
+`tests/fixtures/openvpn_contract_payload.json` is the SOURCE OF TRUTH. When it
+changes, re-vendor it and update that comment -- never edit the server's copy by
+hand (the Ceph #615 lesson: a hand-written copy went green against a fiction
+while production read keys the agent never sent).
+
+- **Effort:** XS (human) / XS (CC)
+- **Depends on:** agent PR for #145 merged (fivenines_agent#152)
+- **Files:** `fivenines-server` spec fixtures + `Host::WINDOWS_OMIT_CONFIG_KEYS`
+  (NOT this repo)
+
 ## P3: Narrow the SELinux net_admin grant to the privileged child (#144)
 
 `selinux/fivenines_agent.te` (v1.3) now grants `fivenines_agent_t`

@@ -30,7 +30,7 @@ Windows 10/11), **Synology DSM 7** and **UNRAID**.
 - **Network and devices**
   - [SNMP Network Device Monitoring](#snmp-network-device-monitoring)
   - [MQTT Broker Monitoring](#mqtt-broker-monitoring)
-  - [VPN Monitoring (WireGuard + Tailscale)](#vpn-monitoring-wireguard--tailscale)
+  - [VPN Monitoring (WireGuard + OpenVPN + Tailscale)](#vpn-monitoring-wireguard--openvpn--tailscale)
 - **Applications**
   - [AI Inference Serving (vLLM and SGLang)](#ai-inference-serving-vllm-and-sglang)
   - [Application Integrations](#application-integrations): [Apache](#apache),
@@ -230,9 +230,11 @@ things differ:
   would otherwise conflate with the Linux metric.
 
 Linux-only collectors (SMART via smartctl, mdadm RAID, ZFS, Ceph, fail2ban,
-QEMU/libvirt, Proxmox, systemd, journald logs, WireGuard) are absent from the
-Windows capability set entirely -- the agent sends a Windows-shaped payload
-rather than Linux keys marked unavailable.
+QEMU/libvirt, Proxmox, systemd, journald logs, WireGuard, OpenVPN) are absent
+from the Windows capability set entirely -- the agent sends a Windows-shaped
+payload rather than Linux keys marked unavailable. OpenVPN is Linux-only
+because this collector reads the management **unix socket**, and OpenVPN on
+Windows exposes TCP management only.
 
 #### Service management and logs
 
@@ -602,6 +604,7 @@ The agent works without sudo, but these features will be unavailable (this is al
 | systemd failure journal tails | journal read access: the bundled service unit grants `SupplementaryGroups=systemd-journal`; for user installs add your user to the `systemd-journal` group (tails degrade to empty without it) |
 | Log monitoring (journald capture + signals) | journal read access (`systemd-journal` group) |
 | WireGuard peer health | `sudo wg show all dump` -- one exact-argv sudoers rule, no capability granted to the agent itself (agent version **1.17.6+**) |
+| OpenVPN instance + client health | a readable **management unix socket** per instance: two config lines (`management <path> unix` + `management-client-group <group>`) and a restart, no sudo (agent version **1.18.0+**) |
 | Tailscale node state | `tailscale` CLI on `PATH` + a reachable `tailscaled` (no extra privilege) |
 | Ubuntu Pro entitlement | `pro` CLI on `PATH` (ubuntu-advantage-tools), or a readable `/var/lib/ubuntu-advantage/status.json` (no extra privilege) |
 | Per-unit cgroup metrics | cgroup v1 or v2 mounted at `/sys/fs/cgroup` |
@@ -651,6 +654,10 @@ The agent works without sudo, but these features will be unavailable (this is al
   ```
   The connection URI is also checked against an agent-side allowlist before the
   agent connects -- see [QEMU/KVM VM Monitoring](#qemukvm-vm-monitoring).
+- OpenVPN: two lines in each instance's config rather than a group you add the
+  agent to, plus -- on RHEL-family only -- membership of the `openvpn` group so
+  the agent can traverse the runtime directory. See
+  [VPN Monitoring](#vpn-monitoring-wireguard--openvpn--tailscale).
 
 **Requires Sudo Configuration:**
 - SMART storage health monitoring
@@ -770,6 +777,7 @@ When the agent starts, it displays a banner showing which features are available
   Networking:
     [+] Snmp
     [-] Wireguard (requires sudo wg show all dump)
+    [-] Openvpn (requires management <path> unix + management-client-group <agent group> on each instance)
 
   Logs:
     [+] Journald
@@ -1121,11 +1129,11 @@ Requires agent version **1.12.0+**. When MQTT monitoring is enabled for a host i
 3. Each tick the agent diffs desired-vs-current and only starts, stops, or resubscribes on an actual change (it never reconnects on an unchanged config, which would re-trigger retained replays)
 4. A bounded per-topic snapshot is reported under `data["mqtt"]`; discovery is capped per monitor to bound memory under a topic storm
 
-## VPN Monitoring (WireGuard + Tailscale)
+## VPN Monitoring (WireGuard + OpenVPN + Tailscale)
 
-Requires agent version **1.16.0+**. Both collectors are enabled per host from
-the fivenines dashboard and are off by default. They are independent: enable
-either, both, or neither.
+Requires agent version **1.16.0+** for WireGuard and Tailscale, **1.18.0+**
+for OpenVPN. Each collector is enabled per host from the fivenines dashboard
+and is off by default. They are fully independent: enable any combination.
 
 ### WireGuard
 
@@ -1191,6 +1199,157 @@ convention. That file is root-only and is read directly, never through `sudo`
 (the rule grants one dump command, not read access to a directory full of
 private keys), so an agent running as `fivenines` will not see it and peers
 fall back to a short key fingerprint; nothing else in the config is read.
+
+### OpenVPN
+
+One connection to each instance's **management unix socket** per tick reports,
+for every OpenVPN 2.x daemon on the host:
+
+- Per instance: name, mode (`server` / `client`), OpenVPN version, and how old
+  the daemon's own status reading is
+- Per connected client on a server instance: common name, real and virtual
+  address, username, connected **age**, cumulative bytes in/out and the
+  negotiated data channel cipher
+- Per client instance: the connection state machine (`CONNECTED`,
+  `RECONNECTING`, `WAIT`, `AUTH`, ...), which is where a down tunnel shows up
+
+Unlike WireGuard, OpenVPN has no single kernel command that reports the whole
+picture: state lives per daemon, behind an interface you have to turn on. That
+is the only setup this collector needs.
+
+**Enabling it.** Add two lines to each instance's config:
+
+```
+# /etc/openvpn/server/<name>.conf
+management /run/openvpn-server/<name>.sock unix
+management-client-group fivenines
+```
+
+then restart that instance:
+
+```bash
+sudo systemctl restart openvpn-server@<name>
+```
+
+Client instances are identical with `/run/openvpn-client/<name>.sock` and
+`openvpn-client@<name>`; the legacy `openvpn@<name>` unit uses `/run/openvpn/`.
+Those three directories are the only places the agent looks, and it globs them
+for `*.sock` -- there is nothing to configure on the fivenines side beyond the
+toggle, and the agent never reads your config files (they are root-only and
+carry inline private keys).
+
+**`management-client-group` must name the agent's PRIMARY group, and
+`usermod -aG` will not do it.** OpenVPN checks the connecting process's
+credentials at accept time and compares only its *primary* GID; a user carrying
+the named group as a secondary group is refused. A standard system install is
+already correct -- the `fivenines` user is created with its own `fivenines`
+group as primary -- but for a user-level install name what `id -gn` prints:
+
+```bash
+id -gn fivenines      # system install  -> fivenines
+id -gn                # user install    -> your own primary group
+```
+
+**The runtime directory needs a second step, and it differs by distro.** The
+socket is world-accessible, but the *directory* it sits in is not, and an agent
+that cannot traverse the directory never reaches the group check at all. These
+are the modes the openvpn package's `tmpfiles.d` actually creates (measured on
+Debian 12 / Ubuntu 24.04 / Rocky 9 -- note neither distro's units use
+`RuntimeDirectory=`):
+
+| Directory | Debian / Ubuntu | RHEL-family |
+|---|---|---|
+| `/run/openvpn-server` | `0710 root:root` | `0750 root:openvpn` |
+| `/run/openvpn-client` | `0710 root:root` | `0750 root:openvpn` |
+| `/run/openvpn` | `0755 root:root` | *(not shipped)* |
+
+**On RHEL-family**, add the agent to the `openvpn` group. A *supplementary*
+group is enough here, because directory traversal is an ordinary filesystem
+check -- unlike `management-client-group` above:
+
+```bash
+sudo usermod -aG openvpn fivenines && sudo systemctl restart fivenines-agent
+```
+
+**On Debian and Ubuntu**, `0710 root:root` has no group to join, so there is
+nothing to add the agent to. Either put the socket in `/run/openvpn` (mode
+`0755`, readable, and the path the legacy `openvpn@` unit already uses):
+
+```
+management /run/openvpn/<name>.sock unix
+management-client-group fivenines
+```
+
+or keep `/run/openvpn-server` and relax it once with a drop-in, which survives
+package upgrades:
+
+```bash
+printf 'd /run/openvpn-server 0750 root fivenines -\n' \
+  | sudo tee /etc/tmpfiles.d/openvpn-fivenines.conf
+sudo systemd-tmpfiles --create && sudo systemctl restart openvpn-server@<name>
+```
+
+A missed step here never looks like a VPN that went away. The agent logs each
+directory it could not read at error level; if a socket was found elsewhere, the
+unreadable directory is reported as its own entry (so the tick is visibly
+incomplete rather than quietly short), and if no socket was found anywhere the
+whole reading is reported as a collection failure rather than as "no instances".
+
+**Verifying it.** Do **not** test this with `test -r` or `test -w` on the
+socket. OpenVPN creates it world-accessible (mode `0777`), so a file test
+succeeds for every user on the box even when the daemon will refuse the
+connection -- it tells you nothing. Connect instead and look for the greeting:
+
+```bash
+sudo -u fivenines python3 -c "import socket; s=socket.socket(socket.AF_UNIX); \
+  s.settimeout(3); s.connect('/run/openvpn-server/<name>.sock'); \
+  print(s.recv(200).decode() or 'REFUSED (check management-client-group)')"
+```
+
+An authorized agent sees `>INFO:OpenVPN Management Interface Version 5 ...`. A
+refused one gets an immediate empty read, because the daemon accepts the
+connection and closes it without a word. The agent's startup capabilities
+banner reports the same thing as `openvpn` available or pending.
+
+> **Security caveat, stated rather than buried.** The OpenVPN management
+> interface has **no read-only level**. Anything that can talk to the socket can
+> also `client-kill` a session or signal the daemon to stop. The agent only ever
+> sends `version`, `status 3`, `state` and `quit`, but the *capability* is there, and it
+> is granted to every member of the group you name -- so name a group that has
+> only the agent in it. This is the same trust the HAProxy `level operator`
+> stats socket already carries. **TCP management** (`management 127.0.0.1 7505`)
+> is deliberately not supported: it is reachable by every local user with at
+> best an optional password file, which is a worse posture than the socket. The
+> agent never sends a management password, so an instance whose socket is
+> password-protected is reported as unreadable rather than opened.
+
+**What the readings mean.** A client that disappears from a successful reading
+is genuinely disconnected. An instance whose socket cannot be read is still
+listed, with the reason, and its existing data is frozen rather than cleared --
+one broken instance never invalidates the others. A host where OpenVPN is
+running but no instance exposes a socket reports a *collection failure*, never
+"zero instances", so forgetting the two lines above can never look like every
+tunnel having been torn down.
+
+Two bounds matter if you run many instances on one box. The instance loop shares
+a **25-second budget** and starts from a rotating position each tick, so a
+wedged daemon costs the instances behind it on *that* tick (they are listed with
+a timeout reason, frozen rather than cleared) but never permanently: over a few
+ticks every instance gets its turn. And past **64** management sockets the whole
+tick is reported as a collection failure rather than a truncated list, because a
+short list is indistinguishable from a shrunken one and everything past the cut
+would be pruned. Both are logged at error level.
+
+Sessions sharing a common name (`duplicate-cn`, or a site reconnecting before
+its old session times out) are reported as **one client with a session count**,
+with bytes summed and the connect time taken from the oldest session. Otherwise
+a roaming client would mint a brand-new row every time its link flapped.
+
+Out of scope: **OpenVPN Access Server** (it has its own REST API and `sacli`)
+and the **OpenVPN 3 client** (no management socket). Status *files*
+(`status <path>`) are not read either -- three formats, a path only readable
+out of a root-only config, and usually mode `0600`; the socket makes them
+redundant.
 
 ### Tailscale
 

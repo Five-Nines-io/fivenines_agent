@@ -27,6 +27,7 @@ _PROBE_METHODS = (
     "_can_run_sudo",
     "_can_run_zfs",
     "_can_access_docker",
+    "_can_access_openvpn",
     "_can_access_libvirt",
     "_can_access_proxmox",
     "_can_list_packages",

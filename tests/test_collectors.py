@@ -48,6 +48,7 @@ def test_registry_has_expected_config_keys():
         "proxmox",
         "wireguard",
         "tailscale",
+        "openvpn",
         "systemd",
         "disk_health",
     ]
@@ -401,13 +402,51 @@ def test_gate_exempt_null_needs_the_capability_to_be_present_and_false():
     mock_fn.assert_called_once()
 
 
-def test_wireguard_is_the_only_gate_exempt_key():
+def test_gate_exempt_keys_are_an_explicit_short_list():
     """Guard on the exemption set itself: it suppresses a real safety check, so
     a new entry must be a deliberate contract decision, not a convenient way to
-    silence a failing capability probe."""
+    silence a failing capability probe.
+
+    Both members are there because their contract distinguishes a null (a
+    collection failure the server skips) from a MISSING key, and gating would
+    collapse the first into the second.
+    """
     from fivenines_agent.collectors import CAPABILITY_GATE_EXEMPT
 
-    assert CAPABILITY_GATE_EXEMPT == frozenset({"wireguard"})
+    assert CAPABILITY_GATE_EXEMPT == frozenset({"wireguard", "openvpn"})
+
+
+def test_null_when_unavailable_is_a_subset_that_excludes_openvpn():
+    """The narrower set: gate-exempt collectors that are ALSO not run once the
+    probe reads False.
+
+    That shortcut is only ever a cost optimisation (wireguard's doomed `sudo -n`
+    writes an auth-log failure every tick). For openvpn it would be WRONG, not
+    merely wasteful: only the collector can tell {"instances": []} (no OpenVPN
+    on this host, prune-all) from null (OpenVPN running with no readable
+    socket), and the probe reports False for both.
+    """
+    from fivenines_agent.collectors import (
+        CAPABILITY_GATE_EXEMPT,
+        CAPABILITY_NULL_WHEN_UNAVAILABLE,
+    )
+
+    assert CAPABILITY_NULL_WHEN_UNAVAILABLE <= CAPABILITY_GATE_EXEMPT
+    assert "openvpn" not in CAPABILITY_NULL_WHEN_UNAVAILABLE
+
+
+def test_openvpn_collector_runs_even_when_its_capability_is_false():
+    """The behavioural half of the test above."""
+    _reset_skip_log()
+    mock_fn = MagicMock(return_value={"instances": []})
+    registry = [("openvpn", [("openvpn", mock_fn, False)])]
+    data = {}
+
+    with patch("fivenines_agent.collectors.COLLECTORS", registry):
+        collect_metrics({"openvpn": True}, data, permissions={"openvpn": False})
+
+    mock_fn.assert_called_once()
+    assert data == {"openvpn": {"instances": []}}
 
 
 def test_skip_logged_only_once_per_process():

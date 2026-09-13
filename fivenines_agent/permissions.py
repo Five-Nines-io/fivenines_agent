@@ -14,6 +14,7 @@ import psutil
 
 from fivenines_agent.debug import log
 from fivenines_agent.env import is_windows
+from fivenines_agent.openvpn import probe_management_access
 from fivenines_agent.qemu import DEFAULT_LIBVIRT_URI
 from fivenines_agent.subprocess_utils import get_clean_env, run_privileged
 from fivenines_agent.wireguard import (
@@ -93,6 +94,10 @@ CAPABILITY_HINTS = {
     "proxmox": "requires Proxmox VE host",
     "fail2ban": "requires sudo fail2ban-client",
     "wireguard": "requires sudo wg show all dump",
+    "openvpn": (
+        "requires management <path> unix + management-client-group <agent group> "
+        "on each instance"
+    ),
     "packages": "requires dpkg-query, rpm, apk, pacman, or synopkg",
     "zfs": "requires zfs permissions",
     "nvidia_gpu": "requires NVIDIA driver",
@@ -128,7 +133,7 @@ LINUX_BANNER_GROUPS = [
     # collector's per-unit resource metrics (kernel surface, not a sensor).
     ("Services", ["docker", "qemu", "proxmox", "systemd", "cgroup"]),
     ("Security", ["fail2ban", "packages"]),
-    ("Networking", ["snmp", "wireguard"]),
+    ("Networking", ["snmp", "wireguard", "openvpn"]),
     ("Logs", ["journald"]),
 ]
 
@@ -322,6 +327,14 @@ class PermissionProbe:
                 ),
                 WG_DUMP_ARGV,
             ),
+            # OpenVPN - needs a readable management unix socket on at least one
+            # instance (#145). Like wireguard this capability is INFORMATIONAL
+            # ONLY (collectors.CAPABILITY_GATE_EXEMPT) -- it never gates
+            # collection, because only the collector can tell a host with no
+            # OpenVPN from one whose daemons expose no socket, and those are
+            # opposite answers. The probe body lives in openvpn.py so it cannot
+            # drift from the read it describes.
+            "openvpn": (self._can_access_openvpn, ()),
             # Log monitoring - needs journald read access (systemd-journal group)
             "journald": (self._can_read_journal, ()),
             # systemd unit collection - needs systemd init + systemctl
@@ -883,6 +896,23 @@ class PermissionProbe:
                 f"{path} not accessible (readable={readable}, writable={writable})"
             )
         return accessible
+
+    def _can_access_openvpn(self):
+        """Probe whether ANY OpenVPN management socket answers this agent.
+
+        Delegates to openvpn.probe_management_access, which connects to each
+        discovered socket and reads the daemon's unsolicited greeting without
+        sending a command. Deliberately NOT an os.access() check: the socket is
+        created mode 0777, so os.access passes for every user on the box and
+        would report this capability available on hosts where every read is
+        refused. See that function for the measurements behind it.
+        """
+        available, reason = probe_management_access()
+        detail = "AVAILABLE" if available else f"UNAVAILABLE ({reason})"
+        log(f"_can_access_openvpn: -> {detail}", "debug")
+        if not available:
+            self._set_reason(reason)
+        return available
 
     def _can_read_journal(self):
         """Probe journald read access the way the log collector reads it: a

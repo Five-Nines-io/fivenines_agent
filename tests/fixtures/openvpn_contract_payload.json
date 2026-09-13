@@ -1,0 +1,412 @@
+{
+  "description": "Shared OpenVPN contract fixture between fivenines-agent and fivenines-server (agent #145 / server #1103). Source of truth: fivenines-agent tests/fixtures/openvpn_contract_payload.json, asserted end-to-end there (the socket transport, socket discovery and the process scan are mocked; every parser, bound and reducer is the real one -- each scenario's 'raw' is replayed back over a scripted management connection and the collector must produce scenario['payload']). The server's spec posts scenario['payload'] under data['openvpn'] through /collect and asserts Ingesters::Agent ingests each shape (instances array / empty / null / per-instance error). 'config' and 'raw' are agent-side inputs the server ignores. Change the payload shape only in lockstep across both repos, keeping the two copies byte-identical. Every 'raw' block is REAL output captured from OpenVPN 2.6.14 on Debian 12 (a live server instance with two duplicate-cn sessions plus a connected client instance), not constructed by hand.",
+  "agent_min_version": "1.18.0",
+  "_agent_min_version_note": "OpenVPN monitoring has NO server version gate (purely config-driven, openvpn_enabled defaults false, so the settings toggle renders for every eligible host and an older agent simply never sends the data['openvpn'] key). The config key is TOP-LEVEL and a plain boolean, so an agent without the collector ignores it (no splat hazard). This number documents which agent first ships the collector for the two-repo lockstep; nothing on the server gates on it.",
+  "config_contract": {
+    "key": "openvpn",
+    "shape": "TOP-LEVEL plain boolean, exactly like 'wireguard' and 'tailscale'. NEVER a nested dict: collectors.py splats a dict config value as **kwargs, and openvpn_metrics takes no parameters, so a future dict value would raise TypeError on this agent. It is registered with pass_kwargs=False, which makes a dict value ignored rather than fatal.",
+    "parameters": "None. The management socket paths are the runtime-dir convention (/run/openvpn-server, /run/openvpn, /run/openvpn-client), globbed for *.sock, so there is nothing for the server to configure per host.",
+    "os": "LINUX-ONLY. OpenVPN on Windows exposes TCP management only, which this collector deliberately does not read, so the key belongs in the server's Host::WINDOWS_OMIT_CONFIG_KEYS next to 'wireguard'.",
+    "capability_gate": "NONE. There IS an 'openvpn' capability (probed for the dashboard's pending-capability panel) but it is listed in collectors.CAPABILITY_GATE_EXEMPT, so it can never omit the key. It is also deliberately absent from CAPABILITY_NULL_WHEN_UNAVAILABLE: unlike wireguard the collector must still RUN when the probe says False, because only the collector can tell {'instances': []} (no OpenVPN here) from null (OpenVPN running, no readable socket), and the probe reports False for both."
+  },
+  "privilege_contract": {
+    "mechanism": "A group gate on the management unix socket -- NOT sudo. #144 removed the agent's last ambient privilege and forbids wildcard sudoers rules, and a per-instance sudo rule would be one rule per daemon.",
+    "operator_config": "Two lines per instance: 'management /run/openvpn-server/<name>.sock unix' and 'management-client-group <the agent's primary group>', then a restart of that instance.",
+    "measured_socket_mode": "The socket file is created mode 0777 root:root: OpenVPN calls umask(0) before bind(). Measured on Debian 12 / OpenVPN 2.6.14 and Rocky 9 / OpenVPN 2.5.11. So neither the collector nor the capability probe may use os.access() on it as an authorization check -- every local user passes.",
+    "measured_group_semantics": "management-client-group is enforced at accept() from SO_PEERCRED against the peer's PRIMARY GID, not its supplementary groups. Measured: a user carrying the named group only as a secondary group is REJECTED ('GID of socket peer (998) doesn't match required value (999) as given by --management-client-group'), and so is root when its primary GID differs. The agent's account is created with 'useradd --system --user-group fivenines', so its primary group is 'fivenines' and the documented line works as written; a user-level install must name the primary group of the account the agent actually runs as, and 'usermod -aG' does not help.",
+    "measured_runtime_dir": "The runtime DIRECTORY is a second gate before the socket's own, and both distro families are hostile to an unprivileged reader in different ways. Measured from the openvpn package's tmpfiles.d (neither family's units use RuntimeDirectory=): Debian 12 / Ubuntu 24.04 ship /run/openvpn-server and /run/openvpn-client as 0710 root:root -- NO group to join -- and /run/openvpn as 0755 root:root; Rocky 9 ships /run/openvpn-server and /run/openvpn-client as 0750 root:openvpn and no /run/openvpn at all. So RHEL-family is fixed by 'usermod -aG openvpn fivenines' (supplementary membership IS enough here, because directory traversal is an ordinary filesystem check, unlike management-client-group), while Debian needs the socket under /run/openvpn or a /etc/tmpfiles.d drop-in. An unreadable directory makes glob.glob return [] rather than raising, which is indistinguishable from a host with no OpenVPN -- so the agent checks readability explicitly and reports a collection failure (null) rather than the prune-all empty set.",
+    "measured_rejection_shape": "A rejected peer's connect() SUCCEEDS and the daemon then closes the connection without sending its greeting, so the refusal is observable only as EOF before the first byte. That is why the capability probe reads the unsolicited '>INFO:' greeting instead of stopping at connect(): a connect-only probe would report the capability available on every host that merely has a socket.",
+    "caveat": "The management interface has NO read-only level: a process holding the socket can 'client-kill' and 'signal SIGTERM'. This is the same trust the HAProxy 'level operator' stats socket already grants the agent, and it is bounded to the members of the named group. It is documented in the README rather than hidden. TCP management (management 127.0.0.1 7505) is deliberately NOT supported: it is reachable by every local user with at best an optional password file."
+  },
+  "secret_contract": {
+    "rule": "Nothing in 'status 3' or 'state' is secret, but two things are still withheld.",
+    "version_banner": "The daemon's 'version' answer carries the full build banner ('OpenVPN 2.6.14 x86_64-pc-linux-gnu [SSL (OpenSSL)] [LZO] [LZ4] [EPOLL] [PKCS11] [MH/PKTINFO] [AEAD] [DCO]'). Only the first two tokens travel, as 'OpenVPN <version>'. The rest is build platform and compiled-in feature flags: useless to the dashboard and exactly the kind of detail not worth accumulating in a database.",
+    "management_password": "The agent never sends a management password and never reads one. An instance whose socket is guarded by a password file stalls at the daemon's 'ENTER PASSWORD:' prompt and is reported as a per-instance error naming that cause."
+  },
+  "null_contract": {
+    "null": "data['openvpn'] = null is a COLLECTION FAILURE. Four causes: a runtime directory could not be read AND no socket was found in ANY directory (the agent is blind, not looking at an empty host -- when a socket IS found elsewhere the tick succeeds and each unreadable directory is reported as its own error entry instead, see per_instance); the process scan failed; an openvpn daemon is running while no management socket was found; or MORE than 64 sockets were discovered, which fails the whole tick rather than truncating the array (see full_set). The server ingests nothing and prunes nothing. Note that the last cause fires on a host with plenty of LIVE instances, so a persistent null there is not necessarily an unreachable daemon.",
+    "empty": "data['openvpn'] = {'instances': []} is a SUCCESSFUL read of a host with genuinely no OpenVPN: no socket AND no openvpn process. This is the documented PRUNE-ALL.",
+    "why_they_differ": "A host that simply forgot the two config lines must never report {'instances': []}. Its daemons are up and carrying traffic, and prune-all would delete every instance row and false-resolve every open incident. That is the whole reason the collector consults the process table when the glob comes up empty.",
+    "per_instance": "An instance whose socket exists but cannot be read is LISTED with an 'error' string and NO 'clients' key. A whole runtime DIRECTORY that could not be read gets the same treatment, as one entry whose 'socket' is the directory path and whose error is 'runtime directory not readable' -- the instances inside it cannot even be enumerated, so they cannot be listed individually, and omitting the directory silently would make a partially-blind tick indistinguishable from a complete one -- a per-instance null. The server keeps that instance's rows untouched and freezes its trigger rather than resolving it. An entry with 'clients': [] would instead assert 'this instance is up and nobody is connected', which is the false all-clear. One broken instance is never folded into a host-wide null, because the other instances are a real reading.",
+    "full_set": "A successful instance's 'clients' array is the FULL set of sessions the daemon knows, so a client absent from it is genuinely disconnected. The agent never truncates it: a capped array is indistinguishable from a shrunken one and the server would vanish-prune everything past the cut. Any bound belongs server-side, where a capped tick can also be marked unsafe to prune."
+  },
+  "raw_contract": {
+    "source": "Captured from OpenVPN 2.6.14 on Debian 12 (bookworm), running on aarch64: a real --mode server instance with --duplicate-cn and two live sessions sharing the common name 'site-lyon', plus a real client instance connected to it. Addresses, byte counters and the build banner's platform triplet were then rewritten (documentation ranges per RFC 5737 / RFC 3849, round numbers, and the more representative x86_64-pc-linux-gnu in place of the capture host's aarch64-unknown-linux-gnu); the LINE SHAPES, separators, column set, sentinels and terminators are untouched.",
+    "now": "Unix time the agent's clock reads during the scenario. The round-trip pins time.time() to it so every *_age_s is deterministic.",
+    "openvpn_running": "What the process scan finds. Only consulted when 'sockets' is empty -- it is what separates {'instances': []} from null.",
+    "sockets": "Ordered list of the management sockets the glob discovers, each with the exact bytes the daemon answers. 'refuse': true means the daemon accepted the connection and closed it without a greeting, which is what a management-client-group mismatch looks like from the agent's side.",
+    "separators": "MEASURED, and there are two in one protocol: 'status 3' is TAB-separated, while 'state' is COMMA-separated regardless of the status format. A non-server instance's status answer is the 'OpenVPN STATISTICS' block, which is comma-separated even under 'status 3'.",
+    "async_lines": "Every '>'-prefixed line is an asynchronous real-time notification ('>INFO:' on connect, plus '>CLIENT:', '>LOG:', '>STATE:', '>BYTECOUNT:', '>HOLD:') that the daemon may interleave into any command's answer. They must be skipped wherever a response is read; treating one as a data line ships a phantom row."
+  },
+  "field_contract": {
+    "openvpn.instances[].name": "Instance name: the socket's filename without its extension. A DISPLAY LABEL, deliberately NOT the row key -- it is not unique. A host running openvpn-server@office and openvpn-client@office reports two instances both named 'office', and keying on the name would make them fight over one row and flap `mode` every tick.",
+    "openvpn.instances[].socket": "Absolute path of the management socket read. THIS is the instance identity the server keys a row on: it is unique by construction (one listener per path), stable across restarts (it is a literal in the daemon config), and it survives the name collision described above. It is also what an operator needs in order to go and look at the thing.",
+    "openvpn.instances[].mode": "'server' or 'client'. POSITIVELY identified from the status answer, never inferred from an absence: a server instance always emits the 'HEADER<TAB>CLIENT_LIST' line (unconditionally, even with zero clients connected) and a client / point-to-point instance emits the 'OpenVPN STATISTICS' block instead. An answer carrying neither errors the instance.",
+    "openvpn.instances[].version": "'OpenVPN <version>', trimmed from the full build banner. See secret_contract.version_banner. NULLABLE: null when the daemon's answer carried no 'OpenVPN Version:' line or a blank banner.",
+    "openvpn.instances[].status_age_s": "Seconds since the daemon's status TIME line, from the agent clock, anchored server-side to received_at. NULLABLE on a SERVER instance too, so do not model it NOT NULL and do not use null as a mode discriminator: null when the instance is client-mode (its statistics block carries a human-readable 'Updated' date with no unix timestamp, and state.age_s is the more useful reading there), when the TIME line is absent or unparseable, and when the computed age is NEGATIVE -- the same clock-stepped-backwards rule as connected_age_s and state.age_s.",
+    "openvpn.instances[].clients": "Full set of connected clients, one entry PER COMMON NAME (see duplicate_cn_contract). [] on a server with nobody connected, [] on a client-mode instance. ABSENT (not empty) on an instance reported with an error.",
+    "openvpn.instances[].clients[].common_name": "The identity the server keys a client row on, resolved as Common Name THEN Username. The certificate CN is used whenever the daemon reports one; it falls back to the Username cell when the CN is OpenVPN's 'UNDEF' sentinel or empty, which is what a --verify-client-cert none server (username/password auth, no client certs) writes for EVERY session -- exactly what OpenVPN's own --username-as-common-name would have put in the CN column. Keying on the CN alone would give every session on such a server the same key, folding them into one anonymous entry with summed bytes and pruning every other client row on that instance each tick. A row carrying an identity in NEITHER column is refused (the instance reports an error) rather than keyed on an empty string.",
+    "openvpn.instances[].clients[].identity_source": "'cn' when the identity came from the certificate Common Name, 'user' when it came from the Username column (see common_name). The ROW KEY IS (socket, common_name, identity_source), not common_name alone: on a --verify-client-cert optional instance a certificate CN and a login name can spell the same thing, and collapsing them would prune the second real client and misreport the merged row as duplicate-cn. It is also worth knowing on its own -- 'this client authenticated with a certificate' and 'this client authenticated with a password' are different facts.",
+    "openvpn.instances[].clients[].real_address": "'<ip>:<port>' the session comes from. From the OLDEST session when sessions collapse.",
+    "openvpn.instances[].clients[].virtual_address": "The address assigned inside the tunnel. From the OLDEST session when sessions collapse.",
+    "openvpn.instances[].clients[].username": "The --auth-user-pass username. '' when the daemon reported none (its 'UNDEF' sentinel or an empty cell), which is DIFFERENT from null: null means this daemon version has no such column at all. Same rule for virtual_address and cipher.",
+    "openvpn.instances[].clients[].sessions": "How many live sessions share this common name. 1 normally; >1 under --duplicate-cn.",
+    "openvpn.instances[].clients[].connected_age_s": "Seconds since the OLDEST session for this common name connected, from the agent clock. null when the daemon reported no parseable timestamp, and null (never 0) when the computed age is negative, which happens on a host whose clock stepped backwards.",
+    "openvpn.instances[].clients[].bytes_received": "RAW cumulative per-session counter, SUMMED across collapsed sessions. Resets on reconnect; the server rates it with counter-reset handling and the agent never diffs it. NULLABLE: null when the daemon's HEADER has no such column or the cell is unparseable, so the rate path must tolerate a missing value rather than reading it as 0.",
+    "openvpn.instances[].clients[].bytes_sent": "Same as bytes_received, outbound, with the same nullability.",
+    "openvpn.instances[].clients[].cipher": "Negotiated data channel cipher. From the OLDEST session when sessions collapse. null on an OpenVPN older than 2.5, which has no such column.",
+    "openvpn.instances[].state": "Client-mode state machine, or null. Reported ONLY for mode 'client', where it IS the health signal (RECONNECTING / WAIT / AUTH is how a down tunnel shows up). A server's state machine sits at CONNECTED from startup to shutdown and carries no signal, so it is null there and the command is not even sent.",
+    "openvpn.instances[].state.name": "The state name verbatim ('CONNECTED', 'RECONNECTING', 'WAIT', 'AUTH', 'GET_CONFIG', 'RESOLVE', 'TCP_CONNECT', 'EXITING', ...). Never an enum: OpenVPN extends the vocabulary.",
+    "openvpn.instances[].state.description": "The daemon's descriptive string, which carries the disconnect reason on RECONNECTING / EXITING. null when empty.",
+    "openvpn.instances[].state.local_ip": "The tunnel's local address (IPv4, falling back to the IPv6 field). null before one is assigned.",
+    "openvpn.instances[].state.remote": "'<address>:<port>' of the remote server, the address alone when no port was reported, null before one is known.",
+    "openvpn.instances[].state.age_s": "Seconds since the state was entered, from the agent clock. Same negative-age rule as connected_age_s.",
+    "openvpn.instances[].error": "Present ONLY on an instance that could not be read, and mutually exclusive with mode / version / status_age_s / clients / state. A bounded operator-facing reason."
+  },
+  "duplicate_cn_contract": {
+    "rule": "Several sessions sharing an IDENTITY (see clients[].common_name -- Common Name, else Username) collapse into ONE client entry: 'sessions' counts them, bytes are SUMMED, and connected_age_s is the OLDEST session's. The descriptive fields (real_address, virtual_address, username, cipher) all come from that same oldest session, so they never mix two sessions' values.",
+    "why": "The Common Name is the identity the server keys a row on. One entry per SESSION would mint a brand-new row on every roaming reconnect and leave the old one to be pruned, so a site's history would restart each time its link flapped.",
+    "scope": "This is the only place the agent aggregates. Everything else ships raw."
+  },
+  "scenarios": {
+    "server_with_duplicate_cn": {
+      "_note": "A server instance with three live sessions: two share the common name 'site-lyon' (--duplicate-cn) and collapse into one entry, and the OLDER of the two is listed SECOND so the fixture pins that the oldest session wins regardless of row order.",
+      "config": {
+        "openvpn": true
+      },
+      "raw": {
+        "now": 1789153020,
+        "openvpn_running": true,
+        "sockets": [
+          {
+            "path": "/run/openvpn-server/server.sock",
+            "greeting": ">INFO:OpenVPN Management Interface Version 5 -- type 'help' for more info\n",
+            "answers": {
+              "version": "OpenVPN Version: OpenVPN 2.6.14 x86_64-pc-linux-gnu [SSL (OpenSSL)] [LZO] [LZ4] [EPOLL] [PKCS11] [MH/PKTINFO] [AEAD] [DCO]\nManagement Version: 5\nEND\n",
+              "status 3": "TITLE\tOpenVPN 2.6.14 x86_64-pc-linux-gnu [SSL (OpenSSL)] [LZO] [LZ4] [EPOLL] [PKCS11] [MH/PKTINFO] [AEAD] [DCO]\nTIME\t2026-09-11 18:57:00\t1789153018\nHEADER\tCLIENT_LIST\tCommon Name\tReal Address\tVirtual Address\tVirtual IPv6 Address\tBytes Received\tBytes Sent\tConnected Since\tConnected Since (time_t)\tUsername\tClient ID\tPeer ID\tData Channel Cipher\nCLIENT_LIST\tsite-lyon\t198.51.100.23:41001\t10.8.0.7\t\t1000\t2000\t2026-09-11 18:55:00\t1789152900\tUNDEF\t1\t1\tAES-256-GCM\nCLIENT_LIST\tsite-lyon\t203.0.113.5:51820\t10.8.0.6\t\t1234\t5678\t2026-09-10 18:57:00\t1789066620\tUNDEF\t0\t0\tAES-256-GCM\nCLIENT_LIST\tsite-paris\t203.0.113.9:1194\t10.8.0.8\t\t777\t888\t2026-09-11 18:40:20\t1789152020\tops@example.com\t2\t2\tCHACHA20-POLY1305\nHEADER\tROUTING_TABLE\tVirtual Address\tCommon Name\tReal Address\tLast Ref\tLast Ref (time_t)\nROUTING_TABLE\t10.8.0.7\tsite-lyon\t198.51.100.23:41001\t2026-09-11 18:56:47\t1789153007\nROUTING_TABLE\t10.8.0.6\tsite-lyon\t203.0.113.5:51820\t2026-09-11 18:56:47\t1789153007\nROUTING_TABLE\t10.8.0.8\tsite-paris\t203.0.113.9:1194\t2026-09-11 18:56:47\t1789153007\nGLOBAL_STATS\tMax bcast/mcast queue length\t0\nGLOBAL_STATS\tdco_enabled\t0\nEND\n"
+            }
+          }
+        ]
+      },
+      "payload": {
+        "openvpn": {
+          "instances": [
+            {
+              "name": "server",
+              "socket": "/run/openvpn-server/server.sock",
+              "mode": "server",
+              "version": "OpenVPN 2.6.14",
+              "status_age_s": 2,
+              "clients": [
+                {
+                  "common_name": "site-lyon",
+                  "identity_source": "cn",
+                  "real_address": "203.0.113.5:51820",
+                  "virtual_address": "10.8.0.6",
+                  "username": "",
+                  "sessions": 2,
+                  "connected_age_s": 86400,
+                  "bytes_received": 2234,
+                  "bytes_sent": 7678,
+                  "cipher": "AES-256-GCM"
+                },
+                {
+                  "common_name": "site-paris",
+                  "identity_source": "cn",
+                  "real_address": "203.0.113.9:1194",
+                  "virtual_address": "10.8.0.8",
+                  "username": "ops@example.com",
+                  "sessions": 1,
+                  "connected_age_s": 1000,
+                  "bytes_received": 777,
+                  "bytes_sent": 888,
+                  "cipher": "CHACHA20-POLY1305"
+                }
+              ],
+              "state": null
+            }
+          ]
+        }
+      }
+    },
+    "username_auth_server": {
+      "_note": "A --verify-client-cert none server: username/password auth, no client certs. OpenVPN writes its UNDEF sentinel into the Common Name column for EVERY session and puts the real identity in Username, so identity resolves CN-then-Username. Keying on the CN alone folds all three sessions into one anonymous entry with summed bytes, and since `clients` is read as the COMPLETE set that prunes two real client rows on every tick. This scenario exists so the server ingester is exercised against a payload whose common_name came from the Username column.",
+      "config": {
+        "openvpn": true
+      },
+      "raw": {
+        "now": 1789153020,
+        "openvpn_running": true,
+        "sockets": [
+          {
+            "path": "/run/openvpn-server/vpn-users.sock",
+            "greeting": ">INFO:OpenVPN Management Interface Version 5 -- type 'help' for more info\n",
+            "answers": {
+              "version": "OpenVPN Version: OpenVPN 2.6.14 x86_64-pc-linux-gnu [SSL (OpenSSL)] [LZO] [LZ4] [EPOLL] [PKCS11] [MH/PKTINFO] [AEAD] [DCO]\nManagement Version: 5\nEND\n",
+              "status 3": "TITLE\tOpenVPN 2.6.14 x86_64-pc-linux-gnu [SSL (OpenSSL)] [LZO] [LZ4] [EPOLL] [PKCS11] [MH/PKTINFO] [AEAD] [DCO]\nTIME\t2026-09-11 18:57:00\t1789153018\nHEADER\tCLIENT_LIST\tCommon Name\tReal Address\tVirtual Address\tVirtual IPv6 Address\tBytes Received\tBytes Sent\tConnected Since\tConnected Since (time_t)\tUsername\tClient ID\tPeer ID\tData Channel Cipher\nCLIENT_LIST\tUNDEF\t203.0.113.5:51820\t10.8.0.6\t\t1234\t5678\t2026-09-10 18:57:00\t1789066620\talice\t0\t0\tAES-256-GCM\nCLIENT_LIST\tUNDEF\t198.51.100.23:41001\t10.8.0.7\t\t4321\t8765\t2026-09-11 18:55:00\t1789152900\tbob\t1\t1\tAES-256-GCM\nGLOBAL_STATS\tMax bcast/mcast queue length\t0\nEND\n"
+            }
+          }
+        ]
+      },
+      "payload": {
+        "openvpn": {
+          "instances": [
+            {
+              "name": "vpn-users",
+              "socket": "/run/openvpn-server/vpn-users.sock",
+              "mode": "server",
+              "version": "OpenVPN 2.6.14",
+              "status_age_s": 2,
+              "clients": [
+                {
+                  "common_name": "alice",
+                  "identity_source": "user",
+                  "real_address": "203.0.113.5:51820",
+                  "virtual_address": "10.8.0.6",
+                  "username": "alice",
+                  "sessions": 1,
+                  "connected_age_s": 86400,
+                  "bytes_received": 1234,
+                  "bytes_sent": 5678,
+                  "cipher": "AES-256-GCM"
+                },
+                {
+                  "common_name": "bob",
+                  "identity_source": "user",
+                  "real_address": "198.51.100.23:41001",
+                  "virtual_address": "10.8.0.7",
+                  "username": "bob",
+                  "sessions": 1,
+                  "connected_age_s": 120,
+                  "bytes_received": 4321,
+                  "bytes_sent": 8765,
+                  "cipher": "AES-256-GCM"
+                }
+              ],
+              "state": null
+            }
+          ]
+        }
+      }
+    },
+    "older_daemon_missing_columns": {
+      "_note": "A pre-2.5 daemon, whose CLIENT_LIST HEADER has no Username and no Data Channel Cipher column. Columns are mapped BY NAME, never by position, so the absent ones report null -- which is DIFFERENT from the '' an UNDEF cell produces. This scenario exists so the server sees that distinction in a real payload rather than only in the field_contract prose: null means 'this daemon cannot report it, upgrade OpenVPN', '' means 'reported, no value'.",
+      "config": {
+        "openvpn": true
+      },
+      "raw": {
+        "now": 1789153020,
+        "openvpn_running": true,
+        "sockets": [
+          {
+            "path": "/run/openvpn/legacy-site.sock",
+            "greeting": ">INFO:OpenVPN Management Interface Version 1 -- type 'help' for more info\n",
+            "answers": {
+              "version": "OpenVPN Version: OpenVPN 2.4.7 x86_64-pc-linux-gnu [SSL (OpenSSL)] [LZO] [LZ4] [EPOLL] [PKCS11] [MH/PKTINFO] [AEAD]\nManagement Version: 1\nEND\n",
+              "status 3": "TITLE\tOpenVPN 2.4.7 x86_64-pc-linux-gnu [SSL (OpenSSL)] [LZO] [LZ4] [EPOLL] [PKCS11] [MH/PKTINFO] [AEAD]\nTIME\t2026-09-11 18:57:00\t1789153018\nHEADER\tCLIENT_LIST\tCommon Name\tReal Address\tVirtual Address\tBytes Received\tBytes Sent\tConnected Since\tConnected Since (time_t)\nCLIENT_LIST\tsite-lyon\t203.0.113.5:51820\t10.8.0.6\t1234\t5678\t2026-09-10 18:57:00\t1789066620\nGLOBAL_STATS\tMax bcast/mcast queue length\t0\nEND\n"
+            }
+          }
+        ]
+      },
+      "payload": {
+        "openvpn": {
+          "instances": [
+            {
+              "name": "legacy-site",
+              "socket": "/run/openvpn/legacy-site.sock",
+              "mode": "server",
+              "version": "OpenVPN 2.4.7",
+              "status_age_s": 2,
+              "clients": [
+                {
+                  "common_name": "site-lyon",
+                  "identity_source": "cn",
+                  "real_address": "203.0.113.5:51820",
+                  "virtual_address": "10.8.0.6",
+                  "username": null,
+                  "sessions": 1,
+                  "connected_age_s": 86400,
+                  "bytes_received": 1234,
+                  "bytes_sent": 5678,
+                  "cipher": null
+                }
+              ],
+              "state": null
+            }
+          ]
+        }
+      }
+    },
+    "client_connected": {
+      "_note": "A client-mode instance. Its status answer is the 'OpenVPN STATISTICS' block (comma-separated even under 'status 3'), which carries no client list and no unix timestamp -- hence clients [] and status_age_s null -- and 'state' is where the health signal lives.",
+      "config": {
+        "openvpn": true
+      },
+      "raw": {
+        "now": 1789153020,
+        "openvpn_running": true,
+        "sockets": [
+          {
+            "path": "/run/openvpn-client/office.sock",
+            "greeting": ">INFO:OpenVPN Management Interface Version 5 -- type 'help' for more info\n",
+            "answers": {
+              "version": "OpenVPN Version: OpenVPN 2.6.14 x86_64-pc-linux-gnu [SSL (OpenSSL)] [LZO] [LZ4] [EPOLL] [PKCS11] [MH/PKTINFO] [AEAD] [DCO]\nManagement Version: 5\nEND\n",
+              "status 3": "OpenVPN STATISTICS\nUpdated,2026-09-11 18:57:01\nTUN/TAP read bytes,0\nTUN/TAP write bytes,0\nTCP/UDP read bytes,1572\nTCP/UDP write bytes,1506\nAuth read bytes,16\nEND\n",
+              "state": "1789152900,CONNECTED,SUCCESS,10.8.0.2,198.51.100.7,1194,,\nEND\n"
+            }
+          }
+        ]
+      },
+      "payload": {
+        "openvpn": {
+          "instances": [
+            {
+              "name": "office",
+              "socket": "/run/openvpn-client/office.sock",
+              "mode": "client",
+              "version": "OpenVPN 2.6.14",
+              "status_age_s": null,
+              "clients": [],
+              "state": {
+                "name": "CONNECTED",
+                "description": "SUCCESS",
+                "local_ip": "10.8.0.2",
+                "remote": "198.51.100.7:1194",
+                "age_s": 120
+              }
+            }
+          ]
+        }
+      }
+    },
+    "client_reconnecting": {
+      "_note": "The state block exists for THIS shape, and every other scenario is CONNECTED. A client instance whose tunnel has dropped reports RECONNECTING with the daemon's own reason in `description` -- the signal an operator is paged on -- while `status 3` still answers normally, so the instance is a healthy READ of an unhealthy TUNNEL. It must never be confused with an instance-level error: `clients` is [] and there is no `error` key.",
+      "config": {
+        "openvpn": true
+      },
+      "raw": {
+        "now": 1789153020,
+        "openvpn_running": true,
+        "sockets": [
+          {
+            "path": "/run/openvpn-client/branch.sock",
+            "greeting": ">INFO:OpenVPN Management Interface Version 5 -- type 'help' for more info\n",
+            "answers": {
+              "version": "OpenVPN Version: OpenVPN 2.6.14 x86_64-pc-linux-gnu [SSL (OpenSSL)] [LZO] [LZ4] [EPOLL] [PKCS11] [MH/PKTINFO] [AEAD] [DCO]\nManagement Version: 5\nEND\n",
+              "status 3": "OpenVPN STATISTICS\nUpdated,2026-09-11 18:57:01\nTUN/TAP read bytes,0\nTUN/TAP write bytes,0\nTCP/UDP read bytes,0\nTCP/UDP write bytes,96\nAuth read bytes,0\nEND\n",
+              "state": "1789152990,RECONNECTING,tls-error,,,,,\nEND\n"
+            }
+          }
+        ]
+      },
+      "payload": {
+        "openvpn": {
+          "instances": [
+            {
+              "name": "branch",
+              "socket": "/run/openvpn-client/branch.sock",
+              "mode": "client",
+              "version": "OpenVPN 2.6.14",
+              "status_age_s": null,
+              "clients": [],
+              "state": {
+                "name": "RECONNECTING",
+                "description": "tls-error",
+                "local_ip": null,
+                "remote": null,
+                "age_s": 30
+              }
+            }
+          ]
+        }
+      }
+    },
+    "one_instance_unreadable": {
+      "_note": "Two instances where one socket is unreadable. The readable one ships IN FULL and the other carries an 'error' with no 'clients' key -- never a host-wide null, and never a silent omission. The refusal shape is the measured one: the daemon accepts and closes without a greeting, which is what a management-client-group mismatch looks like.",
+      "config": {
+        "openvpn": true
+      },
+      "raw": {
+        "now": 1789153020,
+        "openvpn_running": true,
+        "sockets": [
+          {
+            "path": "/run/openvpn-server/server.sock",
+            "greeting": ">INFO:OpenVPN Management Interface Version 5 -- type 'help' for more info\n",
+            "answers": {
+              "version": "OpenVPN Version: OpenVPN 2.6.14 x86_64-pc-linux-gnu [SSL (OpenSSL)] [LZO] [LZ4] [EPOLL] [PKCS11] [MH/PKTINFO] [AEAD] [DCO]\nManagement Version: 5\nEND\n",
+              "status 3": "TITLE\tOpenVPN 2.6.14 x86_64-pc-linux-gnu [SSL (OpenSSL)] [LZO] [LZ4] [EPOLL] [PKCS11] [MH/PKTINFO] [AEAD] [DCO]\nTIME\t2026-09-11 18:57:00\t1789153018\nHEADER\tCLIENT_LIST\tCommon Name\tReal Address\tVirtual Address\tVirtual IPv6 Address\tBytes Received\tBytes Sent\tConnected Since\tConnected Since (time_t)\tUsername\tClient ID\tPeer ID\tData Channel Cipher\nCLIENT_LIST\tsite-lyon\t203.0.113.5:51820\t10.8.0.6\t\t1234\t5678\t2026-09-10 18:57:00\t1789066620\tUNDEF\t0\t0\tAES-256-GCM\nHEADER\tROUTING_TABLE\tVirtual Address\tCommon Name\tReal Address\tLast Ref\tLast Ref (time_t)\nROUTING_TABLE\t10.8.0.6\tsite-lyon\t203.0.113.5:51820\t2026-09-11 18:56:47\t1789153007\nGLOBAL_STATS\tMax bcast/mcast queue length\t0\nEND\n"
+            }
+          },
+          {
+            "path": "/run/openvpn/legacy.sock",
+            "refuse": true
+          }
+        ]
+      },
+      "payload": {
+        "openvpn": {
+          "instances": [
+            {
+              "name": "server",
+              "socket": "/run/openvpn-server/server.sock",
+              "mode": "server",
+              "version": "OpenVPN 2.6.14",
+              "status_age_s": 2,
+              "clients": [
+                {
+                  "common_name": "site-lyon",
+                  "identity_source": "cn",
+                  "real_address": "203.0.113.5:51820",
+                  "virtual_address": "10.8.0.6",
+                  "username": "",
+                  "sessions": 1,
+                  "connected_age_s": 86400,
+                  "bytes_received": 1234,
+                  "bytes_sent": 5678,
+                  "cipher": "AES-256-GCM"
+                }
+              ],
+              "state": null
+            },
+            {
+              "name": "legacy",
+              "socket": "/run/openvpn/legacy.sock",
+              "error": "closed by the daemon before the greeting (management-client-group must name the agent's primary group)"
+            }
+          ]
+        }
+      }
+    },
+    "no_openvpn": {
+      "_note": "No socket and no openvpn process: a successful reading of a host with nothing to monitor. This is the documented PRUNE-ALL, and it is the ONLY empty shape the server may prune against.",
+      "config": {
+        "openvpn": true
+      },
+      "raw": {
+        "now": 1789153020,
+        "openvpn_running": false,
+        "sockets": []
+      },
+      "payload": {
+        "openvpn": {
+          "instances": []
+        }
+      }
+    },
+    "running_without_socket": {
+      "_note": "The acceptance case that makes the two empty-looking shapes worth distinguishing: an OpenVPN daemon IS running, but no instance exposes a management socket -- the operator has not added the two config lines, or has lost them. A tunnel is up and carrying traffic, so reporting {'instances': []} here would prune every instance row and false-resolve every open incident. null instead.",
+      "config": {
+        "openvpn": true
+      },
+      "raw": {
+        "now": 1789153020,
+        "openvpn_running": true,
+        "sockets": []
+      },
+      "payload": {
+        "openvpn": null
+      }
+    }
+  }
+}
