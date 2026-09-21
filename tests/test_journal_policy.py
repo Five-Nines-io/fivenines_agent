@@ -238,13 +238,32 @@ def test_a_trailing_newline_is_refused(config_dir):
     assert journal_policy.unit_allowed("nginx.service\n") is False
 
 
-def test_a_suffix_only_unit_is_refused(config_dir):
-    """systemd appends `.service` to a name with no name part, so `.mount` is
-    authorized here and read by journalctl as `.mount.service`."""
-    write_allowlist(config_dir, "*.mount\n")
-    assert journal_policy.unit_allowed("var-log.mount") is True
-    assert journal_policy.unit_allowed(".mount") is False
-    assert journal_policy.unit_allowed(".service") is False
+def test_the_unit_name_shape_is_validated(config_dir):
+    """A legal charset is not a valid unit name. systemd appends `.service`
+    to anything its validator rejects, which turns the string the policy
+    authorized into a different string journalctl reads -- so the SHAPE rule
+    (name[@instance].suffix, non-empty name, non-empty template prefix) is
+    enforced, not just the characters.
+
+    Both directions matter: refusing a legal name silently kills an
+    operator's allowlisted signals, captures and failure tails.
+    """
+    write_allowlist(config_dir, "*\n")
+    for legal in (
+        "nginx.service",
+        "nginx",  # systemd appends .service too, so both sides agree
+        "-.mount",  # the root filesystem
+        ".hidden.service",  # a leading dot is fine when a name precedes it
+        "postgresql@14-main.service",
+    ):
+        assert journal_policy.unit_allowed(legal) is True, legal
+    for rewritten in (
+        ".mount",  # suffix only -> read as .mount.service
+        ".service",
+        "@foo.mount",  # empty template prefix -> read as @foo.mount.service
+        "@.service",
+    ):
+        assert journal_policy.unit_allowed(rewritten) is False, rewritten
 
 
 def test_a_whitespace_padded_unit_is_refused(config_dir):

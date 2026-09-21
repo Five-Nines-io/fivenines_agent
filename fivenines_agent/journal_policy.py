@@ -151,6 +151,32 @@ def _normalize(name):
     return name + ".service"
 
 
+def _is_structurally_valid_unit(name):
+    """True when `name` has systemd's unit-name SHAPE: name[@instance].suffix,
+    with a non-empty name part -- and a non-empty template prefix when there
+    is an `@`.
+
+    The charset rule above is necessary but not sufficient: systemd's
+    normalizer appends `.service` to anything it does not consider a valid
+    unit name, which silently turns the string the policy authorized into a
+    different string journalctl reads. `.mount` becomes `.mount.service` and
+    `@foo.mount` becomes `@foo.mount.service`, while `.hidden.service` and
+    `-.mount` are passed through untouched and must therefore be allowed.
+    Enumerating the bad shapes one counterexample at a time is how the last
+    two rounds of this went; this is the rule itself.
+    """
+    stem = name
+    for suffix in _UNIT_SUFFIXES:
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    if not stem:
+        return False  # suffix only: ".mount" -> systemd reads ".mount.service"
+    if "@" in stem and not stem.split("@", 1)[0]:
+        return False  # empty template prefix: "@foo.mount"
+    return True
+
+
 def _warn_once(key, message):
     """Log an operator-facing notice once per distinct condition.
 
@@ -344,11 +370,7 @@ def unit_allowed(unit):
         # name through unchanged, so a name that needs escaping authorizes one
         # unit here and reads another there (see _UNIT_NAME_RE).
         return False
-    if unit.startswith("."):
-        # Suffix-only: a unit name has a name part, and systemd's normalizer
-        # appends `.service` when it is missing -- so `.mount` is authorized
-        # here as `.mount` and READ by journalctl as `.mount.service`, which
-        # the same policy refuses. No legal unit name starts with a dot.
+    if not _is_structurally_valid_unit(unit):
         return False
     candidate = _normalize(unit)
     return any(fnmatch.fnmatchcase(candidate, pattern) for pattern in patterns)
