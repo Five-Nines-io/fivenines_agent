@@ -155,7 +155,7 @@ no_openssl_command() {
 openssl dgst -sha256 -sign "$WORK/test.key" -out "$WORK/SHA256SUMS.sig" "$WORK/SHA256SUMS"
 
 (
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   command() { no_openssl_command "$@"; }
   verify_sums_signature "$WORK/SHA256SUMS" "$WORK/SHA256SUMS.sig" > /dev/null 2>&1
 )
@@ -172,9 +172,9 @@ DOWNLOAD_SOURCE="r2"
 
 # A mirror double: download_with_fallback / download_release_file are the two
 # seams every installer fills in with wget or curl.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 download_release_file() { cp "$MIRROR/$1" "$2" 2>/dev/null; }
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 download_with_fallback() {
   DOWNLOAD_SOURCE="r2"
   cp "$MIRROR/$1" "$2" 2>/dev/null
@@ -217,7 +217,7 @@ publish_mirror
 
 cp "$MIRROR/fivenines-agent.service" "$WORK/staged.service"
 (
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   command() { no_openssl_command "$@"; }
   verify_from_manifest "$WORK/staged.service" "fivenines-agent.service" > /dev/null 2>&1
 )
@@ -225,7 +225,7 @@ check "without openssl the install fails closed by default" "$?" "1"
 
 cp "$MIRROR/fivenines-agent.service" "$WORK/staged.service"
 (
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   command() { no_openssl_command "$@"; }
   FIVENINES_ALLOW_UNSIGNED=1 verify_from_manifest "$WORK/staged.service" "fivenines-agent.service" > /dev/null 2>&1
 )
@@ -241,28 +241,28 @@ verification_preflight > /dev/null 2>&1
 check "an openssl-capable host passes preflight" "$?" "0"
 
 (
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   command() { no_openssl_command "$@"; }
   verification_preflight > /dev/null 2>&1
 )
 check "a host with no openssl is refused before anything is touched" "$?" "1"
 
 (
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   command() { no_openssl_command "$@"; }
   FIVENINES_ALLOW_UNSIGNED=1 verification_preflight > /dev/null 2>&1
 )
 check "FIVENINES_ALLOW_UNSIGNED=1 passes preflight without openssl" "$?" "0"
 
 (
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   command() { no_openssl_command "$@"; }
   FIVENINES_AGENT_SHA256=deadbeef verification_preflight > /dev/null 2>&1
 )
 check "an operator-pinned digest needs no openssl" "$?" "0"
 
 (
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   command() { no_openssl_command "$@"; }
   # shellcheck disable=SC2317,SC2329
   release_signing_pubkey() { :; }
@@ -271,7 +271,7 @@ check "an operator-pinned digest needs no openssl" "$?" "0"
 check "no embedded key needs no openssl" "$?" "0"
 
 (
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   command() { no_openssl_command "$@"; }
   FIVENINES_AGENT_SHA256=deadbeef verification_preflight "with-startup-files" > /dev/null 2>&1
 )
@@ -280,14 +280,14 @@ check "a pinned digest does NOT exempt a host that installs startup files" "$?" 
 # ...but test mode installs no startup definition at all, so demanding openssl
 # there would only turn the release matrix red on images without the CLI.
 (
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   command() { no_openssl_command "$@"; }
   FIVENINES_TEST_MODE=1 FIVENINES_AGENT_SHA256=deadbeef verification_preflight "with-startup-files" > /dev/null 2>&1
 )
 check "test mode installs no startup files, so a pinned digest is enough" "$?" "0"
 
 (
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   command() { no_openssl_command "$@"; }
   FIVENINES_TEST_MODE=1 verification_preflight "with-startup-files" > /dev/null 2>&1
 )
@@ -381,7 +381,7 @@ cp "$MIRROR/fivenines-agent.service" "$WORK/staged.service"
 # A mirror that serves the artifact but not the manifest cannot prove
 # anything, so there is nothing to fall back to.
 (
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   download_release_file() { [ "$1" = "SHA256SUMS" ] && return 1; cp "$MIRROR/$1" "$2" 2>/dev/null; }
   verify_from_manifest "$WORK/staged.service" "fivenines-agent.service" > /dev/null 2>&1
 )
@@ -416,7 +416,7 @@ check "FIVENINES_REQUIRE_SIGNATURE=1 refuses an unsigned install" "$?" "1"
 # instead, a host with no openssl would install whatever the mirror served.
 printf 'ExecStart=/tmp/evil\n' > "$WORK/staged.service"
 (
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   command() { no_openssl_command "$@"; }
   FIVENINES_ALLOW_UNSIGNED=1 verify_from_manifest "$WORK/staged.service" "fivenines-agent.service" > /dev/null 2>&1
 )
@@ -449,7 +449,7 @@ check "a failed download leaves the installed unit untouched" \
 # A download that succeeded from no known mirror cannot be verified against
 # any manifest, so it must be refused rather than trusted.
 (
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   download_with_fallback() { DOWNLOAD_SOURCE=""; cp "$MIRROR/$1" "$2" 2>/dev/null; }
   install_verified_release_file "fivenines-agent.service" "$DEST" 644 > /dev/null 2>&1
 )
@@ -468,7 +468,7 @@ check "the skipped-verify install really wrote the file" \
 printf 'ExecStart=/opt/fivenines/fivenines_agent\n' > "$MIRROR/fivenines-agent.service"
 publish_mirror
 (
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   chmod() { return 1; }
   install_verified_release_file "fivenines-agent.service" "$DEST" 644 > /dev/null 2>&1
 )
@@ -491,7 +491,7 @@ check "the un-chmod-able install still wrote the verified bytes" \
 printf 'ExecStart=/opt/fivenines/fivenines_agent\n' > "$MIRROR/fivenines-agent.service"
 publish_mirror
 (
-  # shellcheck disable=SC2329
+  # shellcheck disable=SC2317,SC2329
   mv() { return 1; }
   install_verified_release_file "fivenines-agent.service" "$DEST" 644 > /dev/null 2>&1
 )

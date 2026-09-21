@@ -351,6 +351,9 @@ verify_from_manifest() {
 # anything, so without this preflight that deterministic failure lands after
 # the stop and leaves the host unmonitored. Fail while the agent is still
 # running, and say exactly what to install.
+# The scope argument is optional by design: the system scripts pass one, the
+# user scripts have no startup definition to verify and pass none.
+# shellcheck disable=SC2120
 verification_preflight() {
     # "$1" is "with-startup-files" when the caller also installs a startup
     # definition (the two SYSTEM scripts). Those always go through the signed
@@ -502,6 +505,7 @@ print_success "Architecture: $ARCH, libc: $LIBC_TYPE"
 
 # Refuse BEFORE the agent is stopped if this host cannot verify a release at
 # all (see fivenines_update.sh for the reasoning).
+# shellcheck disable=SC2119
 verification_preflight || exit_with_error "Cannot verify a release on this host -- nothing was changed and the agent is still running."
 
 # Stop the agent if running (skip in test mode)
