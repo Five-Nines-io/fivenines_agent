@@ -1,6 +1,8 @@
 """Tests for IP detection and caching."""
 
+import socket
 import time
+from collections import namedtuple
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -752,3 +754,299 @@ def test_clock_rollback_does_not_extend_suppression(mock_conn_cls):
 
     get_ip(ipv6=True)
     assert mock_conn_cls.call_count == attempts_so_far + 1
+
+
+# --- A host with no IPv6 (issue #155) ---
+#
+# The real _ipv6_configured is captured at import time because conftest's
+# autouse fixture replaces the module attribute with a True-returning double
+# (so every other IPv6 test runs the same way on a v4-only CI runner). These
+# tests drive the genuine function against a faked psutil.
+
+_REAL_IPV6_CONFIGURED = ip_module._ipv6_configured
+
+_Addr = namedtuple("_Addr", "family address")
+_Stat = namedtuple("_Stat", "isup")
+
+
+def _fake_psutil(addrs, stats=None, addrs_error=None, stats_error=None):
+    """Patch psutil.net_if_addrs/net_if_stats as ip.py sees them."""
+    addrs_mock = (
+        MagicMock(side_effect=addrs_error)
+        if addrs_error
+        else MagicMock(return_value=addrs)
+    )
+    stats_mock = (
+        MagicMock(side_effect=stats_error)
+        if stats_error
+        else MagicMock(return_value=stats or {})
+    )
+    return patch.multiple(
+        ip_module.psutil, net_if_addrs=addrs_mock, net_if_stats=stats_mock
+    )
+
+
+def test_ipv6_configured_true_for_a_global_address():
+    addrs = {"eth0": [_Addr(socket.AF_INET6, "2001:db8::1")]}
+    with _fake_psutil(addrs, {"eth0": _Stat(True)}):
+        assert _REAL_IPV6_CONFIGURED() is True
+
+
+def test_ipv6_configured_false_with_only_loopback_and_link_local():
+    """::1 and fe80:: cannot source traffic to the internet, scope suffix included."""
+    addrs = {
+        "lo": [_Addr(socket.AF_INET6, "::1")],
+        "eth0": [
+            _Addr(socket.AF_INET, "10.0.0.2"),
+            _Addr(socket.AF_INET6, "fe80::42:acff:fe11:2%eth0"),
+        ],
+    }
+    with _fake_psutil(addrs, {"lo": _Stat(True), "eth0": _Stat(True)}):
+        assert _REAL_IPV6_CONFIGURED() is False
+
+
+@pytest.mark.parametrize("addr", ["2001:db8::1%eth0", "2001:db8::1%12"])
+def test_ipv6_configured_strips_the_scope_from_a_global_address(addr):
+    """A routable address carrying a %scope must still count as configured.
+
+    Without the strip it fails to parse, falls into the skip branch, and the
+    host reports no public IPv6 forever. Linux reports named scopes, Windows
+    numeric ones.
+    """
+    with _fake_psutil({"eth0": [_Addr(socket.AF_INET6, addr)]}, {"eth0": _Stat(True)}):
+        assert _REAL_IPV6_CONFIGURED() is True
+
+
+def test_ipv6_configured_does_not_stat_interfaces_without_v6(monkeypatch):
+    """The v4-only host this fast-path exists for must not pay the per-NIC
+    ioctl sweep net_if_stats does."""
+    addrs = {"eth0": [_Addr(socket.AF_INET, "10.0.0.2")]}
+    stats_calls = []
+
+    def counting_stats():
+        stats_calls.append(1)
+        return {}
+
+    with patch.object(
+        ip_module.psutil, "net_if_addrs", return_value=addrs
+    ), patch.object(ip_module.psutil, "net_if_stats", side_effect=counting_stats):
+        assert _REAL_IPV6_CONFIGURED() is False
+    assert stats_calls == []
+
+
+def test_ipv6_configured_accepts_a_ula():
+    """A ULA counts: NPTv6 exists, so refusing to even try would be wrong."""
+    addrs = {"eth0": [_Addr(socket.AF_INET6, "fd00::1")]}
+    with _fake_psutil(addrs, {"eth0": _Stat(True)}):
+        assert _REAL_IPV6_CONFIGURED() is True
+
+
+def test_ipv6_configured_ignores_down_interfaces():
+    addrs = {"eth1": [_Addr(socket.AF_INET6, "2001:db8::1")]}
+    with _fake_psutil(addrs, {"eth1": _Stat(False)}):
+        assert _REAL_IPV6_CONFIGURED() is False
+
+
+def test_ipv6_configured_skips_unparseable_addresses():
+    addrs = {"eth0": [_Addr(socket.AF_INET6, "not-an-address")]}
+    with _fake_psutil(addrs, {"eth0": _Stat(True)}):
+        assert _REAL_IPV6_CONFIGURED() is False
+
+
+def test_ipv6_configured_without_interface_stats_still_reads_addresses():
+    """net_if_stats is an optimisation; losing it must not lose the answer."""
+    addrs = {"eth0": [_Addr(socket.AF_INET6, "2001:db8::1")]}
+    with _fake_psutil(addrs, stats_error=OSError("no stats")):
+        assert _REAL_IPV6_CONFIGURED() is True
+
+
+def test_ipv6_configured_assumes_available_when_psutil_fails():
+    """'Cannot tell' must never be reported as 'no IPv6'."""
+    with _fake_psutil({}, addrs_error=RuntimeError("psutil exploded")):
+        assert _REAL_IPV6_CONFIGURED() is True
+
+
+@patch("fivenines_agent.ip.CustomHTTPSConnection")
+def test_no_ipv6_on_the_host_skips_the_fetch_entirely(mock_conn_cls):
+    """No DNS, no connect: the v4-only container case costs nothing."""
+    _reset_caches()
+    with patch.object(ip_module, "_ipv6_configured", return_value=False):
+        assert get_ip(ipv6=True) is None
+    mock_conn_cls.assert_not_called()
+    assert ip_module._ip_v6_cache["failures"] == 1
+
+
+@patch("fivenines_agent.ip.CustomHTTPSConnection")
+def test_no_ipv6_does_not_affect_ipv4(mock_conn_cls):
+    _reset_caches()
+    mock_response = MagicMock()
+    mock_response.status = 200
+    mock_response.read.return_value = b"1.2.3.4\n"
+    mock_conn_cls.return_value.getresponse.return_value = mock_response
+
+    with patch.object(ip_module, "_ipv6_configured", return_value=False):
+        assert get_ip(ipv6=False) == "1.2.3.4"
+
+
+def test_missing_ipv6_is_reported_once_then_goes_quiet():
+    """The customer-visible half of #155: one error line, then debug forever."""
+    _reset_caches()
+    with patch.object(ip_module, "_ipv6_configured", return_value=False):
+        with patch("fivenines_agent.ip.log") as mock_log:
+            get_ip(ipv6=True)
+            levels_first = [c.args[1] for c in mock_log.call_args_list]
+
+            # failures == 1 -> no backoff yet, so the next tick really re-runs.
+            mock_log.reset_mock()
+            get_ip(ipv6=True)
+            levels_second = [c.args[1] for c in mock_log.call_args_list]
+
+    assert "error" in levels_first
+    assert "error" not in levels_second
+    assert "debug" in levels_second
+
+
+@patch("fivenines_agent.ip.CustomHTTPSConnection")
+def test_repeat_failures_quiet_the_per_address_connect_logs(mock_conn_cls):
+    """The connect loop logs one line per candidate address; after the first
+    failed window those drop to debug too."""
+    _reset_caches()
+    mock_conn_cls.return_value.request.side_effect = ConnectionError("unreachable")
+
+    get_ip(ipv6=True)
+    get_ip(ipv6=True)
+
+    assert mock_conn_cls.call_args_list[0].kwargs["error_level"] == "error"
+    assert mock_conn_cls.call_args_list[1].kwargs["error_level"] == "debug"
+
+
+@patch("fivenines_agent.ip.CustomHTTPSConnection")
+def test_a_different_failure_kind_is_still_reported_loudly(mock_conn_cls):
+    """A captive portal answering 200 with HTML is the most security-relevant
+    line this module emits. An earlier connect error must not bury it."""
+    _reset_caches()
+    mock_conn_cls.return_value.request.side_effect = ConnectionError("unreachable")
+    get_ip(ipv6=False)
+    get_ip(ipv6=False)  # same kind -> quiet
+
+    # Two failures arm the negative backoff; step past it so the next call
+    # really re-attempts.
+    ip_module._ip_v4_cache["timestamp"] = ip_module._now() - 1000
+
+    # Now the endpoint answers, with something that is not an IPv4 address.
+    mock_conn_cls.return_value.request.side_effect = None
+    mock_response = MagicMock()
+    mock_response.status = 200
+    mock_response.read.return_value = b"<html>captive portal</html>"
+    mock_conn_cls.return_value.getresponse.return_value = mock_response
+
+    with patch("fivenines_agent.ip.log") as mock_log:
+        assert get_ip(ipv6=False) is None
+    errors = [c for c in mock_log.call_args_list if c.args[1] == "error"]
+    assert len(errors) == 1
+    assert "non-IPv4" in errors[0].args[0]
+
+
+@patch("fivenines_agent.ip.traceback")
+@patch("fivenines_agent.ip.CustomHTTPSConnection")
+def test_traceback_is_printed_only_for_the_first_failure(mock_conn_cls, mock_traceback):
+    """A stack trace per tick is the loudest part of a permanent failure."""
+    _reset_caches()
+    mock_conn_cls.return_value.request.side_effect = ValueError("boom")
+
+    get_ip(ipv6=True)
+    get_ip(ipv6=True)
+
+    assert mock_traceback.print_exc.call_count == 1
+
+
+@pytest.mark.parametrize("level", ["error", "debug"])
+def test_connect_logs_per_address_failures_at_the_configured_level(level):
+    """The connect loop logs one line per candidate address; get_ip drops that
+    to debug once the family is already known to be failing."""
+    conn = ip_module.CustomHTTPSConnection(
+        "ip.fivenines.io", ipv6=True, error_level=level
+    )
+    with patch("fivenines_agent.ip.DNSResolver") as resolver_cls, patch(
+        "fivenines_agent.ip.socket.socket"
+    ) as socket_cls, patch("fivenines_agent.ip.log") as mock_log:
+        resolver_cls.return_value.resolve.return_value = [
+            MagicMock(address="2001:db8::1")
+        ]
+        socket_cls.return_value.connect.side_effect = OSError("Network unreachable")
+        with pytest.raises(ConnectionError):
+            conn.connect()
+
+    assert [c.args[1] for c in mock_log.call_args_list] == [level]
+
+
+# --- CustomHTTPSConnection.connect: the DNS and success halves ---
+#
+# The connect loop is the other half of the error_level change above: the
+# per-address failure line is the only thing #155 quietened, so the paths that
+# must stay silent (a connection that works) and the paths that must stay loud
+# (DNS that answers nothing) are pinned here.
+
+
+def _connection(error_level="error"):
+    return ip_module.CustomHTTPSConnection(
+        "ip.fivenines.io", ipv6=True, error_level=error_level, context=MagicMock()
+    )
+
+
+def test_connect_raises_when_dns_answers_with_no_records():
+    """An empty answer set is a failure, not an empty loop that falls through
+    to the generic 'could not connect' message."""
+    conn = _connection()
+    with patch("fivenines_agent.ip.DNSResolver") as resolver_cls:
+        resolver_cls.return_value.resolve.return_value = []
+        with pytest.raises(ConnectionError, match="No DNS records found"):
+            conn.connect()
+
+
+def test_connect_wraps_a_resolver_error_as_a_connection_error():
+    """get_ip only handles ConnectionError specially, so a resolver blowing up
+    must arrive as one rather than as a bare resolver exception."""
+    conn = _connection()
+    with patch("fivenines_agent.ip.DNSResolver") as resolver_cls:
+        resolver_cls.return_value.resolve.side_effect = RuntimeError("resolver down")
+        with pytest.raises(ConnectionError, match="DNS resolution failed"):
+            conn.connect()
+
+
+def test_connect_returns_on_the_first_address_that_works():
+    """The happy path: TLS is wrapped against the hostname (not the IP, which
+    would never match the certificate) and later candidates are not tried."""
+    conn = _connection()
+    wrapped = MagicMock()
+    conn._context.wrap_socket.return_value = wrapped
+    with patch("fivenines_agent.ip.DNSResolver") as resolver_cls, patch(
+        "fivenines_agent.ip.socket.socket"
+    ) as socket_cls, patch("fivenines_agent.ip.log") as mock_log:
+        resolver_cls.return_value.resolve.return_value = [
+            MagicMock(address="2001:db8::1"),
+            MagicMock(address="2001:db8::2"),
+        ]
+        conn.connect()
+
+    assert socket_cls.call_count == 1
+    assert conn.sock is wrapped
+    assert conn._context.wrap_socket.call_args.kwargs["server_hostname"] == (
+        "ip.fivenines.io"
+    )
+    assert mock_log.call_args_list == []
+
+
+def test_connect_survives_a_socket_that_was_never_created():
+    """socket() itself failing leaves self.sock at None; the cleanup must not
+    turn that into an AttributeError on the way to the real error."""
+    conn = _connection()
+    with patch("fivenines_agent.ip.DNSResolver") as resolver_cls, patch(
+        "fivenines_agent.ip.socket.socket", side_effect=OSError("no fd")
+    ), patch("fivenines_agent.ip.log"):
+        resolver_cls.return_value.resolve.return_value = [
+            MagicMock(address="2001:db8::1")
+        ]
+        with pytest.raises(ConnectionError, match="Could not connect to"):
+            conn.connect()
+    assert conn.sock is None

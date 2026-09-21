@@ -7,6 +7,7 @@ import time
 import traceback
 
 import certifi
+import psutil
 
 from fivenines_agent.debug import debug, log
 from fivenines_agent.dns_resolver import DNSResolver
@@ -66,6 +67,84 @@ def _negative_backoff(failures):
     return NEGATIVE_BACKOFF_SCHEDULE[idx]
 
 
+def _first_failure(cache):
+    """True while this is the first failure of a streak (any success resets).
+
+    One owner for the rule: the log level, the connection's per-address level
+    and the traceback guard all read it here rather than re-deriving it.
+    """
+    return cache.get("failures", 0) == 0
+
+
+def _log_failure(cache, message, category="fetch"):
+    """Log a fetch failure: loud once per kind, debug for the repeats.
+
+    A family that cannot work here -- no IPv6 on the box, egress blocked --
+    fails every backoff window for as long as that stays true, and at error
+    level that is a journal line every few minutes about a condition the
+    operator was told about the first time.
+
+    The latch is keyed on the KIND of failure, not just a counter, because
+    the kinds are not interchangeable: "ip.fivenines.io returned a non-IPv4
+    body" (a captive portal, a hijacked endpoint) is the most security-
+    relevant line this module emits, and a counter already raised by ordinary
+    connect errors would bury it at debug forever. `failures` resets on any
+    success, so the first failure of a NEW outage is loud again too.
+    """
+    loud = _first_failure(cache) or cache.get("last_failure") != category
+    cache["last_failure"] = category
+    log(message, "error" if loud else "debug")
+
+
+def _ipv6_configured():
+    """True when the host has an IPv6 address it could source traffic from.
+
+    A v4-only host (a container on a v4-only bridge is the common case) would
+    otherwise pay a DNS lookup plus a connect that can only fail, every
+    backoff window, forever. Checking the interface list first turns that into
+    no network work at all.
+
+    Deliberately conservative: a ULA counts as configured (NPTv6 exists), and
+    any error reading the interface list falls through to attempting the
+    fetch, because "cannot tell" must never be reported as "no IPv6".
+    """
+    try:
+        addrs = psutil.net_if_addrs()
+    except Exception:
+        return True
+
+    # Resolved lazily: net_if_addrs is one getifaddrs(3) walk, while
+    # net_if_stats runs per-NIC ioctls (network.py calls out the cost on a
+    # host with hundreds of veths). A v4-only box -- the case this function
+    # exists to fast-path -- has no candidate address and never pays it.
+    stats = None
+
+    for name, entries in addrs.items():
+        for entry in entries:
+            if entry.family != socket.AF_INET6:
+                continue
+            # Strip the %scope suffix reported on link-local (and, on
+            # Windows, on global) addresses; without it the address fails to
+            # parse and a real v6 host reads as having none.
+            address = (entry.address or "").split("%")[0]
+            try:
+                parsed = ipaddress.ip_address(address)
+            except ValueError:
+                continue
+            if parsed.is_loopback or parsed.is_link_local:
+                continue
+            if stats is None:
+                try:
+                    stats = psutil.net_if_stats()
+                except Exception:
+                    stats = {}
+            iface = stats.get(name)
+            if iface is not None and not iface.isup:
+                break  # interface is down: no address on it counts
+            return True
+    return False
+
+
 def _is_public_ip(parsed):
     """True if the address is a globally routable public IP.
 
@@ -116,10 +195,16 @@ def _validate_ip(body, ipv6):
 
 
 class CustomHTTPSConnection(http.client.HTTPSConnection):
-    def __init__(self, host, port=None, ipv6=False, timeout=5, **kwargs):
+    def __init__(
+        self, host, port=None, ipv6=False, timeout=5, error_level="error", **kwargs
+    ):
         super().__init__(host, port, timeout=timeout, **kwargs)
         self.ipv6 = ipv6
         self.timeout = timeout
+        # Level for per-address connect failures. get_ip drops it to debug
+        # once this family is already known to be failing, so a host with no
+        # IPv6 route does not log one line per candidate address per window.
+        self.error_level = error_level
 
     def connect(self):
         resolver = DNSResolver(self.host)
@@ -147,7 +232,7 @@ class CustomHTTPSConnection(http.client.HTTPSConnection):
             except OSError as e:
                 if self.sock:
                     self.sock.close()
-                log(f"Could not connect to {ip}: {e}", "error")
+                log(f"Could not connect to {ip}: {e}", self.error_level)
                 continue  # Try next IP
 
         raise ConnectionError(
@@ -178,11 +263,33 @@ def get_ip(ipv6=False):
     if cache["ip"] is None and backoff > 0 and age < backoff:
         return None
 
+    # Nothing to fetch over a family the host cannot source traffic on. This
+    # is the v4-only container case: report no IPv6 without a DNS lookup, a
+    # connect, or -- after the first one -- a log line. It still records a
+    # failure, so the backoff schedule paces the re-check and a v6 address
+    # added later is picked up within one window.
+    if ipv6 and not _ipv6_configured():
+        _log_failure(
+            cache,
+            "No routable IPv6 address on this host: skipping the IPv6 lookup "
+            "for ip.fivenines.io",
+            "no-ipv6",
+        )
+        _record_failure(cache)
+        return None
+
     conn = None
     try:
         ssl_context = _get_ssl_context()
 
-        conn = CustomHTTPSConnection("ip.fivenines.io", ipv6=ipv6, context=ssl_context)
+        # Once this family is already failing, per-address connect errors drop
+        # to debug: the first failure said everything the operator needs.
+        conn = CustomHTTPSConnection(
+            "ip.fivenines.io",
+            ipv6=ipv6,
+            context=ssl_context,
+            error_level="error" if _first_failure(cache) else "debug",
+        )
         conn.request("GET", "")
         response = conn.getresponse()
         log(f"Status: {response.status}, Reason: {response.reason}", "debug")
@@ -192,9 +299,10 @@ def get_ip(ipv6=False):
         # the actual HTTP status rather than as a generic "oversized body"
         # or "non-UTF-8 body" error.
         if response.status != 200:
-            log(
+            _log_failure(
+                cache,
                 f"ip.fivenines.io returned HTTP {response.status} {response.reason}",
-                "error",
+                "http-status",
             )
             _record_failure(cache)
             return None
@@ -205,9 +313,10 @@ def get_ip(ipv6=False):
         # body would just look like a 64-byte body via silent truncation).
         raw = response.read(MAX_RESPONSE_BODY * 4)
         if len(raw) > MAX_RESPONSE_BODY:
-            log(
+            _log_failure(
+                cache,
                 f"ip.fivenines.io returned oversized body ({len(raw)} bytes)",
-                "error",
+                "oversized-body",
             )
             _record_failure(cache)
             return None
@@ -215,9 +324,10 @@ def get_ip(ipv6=False):
         try:
             body = raw.decode("utf-8")
         except UnicodeDecodeError:
-            log(
+            _log_failure(
+                cache,
                 f"ip.fivenines.io returned non-UTF-8 body ({len(raw)} bytes)",
-                "error",
+                "non-utf8-body",
             )
             _record_failure(cache)
             return None
@@ -227,24 +337,30 @@ def get_ip(ipv6=False):
         ip = _validate_ip(body, ipv6=ipv6)
         if ip is None:
             family = "IPv6" if ipv6 else "IPv4"
-            log(
+            _log_failure(
+                cache,
                 f"ip.fivenines.io returned non-{family} body: {body[:64]!r}",
-                "error",
+                "wrong-family-body",
             )
             _record_failure(cache)
             return None
         cache["timestamp"] = _now()
         cache["ip"] = ip
         cache["failures"] = 0
+        cache["last_failure"] = None
         return ip
     except ConnectionError as e:
-        log(f"Unexpected error occurred: {e}", "error")
+        _log_failure(cache, f"Unexpected error occurred: {e}", "connection")
         _record_failure(cache)
         return None
 
     except Exception as e:
-        log(f"Unexpected error occurred: {e}", "error")
-        traceback.print_exc(file=sys.stderr)
+        first = _first_failure(cache)
+        _log_failure(cache, f"Unexpected error occurred: {e}", "unexpected")
+        # The traceback is the expensive, noisy half: print it for the first
+        # failure of an outage only, on the same rule as the log level above.
+        if first:
+            traceback.print_exc(file=sys.stderr)
         _record_failure(cache)
         return None
     finally:

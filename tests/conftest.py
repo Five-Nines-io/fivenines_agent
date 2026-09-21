@@ -4,7 +4,11 @@ The agent caches a number of things at module level for per-tick performance
 (package reads, the Docker client, the mysql replication-verb memo, the NVML
 session, the synchronizer TLS context). Tests patch the underlying functions
 per test, so any cached value leaking across tests makes them order-dependent;
-this autouse fixture resets every such cache before each test.
+the first autouse fixture resets every such cache before each test.
+
+The second keeps the suite off host state it would otherwise read: the host's
+own IPv6 configuration (get_ip(ipv6=True) short-circuits when there is no
+routable IPv6 address, which is most CI runners).
 """
 
 import os
@@ -41,6 +45,20 @@ def _reset_process_caches():
     qemu_module._clear_refusal()  # the production reset path, not a bare assignment
     os.environ.pop("LIBVIRT_AUTOSTART", None)
     yield
+
+
+@pytest.fixture(autouse=True)
+def _assume_ipv6_configured():
+    """Pretend the host has a routable IPv6 address.
+
+    get_ip(ipv6=True) now short-circuits on a host with no IPv6, which is most
+    CI runners and every v4-only container -- without this, every IPv6 test
+    would pass or fail depending on the machine it ran on. Tests that exercise
+    the short-circuit patch this back to False; the detection function itself
+    is tested directly against a faked psutil in test_ip.py.
+    """
+    with patch.object(ip_module, "_ipv6_configured", return_value=True):
+        yield
 
 
 @pytest.fixture
