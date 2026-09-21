@@ -29,7 +29,10 @@ TARBALL_PATH="/tmp/${BINARY_NAME}.tar.gz"
 #
 # These are TEST prerequisites, not agent dependencies: python3 runs the mock
 # API server and wget satisfies the downloader that fivenines_setup_user.sh
-# requires. The frozen binary needs neither -- that is what tests 1 to 7 prove.
+# requires. openssl is what verification_preflight looks for -- busybox has no
+# openssl applet, so an Alpine image without the package cannot check a release
+# signature at all. The frozen binary needs none of them -- that is what tests
+# 1 to 7 prove.
 #
 # Best-effort by design, because an EOL image's package metadata rots: when a
 # distro release goes end-of-life its last Release file keeps a Valid-Until a
@@ -46,13 +49,13 @@ TARBALL_PATH="/tmp/${BINARY_NAME}.tar.gz"
 install_test_deps() {
   if command -v apk > /dev/null 2>&1; then
     # Alpine
-    apk add --no-cache python3 wget shadow
+    apk add --no-cache python3 wget shadow openssl
   elif command -v dnf > /dev/null 2>&1; then
     # Fedora / Rocky 9+
-    dnf install -y -q python3 wget util-linux
+    dnf install -y -q python3 wget util-linux openssl
   elif command -v yum > /dev/null 2>&1; then
     # CentOS 7
-    yum install -y -q python3 wget
+    yum install -y -q python3 wget openssl
   elif command -v apt-get > /dev/null 2>&1; then
     # Debian / Ubuntu. Check-Valid-Until=false accepts an expired Release file,
     # which is the difference between a usable and an unusable EOL image; it is
@@ -61,7 +64,7 @@ install_test_deps() {
     # test). The option is repeated inline rather than held in a variable so
     # that the lint job sees no unquoted word splitting.
     apt-get -o Acquire::Check-Valid-Until=false update -qq \
-      && apt-get -o Acquire::Check-Valid-Until=false install -y -qq python3 wget
+      && apt-get -o Acquire::Check-Valid-Until=false install -y -qq python3 wget openssl
   else
     echo "no supported package manager found"
     return 1

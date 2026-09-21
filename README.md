@@ -1126,19 +1126,28 @@ The first line is the startup capabilities banner; the second is the
 per-capability reason the agent logs beside it.
 
 **OpenRC, UNRAID and user installs** -- there is no unit to override; the
-access is a real group membership, so remove it:
+access is a real group membership, so remove it **and restart the agent**:
 
 ```bash
 sudo gpasswd -d fivenines systemd-journal   # or your own user, for a user install
+sudo rc-service fivenines-agent restart     # OpenRC; UNRAID: re-run the boot script
 ```
+
+The restart is not optional. Supplementary groups are fixed when the process
+starts, so a running agent keeps the journal access it was given until it is
+restarted -- `gpasswd` alone revokes nothing for the live process. `SIGHUP`
+does not help either: it re-probes capabilities, it cannot change the groups
+the kernel already granted. For a user install, the user also needs a fresh
+login session before restarting the agent.
 
 What this changes: the `journald` capability probes false, so the `logs`
 collector is gated off entirely (the key is omitted from the payload, and
 incident captures cannot run), and the systemd collector's failure drilldown
 ships empty journal tails. Unit health, restarts, resource usage and every
-other metric are unaffected. Re-granting is the reverse -- add the group back,
-then `sudo systemctl restart fivenines-agent` (or send `SIGHUP` to re-probe
-capabilities without a restart).
+other metric are unaffected. Re-granting is the reverse -- add the group back, then restart
+(`sudo systemctl restart fivenines-agent`). A restart is required in both
+directions, for the same reason: `SIGHUP` re-probes capabilities but cannot
+change a running process's groups.
 
 ### Locally enforced unit allowlist
 

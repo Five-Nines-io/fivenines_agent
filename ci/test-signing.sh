@@ -277,6 +277,22 @@ check "no embedded key needs no openssl" "$?" "0"
 )
 check "a pinned digest does NOT exempt a host that installs startup files" "$?" "1"
 
+# ...but test mode installs no startup definition at all, so demanding openssl
+# there would only turn the release matrix red on images without the CLI.
+(
+  # shellcheck disable=SC2329
+  command() { no_openssl_command "$@"; }
+  FIVENINES_TEST_MODE=1 FIVENINES_AGENT_SHA256=deadbeef verification_preflight "with-startup-files" > /dev/null 2>&1
+)
+check "test mode installs no startup files, so a pinned digest is enough" "$?" "0"
+
+(
+  # shellcheck disable=SC2329
+  command() { no_openssl_command "$@"; }
+  FIVENINES_TEST_MODE=1 verification_preflight "with-startup-files" > /dev/null 2>&1
+)
+check "test mode without a pinned digest still needs a verifiable release" "$?" "1"
+
 for _script in fivenines_setup.sh fivenines_update.sh fivenines_setup_user.sh fivenines_update_user.sh; do
   check "${_script} runs the preflight" \
     "$(grep -c '^verification_preflight ' "$ROOT/${_script}")" "1"

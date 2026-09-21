@@ -343,6 +343,17 @@ verification_preflight() {
     # was stopped and the binary replaced.
     pf_scope="${1:-}"
 
+    # FIVENINES_TEST_MODE skips ALL service management, so a test-mode run
+    # installs no startup definition however it was called -- and demanding
+    # openssl for files it will never fetch turns the release test matrix red
+    # on any image without the CLI (ci/test-distro.sh installs python3, wget
+    # and shadow, and drives both system installers with a pinned digest).
+    # This grants nothing: test mode already skips service setup entirely, and
+    # anyone who can set it can already set FIVENINES_SKIP_VERIFY.
+    if [ "${FIVENINES_TEST_MODE:-}" = "1" ]; then
+        pf_scope=""
+    fi
+
     if [ "${FIVENINES_SKIP_VERIFY:-}" = "1" ] || [ "${FIVENINES_ALLOW_UNSIGNED:-}" = "1" ]; then
         return 0
     fi
