@@ -637,6 +637,70 @@ probe as well (the check removed in #142 as unreachable becomes reachable).
 
 ## Completed
 
+### P1: Verify the startup definitions against the signed manifest (#154)
+
+The installers verified the agent tarball but downloaded the systemd unit, the
+OpenRC init script and the UNRAID boot script unverified -- on the GitHub
+fallback straight from the `main` branch, which no manifest can cover -- and
+wrote them to their final path. A compromised download server could not touch
+the verified binary but could still choose the `ExecStart` that runs as root
+at every boot. Those three are published release assets now, covered by the
+same signed `SHA256SUMS`; `install_verified_release_file` stages them in a
+private work dir, verifies, then lands them through a sibling temp file inside
+the destination directory (chmod + restorecon there, atomic same-filesystem
+rename), so a refusal leaves the existing definition untouched and a crash
+cannot leave a truncated unit. The raw main-branch URL is gone from all four
+installers, and `ci/test-signing.sh` (64 checks) plus a second list in
+`ci/build-scripts.sh` keep both the helper and its call sites honest.
+
+**Completed:** v1.18.1 (2026-09-21)
+
+### P1: Fail closed when the release signature cannot be checked (#154)
+
+`verify_sums_signature` now distinguishes "no openssl on this host" (3, fatal)
+from "no key embedded in this installer" (2, the key-rotation escape hatch,
+still checksum-only with a warning). `FIVENINES_ALLOW_UNSIGNED=1` is the
+documented opt-out, and minimal Alpine images need `apk add openssl`.
+`verification_preflight` runs that check BEFORE the update script stops the
+agent -- the failure is deterministic per host, so discovering it after the
+stop would leave every minimal-image host unmonitored on every update -- and a
+refusal after the stop now restarts the agent on the existing definition
+instead of exiting with it down.
+
+**Completed:** v1.18.1 (2026-09-21)
+
+### P1: Locally enforced journal allowlist + a documented way to remove journal access
+
+`journal_units.allow` in the config dir is the host owner's veto over which
+unit journals the agent may read. It is intersected with the backend's list,
+never unioned, and bounds every journal read: log signals, incident capture,
+the `_capture_entries` choke point and the systemd failure drilldown. Absent
+file means no local policy (existing installs are unchanged); present-but-
+empty, unreadable, a dangling symlink, a non-regular file and an oversized
+file all mean "read nothing", loudly -- an oversized file is refused rather
+than truncated, because a `*.service` cut at the byte cap becomes `*` and
+would WIDEN the policy. A glob in a name the SERVER sent is refused outright,
+since `journalctl -u` expands globs itself. Refusals ship in the payload as
+`refused_units`, so a unit that was never read cannot render as a unit with
+zero errors. For hosts that need no log monitoring at all, the unit and the
+README document dropping `SupplementaryGroups=systemd-journal` with a
+`systemctl edit` drop-in that survives the updater.
+
+**Completed:** v1.18.1 (2026-09-21)
+
+### P2: Stop logging IPv6 lookup failures on hosts that have no IPv6
+
+`get_ip(ipv6=True)` checked nothing about the host, so a v4-only box (any
+container on a v4-only bridge) paid a DNS lookup plus a connect that could
+only fail, every backoff window, forever -- and logged it at error level. The
+interface list is now consulted first, so there is no network work at all, and
+the failure latch is keyed on the KIND of failure rather than a bare counter:
+the first of each kind is loud, repeats are debug, and a genuinely different
+failure (`ip.fivenines.io returned a non-IPv4 body` -- a captive portal) is
+never buried behind an earlier connect error.
+
+**Completed:** v1.18.1 (2026-09-21)
+
 ### P1: QEMU collector - enforce an agent-side allowlist of libvirt URI schemes (#142)
 
 A libvirt URI selects a TRANSPORT as well as a hypervisor, and `ext` runs a
