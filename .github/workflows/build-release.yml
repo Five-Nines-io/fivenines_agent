@@ -792,6 +792,14 @@ jobs:
           mv artifacts/fivenines-agent-synology-amd64/*.spk release/
           mv artifacts/fivenines-agent-synology-arm64/*.spk release/
           mv artifacts/fivenines-agent-windows-amd64/fivenines-agent-windows-amd64.msi release/
+
+          # The startup definitions the system installers drop into place as
+          # root. They are release assets so that SHA256SUMS (and therefore
+          # SHA256SUMS.sig) covers them: before #154 the installers fetched
+          # these from the main branch, which no manifest can cover.
+          cp fivenines-agent.service release/
+          cp fivenines-agent.openrc release/
+          cp fivenines_script.sh release/
           ls -la release/
 
           # Resolve SPK filenames for download URLs
@@ -951,6 +959,9 @@ jobs:
             release/fivenines-agent-alpine-arm64.tar.gz
             release/*.spk
             release/fivenines-agent-windows-amd64.msi
+            release/fivenines-agent.service
+            release/fivenines-agent.openrc
+            release/fivenines_script.sh
             release/SHA256SUMS
             release/SHA256SUMS.sig
         env:
@@ -984,6 +995,14 @@ jobs:
           mv artifacts/fivenines-agent-synology-amd64/*.spk release/
           mv artifacts/fivenines-agent-synology-arm64/*.spk release/
           mv artifacts/fivenines-agent-windows-amd64/fivenines-agent-windows-amd64.msi release/
+
+          # The startup definitions the system installers drop into place as
+          # root. They are release assets so that SHA256SUMS (and therefore
+          # SHA256SUMS.sig) covers them: before #154 the installers fetched
+          # these from the main branch, which no manifest can cover.
+          cp fivenines-agent.service release/
+          cp fivenines-agent.openrc release/
+          cp fivenines_script.sh release/
           ls -la release/
 
       - name: Extract version from tag
@@ -1107,6 +1126,9 @@ jobs:
             release/fivenines-agent-alpine-arm64.tar.gz
             release/*.spk
             release/fivenines-agent-windows-amd64.msi
+            release/fivenines-agent.service
+            release/fivenines-agent.openrc
+            release/fivenines_script.sh
             release/SHA256SUMS
             release/SHA256SUMS.sig
         env:
