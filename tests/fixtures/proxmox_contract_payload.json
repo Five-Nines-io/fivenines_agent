@@ -31,6 +31,7 @@
     "server_join": "For a zfspool storage the zpool ROOT is pool.split('/')[0] (e.g. 'rpool/data' -> 'rpool'); the server joins that to host-local ZfsPool.name per (host, pool root). This is the join key proxmox_storages.name could never provide -- that column is the PVE storage ID (e.g. 'local-zfs'), not the zpool name. rbd/cephfs 'pool' is the Ceph pool; the server filters by type when joining. OUT OF SCOPE for the agent: the server adds proxmox_storages.pool and performs the join in a paired lockstep PR.",
     "best_effort": "Enrichment is best-effort. A restricted token that cannot read /storage, or an older PVE, degrades to no 'pool' on any entry and NEVER fails or flips storage_ok -- _storage_config_map swallows its own error and is deliberately not threaded through the 'collection' flags block. Deploy order is not sensitive: an old server ignores the extra 'pool' key; a new server reads it with .get('pool')."
   },
+  "backups_contract": {"_note": "Agent 1.19.0+ (fivenines_agent#156, server companion of fivenines_server#1159 phase 2). payload.backups is the one section OUTSIDE the collection flags block: it carries its own three-level signal and NEVER flips a flag (completeness_score is a stored generated column over the five flags that elects the authoritative reporter; a sixth bit would be a migration + a rollout window). See scenarios backups_ok / backups_storage_partial / backups_block_failed / backups_capped.", "three_level_null": "Key ABSENT = an agent older than 1.19.0: the server reads 'unknown', never 'no backups'. backups: null = the block could not be built at all (the node listing failed; see backups_block_failed) -- also 'unknown', and never cached agent-side so the next tick retries. An OBJECT = a read happened; errors[] says which sub-reads failed.", "partial_read_rule": "errors[] entries are {scope: 'storage'|'tasks'|'jobs'|'not_backed_up'|'cap', node, storage, message}. Per-storage entries are LOAD-BEARING: the server's rule for a partial read is asymmetric -- a guest with a fresh backup on a successfully listed storage is fine (evidence exists), but a guest with NO backup found is 'unknown', never 'never'/'aged', because its backups may live on the storage that failed (see backups_storage_partial: ct 101). A 'storage' entry with storage:null means a whole node's storage listing failed (every local storage on that node is unknown). scope 'cap' means an array was trimmed to its hard cap (guest_backups 5000, tasks 50 per node, jobs 200, not_backed_up 2000) and is not complete. A read skipped because the block's 30s wall-clock budget ran out (a wedged PVE/PBS) is recorded under its own scope with message 'skipped: backups collection deadline exceeded' and the same node/storage fields, so it is handled exactly like a failed read. A non-list API envelope is recorded under its scope as 'unexpected response shape (not a list)' rather than iterated into a silent empty result (a false all-clear); a storage whose backup volumes are missing vmid/ctime is flagged 'N backup volume(s) skipped (missing vmid or ctime)' so its unmatched guests read unknown. errors[] itself is bounded (a 'cap'-scope 'errors capped at N' entry once past the limit). PERMISSION FAIL-SAFE (#156): PVE filters backup volumes per-volume, so an audit-only PVEAuditor token gets an empty content listing even when backups exist; the agent detects it lacks Datastore.Allocate (via /access/permissions) and reports the storage 'insufficient privilege to list backups...' (a 'storage' scoped error) WITHOUT the doomed read, rather than guest_backups:[] which would read as 'never backed up'. See scenario backups_no_permission. The server must render such storages' guests as unknown and surface the 'needs Datastore.Allocate' hint.", "guest_backups": "One entry per (vmid, storage[, node]): the LATEST volume's ctime/volid/size, a count, and -- only when the storage reports them -- verification {state: 'ok'|'failed', upid} (PBS), protected, encrypted (PBS). A SHARED storage (PBS/NFS/CIFS) is listed once from the first node where it is active and emitted with node: null; a local storage once per node with node set. Volumes without vmid or ctime are skipped. Sorted by (vmid, storage, node). This is the per-guest signal; the alert is built from it, never from tasks.", "tasks": "Finished vzdump tasks per node (limit 50), JOB-level: status is the free string PVE reports ('OK', 'WARNINGS: <n>', or an error message), passed verbatim and capped -- the server classifies it. id is the vmid only when exactly one guest was backed up (pve-manager VZDump.pm); a scheduled multi-guest job has an empty id, shipped as null. Never attribute a task to a guest.", "jobs": "/cluster/backup definitions trimmed to id/enabled/schedule/storage/vmid/all/exclude/pool/node/mode/comment/next_run (PVE's 'next-run'). Display context and the schedule the server can size a default threshold from.", "not_backed_up": "/cluster/backup-info/not-backed-up verbatim: [{vmid, name, type}] -- guests covered by no job, the signal a job-level webhook can never produce.", "freshness": "The block is computed at most once per 600s and re-emitted with age_s = seconds since it was computed (monotonic). Anchor freshness as received_at - age_s; never trust the agent wall clock. latest_ctime and task starttime/endtime are PVE data timestamps and pass through as-is. In every scenario here age_s is 0 because the block was just computed.", "no_config_key": "The TTL and caps are agent constants. config['proxmox'] is splatted into proxmox_metrics(**config): a key the server started sending would be a TypeError on every older agent and kill the whole Proxmox collector there. Do not add one.", "scrubbing": "Every customer-controlled string (volid, status, comment, upid, name...) is UTF-8-sanitized, NUL-stripped and capped at 500 chars agent-side; the server ingester applies its own scrub regardless."},
   "scenarios": {
     "quorate_cluster": {
       "description": "3-node quorate cluster 'production'. Guests spread across nodes (pve1: vm 100 + ct 200; pve2: vm 101; pve3: stopped ct 201). Shared storage 'ceph-pool' visible on all three nodes (reported 3x, once per node -- server must dedupe) plus a per-node 'local-lvm'. cluster.nodes_online (3) == len(nodes) (3) => nodes_ok. This is the fully-healthy reference shape.",
@@ -109,6 +110,14 @@
           {"name": "ceph-pool", "node": "pve3", "type": "rbd", "total": 10995116277760, "used": 3298534883328, "available": 7696581394432, "active": true},
           {"name": "local-lvm", "node": "pve3", "type": "lvmthin", "total": 68719476736, "used": 10000000000, "available": 58719476736, "active": true}
         ],
+        "backups": {
+          "age_s": 0,
+          "guest_backups": [],
+          "tasks": [],
+          "jobs": [],
+          "not_backed_up": [],
+          "errors": []
+        },
         "collection": {"reachable": true, "cluster_ok": true, "nodes_ok": true, "guests_ok": true, "storage_ok": true, "error": null}
       }
     },
@@ -155,6 +164,16 @@
         "storage": [
           {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 40000000000, "available": 60000000000, "active": true}
         ],
+        "backups": {
+          "age_s": 0,
+          "guest_backups": [],
+          "tasks": [],
+          "jobs": [],
+          "not_backed_up": [],
+          "errors": [
+            {"scope": "storage", "node": "pve2", "storage": null, "message": "storage listing failed: storage boom"}
+          ]
+        },
         "collection": {"reachable": true, "cluster_ok": true, "nodes_ok": false, "guests_ok": false, "storage_ok": false, "error": "node pve2: status query failed"}
       }
     },
@@ -203,6 +222,14 @@
           {"name": "local-lvm", "node": "standalone-pve", "type": "lvmthin", "total": 200000000000, "used": 50000000000, "available": 150000000000, "active": true},
           {"name": "local-zfs", "node": "standalone-pve", "type": "zfspool", "total": 500000000000, "used": 100000000000, "available": 400000000000, "active": true, "pool": "rpool/data"}
         ],
+        "backups": {
+          "age_s": 0,
+          "guest_backups": [],
+          "tasks": [],
+          "jobs": [],
+          "not_backed_up": [],
+          "errors": []
+        },
         "collection": {"reachable": true, "cluster_ok": true, "nodes_ok": true, "guests_ok": true, "storage_ok": true, "error": null}
       }
     },
@@ -276,6 +303,16 @@
           {"name": "local-lvm", "node": "pve1", "type": "lvmthin", "total": 137438953472, "used": 34359738368, "available": 103079215104, "active": true},
           {"name": "local-lvm", "node": "pve3", "type": "lvmthin", "total": 68719476736, "used": 10000000000, "available": 58719476736, "active": true}
         ],
+        "backups": {
+          "age_s": 0,
+          "guest_backups": [],
+          "tasks": [],
+          "jobs": [],
+          "not_backed_up": [],
+          "errors": [
+            {"scope": "storage", "node": "pve2", "storage": null, "message": "storage listing failed: storage boom"}
+          ]
+        },
         "collection": {"reachable": true, "cluster_ok": true, "nodes_ok": false, "guests_ok": false, "storage_ok": false, "error": "node pve2: status query failed"}
       }
     },
@@ -307,6 +344,14 @@
         "storage": [
           {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 25000000000, "available": 75000000000, "active": true}
         ],
+        "backups": {
+          "age_s": 0,
+          "guest_backups": [],
+          "tasks": [],
+          "jobs": [],
+          "not_backed_up": [],
+          "errors": []
+        },
         "collection": {"reachable": true, "cluster_ok": false, "nodes_ok": true, "guests_ok": true, "storage_ok": true, "error": "cluster status query failed"}
       }
     },
@@ -359,7 +404,546 @@
         "storage": [
           {"name": "local-lvm", "node": "pve1", "type": "lvmthin", "total": 137438953472, "used": 34359738368, "available": 103079215104, "active": true}
         ],
+        "backups": {
+          "age_s": 0,
+          "guest_backups": [],
+          "tasks": [],
+          "jobs": [],
+          "not_backed_up": [],
+          "errors": [
+            {"scope": "storage", "node": "pve2", "storage": null, "message": "storage listing failed: storage boom"}
+          ]
+        },
         "collection": {"reachable": true, "cluster_ok": true, "nodes_ok": true, "guests_ok": true, "storage_ok": false, "error": "node pve2: storage query failed"}
+      }
+    },
+    "backups_ok": {
+      "description": "Reference shape for the backups block (#156). 2-node cluster. Shared PBS storage 'pbs-main' is visible on both nodes but LISTED ONCE, from pve1 (the first node where it is active), and emitted with node:null -- pve2's copy of the listing carries a decoy vm 999 entry that MUST NOT appear, proving the second listing never happened. Local 'local' (dir) is listed per node with node set; 'local-lvm' cannot hold backups (content lacks 'backup') and is never listed. vm 100 has two PBS snapshots (aggregated: latest ctime/volid/size/verification, count 2, encrypted from PBS's fingerprint-or-'1' spelling) plus one on local; ct 101 has one PBS snapshot and three on pve2's local. Tasks: pve1 'OK', pve2 'WARNINGS: 1' (verbatim, server classifies); both have an empty id (multi-guest job) -> null. One job with the noise fields (bwlimit/compress/mailto) dropped and next-run -> next_run. vm 105 is in no job. age_s is 0 because the block was just computed.",
+      "api": {
+        "version": {"version": "8.2.4"},
+        "cluster_status": [
+          {"type": "cluster", "name": "production", "quorate": 1, "nodes": 2},
+          {"type": "node", "name": "pve1", "online": 1},
+          {"type": "node", "name": "pve2", "online": 1}
+        ],
+        "nodes": [
+          {"node": "pve1", "status": "online", "cpu": 0.12, "mem": 8589934592, "maxmem": 34359738368},
+          {"node": "pve2", "status": "online", "cpu": 0.34, "mem": 4294967296, "maxmem": 34359738368}
+        ],
+        "node_status_by_name": {
+          "pve1": {"uptime": 864000},
+          "pve2": {"uptime": 432000}
+        },
+        "qemu_by_node": {
+          "pve1": [
+            {"vmid": 100, "name": "web-01", "status": "running", "cpu": 0.05, "mem": 1073741824, "maxmem": 2147483648, "diskread": 1048576, "diskwrite": 2097152, "netin": 3145728, "netout": 4194304, "uptime": 86000}
+          ],
+          "pve2": [
+            {"vmid": 105, "name": "scratch", "status": "stopped", "cpu": 0, "mem": 0, "maxmem": 2147483648, "diskread": 0, "diskwrite": 0, "netin": 0, "netout": 0, "uptime": 0}
+          ]
+        },
+        "lxc_by_node": {
+          "pve1": [],
+          "pve2": [
+            {"vmid": 101, "name": "db-01", "status": "running", "cpu": 0.02, "mem": 536870912, "maxmem": 1073741824, "diskread": 4096, "diskwrite": 8192, "netin": 16384, "netout": 32768, "uptime": 43000}
+          ]
+        },
+        "storage_by_node": {
+          "pve1": [
+            {"storage": "pbs-main", "type": "pbs", "content": "backup", "total": 4398046511104, "used": 1099511627776, "avail": 3298534883328, "active": 1, "shared": 1, "enabled": 1},
+            {"storage": "local", "type": "dir", "content": "iso,vztmpl,backup", "total": 100000000000, "used": 30000000000, "avail": 70000000000, "active": 1, "shared": 0, "enabled": 1},
+            {"storage": "local-lvm", "type": "lvmthin", "content": "images,rootdir", "total": 200000000000, "used": 50000000000, "avail": 150000000000, "active": 1, "shared": 0, "enabled": 1}
+          ],
+          "pve2": [
+            {"storage": "pbs-main", "type": "pbs", "content": "backup", "total": 4398046511104, "used": 1099511627776, "avail": 3298534883328, "active": 1, "shared": 1, "enabled": 1},
+            {"storage": "local", "type": "dir", "content": "iso,vztmpl,backup", "total": 100000000000, "used": 40000000000, "avail": 60000000000, "active": 1, "shared": 0, "enabled": 1}
+          ]
+        },
+        "storage_config": [
+          {"storage": "pbs-main", "type": "pbs", "shared": 1, "content": "backup", "datastore": "main", "server": "pbs.example"},
+          {"storage": "local", "type": "dir", "content": "iso,vztmpl,backup"},
+          {"storage": "local-lvm", "type": "lvmthin", "content": "images,rootdir"}
+        ],
+        "content_by_node_storage": {
+          "pve1": {
+            "pbs-main": [
+              {
+                "volid": "pbs-main:backup/vm/100/2026-09-19T02:00:00Z",
+                "vmid": 100,
+                "ctime": 1789863600,
+                "size": 8489934592,
+                "format": "pbs-vm",
+                "content": "backup",
+                "subtype": "qemu",
+                "protected": 0,
+                "encrypted": "1",
+                "verification": {"state": "ok", "upid": "UPID:pbs:00002A01:0000F1E0:00000000:68CD9A00:verificationjob:main:root@pam:"},
+                "notes": "web-01"
+              },
+              {
+                "volid": "pbs-main:backup/vm/100/2026-09-20T02:00:00Z",
+                "vmid": 100,
+                "ctime": 1789950000,
+                "size": 8589934592,
+                "format": "pbs-vm",
+                "content": "backup",
+                "subtype": "qemu",
+                "protected": 0,
+                "encrypted": "1",
+                "verification": {"state": "ok", "upid": "UPID:pbs:00002A44:0000F3A1:00000000:68CEEB80:verificationjob:main:root@pam:"},
+                "notes": "web-01"
+              },
+              {
+                "volid": "pbs-main:backup/ct/101/2026-09-20T02:05:00Z",
+                "vmid": 101,
+                "ctime": 1789950300,
+                "size": 1073741824,
+                "format": "pbs-ct",
+                "content": "backup",
+                "subtype": "lxc",
+                "protected": 1,
+                "encrypted": "1",
+                "verification": {"state": "failed", "upid": "UPID:pbs:00002A45:0000F3B0:00000000:68CEEC00:verificationjob:main:root@pam:"},
+                "notes": "db-01"
+              }
+            ],
+            "local": [
+              {"volid": "local:backup/vzdump-qemu-100-2026_09_18-02_00_00.vma.zst", "vmid": 100, "ctime": 1789777200, "size": 7516192768, "format": "vma.zst", "content": "backup", "subtype": "qemu", "protected": 0, "notes": "web-01"}
+            ]
+          },
+          "pve2": {
+            "pbs-main": [
+              {"volid": "pbs-main:backup/vm/999/2026-09-20T02:00:00Z", "vmid": 999, "ctime": 1789950000, "size": 1, "format": "pbs-vm", "content": "backup", "subtype": "qemu"}
+            ],
+            "local": [
+              {"volid": "local:backup/vzdump-lxc-101-2026_09_17-02_00_00.tar.zst", "vmid": 101, "ctime": 1789690800, "size": 1000000000, "format": "tar.zst", "content": "backup", "subtype": "lxc", "protected": 0},
+              {"volid": "local:backup/vzdump-lxc-101-2026_09_19-02_00_00.tar.zst", "vmid": 101, "ctime": 1789863600, "size": 1073741824, "format": "tar.zst", "content": "backup", "subtype": "lxc", "protected": 0},
+              {"volid": "local:backup/vzdump-lxc-101-2026_09_18-02_00_00.tar.zst", "vmid": 101, "ctime": 1789777200, "size": 1040000000, "format": "tar.zst", "content": "backup", "subtype": "lxc", "protected": 0}
+            ]
+          }
+        },
+        "tasks_by_node": {
+          "pve1": [
+            {"upid": "UPID:pve1:00001A2B:00001A2B:6AB07380:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1789948800, "endtime": 1789950100, "status": "OK", "user": "root@pam", "type": "vzdump"}
+          ],
+          "pve2": [
+            {"upid": "UPID:pve2:00001B3C:00001B3C:6AB07380:vzdump::root@pam:", "node": "pve2", "id": "", "starttime": 1789948800, "endtime": 1789948900, "status": "WARNINGS: 1", "user": "root@pam", "type": "vzdump"}
+          ]
+        },
+        "backup_jobs": [
+          {"id": "backup-6b2f1a7c-e1d3", "type": "vzdump", "enabled": 1, "schedule": "02:00", "storage": "pbs-main", "vmid": "100,101", "mode": "snapshot", "next-run": 1790035200, "bwlimit": 0, "compress": "zstd", "mailto": "root@localhost", "mailnotification": "failure", "notes-template": "{{guestname}}"}
+        ],
+        "not_backed_up": [
+          {"vmid": 105, "name": "scratch", "type": "qemu"}
+        ]
+      },
+      "payload": {
+        "version": "8.2.4",
+        "cluster": {"name": "production", "quorate": true, "nodes": 2, "nodes_online": 2},
+        "nodes": [
+          {"name": "pve1", "status": "online", "cpu_usage": 0.12, "memory_used": 8589934592, "memory_total": 34359738368, "uptime": 864000, "vms_running": 1, "lxc_running": 0},
+          {"name": "pve2", "status": "online", "cpu_usage": 0.34, "memory_used": 4294967296, "memory_total": 34359738368, "uptime": 432000, "vms_running": 0, "lxc_running": 1}
+        ],
+        "vms": [
+          {"vmid": 100, "name": "web-01", "node": "pve1", "status": "running", "cpu_usage": 0.05, "memory_used": 1073741824, "memory_max": 2147483648, "disk_read": 1048576, "disk_write": 2097152, "net_in": 3145728, "net_out": 4194304, "uptime": 86000},
+          {"vmid": 105, "name": "scratch", "node": "pve2", "status": "stopped", "cpu_usage": 0, "memory_used": 0, "memory_max": 2147483648, "disk_read": 0, "disk_write": 0, "net_in": 0, "net_out": 0, "uptime": 0}
+        ],
+        "lxc": [
+          {"vmid": 101, "name": "db-01", "node": "pve2", "status": "running", "cpu_usage": 0.02, "memory_used": 536870912, "memory_max": 1073741824, "disk_read": 4096, "disk_write": 8192, "net_in": 16384, "net_out": 32768, "uptime": 43000}
+        ],
+        "storage": [
+          {"name": "pbs-main", "node": "pve1", "type": "pbs", "total": 4398046511104, "used": 1099511627776, "available": 3298534883328, "active": true},
+          {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 30000000000, "available": 70000000000, "active": true},
+          {"name": "local-lvm", "node": "pve1", "type": "lvmthin", "total": 200000000000, "used": 50000000000, "available": 150000000000, "active": true},
+          {"name": "pbs-main", "node": "pve2", "type": "pbs", "total": 4398046511104, "used": 1099511627776, "available": 3298534883328, "active": true},
+          {"name": "local", "node": "pve2", "type": "dir", "total": 100000000000, "used": 40000000000, "available": 60000000000, "active": true}
+        ],
+        "backups": {
+          "age_s": 0,
+          "guest_backups": [
+            {"vmid": 100, "storage": "local", "node": "pve1", "latest_ctime": 1789777200, "latest_volid": "local:backup/vzdump-qemu-100-2026_09_18-02_00_00.vma.zst", "latest_size": 7516192768, "count": 1, "protected": false},
+            {
+              "vmid": 100,
+              "storage": "pbs-main",
+              "node": null,
+              "latest_ctime": 1789950000,
+              "latest_volid": "pbs-main:backup/vm/100/2026-09-20T02:00:00Z",
+              "latest_size": 8589934592,
+              "count": 2,
+              "verification": {"state": "ok", "upid": "UPID:pbs:00002A44:0000F3A1:00000000:68CEEB80:verificationjob:main:root@pam:"},
+              "protected": false,
+              "encrypted": true
+            },
+            {"vmid": 101, "storage": "local", "node": "pve2", "latest_ctime": 1789863600, "latest_volid": "local:backup/vzdump-lxc-101-2026_09_19-02_00_00.tar.zst", "latest_size": 1073741824, "count": 3, "protected": false},
+            {
+              "vmid": 101,
+              "storage": "pbs-main",
+              "node": null,
+              "latest_ctime": 1789950300,
+              "latest_volid": "pbs-main:backup/ct/101/2026-09-20T02:05:00Z",
+              "latest_size": 1073741824,
+              "count": 1,
+              "verification": {"state": "failed", "upid": "UPID:pbs:00002A45:0000F3B0:00000000:68CEEC00:verificationjob:main:root@pam:"},
+              "protected": true,
+              "encrypted": true
+            }
+          ],
+          "tasks": [
+            {"upid": "UPID:pve1:00001A2B:00001A2B:6AB07380:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1789948800, "endtime": 1789950100, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve2:00001B3C:00001B3C:6AB07380:vzdump::root@pam:", "node": "pve2", "id": null, "starttime": 1789948800, "endtime": 1789948900, "status": "WARNINGS: 1", "user": "root@pam"}
+          ],
+          "jobs": [
+            {"id": "backup-6b2f1a7c-e1d3", "enabled": true, "schedule": "02:00", "storage": "pbs-main", "vmid": "100,101", "all": false, "exclude": null, "pool": null, "node": null, "mode": "snapshot", "comment": null, "next_run": 1790035200}
+          ],
+          "not_backed_up": [
+            {"vmid": 105, "name": "scratch", "type": "qemu"}
+          ],
+          "errors": []
+        },
+        "collection": {"reachable": true, "cluster_ok": true, "nodes_ok": true, "guests_ok": true, "storage_ok": true, "error": null}
+      }
+    },
+    "backups_storage_partial": {
+      "description": "Partial backups read (#156 rule 1). Standalone node with a shared PBS 'pbs-main' whose content listing raises and a local 'local' that lists fine. The block is still emitted: vm 100's backup on 'local' is present, and errors[] carries ONE entry naming the failed storage (scope 'storage', storage 'pbs-main', node = the node the listing was attempted from, message = the API's reason). The server's asymmetric rule hangs on that entry: ct 101, which has no backup anywhere in this payload, must read as UNKNOWN (its backups may be on pbs-main), never as 'never backed up'. collection stays all-true: the block never touches the flags (rule 2).",
+      "api": {
+        "version": {"version": "8.2.4"},
+        "cluster_status": [],
+        "nodes": [
+          {"node": "pve1", "status": "online", "cpu": 0.1, "mem": 4294967296, "maxmem": 17179869184}
+        ],
+        "node_status_by_name": {
+          "pve1": {"uptime": 864000}
+        },
+        "qemu_by_node": {
+          "pve1": [
+            {"vmid": 100, "name": "web-01", "status": "running", "cpu": 0.05, "mem": 1073741824, "maxmem": 2147483648, "diskread": 1048576, "diskwrite": 2097152, "netin": 3145728, "netout": 4194304, "uptime": 86000}
+          ]
+        },
+        "lxc_by_node": {
+          "pve1": [
+            {"vmid": 101, "name": "db-01", "status": "running", "cpu": 0.02, "mem": 536870912, "maxmem": 1073741824, "diskread": 4096, "diskwrite": 8192, "netin": 16384, "netout": 32768, "uptime": 43000}
+          ]
+        },
+        "storage_by_node": {
+          "pve1": [
+            {"storage": "pbs-main", "type": "pbs", "content": "backup", "total": 4398046511104, "used": 1099511627776, "avail": 3298534883328, "active": 1, "shared": 1, "enabled": 1},
+            {"storage": "local", "type": "dir", "content": "iso,vztmpl,backup", "total": 100000000000, "used": 30000000000, "avail": 70000000000, "active": 1, "shared": 0, "enabled": 1}
+          ]
+        },
+        "storage_config": [
+          {"storage": "pbs-main", "type": "pbs", "shared": 1, "content": "backup", "datastore": "main", "server": "pbs.example"},
+          {"storage": "local", "type": "dir", "content": "iso,vztmpl,backup"}
+        ],
+        "content_by_node_storage": {
+          "pve1": {
+            "local": [
+              {"volid": "local:backup/vzdump-qemu-100-2026_09_20-02_00_00.vma.zst", "vmid": 100, "ctime": 1789950000, "size": 7516192768, "format": "vma.zst", "content": "backup", "subtype": "qemu", "protected": 0}
+            ]
+          }
+        },
+        "content_raises_for": ["pve1/pbs-main"],
+        "tasks_by_node": {
+          "pve1": [
+            {"upid": "UPID:pve1:00001A2B:00001A2B:6AB07380:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1789948800, "endtime": 1789950100, "status": "OK", "user": "root@pam", "type": "vzdump"}
+          ]
+        },
+        "backup_jobs": [
+          {"id": "backup-6b2f1a7c-e1d3", "type": "vzdump", "enabled": 1, "schedule": "02:00", "storage": "pbs-main", "all": 1, "mode": "snapshot", "next-run": 1790035200}
+        ],
+        "not_backed_up": []
+      },
+      "payload": {
+        "version": "8.2.4",
+        "cluster": null,
+        "nodes": [
+          {"name": "pve1", "status": "online", "cpu_usage": 0.1, "memory_used": 4294967296, "memory_total": 17179869184, "uptime": 864000, "vms_running": 1, "lxc_running": 1}
+        ],
+        "vms": [
+          {"vmid": 100, "name": "web-01", "node": "pve1", "status": "running", "cpu_usage": 0.05, "memory_used": 1073741824, "memory_max": 2147483648, "disk_read": 1048576, "disk_write": 2097152, "net_in": 3145728, "net_out": 4194304, "uptime": 86000}
+        ],
+        "lxc": [
+          {"vmid": 101, "name": "db-01", "node": "pve1", "status": "running", "cpu_usage": 0.02, "memory_used": 536870912, "memory_max": 1073741824, "disk_read": 4096, "disk_write": 8192, "net_in": 16384, "net_out": 32768, "uptime": 43000}
+        ],
+        "storage": [
+          {"name": "pbs-main", "node": "pve1", "type": "pbs", "total": 4398046511104, "used": 1099511627776, "available": 3298534883328, "active": true},
+          {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 30000000000, "available": 70000000000, "active": true}
+        ],
+        "backups": {
+          "age_s": 0,
+          "guest_backups": [
+            {"vmid": 100, "storage": "local", "node": "pve1", "latest_ctime": 1789950000, "latest_volid": "local:backup/vzdump-qemu-100-2026_09_20-02_00_00.vma.zst", "latest_size": 7516192768, "count": 1, "protected": false}
+          ],
+          "tasks": [
+            {"upid": "UPID:pve1:00001A2B:00001A2B:6AB07380:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1789948800, "endtime": 1789950100, "status": "OK", "user": "root@pam"}
+          ],
+          "jobs": [
+            {"id": "backup-6b2f1a7c-e1d3", "enabled": true, "schedule": "02:00", "storage": "pbs-main", "vmid": null, "all": true, "exclude": null, "pool": null, "node": null, "mode": "snapshot", "comment": null, "next_run": 1790035200}
+          ],
+          "not_backed_up": [],
+          "errors": [
+            {"scope": "storage", "node": "pve1", "storage": "pbs-main", "message": "content listing failed: content boom"}
+          ]
+        },
+        "collection": {"reachable": true, "cluster_ok": true, "nodes_ok": true, "guests_ok": true, "storage_ok": true, "error": null}
+      }
+    },
+    "backups_block_failed": {
+      "description": "backups:null (#156 rule 1, middle level). The node listing succeeds for the five flagged sections (nodes_raises_from_call=5: collect() lists nodes once per section in the fixed order nodes/vms/lxc/storage/backups, so the 5th call -- the backups build -- is the first to raise). Nothing in the block can be read without the node list, so the whole block is null rather than an object with empty arrays that would read as 'no backups anywhere'. collection is all-true and error is null: the failure is NOT threaded through the flags (rule 2), and store_if keeps the None out of the TTL cache so the next tick retries.",
+      "api": {
+        "version": {"version": "8.2.4"},
+        "cluster_status": [],
+        "nodes": [
+          {"node": "pve1", "status": "online", "cpu": 0.1, "mem": 4294967296, "maxmem": 17179869184}
+        ],
+        "nodes_raises_from_call": 5,
+        "node_status_by_name": {
+          "pve1": {"uptime": 864000}
+        },
+        "qemu_by_node": {
+          "pve1": []
+        },
+        "lxc_by_node": {
+          "pve1": []
+        },
+        "storage_by_node": {
+          "pve1": [
+            {"storage": "local", "type": "dir", "content": "iso,vztmpl,backup", "total": 100000000000, "used": 30000000000, "avail": 70000000000, "active": 1, "shared": 0, "enabled": 1}
+          ]
+        }
+      },
+      "payload": {
+        "version": "8.2.4",
+        "cluster": null,
+        "nodes": [
+          {"name": "pve1", "status": "online", "cpu_usage": 0.1, "memory_used": 4294967296, "memory_total": 17179869184, "uptime": 864000, "vms_running": 0, "lxc_running": 0}
+        ],
+        "vms": [],
+        "lxc": [],
+        "storage": [
+          {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 30000000000, "available": 70000000000, "active": true}
+        ],
+        "backups": null,
+        "collection": {"reachable": true, "cluster_ok": true, "nodes_ok": true, "guests_ok": true, "storage_ok": true, "error": null}
+      }
+    },
+    "backups_capped": {
+      "description": "Cap trimming is never silent (#156 rule 5). PVE is asked for limit=50 vzdump tasks per node; this node answers 51 (a PVE that ignored the limit). The agent keeps the first 50 and adds an errors[] entry with scope 'cap' naming the node, so a trimmed array is never mistaken for a complete one. guest_backups (5000), jobs (200) and not_backed_up (2000) trim the same way (unit-tested; too large to pin here).",
+      "api": {
+        "version": {"version": "8.2.4"},
+        "cluster_status": [],
+        "nodes": [
+          {"node": "pve1", "status": "online", "cpu": 0.1, "mem": 4294967296, "maxmem": 17179869184}
+        ],
+        "node_status_by_name": {
+          "pve1": {"uptime": 864000}
+        },
+        "qemu_by_node": {
+          "pve1": []
+        },
+        "lxc_by_node": {
+          "pve1": []
+        },
+        "storage_by_node": {
+          "pve1": [
+            {"storage": "local", "type": "dir", "content": "iso,vztmpl,backup", "total": 100000000000, "used": 30000000000, "avail": 70000000000, "active": 1, "shared": 0, "enabled": 1}
+          ]
+        },
+        "tasks_by_node": {
+          "pve1": [
+            {"upid": "UPID:pve1:00002000:00002000:6AB07380:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1789948800, "endtime": 1789950100, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002001:00002001:6AAF2200:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1789862400, "endtime": 1789863700, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002002:00002002:6AADD080:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1789776000, "endtime": 1789777300, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002003:00002003:6AAC7F00:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1789689600, "endtime": 1789690900, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002004:00002004:6AAB2D80:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1789603200, "endtime": 1789604500, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002005:00002005:6AA9DC00:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1789516800, "endtime": 1789518100, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002006:00002006:6AA88A80:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1789430400, "endtime": 1789431700, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002007:00002007:6AA73900:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1789344000, "endtime": 1789345300, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002008:00002008:6AA5E780:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1789257600, "endtime": 1789258900, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002009:00002009:6AA49600:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1789171200, "endtime": 1789172500, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:0000200A:0000200A:6AA34480:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1789084800, "endtime": 1789086100, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:0000200B:0000200B:6AA1F300:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1788998400, "endtime": 1788999700, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:0000200C:0000200C:6AA0A180:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1788912000, "endtime": 1788913300, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:0000200D:0000200D:6A9F5000:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1788825600, "endtime": 1788826900, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:0000200E:0000200E:6A9DFE80:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1788739200, "endtime": 1788740500, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:0000200F:0000200F:6A9CAD00:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1788652800, "endtime": 1788654100, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002010:00002010:6A9B5B80:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1788566400, "endtime": 1788567700, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002011:00002011:6A9A0A00:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1788480000, "endtime": 1788481300, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002012:00002012:6A98B880:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1788393600, "endtime": 1788394900, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002013:00002013:6A976700:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1788307200, "endtime": 1788308500, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002014:00002014:6A961580:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1788220800, "endtime": 1788222100, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002015:00002015:6A94C400:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1788134400, "endtime": 1788135700, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002016:00002016:6A937280:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1788048000, "endtime": 1788049300, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002017:00002017:6A922100:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1787961600, "endtime": 1787962900, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002018:00002018:6A90CF80:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1787875200, "endtime": 1787876500, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002019:00002019:6A8F7E00:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1787788800, "endtime": 1787790100, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:0000201A:0000201A:6A8E2C80:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1787702400, "endtime": 1787703700, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:0000201B:0000201B:6A8CDB00:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1787616000, "endtime": 1787617300, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:0000201C:0000201C:6A8B8980:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1787529600, "endtime": 1787530900, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:0000201D:0000201D:6A8A3800:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1787443200, "endtime": 1787444500, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:0000201E:0000201E:6A88E680:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1787356800, "endtime": 1787358100, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:0000201F:0000201F:6A879500:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1787270400, "endtime": 1787271700, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002020:00002020:6A864380:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1787184000, "endtime": 1787185300, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002021:00002021:6A84F200:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1787097600, "endtime": 1787098900, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002022:00002022:6A83A080:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1787011200, "endtime": 1787012500, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002023:00002023:6A824F00:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1786924800, "endtime": 1786926100, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002024:00002024:6A80FD80:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1786838400, "endtime": 1786839700, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002025:00002025:6A7FAC00:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1786752000, "endtime": 1786753300, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002026:00002026:6A7E5A80:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1786665600, "endtime": 1786666900, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002027:00002027:6A7D0900:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1786579200, "endtime": 1786580500, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002028:00002028:6A7BB780:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1786492800, "endtime": 1786494100, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002029:00002029:6A7A6600:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1786406400, "endtime": 1786407700, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:0000202A:0000202A:6A791480:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1786320000, "endtime": 1786321300, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:0000202B:0000202B:6A77C300:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1786233600, "endtime": 1786234900, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:0000202C:0000202C:6A767180:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1786147200, "endtime": 1786148500, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:0000202D:0000202D:6A752000:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1786060800, "endtime": 1786062100, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:0000202E:0000202E:6A73CE80:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1785974400, "endtime": 1785975700, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:0000202F:0000202F:6A727D00:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1785888000, "endtime": 1785889300, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002030:00002030:6A712B80:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1785801600, "endtime": 1785802900, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002031:00002031:6A6FDA00:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1785715200, "endtime": 1785716500, "status": "OK", "user": "root@pam", "type": "vzdump"},
+            {"upid": "UPID:pve1:00002032:00002032:6A6E8880:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1785628800, "endtime": 1785630100, "status": "OK", "user": "root@pam", "type": "vzdump"}
+          ]
+        }
+      },
+      "payload": {
+        "version": "8.2.4",
+        "cluster": null,
+        "nodes": [
+          {"name": "pve1", "status": "online", "cpu_usage": 0.1, "memory_used": 4294967296, "memory_total": 17179869184, "uptime": 864000, "vms_running": 0, "lxc_running": 0}
+        ],
+        "vms": [],
+        "lxc": [],
+        "storage": [
+          {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 30000000000, "available": 70000000000, "active": true}
+        ],
+        "backups": {
+          "age_s": 0,
+          "guest_backups": [],
+          "tasks": [
+            {"upid": "UPID:pve1:00002000:00002000:6AB07380:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1789948800, "endtime": 1789950100, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002001:00002001:6AAF2200:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1789862400, "endtime": 1789863700, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002002:00002002:6AADD080:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1789776000, "endtime": 1789777300, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002003:00002003:6AAC7F00:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1789689600, "endtime": 1789690900, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002004:00002004:6AAB2D80:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1789603200, "endtime": 1789604500, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002005:00002005:6AA9DC00:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1789516800, "endtime": 1789518100, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002006:00002006:6AA88A80:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1789430400, "endtime": 1789431700, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002007:00002007:6AA73900:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1789344000, "endtime": 1789345300, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002008:00002008:6AA5E780:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1789257600, "endtime": 1789258900, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002009:00002009:6AA49600:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1789171200, "endtime": 1789172500, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:0000200A:0000200A:6AA34480:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1789084800, "endtime": 1789086100, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:0000200B:0000200B:6AA1F300:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1788998400, "endtime": 1788999700, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:0000200C:0000200C:6AA0A180:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1788912000, "endtime": 1788913300, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:0000200D:0000200D:6A9F5000:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1788825600, "endtime": 1788826900, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:0000200E:0000200E:6A9DFE80:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1788739200, "endtime": 1788740500, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:0000200F:0000200F:6A9CAD00:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1788652800, "endtime": 1788654100, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002010:00002010:6A9B5B80:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1788566400, "endtime": 1788567700, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002011:00002011:6A9A0A00:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1788480000, "endtime": 1788481300, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002012:00002012:6A98B880:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1788393600, "endtime": 1788394900, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002013:00002013:6A976700:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1788307200, "endtime": 1788308500, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002014:00002014:6A961580:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1788220800, "endtime": 1788222100, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002015:00002015:6A94C400:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1788134400, "endtime": 1788135700, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002016:00002016:6A937280:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1788048000, "endtime": 1788049300, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002017:00002017:6A922100:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1787961600, "endtime": 1787962900, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002018:00002018:6A90CF80:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1787875200, "endtime": 1787876500, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002019:00002019:6A8F7E00:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1787788800, "endtime": 1787790100, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:0000201A:0000201A:6A8E2C80:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1787702400, "endtime": 1787703700, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:0000201B:0000201B:6A8CDB00:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1787616000, "endtime": 1787617300, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:0000201C:0000201C:6A8B8980:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1787529600, "endtime": 1787530900, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:0000201D:0000201D:6A8A3800:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1787443200, "endtime": 1787444500, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:0000201E:0000201E:6A88E680:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1787356800, "endtime": 1787358100, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:0000201F:0000201F:6A879500:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1787270400, "endtime": 1787271700, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002020:00002020:6A864380:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1787184000, "endtime": 1787185300, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002021:00002021:6A84F200:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1787097600, "endtime": 1787098900, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002022:00002022:6A83A080:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1787011200, "endtime": 1787012500, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002023:00002023:6A824F00:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1786924800, "endtime": 1786926100, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002024:00002024:6A80FD80:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1786838400, "endtime": 1786839700, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002025:00002025:6A7FAC00:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1786752000, "endtime": 1786753300, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002026:00002026:6A7E5A80:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1786665600, "endtime": 1786666900, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002027:00002027:6A7D0900:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1786579200, "endtime": 1786580500, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002028:00002028:6A7BB780:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1786492800, "endtime": 1786494100, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002029:00002029:6A7A6600:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1786406400, "endtime": 1786407700, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:0000202A:0000202A:6A791480:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1786320000, "endtime": 1786321300, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:0000202B:0000202B:6A77C300:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1786233600, "endtime": 1786234900, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:0000202C:0000202C:6A767180:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1786147200, "endtime": 1786148500, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:0000202D:0000202D:6A752000:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1786060800, "endtime": 1786062100, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:0000202E:0000202E:6A73CE80:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1785974400, "endtime": 1785975700, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:0000202F:0000202F:6A727D00:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1785888000, "endtime": 1785889300, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002030:00002030:6A712B80:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1785801600, "endtime": 1785802900, "status": "OK", "user": "root@pam"},
+            {"upid": "UPID:pve1:00002031:00002031:6A6FDA00:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1785715200, "endtime": 1785716500, "status": "OK", "user": "root@pam"}
+          ],
+          "jobs": [],
+          "not_backed_up": [],
+          "errors": [
+            {"scope": "cap", "node": "pve1", "storage": null, "message": "tasks capped at 50: 1 dropped"}
+          ]
+        },
+        "collection": {"reachable": true, "cluster_ok": true, "nodes_ok": true, "guests_ok": true, "storage_ok": true, "error": null}
+      }
+    },
+    "backups_no_permission": {
+      "description": "#156 permission fail-safe. A PVEAuditor (audit-only) token: PVE returns HTTP 200 for the storage content endpoint but FILTERS OUT the backup volumes per-volume, so the read is empty even though a backup exists. The agent detects (via /access/permissions) that it lacks Datastore.Allocate and reports the storage UNKNOWN -- a 'storage' error carrying the Datastore.Allocate hint -- WITHOUT issuing the doomed content read, rather than emitting guest_backups:[] which the server would read as 'never backed up'. Confirmed on a real PVE: root sees the volume, the audit token sees []. The server must treat this storage's guests as unknown and surface the 'needs Datastore.Allocate' hint, never 'never backed up'.",
+      "api": {
+        "version": {"version": "8.2.4"},
+        "cluster_status": [],
+        "nodes": [
+          {"node": "pve1", "status": "online", "cpu": 0.1, "mem": 4294967296, "maxmem": 17179869184}
+        ],
+        "node_status_by_name": {
+          "pve1": {"uptime": 864000}
+        },
+        "qemu_by_node": {
+          "pve1": [
+            {"vmid": 100, "name": "web-01", "status": "running", "cpu": 0.05, "mem": 1073741824, "maxmem": 2147483648, "diskread": 1048576, "diskwrite": 2097152, "netin": 3145728, "netout": 4194304, "uptime": 86000}
+          ]
+        },
+        "lxc_by_node": {
+          "pve1": []
+        },
+        "storage_by_node": {
+          "pve1": [
+            {"storage": "local", "type": "dir", "content": "iso,vztmpl,backup", "total": 100000000000, "used": 30000000000, "avail": 70000000000, "active": 1, "shared": 0, "enabled": 1}
+          ]
+        },
+        "content_by_node_storage": {
+          "pve1": {
+            "local": [
+              {"volid": "local:backup/vzdump-qemu-100-2026_09_20-02_00_00.vma.zst", "vmid": 100, "ctime": 1789950000, "size": 7516192768, "format": "vma.zst", "content": "backup", "subtype": "qemu"}
+            ]
+          }
+        },
+        "permissions": {
+          "/storage/local": {"Datastore.Audit": 1, "VM.Audit": 1, "Sys.Audit": 1}
+        },
+        "backup_jobs": [
+          {"id": "backup-6b2f1a7c-e1d3", "type": "vzdump", "enabled": 1, "schedule": "02:00", "storage": "local", "all": 1, "mode": "snapshot", "next-run": 1790035200}
+        ],
+        "not_backed_up": []
+      },
+      "payload": {
+        "version": "8.2.4",
+        "cluster": null,
+        "nodes": [
+          {"name": "pve1", "status": "online", "cpu_usage": 0.1, "memory_used": 4294967296, "memory_total": 17179869184, "uptime": 864000, "vms_running": 1, "lxc_running": 0}
+        ],
+        "vms": [
+          {"vmid": 100, "name": "web-01", "node": "pve1", "status": "running", "cpu_usage": 0.05, "memory_used": 1073741824, "memory_max": 2147483648, "disk_read": 1048576, "disk_write": 2097152, "net_in": 3145728, "net_out": 4194304, "uptime": 86000}
+        ],
+        "lxc": [],
+        "storage": [
+          {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 30000000000, "available": 70000000000, "active": true}
+        ],
+        "backups": {
+          "age_s": 0,
+          "guest_backups": [],
+          "tasks": [],
+          "jobs": [
+            {"id": "backup-6b2f1a7c-e1d3", "enabled": true, "schedule": "02:00", "storage": "local", "vmid": null, "all": true, "exclude": null, "pool": null, "node": null, "mode": "snapshot", "comment": null, "next_run": 1790035200}
+          ],
+          "not_backed_up": [],
+          "errors": [
+            {"scope": "storage", "node": "pve1", "storage": "local", "message": "insufficient privilege to list backups: the token needs Datastore.Allocate on this storage (PVEAuditor cannot see backup volumes)"}
+          ]
+        },
+        "collection": {"reachable": true, "cluster_ok": true, "nodes_ok": true, "guests_ok": true, "storage_ok": true, "error": null}
       }
     }
   }
