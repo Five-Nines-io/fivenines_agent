@@ -1,56 +1,16 @@
 # TODOS
 
-## P1: Proxmox backups block (#156) -- CONFIRMED: PVEAuditor cannot see backup volumes
+## Proxmox backups phase 2 -- server half tracked in fivenines_server#1164
 
-Agent 1.19.0 ships `data["proxmox"]["backups"]` (per-guest latest backup per
-storage, vzdump task outcomes, backup jobs, not-backed-up guests; contract in
-`tests/fixtures/proxmox_contract_payload.json` `backups_contract` + the
-`backups_*` scenarios).
-
-**Runtime finding (proven on a real PVE, 2026-09-21).** The design's Open
-Question #1 is answered and the answer is NO: `PVEAuditor` does NOT cover the
-per-guest content read. PVE's `/nodes/{n}/storage/{s}/content?content=backup`
-filters backup volumes PER-VOLUME, so an audit-only token gets HTTP 200 with the
-backups REMOVED -- indistinguishable from a storage with none. Evidence: with a
-`root@pam!local` token holding exactly the PVEAuditor audit privileges
-(`Datastore.Audit`, `VM.Audit`, `Sys.Audit`, ...), root's API showed
-`vzdump-qemu-114-...vma.zst` on `node2/local` while the token's content read
-returned `{"data":[]}`. The other three reads (`/cluster/backup`,
-`/cluster/backup-info/not-backed-up`, `/nodes/{n}/tasks?typefilter=vzdump`) DO
-work under PVEAuditor.
-
-- **Agent side (DONE in this PR).** Fail-safe: `_effective_permissions` reads
-  `/access/permissions`; for any backup-capable storage where the token lacks
-  `Datastore.Allocate` (`_has_backup_read_priv`, checked on the storage path or
-  an ancestor), the collector reports the storage `unknown` -- a `storage`
-  scoped error with the `needs Datastore.Allocate` hint -- WITHOUT the doomed
-  content read, so a missing privilege can never render as a false "never backed
-  up". Scenario `backups_no_permission` pins it. (Confirm the exact minimal
-  privilege with the pveum `Datastore.Allocate` test noted in the PR; if a
-  narrower read-capable privilege exists on some PVE versions, widen
-  `_has_backup_read_priv` accordingly.)
-- **Server / setup guide (TODO, server companion).** For customers to get
-  per-guest backup age at all, the Proxmox setup guide (`SetupGuides::PROXMOX`,
-  server `docs/proxmox.md`) must grant `Datastore.Allocate` on the backup
-  storages (e.g. `pveum acl modify /storage/<sid> --roles PVEDatastoreAdmin`, or
-  a custom least-privilege role), IN ADDITION to `PVEAuditor` at `/`. This is a
-  rollout + security decision (a monitoring token gaining an allocate-class
-  privilege): FOUNDER CALL, flagged 2026-09-21. Until then every backup storage
-  reads `unknown` (safe, no false alarms) and the dashboard should surface the
-  "grant Datastore.Allocate" hint from `errors[].message`.
-- **Server half of phase 2** (design: fivenines_server
-  `docs/designs/proxmox-backup-monitoring.md`, branch `proxmox-backup-history`;
-  phase 1 is fivenines_server#1159). Copy the fixture over
-  `spec/fixtures/proxmox_contract_payload.json` byte-for-byte, add
-  `proxmox_guests.backups_synced_at` + the three-state unknown/never/aged
-  column, the `proxmox_guest_backup_stale` trigger with `:paused` on lost
-  visibility (the `prometheus_targets_down` posture, not `zfs_pool_health`), and
-  the asymmetric partial-read rule keyed on `errors[].storage` (a storage with a
-  permission/shape/deadline error -> its guests are `unknown`, never `never`).
-
-- **Effort:** S (human, needs a real PVE) / M (CC, server)
-- **Depends on:** agent PR for #156 merged; founder decision on the
-  Datastore.Allocate rollout
+Agent side is DONE (PR #158, v1.19.0): the `data["proxmox"]["backups"]` block
+plus the permission fail-safe. Everything server-side has moved to
+**fivenines_server#1164** and is out of scope for this repo: the runtime finding
+that `PVEAuditor` cannot see backup volumes (needs `Datastore.Allocate`,
+confirmed on a real PVE 2026-09-21),
+the founder Tier-A/Tier-B rollout decision, the `SetupGuides::PROXMOX`
+`Datastore.Allocate` step, the byte-identical `spec/fixtures/proxmox_contract_payload.json`
+copy, and the ingest / per-guest-age model / `proxmox_guest_backup_stale`
+trigger. Design: fivenines_server `docs/designs/proxmox-backup-monitoring.md`.
 
 ## P1: Reconcile the server's copy of ubuntu_pro_contract_payload.json
 
