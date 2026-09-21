@@ -6,9 +6,10 @@ session, the synchronizer TLS context). Tests patch the underlying functions
 per test, so any cached value leaking across tests makes them order-dependent;
 the first autouse fixture resets every such cache before each test.
 
-The second keeps the suite off host state it would otherwise read: the host's
-own IPv6 configuration (get_ip(ipv6=True) short-circuits when there is no
-routable IPv6 address, which is most CI runners).
+The other two keep the suite off host state it would otherwise read: the
+operator's journal allowlist under CONFIG_DIR, and the host's own IPv6
+configuration (get_ip(ipv6=True) short-circuits when there is no routable
+IPv6 address, which is most CI runners).
 """
 
 import os
@@ -21,6 +22,7 @@ import fivenines_agent.docker as docker_module
 import fivenines_agent.fail2ban as fail2ban_module
 import fivenines_agent.gpu as gpu_module
 import fivenines_agent.ip as ip_module
+import fivenines_agent.journal_policy as journal_policy
 import fivenines_agent.mysql as mysql_module
 import fivenines_agent.packages as packages_module
 import fivenines_agent.qemu as qemu_module
@@ -44,7 +46,26 @@ def _reset_process_caches():
     # register and the LIBVIRT_AUTOSTART it writes into the real environment.
     qemu_module._clear_refusal()  # the production reset path, not a bare assignment
     os.environ.pop("LIBVIRT_AUTOSTART", None)
+    journal_policy.reset_cache()
     yield
+
+
+@pytest.fixture(autouse=True)
+def _no_host_journal_policy(tmp_path_factory, monkeypatch):
+    """Keep the suite off the real host's journal allowlist.
+
+    journal_policy reads CONFIG_DIR/journal_units.allow, and env.config_dir()
+    falls back to /etc/fivenines_agent. Without this, a developer who actually
+    uses the feature cannot run the suite: an allowlist on the box makes the
+    positive-control tests for all four journal read paths fail (measured: 12
+    failures across test_logs, test_log_signals, test_log_capture,
+    test_systemd). test_journal_policy.py's own config_dir fixture overrides
+    this one, which is what lets it exercise a real file.
+    """
+    monkeypatch.setenv("CONFIG_DIR", str(tmp_path_factory.mktemp("cfg")))
+    journal_policy.reset_cache()
+    yield
+    journal_policy.reset_cache()
 
 
 @pytest.fixture(autouse=True)

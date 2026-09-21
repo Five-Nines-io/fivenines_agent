@@ -49,6 +49,7 @@ import re
 import shutil
 import subprocess
 
+from fivenines_agent import journal_policy
 from fivenines_agent.cgroup import detect_hierarchy, read_unit_resources
 from fivenines_agent.cgroup import reset_cache as cgroup_reset_cache
 from fivenines_agent.debug import debug, log
@@ -1025,6 +1026,14 @@ class SystemdCollector:
 
     def _journal_tail(self, unit_name):
         """Last few error-priority journal lines for a unit."""
+        # The failure drilldown ships redacted journal content off the box
+        # exactly like the logs collector does, so it honours the same local
+        # allowlist: journal_units.allow bounds EVERY journal read the agent
+        # makes, not just the ones the logs feature drives. An empty tail is
+        # already this method's failure contract, so a refusal degrades the
+        # drilldown instead of blanking the unit's health.
+        if not journal_policy.unit_allowed(unit_name):
+            return []
         args = [
             "-u",
             unit_name,

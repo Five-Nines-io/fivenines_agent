@@ -10,6 +10,22 @@ User=fivenines
 # system installs. The group ships with systemd's sysusers config on every
 # packaged distro. Caveat: on hand-rolled images that stripped the group,
 # systemd fails the unit with status 216/GROUP -- remove this line there.
+#
+# TO TAKE JOURNAL ACCESS AWAY on a host that does not need log monitoring,
+# use a drop-in rather than editing this line (the updater overwrites this
+# file; drop-ins survive it):
+#
+#   sudo systemctl edit fivenines-agent
+#     [Service]
+#     SupplementaryGroups=
+#   sudo systemctl restart fivenines-agent
+#
+# The empty assignment RESETS the list rather than adding to it. After the
+# restart the journald capability probes false, the logs collector is gated
+# off, and the systemd failure drilldown ships empty journal tails; every
+# other metric is unaffected. To keep log monitoring but bound WHICH units
+# the agent may read, leave this line alone and write a
+# journal_units.allow file in the config dir instead (see the README).
 SupplementaryGroups=systemd-journal
 # This unit grants NO capability on purpose. The one collector that needs
 # privileged kernel access (WireGuard: `wg show all dump` reads device state
