@@ -205,6 +205,29 @@ def test_a_path_form_unit_is_refused(config_dir):
     assert journal_policy.unit_allowed("var-log.mount") is False
 
 
+def test_only_the_legal_unit_name_charset_is_accepted(config_dir):
+    """The decisive rule: the string the policy authorizes must be the string
+    journalctl reads. journalctl rewrites anything outside systemd's legal
+    charset into an escape, so `app-+.service` would be selected as
+    `app-\\x2b.service` -- a unit the policy never saw. Enumerating the bad
+    characters loses that race; accepting only the legal ones ends it."""
+    write_allowlist(config_dir, "*\n")
+    for legal in (
+        "nginx.service",
+        "postgresql@14-main.service",
+        "dev-disk-by\\x2duuid.device",
+        "system-getty.slice",
+    ):
+        assert journal_policy.unit_allowed(legal) is True, legal
+    for rewritten in (
+        "app-+.service",
+        "unit,name.service",
+        "a=b.service",
+        "x%y.service",
+    ):
+        assert journal_policy.unit_allowed(rewritten) is False, rewritten
+
+
 def test_a_whitespace_padded_unit_is_refused(config_dir):
     """The name is passed to journalctl unchanged, so a name that only
     matches after normalization authorizes one unit and reads another:

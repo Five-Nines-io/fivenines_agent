@@ -35,6 +35,7 @@ access"); this file is for hosts that keep the feature but want to bound it.
 
 import fnmatch
 import os
+import re
 import stat as stat_module
 import threading
 
@@ -90,27 +91,23 @@ _UNIT_SUFFIXES = (
     ".device",
 )
 _GLOB_CHARS = "*?["
-# Characters that cannot appear in a systemd unit name -- which is drawn from
-# ASCII alphanumerics plus ":-_.\@" -- and therefore mean the SERVER sent
-# something that is not a unit name. Both spellings below make the string the
-# policy checks differ from the one journalctl actually reads, which is the
-# whole ballgame for a veto:
-#   * ? [ ]  a glob. `journalctl -u` expands globs itself, so policy
-#            `app-?.service` would accept the literal `app-*.service` (the `?`
-#            matches the `*`) and journalctl would then read every app-* unit.
-#   /        a PATH. `journalctl -u /var/log` is accepted and resolved to
-#            `var-log.mount`, while the policy sees the text `/var/log`
-#            (normalized to `/var/log.service`) and happily matches it against
-#            `*.service` -- a unit the operator never allowed, and one that is
-#            refused when requested by its real name.
-# Under an active policy these are refused outright.
+# The character set systemd.unit(5) allows in a unit name: ASCII
+# alphanumerics plus ":", "-", "_", ".", "\\" and "@".
 #
-# A leading `-` is deliberately NOT in the set: `-.mount` is the real unit
-# name for the root filesystem, and `journalctl -u -.mount` consumes it as the
-# argument to -u rather than as an option (the value after a short option
-# always is), so refusing it would drop a legitimate allowlisted unit for no
-# security gain.
-_SERVER_REJECT_CHARS = "*?[]/"
+# This is an ALLOWLIST on purpose, after three rounds of patching individual
+# characters. The invariant that matters is that the string the policy
+# authorizes is the string journalctl READS, and journalctl rewrites anything
+# outside this set into an escape: `app-+.service` is selected as
+# `app-\\x2b.service`, `/var/log` is resolved to `var-log.mount`, `nginx ` to
+# `nginx\\x20.service`, and a glob is expanded to whatever matches it. Every
+# one of those reads a unit the policy never saw. Enumerating the bad
+# characters loses that race by construction; accepting only the legal ones
+# ends it.
+#
+# `-.mount` (the root filesystem) passes, as it must: `-` and `.` are legal,
+# and the value after a short option is always consumed as that option's
+# argument, so a leading dash was never an injection.
+_UNIT_NAME_RE = re.compile(r"^[A-Za-z0-9:_.\\@-]+$")
 
 _lock = threading.Lock()
 # key: the stat identity the cached value was derived from. value: always a
@@ -338,18 +335,10 @@ def unit_allowed(unit):
         return False
     if len(unit) > MAX_UNIT_CHARS:
         return False
-    if any(char in unit for char in _SERVER_REJECT_CHARS):
-        # Not a unit name: a glob journalctl would expand, or a path it would
-        # resolve to a different unit than the one the policy just checked
-        # (see _SERVER_REJECT_CHARS).
-        return False
-    if unit != unit.strip() or any(char.isspace() for char in unit):
-        # The callers pass the name through to journalctl UNCHANGED, so a name
-        # that only matches a pattern after normalization authorizes one unit
-        # and reads another: `nginx ` is stripped to `nginx.service` here and
-        # matches a policy allowing it, while journalctl selects the escaped
-        # `nginx\x20.service`, which that same policy refuses by name. systemd
-        # escapes whitespace out of unit names, so a real one never has any.
+    if not _UNIT_NAME_RE.match(unit):
+        # Anything journalctl would rewrite is refused: the callers pass this
+        # name through unchanged, so a name that needs escaping authorizes one
+        # unit here and reads another there (see _UNIT_NAME_RE).
         return False
     candidate = _normalize(unit)
     return any(fnmatch.fnmatchcase(candidate, pattern) for pattern in patterns)
