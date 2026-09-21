@@ -11,12 +11,12 @@ from threading import Event
 import psutil
 from dotenv import load_dotenv
 
-
 try:
     import systemd_watchdog
 except ImportError:
     systemd_watchdog = None
 
+from fivenines_agent import journal_policy
 from fivenines_agent.cli import VERSION
 from fivenines_agent.collectors import (
     COLLECTORS,
@@ -406,7 +406,9 @@ class Agent:
                     try:
                         blob = serialize_payload(data)
                     except (TypeError, ValueError) as e:
-                        log(f"Payload serialization failed; dropping tick: {e}", "error")
+                        log(
+                            f"Payload serialization failed; dropping tick: {e}", "error"
+                        )
                         blob = None
                     if blob is not None:
                         self.queue.put(blob)
@@ -609,6 +611,10 @@ class Agent:
             # unconditionally. (It keeps the last good version on a transient
             # `systemctl --version` miss, so an unconditional call is safe.)
             refresh_runtime_caches()
+            # Same signal, same reason: an operator who just edited
+            # journal_units.allow gets it applied now rather than on the next
+            # stat. (The policy is stat-cached, so this is belt and braces.)
+            journal_policy.reset_cache()
 
     def _apply_config_driven_refresh(self, config):
         """Run config-driven permission refresh for this tick, then republish

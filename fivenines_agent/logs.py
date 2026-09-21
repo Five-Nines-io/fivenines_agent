@@ -25,6 +25,7 @@ import re
 import subprocess
 import time
 
+from fivenines_agent import journal_policy
 from fivenines_agent.debug import log
 from fivenines_agent.subprocess_utils import get_clean_env
 
@@ -259,6 +260,14 @@ def assemble_multiline(entries):
 def _capture_entries(unit, since, lines, timeout=_CAPTURE_TIMEOUT):
     """Run a bounded journalctl slice. Returns a list of entries on success
     (possibly empty), or None on failure (timeout / non-zero exit / error)."""
+    # Last line of defence for the operator's local allowlist. Both callers
+    # (signals and capture) already filter, so reaching this is either a new
+    # code path or a bug -- and this is the one place journalctl is actually
+    # spawned, so enforcing here means no future path can read a journal the
+    # host owner did not allow.
+    if not journal_policy.unit_allowed(unit):
+        log(f"journal allowlist: refusing to read {unit!r}", "debug")
+        return None
     # Clamp lines to a hard agent ceiling: `lines` is backend-supplied and
     # journalctl buffers the whole slice in RAM, so an unbounded value is an OOM
     # DoS. A non-numeric value falls back to the default rather than raising.
@@ -431,7 +440,15 @@ def collect_log_signals(
         return {"window_s": window, "units": {}}
     since = int(_now()) - int(window)
     result = {"window_s": window, "units": {}}
-    all_units = units or []
+    # The server's allowlist intersected with the host's own (absent by
+    # default, in which case this is a pass-through).
+    all_units, refused_units = journal_policy.filter_units(units or [])
+    if refused_units:
+        # Surfaced, not silently dropped: {"units": {}} is byte-identical to
+        # "every unit was healthy this window", so a local refusal that only
+        # showed up in the agent's own journal would read as a clean bill on
+        # the dashboard and could false-resolve an open incident.
+        result["refused_units"] = sorted(str(u) for u in refused_units)
     if len(all_units) > _MAX_SIGNAL_UNITS:
         _warn_units_capped_once(len(all_units))
     for unit in all_units[:_MAX_SIGNAL_UNITS]:

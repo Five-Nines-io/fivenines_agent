@@ -24,6 +24,8 @@ Windows 10/11), **Synology DSM 7** and **UNRAID**.
   - [QEMU/KVM VM Monitoring](#qemukvm-vm-monitoring)
   - [systemd Unit Monitoring](#systemd-unit-monitoring)
   - [Log Monitoring](#log-monitoring)
+    ([removing journal access](#removing-journal-access),
+    [local unit allowlist](#locally-enforced-unit-allowlist))
   - [ZFS Pool Health](#zfs-pool-health)
   - [Ceph Cluster Monitoring](#ceph-cluster-monitoring)
   - [Ubuntu Pro Entitlement](#ubuntu-pro-entitlement)
@@ -369,6 +371,17 @@ There is no quiet "carry on anyway" path: a `SHA256SUMS` that cannot be
 downloaded, or that does not list the tarball, aborts the install too, so the
 check cannot be silently downgraded by suppressing one request.
 
+From **v1.18.1** this covers the **startup definitions** as well as the agent
+tarball: the systemd unit, the Alpine/OpenRC init script and the UNRAID boot
+script. Those three used to be downloaded and written straight to their final
+path unchecked -- and on the GitHub fallback they came from the `main` branch,
+which no manifest covers -- so a compromised download server could not touch
+the verified agent binary but could still hand every installing host an
+`ExecStart` of its choosing, running as root at every boot. They are published
+release assets now, listed in the same signed `SHA256SUMS`, staged in a
+private temporary directory, and moved into place only after they verify. A
+failed check leaves the currently installed unit exactly as it was.
+
 To check an artifact by hand:
 
 ```bash
@@ -380,9 +393,10 @@ grep ' fivenines-agent-linux-amd64.tar.gz$' SHA256SUMS | sha256sum -c -
 ```
 
 `SHA256SUMS` covers everything published at that location -- the four Linux
-tarballs, both Synology `.spk` packages, the Windows MSI, the service units and
-the install scripts themselves -- so the `grep` narrows the check to the one
-file you downloaded. `sha256sum -c SHA256SUMS` without it reports every file
+tarballs, both Synology `.spk` packages, the Windows MSI, the startup
+definitions (`fivenines-agent.service`, `fivenines-agent.openrc`,
+`fivenines_script.sh`) and the install scripts themselves -- so the `grep`
+narrows the check to the one file you downloaded. `sha256sum -c SHA256SUMS` without it reports every file
 you did not download as missing.
 
 #### Signatures
@@ -425,16 +439,45 @@ openssl dgst -sha256 -verify fivenines-release.pub \
 # Verified OK
 ```
 
-A host with no `openssl` reports the same "could not check" outcome and falls
-back to the checksum. That is not a hole an attacker can open: whoever controls
-the release bucket does not get to uninstall `openssl` from your servers.
+**A host with no `openssl` fails the install** (from **v1.18.1**; earlier
+versions warned and fell back to the checksum). Without it the signature
+cannot be looked at, and a digest read out of a manifest nobody authenticated
+proves only that the mirror agrees with itself -- which is free for whoever
+controls the mirror. The installer says so and names the fix:
+
+```
+[-] This host has no openssl, so the release signature cannot be checked.
+[-] Install it and re-run:
+[-]   apk add openssl  |  apt-get install -y openssl  |  yum install -y openssl
+[-] To proceed anyway, with checksum-only verification, re-run with
+[-] FIVENINES_ALLOW_UNSIGNED=1 (see the README).
+```
+
+Minimal Alpine images are the common case -- `busybox` has no `openssl`
+applet, so `apk add openssl` is a real prerequisite there. To install anyway,
+accepting checksum-only verification, re-run with `FIVENINES_ALLOW_UNSIGNED=1`.
+
+This is checked **before anything is touched** -- before the update script
+stops the agent, before any download. "No openssl" is a property of the host,
+so it would fail on every attempt; discovering it after the agent was stopped
+would leave the host unmonitored. The preflight fails while the agent is still
+running and nothing has changed.
+
+One case still degrades to checksum-only with a warning rather than failing:
+an installer that embeds **no** public key at all. That is the documented key
+rotation escape hatch, a property of the script rather than of your host, and
+`FIVENINES_REQUIRE_SIGNATURE=1` makes it fatal too.
 
 #### What each layer proves
 
 | Layer | Catches | Does not catch |
 |-------|---------|----------------|
 | `SHA256SUMS` digest | Truncated download, half-finished mirror sync, swapped or mislabelled asset | An attacker who owns the mirror -- they rewrite the manifest too |
-| `SHA256SUMS.sig` | An attacker who owns the mirror or the GitHub release | A compromise of the signing key itself |
+| `SHA256SUMS.sig` | An attacker who owns the mirror or the GitHub release | A compromise of the signing key itself; a **rollback**, since the manifest carries no version binding and the installers always read `latest` -- a mirror owner can keep serving an older, genuinely signed release |
+
+Both layers apply to the same set of files: the agent tarball **and** the
+systemd unit, OpenRC init script and UNRAID boot script the installer puts in
+place as root.
 
 #### Installing a custom or pre-release build
 
@@ -453,11 +496,19 @@ Pre-release builds list their digests in the GitHub release notes. Without
 `FIVENINES_AGENT_SHA256` the installer prints an `UNVERIFIED` warning and
 continues.
 
+`FIVENINES_AGENT_SHA256` pins the **tarball only**. On a system install the
+startup definitions still come from the release and are still checked against
+the signed `SHA256SUMS`, so a pinned digest does not exempt that host from
+needing `openssl` -- pair it with `FIVENINES_ALLOW_UNSIGNED=1` on a minimal
+image. A user-level install has no startup definition to fetch, so a pinned
+digest is enough there.
+
 | Variable | Effect |
 |----------|--------|
-| `FIVENINES_AGENT_SHA256` | Expected SHA-256 of the tarball. Overrides the published `SHA256SUMS`, and is the only way to verify a `FIVENINES_AGENT_URL` download. |
-| `FIVENINES_REQUIRE_SIGNATURE=1` | Abort unless the release signature over `SHA256SUMS` verifies. Default is to warn and fall back to the checksum. |
-| `FIVENINES_SKIP_VERIFY=1` | Install without verifying anything. Unsupported; intended only for a host that has no `sha256sum`, `shasum` or `openssl` at all. |
+| `FIVENINES_AGENT_SHA256` | Expected SHA-256 of the tarball. Overrides the published `SHA256SUMS`, and is the only way to verify a `FIVENINES_AGENT_URL` download. Covers the tarball only -- the startup definitions a system install writes still go through the signed manifest. |
+| `FIVENINES_ALLOW_UNSIGNED=1` | Install on a host with no `openssl`, with checksum-only verification. Without it, a missing `openssl` aborts the install (v1.18.1+). |
+| `FIVENINES_REQUIRE_SIGNATURE=1` | Abort even when the installer embeds no public key at all (the rotation escape hatch). A signature that cannot be checked is already fatal by default. |
+| `FIVENINES_SKIP_VERIFY=1` | Install without verifying anything -- the agent tarball and the startup definitions alike. Unsupported; intended only for a host that has no `sha256sum`, `shasum` or `openssl` at all. |
 
 On Windows the artifact to verify is the MSI, which `SHA256SUMS` also covers;
 `fivenines_setup.ps1` does not yet check it.
@@ -529,6 +580,23 @@ stays untouched):
 ```powershell
 & "$env:ProgramFiles\fivenines-agent\fivenines-agent-windows-amd64.exe" --dry-run
 ```
+
+### Public IP detection on a host with no IPv6
+
+With `ipv6` enabled on a host that has no routable IPv6 address -- a container
+on a v4-only bridge is the usual case -- the agent reports `ipv6: null` and
+says why **once**, then stays quiet (agent version **1.18.1+**; earlier
+versions retried the lookup and logged the failure every few minutes forever):
+
+```
+[ERROR] No routable IPv6 address on this host: skipping the IPv6 lookup for ip.fivenines.io
+```
+
+It checks the host's own interfaces before doing any network work, so there is
+no DNS lookup and no connection attempt to fail. A v6 address configured later
+is picked up within a few minutes, and the first failure of any *new* outage is
+always reported at error level -- only the repeats are demoted to debug. Turn
+the `ipv6` setting off for the host if you want the null gone too.
 
 ## Permissions
 
@@ -982,7 +1050,10 @@ collects a journal tail and its reverse dependencies for that unit only, so an
 alert arrives with the error text and the list of what else depends on it.
 Journal tails require journal read access; the bundled systemd unit grants
 `SupplementaryGroups=systemd-journal`. Without it, everything else still works
-and the tails are simply empty.
+and the tails are simply empty. A host-side
+[`journal_units.allow`](#locally-enforced-unit-allowlist) file bounds these
+tails too: a failed unit the local allowlist does not cover still reports its
+health, restarts and resource usage, with an empty tail.
 
 **Inventory sync.** With `scan` enabled the agent snapshots full unit properties
 -- including **disabled** units, since a disabled unit is still configuration --
@@ -997,6 +1068,12 @@ capability -- the bundled systemd unit grants `SupplementaryGroups=systemd-journ
 for user installs, add your user to the `systemd-journal` group). Enabled per
 host from the dashboard, with a `units` allowlist -- the agent never reads the
 journal at large, only the units you name.
+
+Two host-side controls sit **underneath** that dashboard setting, for fleets
+where the answer is not "whatever the dashboard says":
+[removing journal access](#removing-journal-access) entirely, and a
+[locally enforced unit allowlist](#locally-enforced-unit-allowlist) for hosts
+that keep the feature.
 
 **Continuous signals.** Each tick the agent scans a short window (60s by
 default) of each allowlisted unit's journal and reports per-severity error/warn
@@ -1015,6 +1092,125 @@ thread -- never on the collection loop, so a large capture cannot stall metric
 collection or trip the systemd watchdog. Each request carries a nonce that is
 persisted to disk, so a capture fires exactly once and never replays after a
 service restart.
+
+### Removing journal access
+
+On a host that needs no log monitoring, the cleanest control is not to
+configure it off -- it is to take the permission away, so the agent could not
+read the journal even if it were asked to. Journal access comes from one group
+membership and nothing else.
+
+**systemd installs** -- override the unit with a drop-in. Drop-ins survive the
+updater, which overwrites `fivenines-agent.service` on every update:
+
+```bash
+sudo systemctl edit fivenines-agent
+# then, in the editor:
+[Service]
+SupplementaryGroups=
+
+sudo systemctl restart fivenines-agent
+```
+
+The empty assignment **resets** the list rather than appending to it. Confirm
+it took effect -- the agent prints its capabilities at startup, and `journald`
+should now be unavailable:
+
+```bash
+sudo journalctl -u fivenines-agent -n 50 | grep -i journald
+# [-] Journald (requires systemd-journal group)
+# Capability 'journald' unavailable: requires systemd-journal group (journalctl non-zero exit (systemd-journal group?))
+```
+
+The first line is the startup capabilities banner; the second is the
+per-capability reason the agent logs beside it.
+
+**OpenRC, UNRAID and user installs** -- there is no unit to override; the
+access is a real group membership, so remove it **and restart the agent**:
+
+```bash
+sudo gpasswd -d fivenines systemd-journal   # or your own user, for a user install
+sudo rc-service fivenines-agent restart     # OpenRC; UNRAID: re-run the boot script
+```
+
+The restart is not optional. Supplementary groups are fixed when the process
+starts, so a running agent keeps the journal access it was given until it is
+restarted -- `gpasswd` alone revokes nothing for the live process. `SIGHUP`
+does not help either: it re-probes capabilities, it cannot change the groups
+the kernel already granted. For a user install, the user also needs a fresh
+login session before restarting the agent.
+
+What this changes: the `journald` capability probes false, so the `logs`
+collector is gated off entirely (the key is omitted from the payload, and
+incident captures cannot run), and the systemd collector's failure drilldown
+ships empty journal tails. Unit health, restarts, resource usage and every
+other metric are unaffected. Re-granting is the reverse -- add the group back, then restart
+(`sudo systemctl restart fivenines-agent`). A restart is required in both
+directions, for the same reason: `SIGHUP` re-probes capabilities but cannot
+change a running process's groups.
+
+### Locally enforced unit allowlist
+
+For hosts that **do** run log monitoring but should never read certain units'
+journals regardless of what the dashboard asks for, drop a
+`journal_units.allow` file in the config dir (agent version **1.18.1+**):
+
+```bash
+sudo tee /etc/fivenines_agent/journal_units.allow > /dev/null <<'EOF'
+# Only these units' journals may be read on this host.
+nginx.service
+postgresql@*.service
+docker.socket
+EOF
+```
+
+The file is a local **veto**, intersected with the dashboard's `units`
+allowlist -- it can only ever remove access, never add it. It bounds *every*
+journal read the agent makes: continuous signals, incident captures, and the
+systemd failure drilldown's journal tail.
+
+| The file | Effect |
+|----------|--------|
+| absent | No local policy. The dashboard allowlist decides (the default; nothing changes for existing installs). |
+| lists units | Only units matching a listed pattern may be read. Anything else the server asks for is refused and logged once. |
+| present but empty (or only comments) | Nothing may be read. A deliberate "configured, but reads nothing" state. |
+| present but unreadable by the agent | Nothing may be read, and the agent says so. A policy that exists but cannot be applied is never treated as no policy. |
+| a symlink whose target is missing | Nothing may be read. A policy pointing at a file that is not there is broken, not absent -- reading it as "no policy" would open every journal at the moment a deployment broke. |
+| not a regular file (a FIFO, a device) | Nothing may be read. Opening a FIFO with no writer blocks forever, and on the collection loop that is a watchdog restart. |
+| larger than 64 KiB | Nothing may be read. An oversized file is refused rather than truncated: cutting it at a byte offset can leave a partial last line, and `*.service` cut to `*` would *widen* the policy to every unit. |
+| more than 200 patterns | The first 200 apply and the rest are refused. The agent logs the overflow and the total, so a file that lost units is never silent. |
+| a line longer than 200 characters | That line is ignored (the rest of the file still applies), and the agent logs how many it dropped. |
+
+**What this bounds, and what it does not.** The allowlist constrains what the
+*backend* can ask this host to read -- a compromised or misconfigured server
+cannot widen it, because it is intersected with the server's list and never
+unioned. It is not a barrier against code already running as the `fivenines`
+user: the config directory is owned by that user, so anything running as the
+agent could remove the file (and an absent file means "no local policy").
+If you need the stronger guarantee, take the journal group away instead --
+see [Removing journal access](#removing-journal-access).
+
+Lines are shell globs matched against the unit name; `#` starts a comment and
+blank lines are ignored. Globs are for **your** file only: a unit name that
+*the server* sends containing `*`, `?` or `[` is refused outright, because
+`journalctl -u` expands globs itself -- matching one literally against your
+patterns would let a compromised backend request `app-*.service` and walk
+through a policy that only allows `app-?.service`. A name with no unit suffix picks up systemd's own
+implicit `.service` on both sides of the match, so `nginx` and `nginx.service`
+are the same entry. With a policy in force the agent also matches at most 200
+units per tick out of whatever the server asked for, and refuses the rest --
+reported as refusals, not dropped silently. Edits are picked up on the next
+collection tick -- no restart needed -- and `SIGHUP` applies them immediately.
+
+Refused units are also reported **in the payload** (`refused_units`), not just
+in the agent's own journal: a unit that was never read must not render on the
+dashboard as a unit with zero errors.
+
+A refused unit is reported once, at error level, rather than on every tick:
+
+```
+[ERROR] journal allowlist: refusing 1 unit(s) requested by the server: mysql.service
+```
 
 ### Redaction
 

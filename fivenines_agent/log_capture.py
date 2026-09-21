@@ -26,6 +26,7 @@ import os
 import threading
 import time
 
+from fivenines_agent import journal_policy
 from fivenines_agent.debug import log
 from fivenines_agent.env import restrict_to_owner
 
@@ -57,9 +58,7 @@ class CaptureCoordinator:
             # 0600 at creation (umask-independent), matching machine_id and the
             # TOKEN swap: state files under the config dir default to
             # owner-only rather than trusting the process umask.
-            fd = os.open(
-                self.state_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600
-            )
+            fd = os.open(self.state_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             # Heal a pre-existing file's mode too (os.open's mode applies only
             # at creation).
             restrict_to_owner(fd)
@@ -94,8 +93,9 @@ class CaptureCoordinator:
                 # Default-deny. Warn once per capture_id to avoid per-tick spam.
                 if self._last_warned_id != capture_id:
                     log(
-                        f"CaptureCoordinator: unit {unit!r} not in allowlist, "
-                        "refusing capture",
+                        f"CaptureCoordinator: unit {unit!r} not in the effective "
+                        "unit allowlist (server units intersected with "
+                        "journal_units.allow), refusing capture",
                         "error",
                     )
                     self._last_warned_id = capture_id
@@ -140,7 +140,19 @@ def evaluate_and_enqueue(coordinator, log_queue, config):
     """
     logs_cfg = config.get("logs")
     allowed = logs_cfg.get("units", []) if isinstance(logs_cfg, dict) else []
-    job = coordinator.evaluate(config.get("capture_logs"), allowed)
+    capture_logs = config.get("capture_logs")
+    # The host's own allowlist (journal_units.allow) can only narrow what the
+    # server asked for. Only the ONE unit a capture command names is checked,
+    # not the whole list: this runs every tick whether or not a capture is
+    # pending (the feature is inert until the backend sends capture_logs), so
+    # filtering the full list here would pay a stat plus up to MAX_PATTERNS
+    # fnmatch calls per configured unit, per tick, for nothing. Emptying
+    # `allowed` hands the refusal to the coordinator's existing warn-once
+    # default-deny.
+    requested = capture_logs.get("unit") if isinstance(capture_logs, dict) else None
+    if requested is not None and not journal_policy.unit_allowed(requested):
+        allowed = []
+    job = coordinator.evaluate(capture_logs, allowed)
     if job is None:
         return None
     # evaluate() already marked this capture in-flight. The bounded log_queue

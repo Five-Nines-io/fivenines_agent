@@ -460,6 +460,34 @@ def test_handle_sighup_refresh_force_resends_inventory(
     assert refresh_permissions_event.is_set() is False
 
 
+@patch("fivenines_agent.agent.print_capabilities_banner")
+@patch("fivenines_agent.agent.refresh_runtime_caches")
+@patch("fivenines_agent.agent.force_inventory_resend")
+@patch("fivenines_agent.agent.journal_policy")
+def test_handle_sighup_refresh_drops_the_journal_allowlist_cache(
+    mock_policy, mock_force, mock_refresh, mock_banner
+):
+    """SIGHUP is also how an operator applies a just-edited journal_units.allow.
+
+    The policy is stat-cached, so without this the edit is picked up anyway on
+    the next stat -- but SIGHUP is the documented "I changed the host" signal
+    and has to be the one that makes it immediate."""
+    from fivenines_agent.agent import refresh_permissions_event
+
+    agent = make_agent()
+    agent._systemd_force_resend = False
+    agent.permissions = MagicMock()
+    agent.static_data = {}
+    refresh_permissions_event.set()
+
+    try:
+        agent._handle_sighup_refresh()
+    finally:
+        refresh_permissions_event.clear()
+
+    mock_policy.reset_cache.assert_called_once()
+
+
 @patch("fivenines_agent.agent.force_inventory_resend")
 @patch("fivenines_agent.agent.refresh_runtime_caches")
 def test_resync_systemd_runtime_redetects_on_capability_flip(mock_refresh, mock_force):

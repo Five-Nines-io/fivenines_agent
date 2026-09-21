@@ -11,8 +11,12 @@
 #   FIVENINES_AGENT_SHA256 - Expected SHA-256 of the tarball. Overrides the published
 #                            SHA256SUMS; the only way to verify a custom URL.
 #   FIVENINES_SKIP_VERIFY  - Set to 1 to install WITHOUT verifying the tarball. Unsupported.
-#   FIVENINES_REQUIRE_SIGNATURE - Set to 1 to abort unless the release signature over
-#                            SHA256SUMS verifies (default: warn and fall back to the checksum).
+#   FIVENINES_ALLOW_UNSIGNED - Set to 1 to install on a host with no openssl, with
+#                            checksum-only verification. Without it, a missing openssl
+#                            aborts the install (the signature cannot be checked).
+#   FIVENINES_REQUIRE_SIGNATURE - Set to 1 to abort even when this installer embeds no
+#                            public key at all (the key-rotation escape hatch). A
+#                            signature that cannot be checked is already fatal.
 #   FIVENINES_INSTALL_DIR  - Custom install directory (default: ~/.local/fivenines)
 #   FIVENINES_CONFIG_DIR   - Custom config directory (default: ~/.config/fivenines_agent)
 #
@@ -196,14 +200,18 @@ MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEYEeNw0yIcXeLpQifrLGT7iU02K9R
 PUBKEY
 }
 
-# Verify the detached signature over SHA256SUMS. Three outcomes, and the
-# difference between the last two is the whole point:
+# Verify the detached signature over SHA256SUMS. Four outcomes, and the
+# difference between the last three is the whole point:
 #   0 - verified against the embedded public key
 #   1 - a signature was expected and did NOT verify. Always fatal.
-#   2 - cannot be checked here (no key embedded yet, or no openssl on this
-#       host). The caller decides; by default that is a warning, because an
-#       attacker who owns the release bucket does not get to uninstall
-#       openssl from the target host - the two are independent.
+#   2 - no key is embedded in this script at all. That is the documented
+#       rotation escape hatch (see release_signing_pubkey), not a property of
+#       the host, so it degrades to checksum-only with a warning.
+#   3 - a key IS embedded but this host has no openssl to check it with.
+#       Fatal by default since 1.18.1: "the signature is good" and "I could
+#       not look at the signature" must not install the same bytes, and a
+#       host with no openssl is exactly the host an attacker would prefer to
+#       be talking to. FIVENINES_ALLOW_UNSIGNED=1 is the documented opt-out.
 verify_sums_signature() {
     sums_file="$1"
     sig_file="$2"
@@ -215,7 +223,7 @@ verify_sums_signature() {
 
     if ! command -v openssl > /dev/null 2>&1; then
         print_warning "No openssl on this host: the release signature cannot be checked."
-        return 2
+        return 3
     fi
 
     if [ ! -s "$sig_file" ]; then
@@ -255,11 +263,14 @@ download_release_file() {
     download_file "$url" "$output" 2>/dev/null
 }
 
-# Check an agent tarball before it is unpacked. The expected digest comes from
-# FIVENINES_AGENT_SHA256 when the operator pinned one, otherwise from the
-# SHA256SUMS the same mirror publishes next to the tarball, which is itself
-# checked against the embedded release public key. A non-zero return means the
-# tarball must not be installed.
+# NOTE: the functions below call download_release_file and
+# download_with_fallback, which are deliberately NOT shared: the system
+# scripts fetch with wget directly while the user scripts go through
+# download_file (wget or curl). Each script defines its own, just above its
+# copy of these functions.
+# Check one downloaded artifact against the signed manifest the same mirror
+# publishes. Shared by the agent tarball and by the startup definitions the
+# system installers drop into place as root, so both get the same proof.
 #
 # The two layers do different jobs. The digest alone proves the bytes arrived
 # intact and are the ones that mirror published - a truncated download, a
@@ -267,6 +278,124 @@ download_release_file() {
 # owns the mirror, because they would rewrite SHA256SUMS too. The signature
 # is what closes that: the signing key lives in a repository secret, not in
 # the bucket, so a manifest the attacker rewrote will not verify (issue #143).
+verify_from_manifest() {
+    file="$1"
+    asset_name="$2"
+
+    sums_path="${file}.SHA256SUMS"
+    sig_path="${sums_path}.sig"
+    rm -f "$sums_path" "$sig_path"
+
+    if ! download_release_file "SHA256SUMS" "$sums_path"; then
+        print_error "Could not download SHA256SUMS from the mirror that served ${asset_name}."
+        rm -f "$sums_path" "$sig_path"
+        return 1
+    fi
+
+    # Fetch the signature unconditionally. Whether its absence is fatal is
+    # verify_sums_signature's decision, not the download's - otherwise an
+    # attacker could downgrade the check by dropping one request.
+    download_release_file "SHA256SUMS.sig" "$sig_path" || true
+
+    sig_status=0
+    verify_sums_signature "$sums_path" "$sig_path" || sig_status=$?
+
+    if [ "$sig_status" -eq 1 ]; then
+        rm -f "$sums_path" "$sig_path"
+        return 1
+    fi
+
+    if [ "$sig_status" -eq 3 ]; then
+        # No openssl here, so the signature cannot be checked at all. Fail
+        # closed: a digest read out of a manifest nobody authenticated only
+        # proves the mirror agrees with itself, which is free for whoever
+        # owns the mirror.
+        if [ "${FIVENINES_ALLOW_UNSIGNED:-}" != "1" ]; then
+            print_error "Cannot verify the release signature: this host has no openssl."
+            print_error "Install it and re-run:"
+            print_error "  apk add openssl  |  apt-get install -y openssl  |  yum install -y openssl"
+            print_error "To install anyway, with checksum-only verification, re-run with"
+            print_error "FIVENINES_ALLOW_UNSIGNED=1 (see the README)."
+            rm -f "$sums_path" "$sig_path"
+            return 1
+        fi
+        print_warning "FIVENINES_ALLOW_UNSIGNED=1 - the release signature was NOT checked."
+    elif [ "$sig_status" -eq 2 ]; then
+        # No key embedded in this script: the rotation escape hatch.
+        if [ "${FIVENINES_REQUIRE_SIGNATURE:-}" = "1" ]; then
+            print_error "FIVENINES_REQUIRE_SIGNATURE=1, but this installer embeds no public key."
+            rm -f "$sums_path" "$sig_path"
+            return 1
+        fi
+        print_warning "Release signature not checked - falling back to the published checksum."
+    fi
+
+    expected_sha256=$(sha256_from_sums "$sums_path" "$asset_name" || true)
+    rm -f "$sums_path" "$sig_path"
+
+    if [ -z "$expected_sha256" ]; then
+        print_error "${asset_name} is not listed in the published SHA256SUMS."
+        return 1
+    fi
+
+    verify_sha256 "$file" "$expected_sha256" "$asset_name"
+}
+
+# Can this host verify a release AT ALL? Called before anything is stopped,
+# downloaded or replaced.
+#
+# Since 1.18.1 a signature that cannot be checked is fatal, and "no openssl"
+# is a property of the host, not of the download: on a minimal image (busybox
+# has no openssl applet, and `openssl` is a separate apk/apt package) EVERY
+# update would fail. The update scripts stop the agent before they verify
+# anything, so without this preflight that deterministic failure lands after
+# the stop and leaves the host unmonitored. Fail while the agent is still
+# running, and say exactly what to install.
+verification_preflight() {
+    # "$1" is "with-startup-files" when the caller also installs a startup
+    # definition (the two SYSTEM scripts). Those always go through the signed
+    # manifest -- install_verified_release_file ignores FIVENINES_AGENT_SHA256,
+    # which pins the TARBALL only -- so a pinned digest does not exempt them,
+    # or the preflight would pass and the refusal would land after the agent
+    # was stopped and the binary replaced.
+    pf_scope="${1:-}"
+
+    # FIVENINES_TEST_MODE skips ALL service management, so a test-mode run
+    # installs no startup definition however it was called -- and demanding
+    # openssl for files it will never fetch turns the release test matrix red
+    # on any image without the CLI (ci/test-distro.sh installs python3, wget
+    # and shadow, and drives both system installers with a pinned digest).
+    # This grants nothing: test mode already skips service setup entirely, and
+    # anyone who can set it can already set FIVENINES_SKIP_VERIFY.
+    if [ "${FIVENINES_TEST_MODE:-}" = "1" ]; then
+        pf_scope=""
+    fi
+
+    if [ "${FIVENINES_SKIP_VERIFY:-}" = "1" ] || [ "${FIVENINES_ALLOW_UNSIGNED:-}" = "1" ]; then
+        return 0
+    fi
+    if [ -n "${FIVENINES_AGENT_SHA256:-}" ] && [ "$pf_scope" != "with-startup-files" ]; then
+        return 0  # operator-pinned digest, and nothing else needs a manifest
+    fi
+    if [ -z "$(release_signing_pubkey)" ]; then
+        return 0  # no key embedded: checksum-only, openssl not required
+    fi
+    if command -v openssl > /dev/null 2>&1; then
+        return 0
+    fi
+
+    print_error "This host has no openssl, so the release signature cannot be checked."
+    print_error "Install it and re-run:"
+    print_error "  apk add openssl  |  apt-get install -y openssl  |  yum install -y openssl"
+    print_error "To proceed anyway, with checksum-only verification, re-run with"
+    print_error "FIVENINES_ALLOW_UNSIGNED=1 (see the README)."
+    return 1
+}
+
+# Check an agent tarball before it is unpacked. The expected digest comes from
+# FIVENINES_AGENT_SHA256 when the operator pinned one, otherwise from the
+# signed SHA256SUMS the same mirror publishes next to the tarball. A non-zero
+# return means the tarball must not be installed.
 verify_agent_tarball() {
     tarball="$1"
     asset_name="$2"
@@ -295,47 +424,7 @@ verify_agent_tarball() {
         return 0
     fi
 
-    sums_path="${tarball}.SHA256SUMS"
-    sig_path="${sums_path}.sig"
-    rm -f "$sums_path" "$sig_path"
-
-    if ! download_release_file "SHA256SUMS" "$sums_path"; then
-        print_error "Could not download SHA256SUMS from the mirror that served ${asset_name}."
-        rm -f "$sums_path" "$sig_path"
-        return 1
-    fi
-
-    # Fetch the signature unconditionally. Whether its absence is fatal is
-    # verify_sums_signature's decision, not the download's - otherwise an
-    # attacker could downgrade the check by dropping one request.
-    download_release_file "SHA256SUMS.sig" "$sig_path" || true
-
-    sig_status=0
-    verify_sums_signature "$sums_path" "$sig_path" || sig_status=$?
-
-    if [ "$sig_status" -eq 1 ]; then
-        rm -f "$sums_path" "$sig_path"
-        return 1
-    fi
-
-    if [ "$sig_status" -eq 2 ]; then
-        if [ "${FIVENINES_REQUIRE_SIGNATURE:-}" = "1" ]; then
-            print_error "FIVENINES_REQUIRE_SIGNATURE=1, but the release signature could not be checked."
-            rm -f "$sums_path" "$sig_path"
-            return 1
-        fi
-        print_warning "Release signature not checked - falling back to the published checksum."
-    fi
-
-    expected_sha256=$(sha256_from_sums "$sums_path" "$asset_name" || true)
-    rm -f "$sums_path" "$sig_path"
-
-    if [ -z "$expected_sha256" ]; then
-        print_error "${asset_name} is not listed in the published SHA256SUMS."
-        return 1
-    fi
-
-    verify_sha256 "$tarball" "$expected_sha256" "$asset_name"
+    verify_from_manifest "$tarball" "$asset_name"
 }
 
 detect_libc() {
@@ -410,6 +499,10 @@ else
 fi
 
 print_success "Architecture: $ARCH, libc: $LIBC_TYPE"
+
+# Refuse BEFORE the agent is stopped if this host cannot verify a release at
+# all (see fivenines_update.sh for the reasoning).
+verification_preflight || exit_with_error "Cannot verify a release on this host -- nothing was changed and the agent is still running."
 
 # Stop the agent if running (skip in test mode)
 if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
