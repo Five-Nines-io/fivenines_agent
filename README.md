@@ -446,9 +446,11 @@ proves only that the mirror agrees with itself -- which is free for whoever
 controls the mirror. The installer says so and names the fix:
 
 ```
-[-] Cannot verify the release signature: this host has no openssl.
+[-] This host has no openssl, so the release signature cannot be checked.
 [-] Install it and re-run:
 [-]   apk add openssl  |  apt-get install -y openssl  |  yum install -y openssl
+[-] To proceed anyway, with checksum-only verification, re-run with
+[-] FIVENINES_ALLOW_UNSIGNED=1 (see the README).
 ```
 
 Minimal Alpine images are the common case -- `busybox` has no `openssl`
@@ -494,9 +496,16 @@ Pre-release builds list their digests in the GitHub release notes. Without
 `FIVENINES_AGENT_SHA256` the installer prints an `UNVERIFIED` warning and
 continues.
 
+`FIVENINES_AGENT_SHA256` pins the **tarball only**. On a system install the
+startup definitions still come from the release and are still checked against
+the signed `SHA256SUMS`, so a pinned digest does not exempt that host from
+needing `openssl` -- pair it with `FIVENINES_ALLOW_UNSIGNED=1` on a minimal
+image. A user-level install has no startup definition to fetch, so a pinned
+digest is enough there.
+
 | Variable | Effect |
 |----------|--------|
-| `FIVENINES_AGENT_SHA256` | Expected SHA-256 of the tarball. Overrides the published `SHA256SUMS`, and is the only way to verify a `FIVENINES_AGENT_URL` download. |
+| `FIVENINES_AGENT_SHA256` | Expected SHA-256 of the tarball. Overrides the published `SHA256SUMS`, and is the only way to verify a `FIVENINES_AGENT_URL` download. Covers the tarball only -- the startup definitions a system install writes still go through the signed manifest. |
 | `FIVENINES_ALLOW_UNSIGNED=1` | Install on a host with no `openssl`, with checksum-only verification. Without it, a missing `openssl` aborts the install (v1.18.1+). |
 | `FIVENINES_REQUIRE_SIGNATURE=1` | Abort even when the installer embeds no public key at all (the rotation escape hatch). A signature that cannot be checked is already fatal by default. |
 | `FIVENINES_SKIP_VERIFY=1` | Install without verifying anything -- the agent tarball and the startup definitions alike. Unsupported; intended only for a host that has no `sha256sum`, `shasum` or `openssl` at all. |
@@ -1041,7 +1050,10 @@ collects a journal tail and its reverse dependencies for that unit only, so an
 alert arrives with the error text and the list of what else depends on it.
 Journal tails require journal read access; the bundled systemd unit grants
 `SupplementaryGroups=systemd-journal`. Without it, everything else still works
-and the tails are simply empty.
+and the tails are simply empty. A host-side
+[`journal_units.allow`](#locally-enforced-unit-allowlist) file bounds these
+tails too: a failed unit the local allowlist does not cover still reports its
+health, restarts and resource usage, with an empty tail.
 
 **Inventory sync.** With `scan` enabled the agent snapshots full unit properties
 -- including **disabled** units, since a disabled unit is still configuration --
@@ -1106,8 +1118,12 @@ should now be unavailable:
 
 ```bash
 sudo journalctl -u fivenines-agent -n 50 | grep -i journald
-# journald            UNAVAILABLE  (journalctl non-zero exit (systemd-journal group?))
+# [-] Journald (requires systemd-journal group)
+# Capability 'journald' unavailable: requires systemd-journal group (journalctl non-zero exit (systemd-journal group?))
 ```
+
+The first line is the startup capabilities banner; the second is the
+per-capability reason the agent logs beside it.
 
 **OpenRC, UNRAID and user installs** -- there is no unit to override; the
 access is a real group membership, so remove it:
@@ -1153,7 +1169,8 @@ systemd failure drilldown's journal tail.
 | a symlink whose target is missing | Nothing may be read. A policy pointing at a file that is not there is broken, not absent -- reading it as "no policy" would open every journal at the moment a deployment broke. |
 | not a regular file (a FIFO, a device) | Nothing may be read. Opening a FIFO with no writer blocks forever, and on the collection loop that is a watchdog restart. |
 | larger than 64 KiB | Nothing may be read. An oversized file is refused rather than truncated: cutting it at a byte offset can leave a partial last line, and `*.service` cut to `*` would *widen* the policy to every unit. |
-| more than 200 patterns | The first 200 apply, the rest are refused, and the agent logs which. |
+| more than 200 patterns | The first 200 apply and the rest are refused. The agent logs the overflow and the total, so a file that lost units is never silent. |
+| a line longer than 200 characters | That line is ignored (the rest of the file still applies), and the agent logs how many it dropped. |
 
 **What this bounds, and what it does not.** The allowlist constrains what the
 *backend* can ask this host to read -- a compromised or misconfigured server
@@ -1171,8 +1188,10 @@ blank lines are ignored. Globs are for **your** file only: a unit name that
 patterns would let a compromised backend request `app-*.service` and walk
 through a policy that only allows `app-?.service`. A name with no unit suffix picks up systemd's own
 implicit `.service` on both sides of the match, so `nginx` and `nginx.service`
-are the same entry. Edits are picked up on the next collection tick -- no
-restart needed -- and `SIGHUP` applies them immediately.
+are the same entry. With a policy in force the agent also matches at most 200
+units per tick out of whatever the server asked for, and refuses the rest --
+reported as refusals, not dropped silently. Edits are picked up on the next
+collection tick -- no restart needed -- and `SIGHUP` applies them immediately.
 
 Refused units are also reported **in the payload** (`refused_units`), not just
 in the agent's own journal: a unit that was never read must not render on the
