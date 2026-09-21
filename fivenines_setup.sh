@@ -346,6 +346,9 @@ verify_from_manifest() {
 # anything, so without this preflight that deterministic failure lands after
 # the stop and leaves the host unmonitored. Fail while the agent is still
 # running, and say exactly what to install.
+# The scope argument is optional by design: the system scripts pass one, the
+# user scripts have no startup definition to verify and pass none.
+# shellcheck disable=SC2120
 verification_preflight() {
     # "$1" is "with-startup-files" when the caller also installs a startup
     # definition (the two SYSTEM scripts). Those always go through the signed
