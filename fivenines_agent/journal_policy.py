@@ -62,12 +62,16 @@ MAX_PATTERN_CHARS = 200
 # `*` WIDENS the policy to every unit -- the one direction a security control
 # must never fail in.
 MAX_FILE_BYTES = 64 * 1024
-# Bound on a single server-supplied unit name. MAX_FILTER_UNITS bounds the
-# count and MAX_PATTERN_CHARS bounds the operator's patterns; without this a
-# 5 MB "unit name" would be strip()ed, scanned for metacharacters and then
-# fnmatch'd against up to MAX_PATTERNS patterns, on the collection loop.
-# Same per-field posture as MAX_PING_FIELD_CHARS.
-MAX_UNIT_CHARS = 256
+# systemd's own limit: unit_name_is_valid() rejects a name of UNIT_NAME_MAX
+# (256) bytes or more, so 255 is the longest valid one. It is systemd's number
+# rather than an arbitrary cap because a name over it is rejected by the
+# validator, and systemd then appends `.service` -- the same
+# authorize-one-name-read-another divergence as the shape rules below.
+# Checked on the NORMALIZED name too: `nginx` becomes `nginx.service`, so an
+# input under the limit can cross it. The raw check also keeps a 5 MB "unit
+# name" off the regex and the per-pattern fnmatch sweep, the same per-field
+# posture as MAX_PING_FIELD_CHARS.
+UNIT_NAME_MAX = 255
 # Cap on how much of the SERVER's unit list is matched per call. The server
 # sends the list, nothing in the agent bounds it, and each entry costs up to
 # MAX_PATTERNS fnmatch calls. Same posture as MAX_PING_TARGETS and
@@ -363,7 +367,7 @@ def unit_allowed(unit):
         return True  # no local policy: the server allowlist decides
     if not isinstance(unit, str) or not unit.strip():
         return False
-    if len(unit) > MAX_UNIT_CHARS:
+    if len(unit) > UNIT_NAME_MAX:
         return False
     if not _UNIT_NAME_RE.fullmatch(unit):
         # Anything journalctl would rewrite is refused: the callers pass this
@@ -373,6 +377,10 @@ def unit_allowed(unit):
     if not _is_structurally_valid_unit(unit):
         return False
     candidate = _normalize(unit)
+    if len(candidate) > UNIT_NAME_MAX:
+        # The implicit `.service` pushed it over systemd's limit, so systemd
+        # would reject the name and append `.service` to it anyway.
+        return False
     return any(fnmatch.fnmatchcase(candidate, pattern) for pattern in patterns)
 
 

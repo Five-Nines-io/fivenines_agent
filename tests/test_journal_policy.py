@@ -286,12 +286,26 @@ def test_the_root_mount_unit_is_allowed(config_dir):
     assert journal_policy.unit_allowed("-.mount") is True
 
 
-def test_an_over_long_unit_name_is_refused(config_dir):
+def test_the_unit_name_length_bound_is_systemds(config_dir):
+    """systemd rejects a name of 256 bytes or more and then appends
+    `.service` to it, so a name at 256 authorizes one string and is read as
+    another. The bound applies to the NORMALIZED name too: `nginx` becomes
+    `nginx.service`, so an input under the limit can cross it."""
+    n = journal_policy.UNIT_NAME_MAX
     write_allowlist(config_dir, "*\n")
-    assert journal_policy.unit_allowed("u" * journal_policy.MAX_UNIT_CHARS) is True
+    # Exactly at systemd's limit, suffix included.
+    assert journal_policy.unit_allowed("u" * (n - len(".service")) + ".service") is True
+    # One over it.
     assert (
-        journal_policy.unit_allowed("u" * (journal_policy.MAX_UNIT_CHARS + 1)) is False
+        journal_policy.unit_allowed("u" * (n - len(".service") + 1) + ".service")
+        is False
     )
+    # Raw over the limit: 250 + ".mount" is 256.
+    assert journal_policy.unit_allowed("a" * 250 + ".mount") is False
+    # Under the limit raw, over it once the implicit .service is appended --
+    # systemd appends it too, then rejects the result, so refusing is right.
+    assert journal_policy.unit_allowed("b" * n) is False
+    assert journal_policy.unit_allowed("c" * (n - len(".service") + 1)) is False
 
 
 def test_a_dangling_symlink_denies_rather_than_disappearing(config_dir):
