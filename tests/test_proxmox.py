@@ -38,15 +38,14 @@ def make_proxmox_mock(
     storage_config=None,
     storage_config_raises=False,
     version_raises=False,
-    content_by_node_storage=None,
-    content_raises_for=None,
+    prunebackups_by_node_storage=None,
+    prunebackups_raises_for=None,
     tasks_by_node=None,
     tasks_raises_for=None,
     backup_jobs=None,
     backup_jobs_raises=False,
     not_backed_up=None,
     not_backed_up_raises=False,
-    permissions=None,
 ):
     """Build a MagicMock simulating proxmoxer.ProxmoxAPI chained-call API.
 
@@ -58,8 +57,8 @@ def make_proxmox_mock(
 
     Backups block (#156) endpoints, all defaulting to empty listings so a
     scenario that says nothing about backups gets a well-formed empty block:
-    `content_by_node_storage` is {node: {storage: [volumes]}} for
-    /nodes/<n>/storage/<s>/content?content=backup and `content_raises_for` a
+    `prunebackups_by_node_storage` is {node: {storage: [prune-preview volumes]}}
+    for /nodes/<n>/storage/<s>/prunebackups and `prunebackups_raises_for` a
     set of "node/storage" strings; `tasks_by_node` / `tasks_raises_for` wire
     /nodes/<n>/tasks; `backup_jobs` wires /cluster/backup and `not_backed_up`
     /cluster/backup-info/not-backed-up. `nodes_raises_from_call` = N makes the
@@ -68,7 +67,7 @@ def make_proxmox_mock(
     fails only the backups build.
     """
     mock = MagicMock()
-    mock._content_calls = []
+    mock._prunebackups_calls = []
 
     if version_raises:
         mock.version.get.side_effect = RuntimeError("version boom")
@@ -105,9 +104,6 @@ def make_proxmox_mock(
         mock.cluster.backup.get.return_value = (
             backup_jobs if backup_jobs is not None else []
         )
-    if permissions is not None:
-        mock.access.permissions.get.return_value = permissions
-
     nbu = MagicMock()
     if not_backed_up_raises:
         nbu.get.side_effect = RuntimeError("not-backed-up boom")
@@ -131,8 +127,8 @@ def make_proxmox_mock(
     qemu_raises_for = qemu_raises_for or set()
     lxc_raises_for = lxc_raises_for or set()
     storage_raises_for = storage_raises_for or set()
-    content_by_node_storage = content_by_node_storage or {}
-    content_raises_for = content_raises_for or set()
+    prunebackups_by_node_storage = prunebackups_by_node_storage or {}
+    prunebackups_raises_for = prunebackups_raises_for or set()
     tasks_by_node = tasks_by_node or {}
     tasks_raises_for = tasks_raises_for or set()
 
@@ -168,13 +164,13 @@ def make_proxmox_mock(
             def storage_call(storage_name, _node=node_name):
                 sm = MagicMock()
 
-                def content_get(**params):
-                    mock._content_calls.append((_node, storage_name, params))
-                    if f"{_node}/{storage_name}" in content_raises_for:
+                def prunebackups_get(**params):
+                    mock._prunebackups_calls.append((_node, storage_name, params))
+                    if f"{_node}/{storage_name}" in prunebackups_raises_for:
                         raise RuntimeError("content boom")
-                    return content_by_node_storage.get(_node, {}).get(storage_name, [])
+                    return prunebackups_by_node_storage.get(_node, {}).get(storage_name, [])
 
-                sm.content.get.side_effect = content_get
+                sm.prunebackups.get.side_effect = prunebackups_get
                 return sm
 
             nm.storage.side_effect = storage_call
@@ -1569,11 +1565,11 @@ _GUEST_BACKUP_KEYS = {
     "node",
     "latest_ctime",
     "latest_volid",
-    "latest_size",
     "count",
+    "protected",
 }
-# Present only when the storage reports them (PBS: verification + encrypted).
-_GUEST_BACKUP_OPTIONAL_KEYS = {"verification", "protected", "encrypted"}
+# The prune-preview read (agent 1.19.0+) carries no size/verification/encrypted.
+_GUEST_BACKUP_OPTIONAL_KEYS = set()
 _TASK_KEYS = {"upid", "node", "id", "starttime", "endtime", "status", "user"}
 _JOB_KEYS = {
     "id",
@@ -1632,11 +1628,8 @@ def test_contract_payload_key_sets(scenario_name):
     assert isinstance(backups["age_s"], int) and backups["age_s"] >= 0
     for entry in backups["guest_backups"]:
         keys = set(entry)
-        assert _GUEST_BACKUP_KEYS <= keys
-        assert keys - _GUEST_BACKUP_KEYS <= _GUEST_BACKUP_OPTIONAL_KEYS
+        assert set(keys) == _GUEST_BACKUP_KEYS
         assert entry["latest_ctime"] is not None and entry["vmid"] is not None
-        if "verification" in entry:
-            assert set(entry["verification"]) == {"state", "upid"}
     for task in backups["tasks"]:
         assert set(task) == _TASK_KEYS
     for job in backups["jobs"]:
@@ -1751,14 +1744,12 @@ def test_contract_backups_shared_once_local_per_node():
     vm100_pbs = next(e for e in pbs if e["vmid"] == 100)
     assert vm100_pbs["count"] == 2
     assert vm100_pbs["latest_ctime"] == 1789950000
-    assert vm100_pbs["verification"] == {
-        "state": "ok",
-        "upid": "UPID:pbs:00002A44:0000F3A1:00000000:68CEEB80:verificationjob:main:root@pam:",
+    assert vm100_pbs["protected"] is False
+    assert set(vm100_pbs) == {
+        "vmid", "storage", "node", "latest_ctime", "latest_volid", "count", "protected",
     }
-    assert vm100_pbs["encrypted"] is True and vm100_pbs["protected"] is False
     ct101_local = next(e for e in local if e["vmid"] == 101)
     assert ct101_local["count"] == 3 and ct101_local["latest_ctime"] == 1789863600
-    assert "verification" not in ct101_local and "encrypted" not in ct101_local
 
 
 def test_contract_backups_status_verbatim_and_id_null():
@@ -1803,7 +1794,7 @@ def test_contract_backups_partial_names_storage_and_keeps_others():
             "scope": "storage",
             "node": "pve1",
             "storage": "pbs-main",
-            "message": "content listing failed: content boom",
+            "message": "backup listing failed: content boom",
         }
     ]
     assert [(e["vmid"], e["storage"]) for e in backups["guest_backups"]] == [(100, "local")]
@@ -1850,7 +1841,9 @@ class _FakeClock:
 
 
 def _volume(vmid, ctime, volid=None, **extra):
-    v = {"vmid": vmid, "ctime": ctime, "volid": volid or f"s:backup/vm/{vmid}/{ctime}"}
+    # prune-preview shape: vmid, ctime, volid, mark (keep|remove|protected).
+    v = {"vmid": vmid, "ctime": ctime,
+         "volid": volid or f"s:backup/vm/{vmid}/{ctime}", "mark": "keep"}
     v.update(extra)
     return v
 
@@ -1897,7 +1890,7 @@ def test_node_name_is_scrubbed_on_the_wire():
     assert tasks[0]["node"] == "nx"
     mock2 = _one_node_mock(
         storage_by_node={"n\x00x": [_dir_storage("local")]},
-        content_by_node_storage={"n\x00x": {"local": [_volume(100, 1)]}},
+        prunebackups_by_node_storage={"n\x00x": {"local": [_volume(100, 1)]}},
     )
     entries = make_collector(proxmox_mock=mock2)._collect_guest_backups(["n\x00x"], [])
     assert entries[0]["node"] == "nx"
@@ -1913,97 +1906,6 @@ def test_log_safe_collapses_control_chars_and_redacts():
     assert safe("secret=AKIAIOSFODNN7EXAMPLE") == "secret=[REDACTED]"
     assert safe(RuntimeError("boom\n403")) == "boom 403"
     assert len(safe("a b " * 2000)) == proxmox_module._ERROR_MAX_LEN
-
-
-def test_has_backup_read_priv_checks_storage_and_ancestors():
-    """#156: only a token with Datastore.Allocate (on the storage or an ancestor
-    path) can trust an empty backup read; audit-only cannot; perms None (fetch
-    failed) degrades to True (best-effort read)."""
-    have = proxmox_module._has_backup_read_priv
-    assert have(None, "s") is True  # perms unavailable -> degrade
-    assert have({}, "s") is False
-    assert have({"/storage/s": {"Datastore.Allocate": 1}}, "s") is True
-    assert have({"/storage": {"Datastore.Allocate": 1}}, "s") is True
-    assert have({"/": {"Datastore.Allocate": 1}}, "s") is True
-    assert have({"/storage/other": {"Datastore.Allocate": 1}}, "s") is False
-    # PVEAuditor's actual set: audit privileges only -> cannot see backups.
-    audit_only = {"/storage/s": {"Datastore.Audit": 1, "VM.Audit": 1}}
-    assert have(audit_only, "s") is False
-
-
-def test_effective_permissions_is_best_effort():
-    ok = _one_node_mock(permissions={"/storage/local": {"Datastore.Allocate": 1}})
-    assert make_collector(proxmox_mock=ok)._effective_permissions() == {
-        "/storage/local": {"Datastore.Allocate": 1}
-    }
-    bad = _one_node_mock()
-    bad.access.permissions.get.side_effect = RuntimeError("boom")
-    assert make_collector(proxmox_mock=bad)._effective_permissions() is None
-    nonlist = _one_node_mock()
-    nonlist.access.permissions.get.return_value = ["not", "a", "dict"]
-    assert make_collector(proxmox_mock=nonlist)._effective_permissions() is None
-
-
-def test_guest_backups_local_without_priv_is_unknown_no_read():
-    """An audit-only token: the storage is reported unknown WITHOUT a content
-    read (the read would be a filtered empty, a false all-clear)."""
-    mock = _one_node_mock(
-        storage_by_node={"pve1": [_dir_storage("local")]},
-        content_by_node_storage={"pve1": {"local": [_volume(100, 1)]}},
-        permissions={"/storage/local": {"Datastore.Audit": 1}},
-    )
-    errors = []
-    entries = make_collector(proxmox_mock=mock)._collect_guest_backups(["pve1"], errors)
-    assert entries == []
-    assert errors == [
-        {
-            "scope": "storage",
-            "node": "pve1",
-            "storage": "local",
-            "message": proxmox_module._NO_BACKUP_PRIV_MESSAGE,
-        }
-    ]
-    # the filtered read is never even issued
-    assert mock._content_calls == []
-
-
-def test_guest_backups_local_with_priv_reads_normally():
-    mock = _one_node_mock(
-        storage_by_node={"pve1": [_dir_storage("local")]},
-        content_by_node_storage={"pve1": {"local": [_volume(100, 1)]}},
-        permissions={"/": {"Datastore.Allocate": 1}},  # granted at the root
-    )
-    errors = []
-    entries = make_collector(proxmox_mock=mock)._collect_guest_backups(["pve1"], errors)
-    assert errors == []
-    assert [(e["vmid"], e["storage"]) for e in entries] == [(100, "local")]
-    assert len(mock._content_calls) == 1
-
-
-def test_guest_backups_shared_without_priv_unknown_once():
-    """A shared storage without the privilege is reported unknown ONCE (node
-    null), no content read, and later nodes do not re-error."""
-    shared = {"storage": "pbs", "type": "pbs", "content": "backup", "shared": 1, "active": 1}
-    mock = _one_node_mock(
-        nodes=[{"node": "pve1"}, {"node": "pve2"}],
-        storage_by_node={"pve1": [shared], "pve2": [shared]},
-        content_by_node_storage={"pve1": {"pbs": [_volume(100, 1)]}},
-        permissions={"/storage/pbs": {"Datastore.Audit": 1}},
-    )
-    errors = []
-    entries = make_collector(proxmox_mock=mock)._collect_guest_backups(
-        ["pve1", "pve2"], errors
-    )
-    assert entries == []
-    assert errors == [
-        {
-            "scope": "storage",
-            "node": None,
-            "storage": "pbs",
-            "message": proxmox_module._NO_BACKUP_PRIV_MESSAGE,
-        }
-    ]
-    assert mock._content_calls == []
 
 
 def test_scrub_csv_truncates_at_comma_never_splits_an_id():
@@ -2132,18 +2034,17 @@ def test_backup_error_bounds_and_scrubs_message():
 
 
 def test_guest_backups_aggregates_latest_per_guest_regardless_of_order():
-    """Latest ctime wins whatever the listing order; count covers every
-    volume; size falls back to approximate-size; the PBS-only keys are
-    re-derived from the winning volume, never inherited from a loser."""
+    """Latest ctime wins whatever the listing order; count covers every volume;
+    protected (prune mark) is re-derived from the winning volume."""
     mock = _one_node_mock(
         storage_by_node={"pve1": [_dir_storage("local")]},
-        content_by_node_storage={
+        prunebackups_by_node_storage={
             "pve1": {
                 "local": [
-                    _volume(100, 300, size=3, verification={"state": "ok", "upid": "U1"}, protected=1),
-                    _volume(100, 100, size=1),
-                    _volume(100, 200, size=2),
-                    _volume(101, 50, **{"approximate-size": 7}),
+                    _volume(100, 300, mark="protected"),
+                    _volume(100, 100),
+                    _volume(100, 200),
+                    _volume(101, 50),
                 ]
             }
         },
@@ -2159,9 +2060,7 @@ def test_guest_backups_aggregates_latest_per_guest_regardless_of_order():
             "node": "pve1",
             "latest_ctime": 300,
             "latest_volid": "s:backup/vm/100/300",
-            "latest_size": 3,
             "count": 3,
-            "verification": {"state": "ok", "upid": "U1"},
             "protected": True,
         },
         {
@@ -2170,27 +2069,29 @@ def test_guest_backups_aggregates_latest_per_guest_regardless_of_order():
             "node": "pve1",
             "latest_ctime": 50,
             "latest_volid": "s:backup/vm/101/50",
-            "latest_size": 7,
             "count": 1,
+            "protected": False,
         },
     ]
 
 
-def test_guest_backups_newer_volume_drops_stale_optional_keys():
+def test_guest_backups_protected_is_rederived_from_the_winning_volume():
+    """protected comes from the LATEST volume's prune mark, never inherited: an
+    older protected backup must not mark a newer unprotected one protected."""
     mock = _one_node_mock(
         storage_by_node={"pve1": [_dir_storage("local")]},
-        content_by_node_storage={
+        prunebackups_by_node_storage={
             "pve1": {
                 "local": [
-                    _volume(100, 100, encrypted="1", protected=1, verification={"state": "ok", "upid": "U"}),
-                    _volume(100, 200),
+                    _volume(100, 100, mark="protected"),
+                    _volume(100, 200),  # newer, mark "keep"
                 ]
             }
         },
     )
     entries = make_collector(proxmox_mock=mock)._collect_guest_backups(["pve1"], [])
     assert entries[0]["latest_ctime"] == 200
-    assert not ({"encrypted", "protected", "verification"} & set(entries[0]))
+    assert entries[0]["protected"] is False
 
 
 def test_guest_backups_content_query_and_skips():
@@ -2208,7 +2109,7 @@ def test_guest_backups_content_query_and_skips():
                 _dir_storage("local"),
             ]
         },
-        content_by_node_storage={
+        prunebackups_by_node_storage={
             "pve1": {
                 "local": [
                     "garbage",
@@ -2231,7 +2132,7 @@ def test_guest_backups_content_query_and_skips():
         }
     ]
     assert [(e["vmid"], e["count"]) for e in entries] == [(100, 1)]
-    assert mock._content_calls == [("pve1", "local", {"content": "backup"})]
+    assert mock._prunebackups_calls == [("pve1", "local", {"prune-backups": "keep-all=1"})]
 
 
 def test_guest_backups_shared_listed_once_from_first_active_node():
@@ -2245,7 +2146,7 @@ def test_guest_backups_shared_listed_once_from_first_active_node():
             "pve2": [dict(shared, active=1)],
             "pve3": [dict(shared, active=1)],
         },
-        content_by_node_storage={
+        prunebackups_by_node_storage={
             "pve2": {"pbs": [_volume(100, 10)]},
             "pve3": {"pbs": [_volume(999, 10)]},
         },
@@ -2262,11 +2163,11 @@ def test_guest_backups_shared_listed_once_from_first_active_node():
             "node": None,
             "latest_ctime": 10,
             "latest_volid": "s:backup/vm/100/10",
-            "latest_size": None,
             "count": 1,
+            "protected": False,
         }
     ]
-    assert [(n, s) for n, s, _ in mock._content_calls] == [("pve2", "pbs")]
+    assert [(n, s) for n, s, _ in mock._prunebackups_calls] == [("pve2", "pbs")]
 
 
 def test_guest_backups_shared_inactive_everywhere_is_an_error_not_a_listing():
@@ -2286,7 +2187,7 @@ def test_guest_backups_shared_inactive_everywhere_is_an_error_not_a_listing():
             "message": "shared storage not active on any node",
         }
     ]
-    assert mock._content_calls == []
+    assert mock._prunebackups_calls == []
 
 
 def test_guest_backups_local_inactive_is_an_error_not_a_listing():
@@ -2302,7 +2203,7 @@ def test_guest_backups_local_inactive_is_an_error_not_a_listing():
             "message": "storage not active on this node",
         }
     ]
-    assert mock._content_calls == []
+    assert mock._prunebackups_calls == []
 
 
 def test_guest_backups_shared_flag_falls_back_to_datacenter_config():
@@ -2312,11 +2213,11 @@ def test_guest_backups_shared_flag_falls_back_to_datacenter_config():
         nodes=[{"node": "pve1"}, {"node": "pve2"}],
         storage_by_node={"pve1": [row], "pve2": [row]},
         storage_config=[{"storage": "nfs", "type": "nfs", "shared": 1}],
-        content_by_node_storage={"pve1": {"nfs": [_volume(100, 1)]}, "pve2": {"nfs": [_volume(100, 1)]}},
+        prunebackups_by_node_storage={"pve1": {"nfs": [_volume(100, 1)]}, "pve2": {"nfs": [_volume(100, 1)]}},
     )
     entries = make_collector(proxmox_mock=mock)._collect_guest_backups(["pve1", "pve2"], [])
     assert [(e["storage"], e["node"]) for e in entries] == [("nfs", None)]
-    assert len(mock._content_calls) == 1
+    assert len(mock._prunebackups_calls) == 1
 
 
 def test_guest_backups_node_storage_listing_failure_is_scoped_and_isolated():
@@ -2324,7 +2225,7 @@ def test_guest_backups_node_storage_listing_failure_is_scoped_and_isolated():
         nodes=[{"node": "pve1"}, {"node": "pve2"}],
         storage_by_node={"pve2": [_dir_storage("local")]},
         storage_raises_for={"pve1"},
-        content_by_node_storage={"pve2": {"local": [_volume(100, 1)]}},
+        prunebackups_by_node_storage={"pve2": {"local": [_volume(100, 1)]}},
     )
     errors = []
     entries = make_collector(proxmox_mock=mock)._collect_guest_backups(["pve1", "pve2"], errors)
@@ -2348,7 +2249,7 @@ def test_guest_backups_non_list_content_is_a_scoped_error():
 
     def storage_call(name):
         sm = MagicMock()
-        sm.content.get.side_effect = lambda **_: {"not": "a list"}
+        sm.prunebackups.get.side_effect = lambda **_: {"not": "a list"}
         return sm
 
     nm.storage.side_effect = storage_call
@@ -2374,8 +2275,8 @@ def test_guest_backups_shared_content_failure_retries_on_next_active_node():
     mock = _one_node_mock(
         nodes=[{"node": "pve1"}, {"node": "pve2"}],
         storage_by_node={"pve1": [shared], "pve2": [shared]},
-        content_raises_for={"pve1/pbs"},
-        content_by_node_storage={"pve2": {"pbs": [_volume(100, 10)]}},
+        prunebackups_raises_for={"pve1/pbs"},
+        prunebackups_by_node_storage={"pve2": {"pbs": [_volume(100, 10)]}},
     )
     errors = []
     entries = make_collector(proxmox_mock=mock)._collect_guest_backups(
@@ -2388,17 +2289,17 @@ def test_guest_backups_shared_content_failure_retries_on_next_active_node():
             "scope": "storage",
             "node": "pve1",
             "storage": "pbs",
-            "message": "content listing failed: content boom",
+            "message": "backup listing failed: content boom",
         }
     ]
-    assert [(n, st) for n, st, _ in mock._content_calls] == [("pve1", "pbs"), ("pve2", "pbs")]
+    assert [(n, st) for n, st, _ in mock._prunebackups_calls] == [("pve1", "pbs"), ("pve2", "pbs")]
 
 
 def test_guest_backups_cap_is_announced(monkeypatch):
     monkeypatch.setattr(proxmox_module, "MAX_GUEST_BACKUPS", 2)
     mock = _one_node_mock(
         storage_by_node={"pve1": [_dir_storage("local")]},
-        content_by_node_storage={
+        prunebackups_by_node_storage={
             "pve1": {"local": [_volume(102, 1), _volume(100, 1), _volume(101, 1)]}
         },
     )
@@ -2594,7 +2495,7 @@ def test_collect_backups_null_when_node_listing_fails_collection_untouched():
 def test_collect_backups_partial_leaves_collection_untouched():
     mock = _one_node_mock(
         storage_by_node={"pve1": [_dir_storage("local")]},
-        content_raises_for={"pve1/local"},
+        prunebackups_raises_for={"pve1/local"},
         tasks_raises_for={"pve1"},
         backup_jobs_raises=True,
         not_backed_up_raises=True,
@@ -2634,25 +2535,25 @@ def test_collect_backups_cached_within_ttl_and_age_grows():
     clock = _FakeClock()
     mock = _one_node_mock(
         storage_by_node={"pve1": [_dir_storage("local")]},
-        content_by_node_storage={"pve1": {"local": [_volume(100, 1)]}},
+        prunebackups_by_node_storage={"pve1": {"local": [_volume(100, 1)]}},
     )
     p1, p2 = _ttl_mocks(clock)
     with p1, p2:
         first = make_collector(proxmox_mock=mock).collect()
         assert first["backups"]["age_s"] == 0
-        assert len(mock._content_calls) == 1
+        assert len(mock._prunebackups_calls) == 1
         node_listings = mock.nodes.get.call_count
 
         clock.t += 30
         second = make_collector(proxmox_mock=mock).collect()
-        assert len(mock._content_calls) == 1
+        assert len(mock._prunebackups_calls) == 1
         assert mock.nodes.get.call_count == node_listings + 4  # the flagged sections only
         assert second["backups"]["age_s"] == 30
         assert second["backups"]["guest_backups"] == first["backups"]["guest_backups"]
 
         clock.t += proxmox_module.BACKUPS_CACHE_TTL
         third = make_collector(proxmox_mock=mock).collect()
-        assert len(mock._content_calls) == 2
+        assert len(mock._prunebackups_calls) == 2
         assert third["backups"]["age_s"] == 0
 
 
@@ -2689,7 +2590,7 @@ def test_collect_backups_cache_keyed_on_connection_identity():
     b = _one_node_mock(storage_by_node={"pve1": [_dir_storage("local")]})
     make_collector(proxmox_mock=a, host="pve-a").collect()
     make_collector(proxmox_mock=b, host="pve-b").collect()
-    assert len(a._content_calls) == 1 and len(b._content_calls) == 1
+    assert len(a._prunebackups_calls) == 1 and len(b._prunebackups_calls) == 1
     assert make_collector(proxmox_mock=a, host="pve-a")._backups_cache_key == (
         "pve-a",
         8006,
@@ -2777,36 +2678,20 @@ def test_collect_backups_partial_block_is_cached_within_ttl():
     clock = _FakeClock()
     mock = _one_node_mock(
         storage_by_node={"pve1": [_dir_storage("local"), _dir_storage("pbs")]},
-        content_by_node_storage={"pve1": {"local": [_volume(100, 1)]}},
-        content_raises_for={"pve1/pbs"},
+        prunebackups_by_node_storage={"pve1": {"local": [_volume(100, 1)]}},
+        prunebackups_raises_for={"pve1/pbs"},
     )
     p1, p2 = _ttl_mocks(clock)
     with p1, p2:
         first = make_collector(proxmox_mock=mock).collect()
         assert [e["storage"] for e in first["backups"]["errors"]] == ["pbs"]
-        calls = len(mock._content_calls)
+        calls = len(mock._prunebackups_calls)
 
         clock.t += 30
         second = make_collector(proxmox_mock=mock).collect()
-        assert len(mock._content_calls) == calls
+        assert len(mock._prunebackups_calls) == calls
         assert second["backups"]["errors"] == first["backups"]["errors"]
         assert second["backups"]["age_s"] == 30
-
-
-def test_guest_backups_non_dict_verification_is_omitted():
-    """T88: PBS spells `verification` as an object. A daemon (or a future
-    version) reporting it as a bare string must omit the key rather than ship
-    {'state': None, 'upid': None}, which the server would read as a real
-    verification record with an unknown state."""
-    mock = _one_node_mock(
-        storage_by_node={"pve1": [_dir_storage("local")]},
-        content_by_node_storage={
-            "pve1": {"local": [_volume(100, 10, verification="ok")]}
-        },
-    )
-    entries = make_collector(proxmox_mock=mock)._collect_guest_backups(["pve1"], [])
-    assert entries[0]["latest_ctime"] == 10
-    assert "verification" not in entries[0]
 
 
 def test_holds_backups_non_string_content_lists_anyway():
@@ -2836,7 +2721,7 @@ def test_guest_backups_one_guest_on_two_storages_is_two_entries():
     (vmid, storage, node)."""
     mock = _one_node_mock(
         storage_by_node={"pve1": [_dir_storage("zzz"), _dir_storage("aaa")]},
-        content_by_node_storage={
+        prunebackups_by_node_storage={
             "pve1": {"zzz": [_volume(100, 50)], "aaa": [_volume(100, 10)]}
         },
     )
@@ -2863,7 +2748,7 @@ def test_backups_deadline_skips_remaining_reads_and_names_each():
             "pve1": [_dir_storage("local"), shared],
             "pve2": [shared, _dir_storage("local")],
         },
-        content_by_node_storage={"pve1": {"local": [_volume(100, 1)]}},
+        prunebackups_by_node_storage={"pve1": {"local": [_volume(100, 1)]}},
         tasks_by_node={"pve1": [{"upid": "U"}]},
         backup_jobs=[{"id": "j"}],
         not_backed_up=[{"vmid": 1}],
@@ -2873,13 +2758,13 @@ def test_backups_deadline_skips_remaining_reads_and_names_each():
 
     def slow_storage_call(name):
         sm = inner(name)
-        real_get = sm.content.get.side_effect
+        real_get = sm.prunebackups.get.side_effect
 
         def slow_get(**params):
             clock.t += proxmox_module.BACKUPS_COLLECT_DEADLINE + 1
             return real_get(**params)
 
-        sm.content.get.side_effect = slow_get
+        sm.prunebackups.get.side_effect = slow_get
         return sm
 
     nm.storage.side_effect = slow_storage_call
@@ -2900,7 +2785,7 @@ def test_backups_deadline_skips_remaining_reads_and_names_each():
         {"scope": "jobs", "node": None, "storage": None, "message": msg},
         {"scope": "not_backed_up", "node": None, "storage": None, "message": msg},
     ]
-    assert len(mock._content_calls) == 1
+    assert len(mock._prunebackups_calls) == 1
     mock.nodes("pve1").tasks.get.assert_not_called()
     mock.cluster.backup.get.assert_not_called()
     # collection is untouched by a budget-trimmed block (rule 2)
@@ -2914,20 +2799,20 @@ def test_backups_deadline_skips_local_storage_and_is_cached():
     clock = _FakeClock()
     mock = _one_node_mock(
         storage_by_node={"pve1": [_dir_storage("a"), _dir_storage("b")]},
-        content_by_node_storage={"pve1": {"a": [_volume(1, 1)], "b": [_volume(2, 1)]}},
+        prunebackups_by_node_storage={"pve1": {"a": [_volume(1, 1)], "b": [_volume(2, 1)]}},
     )
     nm = mock.nodes("pve1")
     inner = nm.storage.side_effect
 
     def slow_storage_call(name):
         sm = inner(name)
-        real_get = sm.content.get.side_effect
+        real_get = sm.prunebackups.get.side_effect
 
         def slow_get(**params):
             clock.t += proxmox_module.BACKUPS_COLLECT_DEADLINE
             return real_get(**params)
 
-        sm.content.get.side_effect = slow_get
+        sm.prunebackups.get.side_effect = slow_get
         return sm
 
     nm.storage.side_effect = slow_storage_call
@@ -2942,7 +2827,7 @@ def test_backups_deadline_skips_local_storage_and_is_cached():
         "storage": "b",
         "message": proxmox_module._DEADLINE_MESSAGE,
     }
-    assert len(mock._content_calls) == 1
+    assert len(mock._prunebackups_calls) == 1
     assert second["errors"] == first["errors"]
 
 

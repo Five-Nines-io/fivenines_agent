@@ -999,13 +999,14 @@ PBS datastore with thousands of snapshots stays a handful of entries; a shared
 storage is listed once, a local one once per node), the finished `vzdump`
 tasks per node (job-level outcomes, `status` passed through verbatim), the
 backup job definitions, and PVE's own list of guests not covered by any job.
-Three of those reads work with the read-only `PVEAuditor` role, but the
-per-guest **backup volume** listing does not: PVE filters backup volumes
-per-volume, so an audit-only token gets an empty list even when backups exist.
-Reading per-guest backup age therefore needs `Datastore.Allocate` on the backup
-storages. When the token lacks it, the agent reports those storages as
-*unknown* (never as "no backups"), so a missing privilege can never turn into a
-false "not backed up" alert.
+All four reads work with the read-only `PVEAuditor` role the setup guide
+provisions -- no token change. The per-guest backup volumes are read through
+PVE's backup **prune-preview** (a dry run that changes nothing), which returns
+each backup's date and id under plain audit rights; the ordinary content
+listing would hide them behind a write-class privilege. If a storage's backups
+genuinely cannot be read (for example a PBS datastore whose credentials lack
+prune rights), that storage is reported as *unknown*, never as "no backups", so
+a read failure can never turn into a false "not backed up" alert.
 The block is refreshed every 10 minutes rather than every tick, since the
 content listing is the most expensive call the collector makes and backup age
 moves in hours; its `age_s` tells the server how old the snapshot is. One

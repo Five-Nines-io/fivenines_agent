@@ -2,15 +2,20 @@
 
 ## Proxmox backups phase 2 -- server half tracked in fivenines_server#1164
 
-Agent side is DONE (PR #158, v1.19.0): the `data["proxmox"]["backups"]` block
-plus the permission fail-safe. Everything server-side has moved to
-**fivenines_server#1164** and is out of scope for this repo: the runtime finding
-that `PVEAuditor` cannot see backup volumes (needs `Datastore.Allocate`,
-confirmed on a real PVE 2026-09-21),
-the founder Tier-A/Tier-B rollout decision, the `SetupGuides::PROXMOX`
-`Datastore.Allocate` step, the byte-identical `spec/fixtures/proxmox_contract_payload.json`
-copy, and the ingest / per-guest-age model / `proxmox_guest_backup_stale`
-trigger. Design: fivenines_server `docs/designs/proxmox-backup-monitoring.md`.
+Agent side is DONE (PR #158, v1.19.0): the `data["proxmox"]["backups"]` block.
+The whole feature works under the read-only `PVEAuditor` role the setup guide
+already provisions -- per-guest backup volumes are read through PVE's
+prune-preview endpoint (`/prunebackups`, a dryrun), so NO token change is needed
+(the earlier `Datastore.Allocate` requirement was a wrong turn: it came from
+reading the content listing, which filters backups per-volume; the prune preview
+returns the same evidence under `Datastore.Audit`). Everything server-side is in
+**fivenines_server#1164**: the ingest, the per-guest-age model, the
+`proxmox_guest_backup_stale` trigger, and the byte-identical
+`spec/fixtures/proxmox_contract_payload.json` copy. The only remaining
+`Datastore.Allocate`/PBS-native question is the OPTIONAL later enrichment
+(verification state, size) the prune preview does not carry -- not a blocker,
+not a rollout decision for the core feature. Design: fivenines_server
+`docs/designs/proxmox-backup-monitoring.md`.
 
 ## P1: Reconcile the server's copy of ubuntu_pro_contract_payload.json
 

@@ -1,37 +1,11 @@
 {
   "description": "Shared Proxmox contract fixture between fivenines-agent and fivenines-server. Source of truth: fivenines-agent tests/fixtures/proxmox_contract_payload.json, asserted end-to-end by tests/test_proxmox.py::test_contract_fixture_scenarios (only proxmoxer.ProxmoxAPI is mocked). For each scenario, 'api' is the agent-side proxmoxer mock input (fed to tests/test_proxmox.py::make_proxmox_mock; the server ignores it, it only documents how the payload arises) and 'payload' is the artifact the agent emits under data['proxmox'] -- the exact thing the server's cluster-scope ingester must parse. As of agent 1.10.0 the payload carries an explicit ceph-style 'collection' flags block (reachable / cluster_ok / nodes_ok / guests_ok / storage_ok / error); the server MUST prefer these flags over shape inference when the block is present. 'inference_contract' below is retained as the pre-1.10.0 fallback: how the server derives the same signals from payload SHAPE when 'collection' is absent (an older agent). Both must agree on every scenario here. Change only in lockstep with spec/fixtures/proxmox_contract_payload.json on the server.",
   "agent_min_version": "1.10.0",
-  "collection_contract": {
-    "reachable": "collection.reachable. Always true inside a non-null payload -- an unreachable API yields a null payload (proxmox_metrics() -> None), never a payload with reachable:false. Stated explicitly so the server reads a flag rather than re-deriving 'reachable == payload is not null'.",
-    "cluster_ok": "collection.cluster_ok. True iff the /cluster/status call succeeded. Resolves the cluster:null ambiguity the inference contract could not: standalone node => cluster:null AND cluster_ok:true (the call succeeded, there was simply no cluster-type entry); clustered reporter whose /cluster/status failed => cluster:null AND cluster_ok:false. See scenarios 'standalone' vs 'cluster_fetch_failed'.",
-    "nodes_ok": "collection.nodes_ok. True iff the /nodes listing AND every per-node /nodes/<n>/status call succeeded. A node dropped from payload.nodes because its status fetch raised mid-loop sets nodes_ok:false (see 'partial_node_timeout', 'quorum_lost'). Unlike the shape heuristic (len(nodes)==cluster.nodes_online) this fires even when the dropped node is genuinely offline and excluded from nodes_online -- it reports call success, not head-count agreement.",
-    "guests_ok": "collection.guests_ok. True iff every qemu AND lxc listing across all reporting nodes succeeded (covers both guest loops). A single node's qemu or lxc call raising sets guests_ok:false; the guests of that node are absent from payload.vms/lxc.",
-    "storage_ok": "collection.storage_ok. True iff every per-node /nodes/<n>/storage call succeeded. Independent of the other flags: a lone storage timeout leaves nodes_ok/guests_ok true and only storage_ok false (see 'storage_query_failed'). This is what the shape heuristic could never express -- 'no storages exist' (empty array, storage_ok:true) vs 'storage query failed' (empty/partial array, storage_ok:false).",
-    "error": "collection.error. First failure message across the sections in collect() order (cluster, nodes, vms, lxc, storage), or null when every flag is true. A short structured hint ('node pve2: storage query failed'), truncated to 500 chars; the full exception goes to the agent log, not the payload. Opaque to the server -- surfaced as a diagnostic, never parsed."
-  },
-  "inference_contract": {
-    "_note": "PRE-1.10.0 FALLBACK ONLY. When the explicit 'collection' block is present (agent >= 1.10.0) the server MUST use it (see 'collection_contract'); these shape rules are how the same signals are recovered from older agents that emit no flags.",
-    "reachable": "payload is not null. A null payload (proxmox_metrics() -> None) is the ONLY unreachable/auth-failure signal; there is no partial 'all empty' payload to disambiguate (normalized agent-side in ProxmoxCollector.collect).",
-    "cluster_ok": "payload.cluster is not null. CAVEAT: payload.cluster is also null for a genuine standalone node (see scenario 'standalone'). cluster:null is therefore ambiguous between (a) standalone, no corosync, and (b) a clustered reporter whose /cluster/status call failed -- ProxmoxCollector._collect_cluster returns None for both. The server must disambiguate with its own cross-reporter knowledge (a lone reporter => standalone; one of N cluster reporters returning cluster:null => that reporter's cluster fetch failed).",
-    "nodes_ok": "when payload.cluster is present, len(payload.nodes) == payload.cluster.nodes_online. A node counted online by corosync (cluster.status) but missing from payload.nodes means its per-node detail collection failed mid-loop (see scenario 'partial_node_timeout'). For a standalone node (cluster:null) expect exactly one node entry.",
-    "guests_ok": "guests (vms + lxc) are only reported for nodes present in payload.nodes; a node that dropped out of payload.nodes also drops its guests. There is no expected-guest-count in the payload, so guests_ok is derived transitively from nodes_ok, not independently.",
-    "storage_ok": "same as guests_ok: storage is reported per node present in payload.nodes. SHARED storage (e.g. ceph/nfs) is reported once PER reporting node (not deduplicated) and the payload carries no shared flag -- the server must dedupe shared pools across reporters by (name, type, total). See scenario 'quorate_cluster' where 'ceph-pool' appears three times, once per node."
-  },
-  "error_path_audit": {
-    "proxmoxer_missing": "proxmox_metrics() -> None (ProxmoxAPI is None guard). data['proxmox'] = null.",
-    "no_credentials": "_connect() logs and leaves self.proxmox = None; collect() returns None. data['proxmox'] = null.",
-    "constructor_raises": "ProxmoxAPI(...) raising is caught in _connect (self.proxmox = None) OR, if ProxmoxCollector.__init__ itself raises, by proxmox_metrics' outer try. Either way -> None.",
-    "api_unreachable_after_construction": "The realistic auth-failure / host-down case: token-auth ProxmoxAPI constructs lazily (no None), then every request raises. version.get() raises AND the node-listing probe raises => collect() returns None (see scenario 'unreachable'). BEFORE 1.9.0 this returned {\"version\": null, \"cluster\": null, \"nodes\": [], \"vms\": [], \"lxc\": [], \"storage\": []}, indistinguishable-by-value from an idle node; normalized to None in 1.9.0.",
-    "single_node_timeout": "One node's per-node calls raise mid-loop while the cluster-wide /cluster/status still counts it online. Exceptions are swallowed per-node in _collect_nodes/_collect_vms/_collect_lxc/_collect_storage, so that node silently drops from payload.nodes/vms/lxc/storage while payload.cluster.nodes_online still includes it (see scenario 'partial_node_timeout')."
-  },
-  "storage_pool_contract": {
-    "_note": "Agent-side prerequisite for the deferred ZFS<->Proxmox join (issue #49, ZFS pool health shipped in agent 1.11.3). Each storage entry OPTIONALLY carries 'pool', read from the datacenter storage config (/storage -> self.proxmox.storage.get(), one cluster-wide call), which is DISTINCT from the per-node /nodes/<n>/storage runtime status the total/used/available/active fields come from. See scenario 'standalone' for the pinned shape (local-zfs carries pool, local/local-lvm do not).",
-    "field": "pool",
-    "present_for": "Pool-backed storage types only: zfspool (the ZFS dataset, e.g. 'rpool/data'), rbd/cephfs (the Ceph pool). OMITTED (key absent, never null) for dir/lvmthin/nfs/etc, so a host with no pool-backed storage stays byte-identical to the pre-field payload -- the contract is purely additive and the field is the single allowed optional key beyond the base 7.",
-    "server_join": "For a zfspool storage the zpool ROOT is pool.split('/')[0] (e.g. 'rpool/data' -> 'rpool'); the server joins that to host-local ZfsPool.name per (host, pool root). This is the join key proxmox_storages.name could never provide -- that column is the PVE storage ID (e.g. 'local-zfs'), not the zpool name. rbd/cephfs 'pool' is the Ceph pool; the server filters by type when joining. OUT OF SCOPE for the agent: the server adds proxmox_storages.pool and performs the join in a paired lockstep PR.",
-    "best_effort": "Enrichment is best-effort. A restricted token that cannot read /storage, or an older PVE, degrades to no 'pool' on any entry and NEVER fails or flips storage_ok -- _storage_config_map swallows its own error and is deliberately not threaded through the 'collection' flags block. Deploy order is not sensitive: an old server ignores the extra 'pool' key; a new server reads it with .get('pool')."
-  },
-  "backups_contract": {"_note": "Agent 1.19.0+ (fivenines_agent#156, server companion of fivenines_server#1159 phase 2). payload.backups is the one section OUTSIDE the collection flags block: it carries its own three-level signal and NEVER flips a flag (completeness_score is a stored generated column over the five flags that elects the authoritative reporter; a sixth bit would be a migration + a rollout window). See scenarios backups_ok / backups_storage_partial / backups_block_failed / backups_capped.", "three_level_null": "Key ABSENT = an agent older than 1.19.0: the server reads 'unknown', never 'no backups'. backups: null = the block could not be built at all (the node listing failed; see backups_block_failed) -- also 'unknown', and never cached agent-side so the next tick retries. An OBJECT = a read happened; errors[] says which sub-reads failed.", "partial_read_rule": "errors[] entries are {scope: 'storage'|'tasks'|'jobs'|'not_backed_up'|'cap', node, storage, message}. Per-storage entries are LOAD-BEARING: the server's rule for a partial read is asymmetric -- a guest with a fresh backup on a successfully listed storage is fine (evidence exists), but a guest with NO backup found is 'unknown', never 'never'/'aged', because its backups may live on the storage that failed (see backups_storage_partial: ct 101). A 'storage' entry with storage:null means a whole node's storage listing failed (every local storage on that node is unknown). scope 'cap' means an array was trimmed to its hard cap (guest_backups 5000, tasks 50 per node, jobs 200, not_backed_up 2000) and is not complete. A read skipped because the block's 30s wall-clock budget ran out (a wedged PVE/PBS) is recorded under its own scope with message 'skipped: backups collection deadline exceeded' and the same node/storage fields, so it is handled exactly like a failed read. A non-list API envelope is recorded under its scope as 'unexpected response shape (not a list)' rather than iterated into a silent empty result (a false all-clear); a storage whose backup volumes are missing vmid/ctime is flagged 'N backup volume(s) skipped (missing vmid or ctime)' so its unmatched guests read unknown. errors[] itself is bounded (a 'cap'-scope 'errors capped at N' entry once past the limit). PERMISSION FAIL-SAFE (#156): PVE filters backup volumes per-volume, so an audit-only PVEAuditor token gets an empty content listing even when backups exist; the agent detects it lacks Datastore.Allocate (via /access/permissions) and reports the storage 'insufficient privilege to list backups...' (a 'storage' scoped error) WITHOUT the doomed read, rather than guest_backups:[] which would read as 'never backed up'. See scenario backups_no_permission. The server must render such storages' guests as unknown and surface the 'needs Datastore.Allocate' hint.", "guest_backups": "One entry per (vmid, storage[, node]): the LATEST volume's ctime/volid/size, a count, and -- only when the storage reports them -- verification {state: 'ok'|'failed', upid} (PBS), protected, encrypted (PBS). A SHARED storage (PBS/NFS/CIFS) is listed once from the first node where it is active and emitted with node: null; a local storage once per node with node set. Volumes without vmid or ctime are skipped. Sorted by (vmid, storage, node). This is the per-guest signal; the alert is built from it, never from tasks.", "tasks": "Finished vzdump tasks per node (limit 50), JOB-level: status is the free string PVE reports ('OK', 'WARNINGS: <n>', or an error message), passed verbatim and capped -- the server classifies it. id is the vmid only when exactly one guest was backed up (pve-manager VZDump.pm); a scheduled multi-guest job has an empty id, shipped as null. Never attribute a task to a guest.", "jobs": "/cluster/backup definitions trimmed to id/enabled/schedule/storage/vmid/all/exclude/pool/node/mode/comment/next_run (PVE's 'next-run'). Display context and the schedule the server can size a default threshold from.", "not_backed_up": "/cluster/backup-info/not-backed-up verbatim: [{vmid, name, type}] -- guests covered by no job, the signal a job-level webhook can never produce.", "freshness": "The block is computed at most once per 600s and re-emitted with age_s = seconds since it was computed (monotonic). Anchor freshness as received_at - age_s; never trust the agent wall clock. latest_ctime and task starttime/endtime are PVE data timestamps and pass through as-is. In every scenario here age_s is 0 because the block was just computed.", "no_config_key": "The TTL and caps are agent constants. config['proxmox'] is splatted into proxmox_metrics(**config): a key the server started sending would be a TypeError on every older agent and kill the whole Proxmox collector there. Do not add one.", "scrubbing": "Every customer-controlled string (volid, status, comment, upid, name...) is UTF-8-sanitized, NUL-stripped and capped at 500 chars agent-side; the server ingester applies its own scrub regardless."},
+  "collection_contract": {"reachable": "collection.reachable. Always true inside a non-null payload -- an unreachable API yields a null payload (proxmox_metrics() -> None), never a payload with reachable:false. Stated explicitly so the server reads a flag rather than re-deriving 'reachable == payload is not null'.", "cluster_ok": "collection.cluster_ok. True iff the /cluster/status call succeeded. Resolves the cluster:null ambiguity the inference contract could not: standalone node => cluster:null AND cluster_ok:true (the call succeeded, there was simply no cluster-type entry); clustered reporter whose /cluster/status failed => cluster:null AND cluster_ok:false. See scenarios 'standalone' vs 'cluster_fetch_failed'.", "nodes_ok": "collection.nodes_ok. True iff the /nodes listing AND every per-node /nodes/<n>/status call succeeded. A node dropped from payload.nodes because its status fetch raised mid-loop sets nodes_ok:false (see 'partial_node_timeout', 'quorum_lost'). Unlike the shape heuristic (len(nodes)==cluster.nodes_online) this fires even when the dropped node is genuinely offline and excluded from nodes_online -- it reports call success, not head-count agreement.", "guests_ok": "collection.guests_ok. True iff every qemu AND lxc listing across all reporting nodes succeeded (covers both guest loops). A single node's qemu or lxc call raising sets guests_ok:false; the guests of that node are absent from payload.vms/lxc.", "storage_ok": "collection.storage_ok. True iff every per-node /nodes/<n>/storage call succeeded. Independent of the other flags: a lone storage timeout leaves nodes_ok/guests_ok true and only storage_ok false (see 'storage_query_failed'). This is what the shape heuristic could never express -- 'no storages exist' (empty array, storage_ok:true) vs 'storage query failed' (empty/partial array, storage_ok:false).", "error": "collection.error. First failure message across the sections in collect() order (cluster, nodes, vms, lxc, storage), or null when every flag is true. A short structured hint ('node pve2: storage query failed'), truncated to 500 chars; the full exception goes to the agent log, not the payload. Opaque to the server -- surfaced as a diagnostic, never parsed."},
+  "inference_contract": {"_note": "PRE-1.10.0 FALLBACK ONLY. When the explicit 'collection' block is present (agent >= 1.10.0) the server MUST use it (see 'collection_contract'); these shape rules are how the same signals are recovered from older agents that emit no flags.", "reachable": "payload is not null. A null payload (proxmox_metrics() -> None) is the ONLY unreachable/auth-failure signal; there is no partial 'all empty' payload to disambiguate (normalized agent-side in ProxmoxCollector.collect).", "cluster_ok": "payload.cluster is not null. CAVEAT: payload.cluster is also null for a genuine standalone node (see scenario 'standalone'). cluster:null is therefore ambiguous between (a) standalone, no corosync, and (b) a clustered reporter whose /cluster/status call failed -- ProxmoxCollector._collect_cluster returns None for both. The server must disambiguate with its own cross-reporter knowledge (a lone reporter => standalone; one of N cluster reporters returning cluster:null => that reporter's cluster fetch failed).", "nodes_ok": "when payload.cluster is present, len(payload.nodes) == payload.cluster.nodes_online. A node counted online by corosync (cluster.status) but missing from payload.nodes means its per-node detail collection failed mid-loop (see scenario 'partial_node_timeout'). For a standalone node (cluster:null) expect exactly one node entry.", "guests_ok": "guests (vms + lxc) are only reported for nodes present in payload.nodes; a node that dropped out of payload.nodes also drops its guests. There is no expected-guest-count in the payload, so guests_ok is derived transitively from nodes_ok, not independently.", "storage_ok": "same as guests_ok: storage is reported per node present in payload.nodes. SHARED storage (e.g. ceph/nfs) is reported once PER reporting node (not deduplicated) and the payload carries no shared flag -- the server must dedupe shared pools across reporters by (name, type, total). See scenario 'quorate_cluster' where 'ceph-pool' appears three times, once per node."},
+  "error_path_audit": {"proxmoxer_missing": "proxmox_metrics() -> None (ProxmoxAPI is None guard). data['proxmox'] = null.", "no_credentials": "_connect() logs and leaves self.proxmox = None; collect() returns None. data['proxmox'] = null.", "constructor_raises": "ProxmoxAPI(...) raising is caught in _connect (self.proxmox = None) OR, if ProxmoxCollector.__init__ itself raises, by proxmox_metrics' outer try. Either way -> None.", "api_unreachable_after_construction": "The realistic auth-failure / host-down case: token-auth ProxmoxAPI constructs lazily (no None), then every request raises. version.get() raises AND the node-listing probe raises => collect() returns None (see scenario 'unreachable'). BEFORE 1.9.0 this returned {\"version\": null, \"cluster\": null, \"nodes\": [], \"vms\": [], \"lxc\": [], \"storage\": []}, indistinguishable-by-value from an idle node; normalized to None in 1.9.0.", "single_node_timeout": "One node's per-node calls raise mid-loop while the cluster-wide /cluster/status still counts it online. Exceptions are swallowed per-node in _collect_nodes/_collect_vms/_collect_lxc/_collect_storage, so that node silently drops from payload.nodes/vms/lxc/storage while payload.cluster.nodes_online still includes it (see scenario 'partial_node_timeout')."},
+  "storage_pool_contract": {"_note": "Agent-side prerequisite for the deferred ZFS<->Proxmox join (issue #49, ZFS pool health shipped in agent 1.11.3). Each storage entry OPTIONALLY carries 'pool', read from the datacenter storage config (/storage -> self.proxmox.storage.get(), one cluster-wide call), which is DISTINCT from the per-node /nodes/<n>/storage runtime status the total/used/available/active fields come from. See scenario 'standalone' for the pinned shape (local-zfs carries pool, local/local-lvm do not).", "field": "pool", "present_for": "Pool-backed storage types only: zfspool (the ZFS dataset, e.g. 'rpool/data'), rbd/cephfs (the Ceph pool). OMITTED (key absent, never null) for dir/lvmthin/nfs/etc, so a host with no pool-backed storage stays byte-identical to the pre-field payload -- the contract is purely additive and the field is the single allowed optional key beyond the base 7.", "server_join": "For a zfspool storage the zpool ROOT is pool.split('/')[0] (e.g. 'rpool/data' -> 'rpool'); the server joins that to host-local ZfsPool.name per (host, pool root). This is the join key proxmox_storages.name could never provide -- that column is the PVE storage ID (e.g. 'local-zfs'), not the zpool name. rbd/cephfs 'pool' is the Ceph pool; the server filters by type when joining. OUT OF SCOPE for the agent: the server adds proxmox_storages.pool and performs the join in a paired lockstep PR.", "best_effort": "Enrichment is best-effort. A restricted token that cannot read /storage, or an older PVE, degrades to no 'pool' on any entry and NEVER fails or flips storage_ok -- _storage_config_map swallows its own error and is deliberately not threaded through the 'collection' flags block. Deploy order is not sensitive: an old server ignores the extra 'pool' key; a new server reads it with .get('pool')."},
+  "backups_contract": {"_note": "Agent 1.19.0+ (fivenines_agent#156, server companion of fivenines_server#1159 phase 2). payload.backups is the one section OUTSIDE the collection flags block: it carries its own three-level signal and NEVER flips a flag (completeness_score is a stored generated column over the five flags that elects the authoritative reporter; a sixth bit would be a migration + a rollout window). See scenarios backups_ok / backups_storage_partial / backups_block_failed / backups_capped.", "three_level_null": "Key ABSENT = an agent older than 1.19.0: the server reads 'unknown', never 'no backups'. backups: null = the block could not be built at all (the node listing failed; see backups_block_failed) -- also 'unknown', and never cached agent-side so the next tick retries. An OBJECT = a read happened; errors[] says which sub-reads failed.", "partial_read_rule": "errors[] entries are {scope: 'storage'|'tasks'|'jobs'|'not_backed_up'|'cap', node, storage, message}. Per-storage entries are LOAD-BEARING: the server's rule for a partial read is asymmetric -- a guest with a fresh backup on a successfully listed storage is fine (evidence exists), but a guest with NO backup found is 'unknown', never 'never'/'aged', because its backups may live on the storage that failed (see backups_storage_partial: ct 101). A 'storage' entry with storage:null means a whole node's storage listing failed (every local storage on that node is unknown). A backup read that fails -- e.g. a PBS storage whose PBS credentials lack prune rights, so the prune-preview errors -- is a 'storage' scoped error too, so those guests read unknown. A non-list envelope is recorded as 'unexpected response shape (not a list)'; a storage whose backup volumes are missing vmid/ctime is flagged 'N backup volume(s) skipped (missing vmid or ctime)'. scope 'cap' means an array was trimmed to its hard cap (guest_backups 5000, tasks 50 per node, jobs 200, not_backed_up 2000) and is not complete; errors[] itself is bounded (a 'cap'-scope 'errors capped at N' entry once past the limit). A read skipped because the block's 30s wall-clock budget ran out is recorded under its scope with message 'skipped: backups collection deadline exceeded'.", "guest_backups": "One entry per (vmid, storage[, node]): the LATEST volume's ctime/volid, a count, and `protected` (from the prune-preview `mark`: protected backups are retention-exempt). Read from the PRUNE-PREVIEW endpoint (/nodes/{n}/storage/{s}/prunebackups?prune-backups=keep-all=1, a dryrun), NOT the content listing, so a read-only PVEAuditor token (Datastore.Audit) sees the volumes -- the content listing filters backups per-volume and would need an allocate-class privilege. The prune preview carries no size/verification/encrypted; those are a later PBS-native or allocate-gated enrichment. A SHARED storage (PBS/NFS/CIFS) is listed once from the first node where it is active and emitted with node: null; a local storage once per node with node set. Volumes without vmid or ctime are skipped. Sorted by (vmid, storage, node). This is the per-guest signal; the alert is built from it, never from tasks.", "tasks": "Finished vzdump tasks per node (limit 50), JOB-level: status is the free string PVE reports ('OK', 'WARNINGS: <n>', or an error message), passed verbatim and capped -- the server classifies it. id is the vmid only when exactly one guest was backed up (pve-manager VZDump.pm); a scheduled multi-guest job has an empty id, shipped as null. Never attribute a task to a guest.", "jobs": "/cluster/backup definitions trimmed to id/enabled/schedule/storage/vmid/all/exclude/pool/node/mode/comment/next_run (PVE's 'next-run'). Display context and the schedule the server can size a default threshold from.", "not_backed_up": "/cluster/backup-info/not-backed-up verbatim: [{vmid, name, type}] -- guests covered by no job, the signal a job-level webhook can never produce.", "freshness": "The block is computed at most once per 600s and re-emitted with age_s = seconds since it was computed (monotonic). Anchor freshness as received_at - age_s; never trust the agent wall clock. latest_ctime and task starttime/endtime are PVE data timestamps and pass through as-is. In every scenario here age_s is 0 because the block was just computed.", "no_config_key": "The TTL and caps are agent constants. config['proxmox'] is splatted into proxmox_metrics(**config): a key the server started sending would be a TypeError on every older agent and kill the whole Proxmox collector there. Do not add one.", "scrubbing": "Every customer-controlled string (volid, status, comment, upid, name...) is UTF-8-sanitized, NUL-stripped and capped at 500 chars agent-side; the server ingester applies its own scrub regardless."},
   "scenarios": {
     "quorate_cluster": {
       "description": "3-node quorate cluster 'production'. Guests spread across nodes (pve1: vm 100 + ct 200; pve2: vm 101; pve3: stopped ct 201). Shared storage 'ceph-pool' visible on all three nodes (reported 3x, once per node -- server must dedupe) plus a per-node 'local-lvm'. cluster.nodes_online (3) == len(nodes) (3) => nodes_ok. This is the fully-healthy reference shape.",
@@ -134,7 +108,9 @@
           {"node": "pve1", "status": "online", "cpu": 0.1, "mem": 4294967296, "maxmem": 17179869184},
           {"node": "pve2", "status": "offline", "cpu": 0, "mem": 0, "maxmem": 17179869184}
         ],
-        "node_status_by_name": {"pve1": {"uptime": 604800}},
+        "node_status_by_name": {
+          "pve1": {"uptime": 604800}
+        },
         "node_status_raises_for": ["pve2"],
         "qemu_by_node": {
           "pve1": [
@@ -142,7 +118,9 @@
           ]
         },
         "qemu_raises_for": ["pve2"],
-        "lxc_by_node": {"pve1": []},
+        "lxc_by_node": {
+          "pve1": []
+        },
         "lxc_raises_for": ["pve2"],
         "storage_by_node": {
           "pve1": [
@@ -187,13 +165,17 @@
         "nodes": [
           {"node": "standalone-pve", "status": "online", "cpu": 0.03, "mem": 2147483648, "maxmem": 8589934592}
         ],
-        "node_status_by_name": {"standalone-pve": {"uptime": 1209600}},
+        "node_status_by_name": {
+          "standalone-pve": {"uptime": 1209600}
+        },
         "qemu_by_node": {
           "standalone-pve": [
             {"vmid": 100, "name": "vm-01", "status": "running", "cpu": 0.04, "mem": 1073741824, "maxmem": 2147483648, "diskread": 1048576, "diskwrite": 2097152, "netin": 3145728, "netout": 4194304, "uptime": 1209500}
           ]
         },
-        "lxc_by_node": {"standalone-pve": []},
+        "lxc_by_node": {
+          "standalone-pve": []
+        },
         "storage_by_node": {
           "standalone-pve": [
             {"storage": "local", "type": "dir", "total": 100000000000, "used": 30000000000, "avail": 70000000000, "active": 1},
@@ -235,11 +217,7 @@
     },
     "unreachable": {
       "description": "Whole-module failure: API unreachable / auth failure after lazy token-auth construction. version.get() raises AND the node-listing reachability probe raises => collect() returns None => data['proxmox'] is null. This is the ONLY unreachable signal (there is no 'all empty' partial payload). Server reads reachable=false. NOTE (agent 1.9.0 normalization): before 1.9.0 this scenario returned {\"version\": null, \"cluster\": null, \"nodes\": [], \"vms\": [], \"lxc\": [], \"storage\": []}, which the server could not tell apart from a healthy idle node by value.",
-      "api": {
-        "version_raises": true,
-        "cluster_status_raises": true,
-        "nodes_raises": true
-      },
+      "api": {"version_raises": true, "cluster_status_raises": true, "nodes_raises": true},
       "payload": null
     },
     "partial_node_timeout": {
@@ -257,7 +235,10 @@
           {"node": "pve2", "status": "online", "cpu": 0.2, "mem": 4294967296, "maxmem": 34359738368},
           {"node": "pve3", "status": "online", "cpu": 0.05, "mem": 2147483648, "maxmem": 17179869184}
         ],
-        "node_status_by_name": {"pve1": {"uptime": 864000}, "pve3": {"uptime": 216000}},
+        "node_status_by_name": {
+          "pve1": {"uptime": 864000},
+          "pve3": {"uptime": 216000}
+        },
         "node_status_raises_for": ["pve2"],
         "qemu_by_node": {
           "pve1": [
@@ -324,9 +305,15 @@
         "nodes": [
           {"node": "pve1", "status": "online", "cpu": 0.09, "mem": 4294967296, "maxmem": 17179869184}
         ],
-        "node_status_by_name": {"pve1": {"uptime": 500000}},
-        "qemu_by_node": {"pve1": []},
-        "lxc_by_node": {"pve1": []},
+        "node_status_by_name": {
+          "pve1": {"uptime": 500000}
+        },
+        "qemu_by_node": {
+          "pve1": []
+        },
+        "lxc_by_node": {
+          "pve1": []
+        },
         "storage_by_node": {
           "pve1": [
             {"storage": "local", "type": "dir", "total": 100000000000, "used": 25000000000, "avail": 75000000000, "active": 1}
@@ -368,7 +355,10 @@
           {"node": "pve1", "status": "online", "cpu": 0.1, "mem": 4294967296, "maxmem": 17179869184},
           {"node": "pve2", "status": "online", "cpu": 0.2, "mem": 2147483648, "maxmem": 17179869184}
         ],
-        "node_status_by_name": {"pve1": {"uptime": 700000}, "pve2": {"uptime": 700001}},
+        "node_status_by_name": {
+          "pve1": {"uptime": 700000},
+          "pve2": {"uptime": 700001}
+        },
         "qemu_by_node": {
           "pve1": [
             {"vmid": 100, "name": "web-01", "status": "running", "cpu": 0.08, "mem": 2147483648, "maxmem": 4294967296, "diskread": 1048576, "diskwrite": 2097152, "netin": 3145728, "netout": 4194304, "uptime": 699900}
@@ -464,64 +454,6 @@
           {"storage": "local", "type": "dir", "content": "iso,vztmpl,backup"},
           {"storage": "local-lvm", "type": "lvmthin", "content": "images,rootdir"}
         ],
-        "content_by_node_storage": {
-          "pve1": {
-            "pbs-main": [
-              {
-                "volid": "pbs-main:backup/vm/100/2026-09-19T02:00:00Z",
-                "vmid": 100,
-                "ctime": 1789863600,
-                "size": 8489934592,
-                "format": "pbs-vm",
-                "content": "backup",
-                "subtype": "qemu",
-                "protected": 0,
-                "encrypted": "1",
-                "verification": {"state": "ok", "upid": "UPID:pbs:00002A01:0000F1E0:00000000:68CD9A00:verificationjob:main:root@pam:"},
-                "notes": "web-01"
-              },
-              {
-                "volid": "pbs-main:backup/vm/100/2026-09-20T02:00:00Z",
-                "vmid": 100,
-                "ctime": 1789950000,
-                "size": 8589934592,
-                "format": "pbs-vm",
-                "content": "backup",
-                "subtype": "qemu",
-                "protected": 0,
-                "encrypted": "1",
-                "verification": {"state": "ok", "upid": "UPID:pbs:00002A44:0000F3A1:00000000:68CEEB80:verificationjob:main:root@pam:"},
-                "notes": "web-01"
-              },
-              {
-                "volid": "pbs-main:backup/ct/101/2026-09-20T02:05:00Z",
-                "vmid": 101,
-                "ctime": 1789950300,
-                "size": 1073741824,
-                "format": "pbs-ct",
-                "content": "backup",
-                "subtype": "lxc",
-                "protected": 1,
-                "encrypted": "1",
-                "verification": {"state": "failed", "upid": "UPID:pbs:00002A45:0000F3B0:00000000:68CEEC00:verificationjob:main:root@pam:"},
-                "notes": "db-01"
-              }
-            ],
-            "local": [
-              {"volid": "local:backup/vzdump-qemu-100-2026_09_18-02_00_00.vma.zst", "vmid": 100, "ctime": 1789777200, "size": 7516192768, "format": "vma.zst", "content": "backup", "subtype": "qemu", "protected": 0, "notes": "web-01"}
-            ]
-          },
-          "pve2": {
-            "pbs-main": [
-              {"volid": "pbs-main:backup/vm/999/2026-09-20T02:00:00Z", "vmid": 999, "ctime": 1789950000, "size": 1, "format": "pbs-vm", "content": "backup", "subtype": "qemu"}
-            ],
-            "local": [
-              {"volid": "local:backup/vzdump-lxc-101-2026_09_17-02_00_00.tar.zst", "vmid": 101, "ctime": 1789690800, "size": 1000000000, "format": "tar.zst", "content": "backup", "subtype": "lxc", "protected": 0},
-              {"volid": "local:backup/vzdump-lxc-101-2026_09_19-02_00_00.tar.zst", "vmid": 101, "ctime": 1789863600, "size": 1073741824, "format": "tar.zst", "content": "backup", "subtype": "lxc", "protected": 0},
-              {"volid": "local:backup/vzdump-lxc-101-2026_09_18-02_00_00.tar.zst", "vmid": 101, "ctime": 1789777200, "size": 1040000000, "format": "tar.zst", "content": "backup", "subtype": "lxc", "protected": 0}
-            ]
-          }
-        },
         "tasks_by_node": {
           "pve1": [
             {"upid": "UPID:pve1:00001A2B:00001A2B:6AB07380:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1789948800, "endtime": 1789950100, "status": "OK", "user": "root@pam", "type": "vzdump"}
@@ -535,7 +467,29 @@
         ],
         "not_backed_up": [
           {"vmid": 105, "name": "scratch", "type": "qemu"}
-        ]
+        ],
+        "prunebackups_by_node_storage": {
+          "pve1": {
+            "pbs-main": [
+              {"volid": "pbs-main:backup/vm/100/2026-09-19T02:00:00Z", "vmid": 100, "ctime": 1789863600, "mark": "keep"},
+              {"volid": "pbs-main:backup/vm/100/2026-09-20T02:00:00Z", "vmid": 100, "ctime": 1789950000, "mark": "keep"},
+              {"volid": "pbs-main:backup/ct/101/2026-09-20T02:05:00Z", "vmid": 101, "ctime": 1789950300, "mark": "protected"}
+            ],
+            "local": [
+              {"volid": "local:backup/vzdump-qemu-100-2026_09_18-02_00_00.vma.zst", "vmid": 100, "ctime": 1789777200, "mark": "keep"}
+            ]
+          },
+          "pve2": {
+            "pbs-main": [
+              {"volid": "pbs-main:backup/vm/999/2026-09-20T02:00:00Z", "vmid": 999, "ctime": 1789950000, "mark": "keep"}
+            ],
+            "local": [
+              {"volid": "local:backup/vzdump-lxc-101-2026_09_17-02_00_00.tar.zst", "vmid": 101, "ctime": 1789690800, "mark": "keep"},
+              {"volid": "local:backup/vzdump-lxc-101-2026_09_19-02_00_00.tar.zst", "vmid": 101, "ctime": 1789863600, "mark": "keep"},
+              {"volid": "local:backup/vzdump-lxc-101-2026_09_18-02_00_00.tar.zst", "vmid": 101, "ctime": 1789777200, "mark": "keep"}
+            ]
+          }
+        }
       },
       "payload": {
         "version": "8.2.4",
@@ -561,32 +515,10 @@
         "backups": {
           "age_s": 0,
           "guest_backups": [
-            {"vmid": 100, "storage": "local", "node": "pve1", "latest_ctime": 1789777200, "latest_volid": "local:backup/vzdump-qemu-100-2026_09_18-02_00_00.vma.zst", "latest_size": 7516192768, "count": 1, "protected": false},
-            {
-              "vmid": 100,
-              "storage": "pbs-main",
-              "node": null,
-              "latest_ctime": 1789950000,
-              "latest_volid": "pbs-main:backup/vm/100/2026-09-20T02:00:00Z",
-              "latest_size": 8589934592,
-              "count": 2,
-              "verification": {"state": "ok", "upid": "UPID:pbs:00002A44:0000F3A1:00000000:68CEEB80:verificationjob:main:root@pam:"},
-              "protected": false,
-              "encrypted": true
-            },
-            {"vmid": 101, "storage": "local", "node": "pve2", "latest_ctime": 1789863600, "latest_volid": "local:backup/vzdump-lxc-101-2026_09_19-02_00_00.tar.zst", "latest_size": 1073741824, "count": 3, "protected": false},
-            {
-              "vmid": 101,
-              "storage": "pbs-main",
-              "node": null,
-              "latest_ctime": 1789950300,
-              "latest_volid": "pbs-main:backup/ct/101/2026-09-20T02:05:00Z",
-              "latest_size": 1073741824,
-              "count": 1,
-              "verification": {"state": "failed", "upid": "UPID:pbs:00002A45:0000F3B0:00000000:68CEEC00:verificationjob:main:root@pam:"},
-              "protected": true,
-              "encrypted": true
-            }
+            {"vmid": 100, "storage": "local", "node": "pve1", "latest_ctime": 1789777200, "latest_volid": "local:backup/vzdump-qemu-100-2026_09_18-02_00_00.vma.zst", "count": 1, "protected": false},
+            {"vmid": 100, "storage": "pbs-main", "node": null, "latest_ctime": 1789950000, "latest_volid": "pbs-main:backup/vm/100/2026-09-20T02:00:00Z", "count": 2, "protected": false},
+            {"vmid": 101, "storage": "local", "node": "pve2", "latest_ctime": 1789863600, "latest_volid": "local:backup/vzdump-lxc-101-2026_09_19-02_00_00.tar.zst", "count": 3, "protected": false},
+            {"vmid": 101, "storage": "pbs-main", "node": null, "latest_ctime": 1789950300, "latest_volid": "pbs-main:backup/ct/101/2026-09-20T02:05:00Z", "count": 1, "protected": true}
           ],
           "tasks": [
             {"upid": "UPID:pve1:00001A2B:00001A2B:6AB07380:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1789948800, "endtime": 1789950100, "status": "OK", "user": "root@pam"},
@@ -634,14 +566,6 @@
           {"storage": "pbs-main", "type": "pbs", "shared": 1, "content": "backup", "datastore": "main", "server": "pbs.example"},
           {"storage": "local", "type": "dir", "content": "iso,vztmpl,backup"}
         ],
-        "content_by_node_storage": {
-          "pve1": {
-            "local": [
-              {"volid": "local:backup/vzdump-qemu-100-2026_09_20-02_00_00.vma.zst", "vmid": 100, "ctime": 1789950000, "size": 7516192768, "format": "vma.zst", "content": "backup", "subtype": "qemu", "protected": 0}
-            ]
-          }
-        },
-        "content_raises_for": ["pve1/pbs-main"],
         "tasks_by_node": {
           "pve1": [
             {"upid": "UPID:pve1:00001A2B:00001A2B:6AB07380:vzdump::root@pam:", "node": "pve1", "id": "", "starttime": 1789948800, "endtime": 1789950100, "status": "OK", "user": "root@pam", "type": "vzdump"}
@@ -650,7 +574,15 @@
         "backup_jobs": [
           {"id": "backup-6b2f1a7c-e1d3", "type": "vzdump", "enabled": 1, "schedule": "02:00", "storage": "pbs-main", "all": 1, "mode": "snapshot", "next-run": 1790035200}
         ],
-        "not_backed_up": []
+        "not_backed_up": [],
+        "prunebackups_by_node_storage": {
+          "pve1": {
+            "local": [
+              {"volid": "local:backup/vzdump-qemu-100-2026_09_20-02_00_00.vma.zst", "vmid": 100, "ctime": 1789950000, "mark": "keep"}
+            ]
+          }
+        },
+        "prunebackups_raises_for": ["pve1/pbs-main"]
       },
       "payload": {
         "version": "8.2.4",
@@ -671,7 +603,7 @@
         "backups": {
           "age_s": 0,
           "guest_backups": [
-            {"vmid": 100, "storage": "local", "node": "pve1", "latest_ctime": 1789950000, "latest_volid": "local:backup/vzdump-qemu-100-2026_09_20-02_00_00.vma.zst", "latest_size": 7516192768, "count": 1, "protected": false}
+            {"vmid": 100, "storage": "local", "node": "pve1", "latest_ctime": 1789950000, "latest_volid": "local:backup/vzdump-qemu-100-2026_09_20-02_00_00.vma.zst", "count": 1, "protected": false}
           ],
           "tasks": [
             {"upid": "UPID:pve1:00001A2B:00001A2B:6AB07380:vzdump::root@pam:", "node": "pve1", "id": null, "starttime": 1789948800, "endtime": 1789950100, "status": "OK", "user": "root@pam"}
@@ -681,7 +613,7 @@
           ],
           "not_backed_up": [],
           "errors": [
-            {"scope": "storage", "node": "pve1", "storage": "pbs-main", "message": "content listing failed: content boom"}
+            {"scope": "storage", "node": "pve1", "storage": "pbs-main", "message": "backup listing failed: content boom"}
           ]
         },
         "collection": {"reachable": true, "cluster_ok": true, "nodes_ok": true, "guests_ok": true, "storage_ok": true, "error": null}
@@ -874,73 +806,6 @@
           "not_backed_up": [],
           "errors": [
             {"scope": "cap", "node": "pve1", "storage": null, "message": "tasks capped at 50: 1 dropped"}
-          ]
-        },
-        "collection": {"reachable": true, "cluster_ok": true, "nodes_ok": true, "guests_ok": true, "storage_ok": true, "error": null}
-      }
-    },
-    "backups_no_permission": {
-      "description": "#156 permission fail-safe. A PVEAuditor (audit-only) token: PVE returns HTTP 200 for the storage content endpoint but FILTERS OUT the backup volumes per-volume, so the read is empty even though a backup exists. The agent detects (via /access/permissions) that it lacks Datastore.Allocate and reports the storage UNKNOWN -- a 'storage' error carrying the Datastore.Allocate hint -- WITHOUT issuing the doomed content read, rather than emitting guest_backups:[] which the server would read as 'never backed up'. Confirmed on a real PVE: root sees the volume, the audit token sees []. The server must treat this storage's guests as unknown and surface the 'needs Datastore.Allocate' hint, never 'never backed up'.",
-      "api": {
-        "version": {"version": "8.2.4"},
-        "cluster_status": [],
-        "nodes": [
-          {"node": "pve1", "status": "online", "cpu": 0.1, "mem": 4294967296, "maxmem": 17179869184}
-        ],
-        "node_status_by_name": {
-          "pve1": {"uptime": 864000}
-        },
-        "qemu_by_node": {
-          "pve1": [
-            {"vmid": 100, "name": "web-01", "status": "running", "cpu": 0.05, "mem": 1073741824, "maxmem": 2147483648, "diskread": 1048576, "diskwrite": 2097152, "netin": 3145728, "netout": 4194304, "uptime": 86000}
-          ]
-        },
-        "lxc_by_node": {
-          "pve1": []
-        },
-        "storage_by_node": {
-          "pve1": [
-            {"storage": "local", "type": "dir", "content": "iso,vztmpl,backup", "total": 100000000000, "used": 30000000000, "avail": 70000000000, "active": 1, "shared": 0, "enabled": 1}
-          ]
-        },
-        "content_by_node_storage": {
-          "pve1": {
-            "local": [
-              {"volid": "local:backup/vzdump-qemu-100-2026_09_20-02_00_00.vma.zst", "vmid": 100, "ctime": 1789950000, "size": 7516192768, "format": "vma.zst", "content": "backup", "subtype": "qemu"}
-            ]
-          }
-        },
-        "permissions": {
-          "/storage/local": {"Datastore.Audit": 1, "VM.Audit": 1, "Sys.Audit": 1}
-        },
-        "backup_jobs": [
-          {"id": "backup-6b2f1a7c-e1d3", "type": "vzdump", "enabled": 1, "schedule": "02:00", "storage": "local", "all": 1, "mode": "snapshot", "next-run": 1790035200}
-        ],
-        "not_backed_up": []
-      },
-      "payload": {
-        "version": "8.2.4",
-        "cluster": null,
-        "nodes": [
-          {"name": "pve1", "status": "online", "cpu_usage": 0.1, "memory_used": 4294967296, "memory_total": 17179869184, "uptime": 864000, "vms_running": 1, "lxc_running": 0}
-        ],
-        "vms": [
-          {"vmid": 100, "name": "web-01", "node": "pve1", "status": "running", "cpu_usage": 0.05, "memory_used": 1073741824, "memory_max": 2147483648, "disk_read": 1048576, "disk_write": 2097152, "net_in": 3145728, "net_out": 4194304, "uptime": 86000}
-        ],
-        "lxc": [],
-        "storage": [
-          {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 30000000000, "available": 70000000000, "active": true}
-        ],
-        "backups": {
-          "age_s": 0,
-          "guest_backups": [],
-          "tasks": [],
-          "jobs": [
-            {"id": "backup-6b2f1a7c-e1d3", "enabled": true, "schedule": "02:00", "storage": "local", "vmid": null, "all": true, "exclude": null, "pool": null, "node": null, "mode": "snapshot", "comment": null, "next_run": 1790035200}
-          ],
-          "not_backed_up": [],
-          "errors": [
-            {"scope": "storage", "node": "pve1", "storage": "local", "message": "insufficient privilege to list backups: the token needs Datastore.Allocate on this storage (PVEAuditor cannot see backup volumes)"}
           ]
         },
         "collection": {"reachable": true, "cluster_ok": true, "nodes_ok": true, "guests_ok": true, "storage_ok": true, "error": null}

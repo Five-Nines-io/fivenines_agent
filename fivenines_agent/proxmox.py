@@ -71,19 +71,19 @@ BACKUPS_CACHE_TTL = 600
 BACKUPS_COLLECT_DEADLINE = 30
 _DEADLINE_MESSAGE = 'skipped: backups collection deadline exceeded'
 
-# The PVE content index filters backup volumes PER-VOLUME: an audit-only token
-# (the PVEAuditor role the setup guide provisions) gets HTTP 200 with the
-# backups REMOVED, indistinguishable from a storage that genuinely has none.
-# Confirmed on a real PVE (agent #156): root sees the volume, a Datastore.Audit
-# token sees []. Only a token holding this privilege on the storage sees backup
-# volumes, so WITHOUT it an empty content read is untrustworthy and the storage
-# is reported `unknown` (a scoped error) rather than emitting a false "never
-# backed up". Checked on the storage path or an ancestor (ACL propagation).
-_BACKUP_READ_PRIV = 'Datastore.Allocate'
-_NO_BACKUP_PRIV_MESSAGE = (
-    'insufficient privilege to list backups: the token needs Datastore.Allocate '
-    'on this storage (PVEAuditor cannot see backup volumes)'
-)
+# Backup volumes are read from the prune-PREVIEW endpoint
+# (/nodes/{n}/storage/{s}/prunebackups?prune-backups=keep-all=1, dryrun), NOT
+# the content listing. The content listing filters backup volumes per-volume
+# via check_volume_access -- an audit-only PVEAuditor token gets HTTP 200 with
+# the backups REMOVED (confirmed on a real PVE, agent #156) and would need an
+# allocate-class privilege. The prune preview returns the SAME present-volume
+# evidence (volid, ctime, vmid, mark) under plain Datastore.Audit, with no
+# check_volume_access filter and no write privilege; keep-all=1 only overrides
+# the preview's retention calc, it changes nothing. So the whole feature works
+# under the PVEAuditor role the setup guide already provisions. It carries fewer
+# fields than the content listing (no size / verification / encrypted); those
+# are a later PBS-native or allocate-gated enrichment.
+_PRUNE_BACKUPS_PARAMS = {'prune-backups': 'keep-all=1'}
 
 # Hard caps on every array in the block. A trim is never silent: it lands in
 # `errors` with scope "cap", because a trimmed guest_backups reads as "never
@@ -157,8 +157,8 @@ def _as_int(value):
 
 
 def _as_bool(value):
-    """PVE spells booleans as 0/1 ints, "0"/"1" strings, and -- for a PBS
-    volume's `encrypted` -- the key fingerprint or "1"."""
+    """PVE spells booleans as 0/1 ints or "0"/"1" strings (active, enabled,
+    all, shared)."""
     if isinstance(value, str):
         return value.strip() not in ("", "0")
     return bool(value)
@@ -231,25 +231,6 @@ def _as_list_or_error(listing, errors, scope, node=None, storage=None):
         node=node, storage=storage,
     )
     return None
-
-
-def _has_backup_read_priv(perms, sid):
-    """Whether an empty backup content read on storage `sid` can be TRUSTED.
-
-    PVE filters backup volumes per-volume, so an audit-only token gets an empty
-    200 whether or not backups exist. Only a token holding _BACKUP_READ_PRIV on
-    the storage (or an ancestor path, honouring ACL propagation) sees them.
-    `perms` is None when the effective-permissions read failed: degrade to True
-    (attempt the read best-effort) rather than freezing every storage unknown on
-    a transient blip.
-    """
-    if perms is None:
-        return True
-    for path in (f"/storage/{sid}", "/storage", "/"):
-        node = perms.get(path)
-        if isinstance(node, dict) and node.get(_BACKUP_READ_PRIV):
-            return True
-    return False
 
 
 def _deadline_hit(deadline, errors, scope, node=None, storage=None):
@@ -709,19 +690,6 @@ class ProxmoxCollector:
             log(f"Error listing datacenter storage config: {e}", 'debug')
         return config
 
-    def _effective_permissions(self):
-        """The agent's own effective permission map (/access/permissions), used
-        to tell "no backups" apart from "backups hidden by per-volume filtering"
-        (#156). Best-effort: None on any failure, so the caller degrades to a
-        plain read instead of freezing every storage unknown.
-        """
-        try:
-            perms = self.proxmox.access.permissions.get()
-        except Exception as e:
-            log(f"Error reading effective permissions for backups: {_log_safe(e)}", 'debug')
-            return None
-        return perms if isinstance(perms, dict) else None
-
     def _collect_storage(self, collection=None):
         """Collect metrics for all storage pools."""
         storage_pools = []
@@ -855,8 +823,7 @@ class ProxmoxCollector:
         The raw listing is never shipped: a PBS datastore with thousands of
         snapshots would otherwise put thousands of entries on every emission.
         One entry per guest x storage-with-backups, carrying the latest
-        volume's ctime/volid/size (+ verification/protected/encrypted when the
-        storage reports them) and a count.
+        volume's ctime/volid, its protected flag (prune `mark`), and a count.
 
         A SHARED storage (PBS/NFS/CIFS) is the same content from every node,
         so it is listed once -- from the first node where it is active -- and
@@ -864,15 +831,12 @@ class ProxmoxCollector:
         set. The `shared` flag comes from the per-node row, falling back to the
         datacenter /storage config. A storage that is inactive everywhere it is
         seen is not listed (the call would only fail) but IS recorded as an
-        error naming it, so the server treats its guests as unknown. A storage
-        the token lacks Datastore.Allocate on is also reported unknown WITHOUT a
-        content read, because PVE would filter its backups to an empty list that
-        is indistinguishable from "no backups" (#156).
+        error naming it, so the server treats its guests as unknown. Volumes are
+        read from the prune-preview endpoint (works under Datastore.Audit); a
+        read that fails -- e.g. a PBS storage whose PBS credentials lack prune
+        rights -- is a storage-scoped error, so those guests read unknown.
         """
         config_map = self._storage_config_map()
-        # One /access/permissions read tells a trustworthy empty ("no backups")
-        # apart from a filtered empty ("backups hidden from an audit-only token").
-        perms = self._effective_permissions()
         latest = {}
         shared_done = set()
         shared_inactive = set()
@@ -914,16 +878,6 @@ class ProxmoxCollector:
                     if not active:
                         shared_inactive.add(storage_name)
                         continue
-                    if not _has_backup_read_priv(perms, raw_sid):
-                        # Cannot trust an empty read here: mark unknown once and
-                        # do not re-error for this shared storage on later nodes.
-                        _backup_error(
-                            errors, 'storage', _NO_BACKUP_PRIV_MESSAGE,
-                            storage=storage_name,
-                        )
-                        shared_done.add(storage_name)
-                        shared_inactive.discard(storage_name)
-                        continue
                     if _deadline_hit(
                         deadline, errors, 'storage', node=node_name, storage=storage_name
                     ):
@@ -947,11 +901,6 @@ class ProxmoxCollector:
                         'storage not active on this node',
                         node=node_name,
                         storage=storage_name,
-                    )
-                elif not _has_backup_read_priv(perms, raw_sid):
-                    _backup_error(
-                        errors, 'storage', _NO_BACKUP_PRIV_MESSAGE,
-                        node=node_name, storage=storage_name,
                     )
                 elif not _deadline_hit(
                     deadline, errors, 'storage', node=node_name, storage=storage_name
@@ -983,11 +932,16 @@ class ProxmoxCollector:
         latest-per-guest computation and must not produce a latest_ctime:null
         entry the server would have to special-case. Returns True on a clean
         listing (so the caller can mark a shared storage done only on success),
-        False when the content read failed or was malformed.
+        False when the read failed or was malformed.
+
+        Reads the prune PREVIEW (dryrun), not the content listing, so a
+        read-only PVEAuditor token sees the volumes -- see _PRUNE_BACKUPS_PARAMS.
         """
         try:
             volumes = (
-                self.proxmox.nodes(node_name).storage(storage_name).content.get(content='backup')
+                self.proxmox.nodes(node_name)
+                .storage(storage_name)
+                .prunebackups.get(**_PRUNE_BACKUPS_PARAMS)
             )
             if not isinstance(volumes, list):
                 _backup_error(
@@ -1017,8 +971,8 @@ class ProxmoxCollector:
                         'node': _scrub_str(entry_node),
                         'latest_ctime': None,
                         'latest_volid': None,
-                        'latest_size': None,
                         'count': 0,
+                        'protected': False,
                     }
                     per_guest[vmid] = entry
                 entry['count'] += 1
@@ -1033,7 +987,7 @@ class ProxmoxCollector:
             _backup_error(
                 errors,
                 'storage',
-                f'content listing failed: {e}',
+                f'backup listing failed: {e}',
                 node=node_name,
                 storage=storage_name,
             )
@@ -1175,28 +1129,12 @@ class ProxmoxCollector:
 
 
 def _set_latest_volume(entry, volume, ctime):
-    """Overwrite the entry's latest-* fields from a newer volume. The optional
-    PBS-only keys are re-derived from the new volume, never inherited from the
-    one it replaces."""
+    """Overwrite the entry's latest-* fields from a newer prune-preview volume.
+    `mark` == 'protected' is a retention-exempt (protected) backup; the prune
+    preview does not carry size / verification / encrypted."""
     entry['latest_ctime'] = ctime
     entry['latest_volid'] = _scrub_str(volume.get('volid'))
-    size = _as_int(volume.get('size'))
-    if size is None:
-        size = _as_int(volume.get('approximate-size'))
-    entry['latest_size'] = size
-    for key in ('verification', 'protected', 'encrypted'):
-        entry.pop(key, None)
-    verification = volume.get('verification')
-    if isinstance(verification, dict):
-        # PBS SnapshotVerifyState: state serialized lowercase ("ok"/"failed").
-        entry['verification'] = {
-            'state': _scrub_str(verification.get('state')),
-            'upid': _scrub_str(verification.get('upid')),
-        }
-    if 'protected' in volume:
-        entry['protected'] = _as_bool(volume['protected'])
-    if 'encrypted' in volume:
-        entry['encrypted'] = _as_bool(volume['encrypted'])
+    entry['protected'] = volume.get('mark') == 'protected'
 
 
 @debug('proxmox_metrics')
