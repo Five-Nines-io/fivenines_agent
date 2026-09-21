@@ -104,10 +104,14 @@ _GLOB_CHARS = "*?["
 # characters loses that race by construction; accepting only the legal ones
 # ends it.
 #
+# Matched with fullmatch(), never match(): Python's `$` also matches just
+# before a trailing newline, so `nginx\\n` would slip through and be read as
+# `nginx\\x0a.service`.
+#
 # `-.mount` (the root filesystem) passes, as it must: `-` and `.` are legal,
 # and the value after a short option is always consumed as that option's
 # argument, so a leading dash was never an injection.
-_UNIT_NAME_RE = re.compile(r"^[A-Za-z0-9:_.\\@-]+$")
+_UNIT_NAME_RE = re.compile(r"[A-Za-z0-9:_.\\@-]+")
 
 _lock = threading.Lock()
 # key: the stat identity the cached value was derived from. value: always a
@@ -335,10 +339,16 @@ def unit_allowed(unit):
         return False
     if len(unit) > MAX_UNIT_CHARS:
         return False
-    if not _UNIT_NAME_RE.match(unit):
+    if not _UNIT_NAME_RE.fullmatch(unit):
         # Anything journalctl would rewrite is refused: the callers pass this
         # name through unchanged, so a name that needs escaping authorizes one
         # unit here and reads another there (see _UNIT_NAME_RE).
+        return False
+    if unit.startswith("."):
+        # Suffix-only: a unit name has a name part, and systemd's normalizer
+        # appends `.service` when it is missing -- so `.mount` is authorized
+        # here as `.mount` and READ by journalctl as `.mount.service`, which
+        # the same policy refuses. No legal unit name starts with a dot.
         return False
     candidate = _normalize(unit)
     return any(fnmatch.fnmatchcase(candidate, pattern) for pattern in patterns)

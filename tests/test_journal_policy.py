@@ -228,6 +228,25 @@ def test_only_the_legal_unit_name_charset_is_accepted(config_dir):
         assert journal_policy.unit_allowed(rewritten) is False, rewritten
 
 
+def test_a_trailing_newline_is_refused(config_dir):
+    """Python's `$` also matches just before a trailing newline, so a
+    match()-anchored charset check would accept `nginx\\n` while journalctl
+    reads `nginx\\x0a.service`."""
+    write_allowlist(config_dir, "nginx.service\n")
+    assert journal_policy.unit_allowed("nginx") is True
+    assert journal_policy.unit_allowed("nginx\n") is False
+    assert journal_policy.unit_allowed("nginx.service\n") is False
+
+
+def test_a_suffix_only_unit_is_refused(config_dir):
+    """systemd appends `.service` to a name with no name part, so `.mount` is
+    authorized here and read by journalctl as `.mount.service`."""
+    write_allowlist(config_dir, "*.mount\n")
+    assert journal_policy.unit_allowed("var-log.mount") is True
+    assert journal_policy.unit_allowed(".mount") is False
+    assert journal_policy.unit_allowed(".service") is False
+
+
 def test_a_whitespace_padded_unit_is_refused(config_dir):
     """The name is passed to journalctl unchanged, so a name that only
     matches after normalization authorizes one unit and reads another:
