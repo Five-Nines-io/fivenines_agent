@@ -104,6 +104,12 @@ _GLOB_CHARS = "*?["
 #            `*.service` -- a unit the operator never allowed, and one that is
 #            refused when requested by its real name.
 # Under an active policy these are refused outright.
+#
+# A leading `-` is deliberately NOT in the set: `-.mount` is the real unit
+# name for the root filesystem, and `journalctl -u -.mount` consumes it as the
+# argument to -u rather than as an option (the value after a short option
+# always is), so refusing it would drop a legitimate allowlisted unit for no
+# security gain.
 _SERVER_REJECT_CHARS = "*?[]/"
 
 _lock = threading.Lock()
@@ -337,9 +343,13 @@ def unit_allowed(unit):
         # resolve to a different unit than the one the policy just checked
         # (see _SERVER_REJECT_CHARS).
         return False
-    if unit.startswith("-"):
-        # Would be parsed by journalctl as an option rather than as the
-        # argument to -u. A unit name never starts with a dash.
+    if unit != unit.strip() or any(char.isspace() for char in unit):
+        # The callers pass the name through to journalctl UNCHANGED, so a name
+        # that only matches a pattern after normalization authorizes one unit
+        # and reads another: `nginx ` is stripped to `nginx.service` here and
+        # matches a policy allowing it, while journalctl selects the escaped
+        # `nginx\x20.service`, which that same policy refuses by name. systemd
+        # escapes whitespace out of unit names, so a real one never has any.
         return False
     candidate = _normalize(unit)
     return any(fnmatch.fnmatchcase(candidate, pattern) for pattern in patterns)

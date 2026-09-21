@@ -205,12 +205,24 @@ def test_a_path_form_unit_is_refused(config_dir):
     assert journal_policy.unit_allowed("var-log.mount") is False
 
 
-def test_an_option_form_unit_is_refused(config_dir):
-    """A name starting with a dash would be parsed by journalctl as an
-    option, not as the argument to -u."""
-    write_allowlist(config_dir, "*\n")
-    assert journal_policy.unit_allowed("--output=cat") is False
-    assert journal_policy.unit_allowed("-n") is False
+def test_a_whitespace_padded_unit_is_refused(config_dir):
+    """The name is passed to journalctl unchanged, so a name that only
+    matches after normalization authorizes one unit and reads another:
+    `nginx ` matches a policy allowing nginx.service, while journalctl
+    selects the escaped `nginx\\x20.service`, which that policy refuses."""
+    write_allowlist(config_dir, "nginx.service\n")
+    assert journal_policy.unit_allowed("nginx.service") is True
+    assert journal_policy.unit_allowed("nginx ") is False
+    assert journal_policy.unit_allowed(" nginx.service") is False
+    assert journal_policy.unit_allowed("nginx\t.service") is False
+
+
+def test_the_root_mount_unit_is_allowed(config_dir):
+    """`-.mount` is the real unit name for the root filesystem, and
+    journalctl consumes it as -u's argument, so it must not be refused for
+    looking like an option."""
+    write_allowlist(config_dir, "-.mount\n")
+    assert journal_policy.unit_allowed("-.mount") is True
 
 
 def test_an_over_long_unit_name_is_refused(config_dir):
