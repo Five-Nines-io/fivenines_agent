@@ -193,6 +193,26 @@ def test_a_server_supplied_glob_is_refused(config_dir):
     assert refused == ["app-*.service"]
 
 
+def test_a_path_form_unit_is_refused(config_dir):
+    """`journalctl -u /var/log` resolves to var-log.mount, but the policy
+    would be checking the text `/var/log` -- a different string than the one
+    journalctl reads, which is exactly how a veto gets walked through."""
+    write_allowlist(config_dir, "*.service\n")
+    assert journal_policy.unit_allowed("nginx.service") is True
+    assert journal_policy.unit_allowed("/var/log") is False
+    assert journal_policy.unit_allowed("/etc/systemd/system/x.service") is False
+    # ...and the unit that path really names is refused either way.
+    assert journal_policy.unit_allowed("var-log.mount") is False
+
+
+def test_an_option_form_unit_is_refused(config_dir):
+    """A name starting with a dash would be parsed by journalctl as an
+    option, not as the argument to -u."""
+    write_allowlist(config_dir, "*\n")
+    assert journal_policy.unit_allowed("--output=cat") is False
+    assert journal_policy.unit_allowed("-n") is False
+
+
 def test_an_over_long_unit_name_is_refused(config_dir):
     write_allowlist(config_dir, "*\n")
     assert journal_policy.unit_allowed("u" * journal_policy.MAX_UNIT_CHARS) is True
@@ -211,6 +231,10 @@ def test_a_dangling_symlink_denies_rather_than_disappearing(config_dir):
         assert journal_policy.unit_allowed("nginx.service") is False
 
 
+@pytest.mark.skipif(
+    not hasattr(os, "mkfifo"),
+    reason="os.mkfifo is Unix-only; Windows CI runs this suite",
+)
 def test_a_non_regular_policy_file_is_refused(config_dir):
     """open() on a FIFO with no writer blocks forever, which on the
     collection loop is a watchdog kill."""

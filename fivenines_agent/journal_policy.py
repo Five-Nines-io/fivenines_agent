@@ -90,14 +90,21 @@ _UNIT_SUFFIXES = (
     ".device",
 )
 _GLOB_CHARS = "*?["
-# systemd unit names are drawn from ASCII alphanumerics plus ":-_.\@", so a
-# glob metacharacter in a name the SERVER sent is never a real unit -- and
-# `journalctl -u` expands globs itself. Matching such a name literally against
-# an operator pattern lets a compromised backend walk straight through the
-# veto: policy `app-?.service` accepts the literal `app-*.service` (the `?`
-# matches the `*`), and journalctl then reads every app-* unit on the box.
+# Characters that cannot appear in a systemd unit name -- which is drawn from
+# ASCII alphanumerics plus ":-_.\@" -- and therefore mean the SERVER sent
+# something that is not a unit name. Both spellings below make the string the
+# policy checks differ from the one journalctl actually reads, which is the
+# whole ballgame for a veto:
+#   * ? [ ]  a glob. `journalctl -u` expands globs itself, so policy
+#            `app-?.service` would accept the literal `app-*.service` (the `?`
+#            matches the `*`) and journalctl would then read every app-* unit.
+#   /        a PATH. `journalctl -u /var/log` is accepted and resolved to
+#            `var-log.mount`, while the policy sees the text `/var/log`
+#            (normalized to `/var/log.service`) and happily matches it against
+#            `*.service` -- a unit the operator never allowed, and one that is
+#            refused when requested by its real name.
 # Under an active policy these are refused outright.
-_SERVER_GLOB_CHARS = "*?[]"
+_SERVER_REJECT_CHARS = "*?[]/"
 
 _lock = threading.Lock()
 # key: the stat identity the cached value was derived from. value: always a
@@ -325,10 +332,14 @@ def unit_allowed(unit):
         return False
     if len(unit) > MAX_UNIT_CHARS:
         return False
-    if any(char in unit for char in _SERVER_GLOB_CHARS):
-        # The name the server sent is not a unit name, it is a pattern --
-        # and journalctl would expand it. Refuse rather than match it
-        # literally against the operator's patterns (see _SERVER_GLOB_CHARS).
+    if any(char in unit for char in _SERVER_REJECT_CHARS):
+        # Not a unit name: a glob journalctl would expand, or a path it would
+        # resolve to a different unit than the one the policy just checked
+        # (see _SERVER_REJECT_CHARS).
+        return False
+    if unit.startswith("-"):
+        # Would be parsed by journalctl as an option rather than as the
+        # argument to -u. A unit name never starts with a dash.
         return False
     candidate = _normalize(unit)
     return any(fnmatch.fnmatchcase(candidate, pattern) for pattern in patterns)
