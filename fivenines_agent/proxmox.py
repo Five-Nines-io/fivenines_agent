@@ -1131,7 +1131,18 @@ class ProxmoxCollector:
 def _set_latest_volume(entry, volume, ctime):
     """Overwrite the entry's latest-* fields from a newer prune-preview volume.
     `mark` == 'protected' is a retention-exempt (protected) backup; the prune
-    preview does not carry size / verification / encrypted."""
+    preview does not carry size / verification / encrypted.
+
+    KNOWN LIMITATION (#156, Codex review): the prune preview reports a snapshot's
+    EXISTENCE by ctime, not its COMPLETION. On a PBS storage an in-progress
+    backup can be listed while it is still uploading (PBS enumerates incomplete
+    snapshots, and keep-all=1 marks them `keep`), so a collection that overlaps a
+    running PBS backup could momentarily promote it as the latest -- a false
+    "backed up" if that upload then fails. The prune preview carries no
+    completion field, so distinguishing complete from in-progress needs a
+    PBS-native read; it is deferred to the same enrichment as `verification`
+    (server issue #1164). Local/NFS/dir storages are unaffected: vzdump writes to
+    a temp name and the archive is only listed once renamed on completion."""
     entry['latest_ctime'] = ctime
     entry['latest_volid'] = _scrub_str(volume.get('volid'))
     entry['protected'] = volume.get('mark') == 'protected'
