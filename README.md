@@ -971,6 +971,9 @@ standalone nodes. Reports:
 - **Nodes**: CPU, memory and uptime
 - **Guests**: per-VM (QEMU/KVM) and per-LXC-container metrics
 - **Storage**: per-pool usage (total / used / available / active)
+- **Backups** (agent **1.19.0+**): per-guest latest backup on every storage
+  (PBS, NFS, local alike), vzdump task outcomes, backup job definitions and the
+  guests covered by no job at all
 
 Authenticate with a Proxmox **API token** (`token_id` in the
 `user@realm!tokenname` form, plus `token_secret`); `host`, `port` (default 8006)
@@ -986,6 +989,34 @@ Agent version **1.11.7+** adds the `pool` property to `zfspool`, `rbd` and
 `cephfs` storage entries -- the join key that lets the dashboard line a Proxmox
 storage pool up with the [ZFS pool health](#zfs-pool-health) or
 [Ceph](#ceph-cluster-monitoring) data collected from the same host.
+
+Agent version **1.19.0+** adds a `backups` block so the dashboard can answer
+"has every VM and container had a backup in the last N hours, whatever the
+target?" and "which guests are in no backup job?". It reads four things: the
+backup volumes on each storage
+(aggregated agent-side to the **latest backup per guest per storage**, so a
+PBS datastore with thousands of snapshots stays a handful of entries; a shared
+storage is listed once, a local one once per node), the finished `vzdump`
+tasks per node (job-level outcomes, `status` passed through verbatim), the
+backup job definitions, and PVE's own list of guests not covered by any job.
+All four reads work with the read-only `PVEAuditor` role the setup guide
+provisions -- no token change. The per-guest backup volumes are read through
+PVE's backup **prune-preview** (a dry run that changes nothing), which returns
+each backup's date and id under plain audit rights; the ordinary content
+listing would hide them behind a write-class privilege. If a storage's backups
+genuinely cannot be read (for example a PBS datastore whose credentials lack
+prune rights), that storage is reported as *unknown*, never as "no backups", so
+a read failure can never turn into a false "not backed up" alert.
+The block is refreshed every 10 minutes rather than every tick, since the
+content listing is the most expensive call the collector makes and backup age
+moves in hours; its `age_s` tells the server how old the snapshot is. One
+refresh is bounded by a 30-second budget, so a wedged PVE or PBS can never
+stall the agent: reads left over when the budget runs out are reported as
+errors rather than silently dropped. A
+sub-read that fails (for example a storage the token cannot list) is reported
+per storage inside the block, so the dashboard can mark that storage's guests
+as *unknown* rather than *never backed up*, and the block never affects the
+completeness flags above.
 
 ## QEMU/KVM VM Monitoring
 
