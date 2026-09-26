@@ -351,18 +351,17 @@ class SNMPCollector:
         Returns:
             dict: {"devices": [device_dict, ...]}
         """
-        # Prune stale state
+        # Prune stale state. A removed device's poll still in flight stays
+        # there until it ends (below): forgotten, a re-added device would be
+        # polled again on top of it.
         current_ids = {t["device_id"] for t in self.targets}
-        known_ids = (
-            set(SNMPCollector._last_poll_times)
-            | set(SNMPCollector._polling_keys)
-            | set(SNMPCollector._in_flight)
+        known_ids = set(SNMPCollector._last_poll_times) | set(
+            SNMPCollector._polling_keys
         )
         for device_id in known_ids - current_ids:
             SNMPCollector._last_poll_times.pop(device_id, None)
             SNMPCollector._last_results.pop(device_id, None)
             SNMPCollector._polling_keys.pop(device_id, None)
-            SNMPCollector._in_flight.pop(device_id, None)
 
         # A device whose POLLING_FIELDS changed loses its poll time: due at
         # once (or as soon as a poll of the old target still in flight ends),
@@ -379,9 +378,9 @@ class SNMPCollector:
             SNMPCollector._polling_keys[device_id] = key
 
         # A poll still running when its batch ended (below) is reported once
-        # it has finished, on a later tick, unless its target changed since.
-        # Until then its device is not polled again: never two polls against
-        # one device, short of it being removed and re-added meanwhile.
+        # it has finished, on a later tick, unless its target changed or went
+        # away since. Until then its device is not polled again: never two
+        # polls against one device.
         devices = []
         busy_ids = set()
         for device_id, (future, key, started, stuck) in list(
@@ -389,7 +388,10 @@ class SNMPCollector:
         ):
             if not future.done():
                 busy_ids.add(device_id)
-                if self._tick_time() - started >= IN_FLIGHT_LIMIT:
+                if (
+                    device_id in current_ids
+                    and self._tick_time() - started >= IN_FLIGHT_LIMIT
+                ):
                     self._report(devices, device_id, _stuck(device_id))
                     SNMPCollector._in_flight[device_id] = (
                         future, key, started, True
@@ -397,10 +399,11 @@ class SNMPCollector:
                 continue
             del SNMPCollector._in_flight[device_id]
             current = SNMPCollector._polling_keys.get(device_id)
-            if key is None or key != current or stuck:
-                # The old target's answer, or one reported stuck meanwhile,
-                # whose success would clear the failures reported for it:
-                # dropped, and the device is polled afresh now.
+            gone = device_id not in current_ids
+            if gone or key is None or key != current or stuck:
+                # A removed target's answer, the old target's, or one reported
+                # stuck meanwhile, whose success would clear the failures
+                # reported for it: dropped, and the device is polled afresh.
                 SNMPCollector._last_poll_times.pop(device_id, None)
                 continue
             busy_ids.add(device_id)
@@ -438,13 +441,15 @@ class SNMPCollector:
             try:
                 futures = {}
                 for target in due_targets:
-                    ticket = _Ticket()
+                    ticket = None
                     accepted = False
                     try:
+                        ticket = _Ticket()
                         future = executor.submit(
                             self._poll_accepted, target, ticket
                         )
-                        accepted = True
+                        futures[future] = target
+                        accepted = True  # only once it is tracked
                     except Exception as e:
                         # Out of threads (a pids limit) or memory: the rest
                         # stay unstamped, due next tick, and the polls
@@ -452,10 +457,10 @@ class SNMPCollector:
                         log("SNMP submit failed: {}".format(e), "error")
                         break
                     finally:
-                        # Whatever submit() raised: an undecided ticket would
-                        # hold its worker, and the agent's exit, forever.
-                        ticket.decide(accepted)
-                    futures[future] = target
+                        # Whatever was raised: an undecided ticket would hold
+                        # its worker, and the agent's exit, forever.
+                        if ticket is not None:
+                            ticket.decide(accepted)
 
                 for future, target in futures.items():
                     device_id = target["device_id"]

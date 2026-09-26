@@ -934,8 +934,10 @@ class TestPollAll:
             "device_id": "old-device"
         }
         SNMPCollector._polling_keys["cut-off"] = "0" * 64  # never stamped
+        finished = Future()
+        finished.set_result({"device_id": "in-flight"})
         SNMPCollector._in_flight["in-flight"] = (
-            Future(), "0" * 64, 900.0, False
+            finished, "0" * 64, 900.0, False
         )
         target = _make_target(device_id="new-device")
         # Force it to be due
@@ -948,12 +950,14 @@ class TestPollAll:
                 (IFXTABLE_OUTPUT, None),
             ]
             collector = SNMPCollector([target])
-            collector.poll_all()
+            devices = collector.poll_all()["devices"]
 
         assert "old-device" not in SNMPCollector._last_poll_times
         assert "old-device" not in SNMPCollector._last_results
         assert set(SNMPCollector._polling_keys) == {"new-device"}
+        # A removed device's finished poll is dropped, not reported.
         assert SNMPCollector._in_flight == {}
+        assert [d["device_id"] for d in devices] == ["new-device"]
 
     @patch("fivenines_agent.snmp._run_snmp_cmd")
     def test_mixed_due_and_cached(self, mock_cmd):
@@ -1424,6 +1428,23 @@ class TestBatchDeadline:
         assert devices == [{"device_id": "dev-1"}]
         assert SNMPCollector._in_flight == {}
 
+    def test_removed_device_keeps_its_running_poll(self):
+        """Removed then re-added while its poll still runs: forgotten, the
+        poll would be started again on top of it, once per round trip."""
+        a, b = _make_target(device_id="dev-a"), _make_target(device_id="dev-b")
+        first = _FakeExecutor(running=1)
+        with _fake_pool(first):
+            SNMPCollector([a], 1000.0).poll_all()
+        with _fake_pool(_FakeExecutor()):
+            gone = SNMPCollector([b], 1300.0).poll_all()["devices"]
+        # Absent: kept in flight, and no "still running" failure for it.
+        assert [d["device_id"] for d in gone] == ["dev-b"]
+        assert SNMPCollector._in_flight["dev-a"][0] is first.futures[0]
+        back = _FakeExecutor()
+        with _fake_pool(back):
+            SNMPCollector([a, b], 1360.0).poll_all()
+        assert "dev-a" not in back.submitted
+
     def test_late_answer_after_a_long_tick_is_not_stuck(self):
         """With ticks 180s+ apart, a poll that finished just after its
         deadline is late, not stuck: its answer is reported, and its device
@@ -1475,6 +1496,26 @@ class TestBatchDeadline:
             time.sleep(0.3)  # the worker has taken the orphan by now
         assert devices == [{"device_id": "dev-1"}]
         assert ran == ["dev-1"]
+        assert SNMPCollector._last_poll_times == {"dev-1": 1000.0}
+
+    def test_failure_to_build_a_ticket_keeps_the_polls_submitted(self):
+        """Out of memory before the second submit(): the first poll is still
+        read, not left running untracked."""
+        built = []
+
+        def ticket():
+            built.append(1)
+            if len(built) == 2:
+                raise MemoryError()
+            return real_ticket()
+
+        from fivenines_agent.snmp import _Ticket as real_ticket
+
+        targets = [_make_target(device_id="dev-1"), _make_target(device_id="dev-2")]
+        executor = _FakeExecutor(poll=lambda t: {"device_id": t["device_id"]}, done=2)
+        with _fake_pool(executor), patch("fivenines_agent.snmp._Ticket", ticket):
+            devices = SNMPCollector(targets, 1000.0).poll_all()["devices"]
+        assert devices == [{"device_id": "dev-1"}]
         assert SNMPCollector._last_poll_times == {"dev-1": 1000.0}
 
     def test_any_submit_error_decides_the_ticket(self):
