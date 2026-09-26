@@ -1,5 +1,19 @@
 # TODOS
 
+## Block device topology (#155) -- server half not filed yet
+
+Agent side is DONE (v1.20.0): `data["io_topology"]`, behind a new TOP-LEVEL
+`io_topology` config flag that nothing sends yet, so the collector is inert until
+the server enables it. The server work: copy
+`tests/fixtures/io_topology_contract_payload.json` byte-for-byte into its specs,
+send `io_topology: true` to agents >= 1.20.0, and replace the name rules in
+`IoDeviceFilter` / `Host#stacked_io_devices` with the structural answer wherever
+one is reported (count whole devices with `slaves == []` and `virtual == false`,
+see the fixture's `counting_contract`). That also retires the ingestion-time
+`dm-`/`zd` drop, the parentless-partition guess (`xvda1`) and the macOS slice
+rule for Linux hosts; absent/`null`/`{}` must keep today's name rules. Known gap,
+not covered by `slaves/`: NVMe native multipath (`/sys/block/<head>/multipath/`).
+
 ## Proxmox backups phase 2 -- server half tracked in fivenines_server#1164
 
 Agent side is DONE (PR #158, v1.19.0): the `data["proxmox"]["backups"]` block.

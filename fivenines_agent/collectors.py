@@ -13,7 +13,7 @@ from fivenines_agent.fail2ban import fail2ban_metrics
 from fivenines_agent.fans import fans
 from fivenines_agent.gpu import gpu_metrics
 from fivenines_agent.haproxy import haproxy_metrics
-from fivenines_agent.io import io
+from fivenines_agent.io import io, io_topology
 from fivenines_agent.logs import collect_log_signals
 from fivenines_agent.memcached import memcached_metrics
 from fivenines_agent.memory import memory, swap
@@ -75,6 +75,13 @@ COLLECTORS = [
         ],
     ),
     ("io", [("io", io, False)]),
+    # Block device topology (#155): what each `io` row is stacked on, so the
+    # server can tell md0/dm-0 from the disks under them and stop summing one
+    # write at every layer. Its own TOP-LEVEL plain boolean, so the server can
+    # roll it out (and back) without touching `io`; pass_kwargs=False is the
+    # wireguard splat safety. Linux-only: None elsewhere, which the server reads
+    # as "not reported", the same as an absent key from an older agent.
+    ("io_topology", [("io_topology", io_topology, False)]),
     # Brique C log signals: per-unit error/warn rate + fingerprints. pass_kwargs
     # unpacks the logs config (units allowlist, signal_interval_s) as **kwargs.
     ("logs", [("logs", collect_log_signals, True)]),

@@ -768,7 +768,10 @@ The agent works without sudo, but these features will be unavailable (this is al
 - CPU usage and model
 - Memory and swap usage
 - Load average
-- Disk I/O statistics
+- Disk I/O statistics, plus on Linux what each block device is stacked on
+  (`/sys/block/<dev>/slaves/`) and which rows are partitions, so an mdraid,
+  LVM/LUKS, bcache or multipath host's total I/O counts each write once
+  instead of once per layer (agent version **1.20.0+**)
 - Network I/O statistics, per interface: byte/packet/error/drop counters plus
   interface type (bridge / physical / virtual), link speed from
   `/sys/class/net/<if>/speed`, and bridge member count, so the dashboard can
