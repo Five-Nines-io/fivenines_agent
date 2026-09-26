@@ -1004,15 +1004,20 @@ jobs:
             This is an automated pre-release build for testing purposes.
 
             ### Quick Install (replace existing agent)
+            The update scripts come from this build's own commit, so a branch
+            that changes them is tested with its copy, not the stable one.
             ```bash
             # System install (root) - glibc
-            FIVENINES_AGENT_URL="https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-linux-amd64.tar.gz" bash fivenines_update.sh
+            wget -T 3 -q -O fivenines_update.sh https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/fivenines_update.sh \
+              && FIVENINES_AGENT_URL="https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-linux-amd64.tar.gz" bash fivenines_update.sh
 
             # System install (root) - Alpine/musl
-            FIVENINES_AGENT_URL="https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-alpine-amd64.tar.gz" bash fivenines_update.sh
+            wget -T 3 -q -O fivenines_update.sh https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/fivenines_update.sh \
+              && FIVENINES_AGENT_URL="https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-alpine-amd64.tar.gz" sh fivenines_update.sh
 
             # User install
-            FIVENINES_AGENT_URL="https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-linux-amd64.tar.gz" bash fivenines_update_user.sh
+            wget -T 3 -q -O fivenines_update_user.sh https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/fivenines_update_user.sh \
+              && FIVENINES_AGENT_URL="https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-linux-amd64.tar.gz" bash fivenines_update_user.sh
             ```
 
             ### Quick Install - Windows (run from elevated PowerShell)
@@ -1059,9 +1064,10 @@ jobs:
             scripts have no `SHA256SUMS` to look up for it. Pin the digest
             yourself to get the same verification a normal install gets:
             ```bash
-            FIVENINES_AGENT_URL="https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-linux-amd64.tar.gz" \
-            FIVENINES_AGENT_SHA256="<digest from the list above>" \
-            bash fivenines_update.sh
+            wget -T 3 -q -O fivenines_update.sh https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/fivenines_update.sh \
+              && FIVENINES_AGENT_URL="https://github.com/${{ github.repository }}/releases/download/${{ steps.release_info.outputs.TAG_NAME }}/fivenines-agent-linux-amd64.tar.gz" \
+                 FIVENINES_AGENT_SHA256="<digest from the list above>" \
+                 bash fivenines_update.sh
             ```
 
             Test builds are not signed: the release signing key is available
