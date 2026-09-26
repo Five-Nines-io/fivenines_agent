@@ -256,7 +256,7 @@ Key dependencies:
 - `docker` (^7.1.0): Docker container monitoring
 - `libvirt-python` (^11.6.0): QEMU/KVM VM monitoring
 - `proxmoxer` (^2.1.0): Proxmox VE monitoring
-- `certifi` (^2024.12.14): SSL/TLS certificate validation
+- `certifi` (^2026.7.22): SSL/TLS certificate validation
 
 ## Binary Build Process
 

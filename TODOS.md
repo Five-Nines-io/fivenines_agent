@@ -320,17 +320,6 @@ pipeline.
 - **Depends on:** #30 (distro regression testing) shipping first
 - **Files:** `.github/workflows/build-release.yml`
 
-## P3: Nightly distro matrix runs
-
-Add a `schedule` trigger to the distro regression testing workflow to run the
-matrix nightly or weekly. This catches upstream distro changes (new Alpine
-minor release changing BusyBox behavior, new Ubuntu release changing adduser
-flags) before users do.
-
-- **Effort:** S (human) / S (CC)
-- **Depends on:** #30 (distro regression testing) shipping first
-- **Files:** `.github/workflows/build-release.yml` (add `schedule:` trigger)
-
 ## P2: Promote Rocky 10 to blocking
 
 The `rockylinux:10` test matrix entry runs with `allow_failure: "1"` because the
@@ -704,6 +693,18 @@ bake's `poetry install` re-syncs poetry's own dependencies to the lock.)
 - **Files:** `ci/requirements/`, `.github/workflows/`
 
 ## Completed
+
+### P3: Nightly distro matrix runs
+
+`build-release.yml` now has a weekly `schedule` trigger (#159): a cold build
+of `main`, the builder images rebuilt without cache, with no release published.
+`test-distro-matrix` has no job-level condition, so it runs on that schedule
+too, against the distro images Docker Hub serves that week. An upstream distro
+change (a new Alpine minor changing BusyBox behavior, a new Ubuntu release
+changing adduser flags) that breaks the installer or the binary now shows up in
+a scheduled run before it reaches users. Weekly rather than nightly.
+
+**Completed:** v1.19.1 (2026-09-26)
 
 ### P1: Verify the startup definitions against the signed manifest (#154)
 
