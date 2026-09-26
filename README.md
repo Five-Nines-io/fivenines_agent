@@ -502,7 +502,7 @@ the GitHub API, so it must be logged in (`gh auth login`); any GitHub account
 will do.
 
 ```bash
-VERSION=v1.19.1
+VERSION=v1.19.2
 FILE=fivenines-agent-linux-amd64.tar.gz
 BASE="https://releases.fivenines.io/${VERSION}"
 
@@ -527,9 +527,12 @@ gh attestation verify "${FILE}" \
 # Verification succeeded!
 ```
 
-Use the versioned path (`/v1.19.1/`) rather than `latest/`, which every new
+Use the versioned path (`/v1.19.2/`) rather than `latest/`, which every new
 release overwrites, so every file comes from the same release. The same assets
 are attached to the [GitHub release](https://github.com/Five-Nines-io/fivenines_agent/releases) for that tag.
+v1.19.1 was published on the GitHub release only -- its sync to
+`releases.fivenines.io` failed -- so verify v1.19.1 from the GitHub release
+assets; `releases.fivenines.io` starts at `/v1.19.2/`.
 
 Each step fails loudly: `openssl` prints `Verification failure`, `sha256sum`
 prints `FAILED`, and `gh` exits non-zero. `--source-ref` rejects a genuine
