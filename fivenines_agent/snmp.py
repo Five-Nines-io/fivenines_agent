@@ -399,11 +399,11 @@ class SNMPCollector:
                 continue
             del SNMPCollector._in_flight[device_id]
             current = SNMPCollector._polling_keys.get(device_id)
-            gone = device_id not in current_ids
-            if gone or key is None or key != current or stuck:
-                # A removed target's answer, the old target's, or one reported
-                # stuck meanwhile, whose success would clear the failures
-                # reported for it: dropped, and the device is polled afresh.
+            if key is None or key != current or stuck:
+                # A removed target's answer (its key was pruned), the old
+                # target's, or one reported stuck meanwhile, whose success
+                # would clear the failures reported for it: dropped, and the
+                # device is polled afresh.
                 SNMPCollector._last_poll_times.pop(device_id, None)
                 continue
             busy_ids.add(device_id)

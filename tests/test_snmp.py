@@ -1518,6 +1518,27 @@ class TestBatchDeadline:
         assert devices == [{"device_id": "dev-1"}]
         assert SNMPCollector._last_poll_times == {"dev-1": 1000.0}
 
+    def test_poll_that_cannot_be_tracked_is_never_accepted(self):
+        """Submitted, then lost before it is recorded: it must not run
+        untracked."""
+
+        class _Unhashable(Future):
+            def __hash__(self):
+                raise MemoryError()
+
+        tickets = []
+
+        class _Pool(_FakeExecutor):
+            def submit(self, fn, target, ticket):
+                tickets.append(ticket)
+                return _Unhashable()
+
+        with _fake_pool(_Pool()):
+            SNMPCollector([_make_target()], 1000.0).poll_all()
+        assert [(t._decided.is_set(), t.accepted) for t in tickets] == [
+            (True, False)
+        ]
+
     def test_any_submit_error_decides_the_ticket(self):
         """An undecided ticket would block a worker, and the agent's exit
         (which joins pool threads), forever."""
