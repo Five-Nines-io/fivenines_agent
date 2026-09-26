@@ -41,24 +41,29 @@ class _IoNames:
     A kobject name cannot contain '/', so the kernel writes it as '!' in sysfs
     (cciss/c0d0 -> /sys/block/cciss!c0d0) while /proc/diskstats prints the disk
     name unrewritten. A '!' in sysfs is therefore EITHER a rewritten '/' or a
-    literal '!' -- md takes any `md_*` array name verbatim -- and only
-    /proc/diskstats can say which. It is read at most once per walk and only
-    when a '!' shows up, so the common case costs nothing. A name it cannot
-    place is None: left out as unknown, never guessed.
+    literal '!' -- md takes any `md_*` array name verbatim, so md_a/b! is
+    md_a!b! in sysfs -- and only /proc/diskstats can say which. Its names are
+    escaped the way the kernel escapes them and looked up by that; it is read
+    at most once per walk and only when a '!' shows up, so the common case
+    costs nothing. A name it cannot place is None: left out as unknown, never
+    guessed.
     """
 
     def __init__(self):
-        self._known = None
+        self._by_sysfs_name = None
 
     def __call__(self, sysfs_name):
         if "!" not in sysfs_name:
             return sysfs_name
-        if self._known is None:
-            self._known = _diskstats_names()
-        for candidate in (sysfs_name, sysfs_name.replace("!", "/")):
-            if candidate in self._known:
-                return candidate
-        return None
+        if self._by_sysfs_name is None:
+            self._by_sysfs_name = {}
+            for name in _diskstats_names():
+                escaped = name.replace("/", "!")
+                # Two names escaping alike could not both be registered in
+                # sysfs; if they ever were, neither could be told apart.
+                ambiguous = escaped in self._by_sysfs_name
+                self._by_sysfs_name[escaped] = None if ambiguous else name
+        return self._by_sysfs_name.get(sysfs_name)
 
 
 def _diskstats_names():

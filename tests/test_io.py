@@ -323,13 +323,19 @@ def test_walk_errors_surface_on_the_callers_thread(linux):
 
 
 def test_io_names_resolve_bang_both_ways():
-    with patch(
-        "fivenines_agent.io._diskstats_names", return_value={"cciss/c0d0p1", "md_x!"}
-    ):
+    known = {"cciss/c0d0p1", "md_x!", "md_a/b!"}
+    with patch("fivenines_agent.io._diskstats_names", return_value=known):
         io_name = _IoNames()
         assert io_name("cciss!c0d0p1") == "cciss/c0d0p1"
         assert io_name("md_x!") == "md_x!"
+        # A '/' and a literal '!' in one name: sysfs shows both as '!'.
+        assert io_name("md_a!b!") == "md_a/b!"
         assert io_name("gone!") is None
+
+
+def test_io_names_refuse_a_name_two_diskstats_names_escape_to():
+    with patch("fivenines_agent.io._diskstats_names", return_value={"a/b", "a!b"}):
+        assert _IoNames()("a!b") is None
 
 
 def test_io_names_read_diskstats_only_for_a_bang_and_only_once():
