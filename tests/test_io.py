@@ -261,6 +261,33 @@ def test_bang_names_are_left_out_when_diskstats_is_unreadable(tmp_path, linux):
     assert out == {"sda": {"slaves": [], "virtual": False}}
 
 
+def test_undecodable_diskstats_byte_is_escaped_like_psutil(tmp_path, linux):
+    """psutil reads /proc/diskstats with surrogateescape, so an `io` row whose
+    name is not valid UTF-8 still has a key; decoding the same way keeps the
+    '!' lookup working and keys that name exactly as `io` does. (0x81 is
+    invalid UTF-8 and unmapped in cp1252, so this holds on the Windows CI.)"""
+    block = _build_sys_block(
+        tmp_path,
+        {
+            "cciss!c0d0": {"device": True, "slaves": []},
+            "md_\udc81!": {"device": False, "slaves": ["sda"]},
+            "sda": {"device": True, "slaves": []},
+        },
+    )
+    proc = tmp_path / "diskstats"
+    proc.write_bytes(
+        _diskstats_text(["sda", "cciss/c0d0"]).encode() + b"   9 0 md_\x81! 1 2\n"
+    )
+    with patch("fivenines_agent.io.SYS_BLOCK", str(block)), patch(
+        "fivenines_agent.io.PROC_DISKSTATS", str(proc)
+    ):
+        assert io_topology() == {
+            "cciss/c0d0": {"slaves": [], "virtual": False},
+            "md_\udc81!": {"slaves": ["sda"], "virtual": True},
+            "sda": {"slaves": [], "virtual": False},
+        }
+
+
 def test_empty_sys_block_is_an_empty_map(tmp_path, linux):
     assert _topology_of(tmp_path, {}) == {}
 
@@ -311,6 +338,38 @@ def test_blocked_sysfs_read_is_abandoned_then_single_flight(linux):
         assert len(calls) == 2
 
 
+def test_stall_reaches_telemetry_once_and_never_holds_exit(linux):
+    """The first stalled tick logs at error on the CALLER's thread, where the
+    dispatcher captures a collector's errors for telemetry; ticks that find
+    the same read still blocked log at debug, so one stall is one telemetry
+    error, not one per tick. The abandoned worker is a daemon, so a read that
+    never returns cannot hold the agent's shutdown either."""
+    release = threading.Event()
+
+    def blocked_read():
+        release.wait(5)
+        return {}
+
+    with patch.object(io_mod, "TOPOLOGY_READ_TIMEOUT", 0.05), patch.object(
+        io_mod, "_read_topology", side_effect=blocked_read
+    ):
+        try:
+            data, first, second = {}, {}, {}
+            collect_metrics({"io_topology": True}, data, first)
+            assert data == {"io_topology": None}
+            assert len(first["io_topology"]["errors"]) == 1
+            assert "sysfs read blocked" in first["io_topology"]["errors"][0]
+            assert io_mod._stalled_worker.daemon
+
+            collect_metrics({"io_topology": True}, data, second)
+            assert data == {"io_topology": None}
+            assert "errors" not in second["io_topology"]
+        finally:
+            release.set()
+            if io_mod._stalled_worker is not None:
+                io_mod._stalled_worker.join(5)
+
+
 def test_walk_errors_surface_on_the_callers_thread(linux):
     """The dispatcher's telemetry records a collector error only if it is
     raised where the dispatcher can see it."""
@@ -355,6 +414,16 @@ def test_diskstats_names_parses_the_name_column(tmp_path):
     proc.write_text(_diskstats_text(["sda", "cciss/c0d0"]) + "\n  8 0\n")
     with patch("fivenines_agent.io.PROC_DISKSTATS", str(proc)):
         assert _diskstats_names() == {"sda", "cciss/c0d0"}
+
+
+def test_diskstats_names_decode_with_the_filesystem_encoding(tmp_path):
+    """The encoding psutil (and os.listdir) use, not the locale's."""
+    proc = tmp_path / "diskstats"
+    proc.write_bytes(b"   9 0 md_\xe9 1 2\n")
+    with patch("fivenines_agent.io.PROC_DISKSTATS", str(proc)), patch(
+        "fivenines_agent.io.sys.getfilesystemencoding", return_value="latin-1"
+    ):
+        assert _diskstats_names() == {"md_\xe9"}
 
 
 def test_diskstats_names_empty_when_unreadable(tmp_path):

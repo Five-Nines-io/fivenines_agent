@@ -1,4 +1,5 @@
 import os
+import sys
 import threading
 
 import psutil
@@ -67,9 +68,18 @@ class _IoNames:
 
 
 def _diskstats_names():
-    """Every device name in /proc/diskstats; empty when it cannot be read."""
+    """Every device name in /proc/diskstats; empty when it cannot be read.
+
+    Decoded the way psutil decodes it for the `io` rows (filesystem encoding,
+    surrogateescape), so a name that is not valid UTF-8 keys identically on
+    both sides -- and one such byte cannot fail the read for every name.
+    """
     try:
-        with open(PROC_DISKSTATS) as f:
+        with open(
+            PROC_DISKSTATS,
+            encoding=sys.getfilesystemencoding(),
+            errors="surrogateescape",
+        ) as f:
             return {fields[2] for fields in map(str.split, f) if len(fields) > 2}
     except (OSError, ValueError):
         return set()
