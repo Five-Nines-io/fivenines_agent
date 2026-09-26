@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -221,6 +222,24 @@ def test_whole_device_counts_a_dangling_device_link_as_hardware(tmp_path):
     block = _build_sys_block(tmp_path, {"sda": {"device": False, "slaves": []}})
     os.symlink("../nowhere", block / "sda" / "device")
     assert _whole_device(str(block / "sda")) == {"slaves": [], "virtual": False}
+
+
+def test_whole_device_vanishing_mid_read_is_unknown_not_virtual(tmp_path):
+    """A disk hot-removed between the slaves/ read and the device lstat also
+    answers ENOENT; calling it virtual would drop its already-collected `io`
+    row from the server's total."""
+    block = _build_sys_block(tmp_path, {"sdz": {"device": True, "slaves": []}})
+    device_link = str(block / "sdz" / "device")
+    real_lstat = os.lstat
+
+    def unplug_on_device_lstat(path, *args, **kwargs):
+        if path == device_link:
+            shutil.rmtree(tmp_path / "devices" / "sdz")
+            os.unlink(block / "sdz")
+        return real_lstat(path, *args, **kwargs)
+
+    with patch("fivenines_agent.io.os.lstat", side_effect=unplug_on_device_lstat):
+        assert _whole_device(str(block / "sdz")) is None
 
 
 def test_whole_device_unknown_when_device_link_cannot_be_checked(tmp_path):

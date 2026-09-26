@@ -14,6 +14,20 @@ see the fixture's `counting_contract`). That also retires the ingestion-time
 rule for Linux hosts; absent/`null`/`{}` must keep today's name rules. Known gap,
 not covered by `slaves/`: NVMe native multipath (`/sys/block/<head>/multipath/`).
 
+## P3: No collector call is bounded in wall-clock time against a kernfs stall
+
+Found by the Codex review of #155. Under memory pressure a sysfs reader can fault
+into reclaim while holding `kernfs_rwsem`, and a queued writer then blocks every
+other sysfs lookup behind it -- 120-second stalls reported upstream (LKML
+2026-09, Shakeel Butt, "kernfs: don't hold kernfs_rwsem across dir_emit()").
+The agent reads sysfs on every tick from several collectors (`network`, psutil's
+hwmon glob behind `temperatures`, `io_topology`), all on the collection thread,
+so one such stall can outlast `WatchdogSec=90` and restart the agent. Bounding
+one collector would not bound the tick, since the earlier ones stall first; the
+uniform fix is a per-collector wall-clock bound in `collectors.collect_metrics`
+(the `run_privileged` posture: run in a worker, abandon it, report `None`).
+Not done in #155 because it changes every collector's failure mode.
+
 ## Proxmox backups phase 2 -- server half tracked in fivenines_server#1164
 
 Agent side is DONE (PR #158, v1.19.0): the `data["proxmox"]["backups"]` block.

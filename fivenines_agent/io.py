@@ -61,6 +61,12 @@ def _whole_device(path):
         os.lstat(os.path.join(path, "device"))
         virtual = False
     except FileNotFoundError:
+        # A device hot-removed after slaves/ was read (a pulled USB disk, an
+        # iSCSI logout) answers ENOENT here too. Its `io` row is already
+        # collected, and virtual: true would drop it from the server's total,
+        # so only a device that is still there is virtual.
+        if not os.path.lexists(os.path.join(path, "slaves")):
+            return None
         virtual = True
     except OSError:
         return None
@@ -116,10 +122,15 @@ def io_topology():
     Read every tick, uncached: it is a few directory reads per device (~26us
     measured, so ~10ms for a 400-device hypervisor), and membership changes
     without the device set changing -- a pvmove, an md member re-added -- so a
-    cache keyed on the device set would serve a stale answer. No deadline
-    either, unlike the collectors that talk to a daemon: sysfs is kernfs,
-    answered from kernel memory without touching the device, so a wedged disk
-    cannot stall these reads and the cost is linear in the device count.
+    cache keyed on the device set would serve a stale answer. No deadline of
+    its own either: sysfs is kernfs, answered from kernel memory without
+    touching the device, so a wedged disk cannot stall these reads. What can
+    is machine-wide memory pressure -- another sysfs reader faulting into
+    reclaim while it holds kernfs_rwsem blocks every sysfs lookup behind a
+    queued writer (LKML, 2026-09: "kernfs: don't hold kernfs_rwsem across
+    dir_emit()") -- and that stalls the network and temperatures collectors,
+    which run earlier in the same tick, just as much. A bound belongs on the
+    collection loop, not on one sysfs reader (TODOS.md).
     """
     if os_family() != "linux":
         return None
