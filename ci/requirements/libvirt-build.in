@@ -1,0 +1,4 @@
+# Tools the manylinux builder images use to build libvirt from source.
+meson
+ninja
+docutils

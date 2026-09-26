@@ -1,0 +1,7 @@
+# libvirt-python for the manylinux builds (built from sdist against the image's
+# libvirt; install with --no-build-isolation after build-tools.txt so the build
+# uses the hash-pinned setuptools rather than an unpinned one). It MUST be the
+# version poetry.lock locks: `poetry install` then finds it installed and skips
+# it, instead of rebuilding its own copy with an unpinned build backend. The
+# builder image checks the two agree.
+libvirt-python==11.10.0

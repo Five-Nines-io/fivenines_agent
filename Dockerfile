@@ -27,9 +27,15 @@ RUN yum install -y \
     && yum clean all
 
 # Build libtirpc from source WITHOUT libnsl dependency
-# This avoids the libnsl runtime dependency that causes issues on newer systems
+# This avoids the libnsl runtime dependency that causes issues on newer systems.
+# Every source download below is checked against a pinned SHA-256 before use:
+# what these images build ends up in the shipped agent. The digests were taken
+# from the upstream-signed releases (libvirt: GPG, Jiri Denemark's release key;
+# Python: GPG, the 3.10 release manager's key) and, for libtirpc, which is not
+# signed, cross-checked against Fedora's source archive.
 RUN cd /tmp && \
-    wget https://downloads.sourceforge.net/libtirpc/libtirpc-1.3.3.tar.bz2 && \
+    wget --timeout=30 --tries=3 https://downloads.sourceforge.net/libtirpc/libtirpc-1.3.3.tar.bz2 && \
+    echo "6474e98851d9f6f33871957ddee9714fdcd9d8a5ee9abb5a98d63ea2e60e12f3  libtirpc-1.3.3.tar.bz2" | sha256sum -c - && \
     tar xf libtirpc-1.3.3.tar.bz2 && \
     cd libtirpc-1.3.3 && \
     ./configure --prefix=/usr --libdir=/usr/lib64 --disable-gssapi --disable-static && \
@@ -40,12 +46,15 @@ RUN cd /tmp && \
     echo "libtirpc installed:" && pkg-config --modversion libtirpc
 
 # Install libvirt 6.10.0 from source (has cgroup V2 and RSS support, still CentOS 7 compatible)
+COPY ci/requirements/libvirt-build.txt /tmp/requirements/
 RUN cd /tmp && \
     echo "Building libvirt 6.10.0 with cgroup V2 and RSS support..." && \
     # Use Python 3.10 from manylinux and install Meson and Ninja build system
-    /opt/python/cp310-cp310/bin/python3.10 -m pip install meson ninja docutils && \
+    # (hash-pinned: ci/requirements/libvirt-build.txt)
+    /opt/python/cp310-cp310/bin/python3.10 -m pip install --require-hashes --no-deps --only-binary :all: -r /tmp/requirements/libvirt-build.txt && \
     export PATH="/opt/python/cp310-cp310/bin:$PATH" && \
-    wget https://libvirt.org/sources/libvirt-6.10.0.tar.xz && \
+    wget --timeout=30 --tries=3 https://libvirt.org/sources/libvirt-6.10.0.tar.xz && \
+    echo "30cfc1365b7a62bf08c5254103087fac51c4210343aa958a7d38cedd280ed2aa  libvirt-6.10.0.tar.xz" | sha256sum -c - && \
     tar xf libvirt-6.10.0.tar.xz && \
     cd libvirt-6.10.0 && \
     meson setup builddir \
@@ -119,7 +128,8 @@ RUN echo "=== Configuring libcrypt for PyInstaller ===" && \
 RUN echo "=== Pre-building libpython3.10.so (shared) ===" && \
     PYTHON_LIB_DIR="/opt/python/cp310-cp310/lib" && \
     cd /tmp && \
-    wget -q --timeout=30 "https://www.python.org/ftp/python/3.10.18/Python-3.10.18.tgz" && \
+    wget -q --timeout=30 --tries=3 "https://www.python.org/ftp/python/3.10.18/Python-3.10.18.tgz" && \
+    echo "1b19ab802518eb36a851f5ddef571862c7a31ece533109a99df6d5af0a1ceb99  Python-3.10.18.tgz" | sha256sum -c - && \
     tar xzf Python-3.10.18.tgz && \
     cd Python-3.10.18 && \
     ./configure \
@@ -170,18 +180,30 @@ RUN . /etc/profile && \
 # The root project is intentionally NOT installed (--no-root); py2exe.sh installs
 # it editable from the mounted /workspace at runtime, so the frozen binary always
 # carries the current commit's code + version metadata while deps stay baked.
+# The build tools (pip, setuptools, wheel, poetry and poetry's own dependencies)
+# and libvirt-python come from hash-pinned files: ci/requirements/build-tools.txt
+# and libvirt-python.txt. The libvirt-python sdist builds WITHOUT isolation so it
+# uses the pinned setuptools rather than fetching an unpinned one, and it must be
+# the version poetry.lock locks, so that `poetry install` finds it installed and
+# skips it -- the guard below fails the build if the two drift. Poetry then
+# installs WHEELS ONLY (hash-checked against poetry.lock): an sdist it would have
+# to build fetches its build backend unpinned, so that fails instead.
 COPY pyproject.toml poetry.lock /build/
+COPY ci/requirements/build-tools.txt ci/requirements/libvirt-python.txt /build/requirements/
 RUN echo "=== Baking build venv at /opt/venv ===" && \
     export PKG_CONFIG_PATH="/usr/lib64/pkgconfig:/usr/lib/pkgconfig:/usr/lib64/pkgconfig" && \
     /opt/python/cp310-cp310/bin/python3.10 -m venv /opt/venv && \
     . /opt/venv/bin/activate && \
-    pip install --upgrade pip setuptools wheel && \
-    pip install poetry==2.4.1 && \
+    pip install --require-hashes --no-deps --only-binary :all: -r /build/requirements/build-tools.txt && \
     poetry config virtualenvs.create false && \
     poetry config installer.max-workers 1 && \
-    pip install libvirt-python==11.6.0 && \
+    LOCKED=$(awk '/^name = "libvirt-python"$/ {getline; gsub(/"/, "", $3); print $3}' /build/poetry.lock) && \
+    { grep -q "^libvirt-python==${LOCKED} " /build/requirements/libvirt-python.txt || { \
+        echo "poetry.lock locks libvirt-python ${LOCKED}, but ci/requirements/libvirt-python.txt pins another version: they must match"; \
+        exit 1; }; } && \
+    pip install --require-hashes --no-deps --no-build-isolation -r /build/requirements/libvirt-python.txt && \
     cd /build && \
-    poetry install --no-root --with virtualization && \
+    POETRY_INSTALLER_ONLY_BINARY=":all:" poetry install --no-root --with virtualization && \
     python -c "import libvirt, PyInstaller; print('venv ok - libvirt', libvirt.getVersion())" && \
     cd / && rm -rf /build
 

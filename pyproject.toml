@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "fivenines_agent"
-version = "1.19.0"
+version = "1.19.1"
 description = ""
 authors = ["Sebastien Puyet <sebastien@fivenines.io>"]
 license = "WTFPL"
@@ -10,7 +10,7 @@ readme = "README.md"
 python = ">=3.10,<3.14"
 python-dotenv = "^1.2.2"
 psutil = "^7.2.1"
-certifi = "^2024.12.14"
+certifi = "^2026.7.22"  # the CA bundle the agent trusts for the API: keep it current (Dependabot here only proposes security updates)
 docker = "^7.1.0"
 dnspython = "^2.7"
 requests = "^2.33.0"
@@ -70,7 +70,26 @@ virtualenv = ">=20.33.0"
 # Security floors for transitive dev deps. Brought in by poetry/keyring/secretstorage. Pinned here so poetry lock cannot resolve below the patched line.
 poetry = "^2.3.4"  # GHSA-4xc9-8hv6-g4j4 (wheel traversal), GHSA-9q47-jr9w-2qhc (tar traversal)
 cryptography = "^50.0.0"  # GHSA-79v4-65xg-pq4g (subgroup attack), GHSA-h4gh-qq45-vh27 (DNS name constraints)
+jaraco-context = "^6.1.0"  # GHSA-58pv-8j8x-9vj2 (tarball path traversal); via keyring. Found by Scorecard's OSV scan -- Dependabot raised no alert for it.
+# Via poetry -> cleo. 3.14+ ships no manylinux2014 wheel for Python 3.10, so the
+# manylinux builders would compile it from source with an unpinned build backend
+# (the builds install wheels only). Same hold as ci/requirements/build-tools.in.
+rapidfuzz = "<3.14"
 
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
+
+# Bandit policy -- see CONTRIBUTING.md. CI fails on any finding not covered by
+# a skip below or by an inline `# nosec BXXX  # <reason>` naming the test.
+#
+# Skipped globally because they fire on what an agent that runs system tools
+# does by design, while the dangerous variant stays enabled:
+#   B404  importing subprocess at all.
+#   B603  a subprocess call WITHOUT a shell. The shell variants (B602, B604,
+#         B605) stay on; an argv list is never re-parsed by a shell.
+#   B607  a tool resolved through PATH. Tool locations differ across distros;
+#         the agent inherits PATH from its service manager, and anyone able to
+#         change that PATH already controls the agent's account.
+[tool.bandit]
+skips = ["B404", "B603", "B607"]
