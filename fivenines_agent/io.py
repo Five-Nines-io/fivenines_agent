@@ -12,6 +12,9 @@ from fivenines_agent.env import os_family
 # "is this a partition" signal, with no name rule involved.
 SYS_BLOCK = "/sys/block"
 
+# Only read to resolve a '!' in a sysfs name (see _IoNames).
+PROC_DISKSTATS = "/proc/diskstats"
+
 # Wall-clock bound on one topology read, on the watchdog-bounded collection
 # loop. A healthy read is well under 1ms here and ~10ms for 400 devices; this
 # only ever fires on a stalled sysfs (see io_topology).
@@ -32,19 +35,42 @@ def io():
     return io
 
 
-def _io_name(sysfs_name):
-    """The name the `io` payload uses for a device sysfs names `sysfs_name`.
+class _IoNames:
+    """sysfs name -> the spelling /proc/diskstats (so the `io` rows) uses.
 
-    A kobject name cannot contain '/', so the kernel rewrites it to '!' in
-    sysfs (cciss/c0d0 -> /sys/block/cciss!c0d0) while /proc/diskstats -- and
-    so psutil and the `io` rows -- print the disk name unrewritten. psutil
-    applies the same substitution in the other direction to find a disk in
-    sysfs. Reversing it keeps io_topology keyed exactly like `io`.
+    A kobject name cannot contain '/', so the kernel writes it as '!' in sysfs
+    (cciss/c0d0 -> /sys/block/cciss!c0d0) while /proc/diskstats prints the disk
+    name unrewritten. A '!' in sysfs is therefore EITHER a rewritten '/' or a
+    literal '!' -- md takes any `md_*` array name verbatim -- and only
+    /proc/diskstats can say which. It is read at most once per walk and only
+    when a '!' shows up, so the common case costs nothing. A name it cannot
+    place is None: left out as unknown, never guessed.
     """
-    return sysfs_name.replace("!", "/")
+
+    def __init__(self):
+        self._known = None
+
+    def __call__(self, sysfs_name):
+        if "!" not in sysfs_name:
+            return sysfs_name
+        if self._known is None:
+            self._known = _diskstats_names()
+        for candidate in (sysfs_name, sysfs_name.replace("!", "/")):
+            if candidate in self._known:
+                return candidate
+        return None
 
 
-def _whole_device(path):
+def _diskstats_names():
+    """Every device name in /proc/diskstats; empty when it cannot be read."""
+    try:
+        with open(PROC_DISKSTATS) as f:
+            return {fields[2] for fields in map(str.split, f) if len(fields) > 2}
+    except (OSError, ValueError):
+        return set()
+
+
+def _whole_device(path, io_name):
     """{"slaves": [...], "virtual": bool} for /sys/block/<dev>, or None.
 
     slaves/ lists the devices this one is stacked on (md members, the PVs under
@@ -52,6 +78,7 @@ def _whole_device(path):
     multipath map). [] is a positive claim -- nothing beneath it -- so it is
     only ever reported from a successful read; an unreadable directory is None,
     which leaves the device out of the topology rather than calling it a leaf.
+    So does a slave io_name cannot place: a partial list is a false claim too.
 
     virtual is sysstat's definition: no `device` link, i.e. the driver
     registered the disk with no parent device (add_disk() rather than
@@ -65,8 +92,10 @@ def _whole_device(path):
     bus device even though every byte goes over the network.
     """
     try:
-        slaves = os.listdir(os.path.join(path, "slaves"))
+        slaves = [io_name(s) for s in os.listdir(os.path.join(path, "slaves"))]
     except OSError:
+        return None
+    if None in slaves:
         return None
     try:
         os.lstat(os.path.join(path, "device"))
@@ -81,7 +110,7 @@ def _whole_device(path):
         virtual = True
     except OSError:
         return None
-    return {"slaves": sorted(_io_name(s) for s in slaves), "virtual": virtual}
+    return {"slaves": sorted(slaves), "virtual": virtual}
 
 
 def _partitions(path, disk):
@@ -187,12 +216,18 @@ def _read_topology():
     except OSError:
         return None
 
+    io_name = _IoNames()
     topology = {}
     for disk in sorted(disks):
+        name = io_name(disk)
+        if name is None:
+            continue
         path = os.path.join(SYS_BLOCK, disk)
-        entry = _whole_device(path)
+        entry = _whole_device(path, io_name)
         if entry is not None:
-            topology[_io_name(disk)] = entry
+            topology[name] = entry
         for part in _partitions(path, disk):
-            topology[_io_name(part)] = {"partition_of": _io_name(disk)}
+            part_name = io_name(part)
+            if part_name is not None:
+                topology[part_name] = {"partition_of": name}
     return topology

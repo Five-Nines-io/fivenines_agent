@@ -13,7 +13,8 @@ import pytest
 from fivenines_agent import io as io_mod
 from fivenines_agent.collectors import collect_metrics
 from fivenines_agent.io import (
-    _io_name,
+    _diskstats_names,
+    _IoNames,
     _partitions,
     _whole_device,
     io,
@@ -73,10 +74,25 @@ def linux():
         yield
 
 
-def _topology_of(tmp_path, model):
+def _topology_of(tmp_path, model, diskstats=None):
+    """io_topology() over a built /sys/block; `diskstats` lists the names
+    /proc/diskstats holds (None: a path that does not exist)."""
     block = _build_sys_block(tmp_path, model)
-    with patch("fivenines_agent.io.SYS_BLOCK", str(block)):
+    proc = tmp_path / "diskstats"
+    if diskstats is not None:
+        proc.write_text(_diskstats_text(diskstats))
+    with patch("fivenines_agent.io.SYS_BLOCK", str(block)), patch(
+        "fivenines_agent.io.PROC_DISKSTATS", str(proc)
+    ):
         return io_topology()
+
+
+def _diskstats_text(names):
+    """Real /proc/diskstats lines (20 fields since 5.5) for the given names."""
+    return "".join(
+        f"   8       {i} {name} 1 2 3 4 5 6 7 8 0 9 10 0 0 0 0 0 0\n"
+        for i, name in enumerate(names)
+    )
 
 
 # --- io() -----------------------------------------------------------------
@@ -182,12 +198,67 @@ def test_slashed_names_are_reported_as_io_spells_them(tmp_path, linux):
             },
             "dm-0": {"device": False, "slaves": ["cciss!c0d0p1"]},
         },
+        diskstats=["cciss/c0d0", "cciss/c0d0p1", "dm-0"],
     )
     assert out == {
         "cciss/c0d0": {"slaves": [], "virtual": False},
         "cciss/c0d0p1": {"partition_of": "cciss/c0d0"},
         "dm-0": {"slaves": ["cciss/c0d0p1"], "virtual": True},
     }
+
+
+def test_literal_bang_in_a_named_md_array_is_kept(tmp_path, linux):
+    """md takes any `md_*` name verbatim, so a '!' in sysfs can be literal:
+    mapping it to '/' unconditionally would key md_data! as md_data/."""
+    out = _topology_of(
+        tmp_path,
+        {
+            "md_data!": {"device": False, "slaves": ["sda1", "sdb1"]},
+            "sda": {"device": True, "slaves": [], "partitions": ["sda1"]},
+            "sdb": {"device": True, "slaves": [], "partitions": ["sdb1"]},
+        },
+        diskstats=["sda", "sda1", "sdb", "sdb1", "md_data!"],
+    )
+    assert out["md_data!"] == {"slaves": ["sda1", "sdb1"], "virtual": True}
+    assert "md_data/" not in out
+
+
+def test_unplaceable_names_are_left_out_never_guessed(tmp_path, linux):
+    """A '!' name /proc/diskstats holds in neither spelling is unknown: the
+    device, its partitions and any layer listing it as a slave are left out
+    (a partial slaves list would be a false claim); neighbours are kept."""
+    out = _topology_of(
+        tmp_path,
+        {
+            "odd!disk": {"device": True, "slaves": [], "partitions": ["odd!disk1"]},
+            "dm-0": {"device": False, "slaves": ["odd!disk1"]},
+            "sda": {"device": True, "slaves": []},
+        },
+        diskstats=["sda", "dm-0"],
+    )
+    assert out == {"sda": {"slaves": [], "virtual": False}}
+
+
+def test_unplaceable_partition_of_a_placeable_disk_is_left_out(tmp_path, linux):
+    """/proc/diskstats skips a zero-size partition, so a '!' partition can be
+    unplaceable while its disk is not: it is left out, never keyed as None."""
+    out = _topology_of(
+        tmp_path,
+        {"cciss!c0d0": {"device": True, "slaves": [], "partitions": ["cciss!c0d0p1"]}},
+        diskstats=["cciss/c0d0"],
+    )
+    assert out == {"cciss/c0d0": {"slaves": [], "virtual": False}}
+
+
+def test_bang_names_are_left_out_when_diskstats_is_unreadable(tmp_path, linux):
+    out = _topology_of(
+        tmp_path,
+        {
+            "cciss!c0d0": {"device": True, "slaves": []},
+            "sda": {"device": True, "slaves": []},
+        },
+    )
+    assert out == {"sda": {"slaves": [], "virtual": False}}
 
 
 def test_empty_sys_block_is_an_empty_map(tmp_path, linux):
@@ -251,16 +322,45 @@ def test_walk_errors_surface_on_the_callers_thread(linux):
 # --- helpers --------------------------------------------------------------
 
 
-def test_io_name_maps_sysfs_bang_back_to_slash():
-    assert _io_name("cciss!c0d0p1") == "cciss/c0d0p1"
-    assert _io_name("sda1") == "sda1"
+def test_io_names_resolve_bang_both_ways():
+    with patch(
+        "fivenines_agent.io._diskstats_names", return_value={"cciss/c0d0p1", "md_x!"}
+    ):
+        io_name = _IoNames()
+        assert io_name("cciss!c0d0p1") == "cciss/c0d0p1"
+        assert io_name("md_x!") == "md_x!"
+        assert io_name("gone!") is None
+
+
+def test_io_names_read_diskstats_only_for_a_bang_and_only_once():
+    """The common path (no '!') never opens /proc/diskstats."""
+    with patch("fivenines_agent.io._diskstats_names", return_value={"a/b"}) as names:
+        io_name = _IoNames()
+        assert io_name("sda1") == "sda1"
+        assert io_name("nvme0n1p1") == "nvme0n1p1"
+        names.assert_not_called()
+        assert io_name("a!b") == "a/b"
+        assert io_name("a!b") == "a/b"
+        names.assert_called_once_with()
+
+
+def test_diskstats_names_parses_the_name_column(tmp_path):
+    proc = tmp_path / "diskstats"
+    proc.write_text(_diskstats_text(["sda", "cciss/c0d0"]) + "\n  8 0\n")
+    with patch("fivenines_agent.io.PROC_DISKSTATS", str(proc)):
+        assert _diskstats_names() == {"sda", "cciss/c0d0"}
+
+
+def test_diskstats_names_empty_when_unreadable(tmp_path):
+    with patch("fivenines_agent.io.PROC_DISKSTATS", str(tmp_path / "missing")):
+        assert _diskstats_names() == set()
 
 
 def test_whole_device_sorts_slaves(tmp_path):
     """listdir order is the filesystem's; the payload's must not be."""
     block = _build_sys_block(tmp_path, {"md0": {"device": False, "slaves": []}})
     with patch("fivenines_agent.io.os.listdir", return_value=["sdb1", "sda1"]):
-        assert _whole_device(str(block / "md0")) == {
+        assert _whole_device(str(block / "md0"), _IoNames()) == {
             "slaves": ["sda1", "sdb1"],
             "virtual": True,
         }
@@ -270,7 +370,10 @@ def test_whole_device_counts_a_dangling_device_link_as_hardware(tmp_path):
     """The link's presence is the signal (lstat), not whether it resolves."""
     block = _build_sys_block(tmp_path, {"sda": {"device": False, "slaves": []}})
     os.symlink("../nowhere", block / "sda" / "device")
-    assert _whole_device(str(block / "sda")) == {"slaves": [], "virtual": False}
+    assert _whole_device(str(block / "sda"), _IoNames()) == {
+        "slaves": [],
+        "virtual": False,
+    }
 
 
 def test_whole_device_vanishing_mid_read_is_unknown_not_virtual(tmp_path):
@@ -288,14 +391,14 @@ def test_whole_device_vanishing_mid_read_is_unknown_not_virtual(tmp_path):
         return real_lstat(path, *args, **kwargs)
 
     with patch("fivenines_agent.io.os.lstat", side_effect=unplug_on_device_lstat):
-        assert _whole_device(str(block / "sdz")) is None
+        assert _whole_device(str(block / "sdz"), _IoNames()) is None
 
 
 def test_whole_device_unknown_when_device_link_cannot_be_checked(tmp_path):
     """Only ENOENT means virtual; any other failure is unknown, never a claim."""
     block = _build_sys_block(tmp_path, {"sda": {"device": True, "slaves": []}})
     with patch("fivenines_agent.io.os.lstat", side_effect=PermissionError):
-        assert _whole_device(str(block / "sda")) is None
+        assert _whole_device(str(block / "sda"), _IoNames()) is None
 
 
 def test_partitions_skips_non_partition_entries(tmp_path):
