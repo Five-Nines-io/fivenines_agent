@@ -151,9 +151,10 @@ verify_sha256() {
 # SHA-256 rather than Ed25519: OpenSSL 1.0.2 on CentOS 7 cannot verify
 # Ed25519, and CentOS 7 is in the support matrix.
 #
-# The matching PRIVATE key lives only in the RELEASE_SIGNING_KEY repository
-# secret - never in the release bucket - which is what makes this worth
-# anything: a mirror that rewrites SHA256SUMS cannot re-sign it.
+# The matching PRIVATE key lives only in the RELEASE_SIGNING_KEY secret of
+# the `release` GitHub environment, which only v* tag builds can read - never
+# in the release bucket - which is what makes this worth anything: a mirror
+# that rewrites SHA256SUMS cannot re-sign it.
 #
 # ROTATION IS A BREAKING CHANGE. Every installed agent carries the key below
 # verbatim, so a release signed with a different key is REJECTED by every
@@ -237,8 +238,9 @@ verify_sums_signature() {
 # intact and are the ones that mirror published - a truncated download, a
 # half-finished mirror sync, a swapped asset. It cannot catch an attacker who
 # owns the mirror, because they would rewrite SHA256SUMS too. The signature
-# is what closes that: the signing key lives in a repository secret, not in
-# the bucket, so a manifest the attacker rewrote will not verify (issue #143).
+# is what closes that: the signing key lives in a GitHub environment secret,
+# not in the bucket, so a manifest the attacker rewrote will not verify
+# (issue #143).
 verify_from_manifest() {
     file="$1"
     asset_name="$2"

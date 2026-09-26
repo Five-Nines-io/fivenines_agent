@@ -1,0 +1,37 @@
+version: 2
+
+updates:
+  # The agent's Python dependencies: pyproject.toml + poetry.lock, the lockfile
+  # every release build installs from (the root requirements.txt is exported
+  # from it). SECURITY updates only -- open-pull-requests-limit: 0 turns off
+  # routine version bumps for this entry but not security updates -- because
+  # every dependency ships inside a binary on customer hosts, and a version
+  # change there is a release decision, not a weekly chore.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+
+  # Bandit and its dependencies, hash-pinned for the security-lint job.
+  - package-ecosystem: pip
+    directory: /.github
+    schedule:
+      interval: monthly
+    cooldown:
+      default-days: 7
+
+  # Every action is pinned to a commit SHA, with the version in a comment.
+  # Dependabot moves both together; one grouped PR a week. The cooldown keeps
+  # a release from being picked up in its first days, when a compromised tag
+  # is most likely to still be live.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns:
+          - '*'

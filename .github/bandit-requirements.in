@@ -1,0 +1,5 @@
+# Bandit for the security-lint CI job (.github/workflows/bandit.yml). Compiled
+# to bandit-requirements.txt with hashes; regenerate from this directory with
+#   pip-compile --generate-hashes --allow-unsafe --strip-extras bandit-requirements.in
+# on the Python version the workflow uses.
+bandit==1.9.4
