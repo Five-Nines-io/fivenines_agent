@@ -8,13 +8,19 @@ Architecture:
   sync_config["snmp_targets"]
        |
        v
-  snmp_metrics(targets)
+  snmp_metrics(targets, tick_started)
        |
        +---> Check shutil.which("snmpget")
-       +---> Filter due devices (_is_device_due)
-       +---> ThreadPoolExecutor.map(_poll_device, ...)
+       +---> Report polls kept in flight that have finished; skip the
+       |         devices whose poll is still running
+       +---> Filter due devices (_is_device_due), oldest poll first
+       +---> ThreadPoolExecutor.submit(_poll_device) per due device,
+       |         results read against a 30s batch deadline (queued:
+       |         cancelled; running: kept in _in_flight);
        |         each thread runs subprocess.run(["snmpget"/...])
        +---> Aggregate results into {"devices": [...]}
+       +---> Append cached successes of not-due devices (_replay_cached;
+       |         a failed poll evicts the device's entry)
        |
        v
   data["snmp_metrics"] = {"devices": [...]}
@@ -23,11 +29,13 @@ Thread safety: each worker thread runs its own subprocess.
 No shared mutable state between threads.
 """
 
+import hashlib
+import json
 import shutil
 import subprocess
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FuturesTimeoutError
+from concurrent.futures import ThreadPoolExecutor, wait
 
 from fivenines_agent.debug import log
 from fivenines_agent.env import dry_run
@@ -78,9 +86,21 @@ SNMP_TIMEOUT = 5  # seconds per SNMP request (-t flag)
 SNMP_RETRIES = 1  # retry once on UDP packet loss (-r flag)
 EXECUTOR_TIMEOUT = 30  # safety net for entire batch
 MAX_WORKERS = 10  # max concurrent device polls
+# A poll kept in flight ends within ~60s by its own subprocess timeouts; one
+# still running this long after its tick started is stuck (an snmpget in
+# uninterruptible sleep), and its device reports a counted failure each tick.
+IN_FLIGHT_LIMIT = 180
+
+# The target fields a poll reads (_build_base_args, _poll_device): a change
+# to any of them is a different target. The interval only decides when.
+POLLING_FIELDS = (
+    "ip", "port", "version", "community", "username", "security_level",
+    "auth_protocol", "auth_password", "priv_protocol", "priv_password",
+    "capabilities", "custom_oids",
+)
 
 
-def snmp_metrics(targets):
+def snmp_metrics(targets, tick_started=None):
     """Poll SNMP targets and return metrics.
 
     Entry point called from agent.py as a special-case collector.
@@ -88,6 +108,9 @@ def snmp_metrics(targets):
 
     Args:
         targets: list of target dicts from sync_config["snmp_targets"]
+        tick_started: time.monotonic() at the start of the agent's
+            collection tick (see SNMPCollector._is_device_due); None: the
+            current time
 
     Returns:
         dict with "devices" key, or None if snmpget is unavailable
@@ -100,7 +123,7 @@ def snmp_metrics(targets):
         return None
 
     global _collector
-    _collector = SNMPCollector(targets)
+    _collector = SNMPCollector(targets, tick_started)
     result = _collector.poll_all()
 
     if dry_run() and result and result.get("devices"):
@@ -142,6 +165,7 @@ def _parse_snmp_line(line):
       .1.3.6.1.2.1.1.5.0 = STRING: "EPSONCD1062"
       .1.3.6.1.2.1.2.2.1.10.1 = Counter32: 7010736
       .1.3.6.1.2.1.1.3.0 = Timeticks: (1491600) 4:08:36.00
+      .1.3.6.1.2.1.2.2.1.8.1 = INTEGER: up(1)
       .1.3.6.1.2.1.31.1.1.1.1 = No Such Object available ...
 
     Returns:
@@ -164,7 +188,12 @@ def _parse_snmp_line(line):
         type_str = type_str.strip()
 
         # Timeticks: (1491600) 4:08:36.00 -> extract raw value
-        if type_str == "Timeticks":
+        # INTEGER: up(1) -> "1". A host that loads MIBs (RHEL family,
+        # snmp-mibs-downloader) labels enumerations, and the int() converters
+        # dropped every interface's type and admin/oper status. -Oe asks for
+        # the bare number, but it is a toggle applied BEFORE snmp.conf is
+        # read, so "printNumericEnums no" there wins.
+        if type_str in ("Timeticks", "INTEGER"):
             if "(" in val and ")" in val:
                 val = val[val.index("(") + 1 : val.index(")")]
 
@@ -172,6 +201,91 @@ def _parse_snmp_line(line):
         return (oid_str, val)
 
     return (oid_str, value_part.strip().strip('"'))
+
+
+def _polling_key(target):
+    """A digest of the POLLING_FIELDS present (an absent field and a null
+    one poll differently): no second plaintext copy of the credentials.
+    None, instead of raising, when the target cannot be serialized (a
+    hostile nesting depth)."""
+    try:
+        blob = json.dumps(
+            {f: target[f] for f in POLLING_FIELDS if f in target},
+            sort_keys=True,
+            default=str,
+        )
+    except (RecursionError, TypeError, ValueError):
+        return None
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _executor_timeout(device_id):
+    """The entry for a poll the batch deadline cut off. The server records
+    it without counting it as a device failure."""
+    log("SNMP executor timeout for device {}".format(device_id), "error")
+    return {
+        "device_id": device_id,
+        "error": {
+            "type": "timeout",
+            "message": "Executor timeout after {}s".format(EXECUTOR_TIMEOUT),
+        },
+    }
+
+
+def _read_poll(device_id, future):
+    """A finished poll's device dict, or an error if the poll raised."""
+    try:
+        return future.result()
+    except Exception as e:
+        log("SNMP error for device {}: {}".format(device_id, e), "error")
+        return {
+            "device_id": device_id,
+            "error": {"type": "unknown", "message": str(e)},
+        }
+
+
+class _Ticket:
+    """Lets a submitted poll run only once submit() has returned its future.
+    submit() queues the work BEFORE starting a thread; when the start then
+    fails (a pids limit), an idle worker could still run a poll that nothing
+    tracks, whose answer is lost and whose device gets polled again."""
+
+    def __init__(self):
+        self.accepted = False
+        self._decided = threading.Event()
+
+    def decide(self, accepted):
+        self.accepted = accepted
+        self._decided.set()
+
+    def wait(self):
+        self._decided.wait()
+        return self.accepted
+
+
+def _late(result):
+    """A poll answered after its batch, without its counters: the server
+    stamps them with this tick's time, a tick or more after they were read,
+    which would skew every rate computed across them."""
+    return {
+        k: v
+        for k, v in result.items()
+        if k not in ("interface_metrics", "custom_metrics")
+    }
+
+
+def _stuck(device_id):
+    """A COUNTED failure (unlike an executor timeout) for a device whose poll
+    has been running past IN_FLIGHT_LIMIT, so it can reach unreachable."""
+    return {
+        "device_id": device_id,
+        "error": {
+            "type": "timeout",
+            "message": "SNMP poll still running after {}s".format(
+                IN_FLIGHT_LIMIT
+            ),
+        },
+    }
 
 
 def _run_snmp_cmd(cmd, args, timeout):
@@ -210,14 +324,26 @@ class SNMPCollector:
 
     Manages per-device interval tracking and concurrent polling
     via ThreadPoolExecutor.
+
+    A device that is not due is reported by replaying its last SUCCESSFUL
+    result, marked "cached": true. A failed poll evicts that result: the
+    server resets a device's failure streak on every success it receives,
+    so replaying one between failed polls kept an outage from ever reaching
+    unreachable (#161). After a failure, a not-due tick reports nothing but
+    the answer of a poll kept in flight, once it finishes.
     """
 
-    def __init__(self, targets):
+    def __init__(self, targets, tick_started=None):
         self.targets = targets
+        self.tick_started = tick_started
         if not hasattr(SNMPCollector, "_last_poll_times"):
             SNMPCollector._last_poll_times = {}
         if not hasattr(SNMPCollector, "_last_results"):
             SNMPCollector._last_results = {}
+        if not hasattr(SNMPCollector, "_polling_keys"):
+            SNMPCollector._polling_keys = {}
+        if not hasattr(SNMPCollector, "_in_flight"):
+            SNMPCollector._in_flight = {}
 
     def poll_all(self):
         """Poll all due SNMP targets concurrently.
@@ -227,100 +353,205 @@ class SNMPCollector:
         """
         # Prune stale state
         current_ids = {t["device_id"] for t in self.targets}
-        stale_ids = set(SNMPCollector._last_poll_times.keys()) - current_ids
-        for device_id in stale_ids:
+        known_ids = (
+            set(SNMPCollector._last_poll_times)
+            | set(SNMPCollector._polling_keys)
+            | set(SNMPCollector._in_flight)
+        )
+        for device_id in known_ids - current_ids:
             SNMPCollector._last_poll_times.pop(device_id, None)
             SNMPCollector._last_results.pop(device_id, None)
+            SNMPCollector._polling_keys.pop(device_id, None)
+            SNMPCollector._in_flight.pop(device_id, None)
 
-        due_targets = [t for t in self.targets if self._is_device_due(t)]
+        # A device whose POLLING_FIELDS changed loses its poll time: due at
+        # once (or as soon as a poll of the old target still in flight ends),
+        # its old answer is replaced or evicted by that poll instead of
+        # replayed until its interval runs out. A target whose key cannot be
+        # computed is never replayed: its old answer may be another target's.
+        for target in self.targets:
+            device_id = target["device_id"]
+            key = _polling_key(target)
+            if key is None:
+                SNMPCollector._last_results.pop(device_id, None)
+            elif SNMPCollector._polling_keys.get(device_id, key) != key:
+                SNMPCollector._last_poll_times.pop(device_id, None)
+            SNMPCollector._polling_keys[device_id] = key
+
+        # A poll still running when its batch ended (below) is reported once
+        # it has finished, on a later tick, unless its target changed since.
+        # Until then its device is not polled again: never two polls against
+        # one device, short of it being removed and re-added meanwhile.
+        devices = []
+        busy_ids = set()
+        for device_id, (future, key, started, stuck) in list(
+            SNMPCollector._in_flight.items()
+        ):
+            if not future.done():
+                busy_ids.add(device_id)
+                if self._tick_time() - started >= IN_FLIGHT_LIMIT:
+                    self._report(devices, device_id, _stuck(device_id))
+                    SNMPCollector._in_flight[device_id] = (
+                        future, key, started, True
+                    )
+                continue
+            del SNMPCollector._in_flight[device_id]
+            current = SNMPCollector._polling_keys.get(device_id)
+            if key is None or key != current or stuck:
+                # The old target's answer, or one reported stuck meanwhile,
+                # whose success would clear the failures reported for it:
+                # dropped, and the device is polled afresh now.
+                SNMPCollector._last_poll_times.pop(device_id, None)
+                continue
+            busy_ids.add(device_id)
+            late = _late(_read_poll(device_id, future))
+            self._report(devices, device_id, late)
+
+        # Oldest poll first: a device cut off before its poll started is
+        # left unstamped (below), so it goes ahead of every device polled
+        # since instead of being cut off again.
+        due_targets = sorted(
+            (
+                t
+                for t in self.targets
+                if t["device_id"] not in busy_ids and self._is_device_due(t)
+            ),
+            key=lambda t: SNMPCollector._last_poll_times.get(
+                t["device_id"], float("-inf")
+            ),
+        )
+        no_replay_ids = busy_ids | {t["device_id"] for t in due_targets}
 
         if not due_targets:
-            cached = [
-                SNMPCollector._last_results[t["device_id"]]
-                for t in self.targets
-                if t["device_id"] in SNMPCollector._last_results
-            ]
-            return {"devices": cached}
+            return {"devices": devices + self._replay_cached(no_replay_ids)}
 
-        devices = []
         workers = min(len(due_targets), MAX_WORKERS)
         batch_deadline = time.monotonic() + EXECUTOR_TIMEOUT
+        # Stamped with the agent tick's start (see _is_device_due). Before
+        # #161 a poll was stamped when it FINISHED, so a ~10s timed-out poll
+        # left the device 50s old on the next 60s tick: not due, polled
+        # every OTHER tick.
+        stamp = self._tick_time()
 
         try:
             executor = ThreadPoolExecutor(max_workers=workers)
             try:
-                futures = {
-                    executor.submit(self._poll_device, target): target
-                    for target in due_targets
-                }
-
-                for future in futures:
-                    target = futures[future]
-                    device_id = target["device_id"]
-                    remaining = max(0.1, batch_deadline - time.monotonic())
-                    result = None
+                futures = {}
+                for target in due_targets:
+                    ticket = _Ticket()
+                    accepted = False
                     try:
-                        result = future.result(timeout=remaining)
-                        devices.append(result)
-                    except FuturesTimeoutError:
-                        log(
-                            "SNMP executor timeout for device {}".format(
-                                device_id
-                            ),
-                            "error",
+                        future = executor.submit(
+                            self._poll_accepted, target, ticket
                         )
-                        devices.append(
-                            {
-                                "device_id": device_id,
-                                "error": {
-                                    "type": "timeout",
-                                    "message": "Executor timeout after {}s"
-                                    .format(EXECUTOR_TIMEOUT),
-                                },
-                            }
-                        )
+                        accepted = True
                     except Exception as e:
-                        log(
-                            "SNMP error for device {}: {}".format(
-                                device_id, e
-                            ),
-                            "error",
-                        )
-                        devices.append(
-                            {
-                                "device_id": device_id,
-                                "error": {
-                                    "type": "unknown",
-                                    "message": str(e),
-                                },
-                            }
-                        )
+                        # Out of threads (a pids limit) or memory: the rest
+                        # stay unstamped, due next tick, and the polls
+                        # already submitted are still read below.
+                        log("SNMP submit failed: {}".format(e), "error")
+                        break
+                    finally:
+                        # Whatever submit() raised: an undecided ticket would
+                        # hold its worker, and the agent's exit, forever.
+                        ticket.decide(accepted)
+                    futures[future] = target
 
-                    SNMPCollector._last_poll_times[device_id] = (
-                        time.monotonic()
+                for future, target in futures.items():
+                    device_id = target["device_id"]
+                    # Past the deadline, only a finished poll is read: waiting
+                    # 0.1s more on each pending one stretched a big batch past
+                    # the watchdog.
+                    wait(
+                        [future],
+                        timeout=max(0.0, batch_deadline - time.monotonic()),
                     )
-                    if result and result.get("error") is None:
-                        SNMPCollector._last_results[device_id] = result
+                    if future.cancel():
+                        # Still queued: it never runs. Left unstamped, the
+                        # device stays due and goes ahead of every device
+                        # polled since.
+                        self._report(
+                            devices, device_id, _executor_timeout(device_id)
+                        )
+                        continue
+                    if future.done():
+                        result = _read_poll(device_id, future)
+                    else:
+                        # Already running: it cannot be stopped, and its
+                        # answer is reported once it finishes. Dropped, the
+                        # answer of a device that always finished just past
+                        # the deadline was never counted (the server does not
+                        # count an executor timeout): it never reached
+                        # unreachable.
+                        SNMPCollector._in_flight[device_id] = (
+                            future,
+                            SNMPCollector._polling_keys.get(device_id),
+                            stamp,
+                            False,  # reported stuck
+                        )
+                        result = _executor_timeout(device_id)
+                    SNMPCollector._last_poll_times[device_id] = stamp
+                    self._report(devices, device_id, result)
             finally:
+                # Never waits on a running poll.
                 executor.shutdown(wait=False)
         except Exception as e:
             log("SNMP ThreadPoolExecutor error: {}".format(e), "error")
 
-        # Include cached results for not-yet-due devices
-        polled_ids = {t["device_id"] for t in due_targets}
-        for target in self.targets:
-            did = target["device_id"]
-            if did not in polled_ids and did in SNMPCollector._last_results:
-                devices.append(SNMPCollector._last_results[did])
+        devices.extend(self._replay_cached(no_replay_ids))
 
         return {"devices": devices}
 
+    def _poll_accepted(self, target, ticket):
+        """Poll `target` unless its submit() failed (see _Ticket)."""
+        if not ticket.wait():
+            return None
+        return self._poll_device(target)
+
+    def _report(self, devices, device_id, result):
+        """Add a poll's outcome to this tick's devices. A success is cached
+        for replay; anything else evicts the device's cached success."""
+        devices.append(result)
+        if result.get("error") is None:
+            SNMPCollector._last_results[device_id] = result
+        else:
+            SNMPCollector._last_results.pop(device_id, None)
+
+    def _replay_cached(self, no_replay_ids):
+        """Cached last successes of the devices not due this tick. A device
+        polled this tick, or with a poll in flight, is never replayed.
+
+        Copies marked "cached": true, so the server can tell a replay from
+        an answer and the marker never reaches the cache itself.
+        """
+        return [
+            dict(SNMPCollector._last_results[t["device_id"]], cached=True)
+            for t in self.targets
+            if t["device_id"] not in no_replay_ids
+            and t["device_id"] in SNMPCollector._last_results
+        ]
+
+    def _tick_time(self):
+        """The agent tick's start when known, else the current time."""
+        if self.tick_started is not None:
+            return self.tick_started
+        return time.monotonic()
+
     def _is_device_due(self, target):
-        """Check if a device is due for polling based on its interval."""
-        device_id = target["device_id"]
+        """Check if a device is due for polling based on its interval.
+
+        Polls are stamped with, and compared against, the START of the
+        agent's tick, so a device is never polled on two ticks closer than
+        its interval while its POLLING_FIELDS are unchanged. Tick starts are at least one collection interval
+        apart: a device whose interval equals the agent's is due every tick
+        however long the collectors before SNMP took, and one between two
+        ticks waits for the later. A device never polled is due at once.
+        """
+        last_poll = SNMPCollector._last_poll_times.get(target["device_id"])
+        if last_poll is None:
+            return True
         interval = target.get("interval", 60)
-        last_poll = SNMPCollector._last_poll_times.get(device_id, 0)
-        return (time.monotonic() - last_poll) >= interval
+        return self._tick_time() - last_poll >= interval
 
     def _build_base_args(self, target):
         """Build CLI args for SNMP version and authentication.
@@ -333,7 +564,11 @@ class SNMPCollector:
         port = target.get("port", 161)
         host = "{}:{}".format(ip, port) if port != 161 else ip
 
-        args = ["-t", str(SNMP_TIMEOUT), "-r", str(SNMP_RETRIES), "-On"]
+        # -On: numeric OIDs. -Oe: enumerations as bare integers, not "up(1)"
+        # (_parse_snmp_line accepts both; snmp.conf can override -Oe).
+        args = [
+            "-t", str(SNMP_TIMEOUT), "-r", str(SNMP_RETRIES), "-On", "-Oe",
+        ]
 
         if version == "v2c":
             community = target.get("community", "public")

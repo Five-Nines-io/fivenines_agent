@@ -1436,7 +1436,8 @@ sudo apk add net-snmp-tools
 1. Add SNMP devices in the fivenines dashboard (IP + credentials)
 2. The server sends `snmp_targets` to the agent via `sync_config`
 3. The agent polls devices concurrently using `snmpget`/`snmpbulkwalk`
-4. Per-device polling intervals are configurable from the dashboard
+4. Per-device polling intervals are configurable from the dashboard. The agent polls on its collection ticks (every 60s by default) and never polls a device on two ticks closer than its interval (unless its settings change, see below): at or below the agent's interval, every tick; otherwise on the first tick once the interval has elapsed (a 90s device on a 60s agent is polled every 120s)
+5. Between polls the agent re-sends the device's last successful answer, marked as cached. After a failed poll it sends nothing for the device until it has a new answer, and a device whose address, credentials or SNMP settings change is polled on the next tick, so an older answer never hides an outage
 
 ## MQTT Broker Monitoring
 
