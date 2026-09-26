@@ -1,9 +1,9 @@
 import os
 import sys
-import threading
 
 import psutil
 
+from fivenines_agent.bounded import WorkerTimeout, call_bounded
 from fivenines_agent.debug import debug, log
 from fivenines_agent.env import os_family
 
@@ -171,7 +171,7 @@ def io_topology():
 
     A device whose entry could not be read is simply absent, so the server
     falls back to its name rules for that row. None when /sys/block cannot be
-    listed, and on every non-Linux host (which has no stacked layers in `io`);
+    listed, and on every non-Linux host (the structure is read from sysfs);
     the server treats None and {} as "not reported", never as "no stacking".
 
     Read every tick, uncached: it is a few directory reads per device (~26us
@@ -179,8 +179,8 @@ def io_topology():
     without the device set changing -- a pvmove, an md member re-added -- so a
     cache keyed on the device set would serve a stale answer.
 
-    The read runs in a daemon worker bounded by TOPOLOGY_READ_TIMEOUT (the
-    libvirt-probe posture). sysfs is kernfs, answered from kernel memory, so a
+    The read runs in a daemon worker bounded by TOPOLOGY_READ_TIMEOUT
+    (bounded.call_bounded, as run_privileged and the libvirt probe). sysfs is kernfs, answered from kernel memory, so a
     wedged DISK cannot stall it; machine-wide memory pressure can -- another
     sysfs reader faulting into reclaim while holding kernfs_rwsem blocks every
     lookup behind a queued writer, for minutes (LKML, 2026-09: "kernfs: don't
@@ -200,28 +200,16 @@ def io_topology():
             return None
         _stalled_worker = None
 
-    outcome = {}
-
-    def target():
-        try:
-            outcome["value"] = _read_topology()
-        except BaseException as e:  # re-raised on the caller's thread below
-            outcome["error"] = e
-
-    worker = threading.Thread(target=target, name="io-topology", daemon=True)
-    worker.start()
-    worker.join(TOPOLOGY_READ_TIMEOUT)
-    if worker.is_alive():
-        _stalled_worker = worker
+    try:
+        return call_bounded(_read_topology, TOPOLOGY_READ_TIMEOUT, name="io-topology")
+    except WorkerTimeout as stalled:
+        _stalled_worker = stalled.worker
         log(
             f"io_topology: sysfs read blocked for {TOPOLOGY_READ_TIMEOUT}s; "
             "reporting None until it returns",
             "error",
         )
         return None
-    if "error" in outcome:
-        raise outcome["error"]
-    return outcome["value"]
 
 
 def _read_topology():

@@ -4,17 +4,21 @@
 
 Agent side is DONE (v1.20.0): `data["io_topology"]`, behind a new TOP-LEVEL
 `io_topology` config flag that nothing sends yet, so the collector is inert until
-the server enables it. The server work: copy
+the server enables it. The payload shape shipped as a PROPOSAL: the server may still
+ask for a different one before it reads the key (one more small agent release). The
+server work: copy
 `tests/fixtures/io_topology_contract_payload.json` byte-for-byte into its specs,
 send `io_topology: true` to agents >= 1.20.0, and replace the name rules in
 `IoDeviceFilter` / `Host#stacked_io_devices` with the structural answer wherever
 one is reported (count whole devices with `slaves == []` and `virtual == false`,
-see the fixture's `counting_contract`). That also retires the ingestion-time
-`dm-`/`zd` drop, the parentless-partition guess (`xvda1`) and the macOS slice
-rule for Linux hosts; absent/`null`/`{}` must keep today's name rules. Known gap,
+see the fixture's `counting_contract`, including its FALLBACK: a host whose
+predicate selects no whole device -- an OpenVZ ploop container, a diskless nbd
+boot -- keeps today's name rules rather than reading a zero total). That also
+retires the ingestion-time `dm-`/`zd` drop and the parentless-partition guess
+(`xvda1`) for Linux hosts; absent/`null`/`{}` must keep today's name rules. Known gap,
 not covered by `slaves/`: NVMe native multipath (`/sys/block/<head>/multipath/`).
 
-## P3: No collector call is bounded in wall-clock time against a kernfs stall
+## P3: Per-collector wall-clock bound against a kernfs stall (only io_topology has one)
 
 Found by the Codex review of #155. Under memory pressure a sysfs reader can fault
 into reclaim while holding `kernfs_rwsem`, and a queued writer then blocks every
@@ -24,10 +28,10 @@ The agent reads sysfs on every tick from several collectors (`network`, psutil's
 hwmon glob behind `temperatures`), all on the collection thread, so one such
 stall can outlast `WatchdogSec=90` and restart the agent. `io_topology` (#155)
 is the first to bound its own read (a single-flight worker abandoned after
-`TOPOLOGY_READ_TIMEOUT`, the libvirt-probe posture); the others are not. The
-uniform fix is a per-collector wall-clock bound in `collectors.collect_metrics`
-built on the same worker, which changes every collector's failure mode -- hence
-its own change.
+`TOPOLOGY_READ_TIMEOUT`); the others are not. The uniform fix is a per-collector
+wall-clock bound in `collectors.collect_metrics` built on `bounded.call_bounded`
+(already shared by `run_privileged`, the libvirt probe and `io_topology`), which
+changes every collector's failure mode -- hence its own change.
 
 ## Proxmox backups phase 2 -- server half tracked in fivenines_server#1164
 

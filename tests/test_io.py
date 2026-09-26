@@ -3,6 +3,7 @@
 import json
 import os
 import shutil
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -33,7 +34,9 @@ def _build_sys_block(root, model):
     Real layout: /sys/block/<name> is a symlink into /sys/devices/..., the
     device directory holds slaves/ (symlinks to the devices beneath), a `device`
     symlink for hardware-backed disks, and one subdirectory per partition with
-    a `partition` attribute. slaves=None models an unreadable slaves/.
+    a `partition` attribute. slaves=None models an unreadable slaves/. Link
+    targets use native separators: Windows CI runs this suite, and a
+    '/'-separated relative link does not resolve there.
     """
     devices = root / "devices"
     block = root / "block"
@@ -49,15 +52,17 @@ def _build_sys_block(root, model):
         if spec["slaves"] is not None:
             (disk / "slaves").mkdir()
             for slave in spec["slaves"]:
-                os.symlink(f"../../{slave}", disk / "slaves" / slave)
+                os.symlink(
+                    os.path.join(os.pardir, os.pardir, slave), disk / "slaves" / slave
+                )
         if spec["device"]:
             (devices / f"hw-{name}").mkdir()
-            os.symlink(f"../hw-{name}", disk / "device")
+            os.symlink(os.path.join(os.pardir, f"hw-{name}"), disk / "device")
         for part in spec.get("partitions", []):
             (disk / part).mkdir()
             (disk / part / "partition").write_text("1\n")
             (disk / part / "holders").mkdir()
-        os.symlink(f"../devices/{name}", block / name)
+        os.symlink(os.path.join(os.pardir, "devices", name), block / name)
     return block
 
 
@@ -224,7 +229,7 @@ def test_literal_bang_in_a_named_md_array_is_kept(tmp_path, linux):
 
 
 def test_unplaceable_names_are_left_out_never_guessed(tmp_path, linux):
-    """A '!' name /proc/diskstats holds in neither spelling is unknown: the
+    """A '!' name that no /proc/diskstats name escapes to is unknown: the
     device, its partitions and any layer listing it as a slave are left out
     (a partial slaves list would be a false claim); neighbours are kept."""
     out = _topology_of(
@@ -288,6 +293,36 @@ def test_undecodable_diskstats_byte_is_escaped_like_psutil(tmp_path, linux):
         }
 
 
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"), reason="psutil's Linux diskstats parser"
+)
+def test_topology_keys_match_psutil_for_the_same_diskstats(tmp_path, linux):
+    """The load-bearing contract, checked against psutil itself rather than a
+    hand-written expectation: fed one /proc/diskstats, io_topology keys every
+    device exactly as psutil keys the `io` rows -- a '/', a literal '!' and a
+    byte that is not valid UTF-8 included."""
+    import psutil
+
+    block = _build_sys_block(
+        tmp_path,
+        {
+            "cciss!c0d0": {"device": True, "slaves": []},
+            "md_\udc81!": {"device": False, "slaves": ["sda"]},
+            "sda": {"device": True, "slaves": []},
+        },
+    )
+    (tmp_path / "diskstats").write_bytes(
+        _diskstats_text(["sda", "cciss/c0d0"]).encode()
+        + b"   9 0 md_\x81! 1 2 3 4 5 6 7 8 0 9 10 0 0 0 0 0 0\n"
+    )
+    with patch("fivenines_agent.io.SYS_BLOCK", str(block)), patch(
+        "fivenines_agent.io.PROC_DISKSTATS", str(tmp_path / "diskstats")
+    ), patch.object(psutil, "PROCFS_PATH", str(tmp_path)):
+        topology = io_topology()
+        io_rows = psutil.disk_io_counters(perdisk=True, nowrap=False)
+    assert set(topology) == set(io_rows) == {"sda", "cciss/c0d0", "md_\udc81!"}
+
+
 def test_empty_sys_block_is_an_empty_map(tmp_path, linux):
     assert _topology_of(tmp_path, {}) == {}
 
@@ -334,7 +369,10 @@ def test_blocked_sysfs_read_is_abandoned_then_single_flight(linux):
 
         release.set()
         io_mod._stalled_worker.join(5)
-        assert io_topology() == {"sda": {"slaves": [], "virtual": False}}
+        # The resume leg is a success path: give it a real deadline, so it
+        # never depends on a fresh thread being scheduled within 50ms.
+        with patch.object(io_mod, "TOPOLOGY_READ_TIMEOUT", 5):
+            assert io_topology() == {"sda": {"slaves": [], "virtual": False}}
         assert len(calls) == 2
 
 
@@ -444,7 +482,7 @@ def test_whole_device_sorts_slaves(tmp_path):
 def test_whole_device_counts_a_dangling_device_link_as_hardware(tmp_path):
     """The link's presence is the signal (lstat), not whether it resolves."""
     block = _build_sys_block(tmp_path, {"sda": {"device": False, "slaves": []}})
-    os.symlink("../nowhere", block / "sda" / "device")
+    os.symlink(os.path.join(os.pardir, "nowhere"), block / "sda" / "device")
     assert _whole_device(str(block / "sda"), _IoNames()) == {
         "slaves": [],
         "virtual": False,
@@ -571,7 +609,7 @@ def test_contract_fixture_round_trip(name, tmp_path, linux):
     - here: each scenario's 'sysfs' is built as a real /sys/block tree and
       io_topology() must equal scenario['payload']['io_topology'];
     - fivenines-server: its collect spec posts payload['io_topology'] under
-      data['io_topology'] and asserts the I/O totals count each write once.
+      data['io_topology'] and asserts the I/O totals per counting_contract.
 
     Change the payload shape only in lockstep with the server spec and its
     byte-identical fixture copy.
