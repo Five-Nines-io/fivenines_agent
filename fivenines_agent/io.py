@@ -146,9 +146,10 @@ def _multipath_paths(path):
     blk-mq, the head through nvme_mpath_start_request -- so without this the
     head reads as a leaf and every I/O counts twice. The directory holds only
     those links, and exists since Linux 6.15 (_attach_hidden_paths covers
-    older kernels, and a path whose link was never created). ENOENT (not a head, or a kernel without the links) is [];
-    any other failure propagates, so the caller reports the device as unknown
-    rather than with a partial list.
+    older kernels, and a path whose link was never created). ENOENT (not a
+    head, or a kernel without the links) is []; any other failure propagates,
+    so the caller reports the device as unknown rather than with a partial
+    list.
     """
     try:
         return os.listdir(os.path.join(path, "multipath"))
@@ -176,14 +177,22 @@ def _attach_hidden_paths(topology, listed):
     only user). So the head is derived, not matched: no identifier can collide,
     and a head that is absent or unreadable simply gets nothing attached. Every
     listed path counts, readable entry or not, as multipath/ would list it; on
-    6.15 and later this finds the same paths multipath/ already did.
+    6.15 and later this finds the same paths multipath/ already did. A path
+    whose `hidden` cannot be read leaves its head out as unknown: the kernel
+    names only hidden paths this way, so the head's list would be partial, and
+    [] beside a live path is exactly the double count this exists to prevent.
     """
     for name, path in listed.items():
         match = _NVME_PATH_DISK.fullmatch(name)
-        if match is None or _read_attr(path, "hidden") != "1":
+        if match is None:
             continue
-        head = topology.get(f"nvme{match[1]}n{match[2]}")
-        if head is None or name in head["slaves"]:
+        head_name = f"nvme{match[1]}n{match[2]}"
+        hidden = _read_attr(path, "hidden")
+        if hidden is None:
+            topology.pop(head_name, None)
+            continue
+        head = topology.get(head_name)
+        if hidden != "1" or head is None or name in head["slaves"]:
             continue
         head["slaves"].append(name)
         head["slaves"].sort()

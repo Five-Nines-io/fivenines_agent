@@ -521,6 +521,29 @@ def test_nvme_head_before_6_15_is_derived_from_its_path_names(tmp_path, linux):
     assert out["nvme0n1"] == {"slaves": [], "virtual": False}
 
 
+def test_derivation_keeps_multi_digit_instances_and_namespaces_apart(tmp_path, linux):
+    """Ten-plus subsystems and controllers, and several namespaces per
+    subsystem (NVMe-oF arrays), are the usual native-multipath hosts: each
+    path goes to its own subsystem's own namespace head, and nowhere else."""
+    out = _topology_of(
+        tmp_path,
+        {
+            "nvme1n1": {"device": True, "slaves": []},
+            "nvme10n1": {"device": True, "slaves": []},
+            "nvme10n2": {"device": True, "slaves": []},
+            "nvme10c12n1": {"device": True, "slaves": [], "hidden": True},
+            "nvme10c3n1": {"device": True, "slaves": [], "hidden": True},
+            "nvme10c12n2": {"device": True, "slaves": [], "hidden": True},
+            "nvme10n12": {"device": True, "slaves": []},
+            "nvme10c3n12": {"device": True, "slaves": [], "hidden": True},
+        },
+    )
+    assert out["nvme10n1"]["slaves"] == ["nvme10c12n1", "nvme10c3n1"]
+    assert out["nvme10n2"]["slaves"] == ["nvme10c12n2"]
+    assert out["nvme10n12"]["slaves"] == ["nvme10c3n12"]
+    assert out["nvme1n1"]["slaves"] == []
+
+
 def test_hidden_paths_found_both_ways_are_listed_once(tmp_path, linux):
     """On 6.15+ multipath/ and the name derivation find the same paths."""
     out = _topology_of(
@@ -588,7 +611,9 @@ def test_a_path_without_its_head_attaches_nothing(model, tmp_path, linux):
     assert all(entry.get("slaves") == [] for entry in out.values())
 
 
-def test_a_path_whose_hidden_attribute_cannot_be_read_is_not_attached(tmp_path, linux):
+def test_a_path_whose_hidden_attribute_cannot_be_read_leaves_its_head_out(
+    tmp_path, linux
+):
     block = _build_sys_block(
         tmp_path,
         {
@@ -598,7 +623,9 @@ def test_a_path_whose_hidden_attribute_cannot_be_read_is_not_attached(tmp_path, 
     )
     os.unlink(tmp_path / "devices" / "nvme0c0n1" / "hidden")
     with patch("fivenines_agent.io.SYS_BLOCK", str(block)):
-        assert io_topology()["nvme0n1"] == {"slaves": [], "virtual": False}
+        out = io_topology()
+    # The head's list cannot be established: unknown, never [] beside a path.
+    assert out == {"nvme0c0n1": {"slaves": [], "virtual": False}}
 
 
 def test_hidden_is_read_only_for_path_shaped_names(tmp_path, linux):
