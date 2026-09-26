@@ -21,12 +21,13 @@ into reclaim while holding `kernfs_rwsem`, and a queued writer then blocks every
 other sysfs lookup behind it -- 120-second stalls reported upstream (LKML
 2026-09, Shakeel Butt, "kernfs: don't hold kernfs_rwsem across dir_emit()").
 The agent reads sysfs on every tick from several collectors (`network`, psutil's
-hwmon glob behind `temperatures`, `io_topology`), all on the collection thread,
-so one such stall can outlast `WatchdogSec=90` and restart the agent. Bounding
-one collector would not bound the tick, since the earlier ones stall first; the
+hwmon glob behind `temperatures`), all on the collection thread, so one such
+stall can outlast `WatchdogSec=90` and restart the agent. `io_topology` (#155)
+is the first to bound its own read (a single-flight worker abandoned after
+`TOPOLOGY_READ_TIMEOUT`, the libvirt-probe posture); the others are not. The
 uniform fix is a per-collector wall-clock bound in `collectors.collect_metrics`
-(the `run_privileged` posture: run in a worker, abandon it, report `None`).
-Not done in #155 because it changes every collector's failure mode.
+built on the same worker, which changes every collector's failure mode -- hence
+its own change.
 
 ## Proxmox backups phase 2 -- server half tracked in fivenines_server#1164
 

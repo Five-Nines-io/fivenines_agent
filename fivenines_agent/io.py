@@ -1,8 +1,9 @@
 import os
+import threading
 
 import psutil
 
-from fivenines_agent.debug import debug
+from fivenines_agent.debug import debug, log
 from fivenines_agent.env import os_family
 
 # Every whole block device the kernel knows about has an entry here (a symlink
@@ -10,6 +11,16 @@ from fivenines_agent.env import os_family
 # inside its disk's entry (/sys/block/sda/sda1/), which is the structural
 # "is this a partition" signal, with no name rule involved.
 SYS_BLOCK = "/sys/block"
+
+# Wall-clock bound on one topology read, on the watchdog-bounded collection
+# loop. A healthy read is well under 1ms here and ~10ms for 400 devices; this
+# only ever fires on a stalled sysfs (see io_topology).
+TOPOLOGY_READ_TIMEOUT = 5
+
+# The worker of a read that outlived TOPOLOGY_READ_TIMEOUT, while it is still
+# blocked. Single-flight: no new read starts until it returns, so a sysfs stall
+# costs one leaked thread, not one per tick.
+_stalled_worker = None
 
 
 @debug("io")
@@ -122,18 +133,55 @@ def io_topology():
     Read every tick, uncached: it is a few directory reads per device (~26us
     measured, so ~10ms for a 400-device hypervisor), and membership changes
     without the device set changing -- a pvmove, an md member re-added -- so a
-    cache keyed on the device set would serve a stale answer. No deadline of
-    its own either: sysfs is kernfs, answered from kernel memory without
-    touching the device, so a wedged disk cannot stall these reads. What can
-    is machine-wide memory pressure -- another sysfs reader faulting into
-    reclaim while it holds kernfs_rwsem blocks every sysfs lookup behind a
-    queued writer (LKML, 2026-09: "kernfs: don't hold kernfs_rwsem across
-    dir_emit()") -- and that stalls the network and temperatures collectors,
-    which run earlier in the same tick, just as much. A bound belongs on the
-    collection loop, not on one sysfs reader (TODOS.md).
+    cache keyed on the device set would serve a stale answer.
+
+    The read runs in a daemon worker bounded by TOPOLOGY_READ_TIMEOUT (the
+    libvirt-probe posture). sysfs is kernfs, answered from kernel memory, so a
+    wedged DISK cannot stall it; machine-wide memory pressure can -- another
+    sysfs reader faulting into reclaim while holding kernfs_rwsem blocks every
+    lookup behind a queued writer, for minutes (LKML, 2026-09: "kernfs: don't
+    hold kernfs_rwsem across dir_emit()"), past WatchdogSec=90. A read that
+    times out reports None and is abandoned; until it returns, later ticks
+    report None without starting another.
     """
+    global _stalled_worker
     if os_family() != "linux":
         return None
+    if _stalled_worker is not None:
+        if _stalled_worker.is_alive():
+            log(
+                "io_topology: previous sysfs read still blocked; reporting None",
+                "debug",
+            )
+            return None
+        _stalled_worker = None
+
+    outcome = {}
+
+    def target():
+        try:
+            outcome["value"] = _read_topology()
+        except BaseException as e:  # re-raised on the caller's thread below
+            outcome["error"] = e
+
+    worker = threading.Thread(target=target, name="io-topology", daemon=True)
+    worker.start()
+    worker.join(TOPOLOGY_READ_TIMEOUT)
+    if worker.is_alive():
+        _stalled_worker = worker
+        log(
+            f"io_topology: sysfs read blocked for {TOPOLOGY_READ_TIMEOUT}s; "
+            "reporting None until it returns",
+            "error",
+        )
+        return None
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["value"]
+
+
+def _read_topology():
+    """The sysfs walk itself; see io_topology() for the shape."""
     try:
         disks = os.listdir(SYS_BLOCK)
     except OSError:

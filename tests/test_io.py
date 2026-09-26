@@ -3,6 +3,8 @@
 import json
 import os
 import shutil
+import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -56,6 +58,13 @@ def _build_sys_block(root, model):
             (disk / part / "holders").mkdir()
         os.symlink(f"../devices/{name}", block / name)
     return block
+
+
+@pytest.fixture(autouse=True)
+def _no_stalled_worker():
+    io_mod._stalled_worker = None
+    yield
+    io_mod._stalled_worker = None
 
 
 @pytest.fixture
@@ -197,6 +206,46 @@ def test_non_linux_is_none_without_touching_the_filesystem(family):
     ) as listdir:
         assert io_topology() is None
     listdir.assert_not_called()
+
+
+# --- the wall-clock bound ------------------------------------------------
+
+
+def test_blocked_sysfs_read_is_abandoned_then_single_flight(linux):
+    """A kernfs stall must not hold the watchdog-bounded loop: the tick gets
+    None at the deadline, later ticks do not pile up workers behind the stuck
+    one, and collection resumes once it returns."""
+    release = threading.Event()
+    calls = []
+
+    def blocked_read():
+        calls.append(1)
+        # Bounded, so a missing join timeout FAILS the test instead of hanging it.
+        release.wait(5)
+        return {"sda": {"slaves": [], "virtual": False}}
+
+    with patch.object(io_mod, "TOPOLOGY_READ_TIMEOUT", 0.05), patch.object(
+        io_mod, "_read_topology", side_effect=blocked_read
+    ):
+        start = time.monotonic()
+        assert io_topology() is None
+        assert time.monotonic() - start < 1
+
+        assert io_topology() is None
+        assert len(calls) == 1
+
+        release.set()
+        io_mod._stalled_worker.join(5)
+        assert io_topology() == {"sda": {"slaves": [], "virtual": False}}
+        assert len(calls) == 2
+
+
+def test_walk_errors_surface_on_the_callers_thread(linux):
+    """The dispatcher's telemetry records a collector error only if it is
+    raised where the dispatcher can see it."""
+    with patch.object(io_mod, "_read_topology", side_effect=RuntimeError("boom")):
+        with pytest.raises(RuntimeError, match="boom"):
+            io_topology()
 
 
 # --- helpers --------------------------------------------------------------
