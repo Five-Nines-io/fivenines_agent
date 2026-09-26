@@ -1439,16 +1439,19 @@ jobs:
       # this job holds the R2 write credentials and the release signing key,
       # and a root shell running whatever a URL serves today could read both.
       # The digest is from rclone's PGP-signed SHA256SUMS for this version.
+      # Never name these RCLONE_*: rclone reads every RCLONE_<FLAG> variable as
+      # that command-line flag, so RCLONE_VERSION became `--version=v1.75.1`
+      # and `rclone version` aborted -- which stopped the v1.19.1 R2 sync.
       - name: Install rclone
         env:
-          RCLONE_VERSION: 'v1.75.1'
-          RCLONE_SHA256: '982b5aa772841168f8e380f139e9e787b2a105403e32b94da8676a0e1c0a13ab'
+          PINNED_RCLONE_VERSION: 'v1.75.1'
+          PINNED_RCLONE_SHA256: '982b5aa772841168f8e380f139e9e787b2a105403e32b94da8676a0e1c0a13ab'
         run: |
-          ZIP="rclone-${RCLONE_VERSION}-linux-amd64.zip"
-          curl -fsSL -o "$RUNNER_TEMP/$ZIP" "https://downloads.rclone.org/${RCLONE_VERSION}/${ZIP}"
-          echo "${RCLONE_SHA256}  $RUNNER_TEMP/$ZIP" | sha256sum -c -
+          ZIP="rclone-${PINNED_RCLONE_VERSION}-linux-amd64.zip"
+          curl -fsSL -o "$RUNNER_TEMP/$ZIP" "https://downloads.rclone.org/${PINNED_RCLONE_VERSION}/${ZIP}"
+          echo "${PINNED_RCLONE_SHA256}  $RUNNER_TEMP/$ZIP" | sha256sum -c -
           unzip -q "$RUNNER_TEMP/$ZIP" -d "$RUNNER_TEMP"
-          sudo install -m 0755 "$RUNNER_TEMP/rclone-${RCLONE_VERSION}-linux-amd64/rclone" /usr/local/bin/rclone
+          sudo install -m 0755 "$RUNNER_TEMP/rclone-${PINNED_RCLONE_VERSION}-linux-amd64/rclone" /usr/local/bin/rclone
           rclone version
 
       - name: Configure rclone for R2
