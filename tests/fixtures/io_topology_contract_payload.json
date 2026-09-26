@@ -1,0 +1,182 @@
+{
+  "description": "Shared block-device topology contract fixture between fivenines-agent and fivenines-server (agent issue #155). Source of truth: fivenines-agent tests/fixtures/io_topology_contract_payload.json, asserted end-to-end by tests/test_io.py::test_contract_fixture_round_trip -- each scenario's 'sysfs' is materialized as a real directory tree (whole devices as /sys/block/<name> symlinks, partitions as subdirectories carrying a `partition` file, slaves/ and multipath/ as symlinks, `device` as a symlink, `hidden` as an attribute file) and io_topology() must equal scenario['payload']['io_topology']. The server ingests data['io_topology'] == payload['io_topology'] BESIDE data['io'] from the same tick; it is a separate, top-level config flag (config['io_topology'] = true, a plain boolean). 'sysfs' is an agent-side input the server ignores. Change the payload shape only in lockstep with the server spec and its byte-identical fixture copy.",
+  "agent_min_version": "1.20.0",
+  "_agent_min_version_note": "MINOR on the 1.x train: a new collector. Gate the config flag on it (older agents ignore the unknown key, so an ungated flag is harmless, just inert).",
+  "null_contract": "data['io_topology'] ABSENT (an older agent, or the flag off), null (a non-Linux host, /sys/block could not be listed, or the sysfs read stalled past the agent's 5s bound -- then null on every tick until that read returns) and {} (no entry could be read or placed) all mean NOT REPORTED: the server keeps its current name rules for every io row. None of them means 'no stacking'.",
+  "entry_contract": "Keys are device names spelled exactly as the `io` rows spell them (/proc/diskstats names). sysfs writes '/' as '!' (cciss!c0d0), but a '!' can also be literal (md takes any md_* array name verbatim), so the agent escapes each /proc/diskstats name the way the kernel does ('/' -> '!') and looks the sysfs name up by that: cciss!c0d0 is reported as 'cciss/c0d0', md_data! stays 'md_data!', md_a!b! is 'md_a/b!'. A name no diskstats name escapes to (or one two of them escape to) is left out, along with any layer that lists it as a slave. Every entry has exactly one of two shapes. WHOLE DEVICE: {'slaves': [names], 'virtual': bool} -- slaves are the devices it is stacked on, read from /sys/block/<dev>/slaves/ plus, for an NVMe native-multipath head, its hidden per-path disks (from /sys/block/<dev>/multipath/ on Linux 6.15+; on any kernel also derived from the kernel's own naming, a hidden path nvme{S}c{C}n{H} belonging to the head nvme{S}n{H}) -- sorted; they may be partitions such as 'sda1' or other layers such as 'md0', and need not appear in `io`; [] means nothing beneath it, and is only ever reported from a successful read. virtual is true when the device has no `device` link, i.e. its driver registered it with no parent device (md, dm, bcache, drbd, loop, brd/ram, zram, nbd, zvol). It describes the driver model, not the hardware: a paravirtual disk (virtio vda, Xen xvda) is NOT virtual, and neither is Ceph RBD (rbd*), whose parent is its rbd bus device. PARTITION: {'partition_of': '<whole device>'} -- decided structurally (a directory nested in its disk's sysfs entry), never by name. A device that appears in `io` with NO entry is UNKNOWN for that row only (its sysfs entry could not be read, its name could not be placed, or it was removed mid-read): fall back to the name rules for it, do not treat it as a leaf. UNTRUSTED STRINGS: every key, every slaves[] element and every partition_of value is a host-controlled device name (local root can name an md array almost anything); run all three through the same name gate as the `io` keys, and escape them before building any PromQL matcher.",
+  "counting_contract": "Compute each device's RATE from its own counters first and classify after: a device's class can change between ticks (an entry left out for one tick falls back to name rules, a stalled read makes the whole map null, a multipath head that loses its last path becomes a leaf), so summing raw cumulative counters over the counted set and then differencing would spike by a device's lifetime bytes on every change. To sum host I/O without counting one write at every layer: count whole devices with slaves == [] and virtual == false (the bottom of this host's stack). That total is PHYSICAL DEVICE TRAFFIC, not unique application writes: a RAID1 write is counted twice because two disks really take it, and a bcache write-back lands on both the cache and the backing device. It is the figure the server's current mdraid workaround already reports (array dropped, members kept). Logical I/O -- the tops of the stacks -- is a different figure, and this map does NOT fully support it: it has edges for md, dm (LVM, LUKS, multipath), bcache and partitions, but none from a zvol to its pool's vdevs, from a loop device to the disk holding its file, or from an RBD image to the OSDs, so summing the tops would count those twice. A device with non-empty slaves is a LAYER whose I/O is already counted on the devices it names. A partition's I/O is already counted on partition_of. A virtual device with no slaves (zd*, loop*, zram*, ram*, nbd*) sits on something the kernel does not model as a block device -- a ZFS pool whose vdevs are already counted, a file, RAM, the network -- so it is not physical I/O either; that is the structural form of today's zd/loop/ram/zram noise rule. EXCEPTION, and the one leaf this predicate cannot place: Ceph RBD (rbd*) reads slaves == [] and virtual == false, so it IS counted, although its I/O is network traffic to the Ceph cluster -- and on a hyperconverged host whose OSDs are local disks, the same write is recorded again at those disks, which slaves/ does not express. If RBD must be excluded, that stays a name rule (see scenario 'ceph_rbd_client'). The same holds for iSCSI and NVMe-oF disks: remote storage with a device link, counted as this host's I/O. FALLBACK: if the predicate selects NO whole device while `io` has rows, the host's storage bottoms out in a virtual leaf -- an OpenVZ/Virtuozzo container sees only its ploop device, a diskless host boots from nbd -- and a zero total would be wrong: use today's name rules for that tick (scenario 'openvz_ploop_container'). NVMe native multipath: the head (nvme0n1) and its hidden path disks (nvme0c0n1, ...) are all in /proc/diskstats with the same I/O, and the head lists its paths as slaves, so it is a layer like a dm-multipath map and the paths are the counted leaves (scenario 'nvme_native_multipath'). Before Linux 6.15 there are no multipath/ links; the head is then derived from the path's name, which the kernel builds from the subsystem and head instances it allocates itself (scenario 'nvme_native_multipath_before_6_15'), so the payload is the same. Under the default nvme_core settings an NVMe subsystem that does not advertise multi-controller support (CMIC) has no head: a plain leaf (nvme_core.multipath_always_on gives every namespace one, handled the same way). A path whose head is not reported (not live yet under ANA, or its entry unreadable) is attached to nothing and stays a counted leaf; a path still present whose `hidden` attribute cannot be read leaves its head out for that tick (unknown) rather than reporting [] beside it, unless multipath/ already lists it; a path hot-removed mid-walk is still listed under its head, since its `io` row was collected that tick. An unknown head is honest data, not a correct count: the name-rule fallback counts nvme{S}n{H} as a disk too. A server that wants that fallback exact can treat nvme{S}n{H} as a layer whenever a row nvme{S}c{C}n{H} is reported -- the kernel's own naming, the same relation the agent uses.",
+  "scenarios": {
+    "mdraid_luks_lvm": {
+      "description": "RAID1 boot + RAID1 data under LUKS under LVM, the classic double-count: one write lands on dm-1, dm-0, md1 and both members. Only sda and sdb are counted; loop0 (a snap) is virtual with no slaves.",
+      "sysfs": {
+        "sda": {"device": true, "slaves": [], "partitions": ["sda1", "sda2"]},
+        "sdb": {"device": true, "slaves": [], "partitions": ["sdb1", "sdb2"]},
+        "md0": {"device": false, "slaves": ["sda1", "sdb1"], "partitions": []},
+        "md1": {"device": false, "slaves": ["sdb2", "sda2"], "partitions": []},
+        "dm-0": {"device": false, "slaves": ["md1"], "partitions": []},
+        "dm-1": {"device": false, "slaves": ["dm-0"], "partitions": []},
+        "loop0": {"device": false, "slaves": [], "partitions": []}
+      },
+      "payload": {
+        "io_topology": {
+          "dm-0": {"slaves": ["md1"], "virtual": true},
+          "dm-1": {"slaves": ["dm-0"], "virtual": true},
+          "loop0": {"slaves": [], "virtual": true},
+          "md0": {"slaves": ["sda1", "sdb1"], "virtual": true},
+          "md1": {"slaves": ["sda2", "sdb2"], "virtual": true},
+          "sda": {"slaves": [], "virtual": false},
+          "sda1": {"partition_of": "sda"},
+          "sda2": {"partition_of": "sda"},
+          "sdb": {"slaves": [], "virtual": false},
+          "sdb1": {"partition_of": "sdb"},
+          "sdb2": {"partition_of": "sdb"}
+        }
+      }
+    },
+    "zfs_hypervisor": {
+      "description": "Proxmox on ZFS: the pool's vdevs are NVMe partitions, every VM disk is a zvol (virtual, no slaves) with its own partition table, and an md0p1 is a kernel partition of an md array. Only nvme0n1 and nvme1n1 are counted.",
+      "sysfs": {
+        "nvme0n1": {"device": true, "slaves": [], "partitions": ["nvme0n1p1", "nvme0n1p9"]},
+        "nvme1n1": {"device": true, "slaves": [], "partitions": ["nvme1n1p1", "nvme1n1p9"]},
+        "zd0": {"device": false, "slaves": [], "partitions": ["zd0p1", "zd0p2"]},
+        "zd16": {"device": false, "slaves": [], "partitions": []},
+        "md0": {"device": false, "slaves": ["nvme0n1p9", "nvme1n1p9"], "partitions": ["md0p1"]}
+      },
+      "payload": {
+        "io_topology": {
+          "md0": {"slaves": ["nvme0n1p9", "nvme1n1p9"], "virtual": true},
+          "md0p1": {"partition_of": "md0"},
+          "nvme0n1": {"slaves": [], "virtual": false},
+          "nvme0n1p1": {"partition_of": "nvme0n1"},
+          "nvme0n1p9": {"partition_of": "nvme0n1"},
+          "nvme1n1": {"slaves": [], "virtual": false},
+          "nvme1n1p1": {"partition_of": "nvme1n1"},
+          "nvme1n1p9": {"partition_of": "nvme1n1"},
+          "zd0": {"slaves": [], "virtual": true},
+          "zd0p1": {"partition_of": "zd0"},
+          "zd0p2": {"partition_of": "zd0"},
+          "zd16": {"slaves": [], "virtual": true}
+        }
+      }
+    },
+    "bcache_and_multipath": {
+      "description": "bcache0 caches sdd on an NVMe partition, and BOTH appear in its slaves/: the backing device is linked on register (drivers/md/bcache/super.c, bd_link_disk_holder(dc->bdev, ...)) and the cache device when the bcache device attaches to its cache set (bcache_device_link(), bd_link_disk_holder(ca->bdev, ...)); a bcache device with no cache set attached lists only its backing device. dm-0 is a multipath map over two paths (sdb, sdc) to one LUN. Neither layer is visible by name. Counted: nvme0n1, sdb, sdc, sdd -- each I/O takes one path, so the two paths do not double-count each other.",
+      "sysfs": {
+        "nvme0n1": {"device": true, "slaves": [], "partitions": ["nvme0n1p1", "nvme0n1p2"]},
+        "sdb": {"device": true, "slaves": [], "partitions": []},
+        "sdc": {"device": true, "slaves": [], "partitions": []},
+        "sdd": {"device": true, "slaves": [], "partitions": []},
+        "bcache0": {"device": false, "slaves": ["sdd", "nvme0n1p2"], "partitions": []},
+        "dm-0": {"device": false, "slaves": ["sdc", "sdb"], "partitions": []}
+      },
+      "payload": {
+        "io_topology": {
+          "bcache0": {"slaves": ["nvme0n1p2", "sdd"], "virtual": true},
+          "dm-0": {"slaves": ["sdb", "sdc"], "virtual": true},
+          "nvme0n1": {"slaves": [], "virtual": false},
+          "nvme0n1p1": {"partition_of": "nvme0n1"},
+          "nvme0n1p2": {"partition_of": "nvme0n1"},
+          "sdb": {"slaves": [], "virtual": false},
+          "sdc": {"slaves": [], "virtual": false},
+          "sdd": {"slaves": [], "virtual": false}
+        }
+      }
+    },
+    "nvme_native_multipath": {
+      "description": "Linux 6.15+: a dual-ported NVMe namespace under native multipath. The head nvme0n1 links its two hidden path disks from multipath/ (not slaves/), and all three rows carry the same I/O in /proc/diskstats. The head reads as a layer over its paths, so only the two paths are counted -- each I/O takes one path. The head's partition belongs to the head.",
+      "sysfs": {
+        "nvme0n1": {"device": true, "slaves": [], "multipath": ["nvme0c1n1", "nvme0c0n1"], "partitions": ["nvme0n1p1"]},
+        "nvme0c0n1": {"device": true, "slaves": [], "hidden": true, "partitions": []},
+        "nvme0c1n1": {"device": true, "slaves": [], "hidden": true, "partitions": []}
+      },
+      "payload": {
+        "io_topology": {
+          "nvme0c0n1": {"slaves": [], "virtual": false},
+          "nvme0c1n1": {"slaves": [], "virtual": false},
+          "nvme0n1": {"slaves": ["nvme0c0n1", "nvme0c1n1"], "virtual": false},
+          "nvme0n1p1": {"partition_of": "nvme0n1"}
+        }
+      }
+    },
+    "nvme_native_multipath_before_6_15": {
+      "description": "The same topology on a kernel older than 6.15 (Ubuntu 24.04's 6.8, Debian 13 / RHEL 10's 6.12): no multipath/ links. The path disks are hidden (`hidden` reads 1) and named nvme0c{C}n1 by the kernel, so each belongs to the head nvme0n1 -- the payload is the same as with the links. nvme1n1 is an NVMe whose subsystem does not advertise multi-controller support: no head, not hidden, a plain leaf.",
+      "sysfs": {
+        "nvme0n1": {"device": true, "slaves": [], "partitions": ["nvme0n1p1"]},
+        "nvme0c0n1": {"device": true, "slaves": [], "hidden": true, "partitions": []},
+        "nvme0c1n1": {"device": true, "slaves": [], "hidden": true, "partitions": []},
+        "nvme1n1": {"device": true, "slaves": [], "partitions": []}
+      },
+      "payload": {
+        "io_topology": {
+          "nvme0c0n1": {"slaves": [], "virtual": false},
+          "nvme0c1n1": {"slaves": [], "virtual": false},
+          "nvme0n1": {"slaves": ["nvme0c0n1", "nvme0c1n1"], "virtual": false},
+          "nvme0n1p1": {"partition_of": "nvme0n1"},
+          "nvme1n1": {"slaves": [], "virtual": false}
+        }
+      }
+    },
+    "xen_pv_whole_disk_named_like_a_partition": {
+      "description": "A Xen PV guest attached as xvda1/xvda2 with no xvda: both are WHOLE devices (top-level /sys/block entries with a device link), whatever the names suggest. Both are counted.",
+      "sysfs": {
+        "xvda1": {"device": true, "slaves": [], "partitions": []},
+        "xvda2": {"device": true, "slaves": [], "partitions": []}
+      },
+      "payload": {
+        "io_topology": {
+          "xvda1": {"slaves": [], "virtual": false},
+          "xvda2": {"slaves": [], "virtual": false}
+        }
+      }
+    },
+    "ceph_rbd_client": {
+      "description": "A Proxmox/Ceph client mapping two RBD images: rbd0/rbd1 have a device link (their parent is the rbd bus device), so they read virtual: false with no slaves, exactly like the local disk. rbd0p1 is a kernel partition of rbd0. By the counting predicate all three whole devices are counted; see counting_contract for why rbd is the exception a structural signal cannot place.",
+      "sysfs": {
+        "sda": {"device": true, "slaves": [], "partitions": ["sda1"]},
+        "rbd0": {"device": true, "slaves": [], "partitions": ["rbd0p1"]},
+        "rbd1": {"device": true, "slaves": [], "partitions": []}
+      },
+      "payload": {
+        "io_topology": {
+          "rbd0": {"slaves": [], "virtual": false},
+          "rbd0p1": {"partition_of": "rbd0"},
+          "rbd1": {"slaves": [], "virtual": false},
+          "sda": {"slaves": [], "virtual": false},
+          "sda1": {"partition_of": "sda"}
+        }
+      }
+    },
+    "openvz_ploop_container": {
+      "description": "An OpenVZ/Virtuozzo container: its only disk is a ploop device, which the kernel builds itself (no device link, no slaves), with one partition. The counting predicate selects nothing here, so the server must apply counting_contract's FALLBACK (today's name rules), never report a zero total.",
+      "sysfs": {
+        "ploop19045": {"device": false, "slaves": [], "partitions": ["ploop19045p1"]}
+      },
+      "payload": {
+        "io_topology": {
+          "ploop19045": {"slaves": [], "virtual": true},
+          "ploop19045p1": {"partition_of": "ploop19045"}
+        }
+      }
+    },
+    "device_unreadable": {
+      "description": "dm-0's slaves/ could not be read (here: the device was torn down between the /sys/block listing and the read). It is left OUT -- never reported as a slaves: [] leaf -- so the server falls back to its name rules for that one row. Its neighbours are unaffected.",
+      "sysfs": {
+        "sda": {"device": true, "slaves": [], "partitions": ["sda1"]},
+        "dm-0": {"device": false, "slaves": null, "partitions": []}
+      },
+      "payload": {
+        "io_topology": {
+          "sda": {"slaves": [], "virtual": false},
+          "sda1": {"partition_of": "sda"}
+        }
+      }
+    },
+    "collection_failure": {
+      "description": "/sys/block could not be listed. null: not reported, the same as an absent key.",
+      "sysfs": null,
+      "payload": {
+        "io_topology": null
+      }
+    }
+  }
+}
