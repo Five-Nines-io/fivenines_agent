@@ -42,13 +42,16 @@ def _whole_device(path):
     only ever reported from a successful read; an unreadable directory is None,
     which leaves the device out of the topology rather than calling it a leaf.
 
-    virtual is sysstat's definition: no `device` link, i.e. no device in the
-    driver model beneath this one -- the kernel built it (md, dm, bcache, loop,
-    zram, zvol, nbd, rbd). That is what separates a real disk from a zvol or a
-    loop device, which have no slaves either: their I/O lands on something the
-    kernel does not model as a block device (a ZFS pool, a file, RAM, the
-    network). A paravirtual disk (virtio vda, Xen xvda) HAS a device link and
-    is not virtual here: it is the bottom of this host's stack.
+    virtual is sysstat's definition: no `device` link, i.e. the driver
+    registered the disk with no parent device (add_disk() rather than
+    device_add_disk(parent, ...)): md, dm, bcache, drbd, loop, brd, zram, nbd,
+    zvol. That is what separates a real disk from a zvol or a loop device,
+    which have no slaves either: their I/O lands on something the kernel does
+    not model as a block device (a ZFS pool, a file, RAM, the network). It is a
+    statement about the driver model, not about hardware: a paravirtual disk
+    (virtio vda, Xen xvda) has a parent and is not virtual -- it is the bottom
+    of this host's stack -- and neither is Ceph RBD, whose parent is its rbd
+    bus device even though every byte goes over the network.
     """
     try:
         slaves = os.listdir(os.path.join(path, "slaves"))
@@ -113,7 +116,10 @@ def io_topology():
     Read every tick, uncached: it is a few directory reads per device (~26us
     measured, so ~10ms for a 400-device hypervisor), and membership changes
     without the device set changing -- a pvmove, an md member re-added -- so a
-    cache keyed on the device set would serve a stale answer.
+    cache keyed on the device set would serve a stale answer. No deadline
+    either, unlike the collectors that talk to a daemon: sysfs is kernfs,
+    answered from kernel memory without touching the device, so a wedged disk
+    cannot stall these reads and the cost is linear in the device count.
     """
     if os_family() != "linux":
         return None

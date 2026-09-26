@@ -3,8 +3,8 @@
   "agent_min_version": "1.20.0",
   "_agent_min_version_note": "MINOR on the 1.x train: a new collector. Gate the config flag on it (older agents ignore the unknown key, so an ungated flag is harmless, just inert).",
   "null_contract": "data['io_topology'] ABSENT (an older agent, or the flag off), null (a non-Linux host, or /sys/block could not be listed) and {} (/sys/block listed nothing) all mean NOT REPORTED: the server keeps its current name rules for every io row. None of them means 'no stacking'.",
-  "entry_contract": "Keys are device names spelled exactly as the `io` rows spell them (/proc/diskstats names; sysfs writes '/' as '!', and the agent maps it back, so cciss!c0d0 is reported as 'cciss/c0d0'). Every entry has exactly one of two shapes. WHOLE DEVICE: {'slaves': [names], 'virtual': bool} -- slaves are the devices it is stacked on (sorted; they may be partitions such as 'sda1' or other layers such as 'md0', and need not appear in `io`); [] means nothing beneath it, and is only ever reported from a successful read. virtual is true when the device has no `device` link, i.e. the kernel built it (md, dm, bcache, loop, zram, zvol, nbd, rbd); a paravirtual disk (virtio vda, Xen xvda) is NOT virtual. PARTITION: {'partition_of': '<whole device>'} -- decided structurally (a directory nested in its disk's sysfs entry), never by name. A device that appears in `io` with NO entry is UNKNOWN for that row only (its sysfs entry could not be read): fall back to the name rules for it, do not treat it as a leaf.",
-  "counting_contract": "To sum host I/O without counting one write at every layer: count whole devices with slaves == [] and virtual == false (the bottom of this host's stack). A device with non-empty slaves is a LAYER whose I/O is already counted on the devices it names. A partition's I/O is already counted on partition_of. A virtual device with no slaves (zd*, loop*, zram*, ram*, nbd*, rbd*) sits on something the kernel does not model as a block device -- a ZFS pool whose vdevs are already counted, a file, RAM, the network -- so it is not physical I/O either; that is the structural form of today's zd/loop/ram/zram noise rule. KNOWN GAP: NVMe native multipath links a head node to its paths through /sys/block/<head>/multipath/, not slaves/, so it is not expressed here.",
+  "entry_contract": "Keys are device names spelled exactly as the `io` rows spell them (/proc/diskstats names; sysfs writes '/' as '!', and the agent maps it back, so cciss!c0d0 is reported as 'cciss/c0d0'). Every entry has exactly one of two shapes. WHOLE DEVICE: {'slaves': [names], 'virtual': bool} -- slaves are the devices it is stacked on (sorted; they may be partitions such as 'sda1' or other layers such as 'md0', and need not appear in `io`); [] means nothing beneath it, and is only ever reported from a successful read. virtual is true when the device has no `device` link, i.e. its driver registered it with no parent device (md, dm, bcache, drbd, loop, brd/ram, zram, nbd, zvol). It describes the driver model, not the hardware: a paravirtual disk (virtio vda, Xen xvda) is NOT virtual, and neither is Ceph RBD (rbd*), whose parent is its rbd bus device. PARTITION: {'partition_of': '<whole device>'} -- decided structurally (a directory nested in its disk's sysfs entry), never by name. A device that appears in `io` with NO entry is UNKNOWN for that row only (its sysfs entry could not be read): fall back to the name rules for it, do not treat it as a leaf.",
+  "counting_contract": "To sum host I/O without counting one write at every layer: count whole devices with slaves == [] and virtual == false (the bottom of this host's stack). A device with non-empty slaves is a LAYER whose I/O is already counted on the devices it names. A partition's I/O is already counted on partition_of. A virtual device with no slaves (zd*, loop*, zram*, ram*, nbd*) sits on something the kernel does not model as a block device -- a ZFS pool whose vdevs are already counted, a file, RAM, the network -- so it is not physical I/O either; that is the structural form of today's zd/loop/ram/zram noise rule. EXCEPTION, and the one leaf this predicate cannot place: Ceph RBD (rbd*) reads slaves == [] and virtual == false, so it IS counted, although its I/O is network traffic to the Ceph cluster -- and on a hyperconverged host whose OSDs are local disks, the same write is recorded again at those disks, which slaves/ does not express. If RBD must be excluded, that stays a name rule (see scenario 'ceph_rbd_client'). KNOWN GAP: NVMe native multipath links a head node to its paths through /sys/block/<head>/multipath/, not slaves/, so it is not expressed here.",
   "scenarios": {
     "mdraid_luks_lvm": {
       "description": "RAID1 boot + RAID1 data under LUKS under LVM, the classic double-count: one write lands on dm-1, dm-0, md1 and both members. Only sda and sdb are counted; loop0 (a snap) is virtual with no slaves.",
@@ -92,6 +92,23 @@
         "io_topology": {
           "xvda1": {"slaves": [], "virtual": false},
           "xvda2": {"slaves": [], "virtual": false}
+        }
+      }
+    },
+    "ceph_rbd_client": {
+      "description": "A Proxmox/Ceph client mapping two RBD images: rbd0/rbd1 have a device link (their parent is the rbd bus device), so they read virtual: false with no slaves, exactly like the local disk. rbd0p1 is a kernel partition of rbd0. By the counting predicate all three whole devices are counted; see counting_contract for why rbd is the exception a structural signal cannot place.",
+      "sysfs": {
+        "sda": {"device": true, "slaves": [], "partitions": ["sda1"]},
+        "rbd0": {"device": true, "slaves": [], "partitions": ["rbd0p1"]},
+        "rbd1": {"device": true, "slaves": [], "partitions": []}
+      },
+      "payload": {
+        "io_topology": {
+          "rbd0": {"slaves": [], "virtual": false},
+          "rbd0p1": {"partition_of": "rbd0"},
+          "rbd1": {"slaves": [], "virtual": false},
+          "sda": {"slaves": [], "virtual": false},
+          "sda1": {"partition_of": "sda"}
         }
       }
     },

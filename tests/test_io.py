@@ -267,11 +267,32 @@ def test_partitions_empty_when_disk_directory_unreadable(tmp_path):
 # --- registry dispatch ----------------------------------------------------
 
 
-def test_registered_under_its_own_top_level_flag():
-    """config["io_topology"] is a plain boolean, never splatted as kwargs."""
+def test_registered_under_its_own_top_level_flag(tmp_path, linux):
+    """config["io_topology"] is a plain boolean, never splatted as kwargs.
+
+    A dict value must still collect: splatting it would raise TypeError, which
+    the dispatcher turns into None -- so the assertion is on a real, non-empty
+    topology and on a telemetry entry with no errors, never on None.
+    """
+    block = _build_sys_block(
+        tmp_path, {"sda": {"device": True, "slaves": [], "partitions": ["sda1"]}}
+    )
+    data, telemetry = {}, {}
+    with patch("fivenines_agent.io.SYS_BLOCK", str(block)):
+        collect_metrics({"io_topology": {"unexpected": 1}}, data, telemetry)
+    assert data == {
+        "io_topology": {
+            "sda": {"slaves": [], "virtual": False},
+            "sda1": {"partition_of": "sda"},
+        }
+    }
+    assert "errors" not in telemetry["io_topology"]
+
+
+def test_registry_reports_none_off_linux():
     with patch.object(io_mod, "os_family", return_value="darwin"):
         data = {}
-        collect_metrics({"io_topology": {"unexpected": 1}}, data)
+        collect_metrics({"io_topology": True}, data)
     assert data == {"io_topology": None}
 
 
