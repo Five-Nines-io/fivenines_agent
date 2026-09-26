@@ -178,29 +178,32 @@ def _attach_hidden_paths(topology, listed):
     head is derived, not matched: no identifier can collide, and a head that is
     absent or unreadable simply gets nothing attached. Every listed path
     counts, readable entry or not, as multipath/ would list it; on 6.15 and
-    later this finds the same paths multipath/ already did. A path that is
-    still there but whose `hidden` cannot be read leaves its head out as
-    unknown -- its list would be partial, and [] beside a live path is a false
-    claim -- while one hot-removed since /sys/block was listed is no longer a
-    path of anything and is skipped.
+    later this finds the same paths multipath/ already did.
+
+    A path hot-removed since /sys/block was listed is still attached: only
+    kernel NVMe code names a disk this way, and its `io` row was collected
+    earlier this tick, so leaving its head a leaf would count that I/O twice.
+    A path still there whose `hidden` cannot be read leaves its head out as
+    unknown -- the list would be partial, and [] beside a live path is a false
+    claim -- unless multipath/ already listed it, which settles the question.
     """
     for name, path in listed.items():
         match = _NVME_PATH_DISK.fullmatch(name)
         if match is None:
             continue
         head_name = f"nvme{match[1]}n{match[2]}"
-        hidden = _read_attr(path, "hidden")
-        if hidden is None:
-            if os.path.lexists(path):
-                topology.pop(head_name, None)
-            continue
         head = topology.get(head_name)
-        # "slaves" in head: only root could make the derived name a partition
-        # (a disk named nvme0n with a partition nvme0n1), but a KeyError here
-        # would null the whole map every tick.
-        if hidden != "1" or head is None or "slaves" not in head:
+        # Only root could make the derived name a partition (a disk named
+        # nvme0n with a partition nvme0n1); leave that row alone.
+        if head is not None and "slaves" not in head:
             continue
-        if name in head["slaves"]:
+        hidden = _read_attr(path, "hidden")
+        if hidden is None and os.path.lexists(path):
+            if head is not None and name not in head["slaves"]:
+                del topology[head_name]
+            continue
+        # hidden is "1", or None because the path is gone (see above).
+        if hidden not in ("1", None) or head is None or name in head["slaves"]:
             continue
         head["slaves"].append(name)
         head["slaves"].sort()

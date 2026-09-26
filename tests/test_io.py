@@ -681,6 +681,55 @@ def test_a_path_hot_removed_mid_walk_does_not_unseat_its_head(tmp_path, linux):
     }
 
 
+def test_a_head_s_only_path_hot_removed_mid_walk_is_still_attached(tmp_path, linux):
+    """Before 6.15 the derivation is the head's only source: a path gone since
+    the listing still had its `io` row collected this tick, so the head must
+    stay a layer over it, not become a counted leaf beside it."""
+    block = _build_sys_block(
+        tmp_path,
+        {
+            "nvme0n1": {"device": True, "slaves": []},
+            "nvme0c0n1": {"device": True, "slaves": [], "hidden": True},
+        },
+    )
+    real_read_attr = _read_attr
+
+    def unplug_then_read(path, attr):
+        if path.endswith("nvme0c0n1") and attr == "hidden":
+            shutil.rmtree(tmp_path / "devices" / "nvme0c0n1")
+            os.unlink(block / "nvme0c0n1")
+        return real_read_attr(path, attr)
+
+    with patch("fivenines_agent.io.SYS_BLOCK", str(block)), patch(
+        "fivenines_agent.io._read_attr", side_effect=unplug_then_read
+    ):
+        out = io_topology()
+    assert out["nvme0n1"] == {"slaves": ["nvme0c0n1"], "virtual": False}
+
+
+def test_unreadable_hidden_on_a_path_multipath_already_lists_keeps_the_head(
+    tmp_path, linux
+):
+    """multipath/ already answers the head's question; one unreadable
+    attribute on a path it lists must not make the head unknown."""
+    block = _build_sys_block(
+        tmp_path,
+        {
+            "nvme0n1": {
+                "device": True,
+                "slaves": [],
+                "multipath": ["nvme0c0n1", "nvme0c1n1"],
+            },
+            "nvme0c0n1": {"device": True, "slaves": [], "hidden": True},
+            "nvme0c1n1": {"device": True, "slaves": [], "hidden": True},
+        },
+    )
+    os.unlink(tmp_path / "devices" / "nvme0c0n1" / "hidden")
+    with patch("fivenines_agent.io.SYS_BLOCK", str(block)):
+        out = io_topology()
+    assert out["nvme0n1"] == {"slaves": ["nvme0c0n1", "nvme0c1n1"], "virtual": False}
+
+
 def test_a_derived_head_that_is_a_partition_is_left_alone(tmp_path, linux):
     """Only root could arrange it (a disk nvme0n partitioned into nvme0n1),
     but it must not null the map with a KeyError."""
