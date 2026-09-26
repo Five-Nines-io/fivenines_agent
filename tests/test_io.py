@@ -392,8 +392,9 @@ def test_whole_device_vanishing_mid_read_is_unknown_not_virtual(tmp_path):
 
     def unplug_on_device_lstat(path, *args, **kwargs):
         if path == device_link:
+            # The device directory goes; /sys/block/sdz is left dangling
+            # (portable: Windows cannot os.unlink a directory symlink).
             shutil.rmtree(tmp_path / "devices" / "sdz")
-            os.unlink(block / "sdz")
         return real_lstat(path, *args, **kwargs)
 
     with patch("fivenines_agent.io.os.lstat", side_effect=unplug_on_device_lstat):
