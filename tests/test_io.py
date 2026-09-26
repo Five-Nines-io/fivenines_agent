@@ -628,6 +628,73 @@ def test_a_path_whose_hidden_attribute_cannot_be_read_leaves_its_head_out(
     assert out == {"nvme0c0n1": {"slaves": [], "virtual": False}}
 
 
+def test_two_unreadable_paths_leave_their_head_out_once(tmp_path, linux):
+    """The head is dropped by the first path; the second must not fail on it,
+    nor may a path whose derived head was never reported."""
+    block = _build_sys_block(
+        tmp_path,
+        {
+            "nvme0n1": {"device": True, "slaves": []},
+            "nvme0c0n1": {"device": True, "slaves": [], "hidden": True},
+            "nvme0c1n1": {"device": True, "slaves": [], "hidden": True},
+            "nvme1c0n1": {"device": True, "slaves": [], "hidden": True},
+        },
+    )
+    for path in ("nvme0c0n1", "nvme0c1n1", "nvme1c0n1"):
+        os.unlink(tmp_path / "devices" / path / "hidden")
+    with patch("fivenines_agent.io.SYS_BLOCK", str(block)):
+        out = io_topology()
+    leaf = {"slaves": [], "virtual": False}
+    assert out == {"nvme0c0n1": leaf, "nvme0c1n1": leaf, "nvme1c0n1": leaf}
+
+
+def test_a_path_hot_removed_mid_walk_does_not_unseat_its_head(tmp_path, linux):
+    """ENOENT on `hidden` because the path is gone is not an unknown head: the
+    head's multipath/ links were read before, and the path is no longer one."""
+    block = _build_sys_block(
+        tmp_path,
+        {
+            "nvme0n1": {
+                "device": True,
+                "slaves": [],
+                "multipath": ["nvme0c0n1", "nvme0c1n1"],
+            },
+            "nvme0c0n1": {"device": True, "slaves": [], "hidden": True},
+            "nvme0c1n1": {"device": True, "slaves": [], "hidden": True},
+        },
+    )
+    real_read_attr = _read_attr
+
+    def unplug_then_read(path, attr):
+        if path.endswith("nvme0c1n1") and attr == "hidden":
+            shutil.rmtree(tmp_path / "devices" / "nvme0c1n1")
+            os.unlink(block / "nvme0c1n1")
+        return real_read_attr(path, attr)
+
+    with patch("fivenines_agent.io.SYS_BLOCK", str(block)), patch(
+        "fivenines_agent.io._read_attr", side_effect=unplug_then_read
+    ):
+        out = io_topology()
+    assert out["nvme0n1"] == {
+        "slaves": ["nvme0c0n1", "nvme0c1n1"],
+        "virtual": False,
+    }
+
+
+def test_a_derived_head_that_is_a_partition_is_left_alone(tmp_path, linux):
+    """Only root could arrange it (a disk nvme0n partitioned into nvme0n1),
+    but it must not null the map with a KeyError."""
+    out = _topology_of(
+        tmp_path,
+        {
+            "nvme0n": {"device": True, "slaves": [], "partitions": ["nvme0n1"]},
+            "nvme0c0n1": {"device": True, "slaves": [], "hidden": True},
+        },
+    )
+    assert out["nvme0n1"] == {"partition_of": "nvme0n"}
+    assert out["nvme0c0n1"] == {"slaves": [], "virtual": False}
+
+
 def test_hidden_is_read_only_for_path_shaped_names(tmp_path, linux):
     """The fallback costs nothing on a host without NVMe multipath."""
     real_read_attr = _read_attr

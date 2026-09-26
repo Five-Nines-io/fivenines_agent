@@ -173,14 +173,16 @@ def _attach_hidden_paths(topology, listed):
     kernel names both ends itself: a path disk nvme{S}c{C}n{H} and its head
     nvme{S}n{H}, from the subsystem and head instances it allocates
     (drivers/nvme/host/core.c) -- nothing a device or its firmware chooses.
-    `hidden` reading 1 confirms the disk really is such a path (NVMe is its
-    only user). So the head is derived, not matched: no identifier can collide,
-    and a head that is absent or unreadable simply gets nothing attached. Every
-    listed path counts, readable entry or not, as multipath/ would list it; on
-    6.15 and later this finds the same paths multipath/ already did. A path
-    whose `hidden` cannot be read leaves its head out as unknown: the kernel
-    names only hidden paths this way, so the head's list would be partial, and
-    [] beside a live path is exactly the double count this exists to prevent.
+    `hidden` reading 1 confirms the disk really is such a path (NVMe also hides
+    namespaces it cannot support, but never under a path-shaped name). So the
+    head is derived, not matched: no identifier can collide, and a head that is
+    absent or unreadable simply gets nothing attached. Every listed path
+    counts, readable entry or not, as multipath/ would list it; on 6.15 and
+    later this finds the same paths multipath/ already did. A path that is
+    still there but whose `hidden` cannot be read leaves its head out as
+    unknown -- its list would be partial, and [] beside a live path is a false
+    claim -- while one hot-removed since /sys/block was listed is no longer a
+    path of anything and is skipped.
     """
     for name, path in listed.items():
         match = _NVME_PATH_DISK.fullmatch(name)
@@ -189,10 +191,16 @@ def _attach_hidden_paths(topology, listed):
         head_name = f"nvme{match[1]}n{match[2]}"
         hidden = _read_attr(path, "hidden")
         if hidden is None:
-            topology.pop(head_name, None)
+            if os.path.lexists(path):
+                topology.pop(head_name, None)
             continue
         head = topology.get(head_name)
-        if hidden != "1" or head is None or name in head["slaves"]:
+        # "slaves" in head: only root could make the derived name a partition
+        # (a disk named nvme0n with a partition nvme0n1), but a KeyError here
+        # would null the whole map every tick.
+        if hidden != "1" or head is None or "slaves" not in head:
+            continue
+        if name in head["slaves"]:
             continue
         head["slaves"].append(name)
         head["slaves"].sort()
