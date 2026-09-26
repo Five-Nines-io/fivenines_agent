@@ -769,7 +769,8 @@ The agent works without sudo, but these features will be unavailable (this is al
 - Memory and swap usage
 - Load average
 - Disk I/O statistics, plus on Linux what each block device is stacked on
-  (`/sys/block/<dev>/slaves/`) and which rows are partitions, so an mdraid,
+  (`/sys/block/<dev>/slaves/`, and `multipath/` for an NVMe multipath head)
+  and which rows are partitions, so an mdraid,
   LVM/LUKS, bcache or multipath host's total I/O is what its physical disks
   did, not every layer added on top (agent version **1.20.0+**, collected once the
   dashboard enables it)

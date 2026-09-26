@@ -92,10 +92,10 @@ def _whole_device(path, io_name):
     a dm/LVM/LUKS device, bcache's backing and cache devices, the paths under a
     dm-multipath map). An NVMe native-multipath head links its paths from
     multipath/ instead (see _multipath_paths), so those count too. [] is a
-    positive claim -- nothing beneath it -- so it is
-    only ever reported from a successful read; an unreadable directory is None,
-    which leaves the device out of the topology rather than calling it a leaf.
-    So does a slave io_name cannot place: a partial list is a false claim too.
+    positive claim -- nothing beneath it -- so it is only ever reported from a
+    successful read; an unreadable directory is None, which leaves the device
+    out of the topology rather than calling it a leaf. So does a slave io_name
+    cannot place: a partial list is a false claim too.
 
     virtual is sysstat's definition: no `device` link, i.e. the driver
     registered the disk with no parent device (add_disk() rather than
@@ -140,7 +140,7 @@ def _multipath_paths(path):
     in /proc/diskstats with the same I/O -- the paths account it through
     blk-mq, the head through nvme_mpath_start_request -- so without this the
     head reads as a leaf and every I/O counts twice. The directory holds only
-    those links. ENOENT (not a head, or a kernel without the links) is [];
+    those links, and exists since Linux 6.15; older kernels keep that gap. ENOENT (not a head, or a kernel without the links) is [];
     any other failure propagates, so the caller reports the device as unknown
     rather than with a partial list.
     """
@@ -209,8 +209,8 @@ def io_topology():
     writer, for minutes (LKML, 2026-09: "kernfs: don't hold kernfs_rwsem across
     dir_emit()"), past WatchdogSec=90. A read that times out reports None and
     is abandoned; until it returns, later ticks report None without starting
-    another. This bounds this collector's share of the tick only: the network
-    and temperatures collectors read sysfs unbounded (TODOS.md).
+    another. This bounds this collector's share of the tick only: the network,
+    temperatures and fans collectors read sysfs unbounded (TODOS.md).
     """
     global _stalled_worker
     if os_family() != "linux":

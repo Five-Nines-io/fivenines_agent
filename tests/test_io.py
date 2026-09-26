@@ -561,9 +561,21 @@ def test_whole_device_vanishing_mid_read_is_unknown_not_virtual(tmp_path):
 
 
 def test_whole_device_unknown_when_device_link_cannot_be_checked(tmp_path):
-    """Only ENOENT means virtual; any other failure is unknown, never a claim."""
+    """Only ENOENT means virtual; any other failure is unknown, never a claim.
+
+    Only the `device` link fails: slaves/ must stay visible, or the hot-removal
+    fallback (lexists on slaves/) would return None for the wrong reason and a
+    code path treating every lstat error as ENOENT would pass unnoticed."""
     block = _build_sys_block(tmp_path, {"sda": {"device": True, "slaves": []}})
-    with patch("fivenines_agent.io.os.lstat", side_effect=PermissionError):
+    device_link = str(block / "sda" / "device")
+    real_lstat = os.lstat
+
+    def denied(path, *args, **kwargs):
+        if path == device_link:
+            raise PermissionError(path)
+        return real_lstat(path, *args, **kwargs)
+
+    with patch("fivenines_agent.io.os.lstat", side_effect=denied):
         assert _whole_device(str(block / "sda"), _IoNames()) is None
 
 

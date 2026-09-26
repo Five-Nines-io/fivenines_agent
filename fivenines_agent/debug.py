@@ -70,8 +70,11 @@ def adopt_log_capture(buffer):
 
     Capture is thread-local, so a collector that does its work on a worker
     thread (bounded.call_bounded) would otherwise log its errors past the
-    dispatcher's telemetry. list.append is atomic, and a worker that outlives
-    the tick only appends to a list nobody reads any more.
+    dispatcher's telemetry. list.append is atomic. A worker abandoned past its
+    deadline keeps the list it was given: a line it logs later lands in that
+    tick's telemetry if the list was already non-empty (stop_log_capture
+    returns it as is) and is lost otherwise. No bounded call logs from its
+    worker today; a per-collector bound (TODOS.md) would have to settle that.
     """
     _thread_local.log_buffer = buffer
 

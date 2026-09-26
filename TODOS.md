@@ -16,8 +16,9 @@ predicate selects no whole device -- an OpenVZ ploop container, a diskless nbd
 boot -- keeps today's name rules rather than reading a zero total). That also
 retires the ingestion-time `dm-`/`zd` drop and the parentless-partition guess
 (`xvda1`) for Linux hosts; absent/`null`/`{}` must keep today's name rules. NVMe
-native multipath is covered through `/sys/block/<head>/multipath/`; the remaining
-gap is a kernel too old to expose those links, where the head still reads as a leaf.
+native multipath is covered through `/sys/block/<head>/multipath/`, which exists
+since Linux 6.15; on older kernels (Ubuntu 24.04's 6.8, Debian 13 and RHEL 10's
+6.12) a multi-controller NVMe head still reads as a leaf beside its paths.
 
 ## P3: Per-collector wall-clock bound against a kernfs stall (only io_topology has one)
 
@@ -26,7 +27,7 @@ into reclaim while holding `kernfs_rwsem`, and a queued writer then blocks every
 other sysfs lookup behind it -- 120-second stalls reported upstream (LKML
 2026-09, Shakeel Butt, "kernfs: don't hold kernfs_rwsem across dir_emit()").
 The agent reads sysfs on every tick from several collectors (`network`, psutil's
-hwmon glob behind `temperatures`), all on the collection thread, so one such
+hwmon globs behind `temperatures` and `fans`), all on the collection thread, so one such
 stall can outlast `WatchdogSec=90` and restart the agent. `io_topology` (#155)
 is the first to bound its own read (a single-flight worker abandoned after
 `TOPOLOGY_READ_TIMEOUT`); the others are not. The uniform fix is a per-collector
