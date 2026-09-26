@@ -33,9 +33,13 @@ def _get_ssl_context():
             # Use certifi if bundled, otherwise fallback to system CA certificates
             cert_path = certifi.where()
             if os.path.exists(cert_path):
-                _ssl_context = ssl.create_default_context(cafile=cert_path)
+                ctx = ssl.create_default_context(cafile=cert_path)
             else:
-                _ssl_context = ssl.create_default_context()
+                ctx = ssl.create_default_context()
+            # Python 3.10+ already defaults to TLS 1.2; pinned here so the floor
+            # does not depend on the interpreter and OpenSSL a build bundles.
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            _ssl_context = ctx
         return _ssl_context
 
 
@@ -112,7 +116,7 @@ class Synchronizer(Thread):
             try:
                 conn.close()
             except Exception:
-                pass
+                pass  # nosec B110  # best-effort close of a connection that is being dropped
 
     def _post(self, endpoint, data):
         """Generic POST with gzip, auth, and retries. Returns parsed JSON or None.
@@ -329,7 +333,7 @@ class Synchronizer(Thread):
                         try:
                             sock.close()
                         except Exception:
-                            pass
+                            pass  # nosec B110  # best-effort close; the connect failure is logged just below
                     log(f"Failed to connect via {record_type}: {e}", "debug")
                     continue
 

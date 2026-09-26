@@ -1003,7 +1003,7 @@ class PermissionProbe:
                     try:
                         conn.close()
                     except Exception:
-                        pass
+                        pass  # nosec B110  # best-effort close once the probe has its answer
 
         worker = threading.Thread(target=attempt, daemon=True)
         self._libvirt_probe_thread = worker

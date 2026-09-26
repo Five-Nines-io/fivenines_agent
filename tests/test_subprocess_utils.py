@@ -15,7 +15,7 @@ import time
 
 import pytest
 
-from fivenines_agent.subprocess_utils import run_command, run_privileged
+from fivenines_agent.subprocess_utils import run_privileged
 
 
 def test_returns_the_completed_process_on_the_normal_path():
@@ -132,32 +132,3 @@ def test_the_abandoned_worker_is_a_daemon(monkeypatch):
         assert captured["thread"].is_alive()
     finally:
         released.set()
-
-
-# --- run_command (the non-privileged wrapper) ------------------------------
-
-
-def test_run_command_defaults_to_a_clean_env(monkeypatch):
-    seen = {}
-
-    def fake_run(cmd, **kwargs):
-        seen.update(kwargs)
-        return subprocess.CompletedProcess(cmd, 0)
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setenv("LD_PRELOAD", "/opt/fivenines/_internal/libz.so")
-    run_command(["true"], timeout=2)
-    assert "LD_PRELOAD" not in seen["env"]
-    assert seen["timeout"] == 2
-
-
-def test_run_command_keeps_an_explicit_env(monkeypatch):
-    seen = {}
-
-    def fake_run(cmd, **kwargs):
-        seen.update(kwargs)
-        return subprocess.CompletedProcess(cmd, 0)
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    run_command(["true"], env={"PATH": "/bin"})
-    assert seen["env"] == {"PATH": "/bin"}

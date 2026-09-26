@@ -21,10 +21,18 @@ RUN apk add --no-cache \
     binutils \
     patchelf
 
-# Determine libvirt version and install matching libvirt-python
+# Install the libvirt-python matching Alpine's libvirt, hash-pinned in
+# ci/requirements/libvirt-python-alpine.txt. The pin names one version, so fail
+# loudly if the base image's libvirt has moved away from it. The sdist builds
+# without isolation, against the image's own setuptools, so nothing unpinned is
+# fetched for the build.
+COPY ci/requirements/libvirt-python-alpine.txt /tmp/requirements/
 RUN LIBVIRT_VERSION=$(pkg-config --modversion libvirt) && \
     echo "System libvirt version: $LIBVIRT_VERSION" && \
-    pip install --no-cache-dir libvirt-python==$LIBVIRT_VERSION
+    grep -q "^libvirt-python==${LIBVIRT_VERSION} " /tmp/requirements/libvirt-python-alpine.txt || { \
+        echo "Alpine's libvirt is ${LIBVIRT_VERSION}, but ci/requirements/libvirt-python-alpine.txt pins another libvirt-python: update the .in file and run ci/requirements/compile.sh"; \
+        exit 1; } && \
+    pip install --no-cache-dir --require-hashes --no-deps --no-build-isolation -r /tmp/requirements/libvirt-python-alpine.txt
 
 # Verify libvirt-python
 RUN python -c "import libvirt; print('libvirt-python version:', libvirt.getVersion())"

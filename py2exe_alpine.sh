@@ -27,29 +27,39 @@ echo "=== Setting up virtual environment ==="
 python -m venv /workspace/venv --clear
 . /workspace/venv/bin/activate
 
-# Install build dependencies
-python -m pip install --upgrade pip setuptools wheel
+# Install the build tools (pip, setuptools, wheel, poetry and its dependencies)
+# from the hash-pinned file: nothing is installed unverified.
+echo "=== Installing build tools (hash-pinned) ==="
+python -m pip install --require-hashes --no-deps --only-binary :all: -r ci/requirements/build-tools.txt
 
-# Install libvirt-python matching system version
+# Install the libvirt-python matching Alpine's libvirt, also hash-pinned. The
+# pin names one version, so fail loudly if the base image's libvirt has moved.
 echo "=== Installing libvirt-python ==="
 LIBVIRT_VERSION=$(pkg-config --modversion libvirt)
-python -m pip install libvirt-python==$LIBVIRT_VERSION
+if ! grep -q "^libvirt-python==${LIBVIRT_VERSION} " ci/requirements/libvirt-python-alpine.txt; then
+    echo "Alpine's libvirt is ${LIBVIRT_VERSION}, but ci/requirements/libvirt-python-alpine.txt pins another libvirt-python."
+    echo "Update ci/requirements/libvirt-python-alpine.in and run ci/requirements/compile.sh."
+    exit 1
+fi
+# Built from sdist without isolation, so it uses the pinned setuptools above.
+python -m pip install --require-hashes --no-deps --no-build-isolation -r ci/requirements/libvirt-python-alpine.txt
 
 # Test libvirt-python
 python -c "import libvirt; print('libvirt-python imported successfully, version:', libvirt.getVersion())"
 
 #
-# Install Poetry and project dependencies
+# Configure Poetry (installed above) and install project dependencies
 #
-echo "=== Installing Poetry and Dependencies ==="
-python -m pip install poetry==2.4.1
+echo "=== Installing project dependencies ==="
 
 # Configure Poetry for current venv
 poetry config virtualenvs.create false
 poetry cache clear --all . || true
 poetry config installer.max-workers 1
 
-poetry install --no-interaction
+# Wheels only (hash-checked against poetry.lock): an sdist poetry would have to
+# build fetches its build backend unpinned, so that fails instead.
+POETRY_INSTALLER_ONLY_BINARY=":all:" poetry install --no-interaction
 
 # Remove systemd-watchdog (not needed on Alpine, may fail to import)
 pip uninstall -y systemd-watchdog 2>/dev/null || true

@@ -262,7 +262,7 @@ EXEC_RECORD_RE = re.compile(
 # every timer fire: { OnCalendar=Mon *-*-* 12:00:00 ; next_elapse=... }.
 TIMER_SPEC_RE = re.compile(r"\{ (?P<spec>.+?) ; next_elapse=")
 
-_SECRET_KEYWORDS = r"(?:pass(?:word|wd)?|secret|token|api[_-]?key|credential[s]?|access[_-]?key|private[_-]?key|auth[_-]?token)"
+_SECRET_KEYWORDS = r"(?:pass(?:word|wd)?|secret|token|api[_-]?key|credential[s]?|access[_-]?key|private[_-]?key|auth[_-]?token)"  # nosec B105  # keyword pattern used to redact secrets, not a secret
 _SECRET_FLAG = r"(--?[a-z0-9_-]*" + _SECRET_KEYWORDS + r"[a-z0-9_-]*)"
 _REDACT_FLAG_EQ_RE = re.compile(r"(?i)" + _SECRET_FLAG + r"=(\S+)")
 # Space-separated form must not eat a FOLLOWING flag when the secret flag is

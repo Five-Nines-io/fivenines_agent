@@ -1,6 +1,7 @@
 """Tests for IP detection and caching."""
 
 import socket
+import ssl
 import time
 from collections import namedtuple
 from unittest.mock import MagicMock, patch
@@ -17,6 +18,24 @@ def _reset_caches():
         cache["timestamp"] = 0
         cache["ip"] = None
         cache["failures"] = 0
+
+
+def test_ssl_context_pins_the_tls_floor():
+    """Pinned, not inherited: a build whose default floor is lower still gets 1.2."""
+    real = ssl.create_default_context
+
+    def lowered_floor(*args, **kwargs):
+        ctx = real(*args, **kwargs)
+        ctx.minimum_version = ssl.TLSVersion.MINIMUM_SUPPORTED
+        return ctx
+
+    with patch(
+        "fivenines_agent.ip.ssl.create_default_context", side_effect=lowered_floor
+    ):
+        ctx = ip_module._get_ssl_context()
+    assert ctx.minimum_version == ssl.TLSVersion.TLSv1_2
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+    assert ip_module._get_ssl_context() is ctx
 
 
 @patch("fivenines_agent.ip.CustomHTTPSConnection")

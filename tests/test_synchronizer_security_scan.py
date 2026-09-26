@@ -2,6 +2,7 @@
 
 import gzip
 import json
+import ssl
 import sys
 from threading import Event
 from unittest.mock import MagicMock, patch
@@ -341,6 +342,103 @@ def test_get_conn_certifi_exists(
 
     # ssl.create_default_context should be called with cafile
     mock_ssl.assert_called_once_with(cafile="/path/to/cacert.pem")
+
+
+_real_create_default_context = ssl.create_default_context
+
+
+def _context_with_a_lower_default_floor(*args, **kwargs):
+    """A real context whose default floor is BELOW TLS 1.2.
+
+    Python 3.10+ already defaults to TLS 1.2, so asserting the floor of a stock
+    context passes with the pin deleted. Lowering it first models the build the
+    pin exists for (an interpreter/OpenSSL with an older default) and makes the
+    assertion fail unless _get_ssl_context really raises the floor.
+    """
+    ctx = _real_create_default_context(*args, **kwargs)
+    ctx.minimum_version = ssl.TLSVersion.MINIMUM_SUPPORTED
+    return ctx
+
+
+@pytest.mark.parametrize(
+    "bundle_exists", [True, False], ids=["certifi-bundle", "system-cas"]
+)
+def test_ssl_context_pins_tls_floor_on_both_trust_root_branches(bundle_exists):
+    """The floor is pinned whichever CA source the build falls back to.
+
+    Real contexts, not mocks: the mocked certifi pair above only checks which
+    trust root was loaded, so a pin applied on one branch alone would pass it.
+    """
+    synchronizer_module._ssl_context = None  # reset the process-wide cache
+    with patch(
+        "fivenines_agent.synchronizer.os.path.exists", return_value=bundle_exists
+    ), patch(
+        "fivenines_agent.synchronizer.ssl.create_default_context",
+        side_effect=_context_with_a_lower_default_floor,
+    ) as build:
+        ctx = synchronizer_module._get_ssl_context()
+
+    if bundle_exists:
+        build.assert_called_once_with(cafile=synchronizer_module.certifi.where())
+    else:
+        build.assert_called_once_with()
+    assert ctx.minimum_version == ssl.TLSVersion.TLSv1_2
+    assert ctx.verify_mode == ssl.CERT_REQUIRED
+    assert ctx.check_hostname is True
+
+
+def test_ssl_context_is_built_once_then_served_pinned_from_cache():
+    """The cached context is the pinned one; the CA bundle is parsed once."""
+    synchronizer_module._ssl_context = None  # reset the process-wide cache
+    with patch(
+        "fivenines_agent.synchronizer.ssl.create_default_context",
+        side_effect=_context_with_a_lower_default_floor,
+    ) as build:
+        first = synchronizer_module._get_ssl_context()
+        second = synchronizer_module._get_ssl_context()
+
+    assert second is first
+    assert build.call_count == 1
+    assert second.minimum_version == ssl.TLSVersion.TLSv1_2
+
+
+class _UnpinnableContext:
+    """An SSLContext stand-in whose TLS floor cannot be set."""
+
+    @property
+    def minimum_version(self):
+        return None
+
+    @minimum_version.setter
+    def minimum_version(self, value):
+        raise ValueError("unsupported protocol version")
+
+
+@patch("fivenines_agent.synchronizer.api_url", return_value="api.fivenines.io")
+@patch("fivenines_agent.synchronizer.DNSResolver")
+def test_context_whose_floor_cannot_be_pinned_is_never_cached_or_dialed(
+    mock_resolver, mock_api_url
+):
+    """A context is published only after its floor is set, so a failed pin
+    costs one POST's retries -- never an unpinned context reused for the life
+    of the process."""
+    synchronizer_module._ssl_context = None  # reset the process-wide cache
+    sync = make_synchronizer()
+
+    with patch(
+        "fivenines_agent.synchronizer.ssl.create_default_context",
+        return_value=_UnpinnableContext(),
+    ) as build:
+        assert sync._post("/collect", {"data": 1}) is None  # handled, not raised
+
+    assert synchronizer_module._ssl_context is None
+    assert build.call_count == 3  # rebuilt on every retry, never served cached
+    mock_resolver.return_value.resolve.assert_not_called()  # nothing dialed
+
+    # Once the floor can be set, the next call builds and caches normally.
+    ctx = synchronizer_module._get_ssl_context()
+    assert ctx.minimum_version == ssl.TLSVersion.TLSv1_2
+    assert synchronizer_module._ssl_context is ctx
 
 
 # --- connection reuse / pre-compressed payloads ---

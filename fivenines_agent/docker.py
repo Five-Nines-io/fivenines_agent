@@ -89,7 +89,7 @@ def invalidate_docker_client():
         try:
             client.close()
         except Exception:
-            pass
+            pass  # nosec B110  # best-effort close of a client that is being discarded
 
 
 # Per-tick container cap. Running containers are always kept first; the rest are

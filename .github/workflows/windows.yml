@@ -25,12 +25,17 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref_name }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+# Nothing here writes to the repository, whatever the default token allows.
+permissions:
+  contents: read
 
 env:
   PYTHON_VERSION: '3.11'
-  POETRY_VERSION: '2.2.1'
+  # Poetry and the other build tools are pinned, with hashes, in
+  # ci/requirements/build-tools.txt.
   # WiX 5+ - need the <Files> harvesting element, which WiX 4 does not have.
   # Pinned to a stable 5.x so the schema we author against stays predictable;
   # WiX 6/7 introduce further changes (e.g. some default behavior shifts).
@@ -47,16 +52,19 @@ jobs:
     name: Tests (windows-latest)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install Poetry
+      - name: Install build tools (hash-pinned)
         shell: pwsh
-        run: pip install "poetry==${{ env.POETRY_VERSION }}"
+        run: |
+          python -m pip install --require-hashes --no-deps --only-binary :all: -r ci/requirements/build-tools.txt
 
       - name: Install dependencies (windows group, virtualization excluded)
         shell: pwsh
@@ -118,7 +126,7 @@ jobs:
           Write-Host "2000 passwords: length 32, all four character classes, no duplicates, shuffled."
 
       - name: Upload Windows coverage
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage-windows
           path: coverage-windows.xml
@@ -129,16 +137,19 @@ jobs:
     needs: test-windows
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
 
-      - name: Install Poetry
+      - name: Install build tools (hash-pinned)
         shell: pwsh
-        run: pip install "poetry==${{ env.POETRY_VERSION }}"
+        run: |
+          python -m pip install --require-hashes --no-deps --only-binary :all: -r ci/requirements/build-tools.txt
 
       - name: Run Windows PyInstaller build
         shell: pwsh
@@ -147,7 +158,7 @@ jobs:
         run: .\py2exe_windows.ps1
 
       - name: Upload Windows binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fivenines-agent-windows-amd64
           path: dist/windows/fivenines-agent-windows-amd64/
@@ -158,10 +169,12 @@ jobs:
     needs: build-windows-binary
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Download agent binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: fivenines-agent-windows-amd64
           path: dist/windows/fivenines-agent-windows-amd64/
@@ -212,7 +225,7 @@ jobs:
             -o fivenines-agent.msi
 
       - name: Upload MSI
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: fivenines-agent-msi
           path: windows/installer/fivenines-agent.msi
@@ -223,10 +236,12 @@ jobs:
     needs: build-msi
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Download MSI
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: fivenines-agent-msi
           path: .
@@ -370,7 +385,7 @@ jobs:
 
       - name: Upload install/uninstall logs (on failure or always)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: msi-logs
           path: |

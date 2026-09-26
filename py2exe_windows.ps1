@@ -23,18 +23,18 @@ Write-Host "=== Python Environment Check ==="
 python --version
 python -m pip --version
 
-Write-Host "=== Installing build prerequisites ==="
-python -m pip install --upgrade pip setuptools wheel
-
-# Poetry is installed by the CI workflow's separate "Install Poetry" step
-# (.github/workflows/windows.yml + build-release.yml). Re-installing it here
+# The build tools (pip, setuptools, wheel, poetry and its dependencies) are
+# installed, hash-pinned, by the CI workflow's "Install build tools" step
+# (.github/workflows/windows.yml + build-release.yml) from
+# ci/requirements/build-tools.txt; upgrading any of them here would replace a
+# verified version with an unverified one. Re-installing poetry here also
 # breaks on Windows when the existing poetry.exe is locked by the running
 # Python process (pip's uninstall step fails with WinError 32 "process
 # cannot access the file"). Anyone running this script outside CI must
-# pre-install poetry (any 2.x is fine).
+# install the build tools first, the same way.
 poetry --version
 if ($LASTEXITCODE -ne 0) {
-    Write-Error "poetry is not on PATH. Install it before running this script (e.g. 'pip install poetry==2.2.1')."
+    Write-Error "poetry is not on PATH. Install the build tools first: python -m pip install --require-hashes --no-deps --only-binary :all: -r ci/requirements/build-tools.txt"
     exit 1
 }
 
@@ -47,8 +47,14 @@ Write-Host "=== Installing project dependencies (windows + dev, virtualization e
 # A venv isolates the project's deps from poetry's runtime, so the self-
 # uninstall path never fires.
 poetry config virtualenvs.in-project true
+# Wheels only (hash-checked against poetry.lock): an sdist poetry would have to
+# build fetches its build backend unpinned, so that fails instead. Scoped to
+# this install, so a local run does not leave it in the caller's session.
+$env:POETRY_INSTALLER_ONLY_BINARY = ":all:"
 poetry install --no-interaction --without virtualization --with windows
-if ($LASTEXITCODE -ne 0) { Write-Error "poetry install failed"; exit 1 }
+$poetryExit = $LASTEXITCODE
+Remove-Item Env:POETRY_INSTALLER_ONLY_BINARY
+if ($poetryExit -ne 0) { Write-Error "poetry install failed"; exit 1 }
 
 # Defensive: confirm the excluded groups are not importable.
 $forbidden = @("libvirt", "systemd_watchdog", "proxmoxer")

@@ -44,7 +44,7 @@ def _reset_nvml():
     try:
         pynvml.nvmlShutdown()
     except Exception:
-        pass
+        pass  # nosec B110  # best-effort teardown; the next tick re-initializes NVML
 
 
 def _safe(fn, *args):
@@ -71,7 +71,7 @@ def _collect_processes(handle):
                     }
                 )
         except Exception:
-            pass
+            pass  # nosec B110  # a GPU that cannot list processes still reports its own metrics
     return processes
 
 

@@ -77,22 +77,16 @@ if [ -d /opt/venv ]; then
         exit 1
     fi
     echo "Installing root project (editable, no deps) from the mounted source"
-    pip install -e . --no-deps || {
+    # No build isolation: the build backend (poetry-core) is already in the
+    # venv from the hash-pinned build tools; isolation would fetch it unpinned.
+    pip install -e . --no-deps --no-build-isolation || {
         echo "Root project install failed. Exiting."
         exit 1
     }
 else
 echo "=== No pre-baked venv found; building environment from scratch (fallback) ==="
-#
-# Install and enable virtualenv
-#
-echo "Installing and enabling virtualenv"
-python -m pip install virtualenv || {
-    echo "Failed to install virtualenv. Exiting."
-    exit 1
-}
 
-# Create the virtual environment
+# Create the virtual environment (the stdlib venv module; nothing to install)
 echo "Creating virtual environment"
 if ! python -m venv /workspace/venv --clear; then
     echo "Failed to create virtual environment. Reinstalling dependencies and retrying..."
@@ -100,7 +94,6 @@ if ! python -m venv /workspace/venv --clear; then
         echo "Failed to ensure pip. Exiting."
         exit 1
     }
-    python -m pip install --upgrade pip setuptools wheel
     python -m venv /workspace/venv --clear || {
         echo "Retry failed. Exiting."
         exit 1
@@ -127,16 +120,11 @@ if [ -z "$VIRTUAL_ENV" ]; then
     exit 1
 fi
 
-# Install build dependencies explicitly
-echo "=== Installing Build Dependencies ==="
-python -m pip install --upgrade pip setuptools wheel
-
-#
-# Install Poetry and dependencies
-#
-echo "=== Installing Poetry and Dependencies ==="
-python -m pip install poetry==2.4.1 || {
-    echo "Failed to install Poetry. Exiting."
+# Install the build tools (pip, setuptools, wheel, poetry and its dependencies)
+# from the same hash-pinned file the builder images use.
+echo "=== Installing build tools (hash-pinned) ==="
+python -m pip install --require-hashes --no-deps --only-binary :all: -r ci/requirements/build-tools.txt || {
+    echo "Failed to install the build tools. Exiting."
     exit 1
 }
 poetry config virtualenvs.create false
@@ -146,7 +134,7 @@ poetry config installer.max-workers 1
 if [ -n "${SYNOLOGY:-}" ]; then
     # Synology: skip the virtualization group (libvirt, systemd-watchdog, proxmoxer)
     echo "=== Installing without virtualization dependencies (Synology) ==="
-    poetry install --no-interaction --without virtualization || {
+    POETRY_INSTALLER_ONLY_BINARY=":all:" poetry install --no-interaction --without virtualization || {
         echo "Poetry installation failed. Exiting."
         exit 1
     }
@@ -163,16 +151,23 @@ else
         echo "PKG_CONFIG_PATH: $PKG_CONFIG_PATH"
         exit 1
     }
-    if ! python -m pip install libvirt-python==11.6.0; then
+    # Hash-pinned, built without isolation so it uses the pinned setuptools. It
+    # must be the version poetry.lock locks, so `poetry install` below skips it.
+    LOCKED=$(awk '/^name = "libvirt-python"$/ {getline; gsub(/"/, "", $3); print $3}' poetry.lock)
+    if ! grep -q "^libvirt-python==${LOCKED} " ci/requirements/libvirt-python.txt; then
+        echo "poetry.lock locks libvirt-python ${LOCKED}, but ci/requirements/libvirt-python.txt pins another version: they must match."
+        exit 1
+    fi
+    if ! python -m pip install --require-hashes --no-deps --no-build-isolation -r ci/requirements/libvirt-python.txt; then
         export CFLAGS="$(pkg-config --cflags libvirt)"
         export LDFLAGS="$(pkg-config --libs libvirt)"
-        python -m pip install -v libvirt-python==11.6.0 || {
+        python -m pip install -v --require-hashes --no-deps --no-build-isolation -r ci/requirements/libvirt-python.txt || {
             echo "libvirt-python installation failed completely. Exiting."
             exit 1
         }
     fi
     python -c "import libvirt; print('libvirt-python imported successfully')"
-    poetry install --no-interaction --with virtualization || {
+    POETRY_INSTALLER_ONLY_BINARY=":all:" poetry install --no-interaction --with virtualization || {
         echo "Poetry installation failed. Exiting."
         exit 1
     }
@@ -207,10 +202,15 @@ if [ ! -f "$LIBPYTHON_PATH" ]; then
     cd /tmp
 
     # Download Python 3.10.18 source
-    if ! wget -q --timeout=30 "https://www.python.org/ftp/python/3.10.18/Python-3.10.18.tgz"; then
+    if ! wget -q --timeout=30 --tries=3 "https://www.python.org/ftp/python/3.10.18/Python-3.10.18.tgz"; then
         echo "Failed to download Python source"
         exit 1
     fi
+    # Same pinned digest as the Dockerfile step (GPG-verified upstream release).
+    echo "1b19ab802518eb36a851f5ddef571862c7a31ece533109a99df6d5af0a1ceb99  Python-3.10.18.tgz" | sha256sum -c - || {
+        echo "Python source failed its checksum. Exiting."
+        exit 1
+    }
 
     tar xzf Python-3.10.18.tgz
     cd Python-3.10.18

@@ -1,0 +1,14 @@
+# Build tools every agent build installs before `poetry install`: the manylinux
+# builder images (Dockerfile, Dockerfile.arm), the Alpine build (py2exe_alpine.sh),
+# the Windows build (build-release.yml, windows.yml, py2exe_windows.ps1) and the
+# local fallback in py2exe.sh. Compiled with hashes by compile.sh; the agent's
+# own dependencies are hash-locked in poetry.lock.
+pip
+setuptools
+wheel
+poetry==2.4.1
+
+# rapidfuzz (via cleo) stopped shipping manylinux2014 wheels for Python 3.10 --
+# the manylinux builders' Python -- at 3.14. Everything here installs with
+# --only-binary, so hold it at the last release that has them there.
+rapidfuzz<3.14; python_version < "3.11"

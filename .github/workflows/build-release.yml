@@ -10,19 +10,43 @@ on:
       - 'fix/**'
     tags:
       - 'v*'
+  # Weekly cold build of main: the builder images rebuilt without cache, the
+  # way a v* tag builds them, so a broken download or pin shows up here rather
+  # than in the middle of a release. Nothing is published from it.
+  schedule:
+    - cron: '37 3 * * 3'
   workflow_dispatch:
 
+# A newer push supersedes a branch run. A v* tag run is never cancelled: it may
+# be part-way through writing R2 latest/, and a half-written latest/ -- one
+# release's SHA256SUMS next to another's binaries -- stops every install.
+# Keyed on the full ref, since ref_name cannot tell a branch from a tag. The
+# weekly cold build gets a group of its own, so a merge to main cannot cancel
+# it (a cancelled run alerts nobody) and it cannot cancel main's build.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref_name }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name == 'schedule' && 'cold-build' || github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+# Read-only unless a job asks for more, whatever the repository (or a fork)
+# sets as its default token permissions: a job that declares nothing -- the
+# ones running third-party build tooling included -- never holds write access
+# to the repository and its releases.
+permissions:
+  contents: read
 
 env:
   REGISTRY: ghcr.io
+  # Build the builder images without any cache: always for a v* tag (every
+  # branch run can write the shared cache), and on the weekly cold build.
+  COLD_BUILD: ${{ startsWith(github.ref, 'refs/tags/v') || github.event_name == 'schedule' }}
+  # The BuildKit daemon runs every step of the builder image builds, a cold tag
+  # build included, so it is pinned by digest instead of the mutable
+  # buildx-stable-1 tag (v0.32.2 is what that tag named when this was pinned).
+  BUILDKIT_IMAGE: 'moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8'
   # Windows build pins. Kept aligned with .github/workflows/windows.yml; the
   # smoke job in that workflow is the CI quality gate and must stay green
   # before the artifacts built here ship.
   PYTHON_VERSION_WINDOWS: '3.11'
-  POETRY_VERSION_WINDOWS: '2.2.1'
   WIX_VERSION: '5.0.2'
   WINSW_VERSION: '2.12.0'
   WINSW_URL: 'https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW.NET4.exe'
@@ -33,7 +57,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Check for non-ASCII characters
         run: |
@@ -59,12 +85,19 @@ jobs:
   build-amd64:
     needs: [lint]
     runs-on: ubuntu-latest
+    # A cold build (v* tag, weekly) rebuilds the builder image from scratch;
+    # bound it so a stalled download fails in an hour, not after GitHub's six.
+    timeout-minutes: 60
+    outputs:
+      builder_digest: ${{ steps.builder.outputs.digest }}
     permissions:
       contents: read
       packages: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Set image name (lowercase)
         id: image
@@ -73,21 +106,23 @@ jobs:
           echo "name=$IMAGE_NAME" >> $GITHUB_OUTPUT
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Tag the builder image with the commit SHA as well as :latest, so
-      # build-synology-amd64 can pull this exact same-commit image. :latest is
-      # global across runs and gets overwritten by concurrent builds (any branch).
+      # Tag the builder image with the commit SHA as well as :latest, for
+      # traceability. build-synology-amd64 does NOT pull either tag: it pulls
+      # the digest this job outputs, because any branch run can overwrite a tag.
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
           tags: |
@@ -95,22 +130,37 @@ jobs:
             type=raw,value=${{ github.sha }}
 
       - name: Build and push Docker image (amd64)
-        uses: docker/build-push-action@v6
+        id: builder
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: ./Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:buildcache
+          # A cold build (v* tag, weekly) reads no cache: every branch run
+          # writes :buildcache too, so a cached layer could come from a branch
+          # -- and what this image builds on a tag is signed and attested.
+          no-cache: ${{ env.COLD_BUILD == 'true' }}
+          cache-from: ${{ env.COLD_BUILD != 'true' && format('type=registry,ref={0}/{1}:buildcache', env.REGISTRY, steps.image.outputs.name) || '' }}
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:buildcache,mode=max
-          load: true
+          # Push only, no `load`: with both exporters the reported digest can be
+          # the local one, which the registry may not have (containerd image
+          # store). One exporter, so `digest` is what was pushed -- and this
+          # job and build-synology-amd64 both run exactly that image.
 
       - name: Build agent binary (amd64)
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
+          BUILDER_DIGEST: ${{ steps.builder.outputs.digest }}
         run: |
+          if [ -z "$BUILDER_DIGEST" ]; then
+            echo "::error::the builder image build reported no digest"
+            exit 1
+          fi
           docker run --rm \
             -v ${{ github.workspace }}:/workspace \
             -e TARGET_ARCH=amd64 \
-            ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:latest \
+            "${IMAGE}@${BUILDER_DIGEST}" \
             bash /workspace/py2exe.sh
 
       - name: Fix permissions and create tarball (amd64)
@@ -122,7 +172,7 @@ jobs:
           mv fivenines-agent-linux-amd64.tar.gz ../
 
       - name: Upload artifact (amd64)
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: fivenines-agent-linux-amd64
           path: dist/fivenines-agent-linux-amd64.tar.gz
@@ -131,12 +181,19 @@ jobs:
   build-arm64:
     needs: [lint]
     runs-on: ubuntu-24.04-arm  # Native ARM64 runner - much faster than QEMU
+    # A cold build (v* tag, weekly) rebuilds the builder image from scratch;
+    # bound it so a stalled download fails in an hour, not after GitHub's six.
+    timeout-minutes: 60
+    outputs:
+      builder_digest: ${{ steps.builder.outputs.digest }}
     permissions:
       contents: read
       packages: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Set image name (lowercase)
         id: image
@@ -145,21 +202,23 @@ jobs:
           echo "name=$IMAGE_NAME" >> $GITHUB_OUTPUT
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Tag the builder image with the commit SHA as well as :latest, so
-      # build-synology-arm64 can pull this exact same-commit image. :latest is
-      # global across runs and gets overwritten by concurrent builds (any branch).
+      # Tag the builder image with the commit SHA as well as :latest, for
+      # traceability. build-synology-arm64 does NOT pull either tag: it pulls
+      # the digest this job outputs, because any branch run can overwrite a tag.
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
           tags: |
@@ -167,22 +226,37 @@ jobs:
             type=raw,value=${{ github.sha }}
 
       - name: Build and push Docker image (arm64)
-        uses: docker/build-push-action@v6
+        id: builder
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: ./Dockerfile.arm
           push: true
           tags: ${{ steps.meta.outputs.tags }}
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:buildcache
+          # A cold build (v* tag, weekly) reads no cache: every branch run
+          # writes :buildcache too, so a cached layer could come from a branch
+          # -- and what this image builds on a tag is signed and attested.
+          no-cache: ${{ env.COLD_BUILD == 'true' }}
+          cache-from: ${{ env.COLD_BUILD != 'true' && format('type=registry,ref={0}/{1}:buildcache', env.REGISTRY, steps.image.outputs.name) || '' }}
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:buildcache,mode=max
-          load: true
+          # Push only, no `load`: with both exporters the reported digest can be
+          # the local one, which the registry may not have (containerd image
+          # store). One exporter, so `digest` is what was pushed -- and this
+          # job and build-synology-arm64 both run exactly that image.
 
       - name: Build agent binary (arm64)
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
+          BUILDER_DIGEST: ${{ steps.builder.outputs.digest }}
         run: |
+          if [ -z "$BUILDER_DIGEST" ]; then
+            echo "::error::the builder image build reported no digest"
+            exit 1
+          fi
           docker run --rm \
             -v ${{ github.workspace }}:/workspace \
             -e TARGET_ARCH=arm64 \
-            ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:latest \
+            "${IMAGE}@${BUILDER_DIGEST}" \
             bash /workspace/py2exe.sh
 
       - name: Fix permissions and create tarball (arm64)
@@ -194,7 +268,7 @@ jobs:
           mv fivenines-agent-linux-arm64.tar.gz ../
 
       - name: Upload artifact (arm64)
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: fivenines-agent-linux-arm64
           path: dist/fivenines-agent-linux-arm64.tar.gz
@@ -203,12 +277,17 @@ jobs:
   build-alpine-amd64:
     needs: [lint]
     runs-on: ubuntu-latest
+    # A cold build (v* tag, weekly) rebuilds the builder image from scratch;
+    # bound it so a stalled download fails in an hour, not after GitHub's six.
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Set image name (lowercase)
         id: image
@@ -217,10 +296,12 @@ jobs:
           echo "name=$IMAGE_NAME" >> $GITHUB_OUTPUT
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -228,26 +309,32 @@ jobs:
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
           tags: |
             type=raw,value=latest
 
       - name: Build and push Docker image (alpine-amd64)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: ./Dockerfile.alpine
           push: true
           tags: ${{ steps.meta.outputs.tags }}
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:buildcache
+          # A cold build (v* tag, weekly) reads no cache: every branch run
+          # writes :buildcache too, so a cached layer could come from a branch
+          # -- and what this image builds on a tag is signed and attested.
+          no-cache: ${{ env.COLD_BUILD == 'true' }}
+          cache-from: ${{ env.COLD_BUILD != 'true' && format('type=registry,ref={0}/{1}:buildcache', env.REGISTRY, steps.image.outputs.name) || '' }}
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:buildcache,mode=max
           load: true
 
       - name: Build agent binary (alpine-amd64)
         run: |
-          docker run --rm \
+          # --pull=never: the image this job just built and loaded, never a
+          # :latest another run pushed to the registry.
+          docker run --rm --pull=never \
             -v ${{ github.workspace }}:/workspace \
             -e TARGET_ARCH=amd64 \
             ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:latest \
@@ -262,7 +349,7 @@ jobs:
           mv fivenines-agent-alpine-amd64.tar.gz ../
 
       - name: Upload artifact (alpine-amd64)
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: fivenines-agent-alpine-amd64
           path: dist/fivenines-agent-alpine-amd64.tar.gz
@@ -271,12 +358,17 @@ jobs:
   build-alpine-arm64:
     needs: [lint]
     runs-on: ubuntu-24.04-arm  # Native ARM64 runner
+    # A cold build (v* tag, weekly) rebuilds the builder image from scratch;
+    # bound it so a stalled download fails in an hour, not after GitHub's six.
+    timeout-minutes: 60
     permissions:
       contents: read
       packages: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Set image name (lowercase)
         id: image
@@ -285,10 +377,12 @@ jobs:
           echo "name=$IMAGE_NAME" >> $GITHUB_OUTPUT
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -296,26 +390,32 @@ jobs:
 
       - name: Extract Docker metadata
         id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}
           tags: |
             type=raw,value=latest
 
       - name: Build and push Docker image (alpine-arm64)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: ./Dockerfile.alpine-arm
           push: true
           tags: ${{ steps.meta.outputs.tags }}
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:buildcache
+          # A cold build (v* tag, weekly) reads no cache: every branch run
+          # writes :buildcache too, so a cached layer could come from a branch
+          # -- and what this image builds on a tag is signed and attested.
+          no-cache: ${{ env.COLD_BUILD == 'true' }}
+          cache-from: ${{ env.COLD_BUILD != 'true' && format('type=registry,ref={0}/{1}:buildcache', env.REGISTRY, steps.image.outputs.name) || '' }}
           cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:buildcache,mode=max
           load: true
 
       - name: Build agent binary (alpine-arm64)
         run: |
-          docker run --rm \
+          # --pull=never: the image this job just built and loaded, never a
+          # :latest another run pushed to the registry.
+          docker run --rm --pull=never \
             -v ${{ github.workspace }}:/workspace \
             -e TARGET_ARCH=arm64 \
             ${{ env.REGISTRY }}/${{ steps.image.outputs.name }}:latest \
@@ -330,7 +430,7 @@ jobs:
           mv fivenines-agent-alpine-arm64.tar.gz ../
 
       - name: Upload artifact (alpine-arm64)
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: fivenines-agent-alpine-arm64
           path: dist/fivenines-agent-alpine-arm64.tar.gz
@@ -345,16 +445,19 @@ jobs:
     needs: [lint]
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: ${{ env.PYTHON_VERSION_WINDOWS }}
 
-      - name: Install Poetry
+      - name: Install build tools (hash-pinned)
         shell: pwsh
-        run: pip install "poetry==${{ env.POETRY_VERSION_WINDOWS }}"
+        run: |
+          python -m pip install --require-hashes --no-deps --only-binary :all: -r ci/requirements/build-tools.txt
 
       - name: Run Windows PyInstaller build
         shell: pwsh
@@ -414,7 +517,7 @@ jobs:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-        uses: azure/trusted-signing-action@v0.5.1
+        uses: azure/trusted-signing-action@0d74250c661747df006298d0fb49944c10f16e03 # v0.5.1
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -429,7 +532,7 @@ jobs:
           timestamp-digest: SHA256
 
       - name: Upload Windows MSI
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: fivenines-agent-windows-amd64
           path: windows/installer/fivenines-agent-windows-amd64.msi
@@ -443,27 +546,37 @@ jobs:
       packages: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build agent binary (synology-amd64)
+        env:
+          BUILDER_DIGEST: ${{ needs.build-amd64.outputs.builder_digest }}
         run: |
-          # Pull the builder image by commit SHA, not :latest. :latest is global
-          # across runs, so a concurrent build (any branch) can overwrite it
-          # between build-amd64's push and this pull, yielding a foreign image
-          # (and defeating the pre-baked libpython). build-amd64 pushes :<sha>.
+          # Pull the builder image by the digest build-amd64 reported for this run's
+          # build, never by tag: every branch run can push to this package, so
+          # :latest and even :<sha> can be overwritten between that push and this
+          # pull, while a digest names content. If the digest does not resolve,
+          # this fails closed rather than falling back to a tag.
+          # On a v* tag, whatever this image builds is signed and attested.
+          if [ -z "$BUILDER_DIGEST" ]; then
+            echo "::error::build-amd64 reported no builder image digest"
+            exit 1
+          fi
           IMAGE=$(echo "${{ env.REGISTRY }}/${{ github.repository }}-builder-amd64" | tr '[:upper:]' '[:lower:]')
           docker run --rm \
             -v ${{ github.workspace }}:/workspace \
             -e TARGET_ARCH=amd64 \
             -e SYNOLOGY=1 \
-            ${IMAGE}:${{ github.sha }} \
+            "${IMAGE}@${BUILDER_DIGEST}" \
             bash /workspace/py2exe.sh
 
       - name: Fix permissions and build SPK (synology-amd64)
@@ -473,7 +586,7 @@ jobs:
           bash synology/build_spk.sh "$VERSION" x86_64
 
       - name: Upload artifact (synology-amd64)
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: fivenines-agent-synology-amd64
           path: dist/synology/fivenines-agent-*-x86_64.spk
@@ -487,27 +600,37 @@ jobs:
       packages: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build agent binary (synology-arm64)
+        env:
+          BUILDER_DIGEST: ${{ needs.build-arm64.outputs.builder_digest }}
         run: |
-          # Pull the builder image by commit SHA, not :latest. :latest is global
-          # across runs, so a concurrent build (any branch) can overwrite it
-          # between build-arm64's push and this pull, yielding a foreign image
-          # (and defeating the pre-baked libpython). build-arm64 pushes :<sha>.
+          # Pull the builder image by the digest build-arm64 reported for this run's
+          # build, never by tag: every branch run can push to this package, so
+          # :latest and even :<sha> can be overwritten between that push and this
+          # pull, while a digest names content. If the digest does not resolve,
+          # this fails closed rather than falling back to a tag.
+          # On a v* tag, whatever this image builds is signed and attested.
+          if [ -z "$BUILDER_DIGEST" ]; then
+            echo "::error::build-arm64 reported no builder image digest"
+            exit 1
+          fi
           IMAGE=$(echo "${{ env.REGISTRY }}/${{ github.repository }}-builder-arm64" | tr '[:upper:]' '[:lower:]')
           docker run --rm \
             -v ${{ github.workspace }}:/workspace \
             -e TARGET_ARCH=arm64 \
             -e SYNOLOGY=1 \
-            ${IMAGE}:${{ github.sha }} \
+            "${IMAGE}@${BUILDER_DIGEST}" \
             bash /workspace/py2exe.sh
 
       - name: Fix permissions and build SPK (synology-arm64)
@@ -517,7 +640,7 @@ jobs:
           bash synology/build_spk.sh "$VERSION" aarch64
 
       - name: Upload artifact (synology-arm64)
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: fivenines-agent-synology-arm64
           path: dist/synology/fivenines-agent-*-aarch64.spk
@@ -528,7 +651,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Install shellcheck
         run: sudo apt-get install -y shellcheck
@@ -545,7 +670,9 @@ jobs:
             fivenines_common.sh \
             ci/test-distro.sh \
             ci/test-selinux-vm.sh \
-            ci/test-signing.sh
+            ci/test-signing.sh \
+            ci/check-nosec.sh \
+            ci/requirements/compile.sh
 
       - name: Verify release-signature checking
         run: sh ci/test-signing.sh
@@ -628,10 +755,12 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Download artifact
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           name: fivenines-agent-${{ matrix.binary }}
           path: artifacts
@@ -680,7 +809,7 @@ jobs:
 
       - name: Upload test logs on failure
         if: steps.distro-test.outcome == 'failure'
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: test-logs-${{ matrix.binary }}-${{ strategy.job-index }}
           path: ${{ github.workspace }}/test-output/
@@ -693,10 +822,12 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Download artifact
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           name: fivenines-agent-linux-amd64
           path: artifacts
@@ -735,7 +866,7 @@ jobs:
 
       - name: Upload VM logs on failure
         if: failure()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
         with:
           name: selinux-vm-test-logs
           path: /tmp/vm-console.log
@@ -751,12 +882,16 @@ jobs:
       (startsWith(github.ref, 'refs/heads/release/') || startsWith(github.ref, 'refs/heads/feature/'))
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           path: artifacts
           pattern: fivenines-agent-*
@@ -794,9 +929,9 @@ jobs:
           mv artifacts/fivenines-agent-windows-amd64/fivenines-agent-windows-amd64.msi release/
 
           # The startup definitions the system installers drop into place as
-          # root. They are release assets so that SHA256SUMS (and therefore
-          # SHA256SUMS.sig) covers them: before #154 the installers fetched
-          # these from the main branch, which no manifest can cover.
+          # root. They are release assets so that SHA256SUMS covers them (a
+          # pre-release is not signed, see below): before #154 the installers
+          # fetched these from the main branch, which no manifest can cover.
           cp fivenines-agent.service release/
           cp fivenines-agent.openrc release/
           cp fivenines_script.sh release/
@@ -824,61 +959,37 @@ jobs:
             echo 'CHECKSUMS_EOF'
           } >> "$GITHUB_OUTPUT"
 
-      # Detached ECDSA P-256 signature over SHA256SUMS. The private key lives
-      # in a repository secret, never in the release bucket - that is the whole
-      # point: a mirror that rewrites the manifest cannot re-sign it. Skipped
-      # when the secret is not configured (forks, or before the key exists),
-      # the same shape as the Authenticode step above.
-      - name: Sign SHA256SUMS
-        if: env.RELEASE_SIGNING_KEY != ''
-        env:
-          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
-        working-directory: release
-        run: |
-          KEY="$RUNNER_TEMP/release-signing.key"
-          PUB="$RUNNER_TEMP/release-signing.pub"
-          ( umask 077; printf '%s\n' "$RELEASE_SIGNING_KEY" > "$KEY" )
+      # Not signed. The release signing key lives in the `release` environment,
+      # which only v* tag builds can use: this job runs for every feature/** and
+      # release/** push, and a key reachable from a branch is reachable by
+      # whatever that branch's workflow file says. Nothing verifies a
+      # pre-release's SHA256SUMS anyway -- the installers read the manifest from
+      # the latest stable release, and a FIVENINES_AGENT_URL build is verified
+      # only when the operator pins its digest with FIVENINES_AGENT_SHA256 --
+      # it installs UNVERIFIED otherwise (see the release body below).
 
-          openssl dgst -sha256 -sign "$KEY" -out SHA256SUMS.sig SHA256SUMS
+      # Signed build provenance for every asset the manifest lists: binds each
+      # file's digest to this workflow, commit and ref. Driven by SHA256SUMS
+      # rather than a file list, so a newly published asset is covered without
+      # anyone having to remember this step.
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: release/SHA256SUMS
 
-          # A signature that does not verify must never ship: every installer
-          # with the key armed would refuse to install.
-          openssl ec -in "$KEY" -pubout -out "$PUB" 2>/dev/null
-          openssl dgst -sha256 -verify "$PUB" -signature SHA256SUMS.sig SHA256SUMS
-
-          # A valid signature made with the WRONG key is worse than no
-          # signature: every agent embeds one public key verbatim and would
-          # refuse the release outright. Compare the key derived from the
-          # secret against the one the installers actually carry, in DER so
-          # PEM line-wrapping cannot make two identical keys look different.
-          EMBEDDED="$RUNNER_TEMP/embedded.pub"
-          sed -n '/-----BEGIN PUBLIC KEY-----/,/-----END PUBLIC KEY-----/p' \
-            "$GITHUB_WORKSPACE/fivenines_common.sh" > "$EMBEDDED"
-          if [ -s "$EMBEDDED" ]; then
-            if ! cmp -s \
-              <(openssl pkey -pubin -in "$PUB" -outform DER) \
-              <(openssl pkey -pubin -in "$EMBEDDED" -outform DER); then
-              echo "::error::RELEASE_SIGNING_KEY does not match the public key embedded in the install scripts. Every agent would refuse this release."
-              rm -f "$KEY" "$PUB" "$EMBEDDED"
-              exit 1
-            fi
-            echo "Signing key matches the public key embedded in the install scripts."
-          else
-            echo "::warning::No public key is embedded in the install scripts, so nothing verifies this signature yet."
-          fi
-
-          rm -f "$KEY" "$PUB" "$EMBEDDED"
-          echo "Signed SHA256SUMS ($(wc -c < SHA256SUMS.sig) byte signature)"
-
+      # The tag name comes from the branch name, which may hold shell syntax
+      # (`$(...)` is a legal ref); pass it as data, never spliced into the script.
       - name: Delete existing pre-release with same tag (if exists)
         run: |
-          gh release delete "${{ steps.release_info.outputs.TAG_NAME }}" --yes || true
-          git push origin --delete "refs/tags/${{ steps.release_info.outputs.TAG_NAME }}" || true
+          gh release delete "$TAG_NAME" --yes --cleanup-tag || true
+          # A tag left behind without its release (deleted by hand, say).
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG_NAME}" || true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ steps.release_info.outputs.TAG_NAME }}
 
       - name: Create Pre-Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: ${{ steps.release_info.outputs.TAG_NAME }}
           name: "Test Build: ${{ steps.release_info.outputs.BRANCH_NAME }} (${{ steps.release_info.outputs.SHORT_SHA }})"
@@ -952,6 +1063,11 @@ jobs:
             FIVENINES_AGENT_SHA256="<digest from the list above>" \
             bash fivenines_update.sh
             ```
+
+            Test builds are not signed: the release signing key is available
+            to version-tag builds only. Each asset still carries a
+            build-provenance attestation for this branch build
+            (`gh attestation verify <file> --repo ${{ github.repository }} --source-ref refs/heads/${{ steps.release_info.outputs.BRANCH_NAME }}`).
           files: |
             release/fivenines-agent-linux-amd64.tar.gz
             release/fivenines-agent-linux-arm64.tar.gz
@@ -963,23 +1079,48 @@ jobs:
             release/fivenines-agent.openrc
             release/fivenines_script.sh
             release/SHA256SUMS
-            release/SHA256SUMS.sig
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # Production release for version tags
   release:
-    needs: [build-amd64, build-arm64, build-alpine-amd64, build-alpine-arm64, build-synology-amd64, build-synology-arm64, build-windows-amd64, test-distro-matrix, test-selinux-vm]
+    # shellcheck-scripts carries the signature-verification test and the
+    # shared-function sync check (which covers the embedded public key in
+    # every installer): a release must not publish scripts that failed them.
+    needs: [build-amd64, build-arm64, build-alpine-amd64, build-alpine-arm64, build-synology-amd64, build-synology-arm64, build-windows-amd64, test-distro-matrix, test-selinux-vm, shellcheck-scripts]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    # RELEASE_SIGNING_KEY and the R2 credentials are secrets of this GitHub
+    # environment, whose deployment policy admits v* tags only, and a tag
+    # ruleset lets only repository admins create, move or delete a v* tag. A
+    # workflow run for any branch -- whatever its workflow file says -- cannot
+    # read them.
+    environment:
+      name: release
+      url: https://github.com/${{ github.repository }}/releases/tag/${{ github.ref_name }}
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # Releases are cut from main: merge first, then tag main's commit. A v*
+      # tag on any other commit -- one no pull request ever reviewed -- is
+      # refused here, before anything is signed or published.
+      - name: Refuse a tag that is not on main
+        run: |
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::${GITHUB_REF_NAME} points at ${GITHUB_SHA}, which is not on main. Tag a commit that has been merged to main."
+            exit 1
+          fi
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           path: artifacts
           pattern: fivenines-agent-*
@@ -1042,10 +1183,10 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       # Detached ECDSA P-256 signature over SHA256SUMS. The private key lives
-      # in a repository secret, never in the release bucket - that is the whole
-      # point: a mirror that rewrites the manifest cannot re-sign it. Skipped
-      # when the secret is not configured (forks, or before the key exists),
-      # the same shape as the Authenticode step above.
+      # in the `release` environment, never in the release bucket - that is the
+      # whole point: a mirror that rewrites the manifest cannot re-sign it.
+      # Skipped when the secret is not configured (forks, or before the key
+      # exists), the same shape as the Authenticode step above.
       - name: Sign SHA256SUMS
         if: env.RELEASE_SIGNING_KEY != ''
         env:
@@ -1089,12 +1230,12 @@ jobs:
 
       # The embedded public key and the published signature have to move
       # together. A key in the scripts with no signature on the mirror makes
-      # every install warn, and hard-fail under FIVENINES_REQUIRE_SIGNATURE=1.
+      # every install abort: a missing .sig is fatal once a key is embedded.
       - name: Check release signing is coherent
         run: |
           if grep -q 'BEGIN PUBLIC KEY' fivenines_common.sh; then
             if [ ! -s release/SHA256SUMS.sig ]; then
-              echo "::error::The install scripts embed a release signing public key, but no SHA256SUMS.sig was produced. Set the RELEASE_SIGNING_KEY secret, or remove the embedded key."
+              echo "::error::The install scripts embed a release signing public key, but no SHA256SUMS.sig was produced. Set RELEASE_SIGNING_KEY in the release environment, or remove the embedded key."
               exit 1
             fi
             echo "Release signing is armed: public key embedded, SHA256SUMS.sig published."
@@ -1104,8 +1245,16 @@ jobs:
             echo "::warning::Release signing is NOT armed: no public key embedded and no SHA256SUMS.sig published. Artifacts ship with checksum-only verification."
           fi
 
+      # Signed build provenance for every asset the manifest lists, binding
+      # each digest to this workflow, the commit and the tag. Runs before the
+      # release is created, so a release never goes out without it.
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: release/SHA256SUMS
+
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           name: Release ${{ steps.version.outputs.VERSION }}
           draft: false
@@ -1119,6 +1268,10 @@ jobs:
             The install scripts verify these automatically. To check an
             artifact by hand, see
             [Verifying a release artifact](https://github.com/${{ github.repository }}#verifying-a-release-artifact).
+
+            Every asset also carries a signed build-provenance attestation
+            tying it to this tag and workflow; see
+            [Build provenance](https://github.com/${{ github.repository }}#build-provenance).
           files: |
             release/fivenines-agent-linux-amd64.tar.gz
             release/fivenines-agent-linux-arm64.tar.gz
@@ -1139,12 +1292,30 @@ jobs:
     needs: [release]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    # One writer to latest/ at a time: two tag runs syncing at once could leave
+    # one run's SHA256SUMS next to the other's signature or binaries, and every
+    # installer would refuse the mismatch. A second sync waits for the first;
+    # GitHub keeps one pending job per group, so a third replaces the second
+    # (refusing an older tag over a newer one is a TODO, see TODOS.md).
+    concurrency:
+      group: r2-latest
+      cancel-in-progress: false
+    # Same environment as the release job, for the same secrets.
+    environment:
+      name: release
+      url: https://releases.fivenines.io/${{ github.ref_name }}/SHA256SUMS
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
           path: artifacts
           pattern: fivenines-agent-*
@@ -1199,10 +1370,10 @@ jobs:
           cat r2-upload/latest/SHA256SUMS
 
       # Detached ECDSA P-256 signature over SHA256SUMS. The private key lives
-      # in a repository secret, never in the release bucket - that is the whole
-      # point: a mirror that rewrites the manifest cannot re-sign it. Skipped
-      # when the secret is not configured (forks, or before the key exists),
-      # the same shape as the Authenticode step above.
+      # in the `release` environment, never in the release bucket - that is the
+      # whole point: a mirror that rewrites the manifest cannot re-sign it.
+      # Skipped when the secret is not configured (forks, or before the key
+      # exists), the same shape as the Authenticode step above.
       - name: Sign SHA256SUMS
         if: env.RELEASE_SIGNING_KEY != ''
         env:
@@ -1244,9 +1415,41 @@ jobs:
           rm -f "$KEY" "$PUB" "$EMBEDDED"
           echo "Signed SHA256SUMS ($(wc -c < SHA256SUMS.sig) byte signature)"
 
-      - name: Install rclone
+      # latest/ is what every installer and updater reads, and they all abort on
+      # a missing signature once a public key is embedded. An unsigned sync --
+      # say, the signing key missing from the `release` environment -- would
+      # stop every install fleet-wide, so refuse before touching the bucket.
+      - name: Refuse to publish an unsigned manifest
         run: |
-          curl https://rclone.org/install.sh | sudo bash
+          if grep -q 'BEGIN PUBLIC KEY' fivenines_common.sh && [ ! -s r2-upload/latest/SHA256SUMS.sig ]; then
+            echo "::error::The install scripts embed a release signing public key, but no SHA256SUMS.sig was produced for R2. Is RELEASE_SIGNING_KEY set in the release environment?"
+            exit 1
+          fi
+
+      # R2 also serves what the GitHub release does not: the install, update
+      # and uninstall scripts. Driven by the R2 manifest like the release job's
+      # step, so the binaries it also lists get a second attestation from the
+      # same run -- harmless, and nothing on this mirror goes unattested.
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: r2-upload/latest/SHA256SUMS
+
+      # Pinned and checksum-verified, never `curl .../install.sh | sudo bash`:
+      # this job holds the R2 write credentials and the release signing key,
+      # and a root shell running whatever a URL serves today could read both.
+      # The digest is from rclone's PGP-signed SHA256SUMS for this version.
+      - name: Install rclone
+        env:
+          RCLONE_VERSION: 'v1.75.1'
+          RCLONE_SHA256: '982b5aa772841168f8e380f139e9e787b2a105403e32b94da8676a0e1c0a13ab'
+        run: |
+          ZIP="rclone-${RCLONE_VERSION}-linux-amd64.zip"
+          curl -fsSL -o "$RUNNER_TEMP/$ZIP" "https://downloads.rclone.org/${RCLONE_VERSION}/${ZIP}"
+          echo "${RCLONE_SHA256}  $RUNNER_TEMP/$ZIP" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/$ZIP" -d "$RUNNER_TEMP"
+          sudo install -m 0755 "$RUNNER_TEMP/rclone-${RCLONE_VERSION}-linux-amd64/rclone" /usr/local/bin/rclone
+          rclone version
 
       - name: Configure rclone for R2
         run: |

@@ -1,5 +1,9 @@
 # fivenines agent
 
+[![CodeQL](https://github.com/Five-Nines-io/fivenines_agent/actions/workflows/codeql.yml/badge.svg?branch=main)](https://github.com/Five-Nines-io/fivenines_agent/actions/workflows/codeql.yml?query=branch%3Amain)
+[![Bandit](https://github.com/Five-Nines-io/fivenines_agent/actions/workflows/bandit.yml/badge.svg?branch=main)](https://github.com/Five-Nines-io/fivenines_agent/actions/workflows/bandit.yml?query=branch%3Amain)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/Five-Nines-io/fivenines_agent/badge)](https://scorecard.dev/viewer/?uri=github.com/Five-Nines-io/fivenines_agent)
+
 This agent collects server metrics from the monitored host and sends it to the [fivenines](https://fivenines.io) API.
 
 Runs on **Linux** (glibc + musl, amd64 + arm64), **Windows** (Server 2019+,
@@ -16,8 +20,10 @@ Windows 10/11), **Synology DSM 7** and **UNRAID**.
   - [Synology Installation (DSM 7+)](#synology-installation-dsm-7)
   - [Cloning VMs or building golden images](#cloning-vms-or-building-golden-images)
   - [Verifying a release artifact](#verifying-a-release-artifact)
+    ([build provenance](#build-provenance))
 - [Update](#update) / [Remove](#remove) / [Debug](#debug)
 - [Permissions](#permissions)
+- [Security evidence](#security-evidence) (see also [SECURITY.md](SECURITY.md))
 - **Host and platform monitoring**
   - [Docker Monitoring](#docker-monitoring) (container states + image vulnerability scanning)
   - [Proxmox VE Monitoring](#proxmox-ve-monitoring)
@@ -405,9 +411,12 @@ you did not download as missing.
 `SHA256SUMS.sig` next to it -- ECDSA P-256 over SHA-256, chosen over Ed25519
 because OpenSSL 1.0.2 on CentOS 7 cannot verify Ed25519 -- and the install
 scripts check it against a public key embedded in the script before they trust
-any digest in the manifest. The signing key lives in a repository secret and
-never touches the release bucket, so a mirror that rewrote `SHA256SUMS` cannot
-re-sign it.
+any digest in the manifest. The signing key never touches the release bucket,
+so a mirror that rewrote `SHA256SUMS` cannot re-sign it. It is a secret of a
+GitHub environment that only builds of a `v*` release tag can use: a workflow
+run for any branch cannot read it, whatever that branch's workflow file says.
+Test builds published from development branches are therefore unsigned, and
+the installers never read their manifest.
 
 Once a public key is embedded, **stripping the signature is not a way around
 it**: a missing or empty `SHA256SUMS.sig` aborts the install exactly like a bad
@@ -468,16 +477,84 @@ an installer that embeds **no** public key at all. That is the documented key
 rotation escape hatch, a property of the script rather than of your host, and
 `FIVENINES_REQUIRE_SIGNATURE=1` makes it fatal too.
 
+#### Build provenance
+
+From **v1.19.1**, every release asset has a signed
+[build provenance attestation](https://docs.github.com/en/actions/concepts/security/artifact-attestations):
+the tarballs, Synology packages, Windows MSI and startup definitions, and on
+`releases.fivenines.io` the install, update and uninstall scripts as well. An
+attestation records the repository, workflow file, commit and tag that produced
+the file. It is signed with a short-lived Sigstore certificate issued to that
+one workflow run, and the signature is recorded in the public Rekor
+transparency log. All of them are listed at
+[github.com/Five-Nines-io/fivenines_agent/attestations](https://github.com/Five-Nines-io/fivenines_agent/attestations).
+
+The signature on `SHA256SUMS` shows that a file is what fivenines published.
+The attestation shows that it was built by this repository's release workflow,
+on a GitHub-hosted runner, from the source at that tag, and it does not depend
+on the release signing key.
+
+**The install scripts do not check provenance** -- they check the signature
+and the digest, as described above. Provenance is for reviewing a release
+yourself. To verify one pinned release end to end, use `openssl` and the
+[GitHub CLI](https://cli.github.com/). The CLI looks attestations up through
+the GitHub API, so it must be logged in (`gh auth login`); any GitHub account
+will do.
+
+```bash
+VERSION=v1.19.1
+FILE=fivenines-agent-linux-amd64.tar.gz
+BASE="https://releases.fivenines.io/${VERSION}"
+
+wget -q "${BASE}/${FILE}" "${BASE}/SHA256SUMS" "${BASE}/SHA256SUMS.sig"
+
+# 1. The manifest carries the fivenines release signature
+#    (the public key above, saved as fivenines-release.pub)
+openssl dgst -sha256 -verify fivenines-release.pub \
+  -signature SHA256SUMS.sig SHA256SUMS
+# Verified OK
+
+# 2. The file is the one the manifest lists
+grep " ${FILE}\$" SHA256SUMS | sha256sum -c -
+# fivenines-agent-linux-amd64.tar.gz: OK
+
+# 3. It was built by this repository's release workflow, from that tag
+gh attestation verify "${FILE}" \
+  --repo Five-Nines-io/fivenines_agent \
+  --signer-workflow Five-Nines-io/fivenines_agent/.github/workflows/build-release.yml \
+  --source-ref "refs/tags/${VERSION}" \
+  --deny-self-hosted-runners
+# Verification succeeded!
+```
+
+Use the versioned path (`/v1.19.1/`) rather than `latest/`, which every new
+release overwrites, so every file comes from the same release. The same assets
+are attached to the [GitHub release](https://github.com/Five-Nines-io/fivenines_agent/releases) for that tag.
+
+Each step fails loudly: `openssl` prints `Verification failure`, `sha256sum`
+prints `FAILED`, and `gh` exits non-zero. `--source-ref` rejects a genuine
+artifact from a different release, or one built from a development branch.
+`--signer-workflow` rejects anything signed by another workflow in this
+repository. The same `gh attestation verify` command works for any other
+asset: the MSI, an `.spk`, or `fivenines_setup.sh` from the versioned path. On
+Windows, Authenticode signing of the MSI -- the signature Windows itself
+checks -- is tracked separately in
+[#63](https://github.com/Five-Nines-io/fivenines_agent/issues/63).
+
+Releases older than v1.19.1 have no attestation, and `gh` reports
+`no attestations found` for them.
+
 #### What each layer proves
 
 | Layer | Catches | Does not catch |
 |-------|---------|----------------|
 | `SHA256SUMS` digest | Truncated download, half-finished mirror sync, swapped or mislabelled asset | An attacker who owns the mirror -- they rewrite the manifest too |
-| `SHA256SUMS.sig` | An attacker who owns the mirror or the GitHub release | A compromise of the signing key itself; a **rollback**, since the manifest carries no version binding and the installers always read `latest` -- a mirror owner can keep serving an older, genuinely signed release |
+| `SHA256SUMS.sig` | An attacker who owns the mirror or the GitHub release | A compromise of the signing key itself; a **rollback**, since the manifest carries no version binding and the installers always read `latest` -- a mirror owner can keep serving an older, genuinely signed release, or one of the development test builds published before v1.19.1, whose manifests were signed with the same key (those signatures were removed from the GitHub pre-releases on 2026-09-25, but a copy taken earlier still verifies; the provenance check's `--source-ref` rejects them) |
+| Build provenance (manual check) | A file this repository's release workflow did not build from the tag you pinned: built elsewhere and signed with a stolen release key, built from a branch, or an older release served as a newer one | A malicious change committed to the repository itself; a compromised base image. What the build downloads is verified -- the agent's Python dependencies are hash-locked in `poetry.lock`, the build tools and libvirt-python in `ci/requirements/`, and the libvirt, libtirpc and Python sources are checked against pinned SHA-256 digests -- but the builder images start from base images pinned by tag, not digest, and the Windows MSI's WiX toolchain is installed by version from nuget.org |
 
-Both layers apply to the same set of files: the agent tarball **and** the
-systemd unit, OpenRC init script and UNRAID boot script the installer puts in
-place as root.
+The digest and signature layers apply to the same set of files: the agent
+tarball **and** the systemd unit, OpenRC init script and UNRAID boot script the
+installer puts in place as root.
 
 #### Installing a custom or pre-release build
 
@@ -881,6 +958,33 @@ storage and security ones:
   Inventory:
     [+] Software Inventory
 ```
+
+## Security evidence
+
+These are automated checks and release metadata a security team can inspect
+directly. They are evidence, not a guarantee. None of them is an audit or a
+certification, and a clean result means the tools found nothing, not that
+there is nothing to find.
+
+| Check | What it covers | Latest results |
+|-------|----------------|----------------|
+| CodeQL | Static analysis of the agent's Python code and of the CI workflows, with the `security-extended` queries. Runs on every pull request, every push to `main` and weekly. A run **fails** if it finds anything and lists each result in its run summary, because GitHub shows code scanning alerts only to maintainers. On a pull request it reports only results in the lines the pull request changes; the runs on `main` and the weekly run cover the whole codebase. | [CodeQL runs](https://github.com/Five-Nines-io/fivenines_agent/actions/workflows/codeql.yml?query=branch%3Amain) |
+| Bandit | Python security lint of the shipped code. Fails on any finding that is not suppressed under the [policy](CONTRIBUTING.md#findings-and-suppressions). Each run's summary lists every suppression with its reason. | [Bandit runs](https://github.com/Five-Nines-io/fivenines_agent/actions/workflows/bandit.yml?query=branch%3Amain) |
+| OpenSSF Scorecard | Repository and supply-chain practices (pinned dependencies, workflow token permissions, branch protection, code review, signed releases and more), each scored 0-10 with the reason. Runs weekly and on every push to `main`. | [scorecard.dev](https://scorecard.dev/viewer/?uri=github.com/Five-Nines-io/fivenines_agent) |
+| Dependabot | Security updates for the Python lockfile (`poetry.lock`, which every release build installs from) and for the pinned GitHub Actions. The alerts themselves are visible only to maintainers. | [configuration](.github/dependabot.yml) |
+| Signed checksums | ECDSA-signed `SHA256SUMS` over every release asset. The Linux install and update scripts check it before anything is unpacked; the Windows installer and the Synology packages are not verified automatically yet (Windows code signing: [#63](https://github.com/Five-Nines-io/fivenines_agent/issues/63)). | [Verifying a release artifact](#verifying-a-release-artifact) |
+| Build provenance | A signed attestation for every release asset (from v1.19.1) that ties it to the tag, commit and workflow that built it. | [attestations](https://github.com/Five-Nines-io/fivenines_agent/attestations), [how to verify](#build-provenance) |
+
+Each results page lists every run with its date and outcome. Use it rather
+than the badges at the top of this README: a badge shows the last result, even
+if the check has since stopped running. The Scorecard page lists every check
+with its score and reason, including the ones that score low.
+
+What these checks do not cover: the fivenines service the agent reports to,
+and the behaviour of the agent on your hosts (see [Permissions](#permissions)
+for what it can read, and the [systemd unit](fivenines-agent.service) for how
+it is sandboxed). No independent third-party review of the agent has been
+published. To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Docker Monitoring
 
@@ -1989,6 +2093,9 @@ agent's memory without bound nor stall its collection loop.
 ## Contribute
 
 Feel free to open a PR/issues if you encounter any bug or want to contribute.
+[CONTRIBUTING.md](CONTRIBUTING.md) covers the development workflow, the test
+policy and how security-check findings are handled. Report security issues
+privately, as described in [SECURITY.md](SECURITY.md).
 
 ## Contact
 

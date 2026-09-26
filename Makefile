@@ -33,7 +33,8 @@ lint: $(INSTALL_STAMP)
 	$(POETRY) run black --check ./tests/ $(NAME) --diff
 	$(POETRY) run flake8 --ignore=W503,E501 ./tests/ $(NAME)
 	$(POETRY) run mypy ./tests/ $(NAME) --ignore-missing-imports
-	$(POETRY) run bandit -r $(NAME) -s B608
+	$(POETRY) run bandit -c pyproject.toml -r $(NAME)
+	sh ci/check-nosec.sh "$(POETRY) run bandit"
 
 .PHONY: format
 format: $(INSTALL_STAMP)

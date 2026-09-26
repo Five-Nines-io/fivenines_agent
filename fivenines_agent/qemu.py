@@ -1,7 +1,7 @@
 import os
 import posixpath
 import time
-import xml.etree.ElementTree as ET
+import xml.etree.ElementTree as ET  # nosec B405  # parses only libvirtd's own domain XML; see _xml_devices
 from urllib.parse import unquote, urlsplit
 
 try:
@@ -275,7 +275,7 @@ class QEMUCollector:
         try:
             libvirt.registerErrorHandler(error_handler, None)
         except Exception:
-            pass
+            pass  # nosec B110  # optional: without the handler libvirt prints its errors to stderr
 
     def _connect(self):
         try:
@@ -312,7 +312,7 @@ class QEMUCollector:
         disks, ifaces = [], []
         try:
             xml = dom.XMLDesc(0)
-            root = ET.fromstring(xml)
+            root = ET.fromstring(xml)  # nosec B314  # libvirtd's domain XML over a local read-only connection; etree never resolves external entities
 
             for d in root.findall(".//devices/disk"):
                 tgt = d.find("target")
@@ -610,7 +610,7 @@ class QEMUCollector:
             try:
                 self.conn.close()
             except Exception:
-                pass
+                pass  # nosec B110  # best-effort close of a connection that is being dropped
             self.conn = None
 
 

@@ -1,0 +1,101 @@
+name: CodeQL
+
+# Static analysis of the agent's Python code and of these workflows, with the
+# security-extended query suite.
+#
+# Code scanning alerts are visible only to people with write access to the
+# repository, so each run also writes what it found to the run summary, which
+# anyone can open, and FAILS when it found anything. A green run means zero
+# results, not merely "the analysis ran". On a pull request CodeQL reports only
+# results in the lines the pull request changes; the runs on main and the
+# weekly run cover the whole codebase. A result is resolved by fixing the code,
+# or by excluding the query in the config below with the reason next to it --
+# never by dismissing the alert in a UI nobody outside can see.
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  schedule:
+    # Weekly, so new and improved queries reach code that has not changed.
+    - cron: '23 5 * * 1'
+  workflow_dispatch:
+
+# A newer push to the same pull request supersedes its running analysis. Runs
+# for main are grouped per commit, so a burst of merges cannot cancel one.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language:
+          - python
+          - actions
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          queries: security-extended
+          # The tests are not shipped; the claim covers the code that is.
+          config: |
+            paths-ignore:
+              - tests
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+        with:
+          category: /language:${{ matrix.language }}
+          # What is uploaded to code scanning -- on a pull request, filtered to
+          # the lines it changes. The raw CLI output is not, so it is not counted.
+          post-processed-sarif-path: sarif-results
+
+      - name: Publish results to the run summary
+        env:
+          LANGUAGE: ${{ matrix.language }}
+        run: |
+          # Fail closed: no post-processed SARIF means nothing was counted.
+          ls sarif-results/*.sarif > /dev/null
+          SARIF=$(jq -s '{runs: [.[].runs[]]}' sarif-results/*.sarif)
+          COUNT=$(jq '[.runs[].results[]] | length' <<<"$SARIF")
+          VERSION=$(jq -r '.runs[0].tool.driver.semanticVersion // "unknown"' <<<"$SARIF")
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            SCOPE="the lines this pull request changes"
+          else
+            SCOPE="the whole codebase"
+          fi
+          {
+            echo "### CodeQL ${LANGUAGE}: ${COUNT} result(s)"
+            echo
+            echo "Query suite \`security-extended\`, CodeQL ${VERSION}, commit \`${GITHUB_SHA}\`, results for ${SCOPE}."
+            if [ "$COUNT" -gt 0 ]; then
+              echo
+              echo '| Rule | Location | Message |'
+              echo '|------|----------|---------|'
+              jq -r '.runs[].results[] |
+                "| `\(.ruleId)` | `\(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine)` | \(.message.text | split("\n")[0] | gsub("\\|"; "\\|")) |"' <<<"$SARIF"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$COUNT" -gt 0 ]; then
+            echo "::error::CodeQL reported ${COUNT} ${LANGUAGE} result(s); they are listed in the run summary. Fix them, or exclude the query in codeql.yml with the reason."
+            exit 1
+          fi
+          echo "CodeQL reported no ${LANGUAGE} results."
