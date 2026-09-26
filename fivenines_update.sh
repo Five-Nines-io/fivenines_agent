@@ -577,7 +577,8 @@ if [ -f /etc/unraid-version ] || { [ -d /boot/config ] && [ -f /boot/config/go ]
   exit_with_error "UNRAID detected. This update script only supports systemd and OpenRC installs.
 Re-run the setup script instead -- it updates an existing UNRAID install in
 place and keeps your token:
-  wget -T 3 -q https://releases.fivenines.io/latest/fivenines_setup.sh \\
+  wget -T 3 -q -O fivenines_setup.sh \\
+    https://releases.fivenines.io/latest/fivenines_setup.sh \\
     && sudo bash fivenines_setup.sh \$(cat /boot/config/custom/fivenines_agent/TOKEN)"
 fi
 
