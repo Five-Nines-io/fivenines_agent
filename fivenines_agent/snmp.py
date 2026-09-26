@@ -132,6 +132,13 @@ def snmp_metrics(targets, tick_started=None):
     return result
 
 
+def forget_targets():
+    """snmp_targets went empty: reconcile as a poll of no target would, so a
+    poll still in flight is dropped rather than read as fresh if its device
+    comes back (the agent does not call snmp_metrics with no targets)."""
+    SNMPCollector([]).poll_all()
+
+
 def _print_diagnostics(devices):
     """Print SNMP diagnostic table for dry-run mode."""
     print("")

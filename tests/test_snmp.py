@@ -25,6 +25,7 @@ from fivenines_agent.snmp import (
     _polling_key,
     _print_diagnostics,
     _run_snmp_cmd,
+    forget_targets,
     snmp_metrics,
 )
 
@@ -1465,6 +1466,24 @@ class TestBatchDeadline:
         assert "dev-a" in again.submitted
         assert {"device_id": "dev-a", "system": {}} not in devices
         assert SNMPCollector._in_flight == {}
+
+    def test_removing_every_target_drops_a_running_poll_on_readd(self):
+        """With no target left the agent does not call snmp_metrics, so it
+        calls forget_targets: otherwise the removal is never seen."""
+        a = _make_target(device_id="dev-a")
+        first = _FakeExecutor(running=1)
+        with _fake_pool(first):
+            SNMPCollector([a], 1000.0).poll_all()
+        forget_targets()
+        first.futures[0].set_result({"device_id": "dev-a", "system": {}})
+        again = _FakeExecutor(
+            poll=lambda t: {"device_id": t["device_id"], "error": DOWN[1]},
+            done=1,
+        )
+        with _fake_pool(again):
+            devices = SNMPCollector([a], 1120.0).poll_all()["devices"]
+        assert again.submitted == ["dev-a"]
+        assert devices == [{"device_id": "dev-a", "error": DOWN[1]}]
 
     def test_late_answer_after_a_long_tick_is_not_stuck(self):
         """With ticks 180s+ apart, a poll that finished just after its

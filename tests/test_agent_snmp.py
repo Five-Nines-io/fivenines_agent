@@ -65,3 +65,20 @@ def test_run_passes_the_start_of_its_tick():
         agent_module.systemd_watchdog = original
     [(tick_started, called_at)] = seen
     assert before <= tick_started <= called_at
+
+
+def test_no_targets_reconciles_the_snmp_state():
+    """snmp_metrics is not called with no targets, so the removal of the
+    last device must be handed to the collector another way."""
+    agent = _agent()
+    agent.config = {"enabled": True, "snmp_targets": []}
+    with patch.object(agent_module, "collect_metrics"), patch.object(
+        agent_module, "mqtt_metrics", return_value=None
+    ), patch.object(agent_module, "is_windows", return_value=True), patch(
+        "fivenines_agent.snmp.forget_targets"
+    ) as forget, patch("fivenines_agent.snmp.snmp_metrics") as snmp:
+        data = {}
+        agent._collect_metrics(data, 1000.0)
+    forget.assert_called_once_with()
+    snmp.assert_not_called()
+    assert "snmp_metrics" not in data

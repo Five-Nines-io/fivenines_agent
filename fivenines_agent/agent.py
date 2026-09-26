@@ -464,6 +464,12 @@ class Agent:
                 snmp_targets,
                 tick_started=tick_started,
             )
+        else:
+            from fivenines_agent.snmp import forget_targets
+
+            # Every device removed: its state must go too, or a poll still
+            # in flight reads as fresh when the device comes back.
+            self._collect("snmp_forget_targets", forget_targets)
         # MQTT: persistent background subscriptions. Reconcile runs on every
         # collection tick (this enabled path) even when the key is absent, so
         # removing the config tears the clients down; the snapshot is None until
