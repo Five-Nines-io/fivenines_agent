@@ -55,7 +55,11 @@ _ssl_context = None
 def _get_ssl_context():
     global _ssl_context
     if _ssl_context is None:
-        _ssl_context = ssl.create_default_context(cafile=certifi.where())
+        ctx = ssl.create_default_context(cafile=certifi.where())
+        # Python 3.10+ already defaults to TLS 1.2; pinned here so the floor
+        # does not depend on the interpreter and OpenSSL a build bundles.
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        _ssl_context = ctx
     return _ssl_context
 
 

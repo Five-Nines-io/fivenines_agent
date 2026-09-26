@@ -57,7 +57,7 @@ def interfaces():
 
         return working_interfaces
     elif family == 'darwin':
-        with os.popen('scutil --nwi | grep "Network interfaces" | cut -d " " -f3') as f:
+        with os.popen('scutil --nwi | grep "Network interfaces" | cut -d " " -f3') as f:  # nosec B605  # macOS dev path; constant command, nothing interpolated
             return f.read().strip().split('\n')
     return []
 

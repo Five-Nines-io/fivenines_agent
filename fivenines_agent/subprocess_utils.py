@@ -6,7 +6,7 @@ Provides helpers for running system commands safely from PyInstaller bundles.
 import os
 import subprocess
 import threading
-from typing import List, Optional
+from typing import List
 
 from fivenines_agent.debug import log
 
@@ -97,42 +97,3 @@ def run_privileged(cmd: List[str], timeout: int, **kwargs):
     if "error" in outcome:
         raise outcome["error"]
     return outcome["value"]
-
-
-def run_command(
-    cmd: List[str],
-    timeout: Optional[int] = None,
-    capture_output: bool = True,
-    check: bool = False,
-    shell: bool = False,
-    **kwargs
-) -> subprocess.CompletedProcess:
-    """
-    Run a system command with a sanitized environment.
-
-    This is a thin wrapper around subprocess.run() that automatically
-    uses get_clean_env() to prevent PyInstaller library conflicts.
-
-    Args:
-        cmd: Command and arguments as a list
-        timeout: Timeout in seconds (optional)
-        capture_output: Capture stdout/stderr (default: True)
-        check: Raise exception on non-zero exit (default: False)
-        shell: Run through shell (default: False)
-        **kwargs: Additional arguments passed to subprocess.run()
-
-    Returns:
-        subprocess.CompletedProcess instance
-    """
-    # Use clean env unless caller explicitly provides one
-    if 'env' not in kwargs:
-        kwargs['env'] = get_clean_env()
-
-    return subprocess.run(
-        cmd,
-        timeout=timeout,
-        capture_output=capture_output,
-        check=check,
-        shell=shell,
-        **kwargs
-    )

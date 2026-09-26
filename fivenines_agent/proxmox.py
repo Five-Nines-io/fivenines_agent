@@ -532,13 +532,13 @@ class ProxmoxCollector:
                         qemu_list = self.proxmox.nodes(node_name).qemu.get()
                         vms_running = sum(1 for vm in qemu_list if vm.get('status') == 'running')
                     except Exception:
-                        pass
+                        pass  # nosec B110  # a failed guest listing leaves this node's running count at 0
 
                     try:
                         lxc_list = self.proxmox.nodes(node_name).lxc.get()
                         lxc_running = sum(1 for ct in lxc_list if ct.get('status') == 'running')
                     except Exception:
-                        pass
+                        pass  # nosec B110  # a failed guest listing leaves this node's running count at 0
 
                     node_data = {
                         'name': node_name,

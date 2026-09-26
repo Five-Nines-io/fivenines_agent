@@ -43,5 +43,5 @@ class DNSResolver:
                 if resolver.cache is not None:
                     resolver.cache.flush()
             except Exception:
-                pass
+                pass  # nosec B110  # best-effort flush; the failed lookup is already returning None
             return None

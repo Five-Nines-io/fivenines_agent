@@ -193,7 +193,7 @@ _SUCCESS_PREFIX = "SUCCESS:"
 # line) when `management ... unix` is guarded by a password file. The agent
 # never sends one, so the read would otherwise just stall until the timeout and
 # report a uselessly generic reason.
-_PASSWORD_PROMPT = "ENTER PASSWORD"
+_PASSWORD_PROMPT = "ENTER PASSWORD"  # nosec B105  # the management protocol's prompt text, not a credential
 
 # The reason reported when the daemon closes the connection before sending its
 # `>INFO:` greeting. Measured (see the module docstring): that is precisely what

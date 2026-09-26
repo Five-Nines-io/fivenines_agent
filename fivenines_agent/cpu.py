@@ -37,7 +37,7 @@ def cpu_model():
                     if line.startswith('model name'):
                         cpu_model = line.split(':')[1].strip()
         elif family == 'darwin':
-            with os.popen('/usr/sbin/sysctl -n machdep.cpu.brand_string') as f:
+            with os.popen('/usr/sbin/sysctl -n machdep.cpu.brand_string') as f:  # nosec B605  # macOS dev path; constant command, nothing interpolated
                 cpu_model = f.read().strip()
         elif family == 'windows':
             # platform.processor() reads PROCESSOR_IDENTIFIER from the
