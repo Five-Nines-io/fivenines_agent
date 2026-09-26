@@ -353,7 +353,8 @@ class SNMPCollector:
         """
         # Prune stale state. A removed device's poll still in flight stays
         # there until it ends (below): forgotten, a re-added device would be
-        # polled again on top of it.
+        # polled again on top of it. Its key is cleared for good, so its
+        # answer is dropped even if the device is re-added unchanged first.
         current_ids = {t["device_id"] for t in self.targets}
         known_ids = set(SNMPCollector._last_poll_times) | set(
             SNMPCollector._polling_keys
@@ -362,6 +363,9 @@ class SNMPCollector:
             SNMPCollector._last_poll_times.pop(device_id, None)
             SNMPCollector._last_results.pop(device_id, None)
             SNMPCollector._polling_keys.pop(device_id, None)
+        for device_id in set(SNMPCollector._in_flight) - current_ids:
+            future, _, started, stuck = SNMPCollector._in_flight[device_id]
+            SNMPCollector._in_flight[device_id] = (future, None, started, stuck)
 
         # A device whose POLLING_FIELDS changed loses its poll time: due at
         # once (or as soon as a poll of the old target still in flight ends),
@@ -400,7 +404,7 @@ class SNMPCollector:
             del SNMPCollector._in_flight[device_id]
             current = SNMPCollector._polling_keys.get(device_id)
             if key is None or key != current or stuck:
-                # A removed target's answer (its key was pruned), the old
+                # A removed target's answer (its key is cleared), the old
                 # target's, or one reported stuck meanwhile, whose success
                 # would clear the failures reported for it: dropped, and the
                 # device is polled afresh.

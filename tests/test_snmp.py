@@ -1445,6 +1445,27 @@ class TestBatchDeadline:
             SNMPCollector([a, b], 1360.0).poll_all()
         assert "dev-a" not in back.submitted
 
+    def test_poll_finished_while_removed_is_dropped_on_readd(self):
+        """REGRESSION: it finished while the device was absent, and the
+        device came back unchanged before it was read: its old answer read
+        as fresh, and could clear a failure streak on the server."""
+        a, b = _make_target(device_id="dev-a"), _make_target(device_id="dev-b")
+        first = _FakeExecutor(running=1)
+        with _fake_pool(first):
+            SNMPCollector([a], 1000.0).poll_all()
+        with _fake_pool(_FakeExecutor()):
+            SNMPCollector([b], 1060.0).poll_all()
+        first.futures[0].set_result({"device_id": "dev-a", "system": {}})
+        again = _FakeExecutor(
+            poll=lambda t: {"device_id": t["device_id"], "error": DOWN[1]},
+            done=2,
+        )
+        with _fake_pool(again):
+            devices = SNMPCollector([a, b], 1120.0).poll_all()["devices"]
+        assert "dev-a" in again.submitted
+        assert {"device_id": "dev-a", "system": {}} not in devices
+        assert SNMPCollector._in_flight == {}
+
     def test_late_answer_after_a_long_tick_is_not_stuck(self):
         """With ticks 180s+ apart, a poll that finished just after its
         deadline is late, not stuck: its answer is reported, and its device
