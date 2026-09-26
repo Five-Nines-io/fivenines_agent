@@ -6,12 +6,12 @@ Detects what capabilities are available based on user permissions.
 import os
 import shutil
 import subprocess
-import threading
 import time
 from functools import partial
 
 import psutil
 
+from fivenines_agent.bounded import WorkerTimeout, call_bounded
 from fivenines_agent.debug import log
 from fivenines_agent.env import is_windows
 from fivenines_agent.openvpn import probe_management_access
@@ -1005,11 +1005,10 @@ class PermissionProbe:
                     except Exception:
                         pass  # nosec B110  # best-effort close once the probe has its answer
 
-        worker = threading.Thread(target=attempt, daemon=True)
-        self._libvirt_probe_thread = worker
-        worker.start()
-        worker.join(LIBVIRT_PROBE_TIMEOUT)
-        if worker.is_alive():
+        try:
+            call_bounded(attempt, LIBVIRT_PROBE_TIMEOUT, name="libvirt-probe")
+        except WorkerTimeout as stalled:
+            self._libvirt_probe_thread = stalled.worker
             log("_can_access_libvirt: probe timed out", "debug")
             self._set_reason("libvirt probe timed out")
             return False

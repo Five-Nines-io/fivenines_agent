@@ -268,6 +268,9 @@ def test_libvirt_probe_times_out():
         ):
             assert probe._can_access_libvirt() is False
         assert probe._current_reason == "libvirt probe timed out"
+        # The stalled worker is remembered, so the next probe single-flights on
+        # it instead of stacking a second hung openReadOnly behind it.
+        assert probe._libvirt_probe_thread.is_alive()
     finally:
         release.set()  # let the abandoned daemon worker finish
 

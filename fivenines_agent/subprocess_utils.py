@@ -5,9 +5,9 @@ Provides helpers for running system commands safely from PyInstaller bundles.
 
 import os
 import subprocess
-import threading
 from typing import List
 
+from fivenines_agent.bounded import WorkerTimeout, call_bounded
 from fivenines_agent.debug import log
 
 # Environment variables that can interfere with system commands when running
@@ -59,10 +59,10 @@ def run_privileged(cmd: List[str], timeout: int, **kwargs):
     SIGABRTs the agent -- and Restart=always makes that a loop.
 
     Killing the process group instead does not help: the group is root-owned
-    too, so the kill fails the same way. What protects the loop is not waiting.
-    This is the pattern permissions.LIBVIRT_PROBE_TIMEOUT already uses for the
-    same reason: run it in a daemon worker, give up at the deadline, and let the
-    wedged child and its thread finish in the background whenever sudo returns.
+    too, so the kill fails the same way. What protects the loop is not waiting:
+    bounded.call_bounded (shared with the libvirt probe and io_topology) runs it
+    in a daemon worker, gives up at the deadline, and lets the wedged child and
+    its thread finish in the background whenever sudo returns.
 
     Returns the CompletedProcess. When the deadline passes it raises
     subprocess.TimeoutExpired -- the same exception the caller would have seen
@@ -71,19 +71,12 @@ def run_privileged(cmd: List[str], timeout: int, **kwargs):
     timeout is only that the child is still out there.
     """
     kwargs.setdefault("env", get_clean_env())
-    outcome: dict = {}
-
-    def target():
-        try:
-            outcome["value"] = subprocess.run(cmd, timeout=timeout, **kwargs)
-        except BaseException as e:  # re-raised on the caller's thread below
-            outcome["error"] = e
-
-    worker = threading.Thread(target=target, daemon=True)
-    worker.start()
-    worker.join(timeout + _ABANDON_GRACE)
-
-    if worker.is_alive():
+    try:
+        return call_bounded(
+            lambda: subprocess.run(cmd, timeout=timeout, **kwargs),
+            timeout + _ABANDON_GRACE,
+        )
+    except WorkerTimeout:
         # The command outlived its own timeout AND the interpreter's teardown,
         # which in practice means sudo is wedged and unkillable. Abandon it:
         # the worker is a daemon, so it dies with the process, and the caller
@@ -93,7 +86,4 @@ def run_privileged(cmd: List[str], timeout: int, **kwargs):
             f"{timeout + _ABANDON_GRACE}s (unkillable sudo child)",
             "error",
         )
-        raise subprocess.TimeoutExpired(cmd, timeout + _ABANDON_GRACE)
-    if "error" in outcome:
-        raise outcome["error"]
-    return outcome["value"]
+        raise subprocess.TimeoutExpired(cmd, timeout + _ABANDON_GRACE) from None
