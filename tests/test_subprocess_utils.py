@@ -107,6 +107,20 @@ def test_an_unkillable_child_is_abandoned_instead_of_blocking(monkeypatch):
         released.set()
 
 
+def test_a_command_finishing_just_past_its_own_timeout_is_not_abandoned(monkeypatch):
+    """The caller waits the command's timeout PLUS the abandon grace: a
+    killable child whose teardown runs a moment past its own timeout returns
+    normally instead of being reported as a wedged, abandoned sudo."""
+
+    def slow_teardown_run(cmd, **kwargs):
+        time.sleep(kwargs["timeout"] + 0.3)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(subprocess, "run", slow_teardown_run)
+    result = run_privileged(["sudo", "-n", "true"], timeout=1)
+    assert result.returncode == 0
+
+
 def test_the_abandoned_worker_is_a_daemon(monkeypatch):
     """An abandoned worker must never keep the process alive at shutdown: the
     agent has to be able to exit while a wedged sudo is still out there."""

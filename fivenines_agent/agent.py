@@ -156,6 +156,9 @@ _DRY_RUN_CONFIG = {
     "network": True,
     "partitions": True,
     "io": True,
+    # Block device topology (#155): host-local sysfs read with no external
+    # config, the zfs/fail2ban class; reports null off Linux.
+    "io_topology": True,
     "logs": {"units": ["nginx.service", "ssh.service"]},
     "processes": True,
     "ports": True,
