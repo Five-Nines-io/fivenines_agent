@@ -55,8 +55,24 @@ Windows 10/11), **Synology DSM 7** and **UNRAID**.
 Requires sudo/root access for initial setup. The agent runs as a dedicated `fivenines` user with limited permissions.
 
 ```bash
-wget -T 3 -q https://releases.fivenines.io/latest/fivenines_setup.sh && sudo bash fivenines_setup.sh TOKEN
+wget -T 3 -q -O fivenines_setup.sh https://releases.fivenines.io/latest/fivenines_setup.sh && sudo bash fivenines_setup.sh TOKEN
 ```
+
+> **Note:** keep the `-O`, here and in every `wget` command below. Without it,
+> GNU wget does not overwrite a `fivenines_setup.sh` left in the current
+> directory by an earlier attempt: it saves the download as
+> `fivenines_setup.sh.1`, exits 0, and the `&&` runs the old file as root.
+>
+> `-O` does not make a directory other users can write to, such as `/tmp`,
+> safe. Another user can create a file, a named pipe or a symlink under that
+> name before you paste, and wget then writes into it (or through it) instead
+> of replacing it. The file stays theirs, so they can change what `sudo bash`
+> runs. Some distributions enable kernel protections that refuse this, but
+> not all hosts have them. On Alpine it is a step back: BusyBox wget without
+> `-O` refuses a name that already exists, so a planted one used to stop the
+> command, while with `-O` it is written into -- as root, the way Alpine runs
+> the installer. Run the command from a directory only you can write to: your
+> home directory, or a fresh one (`cd "$(mktemp -d)"` first).
 
 One script covers every Linux init system: it detects **systemd**, **OpenRC**
 (Alpine) and **UNRAID** and installs the matching service integration, and it
@@ -89,8 +105,12 @@ through a single-command sudoers rule -- see
 For environments where you don't have sudo/root access (shared hosting, managed VPS, etc.):
 
 ```bash
-wget -T 3 -q https://releases.fivenines.io/latest/fivenines_setup_user.sh && bash fivenines_setup_user.sh TOKEN
+wget -T 3 -q -O fivenines_setup_user.sh https://releases.fivenines.io/latest/fivenines_setup_user.sh && bash fivenines_setup_user.sh TOKEN
 ```
+
+On shared hosting every account shares `/tmp`: run this from your home
+directory, not from there (see the note under
+[Standard Installation](#standard-installation-linux)).
 
 This installs to `~/.local/fivenines` and creates helper scripts:
 
@@ -269,7 +289,7 @@ runs `rc-update add fivenines-agent default`:
 Run it as root -- Alpine ships neither `sudo` nor `bash` by default:
 
 ```bash
-wget -T 3 -q https://releases.fivenines.io/latest/fivenines_setup.sh && sh fivenines_setup.sh TOKEN
+wget -T 3 -q -O fivenines_setup.sh https://releases.fivenines.io/latest/fivenines_setup.sh && sh fivenines_setup.sh TOKEN
 ```
 
 ```bash
@@ -295,7 +315,7 @@ Use the [standard installer](#standard-installation-linux) -- it detects UNRAID
 because UNRAID's root filesystem lives in RAM and is rebuilt on every boot:
 
 ```bash
-wget -T 3 -q https://releases.fivenines.io/latest/fivenines_setup.sh && bash fivenines_setup.sh TOKEN
+wget -T 3 -q -O fivenines_setup.sh https://releases.fivenines.io/latest/fivenines_setup.sh && bash fivenines_setup.sh TOKEN
 ```
 
 > **Note:** UNRAID rebuilds `/etc` from RAM on every boot, so a sudoers rule
@@ -391,8 +411,9 @@ failed check leaves the currently installed unit exactly as it was.
 To check an artifact by hand:
 
 ```bash
-wget -q https://releases.fivenines.io/latest/fivenines-agent-linux-amd64.tar.gz
-wget -q https://releases.fivenines.io/latest/SHA256SUMS
+wget -q -O fivenines-agent-linux-amd64.tar.gz \
+  https://releases.fivenines.io/latest/fivenines-agent-linux-amd64.tar.gz
+wget -q -O SHA256SUMS https://releases.fivenines.io/latest/SHA256SUMS
 
 grep ' fivenines-agent-linux-amd64.tar.gz$' SHA256SUMS | sha256sum -c -
 # fivenines-agent-linux-amd64.tar.gz: OK
@@ -439,8 +460,8 @@ setting to use if you want the guarantee enforced fleet-wide.
 To check a signature by hand:
 
 ```bash
-wget -q https://releases.fivenines.io/latest/SHA256SUMS
-wget -q https://releases.fivenines.io/latest/SHA256SUMS.sig
+wget -q -O SHA256SUMS https://releases.fivenines.io/latest/SHA256SUMS
+wget -q -O SHA256SUMS.sig https://releases.fivenines.io/latest/SHA256SUMS.sig
 
 # with the key above saved as fivenines-release.pub
 openssl dgst -sha256 -verify fivenines-release.pub \
@@ -506,7 +527,9 @@ VERSION=v1.19.2
 FILE=fivenines-agent-linux-amd64.tar.gz
 BASE="https://releases.fivenines.io/${VERSION}"
 
-wget -q "${BASE}/${FILE}" "${BASE}/SHA256SUMS" "${BASE}/SHA256SUMS.sig"
+wget -q -O "${FILE}" "${BASE}/${FILE}"
+wget -q -O SHA256SUMS "${BASE}/SHA256SUMS"
+wget -q -O SHA256SUMS.sig "${BASE}/SHA256SUMS.sig"
 
 # 1. The manifest carries the fivenines release signature
 #    (the public key above, saved as fivenines-release.pub)
@@ -567,10 +590,16 @@ development escape hatch and is unverified** unless you pin the digest
 yourself:
 
 ```bash
-sudo FIVENINES_AGENT_URL="https://github.com/.../fivenines-agent-linux-amd64.tar.gz" \
-     FIVENINES_AGENT_SHA256="<expected sha256>" \
+wget -T 3 -q -O fivenines_update.sh https://releases.fivenines.io/latest/fivenines_update.sh \
+  && sudo FIVENINES_AGENT_URL="https://github.com/.../fivenines-agent-linux-amd64.tar.gz" \
+     FIVENINES_AGENT_SHA256="<expected-sha256>" \
      bash fivenines_update.sh
 ```
+
+Fetch the update script in the same command, as above: run on its own,
+`bash fivenines_update.sh` executes whatever copy is already in the directory,
+and one older than **v1.17.7** ignores `FIVENINES_AGENT_SHA256` and installs
+the tarball unverified.
 
 Pre-release builds list their digests in the GitHub release notes. Without
 `FIVENINES_AGENT_SHA256` the installer prints an `UNVERIFIED` warning and
@@ -598,13 +627,13 @@ On Windows the artifact to verify is the MSI, which `SHA256SUMS` also covers;
 ### Standard Update (with sudo/root)
 
 ```bash
-wget -T 3 -q https://releases.fivenines.io/latest/fivenines_update.sh && sudo bash fivenines_update.sh
+wget -T 3 -q -O fivenines_update.sh https://releases.fivenines.io/latest/fivenines_update.sh && sudo bash fivenines_update.sh
 ```
 
 ### User-Level Update (no sudo/root)
 
 ```bash
-wget -T 3 -q https://releases.fivenines.io/latest/fivenines_update_user.sh && bash fivenines_update_user.sh
+wget -T 3 -q -O fivenines_update_user.sh https://releases.fivenines.io/latest/fivenines_update_user.sh && bash fivenines_update_user.sh
 ```
 
 ### Windows Update
@@ -621,13 +650,13 @@ iwr https://releases.fivenines.io/latest/fivenines_update.ps1 -OutFile update.ps
 ### Standard Removal (with sudo/root)
 
 ```bash
-wget -T 3 -q https://releases.fivenines.io/latest/fivenines_uninstall.sh && sudo bash fivenines_uninstall.sh
+wget -T 3 -q -O fivenines_uninstall.sh https://releases.fivenines.io/latest/fivenines_uninstall.sh && sudo bash fivenines_uninstall.sh
 ```
 
 ### User-Level Removal (no sudo/root)
 
 ```bash
-wget -T 3 -q https://releases.fivenines.io/latest/fivenines_uninstall_user.sh && bash fivenines_uninstall_user.sh
+wget -T 3 -q -O fivenines_uninstall_user.sh https://releases.fivenines.io/latest/fivenines_uninstall_user.sh && bash fivenines_uninstall_user.sh
 ```
 
 ### Windows Removal
