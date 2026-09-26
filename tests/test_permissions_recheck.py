@@ -275,6 +275,29 @@ def test_libvirt_probe_times_out():
         release.set()  # let the abandoned daemon worker finish
 
 
+def test_libvirt_probe_runs_again_once_the_timed_out_worker_returns():
+    """Single-flight holds only while the stalled worker is alive: once it
+    returns, the next probe runs for real instead of being skipped forever."""
+    probe = _probe_obj({})
+    release = threading.Event()
+    fake_libvirt = MagicMock()
+
+    def open_ro(uri):
+        release.wait(5)
+        return MagicMock()
+
+    fake_libvirt.openReadOnly.side_effect = open_ro
+    with patch.dict("sys.modules", {"libvirt": fake_libvirt}):
+        with patch.object(perm, "LIBVIRT_PROBE_TIMEOUT", 0.05):
+            assert probe._can_access_libvirt() is False
+        stalled = probe._libvirt_probe_thread
+        release.set()
+        stalled.join(5)
+        assert probe._can_access_libvirt() is True
+    assert fake_libvirt.openReadOnly.call_count == 2
+    assert probe._libvirt_probe_thread is None
+
+
 # --- gap re-probe backoff ---
 
 

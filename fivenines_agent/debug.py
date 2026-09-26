@@ -60,6 +60,22 @@ def stop_log_capture():
     return buffer or []
 
 
+def current_log_capture():
+    """This thread's active capture buffer, or None (see adopt_log_capture)."""
+    return getattr(_thread_local, 'log_buffer', None)
+
+
+def adopt_log_capture(buffer):
+    """Send this thread's error lines to another thread's capture buffer.
+
+    Capture is thread-local, so a collector that does its work on a worker
+    thread (bounded.call_bounded) would otherwise log its errors past the
+    dispatcher's telemetry. list.append is atomic, and a worker that outlives
+    the tick only appends to a list nobody reads any more.
+    """
+    _thread_local.log_buffer = buffer
+
+
 def debug_enabled():
     """True when 'debug' messages would actually be emitted.
 

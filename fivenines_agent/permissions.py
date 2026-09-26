@@ -982,9 +982,8 @@ class PermissionProbe:
             self._set_reason("libvirt probe still running (previous attempt hung)")
             return False
 
-        result = {}
-
         def attempt():
+            """None when libvirt answers, else the reason it did not."""
             conn = None
             try:
                 # The collector's own default, pinned against its URI
@@ -993,11 +992,9 @@ class PermissionProbe:
                 # the value through qemu.libvirt_uri_rejection and the
                 # LIBVIRT_AUTOSTART guard here too.
                 conn = libvirt.openReadOnly(DEFAULT_LIBVIRT_URI)
-                result["ok"] = conn is not None
-                if conn is None:
-                    result["reason"] = "openReadOnly returned None"
+                return None if conn is not None else "openReadOnly returned None"
             except Exception as e:
-                result["reason"] = f"{type(e).__name__}: {e}"
+                return f"{type(e).__name__}: {e}"
             finally:
                 if conn is not None:
                     try:
@@ -1006,17 +1003,16 @@ class PermissionProbe:
                         pass  # nosec B110  # best-effort close once the probe has its answer
 
         try:
-            call_bounded(attempt, LIBVIRT_PROBE_TIMEOUT, name="libvirt-probe")
+            reason = call_bounded(attempt, LIBVIRT_PROBE_TIMEOUT, name="libvirt-probe")
         except WorkerTimeout as stalled:
             self._libvirt_probe_thread = stalled.worker
             log("_can_access_libvirt: probe timed out", "debug")
             self._set_reason("libvirt probe timed out")
             return False
         self._libvirt_probe_thread = None
-        if result.get("ok"):
+        if reason is None:
             log("_can_access_libvirt: -> AVAILABLE (openReadOnly)", "debug")
             return True
-        reason = result.get("reason", "openReadOnly failed")
         log(f"_can_access_libvirt: -> UNAVAILABLE ({reason})", "debug")
         self._set_reason(reason)
         return False

@@ -6,6 +6,7 @@ import time
 import pytest
 
 from fivenines_agent.bounded import WorkerTimeout, call_bounded
+from fivenines_agent.debug import log, start_log_capture, stop_log_capture
 
 
 def test_returns_the_value_of_a_call_that_finishes_in_time():
@@ -26,6 +27,27 @@ def test_reraises_the_calls_exception_on_the_callers_thread():
         call_bounded(fails, timeout=5)
     assert excinfo.value is boom
     assert raised_on["thread"] is not threading.current_thread()
+
+
+def test_reraises_a_base_exception_rather_than_losing_it():
+    """Not only Exception: a SystemExit in fn must not surface as a KeyError."""
+
+    def exits():
+        raise SystemExit(3)
+
+    with pytest.raises(SystemExit):
+        call_bounded(exits, timeout=5)
+
+
+def test_errors_logged_inside_the_call_reach_the_callers_capture():
+    """Log capture is thread-local; the dispatcher reads the caller's."""
+    start_log_capture()
+    try:
+        call_bounded(lambda: log("sysfs said no", "error"), timeout=5)
+        log("on the caller", "error")
+    finally:
+        captured = stop_log_capture()
+    assert captured == ["sysfs said no", "on the caller"]
 
 
 def test_a_call_past_its_deadline_is_abandoned_not_awaited():

@@ -75,6 +75,7 @@ def run_privileged(cmd: List[str], timeout: int, **kwargs):
         return call_bounded(
             lambda: subprocess.run(cmd, timeout=timeout, **kwargs),
             timeout + _ABANDON_GRACE,
+            name="run-privileged",
         )
     except WorkerTimeout:
         # The command outlived its own timeout AND the interpreter's teardown,

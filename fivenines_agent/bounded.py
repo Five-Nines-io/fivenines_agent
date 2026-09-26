@@ -14,6 +14,8 @@ worker (single-flight on it, or not) and its own failure value.
 
 import threading
 
+from fivenines_agent.debug import adopt_log_capture, current_log_capture
+
 
 class WorkerTimeout(Exception):
     """The call outlived its deadline. `worker` is the thread still running it."""
@@ -27,14 +29,19 @@ def call_bounded(fn, timeout, name=None):
     """Return fn() if it finishes within `timeout` seconds.
 
     Whatever fn raises is re-raised on the caller's thread, where the
-    dispatcher's telemetry and the caller's own handlers can see it. When the
-    deadline passes, raises WorkerTimeout carrying the still-running worker so
-    the caller can refuse to start another behind it. The worker is a daemon:
-    it dies with the process and never holds the agent's shutdown.
+    dispatcher's telemetry and the caller's own handlers can see it, and the
+    error lines fn logs land in the caller's log capture too. When the deadline
+    passes, raises WorkerTimeout carrying the still-running worker so the
+    caller can refuse to start another behind it. The worker is a daemon, so
+    the interpreter never waits for it at exit -- though a thread stuck in an
+    uninterruptible kernel wait (D state) still delays the process's final
+    exit until that wait ends; no userspace code can change that.
     """
     outcome = {}
+    capture = current_log_capture()
 
     def target():
+        adopt_log_capture(capture)
         try:
             outcome["value"] = fn()
         except BaseException as e:  # re-raised on the caller's thread below
