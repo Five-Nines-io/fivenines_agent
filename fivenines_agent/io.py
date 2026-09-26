@@ -140,7 +140,8 @@ def _multipath_paths(path):
     in /proc/diskstats with the same I/O -- the paths account it through
     blk-mq, the head through nvme_mpath_start_request -- so without this the
     head reads as a leaf and every I/O counts twice. The directory holds only
-    those links, and exists since Linux 6.15; older kernels keep that gap. ENOENT (not a head, or a kernel without the links) is [];
+    those links, and exists since Linux 6.15 (_attach_hidden_paths covers
+    older kernels). ENOENT (not a head, or a kernel without the links) is [];
     any other failure propagates, so the caller reports the device as unknown
     rather than with a partial list.
     """
@@ -148,6 +149,44 @@ def _multipath_paths(path):
         return os.listdir(os.path.join(path, "multipath"))
     except FileNotFoundError:
         return []
+
+
+def _read_attr(path, attr):
+    """A sysfs attribute's stripped text, or None when it cannot be read."""
+    try:
+        with open(os.path.join(path, attr)) as f:
+            return f.read().strip()
+    except (OSError, ValueError):
+        return None
+
+
+def _attach_hidden_paths(topology, paths):
+    """List each hidden NVMe path disk under its head, without multipath/.
+
+    Before Linux 6.15 a native-multipath head has no multipath/ links, yet its
+    path disks are already hidden gendisks (`hidden` reads 1; NVMe is the only
+    user) and every one of them reports its head's wwid -- the attribute reads
+    the namespace head's ids on both. So a hidden disk belongs to the one
+    VISIBLE disk that shares its wwid. No candidate, or more than one, attaches
+    nothing: the head then stays a leaf as before, never a wrong claim. On 6.15
+    and later this finds the same paths multipath/ already listed.
+    """
+    hidden = [name for name, path in paths.items() if _read_attr(path, "hidden") == "1"]
+    if not hidden:
+        return
+    heads_by_wwid = {}
+    for name, path in paths.items():
+        if name not in hidden:
+            wwid = _read_attr(path, "wwid")
+            if wwid:
+                heads_by_wwid.setdefault(wwid, []).append(name)
+    for name in hidden:
+        heads = heads_by_wwid.get(_read_attr(paths[name], "wwid"), [])
+        if len(heads) == 1:
+            slaves = topology[heads[0]]["slaves"]
+            if name not in slaves:
+                slaves.append(name)
+                slaves.sort()
 
 
 def _partitions(path, disk):
@@ -245,6 +284,7 @@ def _read_topology():
 
     io_name = _IoNames()
     topology = {}
+    whole = {}
     for disk in sorted(disks):
         name = io_name(disk)
         if name is None:
@@ -253,8 +293,10 @@ def _read_topology():
         entry = _whole_device(path, io_name)
         if entry is not None:
             topology[name] = entry
+            whole[name] = path
         for part in _partitions(path, disk):
             part_name = io_name(part)
             if part_name is not None:
                 topology[part_name] = {"partition_of": name}
+    _attach_hidden_paths(topology, whole)
     return topology
