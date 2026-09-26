@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 
 import psutil
@@ -16,8 +17,12 @@ SYS_BLOCK = "/sys/block"
 # Only read to resolve a '!' in a sysfs name (see _IoNames).
 PROC_DISKSTATS = "/proc/diskstats"
 
+# The kernel's own name for an NVMe native-multipath path disk:
+# nvme{subsystem}c{controller}n{head} (see _attach_hidden_paths).
+_NVME_PATH_DISK = re.compile(r"nvme(\d+)c\d+n(\d+)")
+
 # Wall-clock bound on one topology read, on the watchdog-bounded collection
-# loop. A healthy read is well under 1ms here and ~10ms for 400 devices; this
+# loop. A healthy read is well under 1ms here and ~16ms for 400 devices; this
 # only ever fires on a stalled sysfs (see io_topology).
 TOPOLOGY_READ_TIMEOUT = 5
 
@@ -141,7 +146,7 @@ def _multipath_paths(path):
     blk-mq, the head through nvme_mpath_start_request -- so without this the
     head reads as a leaf and every I/O counts twice. The directory holds only
     those links, and exists since Linux 6.15 (_attach_hidden_paths covers
-    older kernels). ENOENT (not a head, or a kernel without the links) is [];
+    older kernels, and a path whose link was never created). ENOENT (not a head, or a kernel without the links) is [];
     any other failure propagates, so the caller reports the device as unknown
     rather than with a partial list.
     """
@@ -160,33 +165,28 @@ def _read_attr(path, attr):
         return None
 
 
-def _attach_hidden_paths(topology, paths):
+def _attach_hidden_paths(topology, listed):
     """List each hidden NVMe path disk under its head, without multipath/.
 
-    Before Linux 6.15 a native-multipath head has no multipath/ links, yet its
-    path disks are already hidden gendisks (`hidden` reads 1; NVMe is the only
-    user) and every one of them reports its head's wwid -- the attribute reads
-    the namespace head's ids on both. So a hidden disk belongs to the one
-    VISIBLE disk that shares its wwid. No candidate, or more than one, attaches
-    nothing: the head then stays a leaf as before, never a wrong claim. On 6.15
-    and later this finds the same paths multipath/ already listed.
+    Before Linux 6.15 a native-multipath head has no multipath/ links, but the
+    kernel names both ends itself: a path disk nvme{S}c{C}n{H} and its head
+    nvme{S}n{H}, from the subsystem and head instances it allocates
+    (drivers/nvme/host/core.c) -- nothing a device or its firmware chooses.
+    `hidden` reading 1 confirms the disk really is such a path (NVMe is its
+    only user). So the head is derived, not matched: no identifier can collide,
+    and a head that is absent or unreadable simply gets nothing attached. Every
+    listed path counts, readable entry or not, as multipath/ would list it; on
+    6.15 and later this finds the same paths multipath/ already did.
     """
-    hidden = [name for name, path in paths.items() if _read_attr(path, "hidden") == "1"]
-    if not hidden:
-        return
-    heads_by_wwid = {}
-    for name, path in paths.items():
-        if name not in hidden:
-            wwid = _read_attr(path, "wwid")
-            if wwid:
-                heads_by_wwid.setdefault(wwid, []).append(name)
-    for name in hidden:
-        heads = heads_by_wwid.get(_read_attr(paths[name], "wwid"), [])
-        if len(heads) == 1:
-            slaves = topology[heads[0]]["slaves"]
-            if name not in slaves:
-                slaves.append(name)
-                slaves.sort()
+    for name, path in listed.items():
+        match = _NVME_PATH_DISK.fullmatch(name)
+        if match is None or _read_attr(path, "hidden") != "1":
+            continue
+        head = topology.get(f"nvme{match[1]}n{match[2]}")
+        if head is None or name in head["slaves"]:
+            continue
+        head["slaves"].append(name)
+        head["slaves"].sort()
 
 
 def _partitions(path, disk):
@@ -235,8 +235,8 @@ def io_topology():
     listed, and on every non-Linux host (the structure is read from sysfs);
     the server treats None and {} as "not reported", never as "no stacking".
 
-    Read every tick, uncached: it is a few directory reads per device (~26us
-    measured, so ~10ms for a 400-device hypervisor), and membership changes
+    Read every tick, uncached: it is a few directory reads per device (~40us
+    measured, so ~16ms for a 400-device hypervisor), and membership changes
     without the device set changing -- a pvmove, an md member re-added -- so a
     cache keyed on the device set would serve a stale answer.
 
@@ -284,19 +284,19 @@ def _read_topology():
 
     io_name = _IoNames()
     topology = {}
-    whole = {}
+    listed = {}
     for disk in sorted(disks):
         name = io_name(disk)
         if name is None:
             continue
         path = os.path.join(SYS_BLOCK, disk)
+        listed[name] = path
         entry = _whole_device(path, io_name)
         if entry is not None:
             topology[name] = entry
-            whole[name] = path
         for part in _partitions(path, disk):
             part_name = io_name(part)
             if part_name is not None:
                 topology[part_name] = {"partition_of": name}
-    _attach_hidden_paths(topology, whole)
+    _attach_hidden_paths(topology, listed)
     return topology

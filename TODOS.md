@@ -16,9 +16,9 @@ predicate selects no whole device -- an OpenVZ ploop container, a diskless nbd
 boot -- keeps today's name rules rather than reading a zero total). That also
 retires the ingestion-time `dm-`/`zd` drop and the parentless-partition guess
 (`xvda1`) for Linux hosts; absent/`null`/`{}` must keep today's name rules. NVMe
-native multipath is covered: `/sys/block/<head>/multipath/` on Linux 6.15+, a
-`hidden` + `wwid` match on older kernels. What remains is a kernel without the
-`hidden` block attribute (5.10 and later have it).
+native multipath is covered: `/sys/block/<head>/multipath/` on Linux 6.15+ and,
+on any kernel, the head derived from the hidden path's kernel-assigned name
+(`nvme{S}c{C}n{H}` -> `nvme{S}n{H}`).
 
 ## P3: Per-collector wall-clock bound against a kernfs stall (only io_topology has one)
 

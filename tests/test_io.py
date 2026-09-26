@@ -37,7 +37,7 @@ def _build_sys_block(root, model):
     symlink for hardware-backed disks, and one subdirectory per partition with
     a `partition` attribute. slaves=None models an unreadable slaves/,
     `multipath` lists an NVMe native-multipath head's path links, and `hidden`
-    / `wwid` set those attributes (every disk gets `hidden`, as on 5.10+). Link
+    marks a hidden disk (every disk gets the attribute, as since 4.15). Link
     targets use native separators: Windows CI runs this suite, and a
     '/'-separated relative link does not resolve there.
     """
@@ -53,8 +53,6 @@ def _build_sys_block(root, model):
         for attr in _DISK_NOISE_FILES:
             (disk / attr).write_text("0\n")
         (disk / "hidden").write_text("1\n" if spec.get("hidden") else "0\n")
-        if spec.get("wwid"):
-            (disk / "wwid").write_text(spec["wwid"] + "\n")
         if spec["slaves"] is not None:
             (disk / "slaves").mkdir()
             for slave in spec["slaves"]:
@@ -505,27 +503,17 @@ def test_nvme_multipath_head_is_a_layer_over_its_paths(tmp_path, linux):
     }
 
 
-def test_nvme_head_before_6_15_is_matched_to_its_paths_by_wwid(tmp_path, linux):
-    """No multipath/ links before Linux 6.15: the hidden path disks carry the
-    head's wwid, and the one visible disk with that wwid is their head. A
-    single-controller NVMe beside it (no head, not hidden) stays a leaf."""
+def test_nvme_head_before_6_15_is_derived_from_its_path_names(tmp_path, linux):
+    """No multipath/ links before Linux 6.15: the kernel names a hidden path
+    nvme{S}c{C}n{H} after its head nvme{S}n{H}, so the head is derived. An NVMe
+    with no head (nvme0n1, no hidden paths) stays a plain leaf."""
     out = _topology_of(
         tmp_path,
         {
-            "nvme1n1": {"device": True, "slaves": [], "wwid": "eui.0000aaaa"},
-            "nvme1c0n1": {
-                "device": True,
-                "slaves": [],
-                "hidden": True,
-                "wwid": "eui.0000aaaa",
-            },
-            "nvme1c1n1": {
-                "device": True,
-                "slaves": [],
-                "hidden": True,
-                "wwid": "eui.0000aaaa",
-            },
-            "nvme0n1": {"device": True, "slaves": [], "wwid": "eui.0000bbbb"},
+            "nvme1n1": {"device": True, "slaves": []},
+            "nvme1c0n1": {"device": True, "slaves": [], "hidden": True},
+            "nvme1c1n1": {"device": True, "slaves": [], "hidden": True},
+            "nvme0n1": {"device": True, "slaves": []},
         },
     )
     assert out["nvme1n1"] == {"slaves": ["nvme1c0n1", "nvme1c1n1"], "virtual": False}
@@ -534,17 +522,12 @@ def test_nvme_head_before_6_15_is_matched_to_its_paths_by_wwid(tmp_path, linux):
 
 
 def test_hidden_paths_found_both_ways_are_listed_once(tmp_path, linux):
-    """On 6.15+ multipath/ and the wwid match name the same paths."""
+    """On 6.15+ multipath/ and the name derivation find the same paths."""
     out = _topology_of(
         tmp_path,
         {
-            "nvme0n1": {
-                "device": True,
-                "slaves": [],
-                "multipath": ["nvme0c0n1"],
-                "wwid": "w",
-            },
-            "nvme0c0n1": {"device": True, "slaves": [], "hidden": True, "wwid": "w"},
+            "nvme0n1": {"device": True, "slaves": [], "multipath": ["nvme0c0n1"]},
+            "nvme0c0n1": {"device": True, "slaves": [], "hidden": True},
         },
     )
     assert out["nvme0n1"]["slaves"] == ["nvme0c0n1"]
@@ -552,56 +535,95 @@ def test_hidden_paths_found_both_ways_are_listed_once(tmp_path, linux):
 
 def test_a_path_missing_its_multipath_link_is_still_attached_in_order(tmp_path, linux):
     """A path whose multipath/ link was not created (the race 08937bcd4cfe
-    fixes upstream) is still found by wwid, and slaves stays sorted."""
+    fixes upstream) is still found by name, and slaves stays sorted."""
     out = _topology_of(
         tmp_path,
         {
-            "nvme0n1": {
-                "device": True,
-                "slaves": [],
-                "multipath": ["nvme0c1n1"],
-                "wwid": "w",
-            },
-            "nvme0c0n1": {"device": True, "slaves": [], "hidden": True, "wwid": "w"},
-            "nvme0c1n1": {"device": True, "slaves": [], "hidden": True, "wwid": "w"},
+            "nvme0n1": {"device": True, "slaves": [], "multipath": ["nvme0c1n1"]},
+            "nvme0c0n1": {"device": True, "slaves": [], "hidden": True},
+            "nvme0c1n1": {"device": True, "slaves": [], "hidden": True},
         },
     )
     assert out["nvme0n1"]["slaves"] == ["nvme0c0n1", "nvme0c1n1"]
 
 
+def test_a_path_whose_own_entry_is_unreadable_is_still_listed(tmp_path, linux):
+    """The head's list is a fact about the head, as multipath/ would give it;
+    the path itself is left out as unknown."""
+    out = _topology_of(
+        tmp_path,
+        {
+            "nvme0n1": {"device": True, "slaves": []},
+            "nvme0c0n1": {"device": True, "slaves": None, "hidden": True},
+        },
+    )
+    assert out == {"nvme0n1": {"slaves": ["nvme0c0n1"], "virtual": False}}
+
+
 @pytest.mark.parametrize(
     "model",
     [
-        # Two visible disks share the wwid: which one is the head is unknown.
+        # The derived head does not exist (not live yet under ANA).
         {
-            "nvme0n1": {"device": True, "slaves": [], "wwid": "w"},
-            "nvme9n1": {"device": True, "slaves": [], "wwid": "w"},
-            "nvme0c0n1": {"device": True, "slaves": [], "hidden": True, "wwid": "w"},
+            "nvme0n1": {"device": True, "slaves": []},
+            "nvme1c0n1": {"device": True, "slaves": [], "hidden": True},
         },
-        # The hidden disk's wwid cannot be read -- nor can sda's, which must
-        # not make them "match".
+        # The derived head's own entry is unreadable: it is left out, never
+        # given a list, and nothing else inherits its path.
         {
-            "nvme0n1": {"device": True, "slaves": [], "wwid": "w"},
+            "nvme0n1": {"device": True, "slaves": None},
             "nvme0c0n1": {"device": True, "slaves": [], "hidden": True},
-            "sda": {"device": True, "slaves": []},
+            "nvme9n1": {"device": True, "slaves": []},
         },
-        # No visible disk carries that wwid.
+        # Path-shaped name, but the disk is not hidden.
         {
-            "nvme0n1": {"device": True, "slaves": [], "wwid": "other"},
-            "nvme0c0n1": {"device": True, "slaves": [], "hidden": True, "wwid": "w"},
+            "nvme0n1": {"device": True, "slaves": []},
+            "nvme0c0n1": {"device": True, "slaves": []},
         },
     ],
 )
-def test_hidden_path_without_exactly_one_head_attaches_nothing(model, tmp_path, linux):
-    """No candidate or several: nothing is claimed, the heads stay leaves."""
+def test_a_path_without_its_head_attaches_nothing(model, tmp_path, linux):
+    """Nothing is claimed: every whole device that is reported stays a leaf."""
     out = _topology_of(tmp_path, model)
     assert all(entry.get("slaves") == [] for entry in out.values())
 
 
+def test_a_path_whose_hidden_attribute_cannot_be_read_is_not_attached(tmp_path, linux):
+    block = _build_sys_block(
+        tmp_path,
+        {
+            "nvme0n1": {"device": True, "slaves": []},
+            "nvme0c0n1": {"device": True, "slaves": [], "hidden": True},
+        },
+    )
+    os.unlink(tmp_path / "devices" / "nvme0c0n1" / "hidden")
+    with patch("fivenines_agent.io.SYS_BLOCK", str(block)):
+        assert io_topology()["nvme0n1"] == {"slaves": [], "virtual": False}
+
+
+def test_hidden_is_read_only_for_path_shaped_names(tmp_path, linux):
+    """The fallback costs nothing on a host without NVMe multipath."""
+    real_read_attr = _read_attr
+    with patch(
+        "fivenines_agent.io._read_attr", side_effect=real_read_attr
+    ) as read_attr:
+        _topology_of(
+            tmp_path,
+            {
+                "sda": {"device": True, "slaves": []},
+                "nvme0n1": {"device": True, "slaves": []},
+                "nvme0c0n1": {"device": True, "slaves": [], "hidden": True},
+            },
+        )
+    assert [os.path.basename(c.args[0]) for c in read_attr.call_args_list] == [
+        "nvme0c0n1"
+    ]
+
+
 def test_read_attr_is_none_when_unreadable(tmp_path):
-    assert _read_attr(str(tmp_path), "wwid") is None
-    (tmp_path / "wwid").write_text("  eui.1  \n")
-    assert _read_attr(str(tmp_path), "wwid") == "eui.1"
+    assert _read_attr(str(tmp_path), "hidden") is None
+    (tmp_path / "hidden").write_text("  1  \n")
+    assert _read_attr(str(tmp_path), "hidden") == "1"
 
 
 def test_unreadable_multipath_dir_leaves_the_head_out(tmp_path):
