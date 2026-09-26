@@ -1,6 +1,6 @@
 # TODOS
 
-## Block device topology (#155) -- server half not filed yet
+## Block device topology (#155) -- server half tracked in fivenines_server#1227
 
 Agent side is DONE (v1.20.0): `data["io_topology"]`, behind a new TOP-LEVEL
 `io_topology` config flag that nothing sends yet, so the collector is inert until
