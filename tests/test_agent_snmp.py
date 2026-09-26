@@ -82,3 +82,19 @@ def test_no_targets_reconciles_the_snmp_state():
     forget.assert_called_once_with()
     snmp.assert_not_called()
     assert "snmp_metrics" not in data
+    # Housekeeping, not a collector: no telemetry entry of its own.
+    assert not [k for k in agent._telemetry if "snmp" in k]
+
+
+def test_failed_snmp_reconcile_does_not_stop_the_tick():
+    agent = _agent()
+    agent.config = {"enabled": True, "snmp_targets": []}
+    with patch.object(agent_module, "collect_metrics"), patch.object(
+        agent_module, "mqtt_metrics", return_value={"brokers": []}
+    ), patch.object(agent_module, "is_windows", return_value=True), patch(
+        "fivenines_agent.snmp.forget_targets", side_effect=RuntimeError("boom")
+    ), patch.object(agent_module, "log") as log:
+        data = {}
+        agent._collect_metrics(data, 1000.0)
+    assert data["mqtt"] == {"brokers": []}  # collection went on
+    assert any("SNMP state reset failed: boom" in c.args[0] for c in log.call_args_list)
