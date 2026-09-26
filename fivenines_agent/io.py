@@ -81,7 +81,7 @@ def _diskstats_names():
             errors="surrogateescape",
         ) as f:
             return {fields[2] for fields in map(str.split, f) if len(fields) > 2}
-    except (OSError, ValueError):
+    except OSError:
         return set()
 
 
@@ -90,7 +90,9 @@ def _whole_device(path, io_name):
 
     slaves/ lists the devices this one is stacked on (md members, the PVs under
     a dm/LVM/LUKS device, bcache's backing and cache devices, the paths under a
-    multipath map). [] is a positive claim -- nothing beneath it -- so it is
+    dm-multipath map). An NVMe native-multipath head links its paths from
+    multipath/ instead (see _multipath_paths), so those count too. [] is a
+    positive claim -- nothing beneath it -- so it is
     only ever reported from a successful read; an unreadable directory is None,
     which leaves the device out of the topology rather than calling it a leaf.
     So does a slave io_name cannot place: a partial list is a false claim too.
@@ -107,9 +109,10 @@ def _whole_device(path, io_name):
     bus device even though every byte goes over the network.
     """
     try:
-        slaves = [io_name(s) for s in os.listdir(os.path.join(path, "slaves"))]
+        beneath = os.listdir(os.path.join(path, "slaves")) + _multipath_paths(path)
     except OSError:
         return None
+    slaves = [io_name(s) for s in beneath]
     if None in slaves:
         return None
     try:
@@ -126,6 +129,25 @@ def _whole_device(path, io_name):
     except OSError:
         return None
     return {"slaves": sorted(slaves), "virtual": virtual}
+
+
+def _multipath_paths(path):
+    """The path devices of an NVMe native-multipath head, [] for anything else.
+
+    The head (nvme0n1) is stacked on its hidden per-path disks (nvme0c0n1,
+    nvme0c1n1) exactly as a dm-multipath map is on its sdX paths, but NVMe
+    links them from /sys/block/<head>/multipath/, not slaves/. Both rows are
+    in /proc/diskstats with the same I/O -- the paths account it through
+    blk-mq, the head through nvme_mpath_start_request -- so without this the
+    head reads as a leaf and every I/O counts twice. The directory holds only
+    those links. ENOENT (not a head, or a kernel without the links) is [];
+    any other failure propagates, so the caller reports the device as unknown
+    rather than with a partial list.
+    """
+    try:
+        return os.listdir(os.path.join(path, "multipath"))
+    except FileNotFoundError:
+        return []
 
 
 def _partitions(path, disk):
@@ -180,13 +202,15 @@ def io_topology():
     cache keyed on the device set would serve a stale answer.
 
     The read runs in a daemon worker bounded by TOPOLOGY_READ_TIMEOUT
-    (bounded.call_bounded, as run_privileged and the libvirt probe). sysfs is kernfs, answered from kernel memory, so a
-    wedged DISK cannot stall it; machine-wide memory pressure can -- another
-    sysfs reader faulting into reclaim while holding kernfs_rwsem blocks every
-    lookup behind a queued writer, for minutes (LKML, 2026-09: "kernfs: don't
-    hold kernfs_rwsem across dir_emit()"), past WatchdogSec=90. A read that
-    times out reports None and is abandoned; until it returns, later ticks
-    report None without starting another.
+    (bounded.call_bounded, as run_privileged and the libvirt probe). sysfs is
+    kernfs, answered from kernel memory, so a wedged DISK cannot stall it;
+    machine-wide memory pressure can -- another sysfs reader faulting into
+    reclaim while holding kernfs_rwsem blocks every lookup behind a queued
+    writer, for minutes (LKML, 2026-09: "kernfs: don't hold kernfs_rwsem across
+    dir_emit()"), past WatchdogSec=90. A read that times out reports None and
+    is abandoned; until it returns, later ticks report None without starting
+    another. This bounds this collector's share of the tick only: the network
+    and temperatures collectors read sysfs unbounded (TODOS.md).
     """
     global _stalled_worker
     if os_family() != "linux":

@@ -34,7 +34,8 @@ def _build_sys_block(root, model):
     Real layout: /sys/block/<name> is a symlink into /sys/devices/..., the
     device directory holds slaves/ (symlinks to the devices beneath), a `device`
     symlink for hardware-backed disks, and one subdirectory per partition with
-    a `partition` attribute. slaves=None models an unreadable slaves/. Link
+    a `partition` attribute. slaves=None models an unreadable slaves/, and
+    `multipath` lists an NVMe native-multipath head's path links. Link
     targets use native separators: Windows CI runs this suite, and a
     '/'-separated relative link does not resolve there.
     """
@@ -54,6 +55,12 @@ def _build_sys_block(root, model):
             for slave in spec["slaves"]:
                 os.symlink(
                     os.path.join(os.pardir, os.pardir, slave), disk / "slaves" / slave
+                )
+        if spec.get("multipath"):
+            (disk / "multipath").mkdir()
+            for path in spec["multipath"]:
+                os.symlink(
+                    os.path.join(os.pardir, os.pardir, path), disk / "multipath" / path
                 )
         if spec["device"]:
             (devices / f"hw-{name}").mkdir()
@@ -469,10 +476,55 @@ def test_diskstats_names_empty_when_unreadable(tmp_path):
         assert _diskstats_names() == set()
 
 
+def test_nvme_multipath_head_is_a_layer_over_its_paths(tmp_path, linux):
+    """The head links its hidden path disks from multipath/, not slaves/; both
+    carry the same I/O in /proc/diskstats, so the head must read as a layer."""
+    out = _topology_of(
+        tmp_path,
+        {
+            "nvme0n1": {
+                "device": True,
+                "slaves": [],
+                "multipath": ["nvme0c1n1", "nvme0c0n1"],
+                "partitions": ["nvme0n1p1"],
+            },
+            "nvme0c0n1": {"device": True, "slaves": []},
+            "nvme0c1n1": {"device": True, "slaves": []},
+        },
+    )
+    assert out == {
+        "nvme0c0n1": {"slaves": [], "virtual": False},
+        "nvme0c1n1": {"slaves": [], "virtual": False},
+        "nvme0n1": {"slaves": ["nvme0c0n1", "nvme0c1n1"], "virtual": False},
+        "nvme0n1p1": {"partition_of": "nvme0n1"},
+    }
+
+
+def test_unreadable_multipath_dir_leaves_the_head_out(tmp_path):
+    """Only ENOENT means "not a head"; a multipath/ that cannot be read would
+    make the list partial, and a partial list is a false claim."""
+    block = _build_sys_block(tmp_path, {"nvme0n1": {"device": True, "slaves": []}})
+    real_listdir = os.listdir
+
+    def denied(path):
+        if path.endswith("multipath"):
+            raise PermissionError(path)
+        return real_listdir(path)
+
+    with patch("fivenines_agent.io.os.listdir", side_effect=denied):
+        assert _whole_device(str(block / "nvme0n1"), _IoNames()) is None
+
+
 def test_whole_device_sorts_slaves(tmp_path):
     """listdir order is the filesystem's; the payload's must not be."""
     block = _build_sys_block(tmp_path, {"md0": {"device": False, "slaves": []}})
-    with patch("fivenines_agent.io.os.listdir", return_value=["sdb1", "sda1"]):
+
+    def listdir(path):
+        if path.endswith("multipath"):
+            raise FileNotFoundError(path)
+        return ["sdb1", "sda1"]
+
+    with patch("fivenines_agent.io.os.listdir", side_effect=listdir):
         assert _whole_device(str(block / "md0"), _IoNames()) == {
             "slaves": ["sda1", "sdb1"],
             "virtual": True,

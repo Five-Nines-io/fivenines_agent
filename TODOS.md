@@ -15,8 +15,9 @@ see the fixture's `counting_contract`, including its FALLBACK: a host whose
 predicate selects no whole device -- an OpenVZ ploop container, a diskless nbd
 boot -- keeps today's name rules rather than reading a zero total). That also
 retires the ingestion-time `dm-`/`zd` drop and the parentless-partition guess
-(`xvda1`) for Linux hosts; absent/`null`/`{}` must keep today's name rules. Known gap,
-not covered by `slaves/`: NVMe native multipath (`/sys/block/<head>/multipath/`).
+(`xvda1`) for Linux hosts; absent/`null`/`{}` must keep today's name rules. NVMe
+native multipath is covered through `/sys/block/<head>/multipath/`; the remaining
+gap is a kernel too old to expose those links, where the head still reads as a leaf.
 
 ## P3: Per-collector wall-clock bound against a kernfs stall (only io_topology has one)
 
@@ -31,7 +32,13 @@ is the first to bound its own read (a single-flight worker abandoned after
 `TOPOLOGY_READ_TIMEOUT`); the others are not. The uniform fix is a per-collector
 wall-clock bound in `collectors.collect_metrics` built on `bounded.call_bounded`
 (already shared by `run_privileged`, the libvirt probe and `io_topology`), which
-changes every collector's failure mode -- hence its own change.
+changes every collector's failure mode -- hence its own change. Two things it must
+handle, both found reviewing #155: `run_privileged` has no single-flight, so a
+wedged sudoers backend leaks one thread and one blocked root `sudo` per call site
+per tick, and its per-call bounds (30s + 2s for `smartctl --scan`, then mdadm,
+fail2ban, wg) can add up past `WatchdogSec=90` in one tick; and a collector that
+keeps per-THREAD state -- docker's thread-local client cache -- would rebuild it
+every tick if moved onto a fresh worker, so it needs its own posture.
 
 ## Proxmox backups phase 2 -- server half tracked in fivenines_server#1164
 
