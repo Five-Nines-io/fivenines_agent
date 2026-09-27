@@ -86,6 +86,13 @@ def test_dry_run_config_includes_vpn_collectors():
     assert _DRY_RUN_CONFIG.get("tailscale")  # present and truthy
 
 
+def test_dry_run_config_includes_io_topology():
+    """Block device topology (#155) is a host-local sysfs read with no external
+    config, so --dry-run must exercise it. Same regression class as systemd/zfs:
+    without the key, collect_metrics' `if not config_value` gate skips it."""
+    assert _DRY_RUN_CONFIG.get("io_topology")  # present and truthy
+
+
 def test_dry_run_config_includes_docker():
     """The Docker collector had NO key in _DRY_RUN_CONFIG, so --dry-run never
     exercised it. Must be truthy (not {}, which collect_metrics' `if not

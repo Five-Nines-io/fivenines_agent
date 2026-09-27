@@ -10,6 +10,11 @@
 # redefining release_signing_pubkey after sourcing, rather than by adding an
 # env var that would weaken the shipped scripts.
 #
+# It also lints the download commands an operator is told to paste -- every
+# wget in README.md and in the UNRAID hint fivenines_update.sh prints -- so
+# the command always runs the file wget just wrote, never a copy left by an
+# earlier attempt (issue #160).
+#
 # Usage: sh ci/test-signing.sh
 
 set -u
@@ -60,6 +65,172 @@ printf 'deadbeef  fivenines-agent-linux-amd64.tar.gz\n' > "$WORK/SHA256SUMS"
 EMBEDDED=$(release_signing_pubkey)
 check "a release signing key is embedded" \
   "$(printf '%s' "$EMBEDDED" | grep -c 'BEGIN PUBLIC KEY')" "1"
+
+# ---------------------------------------------------------------------------
+# Copy-paste download commands (issue #160). Checked here, ahead of the
+# openssl gate below, because it needs nothing but awk and sed.
+#
+# Without -O, GNU wget never overwrites: a fivenines_setup.sh left in the
+# directory by an earlier attempt makes it save the fresh copy as
+# fivenines_setup.sh.1 and exit 0, and the `&&` then runs the OLD file as
+# root. Every wget an operator is told to paste must pin its output name,
+# fetch exactly one URL (-O would concatenate several into one file), and run
+# the very file it wrote. That is all this proves. -O does not make a shared
+# directory such as /tmp safe -- a file, named pipe or symlink another user
+# plants under the name is written into or through, not replaced -- which is
+# what the README note under the standard install is for: keep it.
+# ---------------------------------------------------------------------------
+
+# Every wget in every logical line (backslash continuations joined), each
+# printed from itself to the end of its line, so a second wget chained after a
+# first is judged on its own. wget counts as a command wherever it appears as a
+# word -- after a `cd ... &&`, behind a `$ ` prompt, inside inline code or a
+# `su -c '...'` / `sh -c "..."` string, spelled /usr/bin/wget or \wget -- but
+# only when an option, a URL, or a quoted or $-built argument follows it, so
+# prose that merely names wget is not one. The file may be - for stdin.
+wget_commands() {
+  awk '{ sub(/^[ \t]+/, "") }
+       /\\$/ { sub(/\\+$/, ""); buf = buf $0 " "; next }
+       { line = buf $0; buf = ""
+         n = split(line, f, /[ \t]+/)
+         for (i = 1; i < n; i++) {
+           w = f[i]; sub(/^[`$(\\"\047]+/, "", w); sub(/.*\//, "", w)
+           c = substr(f[i + 1], 1, 1)
+           if (w == "wget" && (c == "-" || c == "\"" || c == "$" || index(f[i + 1], "://"))) {
+             s = w
+             for (k = i + 1; k <= n; k++) s = s " " f[k]
+             gsub(/[`\047]/, "", s)
+             print s
+           }
+         }
+       }' "$1"
+}
+
+# Prints every command on stdin that breaks the rule, nothing when all hold.
+# Deliberately literal, and closed on anything it does not know:
+#   - the only options are -q, -T N and -O NAME, NAME a bare file name (no
+#     `/`, so neither ./NAME nor a path into /tmp). Anything else is reported:
+#     -qO and --output-document for being spelled differently, -c because it
+#     keeps an existing file and exits 0, which is #160 all over again;
+#   - every other word before the first separator is the one URL;
+#   - the command stops there, or continues with
+#     `&& [VAR=value...] [sudo [-opt | VAR=value]...] bash|sh NAME` running
+#     that same NAME.
+#     A `;`, `||` or `|`, a runner with no file, or any other runner is
+#     reported.
+unpinned_wgets() {
+  awk '{
+    out = ""; urls = 0; bad = 0; ran = ""
+    for (i = 2; i <= NF; i++) {
+      if ($i == "&&" || $i == "||" || $i == ";" || $i == "|") break
+      if ($i == "-O") { out = $(i + 1); i++; continue }
+      if ($i == "-T") { i++; continue }
+      if ($i == "-q") continue
+      if (substr($i, 1, 1) == "-") bad = 1; else urls++
+    }
+    if (i <= NF && $i == "&&") {
+      j = i + 1
+      while (j < NF && index($j, "=") && substr($j, 1, 1) != "-") j++
+      if ($j == "sudo") {
+        j++
+        while (j < NF && (substr($j, 1, 1) == "-" || index($j, "="))) j++
+      }
+      if (($j == "bash" || $j == "sh") && j < NF) ran = $(j + 1); else ran = "&& " $j
+    } else if (i <= NF) ran = $i
+    if (bad || out == "" || index(out, "/") || urls != 1 || (ran != "" && ran != out)) print
+  }'
+}
+
+# Canaries first. The real checks compare against "", which an awk that
+# errors out or never prints would produce too, so every leg of both awk
+# programs has to be seen firing on a line that breaks it, and the rule has
+# to be seen staying quiet on lines that keep it. Each argument is one line.
+flagged() { printf '%s\n' "$@" | wget_commands - | unpinned_wgets | wc -l | tr -d ' '; }
+check "the wget lint flags the #160 command (no -O)" \
+  "$(flagged 'wget -T 3 -q https://example.invalid/fivenines_setup.sh && sudo bash fivenines_setup.sh TOKEN')" "1"
+check "the wget lint flags a download with no -O and nothing after it" \
+  "$(flagged 'wget -q https://example.invalid/SHA256SUMS')" "1"
+check "the wget lint sees a wget with no options at all" \
+  "$(flagged 'wget https://example.invalid/fivenines_setup.sh && sudo bash fivenines_setup.sh TOKEN')" "1"
+check "the wget lint flags a -O name the command does not run" \
+  "$(flagged 'wget -T 3 -q -O new.sh https://example.invalid/fivenines_setup.sh && sudo bash fivenines_setup.sh TOKEN')" "1"
+check "the wget lint flags one -O over two URLs" \
+  "$(flagged 'wget -q -O SHA256SUMS https://example.invalid/SHA256SUMS https://example.invalid/SHA256SUMS.sig')" "1"
+check "the wget lint flags an option that keeps an existing file (-c)" \
+  "$(flagged 'wget -c -T 3 -q -O fivenines_setup.sh https://example.invalid/fivenines_setup.sh && sudo bash fivenines_setup.sh TOKEN')" "1"
+check "the wget lint flags a -O path, even one the command runs" \
+  "$(flagged 'wget -T 3 -q -O /tmp/fivenines_setup.sh https://example.invalid/fivenines_setup.sh && sudo bash /tmp/fivenines_setup.sh TOKEN')" "1"
+check "the wget lint flags a mismatch behind sudo options" \
+  "$(flagged 'wget -T 3 -q -O new.sh https://example.invalid/fivenines_update.sh && sudo -E FIVENINES_ALLOW_UNSIGNED=1 bash fivenines_update.sh')" "1"
+check "the wget lint flags a runner it does not know" \
+  "$(flagged 'wget -T 3 -q -O fivenines_setup.sh https://example.invalid/fivenines_setup.sh && doas sh fivenines_setup.sh TOKEN')" "1"
+check "the wget lint flags a runner with no file" \
+  "$(flagged 'wget -T 3 -q -O fivenines_setup.sh https://example.invalid/fivenines_setup.sh && sudo bash')" "1"
+check "the wget lint flags a download the next command does not wait for" \
+  "$(flagged 'wget -T 3 -q -O fivenines_setup.sh https://example.invalid/fivenines_setup.sh ; sudo bash fivenines_setup.sh TOKEN')" "1"
+check "the wget lint sees a second wget chained on the same line" \
+  "$(flagged 'wget -T 3 -q -O fivenines_uninstall.sh https://example.invalid/fivenines_uninstall.sh && sudo bash fivenines_uninstall.sh && wget -T 3 -q https://example.invalid/fivenines_setup.sh && sudo bash fivenines_setup.sh TOKEN')" "1"
+check "the wget lint flags a mismatch behind an environment prefix" \
+  "$(flagged 'wget -T 3 -q -O new.sh https://example.invalid/fivenines_setup.sh && FIVENINES_ALLOW_UNSIGNED=1 sh fivenines_setup.sh TOKEN')" "1"
+check "the wget lint sees a wget inside su -c '...'" \
+  "$(flagged "su -c 'wget -T 3 -q https://example.invalid/fivenines_setup.sh && bash fivenines_setup.sh TOKEN'")" "1"
+check "the wget lint sees a wget inside sh -c \"...\"" \
+  "$(flagged 'sudo sh -c "wget -T 3 -q https://example.invalid/fivenines_setup.sh && bash fivenines_setup.sh TOKEN"')" "1"
+check "the wget lint sees \\wget" \
+  "$(flagged '\wget -q https://example.invalid/fivenines_setup.sh && sudo bash fivenines_setup.sh TOKEN')" "1"
+check "the wget lint sees a wget behind a cd prefix" \
+  "$(flagged 'cd ~ && wget -T 3 -q https://example.invalid/fivenines_setup.sh && sudo bash fivenines_setup.sh TOKEN')" "1"
+# The literal $... and backticks in the checks below are the input under
+# test, and so is the backslash that ends the continued line.
+# shellcheck disable=SC2016
+check "the wget lint sees a wget in inline code" \
+  "$(flagged 'Run `wget -T 3 -q https://example.invalid/fivenines_setup.sh && sudo bash fivenines_setup.sh TOKEN` as root.')" "1"
+# shellcheck disable=SC2016
+check "the wget lint passes a pinned command in inline code" \
+  "$(flagged 'Run `wget -T 3 -q -O fivenines_setup.sh https://example.invalid/fivenines_setup.sh && sudo bash fivenines_setup.sh` as root.')" "0"
+# shellcheck disable=SC2016
+check "the wget lint sees /usr/bin/wget with a quoted \$-built URL" \
+  "$(flagged '/usr/bin/wget "$URL" && sudo bash fivenines_setup.sh TOKEN')" "1"
+# shellcheck disable=SC2016
+check "the wget lint sees a wget with a bare \$-built URL" \
+  "$(flagged 'wget $URL && sudo bash fivenines_setup.sh TOKEN')" "1"
+# shellcheck disable=SC2016
+check "the wget lint sees a wget in a command substitution" \
+  "$(flagged '$(wget -q https://example.invalid/SHA256SUMS)')" "1"
+# shellcheck disable=SC1003
+check "the wget lint joins a continued line before comparing" \
+  "$(flagged 'wget -T 3 -q -O new.sh \' '  https://example.invalid/fivenines_setup.sh && sudo bash fivenines_setup.sh TOKEN')" "1"
+# shellcheck disable=SC2016
+check "the wget lint passes a pinned command" \
+  "$(flagged 'cd "$(mktemp -d)" && wget -T 3 -q -O fivenines_setup.sh https://example.invalid/fivenines_setup.sh && sudo FIVENINES_REQUIRE_SIGNATURE=1 bash fivenines_setup.sh TOKEN')" "0"
+check "the wget lint passes a pinned command inside su -c '...'" \
+  "$(flagged "su -c 'wget -T 3 -q -O fivenines_setup.sh https://example.invalid/fivenines_setup.sh && bash fivenines_setup.sh'")" "0"
+check "the wget lint passes a pinned command behind an environment prefix" \
+  "$(flagged 'wget -T 3 -q -O fivenines_setup.sh https://example.invalid/fivenines_setup.sh && FIVENINES_ALLOW_UNSIGNED=1 sh fivenines_setup.sh TOKEN')" "0"
+check "the wget lint passes a pinned command behind sudo options" \
+  "$(flagged 'wget -T 3 -q -O fivenines_update.sh https://example.invalid/fivenines_update.sh && sudo -E FIVENINES_ALLOW_UNSIGNED=1 bash fivenines_update.sh')" "0"
+# shellcheck disable=SC2016
+check "the wget lint ignores prose that names wget" \
+  "$(flagged 'wget is the only prerequisite, and `wget` ships everywhere.')" "0"
+
+check "every README wget pins -O, fetches one URL and runs what it wrote" \
+  "$(wget_commands "$ROOT/README.md" | unpinned_wgets)" ""
+# A floor, not an exact count: the check above passes vacuously if the
+# extraction ever stops matching, while a new README example must not turn
+# CI red just for existing.
+check "the README still carries its install, update and uninstall commands" \
+  "$([ "$(wget_commands "$ROOT/README.md" | grep -c ' && ')" -ge 8 ] && echo yes || echo no)" "yes"
+
+# The UNRAID refusal in fivenines_update.sh prints a paste-able command too.
+# Its source text is scanned as written, never executed: the message breaks
+# the command with escaped `\\` continuations, which wget_commands joins like
+# the README's single ones.
+sed -n '/^if \[ -f \/etc\/unraid-version \]/,/^fi$/p' "$ROOT/fivenines_update.sh" \
+  > "$WORK/unraid_hint.txt"
+check "the UNRAID update hint pins -O and runs what it wrote" \
+  "$(wget_commands "$WORK/unraid_hint.txt" | unpinned_wgets)" ""
+check "the UNRAID update hint still carries a wget command" \
+  "$(wget_commands "$WORK/unraid_hint.txt" | wc -l | tr -d ' ')" "1"
 
 if ! command -v openssl > /dev/null 2>&1; then
   echo "openssl not available - skipping the signed cases"

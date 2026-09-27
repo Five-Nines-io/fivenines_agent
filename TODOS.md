@@ -1,5 +1,46 @@
 # TODOS
 
+## Block device topology (#155) -- server half tracked in fivenines_server#1227
+
+Agent side is DONE (v1.20.0): `data["io_topology"]`, behind a new TOP-LEVEL
+`io_topology` config flag that nothing sends yet, so the collector is inert until
+the server enables it. The payload shape shipped as a PROPOSAL: the server may still
+ask for a different one before it reads the key (one more small agent release). The
+server work: copy
+`tests/fixtures/io_topology_contract_payload.json` byte-for-byte into its specs,
+send `io_topology: true` to agents >= 1.20.0, and replace the name rules in
+`IoDeviceFilter` / `Host#stacked_io_devices` with the structural answer wherever
+one is reported (count whole devices with `slaves == []` and `virtual == false`,
+see the fixture's `counting_contract`, including its FALLBACK: a host whose
+predicate selects no whole device -- an OpenVZ ploop container, a diskless nbd
+boot -- keeps today's name rules rather than reading a zero total). That also
+retires the ingestion-time `dm-`/`zd` drop and the parentless-partition guess
+(`xvda1`) for Linux hosts; absent/`null`/`{}` must keep today's name rules. NVMe
+native multipath is covered: `/sys/block/<head>/multipath/` on Linux 6.15+ and,
+on any kernel, the head derived from the hidden path's kernel-assigned name
+(`nvme{S}c{C}n{H}` -> `nvme{S}n{H}`).
+
+## P3: Per-collector wall-clock bound against a kernfs stall (only io_topology has one)
+
+Found by the Codex review of #155. Under memory pressure a sysfs reader can fault
+into reclaim while holding `kernfs_rwsem`, and a queued writer then blocks every
+other sysfs lookup behind it -- 120-second stalls reported upstream (LKML
+2026-09, Shakeel Butt, "kernfs: don't hold kernfs_rwsem across dir_emit()").
+The agent reads sysfs on every tick from several collectors (`network`, psutil's
+hwmon globs behind `temperatures` and `fans`), all on the collection thread, so one such
+stall can outlast `WatchdogSec=90` and restart the agent. `io_topology` (#155)
+is the first to bound its own read (a single-flight worker abandoned after
+`TOPOLOGY_READ_TIMEOUT`); the others are not. The uniform fix is a per-collector
+wall-clock bound in `collectors.collect_metrics` built on `bounded.call_bounded`
+(already shared by `run_privileged`, the libvirt probe and `io_topology`), which
+changes every collector's failure mode -- hence its own change. Two things it must
+handle, both found reviewing #155: `run_privileged` has no single-flight, so a
+wedged sudoers backend leaks one thread and one blocked root `sudo` per call site
+per tick, and its per-call bounds (30s + 2s for `smartctl --scan`, then mdadm,
+fail2ban, wg) can add up past `WatchdogSec=90` in one tick; and a collector that
+keeps per-THREAD state -- docker's thread-local client cache -- would rebuild it
+every tick if moved onto a fresh worker, so it needs its own posture.
+
 ## Proxmox backups phase 2 -- server half tracked in fivenines_server#1164
 
 Agent side is DONE (PR #158, v1.19.0): the `data["proxmox"]["backups"]` block.

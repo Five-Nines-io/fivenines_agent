@@ -573,11 +573,15 @@ SYSTEM_TYPE=$(detect_system)
 # /boot/config directory exists on assorted embedded images, and this branch
 # blocks the update permanently, so it demands /boot/config/go (the UNRAID
 # startup file the agent installs into) before claiming UNRAID.
+# The printed command is linted by ci/test-signing.sh (issue #160), which
+# finds this block by its `if [ -f /etc/unraid-version ]` line: keep that
+# line's shape, or move the lint with it.
 if [ -f /etc/unraid-version ] || { [ -d /boot/config ] && [ -f /boot/config/go ]; }; then
   exit_with_error "UNRAID detected. This update script only supports systemd and OpenRC installs.
 Re-run the setup script instead -- it updates an existing UNRAID install in
 place and keeps your token:
-  wget -T 3 -q https://releases.fivenines.io/latest/fivenines_setup.sh \\
+  wget -T 3 -q -O fivenines_setup.sh \\
+    https://releases.fivenines.io/latest/fivenines_setup.sh \\
     && sudo bash fivenines_setup.sh \$(cat /boot/config/custom/fivenines_agent/TOKEN)"
 fi
 
