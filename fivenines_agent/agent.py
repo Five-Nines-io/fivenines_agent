@@ -369,7 +369,7 @@ class Agent:
                 start = time.monotonic()
                 self._telemetry = {}
 
-                self._collect_metrics(data)
+                self._collect_metrics(data, start)
                 self._handle_image_inventory(data)
 
                 if wd is not None:
@@ -423,7 +423,7 @@ class Agent:
         finally:
             self._cleanup()
 
-    def _collect_metrics(self, data):
+    def _collect_metrics(self, data, tick_started=None):
         # Core metrics (always enabled). load_average is Linux-only - psutil's
         # Windows emulation drops to zero on idle systems and resets on
         # process restart, so we omit the key entirely on Windows rather
@@ -462,8 +462,21 @@ class Agent:
             from fivenines_agent.snmp import snmp_metrics
 
             data["snmp_metrics"] = self._collect(
-                "snmp_metrics", snmp_metrics, snmp_targets
+                "snmp_metrics",
+                snmp_metrics,
+                snmp_targets,
+                tick_started=tick_started,
             )
+        else:
+            from fivenines_agent.snmp import forget_targets
+
+            # Every device removed: its state must go too, or a poll still
+            # in flight reads as fresh when the device comes back. Called
+            # directly: housekeeping, not a collector with telemetry.
+            try:
+                forget_targets()
+            except Exception as e:
+                log(f"SNMP state reset failed: {e}", "error")
         # MQTT: persistent background subscriptions. Reconcile runs on every
         # collection tick (this enabled path) even when the key is absent, so
         # removing the config tears the clients down; the snapshot is None until

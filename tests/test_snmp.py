@@ -2,6 +2,7 @@
 
 import subprocess
 import time
+from concurrent.futures import Future
 from io import StringIO
 from unittest.mock import MagicMock, patch
 
@@ -21,8 +22,10 @@ from fivenines_agent.snmp import (
     SNMP_TIMEOUT,
     SNMPCollector,
     _parse_snmp_line,
+    _polling_key,
     _print_diagnostics,
     _run_snmp_cmd,
+    forget_targets,
     snmp_metrics,
 )
 
@@ -129,6 +132,18 @@ IFXTABLE_OUTPUT = """\
 .1.3.6.1.2.1.31.1.1.1.18.2 = STRING: "Server"
 """
 
+# The same ifTable columns as net-snmp prints them on a host that loads MIBs
+LABELLED_IFTABLE = """\
+.1.3.6.1.2.1.2.2.1.1.1 = INTEGER: 1
+.1.3.6.1.2.1.2.2.1.1.2 = INTEGER: 2
+.1.3.6.1.2.1.2.2.1.3.1 = INTEGER: ethernetCsmacd(6)
+.1.3.6.1.2.1.2.2.1.3.2 = INTEGER: ieee8023adLag(161)
+.1.3.6.1.2.1.2.2.1.7.1 = INTEGER: up(1)
+.1.3.6.1.2.1.2.2.1.7.2 = INTEGER: down(2)
+.1.3.6.1.2.1.2.2.1.8.1 = INTEGER: up(1)
+.1.3.6.1.2.1.2.2.1.8.2 = INTEGER: lowerLayerDown(7)
+"""
+
 IFXTABLE_NO_SUPPORT = """\
 .1.3.6.1.2.1.31.1.1.1.1 = No Such Object available on this agent at this OID
 """
@@ -154,9 +169,83 @@ def _reset_collector_state():
     """Reset class-level state between tests."""
     SNMPCollector._last_poll_times = {}
     SNMPCollector._last_results = {}
+    SNMPCollector._polling_keys = {}
+    SNMPCollector._in_flight = {}
     yield
     SNMPCollector._last_poll_times = {}
     SNMPCollector._last_results = {}
+    SNMPCollector._polling_keys = {}
+    SNMPCollector._in_flight = {}
+
+
+class _Clock:
+    """Stands in for the snmp module's `time`: monotonic() returns `now`, so
+    tick spacing and poll duration are exact rather than wall-clock."""
+
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def monotonic(self):
+        return self.now
+
+
+class _FakeExecutor:
+    """Runs nothing. When the batch deadline has passed, the first `done`
+    polls submitted have finished with poll(target), the next `running` are
+    still running, and the rest are still queued."""
+
+    def __init__(self, poll=None, done=0, running=0, threads=None):
+        self.poll = poll
+        self.done = done
+        self.running = running
+        self.threads = threads  # submits that can start a thread
+        self.submitted = []
+        self.futures = []
+        self.shutdown_args = None
+
+    def submit(self, fn, target, *args):
+        if self.threads is not None and len(self.submitted) >= self.threads:
+            raise RuntimeError("can't start new thread")
+        future = Future()
+        n = len(self.submitted)
+        self.submitted.append(target["device_id"])
+        if n < self.done + self.running:
+            future.set_running_or_notify_cancel()
+        if n < self.done:
+            future.set_result(self.poll(target))
+        self.futures.append(future)
+        return future
+
+    def shutdown(self, wait=True, cancel_futures=False):
+        self.shutdown_args = (wait, cancel_futures)
+
+
+def _fake_pool(executor):
+    """Patch the pool, with the batch deadline already passed."""
+    return patch.multiple(
+        "fivenines_agent.snmp",
+        ThreadPoolExecutor=lambda max_workers: executor,
+        EXECUTOR_TIMEOUT=0,
+    )
+
+
+OK_POLL = [
+    (SYSTEM_OUTPUT, None),
+    (IFTABLE_OUTPUT, None),
+    (IFXTABLE_OUTPUT, None),
+]
+DOWN = (None, {"type": "timeout", "message": "Timeout: No Response"})
+
+
+def _outcome(devices):
+    """What one tick reported for dev-1: "ok", "cached", "error" or None."""
+    assert len(devices) <= 1
+    if not devices:
+        return None
+    dev = devices[0]
+    if "error" in dev:
+        return "error"
+    return "cached" if dev.get("cached") else "ok"
 
 
 def _mock_run(stdout="", stderr="", returncode=0):
@@ -201,6 +290,31 @@ class TestParseSnmpLine:
     def test_timeticks(self):
         line = ".1.3.6.1.2.1.1.3.0 = Timeticks: (1491600) 4:08:36.00"
         assert _parse_snmp_line(line) == ("1.3.6.1.2.1.1.3.0", "1491600")
+
+    @pytest.mark.parametrize(
+        "value, number",
+        [
+            ("up(1)", "1"),
+            ("not-present(-1)", "-1"),
+            ("l2vlan(135)", "135"),
+            ("other_type(3)", "3"),
+        ],
+    )
+    def test_enumeration_reads_as_its_number(self, value, number):
+        """REGRESSION (#162): a host that loads MIBs prints an enumeration
+        as label(N), and int("up(1)") dropped every interface's status.
+        Like Timeticks, the value is the number in parentheses."""
+        line = ".1.3.6.1.2.1.2.2.1.8.1 = INTEGER: {}".format(value)
+        assert _parse_snmp_line(line) == ("1.3.6.1.2.1.2.2.1.8.1", number)
+
+    def test_parenthesized_string_is_data(self):
+        """Only an INTEGER is read that way: a string ending in "(N)" is
+        the value itself. Unquoted, as a host that loads MIBs prints a
+        DisplayString (ifAlias) -- the same hosts that label enums."""
+        line = ".1.3.6.1.2.1.31.1.1.1.18.1 = STRING: uplink(2)"
+        assert _parse_snmp_line(line) == (
+            "1.3.6.1.2.1.31.1.1.1.18.1", "uplink(2)"
+        )
 
     def test_no_such_object(self):
         line = (
@@ -376,6 +490,15 @@ class TestSnmpMetrics:
         assert len(dev["interface_metrics"]) == 2
         assert dev["hc_counters"] is True
 
+    @patch("fivenines_agent.snmp.SNMPCollector")
+    @patch("fivenines_agent.snmp.shutil.which")
+    def test_tick_start_reaches_collector(self, mock_which, mock_cls):
+        mock_which.return_value = "/usr/bin/snmpget"
+        mock_cls.return_value.poll_all.return_value = {"devices": []}
+        targets = [_make_target()]
+        snmp_metrics(targets, tick_started=1000.0)
+        mock_cls.assert_called_once_with(targets, 1000.0)
+
     @patch("fivenines_agent.snmp._run_snmp_cmd")
     @patch("fivenines_agent.snmp.shutil.which")
     def test_dry_run_prints_diagnostics(self, mock_which, mock_cmd, capsys):
@@ -409,6 +532,7 @@ class TestBuildBaseArgs:
         assert args[idx + 1] == "public"
         assert "192.168.1.10" in args
         assert "-On" in args
+        assert "-Oe" in args  # numeric enums (#162)
 
     def test_v2c_custom_community(self):
         target = _make_target(community="secret")
@@ -587,6 +711,23 @@ class TestPollInterfaces:
         assert c1["broadcast_in"] == 100
 
     @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_labelled_enums(self, mock_cmd):
+        """REGRESSION (#162): a walk from a host that loads MIBs keeps the
+        type and admin/oper status of every interface."""
+        mock_cmd.side_effect = [(LABELLED_IFTABLE, None), ("", None)]
+        collector = SNMPCollector([_make_target()])
+        ifaces, _, _, error = collector._poll_interfaces([])
+        assert error is None
+        iface1 = next(i for i in ifaces if i["if_index"] == 1)
+        assert iface1["if_type"] == 6
+        assert iface1["if_admin_status"] == 0  # up(1)
+        assert iface1["if_oper_status"] == 0  # up(1)
+        iface2 = next(i for i in ifaces if i["if_index"] == 2)
+        assert iface2["if_type"] == 161  # a LACP bond: a label with digits
+        assert iface2["if_admin_status"] == 1  # down(2)
+        assert iface2["if_oper_status"] == 6  # lowerLayerDown(7)
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
     def test_printer_no_ifxtable(self, mock_cmd):
         """Printer with only ifTable (no ifXTable support)."""
         mock_cmd.side_effect = [
@@ -751,15 +892,11 @@ class TestPollAll:
         result = collector.poll_all()
         assert len(result["devices"]) == 1
 
-    @pytest.mark.skipif(
-        __import__("sys").platform == "win32",
-        reason="SNMP poll-due caching uses time precision that differs on Windows; "
-               "test passes deterministically on Linux but is flaky on windows-latest. "
-               "Pre-existing test, exposed by the Windows CI runner.",
-    )
     @patch("fivenines_agent.snmp._run_snmp_cmd")
     def test_device_not_due(self, mock_cmd):
-        """Devices not yet due for polling should return cached results."""
+        """Devices not yet due for polling should return cached results.
+        (Was skipped on Windows as flaky: a device never polled read as
+        "polled at boot", not due on a runner up for less than 3600s.)"""
         mock_cmd.side_effect = [
             (SYSTEM_OUTPUT, None),
             (IFTABLE_OUTPUT, None),
@@ -797,6 +934,12 @@ class TestPollAll:
         SNMPCollector._last_results["old-device"] = {
             "device_id": "old-device"
         }
+        SNMPCollector._polling_keys["cut-off"] = "0" * 64  # never stamped
+        finished = Future()
+        finished.set_result({"device_id": "in-flight"})
+        SNMPCollector._in_flight["in-flight"] = (
+            finished, "0" * 64, 900.0, False
+        )
         target = _make_target(device_id="new-device")
         # Force it to be due
         SNMPCollector._last_poll_times["new-device"] = 0
@@ -808,10 +951,14 @@ class TestPollAll:
                 (IFXTABLE_OUTPUT, None),
             ]
             collector = SNMPCollector([target])
-            collector.poll_all()
+            devices = collector.poll_all()["devices"]
 
         assert "old-device" not in SNMPCollector._last_poll_times
         assert "old-device" not in SNMPCollector._last_results
+        assert set(SNMPCollector._polling_keys) == {"new-device"}
+        # A removed device's finished poll is dropped, not reported.
+        assert SNMPCollector._in_flight == {}
+        assert [d["device_id"] for d in devices] == ["new-device"]
 
     @patch("fivenines_agent.snmp._run_snmp_cmd")
     def test_mixed_due_and_cached(self, mock_cmd):
@@ -872,6 +1019,786 @@ class TestIsDeviceDue:
         SNMPCollector._last_poll_times["dev-1"] = time.monotonic() - 61
         collector = SNMPCollector([target])
         assert collector._is_device_due(target) is True
+
+    def test_due_every_tick_when_interval_equals_the_agents(self):
+        """Stamps and checks both use the tick START, which is at least one
+        collection interval after the last one: however long the collectors
+        before SNMP took, a 60s device on a 60s agent is due every tick."""
+        SNMPCollector._last_poll_times["dev-1"] = 1000.0
+        target = _make_target(interval=60)
+        assert SNMPCollector([target], 1060.0)._is_device_due(target) is True
+
+    def test_due_exactly_once_the_interval_has_elapsed(self):
+        SNMPCollector._last_poll_times["dev-1"] = 1000.0
+        target = _make_target(interval=75)
+        assert SNMPCollector([target], 1074.9)._is_device_due(target) is False
+        assert SNMPCollector([target], 1075.0)._is_device_due(target) is True
+
+    def test_never_polled_faster_than_its_interval(self):
+        """A 90s device on a 60s agent waits for the second tick (120s), it
+        is not polled every 60s."""
+        SNMPCollector._last_poll_times["dev-1"] = 1000.0
+        target = _make_target(interval=90)
+        assert SNMPCollector([target], 1060.0)._is_device_due(target) is False
+        assert SNMPCollector([target], 1120.0)._is_device_due(target) is True
+
+    def test_due_check_uses_the_tick_start_not_the_current_time(self):
+        """Where SNMP runs within the tick is irrelevant once the tick start
+        is known; without one, the current time is used."""
+        clock = _Clock(1119.0)  # SNMP ran late in its tick
+        SNMPCollector._last_poll_times["dev-1"] = 1000.0
+        target = _make_target(interval=90)
+        with patch("fivenines_agent.snmp.time", clock):
+            assert SNMPCollector([target], 1060.0)._is_device_due(target) is False
+            assert SNMPCollector([target])._is_device_due(target) is True
+
+    def test_never_polled_is_due_right_after_boot(self):
+        """monotonic() counts from boot: a device never polled must not wait
+        until the host has been up for one interval."""
+        clock = _Clock(5.0)
+        target = _make_target(interval=60)
+        with patch("fivenines_agent.snmp.time", clock):
+            assert SNMPCollector([target])._is_device_due(target) is True
+
+    def test_interval_too_large_for_a_float_is_not_due(self):
+        """A server-pushed int past float range must read "not due", not
+        raise: an exception here nulls every device on the host. Pins the
+        interval out of any float arithmetic."""
+        SNMPCollector._last_poll_times["dev-1"] = 1000.0
+        target = _make_target(interval=10**400)
+        assert SNMPCollector([target], 1060.0)._is_device_due(target) is False
+
+
+# ================================================================
+# Tests for replay, the batch deadline and target changes (#161)
+# ================================================================
+
+
+class TestReplayAfterFailure:
+    """REGRESSION (#161): the last success was replayed on the ticks between
+    failed polls, the server reset the failure streak on each replay, and an
+    outage never reached unreachable."""
+
+    def _ticks(self, clock, target, starts, offsets=None):
+        """Run one agent tick at each start time, SNMP running `offset`
+        seconds into the tick; dev-1's outcome per tick."""
+        outcomes = []
+        with patch("fivenines_agent.snmp.time", clock):
+            for start, offset in zip(starts, offsets or [0] * len(starts)):
+                clock.now = start + offset
+                collector = SNMPCollector([target], start)
+                outcomes.append(_outcome(collector.poll_all()["devices"]))
+        return outcomes
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_outage_at_defaults_fails_every_tick(self, mock_cmd):
+        """60s device interval, 60s agent tick, and a timed-out poll takes
+        ~10s (-t 5 -r 1). Stamped when it finished, the device was 50s old
+        on the next tick, not due, and the last success was replayed. SNMP
+        also runs at a different point of each tick (the collectors before
+        it vary), which must not matter either."""
+        clock = _Clock()
+        responses = iter(OK_POLL)
+
+        def snmp_cmd(cmd, args, timeout):
+            try:
+                return next(responses)
+            except StopIteration:
+                clock.now += 10
+                return DOWN
+
+        mock_cmd.side_effect = snmp_cmd
+        outcomes = self._ticks(
+            clock,
+            _make_target(interval=60),
+            [1000, 1060, 1120, 1180],
+            offsets=[9.0, 0.5, 20.0, 0.1],
+        )
+        assert outcomes == ["ok", "error", "error", "error"]
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_not_due_tick_after_a_failure_reports_nothing(self, mock_cmd):
+        """error, not-due tick, error, not-due tick, error: nothing between
+        the failures, never the success from before them."""
+        mock_cmd.side_effect = OK_POLL + [DOWN, DOWN, DOWN]
+        outcomes = self._ticks(
+            _Clock(),
+            _make_target(interval=120),
+            [1000, 1060, 1120, 1180, 1240, 1300, 1360],
+        )
+        assert outcomes == [
+            "ok", "cached", "error", None, "error", None, "error",
+        ]
+
+    def test_executor_failure_evicts_the_cached_success(self):
+        clock = _Clock()
+        SNMPCollector._last_poll_times["dev-1"] = 900.0
+        SNMPCollector._last_results["dev-1"] = {
+            "device_id": "dev-1",
+            "system": {"sys_name": "cached"},
+        }
+        target = _make_target(interval=60)
+        collector = SNMPCollector([target])
+        with patch("fivenines_agent.snmp.time", clock), patch.object(
+            collector, "_poll_device", side_effect=RuntimeError("boom")
+        ):
+            devices = collector.poll_all()["devices"]
+        assert _outcome(devices) == "error"
+        assert "dev-1" not in SNMPCollector._last_results
+        # It was polled (it raised): stamped, next poll at its interval.
+        assert SNMPCollector._last_poll_times["dev-1"] == 1000.0
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_mixed_tick_replays_only_the_not_due_device(self, mock_cmd):
+        """On a tick that polls some devices, the not-due ones are replayed
+        marked cached, and a failure evicts only the device that failed."""
+        mock_cmd.return_value = DOWN
+        clock = _Clock()
+        SNMPCollector._last_poll_times.update({"dev-1": 990.0, "dev-2": 900.0})
+        for did in ("dev-1", "dev-2"):
+            SNMPCollector._last_results[did] = {
+                "device_id": did,
+                "system": {"sys_name": did},
+            }
+        targets = [
+            _make_target(device_id="dev-1", interval=300),
+            _make_target(device_id="dev-2", interval=60),
+        ]
+        with patch("fivenines_agent.snmp.time", clock):
+            devices = SNMPCollector(targets).poll_all()["devices"]
+        by_id = {d["device_id"]: d for d in devices}
+        assert set(by_id) == {"dev-1", "dev-2"}
+        assert by_id["dev-2"]["error"]["type"] == "timeout"
+        assert by_id["dev-1"]["cached"] is True
+        assert by_id["dev-1"]["system"] == {"sys_name": "dev-1"}
+        assert "dev-2" not in SNMPCollector._last_results
+        assert "cached" not in SNMPCollector._last_results["dev-1"]
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_replay_is_marked_and_the_cache_is_not(self, mock_cmd):
+        mock_cmd.side_effect = OK_POLL
+        clock = _Clock()
+        target = _make_target(interval=300)
+        with patch("fivenines_agent.snmp.time", clock):
+            fresh = SNMPCollector([target], 1000.0).poll_all()["devices"][0]
+            clock.now = 1060
+            replay = SNMPCollector([target], 1060.0).poll_all()["devices"][0]
+        assert "cached" not in fresh
+        assert replay["cached"] is True
+        assert {k: v for k, v in replay.items() if k != "cached"} == fresh
+        assert "cached" not in SNMPCollector._last_results["dev-1"]
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_poll_is_stamped_with_the_tick_start(self, mock_cmd):
+        """Not when the poll finished, not even when SNMP started: the tick
+        began at 990, SNMP ran at 1000 and the poll took 10s."""
+        clock = _Clock()
+
+        def slow_timeout(cmd, args, timeout):
+            clock.now += 10
+            return DOWN
+
+        mock_cmd.side_effect = slow_timeout
+        with patch("fivenines_agent.snmp.time", clock):
+            SNMPCollector([_make_target()], 990.0).poll_all()
+            assert SNMPCollector._last_poll_times["dev-1"] == 990.0
+            # Without a tick start, the time the batch started.
+            clock.now = 2000.0
+            SNMPCollector._last_poll_times.clear()
+            SNMPCollector([_make_target()]).poll_all()
+        assert SNMPCollector._last_poll_times["dev-1"] == 2000.0
+
+
+class TestBatchDeadline:
+    """The 30s batch deadline bounds the tick. Past it a poll still queued
+    is cancelled; one already running is kept in flight and reported once
+    it finishes, and its device is not polled again meanwhile."""
+
+    def test_executor_timeout_evicts_the_cached_success(self):
+        """A poll the batch deadline cuts off evicts the cached success. One
+        still queued is cancelled and never runs: left unstamped, still due.
+        One already running cannot be stopped: stamped, and kept in flight
+        to be reported when it finishes."""
+        for did in ("dev-1", "dev-2"):
+            SNMPCollector._last_poll_times[did] = 900.0
+            SNMPCollector._last_results[did] = {"device_id": did}
+        targets = [
+            _make_target(device_id="dev-1"),
+            _make_target(device_id="dev-2"),
+        ]
+        executor = _FakeExecutor(running=1)
+        with _fake_pool(executor):
+            devices = SNMPCollector(targets, 1000.0).poll_all()["devices"]
+        assert [d["error"]["message"][:16] for d in devices] == [
+            "Executor timeout", "Executor timeout",
+        ]
+        assert SNMPCollector._last_results == {}
+        assert [f.cancelled() for f in executor.futures] == [False, True]
+        assert SNMPCollector._last_poll_times == {
+            "dev-1": 1000.0, "dev-2": 900.0,
+        }
+        future, _, started, stuck = SNMPCollector._in_flight["dev-1"]
+        assert future is executor.futures[0] and started == 1000.0
+        assert stuck is False
+        assert list(SNMPCollector._in_flight) == ["dev-1"]
+        # The tick never waits on the running poll.
+        assert executor.shutdown_args[0] is False
+
+    def test_late_answer_is_reported_once_the_poll_finishes(self):
+        """REGRESSION: an outage of 21-30 dead devices on one host ends the
+        third 10s round just past the 30s deadline, every tick: the same
+        devices only ever reported an (uncounted) executor timeout and
+        never reached unreachable. Their answer now arrives a tick late."""
+        targets = [
+            _make_target(device_id="dev-1"),
+            _make_target(device_id="dev-2"),
+        ]
+        first = _FakeExecutor(running=1)
+        with _fake_pool(first):
+            SNMPCollector(targets[:1], 1000.0).poll_all()
+        first.futures[0].set_result({"device_id": "dev-1", "error": DOWN[1]})
+        second = _FakeExecutor(
+            poll=lambda t: {"device_id": t["device_id"]}, done=1
+        )
+        with _fake_pool(second):
+            devices = SNMPCollector(targets, 1060.0).poll_all()["devices"]
+        assert devices[0] == {"device_id": "dev-1", "error": DOWN[1]}
+        assert second.submitted == ["dev-2"]  # dev-1 reported, not re-polled
+        assert SNMPCollector._in_flight == {}
+
+    def test_device_still_being_polled_is_not_polled_again(self):
+        """Two polls never run against one device at once."""
+        target = _make_target(device_id="dev-1")
+        first = _FakeExecutor(running=1)
+        with _fake_pool(first):
+            SNMPCollector([target], 1000.0).poll_all()
+        second = _FakeExecutor()
+        with _fake_pool(second):
+            devices = SNMPCollector([target], 1060.0).poll_all()["devices"]
+        assert second.submitted == []
+        assert devices == []
+        assert SNMPCollector._in_flight["dev-1"][0] is first.futures[0]
+        # Finished by the next tick, with nothing else due: still reported.
+        first.futures[0].set_result({"device_id": "dev-1", "error": DOWN[1]})
+        third = _FakeExecutor()
+        with _fake_pool(third):
+            devices = SNMPCollector([target], 1120.0).poll_all()["devices"]
+        assert devices == [{"device_id": "dev-1", "error": DOWN[1]}]
+        assert third.submitted == []
+
+    def test_pending_polls_share_one_batch_deadline(self):
+        """The first wait gets the whole budget, the rest what is left: no
+        poll gets a fresh 30s once the batch has spent it."""
+        clock = _Clock(1000.0)
+        waits = []
+
+        def fake_wait(futures, timeout):
+            waits.append(timeout)
+            clock.now += timeout  # nothing finished: the wait ran out
+
+        targets = [_make_target(device_id="dev-%d" % i) for i in range(3)]
+        with patch("fivenines_agent.snmp.time", clock), patch(
+            "fivenines_agent.snmp.wait", fake_wait
+        ), patch(
+            "fivenines_agent.snmp.ThreadPoolExecutor",
+            lambda max_workers: _FakeExecutor(),
+        ):
+            # The tick started 20s earlier: the budget is SNMP's own.
+            SNMPCollector(targets, 980.0).poll_all()
+        assert waits == [30, 0.0, 0.0]
+
+    def test_no_waiting_on_pending_polls_past_the_deadline(self):
+        """Waiting 0.1s more on each pending poll stretched a big batch
+        without bound: 1000 dead targets took minutes, past the watchdog."""
+        targets = [_make_target(device_id="dev-%d" % i) for i in range(200)]
+        started = time.monotonic()
+        with _fake_pool(_FakeExecutor()):
+            devices = SNMPCollector(targets, 1000.0).poll_all()["devices"]
+        assert time.monotonic() - started < 5  # 20s at 0.1s a poll
+        assert len(devices) == 200
+
+    def test_oldest_poll_goes_first_so_every_device_gets_its_turn(self):
+        """REGRESSION: the server does not count an executor timeout as a
+        failure, and the pool always took the targets in config order, so
+        in an outage bigger than one batch the same tail was cut off every
+        tick and never reached unreachable."""
+        targets = [
+            _make_target(device_id=d, interval=60)
+            for d in ("dev-1", "dev-2", "dev-3", "dev-4")
+        ]
+        orders = []
+        for start in (1000.0, 1060.0, 1120.0, 1180.0):
+            executor = _FakeExecutor(
+                poll=lambda t: {"device_id": t["device_id"], "error": DOWN[1]},
+                done=2,
+            )
+            with _fake_pool(executor):
+                SNMPCollector(targets, start).poll_all()
+            orders.append(executor.submitted)
+        assert orders == [
+            ["dev-1", "dev-2", "dev-3", "dev-4"],
+            ["dev-3", "dev-4", "dev-1", "dev-2"],
+            ["dev-1", "dev-2", "dev-3", "dev-4"],
+            ["dev-3", "dev-4", "dev-1", "dev-2"],
+        ]
+
+    def test_late_success_is_reported_once_without_its_counters(self):
+        """Its counters were read a tick or more before this tick's ts,
+        which the server stamps them with: sent, they would skew rates."""
+        target = _make_target(interval=300)
+        first = _FakeExecutor(running=1)
+        with _fake_pool(first):
+            SNMPCollector([target], 1000.0).poll_all()
+        answer = {
+            "device_id": "dev-1",
+            "system": {"sys_uptime": 42},
+            "interfaces": [{"if_index": 1}],
+            "interface_metrics": [{"if_index": 1, "bytes_in": 7}],
+            "custom_metrics": [{"name": "cpu", "value": 3}],
+        }
+        first.futures[0].set_result(answer)
+        with _fake_pool(_FakeExecutor()):
+            devices = SNMPCollector([target], 1060.0).poll_all()["devices"]
+        late = {
+            "device_id": "dev-1",
+            "system": {"sys_uptime": 42},
+            "interfaces": [{"if_index": 1}],
+        }
+        assert devices == [late]
+        with _fake_pool(_FakeExecutor()):
+            devices = SNMPCollector([target], 1120.0).poll_all()["devices"]
+        assert devices == [dict(late, cached=True)]
+
+    def test_late_poll_that_raised_is_an_error_entry(self):
+        targets = [
+            _make_target(device_id="dev-1"),
+            _make_target(device_id="dev-2"),
+        ]
+        first = _FakeExecutor(running=1)
+        with _fake_pool(first):
+            SNMPCollector(targets[:1], 1000.0).poll_all()
+        first.futures[0].set_exception(RuntimeError("boom"))
+        second = _FakeExecutor(
+            poll=lambda t: {"device_id": t["device_id"]}, done=1
+        )
+        with _fake_pool(second):
+            devices = SNMPCollector(targets, 1060.0).poll_all()["devices"]
+        assert devices[0]["error"] == {"type": "unknown", "message": "boom"}
+        assert devices[1] == {"device_id": "dev-2"}
+
+    def test_stuck_poll_is_a_counted_failure_every_tick(self):
+        """An snmpget in uninterruptible sleep outlives its own timeouts:
+        the device must still reach unreachable, without a second poll."""
+        target = _make_target()
+        first = _FakeExecutor(running=1)
+        with _fake_pool(first):
+            SNMPCollector([target], 1000.0).poll_all()
+        for start in (1120.0, 1179.0):
+            with _fake_pool(_FakeExecutor()):
+                devices = SNMPCollector([target], start).poll_all()["devices"]
+            assert devices == []  # younger than IN_FLIGHT_LIMIT
+        for start in (1180.0, 1240.0, 1300.0):
+            executor = _FakeExecutor()
+            with _fake_pool(executor):
+                devices = SNMPCollector([target], start).poll_all()["devices"]
+            assert [d["error"]["message"] for d in devices] == [
+                "SNMP poll still running after 180s"
+            ]
+            assert executor.submitted == []
+
+    def test_poll_finishing_as_it_is_cancelled_is_read(self):
+        """Running at the deadline, done a moment later: cancel() fails
+        and the answer, already there, is read rather than kept in
+        flight."""
+
+        class _FinishesAtCancel(Future):
+            def cancel(self):
+                self.set_result({"device_id": "dev-1"})
+                return False
+
+        class _Pool(_FakeExecutor):
+            def submit(self, fn, target, *args):
+                future = _FinishesAtCancel()
+                future.set_running_or_notify_cancel()
+                return future
+
+        with _fake_pool(_Pool()):
+            devices = SNMPCollector([_make_target()], 1000.0).poll_all()[
+                "devices"
+            ]
+        assert devices == [{"device_id": "dev-1"}]
+        assert SNMPCollector._in_flight == {}
+
+    def test_removed_device_keeps_its_running_poll(self):
+        """Removed then re-added while its poll still runs: forgotten, the
+        poll would be started again on top of it, once per round trip."""
+        a, b = _make_target(device_id="dev-a"), _make_target(device_id="dev-b")
+        first = _FakeExecutor(running=1)
+        with _fake_pool(first):
+            SNMPCollector([a], 1000.0).poll_all()
+        with _fake_pool(_FakeExecutor()):
+            gone = SNMPCollector([b], 1300.0).poll_all()["devices"]
+        # Absent: kept in flight, and no "still running" failure for it.
+        assert [d["device_id"] for d in gone] == ["dev-b"]
+        assert SNMPCollector._in_flight["dev-a"][0] is first.futures[0]
+        back = _FakeExecutor()
+        with _fake_pool(back):
+            SNMPCollector([a, b], 1360.0).poll_all()
+        assert "dev-a" not in back.submitted
+
+    def test_poll_finished_while_removed_is_dropped_on_readd(self):
+        """REGRESSION: it finished while the device was absent, and the
+        device came back unchanged before it was read: its old answer read
+        as fresh, and could clear a failure streak on the server."""
+        a, b = _make_target(device_id="dev-a"), _make_target(device_id="dev-b")
+        first = _FakeExecutor(running=1)
+        with _fake_pool(first):
+            SNMPCollector([a], 1000.0).poll_all()
+        with _fake_pool(_FakeExecutor()):
+            SNMPCollector([b], 1060.0).poll_all()
+        first.futures[0].set_result({"device_id": "dev-a", "system": {}})
+        again = _FakeExecutor(
+            poll=lambda t: {"device_id": t["device_id"], "error": DOWN[1]},
+            done=2,
+        )
+        with _fake_pool(again):
+            devices = SNMPCollector([a, b], 1120.0).poll_all()["devices"]
+        assert "dev-a" in again.submitted
+        assert {"device_id": "dev-a", "system": {}} not in devices
+        assert SNMPCollector._in_flight == {}
+
+    def test_removing_every_target_drops_a_running_poll_on_readd(self):
+        """With no target left the agent does not call snmp_metrics, so it
+        calls forget_targets: otherwise the removal is never seen."""
+        a = _make_target(device_id="dev-a")
+        first = _FakeExecutor(running=1)
+        with _fake_pool(first):
+            SNMPCollector([a], 1000.0).poll_all()
+        forget_targets()
+        first.futures[0].set_result({"device_id": "dev-a", "system": {}})
+        again = _FakeExecutor(
+            poll=lambda t: {"device_id": t["device_id"], "error": DOWN[1]},
+            done=1,
+        )
+        with _fake_pool(again):
+            devices = SNMPCollector([a], 1120.0).poll_all()["devices"]
+        assert again.submitted == ["dev-a"]
+        assert devices == [{"device_id": "dev-a", "error": DOWN[1]}]
+
+    def test_late_answer_after_a_long_tick_is_not_stuck(self):
+        """With ticks 180s+ apart, a poll that finished just after its
+        deadline is late, not stuck: its answer is reported, and its device
+        waits for its interval."""
+        target = _make_target(interval=3600)
+        first = _FakeExecutor(running=1)
+        with _fake_pool(first):
+            SNMPCollector([target], 1000.0).poll_all()
+        first.futures[0].set_result({"device_id": "dev-1", "error": DOWN[1]})
+        second = _FakeExecutor()
+        with _fake_pool(second):
+            devices = SNMPCollector([target], 1300.0).poll_all()["devices"]
+        assert devices == [{"device_id": "dev-1", "error": DOWN[1]}]
+        assert second.submitted == []
+        assert SNMPCollector._last_poll_times == {"dev-1": 1000.0}
+
+    def test_submit_failure_keeps_the_polls_already_submitted(self):
+        """Out of threads mid-batch, with a real pool: what was submitted is
+        still read, the rest stays unstamped, and the poll a failed submit()
+        had already queued never runs (an idle worker would take it)."""
+        import threading as real_threading
+
+        starts = []
+        start = real_threading.Thread.start
+        orphan_queued = real_threading.Event()
+
+        def start_once(thread):
+            starts.append(thread)
+            if len(starts) > 1:
+                orphan_queued.set()  # submit() queued its work first
+                raise RuntimeError("can't start new thread")
+            start(thread)
+
+        ran = []
+
+        def poll(target):
+            ran.append(target["device_id"])
+            if target["device_id"] == "dev-1":
+                # Busy until the orphan is queued, so the second submit()
+                # must start a thread; then free to pick the orphan up.
+                orphan_queued.wait(5)
+            return {"device_id": target["device_id"]}
+
+        targets = [_make_target(device_id=d) for d in ("dev-1", "dev-2", "dev-3")]
+        with patch.object(real_threading.Thread, "start", start_once), patch.object(
+            SNMPCollector, "_poll_device", side_effect=poll
+        ):
+            devices = SNMPCollector(targets, 1000.0).poll_all()["devices"]
+            time.sleep(0.3)  # the worker has taken the orphan by now
+        assert devices == [{"device_id": "dev-1"}]
+        assert ran == ["dev-1"]
+        assert SNMPCollector._last_poll_times == {"dev-1": 1000.0}
+
+    def test_failure_to_build_a_ticket_keeps_the_polls_submitted(self):
+        """Out of memory before the second submit(): the first poll is still
+        read, not left running untracked."""
+        built = []
+
+        def ticket():
+            built.append(1)
+            if len(built) == 2:
+                raise MemoryError()
+            return real_ticket()
+
+        from fivenines_agent.snmp import _Ticket as real_ticket
+
+        targets = [_make_target(device_id="dev-1"), _make_target(device_id="dev-2")]
+        executor = _FakeExecutor(poll=lambda t: {"device_id": t["device_id"]}, done=2)
+        with _fake_pool(executor), patch("fivenines_agent.snmp._Ticket", ticket):
+            devices = SNMPCollector(targets, 1000.0).poll_all()["devices"]
+        assert devices == [{"device_id": "dev-1"}]
+        assert SNMPCollector._last_poll_times == {"dev-1": 1000.0}
+
+    def test_poll_that_cannot_be_tracked_is_never_accepted(self):
+        """Submitted, then lost before it is recorded: it must not run
+        untracked."""
+
+        class _Unhashable(Future):
+            def __hash__(self):
+                raise MemoryError()
+
+        tickets = []
+
+        class _Pool(_FakeExecutor):
+            def submit(self, fn, target, ticket):
+                tickets.append(ticket)
+                return _Unhashable()
+
+        with _fake_pool(_Pool()):
+            SNMPCollector([_make_target()], 1000.0).poll_all()
+        assert [(t._decided.is_set(), t.accepted) for t in tickets] == [
+            (True, False)
+        ]
+
+    def test_any_submit_error_decides_the_ticket(self):
+        """An undecided ticket would block a worker, and the agent's exit
+        (which joins pool threads), forever."""
+        tickets = []
+
+        class _Raises(_FakeExecutor):
+            def submit(self, fn, target, ticket):
+                tickets.append(ticket)
+                raise MemoryError()
+
+        with _fake_pool(_Raises()):
+            devices = SNMPCollector([_make_target()], 1000.0).poll_all()[
+                "devices"
+            ]
+        assert devices == []
+        # Checked without waiting: an undecided ticket must fail, not hang.
+        assert [(t._decided.is_set(), t.accepted) for t in tickets] == [
+            (True, False)
+        ]
+
+    @pytest.mark.parametrize("error", [RuntimeError, MemoryError])
+    def test_submit_failure_ends_the_batch(self, error):
+        """The first failed submit() ends it: out of threads or memory, the
+        next ones would only queue more work that never polls. The polls
+        already submitted are still read, not left running untracked."""
+
+        class _FailsOnce(_FakeExecutor):
+            def submit(self, fn, target, *args):
+                self.attempts = getattr(self, "attempts", 0) + 1
+                if self.attempts == 2:
+                    raise error("no resources")
+                return super().submit(fn, target, *args)
+
+        targets = [_make_target(device_id=d) for d in ("dev-1", "dev-2", "dev-3")]
+        executor = _FailsOnce(poll=lambda t: {"device_id": t["device_id"]}, done=3)
+        with _fake_pool(executor):
+            devices = SNMPCollector(targets, 1000.0).poll_all()["devices"]
+        assert executor.submitted == ["dev-1"]
+        assert devices == [{"device_id": "dev-1"}]
+
+    def test_answer_of_a_stuck_poll_is_dropped(self):
+        """REGRESSION: after counted "still running" failures, the stuck
+        poll's own success would read as a recovery on the server. Recovery
+        needs a fresh poll, made at once."""
+        target = _make_target(interval=3600)
+        first = _FakeExecutor(running=1)
+        with _fake_pool(first):
+            SNMPCollector([target], 1000.0).poll_all()
+        with _fake_pool(_FakeExecutor()):
+            stuck = SNMPCollector([target], 1180.0).poll_all()["devices"]
+        assert stuck[0]["error"]["message"].startswith("SNMP poll still")
+        first.futures[0].set_result({"device_id": "dev-1", "system": {}})
+        fresh = _FakeExecutor(
+            poll=lambda t: {"device_id": t["device_id"], "error": DOWN[1]},
+            done=1,
+        )
+        with _fake_pool(fresh):
+            devices = SNMPCollector([target], 1240.0).poll_all()["devices"]
+        assert fresh.submitted == ["dev-1"]
+        assert devices == [{"device_id": "dev-1", "error": DOWN[1]}]
+
+
+class TestPollingKey:
+    """A change to what a target polls (POLLING_FIELDS) is a new target:
+    polled at once, never answered with the old target's result."""
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_changed_polling_config_is_polled_at_once(self, mock_cmd):
+        """REGRESSION: re-addressed, a device replayed its OLD address's last
+        success until its interval ran out, up to an hour."""
+        mock_cmd.side_effect = OK_POLL + [DOWN]
+        old = _make_target(interval=3600)
+        new = _make_target(interval=3600, ip="192.168.1.99")
+        first = SNMPCollector([old], 1000.0).poll_all()["devices"]
+        second = SNMPCollector([new], 1060.0).poll_all()["devices"]
+        assert _outcome(first) == "ok"
+        assert _outcome(second) == "error"
+        assert "192.168.1.99" in mock_cmd.call_args_list[-1].args[1]
+        assert "dev-1" not in SNMPCollector._last_results
+        # Then back to its interval: not polled again on the next tick.
+        third = SNMPCollector([new], 1120.0).poll_all()["devices"]
+        assert _outcome(third) is None
+        assert mock_cmd.call_count == 4
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_field_the_poll_does_not_read_is_not_a_config_change(
+        self, mock_cmd
+    ):
+        """Only POLLING_FIELDS count: a field the server adds later, or one
+        that changes every tick, must not reset the interval."""
+        mock_cmd.side_effect = OK_POLL
+        SNMPCollector([_make_target(interval=3600)], 1000.0).poll_all()
+        target = _make_target(interval=3600, name="renamed")
+        devices = SNMPCollector([target], 1060.0).poll_all()["devices"]
+        assert _outcome(devices) == "cached"
+
+    def test_polling_key_holds_no_credentials(self):
+        target = _make_v3_target()
+        with patch.object(SNMPCollector, "_poll_device", return_value={}):
+            SNMPCollector([target], 1000.0).poll_all()
+        key = SNMPCollector._polling_keys["dev-v3"]
+        assert len(key) == 64 and int(key, 16) >= 0  # a SHA-256 digest
+
+    def test_absent_and_null_field_are_different_targets(self):
+        """An absent community polls as "public", a null one does not."""
+        assert _polling_key({"ip": "a"}) != _polling_key(
+            {"ip": "a", "community": None}
+        )
+
+    @pytest.mark.parametrize(
+        "field, value",
+        [
+            ("ip", "192.168.1.99"),
+            ("port", 1161),
+            ("version", "v3"),
+            ("community", "private"),
+            ("username", "other"),
+            ("security_level", "auth_priv"),
+            ("auth_protocol", "md5"),
+            ("auth_password", "new-auth"),
+            ("priv_protocol", "des"),
+            ("priv_password", "new-priv"),
+            ("capabilities", ["system"]),
+            ("custom_oids", [{"name": "x", "oid": "1.3.6.1.2.1.1.7.0"}]),
+        ],
+    )
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_every_polling_field_change_is_polled_at_once(
+        self, mock_cmd, field, value
+    ):
+        """Hard-coded, not read from POLLING_FIELDS: dropping a field from
+        the tuple must fail its case here."""
+        mock_cmd.side_effect = OK_POLL + [DOWN]
+        SNMPCollector([_make_target(interval=3600)], 1000.0).poll_all()
+        changed = dict(_make_target(interval=3600), **{field: value})
+        devices = SNMPCollector([changed], 1060.0).poll_all()["devices"]
+        assert _outcome(devices) == "error"
+
+    def test_unserializable_target_does_not_raise(self):
+        """A hostile nesting depth must not null SNMP for every device, and
+        with no key to compare, a change of address behind it could not be
+        seen: such a target is never replayed."""
+        nested = []
+        for _ in range(100000):
+            nested = [nested]
+        target = _make_target(interval=3600, custom_oids=nested)
+        answer = {"device_id": "dev-1", "system": {"sys_name": "old"}}
+        with patch.object(SNMPCollector, "_poll_device", return_value=answer):
+            first = SNMPCollector([target], 1000.0).poll_all()["devices"]
+            second = SNMPCollector([target], 1060.0).poll_all()["devices"]
+        assert SNMPCollector._polling_keys["dev-1"] is None
+        assert first == [answer]
+        assert second == []
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_interval_change_alone_keeps_the_device_state(self, mock_cmd):
+        """The interval only decides when: changing it is not a new target."""
+        mock_cmd.side_effect = OK_POLL
+        SNMPCollector([_make_target(interval=3600)], 1000.0).poll_all()
+        target = _make_target(interval=1800)
+        devices = SNMPCollector([target], 1060.0).poll_all()["devices"]
+        assert _outcome(devices) == "cached"
+
+    def test_config_change_waits_for_the_running_poll_then_drops_it(self):
+        """The old target's poll keeps the device busy until it ends, then
+        its answer is dropped and the new target is polled."""
+        first = _FakeExecutor(running=1)
+        with _fake_pool(first):
+            SNMPCollector([_make_target()], 1000.0).poll_all()
+        new = _make_target(ip="192.168.1.99")
+        second = _FakeExecutor()
+        with _fake_pool(second):
+            SNMPCollector([new], 1060.0).poll_all()
+        assert second.submitted == []  # never two polls at once
+        first.futures[0].set_result({"device_id": "dev-1"})
+        third = _FakeExecutor(
+            poll=lambda t: {"device_id": t["device_id"], "error": DOWN[1]},
+            done=1,
+        )
+        with _fake_pool(third):
+            devices = SNMPCollector([new], 1120.0).poll_all()["devices"]
+        assert third.submitted == ["dev-1"]
+        assert devices == [{"device_id": "dev-1", "error": DOWN[1]}]
+
+    def test_in_flight_answer_of_a_target_without_key_is_dropped(self):
+        """With no key, a change of address behind it cannot be seen: the
+        answer is not reported and the device is polled afresh."""
+        nested = []
+        for _ in range(100000):
+            nested = [nested]
+        target = _make_target(custom_oids=nested)
+        first = _FakeExecutor(running=1)
+        with _fake_pool(first):
+            SNMPCollector([target], 1000.0).poll_all()
+        first.futures[0].set_result({"device_id": "dev-1", "system": {}})
+        second = _FakeExecutor()
+        with _fake_pool(second):
+            devices = SNMPCollector([target], 1060.0).poll_all()["devices"]
+        assert second.submitted == ["dev-1"]
+        assert {"device_id": "dev-1", "system": {}} not in devices
+
+    def test_target_that_gets_a_key_is_polled_at_once(self):
+        nested = []
+        for _ in range(100000):
+            nested = [nested]
+        with patch.object(SNMPCollector, "_poll_device", return_value={}):
+            SNMPCollector(
+                [_make_target(interval=3600, custom_oids=nested)], 1000.0
+            ).poll_all()
+        executor = _FakeExecutor()
+        with _fake_pool(executor):
+            SNMPCollector(
+                [_make_target(interval=3600, ip="192.168.1.99")], 1060.0
+            ).poll_all()
+        assert executor.submitted == ["dev-1"]
+
+    def test_key_ignores_the_order_of_keys_in_a_dict(self):
+        assert _polling_key(
+            {"custom_oids": [{"name": "x", "oid": "1.3"}]}
+        ) == _polling_key({"custom_oids": [{"oid": "1.3", "name": "x"}]})
 
 
 # ================================================================
@@ -1074,9 +2001,13 @@ class TestEdgeCases:
             del SNMPCollector._last_poll_times
         if hasattr(SNMPCollector, "_last_results"):
             del SNMPCollector._last_results
+        del SNMPCollector._polling_keys
+        del SNMPCollector._in_flight
         collector = SNMPCollector([_make_target()])
         assert hasattr(SNMPCollector, "_last_poll_times")
         assert hasattr(SNMPCollector, "_last_results")
+        assert SNMPCollector._polling_keys == {}
+        assert SNMPCollector._in_flight == {}
 
     @patch("fivenines_agent.snmp._run_snmp_cmd")
     def test_executor_timeout(self, mock_cmd):
