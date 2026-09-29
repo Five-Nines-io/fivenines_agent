@@ -79,7 +79,10 @@ wget -T 3 -q -O fivenines_setup.sh https://releases.fivenines.io/latest/fivenine
 
 One script covers every Linux init system: it detects **systemd**, **OpenRC**
 (Alpine) and **UNRAID** and installs the matching service integration, and it
-detects glibc vs musl and downloads the matching binary. See
+detects the architecture and glibc vs musl and downloads the matching binary.
+On a host no release has a binary for (see the platforms listed at the top),
+the install and update scripts stop with `Unsupported architecture` or
+`Unsupported system` before they create, download or stop anything. See
 [Alpine Linux (OpenRC)](#alpine-linux-openrc) and [UNRAID](#unraid) for the
 platform-specific notes.
 
