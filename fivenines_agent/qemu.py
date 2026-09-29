@@ -156,11 +156,15 @@ COLLECT_TIMEOUT = 15
 # blocked (the io_topology and libvirt-probe posture).
 _stalled_worker = None
 
-# A VM whose monitor STAYS stuck would still cost the full COLLECT_TIMEOUT on
-# every tick: its worker ends on its own before the next tick (the stuck call
-# fails after 30s and the budget is spent by then), so the single-flight never
-# engages, and each tick reopens libvirt, walks every healthy VM again and ties
-# up a libvirtd worker for another 30s, for a result that is always None. So a
+# A VM whose job lock STAYS held by someone else would still cost the full
+# COLLECT_TIMEOUT on every tick: the agent's call fails after libvirt's 30s
+# job wait and the worker ends before the next tick (its budget is spent by
+# then), so the single-flight never engages, and each tick reopens libvirt,
+# walks every healthy VM again and ties up a libvirtd worker for another 30s,
+# for a result that is always None. (When the agent's OWN call is the one
+# stuck in a hung monitor -- libvirt waits for a monitor reply with no
+# timeout -- the worker never returns and the single-flight holds instead;
+# the timeout line names the VM either way.) So a
 # collection that ran out of time -- timed out or spent its budget -- is not
 # retried for TIMEOUT_BACKOFF_BASE seconds, doubling per consecutive one up to
 # TIMEOUT_BACKOFF_MAX (the permissions gap-probe numbers), and QEMU reports
@@ -353,10 +357,11 @@ class QEMUCollector:
         self.vms_total = 0
         self.vms_done = 0
         self.collecting = None
+        self.scanning = False
         self.budget_spent = False
-        # {domain UUID: QEMU process start time}, read once per collection
-        # when the first running VM needs it (see _get_vm_uptime).
-        self._started = None
+        # (uuid, state, labels) per VM read; their uptime rows are appended
+        # after the walk, from one process scan (see _append_uptimes).
+        self._uptime_rows = []
         # The allowlist is the one gate, before ANY libvirt call (not even
         # the global error-handler registration): a refused URI keeps its
         # reason here, no connection is attempted, and qemu_metrics reports
@@ -433,20 +438,33 @@ class QEMUCollector:
             log(f"Error parsing XML for domain: {e}", 'error')
         return disks, ifaces
 
-    def _get_vm_uptime(self, uuid, state_num):
-        """Seconds since the VM's QEMU process started; 0 when the VM is not
-        running or its process is not visible to the agent. libvirt has no
-        API for a domain's start time -- dom.info() is [state, maxMem, memory,
-        nrVirtCpu, cpuTime] -- so it is read from the process (no libvirt
-        call, so no budget check)."""
-        if state_num != 1:
-            return 0
-        if self._started is None:
-            self._started = _qemu_start_times()
-        started = self._started.get(str(uuid).lower())
-        if started is None:
-            return 0
-        return max(0, int(time.time() - started))
+    def _append_uptimes(self, data):
+        """vm_vm_uptime_seconds_total for every VM read: seconds since its
+        QEMU process started; 0 when the VM is not running or its process is
+        not visible to the agent. libvirt has no API for a domain's start time
+        -- dom.info() is [state, maxMem, memory, nrVirtCpu, cpuTime] -- so it
+        is read from the processes, in ONE scan after the walk: a slow scan is
+        then never blamed on a VM, and none runs when no VM is running."""
+        started = {}
+        if any(state_num == 1 for _, state_num, _ in self._uptime_rows):
+            self.collecting = None
+            self.scanning = True
+            started = _qemu_start_times(self.deadline)
+            self.scanning = False
+        for uuid, state_num, labels in self._uptime_rows:
+            created = started.get(str(uuid).lower()) if state_num == 1 else None
+            uptime = 0 if created is None else max(0, int(time.time() - created))
+            self._safe_append(data, 'vm_vm_uptime_seconds_total', uptime, labels)
+
+    def progress(self):
+        """Where the collection got to, for the time-bound log lines."""
+        if self.scanning:
+            where = "while reading QEMU process start times"
+        elif self.collecting is None:
+            where = "before the first VM"
+        else:
+            where = f"at VM {self.collecting!r}"
+        return f"{where} ({self.vms_done} of {self.vms_total} VMs done)"
 
     def _safe_append(self, data, metric_name, value, labels):
         try:
@@ -652,8 +670,10 @@ class QEMUCollector:
         daemon lost mid-walk (restarted by an update) fails the next VM's
         state() in every topology, including behind virtproxyd, where the
         agent's own socket stays open and isAlive() cannot see it. A loss
-        after the last VM's state() leaves the list complete and only costs
-        that VM's detail metrics, as any per-metric failure does."""
+        after the last VM's state() leaves the list complete: behind
+        virtproxyd it only costs that VM's detail metrics, as any per-metric
+        failure does; on a direct connection the isAlive() check in _collect
+        conservatively reports None."""
         name = None
         try:
             uuid = dom.UUIDString()
@@ -676,7 +696,7 @@ class QEMUCollector:
 
             self._safe_append(data, 'vm_vm_info', 1, {**labels, 'state': state})
             self._safe_append(data, 'vm_vm_state_code', state_num, labels)
-            self._safe_append(data, 'vm_vm_uptime_seconds_total', self._get_vm_uptime(uuid, state_num), labels)
+            self._uptime_rows.append((uuid, state_num, labels))
 
             # Only collect detailed metrics if VM is running
             if state_num == 1:  # running
@@ -712,15 +732,11 @@ class QEMUCollector:
             # Names the VM whose call used the last of the budget: the check
             # fires on the call AFTER the slow one, and a VM's first calls
             # (UUIDString, name) are local reads that never wait.
-            if self.collecting is None:
-                where = "before the first VM"
-            else:
-                where = f"at VM {self.collecting!r}"
             log(
-                f"QEMU collection ran past its {COLLECT_BUDGET}s budget {where} "
-                f"({self.vms_done} of {self.vms_total} VMs done); reporting "
-                "collection failure (a VM whose QEMU monitor is stuck makes each "
-                "of its monitor calls wait up to 30s)",
+                f"QEMU collection ran past its {COLLECT_BUDGET}s budget "
+                f"{self.progress()}; reporting collection failure (a VM whose "
+                "QEMU monitor is stuck makes each of its monitor calls wait up "
+                "to 30s)",
                 "error",
             )
             return None
@@ -769,6 +785,7 @@ class QEMUCollector:
                 "error",
             )
             return None
+        self._append_uptimes(data)
         return data
 
     def close(self):
@@ -805,15 +822,24 @@ def qemu_metrics(uri=DEFAULT_LIBVIRT_URI):
         )
         return None
 
+    # The worker publishes its collector here once connected, so the tick
+    # can say where a collection it stops waiting for got stuck.
+    holder = {}
     try:
         data, budget_spent = call_bounded(
-            lambda: _collect_once(uri), COLLECT_TIMEOUT, name="qemu-collect"
+            lambda: _collect_once(uri, holder), COLLECT_TIMEOUT, name="qemu-collect"
         )
     except WorkerTimeout as stalled:
         _stalled_worker = stalled.worker
         delay = _back_off()
+        collector = holder.get("collector")
+        where = (
+            collector.progress()
+            if collector is not None
+            else "while opening the libvirt connection"
+        )
         log(
-            f"QEMU: libvirt collection blocked for {COLLECT_TIMEOUT}s; "
+            f"QEMU: libvirt collection blocked for {COLLECT_TIMEOUT}s {where}; "
             f"reporting None for at least {delay}s and until it returns",
             "error",
         )
@@ -826,9 +852,10 @@ def qemu_metrics(uri=DEFAULT_LIBVIRT_URI):
     return data
 
 
-def _collect_once(uri):
+def _collect_once(uri, holder):
     """(the collection, whether it spent COLLECT_BUDGET)."""
     collector = QEMUCollector(uri)
+    holder["collector"] = collector
     try:
         return collector.collect(), collector.budget_spent
     finally:
@@ -860,25 +887,51 @@ def _is_no_domain(error):
     return callable(get_code) and get_code() == libvirt.VIR_ERR_NO_DOMAIN
 
 
-def _qemu_start_times():
+def _qemu_start_times(deadline):
     """{domain UUID: start time} of the QEMU processes on this host, keyed by
     each one's `-uuid` argument (libvirt passes it to every QEMU it starts).
     A process the agent cannot see -- /proc mounted hidepid=, another user's
     process on a hardened host, or SELinux confining QEMU as svirt_t (the
     RHEL family), which the agent's policy cannot read -- is absent, and its
     VM reports 0. Two processes claiming one UUID (an in-host migration)
-    keep the older."""
+    keep the older.
+
+    Each pid is read through its OWN psutil.Process, never process_iter():
+    that one hands out module-wide cached objects, holds each one's lock
+    across the read and keeps what it read on them. A /proc/<pid>/cmdline
+    read can block on that process's mmap lock, and a worker blocked holding
+    a shared object's lock would stall the processes and openvpn collectors
+    on the main thread -- past WatchdogSec; every command line on the host
+    would stay in memory; and a cached create_time survives PID reuse. A
+    fresh object reads create_time now, against the current boot time.
+    COLLECT_BUDGET is checked per process, so an abandoned worker stops."""
     started = {}
     try:
-        for proc in psutil.process_iter(["cmdline", "create_time"]):
-            cmdline = proc.info.get("cmdline") or []
-            created = proc.info.get("create_time")
-            if created is None or "-uuid" not in cmdline:
-                continue
-            position = cmdline.index("-uuid") + 1
-            if position < len(cmdline):
-                uuid = cmdline[position].lower()
-                started[uuid] = min(created, started.get(uuid, created))
+        pids = psutil.pids()
     except Exception as e:
-        log(f"Cannot read QEMU process start times: {e}", "debug")
+        log(f"Cannot list processes for QEMU start times: {e}", "debug")
+        return started
+    for pid in pids:
+        if time.monotonic() >= deadline:
+            raise _BudgetSpent()
+        found = _qemu_uuid_and_start(pid)
+        if found is not None:
+            uuid, created = found
+            started[uuid] = min(created, started.get(uuid, created))
     return started
+
+
+def _qemu_uuid_and_start(pid):
+    """(lower-cased -uuid argument, start time) of one QEMU process, or None
+    for any other process, or one that is gone or not readable."""
+    try:
+        proc = psutil.Process(pid)
+        cmdline = proc.cmdline()
+        if "-uuid" not in cmdline:
+            return None
+        position = cmdline.index("-uuid") + 1
+        if position >= len(cmdline):
+            return None
+        return cmdline[position].lower(), proc.create_time()
+    except Exception:
+        return None

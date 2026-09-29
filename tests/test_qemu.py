@@ -20,6 +20,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import psutil
 import pytest
 
 import fivenines_agent.qemu as qemu
@@ -35,8 +36,17 @@ def _no_host_processes():
     """Keep the VM uptime scan off the host's real process table: the tests
     stay deterministic, and a full cmdline scan is slow on a Windows runner.
     The uptime tests patch in their own processes."""
-    with patch.object(qemu.psutil, "process_iter", return_value=[]):
+    with patch.object(qemu.psutil, "pids", return_value=[]), patch.object(
+        qemu.psutil,
+        "process_iter",
+        side_effect=AssertionError("the uptime scan must not use psutil's cache"),
+    ):
         yield
+
+
+# The real functions, for the one test that scans real processes.
+_REAL_PIDS = psutil.pids
+_REAL_PROCESS = psutil.Process
 
 
 # fake_libvirt (a libvirt double installed as fivenines_agent.qemu.libvirt)
@@ -1230,18 +1240,37 @@ def test_a_worker_timeout_backs_off_too(fake_libvirt):
     assert fake_libvirt.openReadOnly.call_count == 1
 
 
-def _qemu_process(uuid, created):
-    return SimpleNamespace(
-        info={
-            "cmdline": [
-                "/usr/bin/qemu-system-x86_64",
-                "-name",
-                "guest=x",
-                "-uuid",
-                uuid,
-            ],
-            "create_time": created,
-        }
+def _qemu_cmdline(uuid):
+    return ["/usr/bin/qemu-system-x86_64", "-name", "guest=x", "-uuid", uuid]
+
+
+class _FakeProcess:
+    """psutil.Process over a {pid: (cmdline, create_time)} table; an entry
+    that is an exception is raised by the constructor (the process is gone),
+    a cmdline that is one by cmdline() (not ours to read)."""
+
+    table: dict = {}
+
+    def __init__(self, pid):
+        entry = self.table[pid]
+        if isinstance(entry, Exception):
+            raise entry
+        self._cmdline, self._created = entry
+
+    def cmdline(self):
+        if isinstance(self._cmdline, Exception):
+            raise self._cmdline
+        return self._cmdline
+
+    def create_time(self):
+        return self._created
+
+
+def _host_processes(table):
+    """Patch the uptime scan's view of the host's processes."""
+    fake = type("FakeProcess", (_FakeProcess,), {"table": table})
+    return patch.multiple(
+        qemu.psutil, pids=MagicMock(return_value=list(table)), Process=fake
     )
 
 
@@ -1260,18 +1289,19 @@ def test_uptime_comes_from_the_qemu_process_start_time(fake_libvirt):
     off.state.return_value = [5, 0]
     conn = fake_libvirt.openReadOnly.return_value
     conn.listAllDomains.return_value = [web, hidden, off]
-    processes = [
-        SimpleNamespace(info={"cmdline": None, "create_time": now}),
-        SimpleNamespace(info={"cmdline": ["bash"], "create_time": now}),
-        SimpleNamespace(info={"cmdline": ["qemu", "-uuid"], "create_time": now}),
-        SimpleNamespace(info={"cmdline": ["qemu", "-uuid", "x"], "create_time": None}),
-        _qemu_process("UUID-WEB", now - 3600),  # the older: found only via .lower()
-        _qemu_process("uuid-web", now - 30),
-        _qemu_process("uuid-off", now - 100),
-    ]
+    processes = {
+        1: psutil.NoSuchProcess(1),  # gone between pids() and Process()
+        2: (psutil.AccessDenied(2), now),  # not ours to read
+        3: (["bash"], now),
+        4: (["qemu", "-uuid"], now),  # no value after -uuid
+        5: (_qemu_cmdline("UUID-WEB"), now - 3600),  # the older: needs .lower()
+        6: (_qemu_cmdline("uuid-web"), now - 30),
+        7: (_qemu_cmdline("uuid-off"), now - 100),
+    }
 
-    with patch.object(qemu.psutil, "process_iter", return_value=processes) as scan:
+    with _host_processes(processes):
         result = qemu_metrics()
+        qemu.psutil.pids.assert_called_once_with()
 
     uptime = {
         m["labels"]["vm_name"]: m["value"]
@@ -1281,7 +1311,6 @@ def test_uptime_comes_from_the_qemu_process_start_time(fake_libvirt):
     assert 3599 <= uptime["web"] <= 3601
     assert uptime["hidden"] == 0
     assert uptime["off"] == 0
-    scan.assert_called_once_with(["cmdline", "create_time"])
     for dom in (web, hidden, off):
         dom.info.assert_not_called()
         assert dom.state.call_count == 1
@@ -1292,9 +1321,10 @@ def test_uptime_is_zero_when_processes_cannot_be_read(fake_libvirt):
     conn = fake_libvirt.openReadOnly.return_value
     conn.listAllDomains.return_value = [_running_domain("web")]
 
-    with patch.object(
-        qemu.psutil, "process_iter", side_effect=RuntimeError("no /proc")
-    ), patch("fivenines_agent.qemu.log") as mock_log:
+    no_proc = RuntimeError("no /proc")
+    with patch.object(qemu.psutil, "pids", side_effect=no_proc), patch(
+        "fivenines_agent.qemu.log"
+    ) as mock_log:
         result = qemu_metrics()
 
     uptime = [m for m in result if m["name"] == "vm_vm_uptime_seconds_total"]
@@ -1329,12 +1359,12 @@ def test_uptime_matches_an_uppercase_domain_uuid_and_is_never_negative(
     upper.UUIDString.return_value = "UUID-UPPER"
     conn = fake_libvirt.openReadOnly.return_value
     conn.listAllDomains.return_value = [upper, ahead]
-    processes = [
-        _qemu_process("uuid-upper", now - 600),
-        _qemu_process("uuid-ahead", now + 3600),
-    ]
+    processes = {
+        1: (_qemu_cmdline("uuid-upper"), now - 600),
+        2: (_qemu_cmdline("uuid-ahead"), now + 3600),
+    }
 
-    with patch.object(qemu.psutil, "process_iter", return_value=processes):
+    with _host_processes(processes):
         result = qemu_metrics()
 
     uptime = {
@@ -1443,3 +1473,116 @@ def test_no_domain_needs_libvirts_own_error_code():
         )
         assert not qemu._is_no_domain(_FakeLibvirtError(1, "Domain not found"))
         assert not qemu._is_no_domain(RuntimeError("Domain not found"))
+
+
+def test_uptime_is_read_from_a_real_process_through_private_objects():
+    """The real psutil path, which the fakes above cannot vouch for: a child
+    started with `-uuid` is found, with its fresh start time, and psutil's
+    module-wide process_iter() cache is never touched (the autouse fixture
+    makes any use of it fail)."""
+    import subprocess
+    import sys
+
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)", "-uuid", "ABCD-171"]
+    )
+    try:
+        with patch.object(qemu.psutil, "pids", _REAL_PIDS), patch.object(
+            qemu.psutil, "Process", _REAL_PROCESS
+        ):
+            deadline = time.monotonic() + 30
+            started = {}
+            while "abcd-171" not in started and time.monotonic() < deadline:
+                started = qemu._qemu_start_times(deadline)
+        assert started["abcd-171"] == _REAL_PROCESS(child.pid).create_time()
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_the_process_scan_counts_against_the_budget(fake_libvirt):
+    """The scan runs once, after the walk, and checks the budget per process:
+    one that runs out there reports None and says so -- not a VM, not
+    libvirt -- and an abandoned worker stops scanning."""
+    clock = [1000.0]
+    fake_time = SimpleNamespace(monotonic=lambda: clock[0], time=time.time)
+    conn = fake_libvirt.openReadOnly.return_value
+    conn.listAllDomains.return_value = [_running_domain("a")]
+
+    class SlowProcess(_FakeProcess):
+        table = {pid: (["bash"], 0.0) for pid in range(3)}
+
+        def cmdline(self):
+            clock[0] += qemu.COLLECT_BUDGET
+            return super().cmdline()
+
+    with patch.object(qemu, "time", fake_time), patch.multiple(
+        qemu.psutil, pids=MagicMock(return_value=[0, 1, 2]), Process=SlowProcess
+    ), patch("fivenines_agent.qemu.log") as mock_log:
+        assert qemu_metrics() is None
+
+    (error,) = _errors(mock_log)
+    assert "while reading QEMU process start times (1 of 1 VMs done)" in error
+
+
+def test_no_process_scan_when_no_vm_is_running(fake_libvirt):
+    """Only a running VM has a QEMU process to age."""
+    off = _running_domain("off")
+    off.state.return_value = [5, 0]
+    fake_libvirt.openReadOnly.return_value.listAllDomains.return_value = [off]
+
+    with _host_processes({}):
+        result = qemu_metrics()
+        qemu.psutil.pids.assert_not_called()
+    uptime = [m for m in result if m["name"] == "vm_vm_uptime_seconds_total"]
+    assert [m["value"] for m in uptime] == [0]
+
+
+@pytest.mark.parametrize(
+    "where, expected",
+    [
+        ("open", "while opening the libvirt connection"),
+        ("vm", "at VM 'stuck' (1 of 2 VMs done)"),
+    ],
+)
+def test_the_timeout_line_names_where_the_collection_is_stuck(
+    fake_libvirt, where, expected
+):
+    """libvirt waits for a monitor reply with no timeout, so when the
+    agent's own call is the one stuck in a hung QEMU monitor its worker never
+    returns and no budget line will ever be written: the tick's own timeout
+    line has to say where it is. The tick here stops waiting exactly once the
+    worker is inside the hang, so the position is deterministic."""
+    entered, release = threading.Event(), threading.Event()
+    conn = fake_libvirt.openReadOnly.return_value
+
+    def hang(*args):
+        entered.set()
+        release.wait(5)
+        return conn if where == "open" else {}
+
+    if where == "open":
+        fake_libvirt.openReadOnly.side_effect = hang
+    else:
+        stuck = _running_domain("stuck")
+        stuck.memoryStats.side_effect = hang
+        conn.listAllDomains.return_value = [_running_domain("ok"), stuck]
+
+    def give_up_once_stuck(fn, timeout, name=None):
+        worker = threading.Thread(target=fn, name=name, daemon=True)
+        worker.start()
+        assert entered.wait(5)
+        raise qemu.WorkerTimeout(worker, timeout)
+
+    try:
+        with patch.object(qemu, "call_bounded", give_up_once_stuck), patch(
+            "fivenines_agent.qemu.log"
+        ) as mock_log:
+            assert qemu_metrics() is None
+    finally:
+        release.set()
+        if qemu._stalled_worker is not None:
+            qemu._stalled_worker.join(5)
+
+    (error,) = [e for e in _errors(mock_log) if "blocked for" in e]
+    assert expected in error
