@@ -6,8 +6,11 @@
 
 This agent collects server metrics from the monitored host and sends it to the [fivenines](https://fivenines.io) API.
 
-Runs on **Linux** (glibc + musl, amd64 + arm64), **Windows** (Server 2019+,
-Windows 10/11), **Synology DSM 7** and **UNRAID**.
+Runs on **Linux** (glibc + musl, 64-bit amd64 + arm64 only: the installers
+refuse 32-bit ARM, i686 and every other architecture, and -- wherever `getconf`
+is installed, as on Debian, Raspberry Pi OS and Alpine -- a 32-bit OS on 64-bit
+hardware such as 32-bit Raspberry Pi OS on a Pi 4 or 5), **Windows** (Server
+2019+, Windows 10/11), **Synology DSM 7** and **UNRAID**.
 
 ## Contents
 
