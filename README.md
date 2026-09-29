@@ -1217,7 +1217,9 @@ the missing VMs being gone); every other metric is sent as usual. A libvirt
 call that never returns is left to finish in the background, and no second
 collection starts behind it. So a VM with a stuck monitor shows up as QEMU
 collection failing for as long as it stays stuck, and the agent's journal
-names the VM the collection ran out of time at.
+says where the collection ran out of time: the VM it was reading, or the step
+it was on (opening or closing the connection, listing the VMs, reading the
+QEMU processes' start times).
 
 After a collection that ran out of time the agent skips QEMU for 60s, then
 120s, counted from the end of that collection (every 2nd, then every 3rd
@@ -1226,9 +1228,10 @@ cost 15s of every collection; QEMU shows up again within about 3 minutes of it
 recovering. A VM that libvirt listed but cannot read -- the daemon restarted
 mid-collection by an update, directly or behind `virtproxyd` -- also makes the
 collection report `null`, never the VMs read before it; only a VM deleted
-during the collection is left out on its own. The bound also caps how large a host can be: one whose VMs cannot all be read in
-10s reports `null` on every tick, and the same journal line says how many VMs
-it got through.
+during the collection is left out on its own. The bound also caps how large a
+host can be: one whose VMs cannot all be read in 10s -- a budget that also
+covers the uptime lookup, about 0.1ms per process on the host -- reports `null`
+on every tick, and the same journal line says how many VMs it got through.
 
 The agent also never starts a hypervisor daemon on your behalf: it sets
 `LIBVIRT_AUTOSTART=0` at startup, so a `qemu:///session` URI needs the session

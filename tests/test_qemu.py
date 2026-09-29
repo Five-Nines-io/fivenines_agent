@@ -849,7 +849,7 @@ def test_a_spent_budget_escapes_the_hypervisor_totals_handler(fake_libvirt):
     dom.state.assert_not_called()
     errors = _errors(mock_log)
     assert len(errors) == 1
-    assert "budget" in errors[0]
+    assert "budget while listing VMs (0 of 1 VMs done)" in errors[0]
 
 
 def test_worker_errors_reach_the_ticks_telemetry(fake_libvirt):
@@ -1483,18 +1483,21 @@ def test_uptime_is_read_from_a_real_process_through_private_objects():
     import subprocess
     import sys
 
+    import uuid
+
+    tag = f"TEST-{uuid.uuid4().hex}"  # unique: parallel runs on one host
     child = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(30)", "-uuid", "ABCD-171"]
+        [sys.executable, "-c", "import time; time.sleep(30)", "-uuid", tag]
     )
     try:
         with patch.object(qemu.psutil, "pids", _REAL_PIDS), patch.object(
             qemu.psutil, "Process", _REAL_PROCESS
         ):
-            deadline = time.monotonic() + 30
+            give_up = time.monotonic() + 30
             started = {}
-            while "abcd-171" not in started and time.monotonic() < deadline:
-                started = qemu._qemu_start_times(deadline)
-        assert started["abcd-171"] == _REAL_PROCESS(child.pid).create_time()
+            while tag.lower() not in started and time.monotonic() < give_up:
+                started = qemu._qemu_start_times(float("inf"))
+        assert started[tag.lower()] == _REAL_PROCESS(child.pid).create_time()
     finally:
         child.kill()
         child.wait()
@@ -1509,10 +1512,13 @@ def test_the_process_scan_counts_against_the_budget(fake_libvirt):
     conn = fake_libvirt.openReadOnly.return_value
     conn.listAllDomains.return_value = [_running_domain("a")]
 
+    reads = []
+
     class SlowProcess(_FakeProcess):
         table = {pid: (["bash"], 0.0) for pid in range(3)}
 
         def cmdline(self):
+            reads.append(1)
             clock[0] += qemu.COLLECT_BUDGET
             return super().cmdline()
 
@@ -1523,6 +1529,7 @@ def test_the_process_scan_counts_against_the_budget(fake_libvirt):
 
     (error,) = _errors(mock_log)
     assert "while reading QEMU process start times (1 of 1 VMs done)" in error
+    assert len(reads) == 1  # stopped at the next process, not after the scan
 
 
 def test_no_process_scan_when_no_vm_is_running(fake_libvirt):
@@ -1543,6 +1550,7 @@ def test_no_process_scan_when_no_vm_is_running(fake_libvirt):
     [
         ("open", "while opening the libvirt connection"),
         ("vm", "at VM 'stuck' (1 of 2 VMs done)"),
+        ("close", "while closing the libvirt connection (0 of 0 VMs done)"),
     ],
 )
 def test_the_timeout_line_names_where_the_collection_is_stuck(
@@ -1563,6 +1571,8 @@ def test_the_timeout_line_names_where_the_collection_is_stuck(
 
     if where == "open":
         fake_libvirt.openReadOnly.side_effect = hang
+    elif where == "close":
+        conn.close.side_effect = hang
     else:
         stuck = _running_domain("stuck")
         stuck.memoryStats.side_effect = hang
@@ -1586,3 +1596,78 @@ def test_the_timeout_line_names_where_the_collection_is_stuck(
 
     (error,) = [e for e in _errors(mock_log) if "blocked for" in e]
     assert expected in error
+
+
+def test_a_budget_the_last_vm_spent_is_reported_at_that_vm(fake_libvirt):
+    """The first budget check after the walk is the scan's: a budget the last
+    VM's final call already spent must still be reported at that VM, the one
+    a stuck monitor would be in, not at the process scan."""
+    clock = [1000.0]
+    fake_time = SimpleNamespace(monotonic=lambda: clock[0], time=time.time)
+    last = _running_domain("last")
+
+    def slow_interface_stats(iface):
+        clock[0] += qemu.COLLECT_BUDGET
+        return (1, 2, 0, 0, 3, 4, 0, 0)
+
+    last.interfaceStats.side_effect = slow_interface_stats
+    conn = fake_libvirt.openReadOnly.return_value
+    conn.listAllDomains.return_value = [_running_domain("first"), last]
+
+    with patch.object(qemu, "time", fake_time), patch(
+        "fivenines_agent.qemu.log"
+    ) as mock_log:
+        assert qemu_metrics() is None
+
+    (error,) = _errors(mock_log)
+    assert "budget at VM 'last' (2 of 2 VMs done)" in error
+
+
+def test_one_uptime_row_per_vm_read_even_when_its_details_fail(fake_libvirt):
+    """Every VM read gets exactly one uptime row, like its info and state
+    rows, including a running VM whose detail metrics fail; a VM that
+    vanished mid-walk gets none."""
+    from collections import Counter
+
+    now = time.time()
+    a, broken, gone = (
+        _running_domain("a"),
+        _running_domain("broken"),
+        _running_domain("gone"),
+    )
+    broken.maxVcpus.side_effect = RuntimeError("detail read failed")
+    gone.state.side_effect = _FakeLibvirtError(VIR_ERR_NO_DOMAIN, "Domain not found")
+    conn = fake_libvirt.openReadOnly.return_value
+    conn.listAllDomains.return_value = [a, broken, gone]
+    processes = {
+        1: (_qemu_cmdline("uuid-a"), now - 60),
+        2: (_qemu_cmdline("uuid-broken"), now - 120),
+    }
+
+    with _host_processes(processes), patch("fivenines_agent.qemu.log"):
+        result = qemu_metrics()
+
+    rows = [m for m in result if m["name"] == "vm_vm_uptime_seconds_total"]
+    assert Counter(m["labels"]["vm_name"] for m in rows) == {"a": 1, "broken": 1}
+    broken_uptime = next(m["value"] for m in rows if m["labels"]["vm_name"] == "broken")
+    assert 119 <= broken_uptime <= 121
+
+
+def test_a_reused_pid_reports_the_new_process_start_time(fake_libvirt):
+    """Each scan reads start times through fresh objects: a pid reused by a
+    new QEMU process (the VM restarted) reports the new start, never the
+    first one seen for that pid."""
+    now = time.time()
+    fake_libvirt.openReadOnly.return_value.listAllDomains.return_value = [
+        _running_domain("web")
+    ]
+
+    def uptime_of_web(processes):
+        with _host_processes(processes):
+            result = qemu_metrics()
+        return next(
+            m["value"] for m in result if m["name"] == "vm_vm_uptime_seconds_total"
+        )
+
+    assert 3599 <= uptime_of_web({7: (_qemu_cmdline("uuid-web"), now - 3600)}) <= 3601
+    assert 29 <= uptime_of_web({7: (_qemu_cmdline("uuid-web"), now - 30)}) <= 31

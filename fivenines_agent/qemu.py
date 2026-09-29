@@ -144,11 +144,13 @@ DEFAULT_LIBVIRT_URI = "qemu:///system"
 # So a VM with a stuck monitor reports QEMU as None -- a collection failure
 # the server never prunes on -- for as long as it stays stuck, instead of
 # restarting the agent. 10s and 15s rather than docker's 25s: the budget only
-# has to cover one healthy collection (a few ms per VM), and every
-# self-bounded collector shares ONE WatchdogSec window -- the watchdog is fed
+# has to cover one healthy collection -- a few ms per VM, plus the uptime
+# scan's ~0.1ms per host process (see _qemu_start_times) -- and every
+# self-bounded collector shares ONE WatchdogSec window: the watchdog is fed
 # before and after the whole collection pass, and docker alone can take ~45s.
-# A healthy host too large to walk in 10s reports None on every tick; the
-# budget line says how far the walk got (see QEMUCollector.collect).
+# A healthy host too large for 10s reports None on every tick; the budget
+# line says where the collection got to -- a VM, the process scan, the
+# listing (see QEMUCollector.progress).
 COLLECT_BUDGET = 10
 COLLECT_TIMEOUT = 15
 
@@ -352,12 +354,13 @@ class QEMUCollector:
         self.conn = None
         # Started before the open: connecting is part of the budget.
         self.deadline = time.monotonic() + COLLECT_BUDGET
-        # Where the budget ran out, for its log line (see collect), and
-        # whether it did, for qemu_metrics' backoff.
+        # Where the collection got to, for the time-bound log lines (see
+        # progress), and whether the budget ran out, for qemu_metrics'
+        # backoff. position is one (phase, VM name) tuple, assigned whole, so
+        # the tick can read it consistently while the worker moves on.
         self.vms_total = 0
         self.vms_done = 0
-        self.collecting = None
-        self.scanning = False
+        self.position = ("open", None)
         self.budget_spent = False
         # (uuid, state, labels) per VM read; their uptime rows are appended
         # after the walk, from one process scan (see _append_uptimes).
@@ -444,13 +447,15 @@ class QEMUCollector:
         not visible to the agent. libvirt has no API for a domain's start time
         -- dom.info() is [state, maxMem, memory, nrVirtCpu, cpuTime] -- so it
         is read from the processes, in ONE scan after the walk: a slow scan is
-        then never blamed on a VM, and none runs when no VM is running."""
+        then never blamed on a VM, and none runs when no VM is running. A
+        budget the walk already spent (its last call overran) is reported at
+        that VM, before the scan could claim it."""
         started = {}
         if any(state_num == 1 for _, state_num, _ in self._uptime_rows):
-            self.collecting = None
-            self.scanning = True
+            if time.monotonic() >= self.deadline:
+                raise _BudgetSpent()
+            self.position = ("scan", None)
             started = _qemu_start_times(self.deadline)
-            self.scanning = False
         for uuid, state_num, labels in self._uptime_rows:
             created = started.get(str(uuid).lower()) if state_num == 1 else None
             uptime = 0 if created is None else max(0, int(time.time() - created))
@@ -458,12 +463,13 @@ class QEMUCollector:
 
     def progress(self):
         """Where the collection got to, for the time-bound log lines."""
-        if self.scanning:
-            where = "while reading QEMU process start times"
-        elif self.collecting is None:
-            where = "before the first VM"
-        else:
-            where = f"at VM {self.collecting!r}"
+        phase, name = self.position
+        where = {
+            "open": "while opening the libvirt connection",
+            "list": "while listing VMs",
+            "scan": "while reading QEMU process start times",
+            "close": "while closing the libvirt connection",
+        }.get(phase) or f"at VM {name!r}"
         return f"{where} ({self.vms_done} of {self.vms_total} VMs done)"
 
     def _safe_append(self, data, metric_name, value, labels):
@@ -678,7 +684,7 @@ class QEMUCollector:
         try:
             uuid = dom.UUIDString()
             name = dom.name()
-            self.collecting = name
+            self.position = ("vm", name)
             state_num = int(dom.state()[0])
         except Exception as e:
             if _is_no_domain(e):
@@ -743,6 +749,7 @@ class QEMUCollector:
 
     def _collect(self):
         data = []
+        self.position = ("list", None)
 
         try:
             doms = [_Budgeted(dom, self.deadline) for dom in self.conn.listAllDomains()]
@@ -789,6 +796,7 @@ class QEMUCollector:
         return data
 
     def close(self):
+        self.position = ("close", None)
         if self.conn:
             try:
                 self.conn.close()
@@ -901,10 +909,13 @@ def _qemu_start_times(deadline):
     across the read and keeps what it read on them. A /proc/<pid>/cmdline
     read can block on that process's mmap lock, and a worker blocked holding
     a shared object's lock would stall the processes and openvpn collectors
-    on the main thread -- past WatchdogSec; every command line on the host
-    would stay in memory; and a cached create_time survives PID reuse. A
-    fresh object reads create_time now, against the current boot time.
-    COLLECT_BUDGET is checked per process, so an abandoned worker stops."""
+    on the main thread behind that lock, for EVERY process; every command
+    line on the host would stay in memory; and a cached create_time survives
+    PID reuse. (Those two collectors still read a QEMU process's cmdline
+    themselves, through psutil's name() for a 15-character comm such as
+    qemu-system-x86: the per-collector bound in TODOS.md.) A fresh object
+    reads create_time now, against the current boot time. COLLECT_BUDGET is
+    checked per process, so an abandoned worker stops."""
     started = {}
     try:
         pids = psutil.pids()

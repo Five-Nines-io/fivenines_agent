@@ -42,7 +42,11 @@ one tick; and a collector that keeps per-THREAD state -- docker's thread-local
 client cache -- would rebuild it every tick if moved onto a fresh worker, so it
 needs its own posture. `qemu` (#171) already bounds its whole collection, with a
 contract a generic bound must not replace: its budget stops the worker between
-libvirt calls and reports `None`, never a partial VM list.
+libvirt calls and reports `None`, never a partial VM list. The same exposure
+exists outside sysfs: `processes` and `openvpn` read every QEMU process's
+`/proc/<pid>/cmdline` on the collection thread, through psutil's `name()` (it
+falls back to `cmdline()` for a 15-character comm such as `qemu-system-x86`),
+and that read waits on the process's mmap lock.
 
 ## Proxmox backups phase 2 -- server half tracked in fivenines_server#1164
 
