@@ -1,0 +1,23 @@
+[package]
+name = "fivenines-agent-rust-proto"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bollard = { version = "0.21.1", default-features = false, features = ["pipe"] }
+flate2 = "1.1.10"
+futures-util = { version = "0.3.34", default-features = false }
+nix = { version = "0.31.3", features = ["user", "fs", "net", "feature", "hostname"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+signal-hook = "0.4.4"
+tokio = { version = "1.53.1", features = ["rt", "time", "net"] }
+ureq = "3.4.2"
+uuid = { version = "1.26.1", features = ["v4"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+# panic stays "unwind": a panicking collector must cost a null (bounded.rs),
+# not the whole agent.
