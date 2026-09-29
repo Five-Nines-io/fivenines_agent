@@ -42,10 +42,13 @@ def _reset_process_caches():
     ip_module._ssl_context = None
     dns_resolver_module._resolver = None
     docker_module.invalidate_docker_client()
-    # Both pieces of process-global state QEMUCollector mutates: the log-once
-    # register and the LIBVIRT_AUTOSTART it writes into the real environment.
+    # qemu's process-global state: the log-once register and the
+    # LIBVIRT_AUTOSTART QEMUCollector writes into the real environment, and the
+    # single-flight worker and timeout backoff qemu_metrics keeps across ticks.
     qemu_module._clear_refusal()  # the production reset path, not a bare assignment
     os.environ.pop("LIBVIRT_AUTOSTART", None)
+    qemu_module._stalled_worker = None
+    qemu_module._reset_backoff()
     journal_policy.reset_cache()
     yield
 
@@ -90,6 +93,7 @@ def make_fake_libvirt():
 
     def _make():
         lib = MagicMock()
+        lib.VIR_ERR_NO_DOMAIN = 42  # libvirt's own value
         conn = MagicMock()
         conn.listAllDomains.return_value = []
         conn.getInfo.return_value = None

@@ -73,8 +73,11 @@ def adopt_log_capture(buffer):
     dispatcher's telemetry. list.append is atomic. A worker abandoned past its
     deadline keeps the list it was given: a line it logs later lands in that
     tick's telemetry if the list was already non-empty (stop_log_capture
-    returns it as is) and is lost otherwise. No bounded call logs from its
-    worker today; a per-collector bound (TODOS.md) would have to settle that.
+    returns it as is) and the tick's payload has not been built yet, and is
+    lost otherwise (the journal still gets it). The qemu collector logs from
+    its worker and logs its own timeout on the caller's thread, so its list is
+    never empty when it abandons one; a per-collector bound (TODOS.md) would
+    have to settle this for every collector.
     """
     _thread_local.log_buffer = buffer
 

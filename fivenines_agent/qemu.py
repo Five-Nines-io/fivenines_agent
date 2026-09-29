@@ -4,6 +4,8 @@ import time
 import xml.etree.ElementTree as ET  # nosec B405  # parses only libvirtd's own domain XML; see _xml_devices
 from urllib.parse import unquote, urlsplit
 
+import psutil
+
 try:
     import libvirt
     _LibvirtError = libvirt.libvirtError
@@ -11,6 +13,7 @@ except ImportError:
     libvirt = None  # type: ignore[assignment]
     _LibvirtError = Exception
 
+from fivenines_agent.bounded import WorkerTimeout, call_bounded
 from fivenines_agent.debug import debug, log
 
 STATE_MAP = {
@@ -34,10 +37,11 @@ STATE_MAP = {
 #             qemu+unix:///session -- optionally with ?socket=<path> and/or
 #             ?mode=auto|direct|legacy, the only two parameters the unix
 #             transport reads. socket= must be a normalized absolute path
-#             inside a libvirt socket directory (LIBVIRT_SOCKET_DIRS): the
-#             collector's open has no timeout, and a peer that reads and
-#             waits (docker.sock, a socket-activated service) would stall
-#             the tick past the systemd watchdog.
+#             inside a libvirt socket directory (LIBVIRT_SOCKET_DIRS): a
+#             peer that reads and waits (docker.sock) would wedge the
+#             collection worker for good -- the tick is bounded (see
+#             COLLECT_TIMEOUT), but QEMU would report None until the agent
+#             restarts -- and a socket-activated service would be started.
 #   refused   every other scheme (qemu+ext, qemu+ssh, qemu+libssh[2],
 #             qemu+tcp, qemu+tls, test, xen, lxc, ...); any URI with an
 #             authority component (qemu://HOST/system is an implicit TLS
@@ -106,6 +110,68 @@ LIBVIRT_URI_MAX_CHARS = 512
 # The collector's default, and the URI the permissions probe opens (it
 # imports this name) -- one spelling, so the two cannot drift.
 DEFAULT_LIBVIRT_URI = "qemu:///system"
+
+# --- Collection time bounds (agent #171) ------------------------------------
+#
+# No libvirt client call carries a timeout, and an honest libvirtd can take a
+# long time to answer one: every call that goes through a domain's QEMU
+# monitor (memoryStats, blockStatsFlags, ...) first takes that domain's job
+# lock, and libvirtd waits up to 30s for it before failing with "cannot
+# acquire state change lock". One VM whose monitor is stuck (a hung QEMU, a
+# long-running job, storage stalled under the guest) costs 30s per such call,
+# 60-90s for a VM with two disks, and a wedged libvirtd never answers at all.
+# On the collection loop that is a tick past WatchdogSec=90: systemd kills the
+# agent, every host metric is lost, and it repeats on every tick for as long
+# as the VM stays stuck. Two bounds:
+#
+#   COLLECT_TIMEOUT  how long the tick waits for QEMU. The whole collection
+#                    (open, list, per-domain loop, close) runs on a daemon
+#                    worker (bounded.call_bounded); past the timeout the tick
+#                    reports None and abandons the worker, single-flight
+#                    (_stalled_worker): until it returns, later ticks report
+#                    None without starting another, so a wedged libvirtd
+#                    leaks one thread, not one per tick.
+#   COLLECT_BUDGET   the worker's own wall-clock budget, checked before EVERY
+#                    libvirt call on a domain (_Budgeted). Once it is spent
+#                    the worker makes no further call and reports None, never
+#                    the VMs it got through: [] means zero VMs, and a short
+#                    list would read as the missing VMs being gone (the docker
+#                    COLLECT_DEADLINE contract). Shorter than the timeout, so
+#                    a merely slow libvirtd ends inside the tick with no
+#                    abandoned worker, and an abandoned one stops at its next
+#                    call instead of queueing another 30s lock wait.
+#
+# So a VM with a stuck monitor reports QEMU as None -- a collection failure
+# the server never prunes on -- for as long as it stays stuck, instead of
+# restarting the agent. 10s and 15s rather than docker's 25s: the budget only
+# has to cover one healthy collection (a few ms per VM), and every
+# self-bounded collector shares ONE WatchdogSec window -- the watchdog is fed
+# before and after the whole collection pass, and docker alone can take ~45s.
+# A healthy host too large to walk in 10s reports None on every tick; the
+# budget line says how far the walk got (see QEMUCollector.collect).
+COLLECT_BUDGET = 10
+COLLECT_TIMEOUT = 15
+
+# The worker of a collection that outlived COLLECT_TIMEOUT, while it is still
+# blocked (the io_topology and libvirt-probe posture).
+_stalled_worker = None
+
+# A VM whose monitor STAYS stuck would still cost the full COLLECT_TIMEOUT on
+# every tick: its worker ends on its own before the next tick (the stuck call
+# fails after 30s and the budget is spent by then), so the single-flight never
+# engages, and each tick reopens libvirt, walks every healthy VM again and ties
+# up a libvirtd worker for another 30s, for a result that is always None. So a
+# collection that ran out of time -- timed out or spent its budget -- is not
+# retried for TIMEOUT_BACKOFF_BASE seconds, doubling per consecutive one up to
+# TIMEOUT_BACKOFF_MAX (the permissions gap-probe numbers), and QEMU reports
+# None meanwhile. The wait runs from the END of the failed collection, so at
+# the default 60s interval the next attempt is two ticks later, then three:
+# QEMU shows up again within ~3 minutes of the VM recovering. Any collection
+# that finishes in time clears it.
+TIMEOUT_BACKOFF_BASE = 60
+TIMEOUT_BACKOFF_MAX = 120
+_backoff_failures = 0
+_backoff_until = 0.0
 
 
 def _disable_session_autostart():
@@ -247,10 +313,50 @@ def _clear_refusal():
     _last_refused_uri = _NEVER_REFUSED
 
 
+class _BudgetSpent(BaseException):
+    """COLLECT_BUDGET ran out. A BaseException, like asyncio.CancelledError
+    and for the same reason: every per-metric helper catches Exception to skip
+    one bad reading and move on to the next libvirt call, and this must reach
+    collect() instead, which reports None."""
+
+
+class _Budgeted:
+    """A libvirt domain whose every method call first checks the collection
+    budget, so no call starts once it is spent (see COLLECT_BUDGET). Reading a
+    non-callable attribute is no libvirt call and passes through unchecked."""
+
+    def __init__(self, dom, deadline):
+        self._dom = dom
+        self._deadline = deadline
+
+    def __getattr__(self, name):
+        method = getattr(self._dom, name)
+        if not callable(method):
+            return method
+
+        def call(*args, **kwargs):
+            if time.monotonic() >= self._deadline:
+                raise _BudgetSpent()
+            return method(*args, **kwargs)
+
+        return call
+
+
 class QEMUCollector:
     def __init__(self, uri=DEFAULT_LIBVIRT_URI):
         self.uri = uri
         self.conn = None
+        # Started before the open: connecting is part of the budget.
+        self.deadline = time.monotonic() + COLLECT_BUDGET
+        # Where the budget ran out, for its log line (see collect), and
+        # whether it did, for qemu_metrics' backoff.
+        self.vms_total = 0
+        self.vms_done = 0
+        self.collecting = None
+        self.budget_spent = False
+        # {domain UUID: QEMU process start time}, read once per collection
+        # when the first running VM needs it (see _get_vm_uptime).
+        self._started = None
         # The allowlist is the one gate, before ANY libvirt call (not even
         # the global error-handler registration): a refused URI keeps its
         # reason here, no connection is attempted, and qemu_metrics reports
@@ -327,22 +433,20 @@ class QEMUCollector:
             log(f"Error parsing XML for domain: {e}", 'error')
         return disks, ifaces
 
-    def _get_vm_uptime(self, dom):
-        try:
-            state = int(dom.state()[0])
-            if state != 1:  # Not running
-                return 0
-
-            info = dom.info()
-            if info and len(info) >= 6:
-                start_time = info[5]
-                current_time = int(time.time())
-                uptime = current_time - start_time
-                return max(0, uptime)
-
-        except Exception as e:
-            log(f"Error getting VM uptime: {e}", 'error')
-        return 0
+    def _get_vm_uptime(self, uuid, state_num):
+        """Seconds since the VM's QEMU process started; 0 when the VM is not
+        running or its process is not visible to the agent. libvirt has no
+        API for a domain's start time -- dom.info() is [state, maxMem, memory,
+        nrVirtCpu, cpuTime] -- so it is read from the process (no libvirt
+        call, so no budget check)."""
+        if state_num != 1:
+            return 0
+        if self._started is None:
+            self._started = _qemu_start_times()
+        started = self._started.get(str(uuid).lower())
+        if started is None:
+            return 0
+        return max(0, int(time.time() - started))
 
     def _safe_append(self, data, metric_name, value, labels):
         try:
@@ -541,17 +645,38 @@ class QEMUCollector:
                 continue
 
     def _collect_domain_metrics(self, dom, data):
+        """Append one VM's metrics. False when a listed VM could not be read
+        at all: it would be missing from the list, which the server reads as
+        the VM being gone. Only a VM undefined or destroyed since
+        listAllDomains (VIR_ERR_NO_DOMAIN) is skipped on its own. A libvirt
+        daemon lost mid-walk (restarted by an update) fails the next VM's
+        state() in every topology, including behind virtproxyd, where the
+        agent's own socket stays open and isAlive() cannot see it. A loss
+        after the last VM's state() leaves the list complete and only costs
+        that VM's detail metrics, as any per-metric failure does."""
+        name = None
         try:
             uuid = dom.UUIDString()
             name = dom.name()
+            self.collecting = name
             state_num = int(dom.state()[0])
+        except Exception as e:
+            if _is_no_domain(e):
+                log(f"VM {name!r} vanished during the QEMU collection: {e}", "debug")
+                return True
+            log(
+                f"Cannot read listed VM {name!r} ({e}); reporting collection failure",
+                "error",
+            )
+            return False
+        try:
             state = STATE_MAP.get(state_num, str(state_num))
 
             labels = {'vm_uuid': uuid, 'vm_name': name}
 
             self._safe_append(data, 'vm_vm_info', 1, {**labels, 'state': state})
             self._safe_append(data, 'vm_vm_state_code', state_num, labels)
-            self._safe_append(data, 'vm_vm_uptime_seconds_total', self._get_vm_uptime(dom), labels)
+            self._safe_append(data, 'vm_vm_uptime_seconds_total', self._get_vm_uptime(uuid, state_num), labels)
 
             # Only collect detailed metrics if VM is running
             if state_num == 1:  # running
@@ -566,22 +691,46 @@ class QEMUCollector:
 
         except Exception as ex:
             log(f"Error collecting metrics for domain: {ex}", 'error')
+        return True
 
     def collect(self):
         """The domain metric list; [] only when libvirt answered and listed
         zero domains. None -- a collection failure the server skips -- on a
-        refused URI, a failed connection or a failed enumeration, so an
-        outage never reads as "all VMs are gone"."""
+        refused URI, a failed connection, a failed enumeration, a listed VM
+        that cannot be read or a connection lost mid-walk (see
+        _collect_domain_metrics), or a spent COLLECT_BUDGET, so an outage
+        never reads as "all VMs are gone"."""
         if self.refused:
             return None
         if not self.conn:
             log("No libvirt connection available", 'error')
             return None
+        try:
+            return self._collect()
+        except _BudgetSpent:
+            self.budget_spent = True
+            # Names the VM whose call used the last of the budget: the check
+            # fires on the call AFTER the slow one, and a VM's first calls
+            # (UUIDString, name) are local reads that never wait.
+            if self.collecting is None:
+                where = "before the first VM"
+            else:
+                where = f"at VM {self.collecting!r}"
+            log(
+                f"QEMU collection ran past its {COLLECT_BUDGET}s budget {where} "
+                f"({self.vms_done} of {self.vms_total} VMs done); reporting "
+                "collection failure (a VM whose QEMU monitor is stuck makes each "
+                "of its monitor calls wait up to 30s)",
+                "error",
+            )
+            return None
 
+    def _collect(self):
         data = []
 
         try:
-            doms = self.conn.listAllDomains()
+            doms = [_Budgeted(dom, self.deadline) for dom in self.conn.listAllDomains()]
+            self.vms_total = len(doms)
 
             try:
                 info = self.conn.getInfo()
@@ -601,8 +750,25 @@ class QEMUCollector:
             return None
 
         for dom in doms:
-            self._collect_domain_metrics(dom, data)
+            if not self._collect_domain_metrics(dom, data):
+                return None
+            self.vms_done += 1
 
+        # A complement to the check above on a direct connection. isAlive() is
+        # local (no RPC) and, with no event loop in the agent, only reports a
+        # transport failure an earlier call already hit -- e.g. one of the
+        # last VM's detail calls.
+        try:
+            alive = self.conn.isAlive()
+        except Exception:
+            alive = False
+        if not alive:
+            log(
+                "libvirt connection lost during the QEMU collection; "
+                "reporting collection failure",
+                "error",
+            )
+            return None
         return data
 
     def close(self):
@@ -616,11 +782,103 @@ class QEMUCollector:
 
 @debug('qemu_metrics')
 def qemu_metrics(uri=DEFAULT_LIBVIRT_URI):
+    """The collection, bounded by COLLECT_TIMEOUT on a single-flight worker
+    and backed off after one that ran out of time (see the header above
+    COLLECT_BUDGET)."""
+    global _stalled_worker
     if libvirt is None:
         log("libvirt not available, skipping QEMU metrics", "debug")
         return None
+    if _stalled_worker is not None:
+        if _stalled_worker.is_alive():
+            log(
+                "QEMU: previous libvirt collection still blocked; reporting None",
+                "debug",
+            )
+            return None
+        _stalled_worker = None
+    if time.monotonic() < _backoff_until:
+        log(
+            "QEMU: backing off after a collection that ran out of time; "
+            "reporting None",
+            "debug",
+        )
+        return None
+
+    try:
+        data, budget_spent = call_bounded(
+            lambda: _collect_once(uri), COLLECT_TIMEOUT, name="qemu-collect"
+        )
+    except WorkerTimeout as stalled:
+        _stalled_worker = stalled.worker
+        delay = _back_off()
+        log(
+            f"QEMU: libvirt collection blocked for {COLLECT_TIMEOUT}s; "
+            f"reporting None for at least {delay}s and until it returns",
+            "error",
+        )
+        return None
+    if budget_spent:
+        delay = _back_off()
+        log(f"QEMU: no collection attempt for the next {delay}s", "debug")
+    else:
+        _reset_backoff()
+    return data
+
+
+def _collect_once(uri):
+    """(the collection, whether it spent COLLECT_BUDGET)."""
     collector = QEMUCollector(uri)
     try:
-        return collector.collect()
+        return collector.collect(), collector.budget_spent
     finally:
         collector.close()
+
+
+def _back_off():
+    """Record a collection that ran out of time; return the seconds until
+    the next one may start (see TIMEOUT_BACKOFF_BASE)."""
+    global _backoff_failures, _backoff_until
+    _backoff_failures += 1
+    delay = min(
+        TIMEOUT_BACKOFF_BASE * 2 ** (_backoff_failures - 1), TIMEOUT_BACKOFF_MAX
+    )
+    _backoff_until = time.monotonic() + delay
+    return delay
+
+
+def _reset_backoff():
+    global _backoff_failures, _backoff_until
+    _backoff_failures = 0
+    _backoff_until = 0.0
+
+
+def _is_no_domain(error):
+    """True for libvirt's "domain not found": a VM undefined or destroyed
+    after listAllDomains, the one VM that may be left out of the list."""
+    get_code = getattr(error, "get_error_code", None)
+    return callable(get_code) and get_code() == libvirt.VIR_ERR_NO_DOMAIN
+
+
+def _qemu_start_times():
+    """{domain UUID: start time} of the QEMU processes on this host, keyed by
+    each one's `-uuid` argument (libvirt passes it to every QEMU it starts).
+    A process the agent cannot see -- /proc mounted hidepid=, another user's
+    process on a hardened host, or SELinux confining QEMU as svirt_t (the
+    RHEL family), which the agent's policy cannot read -- is absent, and its
+    VM reports 0. Two processes claiming one UUID (an in-host migration)
+    keep the older."""
+    started = {}
+    try:
+        for proc in psutil.process_iter(["cmdline", "create_time"]):
+            cmdline = proc.info.get("cmdline") or []
+            created = proc.info.get("create_time")
+            if created is None or "-uuid" not in cmdline:
+                continue
+            position = cmdline.index("-uuid") + 1
+            if position < len(cmdline):
+                uuid = cmdline[position].lower()
+                started[uuid] = min(created, started.get(uuid, created))
+    except Exception as e:
+        log(f"Cannot read QEMU process start times: {e}", "debug")
+    return started
