@@ -4,9 +4,9 @@
 - Date: 2026-09-29
 - Tracking: #173 (Phase 0 "Decision record" of #169)
 - Inputs: the Go and Rust prototypes and their harness on
-  `experiments/agent-rewrite-prototypes` (7de6404), a memory re-measurement
-  made for this record (section 3), and an inventory of the Python agent at
-  v1.20.1 (86f9857)
+  `experiments/agent-rewrite-prototypes` (7de6404), memory re-measurements
+  made for this record on aarch64 and x86_64 (section 3), and an inventory of
+  the Python agent at v1.20.1 (86f9857)
 
 This record settles the questions every later step of #169 depends on:
 platform scope and order, glibc vs musl, toolchain and MSRV, the concurrency
@@ -20,7 +20,7 @@ section).
 |---|------------------------------|----------|
 | 1 | Where the code lives         | This repository, one Cargo workspace under `rust/` |
 | 2 | Platform scope and order     | GA = today's matrix plus armv7 and i686. Linux (glibc + musl; x86_64, aarch64, armv7, i686), then Synology, then Windows |
-| 3 | glibc or musl                | Both, on every architecture: each host gets the libc it runs, as the installers already choose. glibc build dynamically linked, floor 2.17; musl build fully static |
+| 3 | glibc or musl                | Both, on every architecture: each host gets the libc it runs, as the installers already choose. glibc build dynamically linked, floor 2.17, malloc arenas capped; musl build fully static |
 | 4 | Toolchain and MSRV           | Exact stable version pinned in `rust-toolchain.toml`; MSRV = that version; never below 1.93 |
 | 5 | Concurrency                  | Synchronous code on std threads, same thread layout as today. tokio only inside an SDK that needs it, current-thread runtime only |
 | 6 | libvirt                      | Our own client for the libvirt RPC protocol, local unix socket only. No C library |
@@ -46,18 +46,28 @@ section).
   agent or a fixture changes.
 - The ASCII-only rule and the security checks cover `rust/` too. The CI
   ASCII check in `build-release.yml` matches only `*.py`, `*.toml`, `*.yml`,
-  `*.json` and `*.sh` files today; the workspace step adds `*.rs`.
+  `*.yaml`, `*.json` and `*.sh` files today, and that workflow has no
+  `pull_request` trigger. The workspace step adds `*.rs` and runs the check
+  on pull requests.
 
 ## 2. Platform scope and order
 
 **What ships today.**
 - Linux glibc, x86_64 and aarch64. Built on manylinux2014, so the floor is
-  glibc 2.17 / CentOS 7, and `centos:7` is still in the distro matrix.
-- Linux musl, x86_64 and aarch64. Alpine 3.19+.
+  glibc 2.17 / CentOS 7, and `centos:7` is still in the distro matrix (for
+  x86_64; the aarch64 glibc build is tested on Ubuntu 22.04, Debian 12 and
+  Rocky 9).
+- Linux musl, x86_64 and aarch64. Documented as Alpine 3.19+; the matrix
+  tests Alpine 3.21 only.
 - Synology DSM 7, x86_64 and aarch64. This is the glibc build without
   libvirt, proxmoxer, NVML or the watchdog module.
 - Windows x64, as an MSI: Windows 10/11 and Server 2019+.
 - There is no 32-bit, armv7, macOS or FreeBSD artifact.
+- The optional `virtualization` Poetry group (libvirt-python, proxmoxer,
+  pynvml, systemd-watchdog) is installed only by the glibc build. The Alpine
+  binary therefore ships without proxmoxer and pynvml (libvirt-python is
+  added separately), and the Windows binary without pynvml, although both
+  still probe `nvidia_gpu`.
 
 **Decision.** GA requires parity with that matrix, plus two new Linux
 architectures, armv7 and i686, in this order:
@@ -71,17 +81,25 @@ architectures, armv7 and i686, in this order:
 
 armv7 and i686 gate GA like the other two architectures, so they need what
 x86_64 and aarch64 already have:
-- a mapping in every installer and update script (root, user and UNRAID),
-  as `armv7l` and `i686`/`i386`;
+- a mapping in every installer and update script (root and user; UNRAID is
+  x86_64 only), as `armv7l` and `i686`/`i386`. The mapping follows the
+  userland, not only `uname -m`, which names the kernel: 32-bit Raspberry Pi
+  OS boots a 64-bit kernel on a Pi 4 or 5, so it reports `aarch64` over an
+  armhf userland with no arm64 loader. The #170 fix already refuses that case
+  through `getconf LONG_BIT`; the Rust installers send it to armv7 instead
+  (and a 32-bit userland on an x86_64 kernel to i686);
 - distro jobs in the matrix, run under QEMU user emulation, for both
   libcs;
 - the same harness parity as x86_64 and aarch64.
 
+i686 means Rust's baseline for that target: SSE2, i.e. a Pentium 4 or later.
+
 Out of scope: macOS, FreeBSD, Windows arm64, 32-bit Windows.
 
 **Why.** The port promises the same payload from a smaller agent. armv7 and
-i686 are added now because the Rust build makes them cheap to produce (tier 2
-targets, one matrix row per libc), and because the installers are rewritten
+i686 are added now because the Rust build makes them cheap to produce
+(`i686-unknown-linux-gnu` is a tier 1 target, the other three tier 2; one
+matrix row per libc), and because the installers are rewritten
 for the Rust artifacts anyway; they are the only platform widening in the
 port. They carry their own class of bugs (section 5, counters), which the
 harness has to catch on those targets, not only on 64-bit hosts.
@@ -95,36 +113,54 @@ independently of the port: until the Rust artifacts exist, such a host
 should be refused with a clear message rather than handed a binary it
 cannot run (#170).
 
+The Windows gap is a Python packaging bug, not a platform limit. NVIDIA
+ships NVML on Windows as `nvml.dll`, which pynvml knows how to load, and the
+Windows capability set already probes `nvidia_gpu`. A Windows host with an
+NVIDIA GPU therefore reports no GPU metrics today, where a Rust build using
+nvml-wrapper would. By section 9 it is fixed in Python first (issue to be
+filed). The Alpine gaps change no payload: the proxmox probe requires a
+local Proxmox VE node (`/etc/pve` or `pvesh`), which is never Alpine, and
+the Rust musl build has no NVML either, since a static binary cannot
+`dlopen` (section 3).
+
 ## 3. glibc or musl
 
 **Facts.**
 
 *Name-service lookups that reach the payload:*
 - `user_context.username`, `groupname` and `groups`, resolved once at startup.
-- `processes[].username`, resolved for every process on every tick (psutil
-  calls `pwd.getpwuid` and falls back to the uid as a string).
+- `processes[].username`, resolved for every process on every tick when
+  `processes` is enabled (psutil calls `pwd.getpwuid` and falls back to the
+  uid as a string).
 - On glibc these lookups go through NSS: SSSD, LDAP, winbind and nss-systemd
   (`DynamicUser=`).
 - musl reads only `/etc/passwd` and `/etc/group`, plus nscd if it is running.
 
 *Hostname resolution:*
 - The API host and `ip.fivenines.io` bypass libc: dnspython reads
-  `/etc/resolv.conf` itself, so the libc choice does not affect them.
+  `/etc/resolv.conf` itself (once per process) and never reads `/etc/hosts`,
+  so the libc choice does not affect them.
 - Every other host goes through `getaddrinfo`, which means NSS on glibc. That
-  covers ping targets, the redis, memcached, php-fpm, PostgreSQL and MQTT
-  hosts, and the HTTP collector URLs.
+  covers ping targets, the memcached, php-fpm, PostgreSQL and MQTT hosts, and
+  the HTTP collector URLs (proxmox and a `tcp://` Docker socket included).
+  redis always connects to `localhost`.
+- The CLI tools the agent runs against a host (net-snmp, mysql, ceph) resolve
+  names in their own process, whatever libc the agent uses.
 
 *Native code loaded at runtime:*
 - NVIDIA ships NVML only as a shared library linked against glibc. pynvml
   loads it through ctypes; the Rust equivalent, nvml-wrapper, loads it through
   libloading.
 - A static musl binary cannot `dlopen` at all.
+- Today's Alpine binary does not bundle pynvml (section 2), so the Alpine
+  agent has no NVIDIA monitoring either.
 
 *Memory, re-measured.* The prototype READMEs give RSS only. RSS counts the
 pages of `libc.so`, `ld.so` and `libgcc_s` that every other process on the
 host already maps. `bench/measure.sh` samples PSS too, so both prototype
-builds were measured again with the `procs` profile, reading `smaps_rollup`
-once the agent was steady (values in kB):
+builds were measured again with the `procs` profile (the core collectors
+plus `processes`, no Docker), reading `smaps_rollup` once the agent was
+steady (values in kB):
 
 | build          | Rss  | Pss  | Private_Clean (own text) | Private_Dirty (heap, stacks) | Shared_Clean (libc, ld.so, libgcc_s) |
 |----------------|-----:|-----:|-------------------------:|-----------------------------:|-------------------------------------:|
@@ -141,7 +177,24 @@ approximate; `smaps_rollup` is exact.)
 
 Very few processes mapped libc in that VM, so the glibc PSS above is an upper
 bound. On a real host the shared part tends to zero, and the actual difference
-is the private heap: about 0.56 MB.
+is the private memory: about 0.56 MB here.
+
+That difference grows with the workload. The same binaries as the #169 table
+were run again on its 16-core x86_64 host (1s interval, 40 mock containers
+for `docker`), reading `Private_Dirty` (heap and stacks, in kB), the one
+figure that does not depend on what else shares the pages:
+
+| profile  | glibc                    | glibc, one malloc arena | musl        |
+|----------|-------------------------:|------------------------:|------------:|
+| `procs`  | 1248 (1460 at 90s)       | 1216 to 1244            | 556 to 572  |
+| `docker` | 2940, 3096 at 300s       | 1912 to 1940            | 1092 to 1156 |
+
+- Without Docker, the private difference is 0.6 to 0.7 MB, in line with the
+  aarch64 table.
+- With Docker, it is about 1.9 MB, and the glibc build is still creeping
+  after 5 minutes while the other two are flat. glibc's per-thread malloc
+  arenas account for 1.1 MB of it: `glibc.malloc.arena_max=1` removes that
+  and leaves about 0.8 MB.
 
 **Decision.** Ship both builds, on every architecture. Each host gets the
 libc it runs, which is the choice `detect_libc()` in the installers already
@@ -158,7 +211,8 @@ name-service and resolver behavior of the Python build it replaces, and the
 Alpine build is musl already. armv7 and i686 have no Python build to match,
 so they follow the same rule: a glibc host gets glibc names.
 
-musl everywhere would save about half a megabyte, at two costs:
+musl everywhere would save 0.6 to 0.8 MB of private memory once the glibc
+build caps its arenas (consequences), at two costs:
 - usernames would become uids on every LDAP, SSSD or DynamicUser host;
 - NVIDIA monitoring would disappear.
 
@@ -169,20 +223,24 @@ exactly the kind of divergence constraint 1 of #169 exists to catch.
 - CI checks the glibc floor on the binary itself: no symbol may require a
   `GLIBC_` version above 2.17. The Python build never had this check. The
   `centos:7` distro job stays.
-- The glibc build runs in a glibc 2.17 sysroot: the digest-pinned
-  manylinux2014 builder images already exist, on native x86_64 and aarch64
+- The glibc build runs in a glibc 2.17 sysroot: the manylinux2014-based
+  builder images already exist, on native x86_64 and aarch64
   runners, and manylinux2014 also has an i686 image that runs on the x86_64
   runner. rustup and rustc run there, because Rust's own host floor is also
-  glibc 2.17 / kernel 3.2. There is no manylinux2014 image for armv7, so the
+  glibc 2.17. There is no manylinux2014 image for armv7, so the
   release pipeline step sets the armv7 glibc floor and how it is built
   (section 4); the same symbol-version check then enforces it.
-- The static musl binary no longer depends on the host's musl. The Alpine
-  3.19 floor, which came from the Python build's `pwritev2`, disappears. It is
-  lowered only once the distro matrix tests an older Alpine.
-- `call_bounded` starts one thread per collector call, and glibc's
-  per-thread malloc arenas handle that pattern differently from musl's
-  allocator. The RSS soak test covers the glibc artifacts as well as the
-  musl ones.
+- The static musl binary no longer depends on the host's musl. The documented
+  Alpine 3.19 floor (the current musl binary needs `pwritev2`, which Alpine
+  3.18 lacks) no longer applies to it, but it is lowered only once the
+  distro matrix tests an older Alpine.
+- `call_bounded` starts one thread per collector call, and glibc binds
+  threads to extra malloc arenas that keep freed memory. The glibc build
+  caps the arena count with `mallopt(M_ARENA_MAX, ...)` at startup, before
+  any thread starts. It does this in the binary, not through
+  `GLIBC_TUNABLES`, which every child process would inherit. The release
+  pipeline step picks the value; the RSS soak test covers the glibc
+  artifacts as well as the musl ones.
 
 **Reopen if** a platform we must support has no usable glibc floor.
 
@@ -202,9 +260,9 @@ exactly the kind of divergence constraint 1 of #169 exists to catch.
   - **Rust 1.93 or later**, whose musl targets bundle musl 1.2.5. The DNS
     resolver rewrite in musl 1.2.4 (TCP fallback, large responses) matters to
     a static agent that resolves user-configured hosts.
-  - **glibc 2.17 / kernel 3.2**, the linux-gnu floor since Rust 1.64. A Rust
-    release that raises it would drop CentOS 7, which is a platform decision,
-    not a toolchain chore.
+  - **glibc 2.17 / kernel 3.2** (4.1 on aarch64), the linux-gnu floor since
+    Rust 1.64. A Rust release that raises it would drop CentOS 7, which is a
+    platform decision, not a toolchain chore.
   - **Windows 10**, the Windows floor since Rust 1.78. The supported list
     (Windows 10/11, Server 2019+) already meets it.
 - Cross-compilation:
@@ -214,6 +272,11 @@ exactly the kind of divergence constraint 1 of #169 exists to catch.
   - armv7 has no native runner, so it is cross-compiled: cargo-zigbuild or a
     pinned cross sysroot, chosen by the release pipeline step. A zig
     version, if used, is pinned exactly.
+  - The cross toolchain includes a C compiler for every target: ring, the
+    rustls crypto provider in the prototype, compiles C and assembly (so
+    does aws-lc-rs, the alternative).
+  - The prototype pinned none of this: it was built with whatever `stable`
+    was (1.98.1), and its zig pin exists only as README text.
   - Every release artifact goes through the RSS soak test: with zig 0.16.0,
     the linked musl never freed memory.
 
@@ -224,17 +287,20 @@ exactly the kind of divergence constraint 1 of #169 exists to catch.
 - the synchronizer;
 - the log uploader and the image inventory uploader;
 - one paho network thread per MQTT broker;
-- a per-tick SNMP pool (at most 10 threads, whose polls can outlive the tick);
+- a per-tick SNMP pool (at most 10 threads per tick; a poll can outlive its
+  tick, so polls from earlier pools can add to that);
 - a systemd drilldown pool (at most 10 threads, joined within the tick);
 - `call_bounded` workers: sudo commands, the libvirt probe and io_topology.
+  Only the last two are single-flight; each timed-out sudo call leaves one
+  thread behind.
 
 **Decision.**
 - The agent is synchronous, uses std threads, and keeps the Python agent's
   thread layout.
 - The collection loop runs collectors in sequence. Each collector call goes
   through `call_bounded`, which gives each call its own thread, a deadline,
-  single-flight per name and `catch_unwind`. That also delivers the per-collector
-  bound listed as P3 in TODOS.md.
+  single-flight per name and `catch_unwind`. That also delivers the
+  per-collector bound listed as P3 in TODOS.md.
 - The agent's own code uses no async runtime.
 - An async-only dependency is allowed only if all of this holds:
   - it sits behind a module boundary that owns one current-thread tokio
@@ -257,11 +323,14 @@ exactly the kind of divergence constraint 1 of #169 exists to catch.
 | proxmoxer                  | ureq                                                              | none |
 | systemd-watchdog           | An `sd_notify` datagram, written directly                         | none |
 
-The prototype ruled out bollard for three reasons:
-- Its models are closed enums, so a container state it does not know turns
-  the whole host's `docker` key into `null` (constraint 4).
-- It sends unversioned request paths.
-- Its timeout panicked outside a runtime context.
+bollard is ruled out by what the prototype's docker port found:
+- Its models are closed enums: 14 in the responses the prototype parses. An
+  unknown value in 10 of them, such as a container state it does not know,
+  turns the whole host's `docker` key into `null` (constraint 4). The other
+  4 are in the image inspect response, where the failed lookup was shipped
+  as empty tags for that image.
+- It sends unversioned request paths: it joins an absolute path over its
+  `/v1.xx` prefix, which drops the prefix.
 
 **Why synchronous.**
 - The collectors' work is blocking syscalls on /proc and /sys. Async has
@@ -270,41 +339,57 @@ The prototype ruled out bollard for three reasons:
 - `run_privileged` must be able to abandon a subprocess that may never
   return, and only an OS thread can be abandoned safely.
 - The collection loop is sequential by design under `WatchdogSec=90`.
-- The prototype ran on 3 threads; the Go runtime alone used 15 to 19.
+- The Rust prototype ran on 3 long-lived threads, plus one short-lived
+  worker per collector call; the Go prototype used 14 to 19 on the same
+  16-core host.
 
 **Consequences.**
-- The release profile keeps `panic = "unwind"` and never `"abort"`. With it,
-  a panic costs one collector a `null`; the prototype confirmed this when
-  bollard's timeout panicked.
+- The release profile states `panic = "unwind"` explicitly and never uses
+  `"abort"` (the prototype relied on the default). With it, a panic costs
+  one collector a `null`; the prototype confirmed this when its own
+  `tokio::time::timeout`, built outside the runtime, panicked.
 - **Mutex poisoning.** A collector that panics while holding shared state
   poisons the lock, and every later `.lock().unwrap()` panics too. The
-  prototype's `processes` and `docker` state would turn one panic into a
-  `null` on every tick until the agent restarts. So shared state must either
-  recover the guard (`PoisonError::into_inner`) and reset what it protects,
-  or use a lock that cannot be poisoned.
+  prototype's `processes` and `cpu` state take their lock that way, so one
+  panic there would become a `null` on every tick until the agent restarts
+  (its `docker` state already recovers the guard). So shared state must
+  either recover the guard (`PoisonError::into_inner`) and reset what it
+  protects, or use a lock that cannot be poisoned.
 - An abandoned worker can still hold shared state. Single-flight per name
   protects the next tick only if every path into that state goes through the
   same name.
 - Every counter is `u64`. Python integers are unbounded, and `usize`
-  truncates on the 32-bit targets (armv7, i686). Values above 2^53, such as docker's
-  `system_cpu_usage`, stay integers in the JSON.
+  truncates on the 32-bit targets (armv7, i686). Values above 2^53 (qemu's
+  `vm_cpu_time_nanoseconds_total`, docker's `cpu_throttling.throttled_time`,
+  network and disk byte counters) stay integers in the JSON, and SNMP
+  Counter64 values use the whole unsigned range, so `i64` is not enough
+  either.
 
 ## 6. libvirt
 
 **Facts.**
-- `qemu.py` makes about 15 read-only calls:
-  - connection: open read-only, type and version (debug only), node info,
-    list all domains;
-  - per domain: state, info, max vCPUs, CPU stats, vCPUs, memory stats, XML
-    description, block stats and interface stats.
+- `qemu.py` opens and closes its connection on every tick, and makes 15
+  distinct read-only calls that reach the daemon (plus a few, such as a
+  domain's name and UUID, that the client answers locally):
+  - connection: open read-only, version and type (every tick; the result is
+    only logged), node info, list all domains, close;
+  - per domain: state and info;
+  - per running domain: max vCPUs, CPU stats (per host CPU and total),
+    vCPUs, memory stats, XML description, then block stats per disk and
+    interface stats per interface.
 - The URI allowlist already limits it to local unix sockets
   (`qemu:///system`, `qemu:///session`, `qemu+unix` with a socket in a libvirt
   run directory).
-- The glibc build bundles libvirt 6.10.0 and libtirpc, built from source with
-  every driver disabled: a socket client and nothing else. Alpine uses the
-  system libvirt. Windows and Synology have no qemu collector.
+- The glibc build bundles libvirt 6.10.0 and libtirpc 1.3.3, built from
+  source with the hypervisor drivers disabled. `libvirt.so.0` brings its
+  own dependencies into the v1.20.1 bundle: libxml2, gnutls (with nettle,
+  gmp, libtasn1 and p11-kit), glib, libnl, yajl and libselinux, whose clash
+  with the host's sudo is why `get_clean_env` exists. The Alpine build
+  bundles the libvirt of its Alpine 3.21 builder image. Windows and Synology
+  exclude libvirt, so qemu never runs there.
 - The collector's own libvirt calls have no timeout; only the 3s probe is
-  bounded.
+  bounded (#171). No event loop is registered, so libvirt's keepalive is
+  off too.
 - Much of the allowlist exists to fence behaviors of the C client itself:
   - transports that run commands (`ssh`, `ext`);
   - `LIBVIRT_DEFAULT_URI` and `libvirt.conf`;
@@ -320,7 +405,7 @@ unix socket only, implementing only the procedures the collector uses.
 **Why.**
 - It is the only option that keeps both builds a single file with no bundled
   `.so`. Linking the C library brings back:
-  - bundling libvirt, libtirpc, libxml2 and gnutls;
+  - bundling libvirt and the libraries listed above;
   - `LD_LIBRARY_PATH` in child processes;
   - libvirt's own threads.
 - The allowlist becomes structural: the client has no TLS, SSH or `ext`
@@ -343,7 +428,7 @@ unix socket only, implementing only the procedures the collector uses.
   selection is parity-critical and is tested against both daemon layouts.
 
 qemu has no contract fixture yet, so its step first writes one from the
-Python agent's output.
+Python agent's output, after the Python fixes listed in section 9.
 
 **Reopen if** real hosts set `auth_unix_ro = "sasl"`. SASL is the one
 handshake the C client would give us for free.
@@ -381,7 +466,7 @@ Control Manager itself, which would remove WinSW and its .NET 4 dependency.
 **Facts.** The agent never updates itself. Updates happen only when someone
 runs them:
 - Linux: the operator runs the update scripts.
-- Windows: the MSI is re-run.
+- Windows: `fivenines_update.ps1` downloads and runs the latest MSI.
 - Synology: the SPK is installed by hand.
 - UNRAID: the binary already on flash is relaunched.
 
@@ -399,8 +484,11 @@ this record decides.
   - Installers and update scripts install the Rust agent.
   - The update script migrates a Python install in place; the state files are
     compatible (Phase 3).
-  - The Rust GA is the next major version (2.0.0) on the same version line, so
-    every existing version comparison keeps working.
+  - The Rust GA is the next major version (2.0.0) on the same version line.
+    Nothing agent-side depends on a 1.x prefix: the installers compare no
+    versions, and the MSI's major upgrade only needs a higher version.
+    Version checks on the server side are outside this repository; the GA
+    step (#210) reviews them.
 - **After GA.**
   - The Python agent for that platform stays in maintenance for 12 months:
     security fixes and fixes that keep its payload valid, no new collectors.
@@ -426,11 +514,18 @@ fix reaches today's hosts months before the Rust agent does.
 
 Found while preparing this record:
 - `vm_vm_uptime_seconds_total` is always 0. `_get_vm_uptime` reads
-  `dom.info()[5]`, but `virDomainGetInfo` returns five fields.
+  `dom.info()[5]` only when `info()` has six fields, and `virDomainGetInfo`
+  returns five (issue to be filed).
+- `vm_vcpu_time_nanoseconds_total` labels host CPUs as vCPUs on cgroup v1
+  hosts: `getCPUStats(False)` returns one entry per host CPU, not per vCPU,
+  and each is shipped with `vcpu` set to its index. On cgroup v2 that call
+  fails and the `vcpus()` fallback reports real vCPUs (issue to be filed).
 - The qemu collector's libvirt calls have no timeout, so one VM with a stuck
   QEMU monitor can stall the tick past `WatchdogSec` (#171).
 - The root installers map every unknown architecture to amd64 (section 2,
   #170).
+- The Windows binary ships without pynvml, so Windows hosts report no
+  NVIDIA GPU metrics (section 2, issue to be filed).
 - Child processes inherit the host locale: `get_clean_env` sets no `LC_ALL`,
   and only `dpkg-query` and `rpm` force `C`. smartctl formats `User
   Capacity`, which is shipped verbatim as `total_capacity`, with the locale's
@@ -441,9 +536,12 @@ Found while preparing this record:
 
 - Crate layout, lint set, coverage tool and threshold, and the cargo-deny /
   cargo-vet policy: the workspace and CI step.
-- The API host's DNS client (it must match dnspython's behavior: reads
-  `/etc/resolv.conf` once, A then AAAA, TTL cache flushed on any failure):
-  the synchronizer step.
+- The API host's DNS client: the synchronizer step. It must match how the
+  agent uses dnspython: `/etc/resolv.conf` read once per process,
+  `/etc/hosts` never read, `search` and `ndots` honored; A first, and AAAA
+  only when the A lookup fails or its first address fails to connect or
+  complete TLS; only the first address of an answer tried; TTL cache
+  flushed on any failure.
 - The PostgreSQL and MQTT clients: their steps, within section 5.
 - How the Windows service is run: the Windows step.
 
@@ -458,3 +556,7 @@ Found while preparing this record:
 - musl 1.2.5 in Rust's musl targets (Rust 1.93):
   https://blog.rust-lang.org/2025/12/05/Updating-musl-1.2.5
 - nvml-wrapper loads NVML at runtime: https://docs.rs/nvml-wrapper
+- Rust target tiers and floors (i686 tier 1 with SSE2, aarch64 kernel 4.1):
+  https://doc.rust-lang.org/rustc/platform-support.html
+- 32-bit Raspberry Pi OS ships a 64-bit kernel with a 32-bit userland:
+  https://www.raspberrypi.com/news/bookworm-the-new-version-of-raspberry-pi-os/
