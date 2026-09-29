@@ -7,13 +7,25 @@ if pgrep -f "fivenines-agent-linux" > /dev/null; then
   pkill -f "fivenines-agent-linux" 2>/dev/null || true
 fi
 
-# Detect architecture and set paths
+# Detect architecture and set paths. The same architecture mapping as the
+# installers' select_agent_binary (this script sources nothing), for the glibc
+# builds only, since UNRAID is glibc: an architecture no release ships is
+# refused, never handed the amd64 build (issue #170). Its 32-bit-userland
+# check is not repeated: UNRAID ships a 64-bit x86_64 userland only, and the
+# installer refuses anything else before this script is ever put in place.
 CURRENT_ARCH=$(uname -m)
-if [ "$CURRENT_ARCH" = "aarch64" ]; then
-  BINARY_NAME="fivenines-agent-linux-arm64"
-else
-  BINARY_NAME="fivenines-agent-linux-amd64"
-fi
+case "$CURRENT_ARCH" in
+  x86_64)
+    BINARY_NAME="fivenines-agent-linux-amd64"
+    ;;
+  aarch64)
+    BINARY_NAME="fivenines-agent-linux-arm64"
+    ;;
+  *)
+    echo "Error: unsupported architecture $CURRENT_ARCH (agent binaries are published for x86_64 and aarch64 only)"
+    exit 1
+    ;;
+esac
 
 AGENT_DIR="/boot/config/custom/fivenines_agent/${BINARY_NAME}"
 AGENT_EXEC="${AGENT_DIR}/${BINARY_NAME}"
