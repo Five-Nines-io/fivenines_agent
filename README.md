@@ -922,6 +922,10 @@ sudo kill -HUP $(pgrep -f fivenines_agent)
 sudo systemctl restart fivenines-agent
 ```
 
+Either one also releases the Proxmox Backup Server reads the agent holds after
+a timeout (see Proxmox Backup Server Monitoring): if a datastore on that PBS is
+still broken, repair it first, or each release sends the stuck request again.
+
 ### Viewing Available Capabilities
 
 When the agent starts, it displays a banner showing which features are available:
@@ -1306,7 +1310,10 @@ meanwhile; a full-scope token still reports each datastore's usage, without
 its estimated full date. Once the datastore is repaired, restart
 `proxmox-backup-proxy` on the PBS, then reload the agent
 (`sudo kill -HUP $(pgrep -f fivenines_agent)`; on Windows, restart the
-service). A first backup that is still uploading is never shown as the
+service). Any reload or restart releases them -- one sent for another reason,
+an agent update, a crash restart -- so repair a broken datastore before
+reloading the agent for anything else; changing the PBS host, fingerprint or
+token in the dashboard does not. A first backup that is still uploading is never shown as the
 latest backup. Anything that could not be read -- a datastore in offline maintenance,
 a namespace whose group listing failed -- is reported per datastore and
 namespace, so the dashboard shows those backups as *unknown*, never as

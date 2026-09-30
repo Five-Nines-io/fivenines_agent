@@ -349,8 +349,9 @@ class _PbsError(Exception):
     the agent did not (fully) make -- "deadline": past the budget, never sent
     or answered too late; "backoff": held back by _timeout_backoff -- which
     is no evidence about the PBS either way. `pending`: sent, and not answered
-    in time (a read timeout, never a connect one), so PBS may still be
-    running it."""
+    in time (a read timeout that waited its whole read timeout -- never a
+    connect one, nor a stalled TLS handshake urllib3 reports as a read one),
+    so PBS may still be running it."""
 
     def __init__(
         self, error_type, message, reachable, status=None, skipped=None, pending=False
@@ -400,10 +401,6 @@ class _Target:
                 "fingerprint"
             )
         self.base = f"https://{url_host}:{self.port}/api2/json"
-        # Which PBS this is, whatever the TLS policy: a pinned or verified
-        # "localhost" keeps its name in the URL, an unverified one does not.
-        name = self.host.lower()
-        self.address = ("127.0.0.1" if name == "localhost" else name, self.port)
         # The secret is deliberately not part of the key (the proxmox
         # _backups_cache_key posture): it must never sit in a cache key, and a
         # rotated secret on the same token serves the same PBS's block.
@@ -630,6 +627,7 @@ def _get(
     if deadline is not None:
         remaining = _remaining(deadline)
         connect, read = min(connect, remaining), max(min(read, remaining), min_wait)
+    sent = time.monotonic()
     try:
         response = session.get(
             target.base + path,
@@ -641,9 +639,13 @@ def _get(
     except requests.exceptions.SSLError as e:
         raise _PbsError("tls_error", _transport_message(target, e), reachable=False)
     except requests.exceptions.ReadTimeout as e:
-        # Sent, and not answered in time: PBS may still be running it.
+        # Sent, and not answered in time: PBS may still be running it -- but
+        # urllib3 also reports a TLS handshake that stalled, within the
+        # connect timeout, as a read timeout, and that request never reached
+        # PBS. Only one that waited the whole read timeout was sent.
         message = _transport_message(target, e)
-        raise _PbsError("timeout", message, reachable=False, pending=True)
+        pending = time.monotonic() - sent >= read
+        raise _PbsError("timeout", message, reachable=False, pending=pending)
     except requests.exceptions.Timeout as e:  # connecting: never reached PBS
         raise _PbsError("timeout", _transport_message(target, e), reachable=False)
     except requests.exceptions.ConnectionError as e:
@@ -917,7 +919,7 @@ def _deadline_hit(deadline, errors, scope, store=None, ns=None):
     return True
 
 
-def _cap(rows, room, errors, noun, limit=None, store=None, ns=None):
+def _cap(rows, room, errors, noun, limit=None, store=None):
     """`rows` trimmed to `room`, with a 'cap' error naming what was dropped.
     `limit` is the cap to report when `room` is what is left of a shared one."""
     if len(rows) <= room:
@@ -928,7 +930,6 @@ def _cap(rows, room, errors, noun, limit=None, store=None, ns=None):
         f"{noun} capped at {room if limit is None else limit}: "
         f"{len(rows) - room} dropped",
         store=store,
-        ns=ns,
     )
     return rows[:room]
 
@@ -973,20 +974,18 @@ def _log_read_failure(scope, message, store=None, ns=None):
 
 _UNSET = object()
 
-# After a listing that walks namespaces TIMED OUT, PBS may still be running
-# it. Its namespace iterator never ends while reading a <store>/ns keeps failing
-# (an NFS datastore gone stale, EACCES, EIO): list_namespaces spins on the
-# proxy's own runtime thread for good, and so does /status/datastore-usage
-# under a scoped token, which walks the tree of every datastore the token
-# cannot audit (both reproduced on PBS 4.2, one pinned proxy thread per
-# request). Re-sent every rebuild, one more thread each time, until backups
-# stop. So that exact request waits: one rebuild at first, twice as long after
-# each further timeout, at most _TIMEOUT_BACKOFF_MAX; a success clears it.
-# Meanwhile it is skipped like a failed read (its scope unknown, an errors[]
-# entry; its log line stays at debug on a later identical failure).
+# After a read TIMED OUT, PBS may still be running it. A slow read ends, so it
+# waits: one rebuild at first, twice as long after each further timeout, at
+# most _TIMEOUT_BACKOFF_MAX; a success clears it. Meanwhile it is skipped like
+# a failed read (its scope unknown, an errors[] entry; its log line stays at
+# debug on a later identical failure).
 #
-# But every re-send of a walk that never ends pins ONE MORE proxy thread, for
-# good, and the proxy has one per core: two kill a 2-vCPU PBS. So the two
+# But PBS's namespace iterator never ends while reading a <store>/ns keeps
+# failing (an NFS datastore gone stale, EACCES, EIO): list_namespaces spins on
+# the proxy's own runtime thread for good, and so does /status/datastore-usage
+# (reproduced on PBS 4.2, one pinned proxy thread per request). Every re-send
+# of a walk that never ends pins ONE MORE proxy thread, for good, and the
+# proxy has one per core: two kill a 2-vCPU PBS. So the two
 # reads that can walk namespaces -- a datastore's namespace listing, and the
 # usage status, which walks every datastore the token cannot audit (all of
 # them for a scoped token; for a full-scope one, any a deeper ACL entry hides,
@@ -997,11 +996,12 @@ _UNSET = object()
 # never walking namespaces; a datastore's status is one statfs), so holding
 # them for good would only blind a PBS that is slow: they retry on the
 # backoff above.
-# {(target address, path, params): (retry-after monotonic time -- inf for a
-#  hold --, timeouts, the _read_failures key of its failure)}. Keyed on the
-# PBS's address, not the token or the TLS policy: the stuck walk pins that
-# PBS's proxy whoever asked, so a rotated token or a pasted fingerprint must
-# not re-send it.
+# {(path, params): (retry-after monotonic time -- inf for a hold --, timeouts,
+#  the _read_failures key of its failure)}. Keyed on the request alone, not on
+# the PBS's address, token or TLS policy: the stuck walk pins that PBS's proxy
+# whoever asks and however its host is spelled (localhost, 127.0.0.2, ::1,
+# its FQDN), so no configuration change may re-send it -- only a reload or a
+# restart. After a move to another PBS, its holds wait for that reload too.
 _timeout_backoff: dict = {}
 _TIMEOUT_BACKOFF_MAX = 6 * 3600
 # One build backs off or holds at most this many reads: a namespace listing
@@ -1025,8 +1025,8 @@ _TIMEOUT_HOLD_MESSAGE = (
 )
 
 
-def _timeout_backoff_key(target, path, params):
-    return (target.address, path, tuple(sorted((params or {}).items())))
+def _timeout_backoff_key(path, params):
+    return (path, tuple(sorted((params or {}).items())))
 
 
 def _arm_timeout_backoff(key, failure, hold):
@@ -1049,15 +1049,15 @@ def _arm_timeout_backoff(key, failure, hold):
     _timeout_backoff[key] = (time.monotonic() + delay, timeouts, failure)
 
 
-def _forget_stale_backoffs(target):
-    """Entries of another PBS (its host or port changed) or expired this long
-    ago (never retried: the namespace or datastore is gone) are dropped. A
-    hold never expires: _TIMEOUT_BACKOFF_ENTRIES bounds those."""
+def _forget_stale_backoffs():
+    """Retries expired this long ago (never sent again: the namespace or
+    datastore is gone) are dropped. A hold never expires:
+    _TIMEOUT_BACKOFF_ENTRIES bounds those."""
     now = time.monotonic()
     for key in [
         key
         for key, (retry_at, _, _) in _timeout_backoff.items()
-        if key[0] != target.address or now - retry_at > _TIMEOUT_BACKOFF_MAX
+        if now - retry_at > _TIMEOUT_BACKOFF_MAX
     ]:
         del _timeout_backoff[key]
 
@@ -1094,7 +1094,7 @@ def _sub_read(
     `missing` when one is given (an endpoint an older PBS does not have);
     `on_error` receives the failure, a backoff skip included, for a caller
     that must know what happened."""
-    key = _timeout_backoff_key(target, path, params) if backoff else None
+    key = _timeout_backoff_key(path, params) if backoff else None
     waiting = _timeout_backoff.get(key)
     if waiting is not None and time.monotonic() < waiting[0]:
         _read_failures["current"].add(waiting[2])  # stays quiet on retry
@@ -1154,8 +1154,9 @@ def _check_privileges(permissions, redact=str):
       /datastore or /remote on the token or its user makes one when its role
       lacks the audited privilege: a deeper entry REPLACES the inherited role
       (a NoAccess, or a DatastoreBackup the user also holds, leaves the token
-      nothing there). That path is then invisible here: the README gives the
-      token's user no other ACL.
+      nothing there). That path is then invisible here -- unless the token
+      can still audit a path below it (_hidden_below) -- so the README gives
+      the token's user no other ACL.
     A grant on /datastore/<store>[/ns] is a scoped token whatever its
     propagate flag: it audits at least that path.
     """
@@ -1218,6 +1219,35 @@ def _check_privileges(permissions, redact=str):
     return propagated("Remote.Audit", ("/remote",)), full_scope
 
 
+def _hidden_below(permissions):
+    """(whether some path below /datastore is hidden from the token, the
+    datastores it cannot audit at the datastore level) -- the deeper ACL
+    entries _check_privileges cannot see, in the one case where they show:
+    PBS puts every node of its ACL tree in this map, a node's ancestors are
+    nodes too, and it leaves out only a node where the token holds NO
+    privilege. So a path present under an absent one names a deeper entry
+    that took the token's privilege away there. PBS still lists such a
+    datastore (the token audits something below it), but not its root
+    namespace or groups, and its own status answers 0/0/0."""
+    paths = {
+        str(path)
+        for path, privileges in permissions.items()
+        if isinstance(privileges, dict)
+    }
+    hidden, unaudited = False, set()
+    for path in paths:
+        parts = path.split("/")  # "", "datastore", store, ns...
+        if len(parts) < 4 or parts[1] != "datastore":
+            continue
+        for depth in range(3, len(parts)):
+            if "/".join(parts[:depth]) not in paths:
+                hidden = True
+                if depth == 3:
+                    unaudited.add(parts[2])
+                break
+    return hidden, unaudited
+
+
 def _is_name(value, namespace=False):
     """A datastore (or, with `namespace`, a namespace: "" is the root) name as
     PBS's own schema spells it (_SAFE_ID). Anything else -- a lone surrogate
@@ -1267,11 +1297,11 @@ def _build_block(session, target, deadline):
     _read_failures["current"] = set()
     _read_failure_lines.update(error=0, quieted=0)
     _local_nodes.clear()
-    _forget_stale_backoffs(target)
-    remote_audit, full_scope = _check_privileges(
-        _get(session, target, "/access/permissions", deadline=deadline),
-        target.redact,
-    )
+    _forget_stale_backoffs()
+    permissions = _get(session, target, "/access/permissions", deadline=deadline)
+    remote_audit, full_scope = _check_privileges(permissions, target.redact)
+    hidden, unaudited = _hidden_below(permissions)
+    del permissions
     stores = _datastore_entries(
         _get(session, target, "/admin/datastore", deadline=deadline)
     )
@@ -1286,8 +1316,10 @@ def _build_block(session, target, deadline):
     errors = _Errors(target.redact)
     kept_stores = _cap(stores, MAX_DATASTORES, errors, "datastores")
     # "partial": a datastore or namespace absent from this block may exist and
-    # simply not be visible to this token (or past the datastore cap).
-    scope = "full" if full_scope and len(kept_stores) == len(stores) else "partial"
+    # simply not be visible to this token (or past the datastore cap, or
+    # hidden from it by a deeper ACL entry).
+    whole = full_scope and not hidden and len(kept_stores) == len(stores)
+    scope = "full" if whole else "partial"
     del stores  # past the cap, not kept alive for the whole build
     usage, usage_failed = _read_usage(
         session,
@@ -1327,6 +1359,7 @@ def _build_block(session, target, deadline):
         usage,
         full_scope and usage_failed,
         backends,
+        unaudited,
     )
     # After the job lists and the GC reads: they teach _local_nodes, which
     # decides which verifications the group rows count.
@@ -1420,7 +1453,15 @@ def _resume_index(order_length, start, cut):
 
 
 def _read_datastores(
-    session, target, errors, deadline, stores, usage, per_store_usage, backends
+    session,
+    target,
+    errors,
+    deadline,
+    stores,
+    usage,
+    per_store_usage,
+    backends,
+    unaudited=frozenset(),
 ):
     """(name -> datastore, sorted (store, ns) units).
 
@@ -1433,7 +1474,8 @@ def _read_datastores(
     aggregate usage read FAILED (PBS fails it whole when ONE datastore's
     statfs errors) and the token is full-scope, so each datastore's own status
     is read instead -- for a FILESYSTEM datastore only: any other backend's
-    usage is withheld anyway.
+    usage is withheld anyway -- and never for one in `unaudited`, which PBS
+    answers with 0/0/0 (_hidden_below).
     """
     global _store_rotation
     datastores = {}
@@ -1449,7 +1491,11 @@ def _read_datastores(
         name = entry["store"]
         if usage is not None:
             row = usage.get(name, {})
-        elif per_store_usage and backends.get(name) == "filesystem":
+        elif (
+            per_store_usage
+            and backends.get(name) == "filesystem"
+            and name not in unaudited
+        ):
             # Only where it can ship: any other backend's usage is withheld.
             row = _read_store_status(session, target, errors, phase_deadline, name)
         else:

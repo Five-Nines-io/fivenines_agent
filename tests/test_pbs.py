@@ -95,7 +95,15 @@ class FakeSession:
             url += "?" + urlencode(params)
         self.calls.append(url)
         self.timeouts.append(timeout)
-        return self._handler(url)
+        try:
+            return self._handler(url)
+        except requests.exceptions.ReadTimeout as e:
+            # The wait a real timeout takes: the whole read timeout for a
+            # request sent and left unanswered; only the connect timeout for a
+            # TLS handshake that stalled (urllib3 reports it as a read one).
+            if isinstance(pbs.time, Clock):
+                pbs.time.now += connect if isinstance(e, HandshakeStall) else read
+            raise
 
     def close(self):
         self.closed = True
@@ -125,8 +133,14 @@ def use_clock(monkeypatch, clock, cache_too=False):
 
 _BASE_RE = re.compile(r"^https://[^/]+/api2/json")
 
+
+class HandshakeStall(requests.exceptions.ReadTimeout):
+    """A TLS handshake that stalled: urllib3 raises a read timeout for it."""
+
+
 _TRANSPORT_ERRORS = {
     "connection_refused": requests.exceptions.ConnectionError,
+    "handshake_timeout": HandshakeStall,
     # A request sent and not answered in time (PBS may still be running it).
     "timeout": requests.exceptions.ReadTimeout,
     "connect_timeout": requests.exceptions.ConnectTimeout,
@@ -5647,7 +5661,7 @@ def test_a_timed_out_namespace_listing_is_held_until_a_reload(monkeypatch):
     assert len(_ns_calls(session)) == 1
     assert out["datastores"][0]["namespaces"] is None
     [key] = pbs._timeout_backoff
-    assert key[1:] == (_NS_PATH, ())
+    assert key == (_NS_PATH, ())
     failure = ("namespaces", "ds", None, "t")
     assert pbs._timeout_backoff[key] == (math.inf, 1, failure)
     assert (
@@ -5668,14 +5682,98 @@ def test_a_timed_out_namespace_listing_is_held_until_a_reload(monkeypatch):
     assert pbs._timeout_backoff == {}
 
 
+# Value: protects=a hold surviving any configuration change -- a pasted
+#   fingerprint, the same PBS spelled 127.0.0.2 or ::1, a rotated token --
+#   through whole builds; fails_when=the key or the stale-entry cleanup
+#   depends on the host, the URL or the token again; why_new=the key test
+#   never runs a build; seam=none
+@pytest.mark.parametrize(
+    "change, url",
+    [
+        ({"fingerprint": FINGERPRINT}, "https://localhost:8007/"),
+        ({"host": "127.0.0.2"}, "https://127.0.0.2:8007/"),
+        ({"host": "::1"}, "https://[::1]:8007/"),
+        ({"token_id": "other@pbs!t"}, "https://127.0.0.1:8007/"),
+    ],
+    ids=["pasted_pin", "loopback_alias", "ipv6_loopback", "rotated_token"],
+)
+def test_a_hold_survives_any_configuration_change(monkeypatch, change, url):
+    clock = use_clock(monkeypatch, Clock())
+    stuck = minimal_responses(**{_NS_PATH: {"error": "timeout", "message": "t"}})
+    collect(monkeypatch, stuck)  # unverified localhost: https://127.0.0.1
+    clock.now += pbs.PBS_CACHE_TTL + 5
+    out, session = collect(monkeypatch, stuck, **change)
+    assert session.calls[0].startswith(url)
+    assert _ns_calls(session) == []
+    assert out["datastores"][0]["namespaces"] is None
+
+
+# Value: protects=the one deeper ACL entry the permissions map DOES show (a
+#   path present under an absent ancestor); fails_when=the ancestor walk is
+#   dropped, or a namespace-level gap is read as a datastore one;
+#   why_new=nothing read the map's shape below /datastore before; seam=none
+def test_a_path_below_an_absent_one_names_a_hidden_datastore_or_namespace():
+    audit = {"Datastore.Audit": True}
+    assert pbs._hidden_below(PERMS_FULL) == (False, set())
+    visible = {**PERMS_FULL, "/datastore/s1": audit, "/datastore/s1/a": audit}
+    assert pbs._hidden_below(visible) == (False, set())
+    # NoAccess on /datastore/s2 (absent) and an audit grant on a namespace.
+    assert pbs._hidden_below({**PERMS_FULL, "/datastore/s2/a": audit}) == (
+        True,
+        {"s2"},
+    )
+    # A namespace hidden inside an audited datastore: not the datastore.
+    deep = {**PERMS_FULL, "/datastore/s1": audit, "/datastore/s1/a/b": audit}
+    assert pbs._hidden_below(deep) == (True, set())
+    odd = {**PERMS_FULL, "/remote/r/x": audit, "/datastore/s3/a": "junk"}
+    assert pbs._hidden_below(odd) == (False, set())
+
+
+# Value: protects=a datastore a deeper ACL entry hides at its own level ships
+#   as partial scope with usage unknown, never PBS's 0/0/0; fails_when=the
+#   fallback reads its /status (a false "0 bytes free") or scope stays full
+#   (its root groups would be pruned); why_new=reproduced on PBS 4.2 by the
+#   pass-3 red team; seam=none
+def test_a_datastore_audited_only_below_is_partial_and_never_zero(monkeypatch):
+    audit = {"Datastore.Audit": True}
+    responses = minimal_responses(
+        **{
+            "/access/permissions": ok({**PERMS_FULL, "/datastore/ds/a": audit}),
+            "/status/datastore-usage": fail(500, "EIO"),
+            "/admin/datastore/ds/status": ok({"total": 0, "used": 0, "avail": 0}),
+        }
+    )
+    out, session = collect(monkeypatch, responses)
+    assert out["scope"] == "partial"
+    assert "/admin/datastore/ds/status" not in [route(u) for u in session.calls]
+    assert out["datastores"][0]["total"] is None
+
+
+# Value: protects=a TLS handshake that stalled (urllib3 calls it a read
+#   timeout) never arms a hold for a request PBS never received;
+#   fails_when=every ReadTimeout counts as pending again; why_new=the fake
+#   transport could not tell the two apart before; seam=none
+def test_a_stalled_tls_handshake_holds_nothing(monkeypatch):
+    clock = use_clock(monkeypatch, Clock())
+    stalled = minimal_responses(
+        **{_NS_PATH: {"error": "handshake_timeout", "message": "t"}}
+    )
+    out, _ = collect(monkeypatch, stalled)
+    assert out["datastores"][0]["namespaces"] is None
+    assert pbs._timeout_backoff == {}
+    clock.now += pbs.PBS_CACHE_TTL + 5
+    out, session = collect(monkeypatch, minimal_responses())
+    assert len(_ns_calls(session)) == 1  # sent again: nothing held
+    assert out["datastores"][0]["namespaces"] == [""]
+
+
 def test_a_timeout_backoff_is_capped_and_per_request(monkeypatch):
     """A retried read's delay stops doubling at _TIMEOUT_BACKOFF_MAX; a held
-    one never expires. The key is the exact request, for one PBS address."""
+    one never expires. The key is the exact request, and nothing else."""
     use_clock(monkeypatch, Clock())
-    target = _target()
-    key = pbs._timeout_backoff_key(target, "/p", {"ns": "a"})
-    assert key == (("127.0.0.1", 8007), "/p", (("ns", "a"),))
-    assert pbs._timeout_backoff_key(target, "/p", None) != key
+    key = pbs._timeout_backoff_key("/p", {"ns": "a"})
+    assert key == ("/p", (("ns", "a"),))
+    assert pbs._timeout_backoff_key("/p", None) != key
     failure = ("snapshots", "ds", "a", "t")
     for _ in range(12):
         pbs._arm_timeout_backoff(key, failure, hold=False)
@@ -5686,17 +5784,6 @@ def test_a_timeout_backoff_is_capped_and_per_request(monkeypatch):
     )
     pbs._arm_timeout_backoff(key, failure, hold=True)
     assert pbs._timeout_backoff[key] == (math.inf, 13, failure)
-    other = _target(port=8008)  # (localhost IS 127.0.0.1: one target)
-    assert pbs._timeout_backoff_key(other, "/p", {"ns": "a"}) != key
-    # Value: protects=a hold surviving a token rotation or a pasted pin;
-    # fails_when=holds are keyed on the token (cache_key) or the URL (base,
-    # where an unverified localhost becomes 127.0.0.1) again;
-    # why_new=the walk pins the PBS proxy whoever asked; seam=none
-    rotated = _target(token_id="o@pbs!t", fingerprint=FINGERPRINT)
-    assert rotated.base != target.base  # the pinned name stays in the URL
-    assert pbs._timeout_backoff_key(rotated, "/p", {"ns": "a"}) == key
-    loopback = _target(host="127.0.0.1", verify_ssl=True)
-    assert pbs._timeout_backoff_key(loopback, "/p", {"ns": "a"}) == key
 
 
 # Value: protects=the backoff dict's bound once holds (which never expire)
@@ -5774,21 +5861,13 @@ def test_an_answer_past_the_budget_arms_no_backoff(monkeypatch):
 
 
 def test_stale_backoffs_are_forgotten_at_the_next_build(monkeypatch):
-    """An entry expired long ago and never retried (its namespace or
-    datastore is gone), or another PBS's (its address changed), is dropped. A
-    hold stays."""
+    """A retry expired long ago and never sent again (its namespace or
+    datastore is gone) is dropped. A hold stays."""
     clock = use_clock(monkeypatch, Clock(now=100_000.0))
-    mine = pbs._Target(
-        **{"port": pbs.DEFAULT_PORT, "fingerprint": None, **LOOPBACK}
-    ).address
-    gone = (mine, "/gone", ())
-    recent = (mine, "/recent", ())
-    held = (mine, "/held", ())
-    elsewhere = ("another target", "/p", ())
+    gone, recent, held = ("/gone", ()), ("/recent", ()), ("/held", ())
     pbs._timeout_backoff[gone] = (clock.now - pbs._TIMEOUT_BACKOFF_MAX - 1, 3, None)
     pbs._timeout_backoff[recent] = (clock.now - 60, 1, None)
     pbs._timeout_backoff[held] = (math.inf, 1, None)
-    pbs._timeout_backoff[elsewhere] = (math.inf, 1, None)
     collect(monkeypatch, minimal_responses())
     assert sorted(pbs._timeout_backoff) == sorted([recent, held])
 
@@ -5893,7 +5972,7 @@ def test_a_read_held_back_by_its_backoff_stays_quiet_on_retry(monkeypatch):
     collect(monkeypatch, stuck)
     clock.now += pbs.PBS_CACHE_TTL + 5
     collect(monkeypatch, stuck)  # held back
-    clock.now = 1000.0 + 2 * pbs.PBS_CACHE_TTL
+    clock.now += pbs.PBS_CACHE_TTL  # two rebuilds after the timeout
     collect(monkeypatch, stuck)  # retried, times out again
     levels = [lvl for lvl, m in logged if "snapshots read failed" in m]
     assert levels == ["error", "debug"]
@@ -6169,10 +6248,11 @@ def test_a_snapshot_listing_that_answers_again_restarts_its_backoff(monkeypatch)
     clock = use_clock(monkeypatch, Clock())
     path = "/admin/datastore/ds/snapshots"
     stuck = minimal_responses(**{path: {"error": "timeout", "message": "t"}})
-    collect(monkeypatch, stuck)
+    collect(monkeypatch, stuck)  # the timeout takes its whole read timeout
     [key] = pbs._timeout_backoff
-    assert pbs._timeout_backoff[key][:2] == (1000.0 + 2 * pbs.PBS_CACHE_TTL, 1)
-    clock.now = 1000.0 + 2 * pbs.PBS_CACHE_TTL  # the retry, answered this time
+    timed_out = 1000.0 + pbs._READ_TIMEOUT
+    assert pbs._timeout_backoff[key][:2] == (timed_out + 2 * pbs.PBS_CACHE_TTL, 1)
+    clock.now = timed_out + 2 * pbs.PBS_CACHE_TTL  # the retry, answered this time
     out, _ = collect(monkeypatch, minimal_responses())
     assert out["groups"][0]["in_progress"] is False
     assert out["datastores"][0]["unread_namespaces"] == []
@@ -6226,7 +6306,9 @@ def test_a_timed_out_read_that_is_not_a_walk_is_sent_again_next_build(
         monkeypatch, minimal_responses(**{path: {"error": "timeout", "message": "t"}})
     )
     assert "datastores" in out  # a scoped failure, not the envelope
-    assert [e["message"] for e in out["errors"]] == ["t"]
+    # (A GC read that times out also spends the per-datastore half of the
+    # budget, so the namespace listing after it may be skipped.)
+    assert [e["message"] for e in out["errors"]][:1] == ["t"]
     assert pbs._timeout_backoff == {}
     clock.now += pbs.PBS_CACHE_TTL + 5
     out, session = collect(monkeypatch, minimal_responses())
@@ -6241,6 +6323,7 @@ def test_a_hold_names_the_read_it_holds_in_the_log(monkeypatch):
     """The held line is the operator's pointer to WHAT to repair: it names the
     datastore when the read has one (its namespace listing), and none for
     the aggregate usage status."""
+    use_clock(monkeypatch, Clock())
     logged = capture_logs(monkeypatch)
     collect(
         monkeypatch,
