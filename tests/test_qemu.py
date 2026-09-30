@@ -1506,7 +1506,7 @@ def test_uptime_is_read_from_a_real_process_through_private_objects():
             give_up = time.monotonic() + 30
             started = {}
             while tag.lower() not in started and time.monotonic() < give_up:
-                started = qemu._qemu_start_times(float("inf"))
+                started = qemu._qemu_start_times(float("inf"), {tag.lower()})
         assert started[tag.lower()] == _REAL_PROCESS(child.pid).create_time()
     finally:
         child.kill()
@@ -1731,3 +1731,41 @@ def test_a_slow_last_process_read_still_spends_the_budget(fake_libvirt):
     (error,) = _errors(mock_log)
     assert "while reading QEMU process start times" in error
     assert qemu._backoff_failures == 1
+
+
+def test_the_scan_keeps_only_the_running_vms_uuids():
+    """Any local user can start a process with a `-uuid` argument of any size:
+    only the running VMs' UUIDs are kept, and an oversized argument is
+    refused before it is copied, so unrelated processes cannot grow the
+    agent's memory."""
+    now = time.time()
+    processes = {
+        1: (_qemu_cmdline("uuid-a"), now - 60),
+        2: (_qemu_cmdline("uuid-not-a-vm-here"), now - 60),
+        3: (_qemu_cmdline("x" * (qemu._UUID_MAX_CHARS + 1)), now - 60),
+    }
+    with _host_processes(processes):
+        started = qemu._qemu_start_times(float("inf"), {"uuid-a"})
+    assert started == {"uuid-a": now - 60}
+
+
+def test_an_oversized_uuid_argument_is_refused_before_it_is_copied():
+    """The length is checked on the raw argument: one exactly at the limit
+    that is wanted is kept, one past it never reaches .lower()."""
+    at_limit = "A" * qemu._UUID_MAX_CHARS
+    now = time.time()
+    copied = []
+
+    class Arg(str):
+        def lower(self):  # recorded, not raised: the scan swallows errors
+            copied.append(len(self))
+            return str.lower(self)
+
+    processes = {
+        1: (["qemu", "-uuid", at_limit], now - 5),
+        2: (["qemu", "-uuid", Arg("B" * (qemu._UUID_MAX_CHARS + 1))], now - 5),
+    }
+    with _host_processes(processes):
+        started = qemu._qemu_start_times(float("inf"), {at_limit.lower()})
+    assert started == {at_limit.lower(): now - 5}
+    assert copied == []

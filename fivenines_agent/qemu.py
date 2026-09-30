@@ -451,11 +451,16 @@ class QEMUCollector:
         budget the walk already spent (its last call overran) is reported at
         that VM, before the scan could claim it."""
         started = {}
-        if any(state_num == 1 for _, state_num, _ in self._uptime_rows):
+        wanted = {
+            str(uuid).lower()
+            for uuid, state_num, _ in self._uptime_rows
+            if state_num == 1
+        }
+        if wanted:
             if time.monotonic() >= self.deadline:
                 raise _BudgetSpent()
             self.position = ("scan", None)
-            started = _qemu_start_times(self.deadline)
+            started = _qemu_start_times(self.deadline, wanted)
         for uuid, state_num, labels in self._uptime_rows:
             created = started.get(str(uuid).lower()) if state_num == 1 else None
             uptime = 0 if created is None else max(0, int(time.time() - created))
@@ -891,6 +896,10 @@ def _reset_backoff():
     _backoff_until = 0.0
 
 
+# A libvirt UUID string is 36 characters; anything longer is not one.
+_UUID_MAX_CHARS = 64
+
+
 def _is_no_domain(error):
     """True for libvirt's "domain not found": a VM undefined or destroyed
     after listAllDomains, the one VM that may be left out of the list."""
@@ -898,9 +907,12 @@ def _is_no_domain(error):
     return callable(get_code) and get_code() == libvirt.VIR_ERR_NO_DOMAIN
 
 
-def _qemu_start_times(deadline):
-    """{domain UUID: start time} of the QEMU processes on this host, keyed by
-    each one's `-uuid` argument (libvirt passes it to every QEMU it starts).
+def _qemu_start_times(deadline, wanted):
+    """{domain UUID: start time} of the QEMU processes on this host whose
+    `-uuid` argument (libvirt passes it to every QEMU it starts) is one of
+    the *wanted* running VMs' UUIDs -- only those: any local user can start a
+    process with a `-uuid` argument of any size, and keeping every distinct
+    one would let them grow the agent's memory.
     A process the agent cannot see -- /proc mounted hidepid=, another user's
     process on a hardened host, or SELinux confining QEMU as svirt_t (the
     RHEL family), which the agent's policy cannot read -- is absent, and its
@@ -926,7 +938,7 @@ def _qemu_start_times(deadline):
         log(f"Cannot list processes for QEMU start times: {e}", "debug")
         return started
     for pid in pids:
-        found = _qemu_uuid_and_start(pid)
+        found = _qemu_uuid_and_start(pid, wanted)
         if found is not None:
             uuid, created = found
             started[uuid] = min(created, started.get(uuid, created))
@@ -937,9 +949,11 @@ def _qemu_start_times(deadline):
     return started
 
 
-def _qemu_uuid_and_start(pid):
-    """(lower-cased -uuid argument, start time) of one QEMU process, or None
-    for any other process, or one that is gone or not readable. The start
+def _qemu_uuid_and_start(pid, wanted):
+    """(lower-cased -uuid argument, start time) of one QEMU process whose
+    UUID is *wanted*, or None for any other process, or one that is gone or
+    not readable. An argument longer than _UUID_MAX_CHARS is refused before
+    it is copied. The start
     time is read BEFORE the command line and checked again after it through
     a fresh object: a pid reused in between would pair one process's UUID
     with another's start time."""
@@ -950,10 +964,13 @@ def _qemu_uuid_and_start(pid):
         if "-uuid" not in cmdline:
             return None
         position = cmdline.index("-uuid") + 1
-        if position >= len(cmdline):
+        if position >= len(cmdline) or len(cmdline[position]) > _UUID_MAX_CHARS:
+            return None
+        uuid = cmdline[position].lower()
+        if uuid not in wanted:
             return None
         if psutil.Process(pid).create_time() != created:
             return None
-        return cmdline[position].lower(), created
+        return uuid, created
     except Exception:
         return None
