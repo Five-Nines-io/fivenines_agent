@@ -27,6 +27,7 @@ Windows 10/11), **Synology DSM 7** and **UNRAID**.
 - **Host and platform monitoring**
   - [Docker Monitoring](#docker-monitoring) (container states + image vulnerability scanning)
   - [Proxmox VE Monitoring](#proxmox-ve-monitoring)
+  - [Proxmox Backup Server Monitoring](#proxmox-backup-server-monitoring)
   - [QEMU/KVM VM Monitoring](#qemukvm-vm-monitoring)
   - [systemd Unit Monitoring](#systemd-unit-monitoring)
   - [Log Monitoring](#log-monitoring)
@@ -1159,6 +1160,150 @@ sub-read that fails (for example a storage the token cannot list) is reported
 per storage inside the block, so the dashboard can mark that storage's guests
 as *unknown* rather than *never backed up*, and the block never affects the
 completeness flags above.
+
+This view sees a backup's *existence* through Proxmox VE. Whether it is
+intact (verification), encrypted, how big it is, and whether the offsite sync
+job still runs are read on the Proxmox Backup Server itself: see
+[Proxmox Backup Server Monitoring](#proxmox-backup-server-monitoring). Agent
+version **1.21.0+** adds a `pbs` object to each PBS storage entry whose
+configuration names a server and a datastore (its server, port, datastore,
+namespace and the certificate fingerprint PVE pinned), so the dashboard can
+line a guest's backups up with that PBS report even when several clusters back
+up to the same PBS. A PBS whose certificate Proxmox VE trusts through a CA (no
+pinned fingerprint) cannot be lined up yet.
+
+## Proxmox Backup Server Monitoring
+
+Enabled per host from the fivenines dashboard (agent **1.21.0+**). The agent
+reads the Proxmox Backup Server REST API directly, which answers what the
+Proxmox VE backups view cannot: is the latest backup intact, is it encrypted,
+is the offsite copy still running, when will the datastore be full? It
+reports:
+
+- **Datastores**: usage, PBS's own estimated-full date, garbage-collection
+  status (a GC that keeps failing is a datastore that fills up),
+  deduplication counters and maintenance mode
+- **Backup groups**: every VM, container and host backed up to the PBS --
+  including bare-metal machines using `proxmox-backup-client`, which Proxmox VE
+  never sees. Per group: the newest *finished* backup, its size and encryption
+  mode, the result and date of its last verification, the newest backup known
+  to verify OK, and how many snapshots failed verification. A backup that is
+  still uploading is flagged, never counted as the latest. Only verifications
+  that ran on that datastore count: a sync copies each backup's verification
+  result from the source, and PBS's verify jobs then skip the copy by default
+  (their "skip verified" option), so an offsite copy PBS shows as verified can
+  read *never verified here* -- which it is. Clear "skip verified" (or set
+  "re-verify after") on the target's verify job to have it checked. A failed
+  verification of the datastore counts even when it was recorded under the
+  PBS's previous host name -- but on a sync target, each sync run re-pulls the
+  newest backup and puts the source's manifest back over it, erasing a local
+  verification of that one (failed included): enable "resync-corrupt" on the
+  sync job so a copy that failed verification is downloaded again.
+- **Jobs**: sync (pull and push -- your offsite copies), verify and prune
+  jobs, with their last run state
+
+### Setup: the agent on the PBS, with a read-only token
+
+Install the agent on the Proxmox Backup Server itself (the
+[standard Linux installation](#standard-installation-linux)). It then also
+monitors the PBS host (disks, SMART, ZFS), the agent only ever sends the API
+token to the PBS on the same machine, and each PBS is reported exactly once.
+The token secret itself is stored in your fivenines account and delivered to
+the agent in its configuration -- which is why it must be read-only. Create
+one on the PBS:
+
+```bash
+proxmox-backup-manager user create fivenines@pbs
+proxmox-backup-manager user generate-token fivenines@pbs monitoring
+# PBS intersects a token's privileges with its user's: grant BOTH.
+for id in 'fivenines@pbs' 'fivenines@pbs!monitoring'; do
+  proxmox-backup-manager acl update /datastore DatastoreAudit --auth-id "$id"
+  proxmox-backup-manager acl update /remote RemoteAudit --auth-id "$id"
+done
+```
+
+Then enter the token id (`fivenines@pbs!monitoring`), its secret and the
+certificate fingerprint (see [TLS](#tls) below) in the dashboard, with host
+`localhost`. `RemoteAudit` is only needed to see sync jobs; without it they are
+reported as unknown. Keep the ACLs propagating (the default): a grant on
+`/datastore` without propagation reaches no datastore at all. Keep this user
+dedicated to monitoring, and give neither it nor its token any other ACL
+entry below `/datastore` or `/remote`: in PBS a deeper entry REPLACES the
+inherited role at that path instead of adding to it, so any role there
+without the audit privilege -- `NoAccess`, but also a `DatastoreBackup` the
+user holds for backups on `/datastore/store1` -- leaves the token no
+privilege there, and PBS then hides `store1` from it without an error. The
+agent cannot tell a datastore, namespace or remote hidden that way from a
+deleted one.
+
+### A read-only token, enforced
+
+On every refresh the agent reads the token's effective privileges and
+**refuses any token holding more than `Datastore.Audit` and `Remote.Audit`**:
+`DatastoreReader` can restore -- read the full content of -- every backup,
+`DatastoreBackup`, `DatastorePowerUser` and `DatastoreAdmin` can write or prune
+them, and even the built-in `Audit` role carries `Sys.Audit`, which reads the
+PBS system journal. Such a token is reported as *over-privileged* and nothing
+is collected, so a token created "with every right, to make it work" is caught
+on the first tick instead of sitting in your monitoring configuration. A token
+that cannot audit any datastore is reported too: PBS answers an
+under-privileged token with empty lists rather than an error, and the agent
+will not report an empty PBS it simply cannot see. After an *authentication
+failed* (a revoked or mistyped token) the agent leaves the PBS alone for
+5 minutes, so it does not fill the PBS authentication log; a new secret is
+tried at once.
+
+A token restricted to one datastore or one namespace works, but PBS then hides
+the jobs defined outside that scope, so the dashboard shows those job lists as
+partial.
+
+### TLS
+
+PBS uses a self-signed certificate by default. **Pin its SHA-256
+fingerprint** -- shown by the PBS web UI (*Dashboard > Show Fingerprint*) or
+`proxmox-backup-manager cert info`, and the same one Proxmox VE asks for when
+you add the PBS storage. That is recommended on the PBS itself too: with
+verification off, whatever answers on the local port 8007 while the PBS proxy
+is stopped would receive the token. Turning `verify_ssl` off is accepted for
+`localhost` only, as a fallback. For a **remote** PBS the agent never sends the
+token over unverified TLS: either the certificate chains to a public CA
+(`verify_ssl` on; the agent's bundled CA list, not the operating system's, so
+an internal CA needs the fingerprint), or its fingerprint is pinned. A remote
+host with verification off and no fingerprint is refused before any request is
+made. When TLS fails -- for example after a pinned certificate is renewed --
+the dashboard shows the fingerprint that was presented (read with a bare TLS
+handshake, no token sent). It is **unverified**: whatever answered on that
+port presented it, so compare it with `proxmox-backup-manager cert info` on the
+PBS itself before pinning it. With verification off, `localhost` is dialled as
+`127.0.0.1`. Proxy environment variables are ignored.
+
+### Freshness and partial reads
+
+The datastore, group and job snapshot is refreshed every 5 minutes (listing
+every snapshot is the costliest call), but reachability is checked every
+minute, so a PBS that goes down is reported on the next tick. One collection
+works within a 20-second budget, which also shortens each request's timeouts,
+and is cut off at 30 seconds whatever blocks it (a host name that does not
+resolve, or whose addresses do not answer), which is then reported as a timeout
+until that collection returns (no second one starts meanwhile, even after a
+configuration change); the next refresh starts where this one was cut off, so
+a slow tail is not starved, and a datastore or namespace that alone outlasts
+the budget is moved to the back instead of blocking the others. A read the
+Proxmox Backup Server may still be working on after it timed out is not
+requested again blindly: a snapshot listing is retried later, but a
+namespace, group or usage read is held until the agent is reloaded -- with a
+datastore on a stale or broken mount, PBS never finishes that walk and each
+request holds one of its proxy threads for good. The dashboard shows what it
+covers as unknown meanwhile. Once the datastore is repaired, restart
+`proxmox-backup-proxy` on the PBS, then reload the agent
+(`sudo kill -HUP $(pgrep -f fivenines_agent)`). A first backup that is still uploading is never shown as the
+latest backup. Anything that could not be read -- a datastore in offline maintenance,
+a namespace whose group listing failed -- is reported per datastore and
+namespace, so the dashboard shows those backups as *unknown*, never as
+missing; a namespace whose snapshot listing timed out still shows its latest
+backups as PBS's group listing reports them, with their verification details
+unknown (on PBS before 4.0.17 that listing can name an older backup, or none,
+while an upload runs, so it is only a lower bound there).
 
 ## QEMU/KVM VM Monitoring
 

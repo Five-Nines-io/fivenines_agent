@@ -540,3 +540,30 @@ def test_resync_systemd_runtime_noop_on_non_systemd_host(mock_refresh):
     agent._resync_systemd_runtime()  # must not raise
 
     mock_refresh.assert_not_called()
+
+
+@patch("fivenines_agent.agent.print_capabilities_banner")
+@patch("fivenines_agent.agent.refresh_runtime_caches")
+@patch("fivenines_agent.agent.force_inventory_resend")
+@patch("fivenines_agent.agent.journal_policy")
+@patch("fivenines_agent.agent.reset_pbs_timeout_holds")
+def test_handle_sighup_refresh_releases_held_pbs_reads(
+    mock_reset, mock_policy, mock_force, mock_refresh, mock_banner
+):
+    """A PBS read held after it timed out (a namespace walk PBS may still be
+    running) is sent again only on SIGHUP: the operator's 'datastore
+    repaired' signal."""
+    from fivenines_agent.agent import refresh_permissions_event
+
+    agent = make_agent()
+    agent._systemd_force_resend = False
+    agent.permissions = MagicMock()
+    agent.static_data = {}
+    refresh_permissions_event.set()
+
+    try:
+        agent._handle_sighup_refresh()
+    finally:
+        refresh_permissions_event.clear()
+
+    mock_reset.assert_called_once_with()

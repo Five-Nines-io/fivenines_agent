@@ -1,0 +1,4227 @@
+{
+  "description": "Shared Proxmox Backup Server (PBS) contract fixture between fivenines-agent and fivenines-server. Source of truth: fivenines-agent tests/fixtures/pbs_contract_payload.json, asserted end-to-end by tests/test_pbs.py::test_contract_fixture_round_trip (only the HTTP transport is mocked: each scenario's recorded responses replay through the real collector). The server keeps a BYTE-IDENTICAL copy and posts each scenario's payload under data['pbs']; change the shape only in lockstep. Responses marked CAPTURED were recorded from a real PBS 4.2.0 on 2026-09-28 with the official proxmox-backup-client 4.2.6 producing the backups; SYNTHETIC ones are derived and say so. A scenario with `responses_base` replays that scenario's responses with its own `responses` on top.",
+  "agent_min_version": "1.21.0",
+  "_agent_min_version_note": "First agent release carrying the pbs collector. Purely config-driven: an older agent ignores the top-level 'pbs' key entirely (the key is absent from its payload), so the server may send it before the fleet upgrades.",
+  "config_contract": {
+    "_note": "config['pbs'] is a TOP-LEVEL key, never nested under config['proxmox'] (that dict is splatted into proxmox_metrics(**kwargs), where a new key would TypeError every older agent). It is splatted into pbs_metrics(**config['pbs']), which takes **_kwargs, so a key added later is ignored by this agent rather than breaking it.",
+    "host": "PBS API host. Default 'localhost': the agent installed on the PBS itself; null or '' also mean the default. A hostname or an IP literal only (no scheme, path, port or userinfo) -- anything else is a config_error. With verification off, the NAME localhost is dialled as 127.0.0.1 (a name resolves through NSS and, without an /etc/hosts entry, DNS).",
+    "port": "Default 8007; null or '' also mean the default.",
+    "token_id": "An API TOKEN id, 'user@realm!tokenname' (printable ASCII). A user/password login is not supported (a ticket login is a far wider credential).",
+    "token_secret": "The token secret (printable ASCII, no whitespace). Never part of any cache key, and removed from every error message before it is logged or shipped.",
+    "verify_ssl": "Verify the certificate against the bundled public CA set (requests' certifi bundle; the OS trust store and REQUESTS_CA_BUNDLE are NOT consulted). Default true; only an explicit false (false/0/'false'/'no'/'off') disables it. A certificate from an internal CA therefore needs `fingerprint`.",
+    "fingerprint": "SHA-256 certificate fingerprint to PIN instead (as shown by PBS: Dashboard > Show Fingerprint, or proxmox-backup-manager cert info), with or without colons, any case. The Proxmox-native way to trust PBS's default self-signed certificate. A pin names ONE certificate: after a renewal the tls_error envelope carries the new one in presented_fingerprint. When set, verify_ssl is irrelevant.",
+    "tls_policy": "The token is NEVER sent over unverified TLS to a non-loopback host: a remote host needs verify_ssl true or a fingerprint, else config_error before any request. verify_ssl false with no fingerprint is accepted for loopback only (localhost, 127.0.0.0/8, ::1); pinning is recommended there too. Proxy and netrc environment variables are ignored, and redirects are refused."
+  },
+  "privilege_contract": {
+    "_note": "Measured on PBS 4.2: a token's effective privileges are the INTERSECTION of its user's ACL and its own ACL, so BOTH need the grant. PBS HIDES what a token may not audit instead of refusing it (HTTP 200, empty list), which is why the agent reads /access/permissions ({path: {privilege: propagate}}) first.",
+    "setup": "proxmox-backup-manager user create fivenines@pbs; proxmox-backup-manager user generate-token fivenines@pbs monitoring; then for BOTH auth ids 'fivenines@pbs' and 'fivenines@pbs!monitoring': proxmox-backup-manager acl update /datastore DatastoreAudit --auth-id <id>; proxmox-backup-manager acl update /remote RemoteAudit --auth-id <id>",
+    "read_only_rule": "The token may hold Datastore.Audit and Remote.Audit and NOTHING else. Any other effective privilege -> over_privileged envelope, nothing collected: Datastore.Read (restore every backup), Datastore.Backup/Prune/Modify/Verify, Sys.Modify, Permissions.Modify, Remote.Read, ... and also Sys.Audit (it reads the PBS system journal and syslog) and Tape.Audit (unused).",
+    "measured_roles": "CAPTURED from GET /access/roles on PBS 4.2.0: DatastoreAudit = [Datastore.Audit]; RemoteAudit = [Remote.Audit]; Audit = [Sys.Audit, Datastore.Audit]; DatastoreReader = [Datastore.Audit, Datastore.Read, Datastore.Verify]; DatastoreBackup = [Datastore.Backup]; DatastorePowerUser = [Datastore.Backup, Datastore.Prune]. Only DatastoreAudit and RemoteAudit pass the read-only rule; a token given the built-in Audit role is refused.",
+    "propagation": "CAPTURED: a DatastoreAudit ACL on /datastore with propagate OFF shows as {'/datastore': {'Datastore.Audit': false}} and reaches no datastore (every listing is an empty 200). Only a PROPAGATED Datastore.Audit reaching /datastore counts as seeing every datastore (a grant on / is reported AT /datastore, inherited: PBS always evaluates /datastore and /remote, and omits a path only when the token has no privilege there -- so / with /datastore absent means an entry at /datastore hid every datastore, and reads no_datastore_access); a grant on /datastore/<store>[/<ns>] is a scoped token; neither -> no_datastore_access. A scoped token whose grants reach no existing datastore -> no_datastore_access too.",
+    "remote_audit": "Sync jobs are listed only with a PROPAGATED Remote.Audit reaching /remote (granted there or on /, which PBS reports at /remote, inherited). Without it sync_jobs is null plus a 'sync_jobs' error naming the privilege.",
+    "scoped_token": "Datastore.Audit granted below /datastore (one datastore or one namespace) is accepted, but PBS then hides every job defined outside that scope: each job list read under such a token carries a 'partial:' error under its own scope.",
+    "deeper_acls": "Verified in PBS source (pbs-config acl.rs): an ACL entry deeper in the tree REPLACES the roles inherited from above at that path, it does not add to them. So an entry below /datastore or /remote on the token or its user whose role lacks the audited privilege (Datastore.Audit, Remote.Audit under /remote) -- NoAccess, or e.g. a DatastoreBackup the user also holds for PVE backups -- leaves the token (token ACL intersected with user ACL) no privilege there, and PBS hides that datastore, namespace or remote without an error and without listing the path in /access/permissions. The setup therefore uses a DEDICATED user with no other ACL; the agent cannot detect a violation BELOW /datastore or /remote (an entry AT /datastore or /remote hiding a grant made on / is detected: no_datastore_access, or sync_jobs null)."
+  },
+  "envelope_contract": "data['pbs'] is never null. FAILURE: exactly {reachable, error_type, error_message}, plus presented_fingerprint when error_type is tls_error, and NO 'datastores' key -> the server ingests nothing and prunes nothing. SUCCESS: {reachable: true, scope, version, release, fingerprint, age_s, built_at, datastores, groups, sync_jobs, verify_jobs, prune_jobs, errors}. Branch on the presence of 'datastores' (or of 'error_type'). reachable is true whenever /version answered this tick, so a rebuild that fails later (a read timing out) is a slow or broken PBS, not an unreachable one.",
+  "error_types": {
+    "config_error": "Invalid host/port/token/fingerprint, or the TLS policy refused the target. reachable false; nothing was sent.",
+    "connection_refused": "Connection refused / DNS failure / no route. reachable false.",
+    "timeout": "Connect or read timeout, or the tick's 20s budget ran out (message 'skipped: pbs collection deadline exceeded'). reachable is true when /version answered this tick. A collection still running after the hard 30s bound (resolving the host name, connecting to its addresses, or a PBS that stopped answering) is abandoned: error_type timeout, reachable true only if its /version had answered; every later tick reports the same timeout, reachable included, until it returns, whatever the config says meanwhile (no second collection starts).",
+    "tls_error": "Certificate verification failed or the pinned fingerprint did not match. reachable false; the token was not sent. presented_fingerprint: the SHA-256 of the certificate WHATEVER answered on host:port presented, from a bare TLS handshake (no request, no token), or null when that handshake failed too. It is UNVERIFIED by construction -- a man in the middle, or a local listener while the PBS proxy is down, presents its own -- so it is a hint to compare with `proxmox-backup-manager cert info` on the PBS console, never a value to trust or apply automatically.",
+    "auth_failed": "HTTP 401 (wrong, disabled or deleted token). reachable true. The agent then leaves the PBS alone for 300s (each attempt is an authentication failure in the PBS auth log) unless the secret changes, and keeps reporting this envelope meanwhile.",
+    "http_error": "Any other failure of a read the whole block depends on (/version, /access/permissions, /admin/datastore): a non-200, a malformed or oversized body. reachable true if PBS answered. Also a block too large to ship -- over 8 MB of JSON or 1 MB gzipped; it is re-emitted every tick, and a real block at every cap is ~3 MB of JSON, ~0.1 MB gzipped, so only a broken PBS gets there; that envelope is cached for the TTL like a block -- and the catch-all for anything unexpected, such as a collection whose thread could not start (reachable false).",
+    "over_privileged": "The token holds a privilege beyond Datastore.Audit and Remote.Audit. reachable true.",
+    "no_datastore_access": "The token can audit no datastore (no grant, or one without propagation, or a scoped grant reaching no existing datastore). reachable true."
+  },
+  "freshness": "The block (scope, datastores, groups, jobs, errors) is rebuilt at most once per 300s and re-emitted, identical, with age_s = seconds since it was built (anchor freshness as received_at - age_s) and built_at = the agent's epoch seconds when it was built: every re-emission carries the SAME built_at and a rebuild a new one, so built_at is the build's identity (a block is re-emitted ~5 times per TTL; count builds, never payloads). /version, fingerprint and reachability are read EVERY tick: a PBS that goes down produces the failure envelope on the next tick, not after the TTL. A failed build is not cached (a block too large to ship is: its envelope is re-emitted for the TTL). One tick of this collector (/version plus a rebuild) works within a 20s budget that also clamps every request's timeouts, so it stays NEAR that bound (what no request timeout covers -- resolving the host name, connecting to each of its addresses -- is cut by a hard 30s bound); the per-datastore reads get at most half of it. The next build starts its per-datastore and per-namespace reads at the first one this build cut (the budget or a cap ran out inside it, or before it was started; a read that merely failed is not a cut) -- or past it, when it was already the first one of the build. The start is positional: a datastore or namespace added or removed in between shifts it for one build.",
+  "field_contract": {
+    "version / release": "/version verbatim (e.g. '4.2' / '0'). PBS spells its version as version = MAJOR.MINOR and release = the PATCH level: PBS 4.0.17 answers version '4.0', release '17', so the full version is version + '.' + release -- NOT Proxmox VE's convention (PVE ships version '8.2.4'). Every version gate in this contract (4.0.17, 4.1.6, 4.1.7) is on the full version.",
+    "fingerprint": "SHA-256 of the certificate the PBS presented on this tick's connection, lowercase colon form; the pinned fingerprint when the socket could not be read (e.g. a reverse proxy answering Connection: close); null when neither is known. The join key with the PVE side (see pve_join_contract).",
+    "built_at": "Integer epoch seconds (the agent's clock) when this block was built. Every re-emission of a cached block carries the same value and a rebuild a new one: it is the build's identity, which the pruning rule counts -- compare it for EQUALITY only (distinct built_at values, never payloads). It is not an ordering key: the agent's clock can step back (NTP, a manual fix); order payloads by queue order or received_at - age_s.",
+    "datastores[]": "One per datastore the token can audit, sorted by store: store, backend_type ('filesystem' | 's3' ...; from the listing on PBS >= 4.1.7, the usage status on 4.1.6, else /config/datastore, where no backend property means 'filesystem'; null = unknown, and then the usage fields are null too), mount_status ('nonremovable' | 'mounted' | 'notmounted'), maintenance_mode ('read-only' | 'offline' | ... | null) + maintenance_message (capped 200), total/used/avail (bytes; NULL when unknown, never 0; from /status/datastore-usage, or -- when that read fails as a whole, which PBS does when ONE datastore's statfs errors, and the token is full-scope -- from each datastore's own status, then without estimated_full_date; always NULL for a non-filesystem backend such as 's3', where PBS measures its local CACHE disk), estimated_full_date (epoch, PBS's own forecast verbatim: null until it has history, and always null for a non-filesystem backend, whose forecast is of the local cache disk; 0 is its 'no fill expected' sentinel for flat usage, and also what an unforecastable history gives; a date in the past means usage is shrinking; a nearly flat datastore can give a date far past any calendar, up to 9223372036854775807 -- read anything beyond a sane horizon as 'not in the foreseeable future', never as a timestamp to store as is), gc, namespaces, unread_namespaces.",
+    "datastores[].gc": "{schedule, next_run, last_run_starttime, last_run_state (verbatim: 'OK', 'WARNINGS: n' or an error), last_run_endtime, duration, index_file_count, index_data_bytes, disk_bytes, disk_chunks, pending_bytes, pending_chunks, removed_bytes, removed_chunks, removed_bad, still_bad}, or null when unread. PBS keeps a GC's status only when the run SUCCEEDS: last_run_starttime (from its task id) and the counters describe the last successful GC; last_run_state and last_run_endtime the last run, whatever its outcome. So: all null = no successful GC known (it may have run and failed); a start time with a null state = a PBS older than ~3.2 (which reports no state) or a GC running now; a failed state next to an older start time = the last run failed, and duration then spans from that older start. Dedup factor = index_data_bytes / disk_bytes.",
+    "datastores[].namespaces": "The namespaces the token can see, sorted ('' = root). NULL when the namespace set is unknown: its listing failed, a row of it could not be parsed, or it did not fit the namespace cap -- a block-wide total (1000) spent in rotation order, so which datastore goes null moves between builds.",
+    "datastores[].unread_namespaces": "The namespaces of `namespaces` whose GROUPS are unknown this build: their /groups read failed or is held, a group row could not be parsed, their /snapshots did not come back as a list (an HTTP error, a timeout, a reset, a budget skip, a backoff or an unreadable body: PBS leaves out of /groups a group whose snapshots it failed to read, and only /snapshots fails on it), the group cap trimmed or never reached them, or the budget ran out first. NULL whenever namespaces is null. A build where a namespace is listed here resets its groups' absence count (pruning_contract).",
+    "groups[]": "One per backup group (store, ns, type 'vm'|'ct'|'host', id), sorted. last_backup: the newest FINISHED backup (/groups last-backup, discarded when /groups names a snapshot with no manifest -- PBS does so for a group whose only snapshot is still uploading; a snapshot still uploading can never be it; null when the group has none -- BUT when in_progress is null (the snapshot listing was not read) on PBS < 4.0.17, last_backup is a LOWER BOUND: that PBS's /groups folds over an unsorted listing, so while an upload runs it can name an older backup, or the upload itself (discarded -> null), and must never read as 'no backup' or 'overdue'; when the snapshot listing was read, its newest finished snapshot wins if /groups gives none OR an older one -- PBS < 4.0.17 folds last-backup over an unsorted listing; before 4.0.17 a group with no snapshot at all is absent from /groups rather than listed with last-backup 0). count: PBS backup-count verbatim (it includes a snapshot still uploading). in_progress: a snapshot newer than last_backup has no manifest yet; in_progress_since: that snapshot's BACKUP time (null unless in_progress), not when writing started -- a long backup keeps its start time, a pull sync writes the SOURCE's backup time (days old while the sync is live), and PBS keeps an upload orphaned by a crash, so age alone cannot tell a dead upload from a live one (correlate with a running job on that store: a job row with last_run_starttime set and last_run_state null) -- and in_progress NULL means every snapshot detail of the row is unknown (the snapshot listing was not read, or it did not show last_backup finished). size: bytes of the last_backup snapshot. crypt_mode: 'encrypt' | 'sign-only' | 'none' | 'mixed' (from its archives; the manifest is ignored). protected. Every verification field counts ONLY verifications that ran on THIS datastore (an 'ok' one also on a node of THIS PBS, see below): a pull sync copies each snapshot's manifest verbatim, verification state included, so a synced copy carries its SOURCE's verification (another datastore, often another PBS), which PBS's verify jobs then skip by default (ignore-verified); the agent checks the verify task id (its worker id starts with the datastore, its node must be one this PBS's own GC/job task ids carry, when any is known -- else only the datastore name is checked). The node check applies to an 'ok' only: a 'failed' verification of this datastore counts whatever node ran it (a PBS renamed or reinstalled keeps its own past verifications under the old node name; a copied failure is at worst a false alarm, a hidden real one is missed corruption), and after such a rename an 'ok' reads never-verified-here until PBS verifies the snapshot again. On a pull-sync TARGET, every sync run re-pulls the newest snapshot and renames the source's manifest over it, erasing a local verification of that snapshot, failed included: verify_failed_count dropping (1 -> 0) on a synced group is NOT proof of a repair (the sync job's resync-corrupt option re-downloads a snapshot that failed verification). A heuristic, not proof: nodes compare by NAME, and the sync source writes the copied task id, so a source PBS with the same node and datastore name is indistinguishable. verify_state: 'ok' | 'failed' | null (never verified HERE, when in_progress is not null) of the last_backup snapshot; verify_time: when that verification ran (from its task id). last_verified_ok: backup time of the newest snapshot that verified OK here -- the newest restore point known to be intact on this datastore. verify_failed_count: snapshots in the group whose last local verification failed.",
+    "sync_jobs[]": "Sorted by (store, id). id, store, ns, max_depth, schedule, next_run, last_run_starttime, last_run_state (verbatim), last_run_endtime, remote (null = a local sync), remote_store, remote_ns, direction ('pull' | 'push'). The roles swap with direction: a PULL job copies remote/remote_store/remote_ns INTO store/ns on this PBS (store is the target); a PUSH job copies store/ns FROM this PBS to remote/remote_store/remote_ns (store is the source). Push jobs (PBS >= 3.3) are included. max_depth null = full recursion (0 = this namespace only), in all three job lists. For every job list: last_run_starttime comes from the last run's task id; a job RUNNING now has it set with a null state and end time (a sync hung for days shows its start); all three null = never ran, or its state is unknown.",
+    "verify_jobs[]": "Sorted by (store, id). id, store, ns, max_depth, schedule, next_run, last_run_starttime, last_run_state, last_run_endtime, outdated_after (days), ignore_verified (absent from PBS's config = true, its default).",
+    "prune_jobs[]": "Sorted by (store, id). id, store, ns, max_depth, schedule, next_run, last_run_starttime, last_run_state, last_run_endtime, disabled.",
+    "never_shipped": "Owners, comments/notes, file lists, encryption-key fingerprints, task ids, the token secret. Every shipped string is UTF-8-sanitized, NUL-free and capped (500 chars; maintenance_message 200); error messages are also redacted.",
+    "scope": "'full' when the token audits every datastore (a propagated Datastore.Audit reaching /datastore) and no datastore was trimmed by the cap -- except what a deeper ACL entry hides, which no token can see (privilege_contract.deeper_acls), hence the two-absences rule in pruning_contract; else 'partial': a datastore or namespace ABSENT from this block may exist and simply be invisible to the token."
+  },
+  "pruning_contract": "What may be pruned is carried OUTSIDE errors[] (which is capped) -- except a job list's completeness: a list that was read but may be partial is flagged by a 'partial:' errors[] entry under its own scope, appended before any per-datastore or per-namespace entry so the cap never drops it. An unparseable row makes its scope unknown, never smaller -- including a datastore, namespace or group whose name is outside PBS's own schema (a datastore or namespace level is a safe id [A-Za-z0-9_][A-Za-z0-9._-]{0,254}, a namespace at most 500 characters -- the wire cap, so no two ship alike -- and a group (vm|ct|host)/safe id): a real PBS never sends one. A group row is authoritative for its (store, ns) when that datastore's namespaces is not null and ns is listed in namespaces but NOT in unread_namespaces -- groups absent there are gone. A namespace absent from a non-null namespaces list is gone with its groups, and a datastore absent from datastores is gone -- but ONLY when scope is 'full'; under 'partial' an absent datastore or namespace is not visible to this token, never gone. A datastore with namespaces null, or a namespace in unread_namespaces: nothing may be pruned there (rows shipped are still current). PBS leaves a path where the token holds NO privilege out of /access/permissions, and an ACL entry below /datastore or /remote on the monitoring token or its user creates one when its role lacks the audited privilege (a deeper entry REPLACES the inherited role, so a NoAccess, or a DatastoreBackup the user also holds, leaves the token nothing there): that datastore, namespace or remote's sync jobs then vanish from a block that still reads scope 'full'. The setup forbids such entries, but the agent cannot detect one. PBS ITSELF leaves out of its 200 answers a group it failed to read and a namespace whose iteration failed. For a group whose snapshot directory cannot be read, /snapshots fails (HTTP 400, once its scan reaches that group) and the agent marks the namespace unread -- and since a /snapshots that timed out, or did not come back as a list, gives no such signal, it marks the namespace unread too. A group whose OWNER file cannot be read is left out of /groups AND /snapshots with 200 (PBS only logs a warning): invisible to the agent, for as long as the file stays unreadable. Absence is strong evidence, not proof: prune a datastore, namespace or group only after it has been absent from TWO consecutive successful BUILDS where its scope was authoritative -- two distinct built_at values; a re-emission of the same block (same built_at) is not a second absence, and a build where that namespace is unread (or its datastore's namespaces null, or the scope partial) RESETS the count -- and treat one that vanished while its PBS stayed reachable as worth surfacing, not only as deleted.",
+  "errors_contract": {
+    "_note": "errors[] = {scope, store, ns, message}, capped at 500 entries: diagnostic detail for what was not read. Entries are appended in read order and the cap drops the TAIL, so the block-level entries (datastores cap, job lists) always survive it. Pruning depends on errors[] only for the job lists' 'partial:' flags (see pruning_contract). Every message has the API token secret removed, including ones that quote PBS data.",
+    "usage": "store null = /status/datastore-usage failed (every total/used/avail unknown unless the per-datastore fallback read them); store set = PBS reported that datastore unavailable (e.g. offline maintenance), or its own status read failed.",
+    "gc": "That datastore's gc is unknown.",
+    "namespaces": "That datastore's namespace listing failed, or a row of it could not be parsed (namespaces null).",
+    "groups": "(store, ns) could not be listed, or N of its rows could not be parsed; or, with ns null and a message counting them, namespaces skipped past the budget (all of them in unread_namespaces).",
+    "snapshots": "(store, ns) groups shipped, but some or all of their snapshot details are unknown (in_progress null on those rows): the read failed or was skipped, a row of it could not be parsed, or a last_backup was not found finished in it. The namespace is then in unread_namespaces too, whatever the failure: PBS omits from /groups a group whose snapshots it failed to read, and only /snapshots fails on it (HTTP 400, like every handler error) -- once its scan reaches that group, so a timeout, a reset, a budget skip, a backoff or a body that is not a list may hide it just the same. Only a snapshot list proves the scan ended.",
+    "sync_jobs / verify_jobs / prune_jobs": "The list is null (unread), or -- message starting 'partial:' -- read but possibly missing jobs: outside the token's scope, past the 200-job cap, or unparseable rows skipped.",
+    "cap": "An array was trimmed: datastores (100; scope is then 'partial'), namespaces (a block-wide 1000; that datastore's namespaces is then null), groups (a block-wide 5000; the namespaces trimmed or not reached are in unread_namespaces, with ns null and a count when not reached), errors (500).",
+    "deadline": "A read skipped because its budget was spent (the tick's 20s; for the per-datastore reads -- the usage fallback, gc, namespaces -- at most half of what was left of it) carries the message 'skipped: pbs collection deadline exceeded' under that read's own scope.",
+    "backoff": "A read that TIMED OUT after it was sent (a read timeout, given at least 5s; a connect timeout never reached PBS) may still be running in PBS: its namespace walk never ends while a datastore's ns directory is unreadable (a stale NFS mount, EACCES, EIO), holding one PBS proxy thread for good per request -- list_namespaces does it, and so does /status/datastore-usage under a scoped token, which walks every datastore the token cannot audit (both reproduced on PBS 4.2) -- and the proxy has one such thread per core. So the namespace listing, the groups listing, the usage status and each datastore's own status are HELD after such a timeout: not requested again until the agent is reloaded (SIGHUP) or restarted, with the message 'skipped: this read timed out and PBS may still be running it (...): not sent again until the agent is reloaded (SIGHUP) -- repair the datastore and restart proxmox-backup-proxy first'. A snapshot listing (a bounded scan, off the proxy's core threads) is only backed off: retried after one rebuild, then twice as long per further timeout, at most 6h, with the message 'skipped: this read timed out before and PBS may still be running it; retried later'. Either way the read is unknown meanwhile, exactly like a failed read: namespaces null, the namespace in unread_namespaces, its snapshot details null, or usage null (a full-scope token then reads each datastore's own status).",
+    "datastore_config": "/config/datastore could not be read: it is read only when neither the datastore listing (PBS >= 4.1.7) nor the usage status (4.1.6) names a datastore's backend. Those datastores ship backend_type null and total/used/avail/estimated_full_date null (an S3 datastore's usage measures its local cache disk, so unknown is withheld)."
+  },
+  "pve_join_contract": "Agent 1.21.0+ also adds a 'pbs' object to data['proxmox'].storage rows of type 'pbs' (omitted, never null, otherwise, like 'pool'): {server, port (null = 8007), datastore, namespace ('' = root), fingerprint (lowercase, null when PVE trusts a CA-signed certificate)}. A PVE guest's backups live in the PBS group (datastore, namespace, type, vmid) of the matching PBS -- vmids alone collide when two clusters share one PBS. PBS identity: the certificate fingerprint (same spelling on both sides) plus the datastore -- join a PVE storage to the ONE reporting PBS whose fingerprint matches and which lists that datastore. A fingerprint alone is not unique (PBS VMs cloned from one template share their certificate): when two reporting PBS share it, the host breaks the tie only where it is known -- a REMOTE reporter's config['pbs']['host']:port against PVE's server:port; a loopback reporter (the recommended setup) ships no host identity -- and otherwise nothing joins. A PVE storage with no fingerprint (PVE trusts a CA-signed PBS certificate) cannot be joined yet. A guest's group may be called absent ONLY where pruning_contract makes its (datastore, namespace) authoritative in that report -- scope full, namespaces non-null, the namespace listed and not in unread_namespaces; anywhere else (a 'partial' report, namespaces null, an unread namespace) the join is unknown, never 'no backups'.",
+  "scenarios": {
+    "healthy": {
+      "description": "CAPTURED from a real PBS 4.2.0 (token fivenines@pbs!monitoring with DatastoreAudit on /datastore + RemoteAudit on /remote, both propagated: the documented minimal grant), agent installed on the PBS itself (localhost, verify_ssl false: loopback). Two datastores, three namespaces each ('', 'clusterA', 'clusterA/sub'), all read (unread_namespaces []); store2 is a sync target of store1 (its snapshots carry store1's verification, copied by the sync: never verified on store2, so its groups ship verify_state/last_verified_ok null). Shows: an upload IN PROGRESS for store1 host/web01 (its snapshot listed with files [] and no size -> in_progress true, count 4, last_backup still the last FINISHED backup); a FAILED verification (store1 clusterA vm/100: a chunk was corrupted on purpose -> verify_state failed, last_verified_ok null); a newer backup never verified (store1 clusterA vm/101: verify_state null with in_progress false, last_verified_ok on the older one); client-side ENCRYPTED backups (host/db01 on both datastores and store2's vm/101 -> crypt_mode encrypt; store1 clusterA vm/101's newest backup is unencrypted -> none); a group whose only sync failed (store2 clusterA vm/100: PBS lists last-backup 0 / backup-count 0 -> last_backup null, never 1970); a pull sync job failing on a dead remote, a pull sync job failing on the corrupt chunk, a push sync job never run; GC finished WITH WARNINGS on store1 and never run on store2 (last_run_starttime null). /status/datastore-usage 'history' arrays are truncated to 3 entries (the collector does not read them).",
+      "config": {
+        "pbs": {
+          "host": "localhost",
+          "port": 8007,
+          "token_id": "fivenines@pbs!monitoring",
+          "token_secret": "00000000-0000-0000-0000-000000000000",
+          "verify_ssl": false,
+          "fingerprint": null
+        }
+      },
+      "peer_fingerprint": "b7:24:5c:7a:78:c1:25:6c:0d:a9:ff:4a:6c:30:2e:10:03:ce:82:2c:00:d7:e9:82:1e:fc:00:93:f4:de:85:4f",
+      "responses": {
+        "/version": {
+          "status": 200,
+          "json": {
+            "data": {
+              "release": "0",
+              "repoid": "51422cf876826ca6f8dde138e062e61ea4ffe8a8",
+              "version": "4.2"
+            }
+          }
+        },
+        "/access/permissions": {
+          "status": 200,
+          "json": {
+            "data": {
+              "/datastore": {
+                "Datastore.Audit": true
+              },
+              "/datastore/store1": {
+                "Datastore.Audit": true
+              },
+              "/datastore/store1/clusterA": {
+                "Datastore.Audit": true
+              },
+              "/remote": {
+                "Remote.Audit": true
+              }
+            }
+          }
+        },
+        "/admin/datastore": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backend-type": "filesystem",
+                "comment": null,
+                "mount-status": "nonremovable",
+                "store": "store2"
+              },
+              {
+                "backend-type": "filesystem",
+                "comment": null,
+                "mount-status": "nonremovable",
+                "store": "store1"
+              }
+            ]
+          }
+        },
+        "/status/datastore-usage": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "avail": 28239130624,
+                "backend-type": "filesystem",
+                "gc-status": {
+                  "cache-stats": {
+                    "hits": 7,
+                    "misses": 29
+                  },
+                  "disk-bytes": 69539959,
+                  "disk-chunks": 29,
+                  "index-data-bytes": 78002299,
+                  "index-file-count": 13,
+                  "pending-bytes": 0,
+                  "pending-chunks": 0,
+                  "removed-bad": 0,
+                  "removed-bytes": 0,
+                  "removed-chunks": 0,
+                  "still-bad": 0,
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:0000000A:6ABA2CCA:garbage_collection:store1:root@pam:"
+                },
+                "history": [
+                  null,
+                  null,
+                  null
+                ],
+                "history-delta": 1800,
+                "history-start": 1787995033,
+                "mount-status": "nonremovable",
+                "store": "store1",
+                "total": 62671097856,
+                "used": 31215251456
+              },
+              {
+                "avail": 28239130624,
+                "backend-type": "filesystem",
+                "gc-status": {
+                  "disk-bytes": 0,
+                  "disk-chunks": 0,
+                  "index-data-bytes": 0,
+                  "index-file-count": 0,
+                  "pending-bytes": 0,
+                  "pending-chunks": 0,
+                  "removed-bad": 0,
+                  "removed-bytes": 0,
+                  "removed-chunks": 0,
+                  "still-bad": 0,
+                  "upid": null
+                },
+                "history": [
+                  null,
+                  null,
+                  null
+                ],
+                "history-delta": 1800,
+                "history-start": 1787995033,
+                "mount-status": "nonremovable",
+                "store": "store2",
+                "total": 62671097856,
+                "used": 31215251456
+              }
+            ]
+          }
+        },
+        "/admin/sync?sync-direction=all": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "id": "pushjob",
+                "next-run": 1790640000,
+                "remote": "selfremote",
+                "remote-store": "store2",
+                "schedule": "daily",
+                "store": "store1",
+                "sync-direction": "push"
+              },
+              {
+                "id": "sjob1",
+                "last-run-endtime": 1790586081,
+                "last-run-state": "sync failed with some errors.",
+                "last-run-upid": "UPID:541a750a1e0c:00000025:000023D8:0000000D:6ABA2CE1:syncjob:selfremote\\x3astore1\\x3astore2\\x3a\\x3asjob1:root@pam:",
+                "next-run": 1790589600,
+                "remote": "selfremote",
+                "remote-store": "store1",
+                "schedule": "hourly",
+                "store": "store2"
+              },
+              {
+                "id": "sjob-dead",
+                "last-run-endtime": 1790586089,
+                "last-run-state": "client error (Connect)",
+                "last-run-upid": "UPID:541a750a1e0c:00000025:000023D8:00000015:6ABA2CE2:syncjob:deadremote\\x3astore1\\x3astore2\\x3a\\x3asjob\\x2ddead:root@pam:",
+                "next-run": 1790589600,
+                "remote": "deadremote",
+                "remote-store": "store1",
+                "schedule": "hourly",
+                "store": "store2"
+              }
+            ]
+          }
+        },
+        "/admin/verify": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "id": "vjob1",
+                "ignore-verified": true,
+                "last-run-endtime": 1790586079,
+                "last-run-state": "OK",
+                "last-run-upid": "UPID:541a750a1e0c:00000025:000023D8:0000000B:6ABA2CDF:verificationjob:store1\\x3avjob1:root@pam:",
+                "next-run": 1790640000,
+                "outdated-after": 30,
+                "schedule": "daily",
+                "store": "store1"
+              }
+            ]
+          }
+        },
+        "/admin/prune": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "id": "pjob1",
+                "keep-last": 5,
+                "last-run-endtime": 1790586080,
+                "last-run-state": "OK",
+                "last-run-upid": "UPID:541a750a1e0c:00000025:000023D8:0000000C:6ABA2CE0:prunejob:store1:root@pam:",
+                "next-run": 1790640000,
+                "schedule": "daily",
+                "store": "store1"
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store1/gc": {
+          "status": 200,
+          "json": {
+            "data": {
+              "cache-stats": {
+                "hits": 7,
+                "misses": 29
+              },
+              "disk-bytes": 69539959,
+              "disk-chunks": 29,
+              "duration": 2,
+              "index-data-bytes": 78002299,
+              "index-file-count": 13,
+              "last-run-endtime": 1790586060,
+              "last-run-state": "WARNINGS: 1",
+              "next-run": 1790640000,
+              "pending-bytes": 0,
+              "pending-chunks": 0,
+              "removed-bad": 0,
+              "removed-bytes": 0,
+              "removed-chunks": 0,
+              "schedule": "daily",
+              "still-bad": 0,
+              "store": "store1",
+              "upid": "UPID:541a750a1e0c:00000025:000023D8:0000000A:6ABA2CCA:garbage_collection:store1:root@pam:"
+            }
+          }
+        },
+        "/admin/datastore/store1/namespace": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "ns": ""
+              },
+              {
+                "ns": "clusterA"
+              },
+              {
+                "ns": "clusterA/sub"
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store1/groups": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-count": 1,
+                "backup-id": "db01",
+                "backup-type": "host",
+                "files": [
+                  "root.pxar.didx",
+                  "index.json.blob",
+                  "catalog.pcat1.didx"
+                ],
+                "last-backup": 1790585927,
+                "owner": "backupuser@pbs"
+              },
+              {
+                "backup-count": 4,
+                "backup-id": "web01",
+                "backup-type": "host",
+                "files": [
+                  "root.pxar.didx",
+                  "index.json.blob",
+                  "catalog.pcat1.didx"
+                ],
+                "last-backup": 1790585958,
+                "owner": "backupuser@pbs"
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store1/snapshots": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-type": "host",
+                "backup-id": "db01",
+                "backup-time": 1790585927,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "fingerprint": "03:7e:74:e5:1e:85:ff:c0:09:60:49:a0:56:08:86:d9:61:1c:cc:dc:d8:1b:c7:ac:8f:7a:04:ab:1a:31:dd:03",
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "encrypt",
+                    "size": 3000343
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "encrypt",
+                    "size": 66
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "sign-only",
+                    "size": 560
+                  }
+                ],
+                "size": 3000969,
+                "owner": "backupuser@pbs",
+                "protected": false
+              },
+              {
+                "backup-type": "host",
+                "backup-id": "web01",
+                "backup-time": 1790585924,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "none",
+                    "size": 3000338
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "none",
+                    "size": 66
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 451
+                  }
+                ],
+                "size": 3000855,
+                "owner": "backupuser@pbs",
+                "protected": false
+              },
+              {
+                "backup-type": "host",
+                "backup-id": "web01",
+                "backup-time": 1790587027,
+                "files": [],
+                "owner": "backupuser@pbs",
+                "protected": false
+              },
+              {
+                "backup-type": "host",
+                "backup-id": "web01",
+                "backup-time": 1790585958,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "none",
+                    "size": 60000210
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "none",
+                    "size": 49
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 450
+                  }
+                ],
+                "size": 60000709,
+                "owner": "backupuser@pbs",
+                "protected": false
+              },
+              {
+                "backup-type": "host",
+                "backup-id": "web01",
+                "backup-time": 1790585926,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "none",
+                    "size": 3000343
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "none",
+                    "size": 66
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 452
+                  }
+                ],
+                "size": 3000861,
+                "owner": "backupuser@pbs",
+                "protected": false
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store1/groups?ns=clusterA": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-count": 1,
+                "backup-id": "100",
+                "backup-type": "vm",
+                "files": [
+                  "index.json.blob",
+                  "drive-scsi0.img.fidx"
+                ],
+                "last-backup": 1790585935,
+                "owner": "backupuser@pbs"
+              },
+              {
+                "backup-count": 2,
+                "backup-id": "101",
+                "backup-type": "vm",
+                "files": [
+                  "root.pxar.didx",
+                  "index.json.blob",
+                  "catalog.pcat1.didx"
+                ],
+                "last-backup": 1790586948,
+                "owner": "backupuser@pbs"
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store1/snapshots?ns=clusterA": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-type": "vm",
+                "backup-id": "100",
+                "backup-time": 1790585935,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "failed"
+                },
+                "files": [
+                  {
+                    "filename": "drive-scsi0.img.fidx",
+                    "crypt-mode": "none",
+                    "size": 3000000
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 389
+                  }
+                ],
+                "size": 3000389,
+                "owner": "backupuser@pbs",
+                "protected": false
+              },
+              {
+                "backup-type": "vm",
+                "backup-id": "101",
+                "backup-time": 1790586948,
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "none",
+                    "size": 60000210
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "none",
+                    "size": 49
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 370
+                  }
+                ],
+                "size": 60000629,
+                "owner": "backupuser@pbs",
+                "protected": false
+              },
+              {
+                "backup-type": "vm",
+                "backup-id": "101",
+                "backup-time": 1790585936,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "fingerprint": "03:7e:74:e5:1e:85:ff:c0:09:60:49:a0:56:08:86:d9:61:1c:cc:dc:d8:1b:c7:ac:8f:7a:04:ab:1a:31:dd:03",
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "encrypt",
+                    "size": 3000343
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "encrypt",
+                    "size": 66
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "sign-only",
+                    "size": 559
+                  }
+                ],
+                "size": 3000968,
+                "owner": "backupuser@pbs",
+                "protected": false
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store1/groups?ns=clusterA/sub": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-count": 1,
+                "backup-id": "200",
+                "backup-type": "ct",
+                "files": [
+                  "root.pxar.didx",
+                  "index.json.blob",
+                  "catalog.pcat1.didx"
+                ],
+                "last-backup": 1790585935,
+                "owner": "backupuser@pbs"
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store1/snapshots?ns=clusterA/sub": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-type": "ct",
+                "backup-id": "200",
+                "backup-time": 1790585935,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "none",
+                    "size": 3000343
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "none",
+                    "size": 66
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 446
+                  }
+                ],
+                "size": 3000855,
+                "owner": "backupuser@pbs",
+                "protected": false
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store2/gc": {
+          "status": 200,
+          "json": {
+            "data": {
+              "disk-bytes": 0,
+              "disk-chunks": 0,
+              "index-data-bytes": 0,
+              "index-file-count": 0,
+              "pending-bytes": 0,
+              "pending-chunks": 0,
+              "removed-bad": 0,
+              "removed-bytes": 0,
+              "removed-chunks": 0,
+              "still-bad": 0,
+              "store": "store2",
+              "upid": null
+            }
+          }
+        },
+        "/admin/datastore/store2/namespace": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "ns": ""
+              },
+              {
+                "ns": "clusterA"
+              },
+              {
+                "ns": "clusterA/sub"
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store2/groups": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-count": 1,
+                "backup-id": "db01",
+                "backup-type": "host",
+                "files": [
+                  "root.pxar.didx",
+                  "index.json.blob",
+                  "catalog.pcat1.didx"
+                ],
+                "last-backup": 1790585927,
+                "owner": "root@pam"
+              },
+              {
+                "backup-count": 3,
+                "backup-id": "web01",
+                "backup-type": "host",
+                "files": [
+                  "root.pxar.didx",
+                  "index.json.blob",
+                  "catalog.pcat1.didx"
+                ],
+                "last-backup": 1790585958,
+                "owner": "root@pam"
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store2/snapshots": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-type": "host",
+                "backup-id": "db01",
+                "backup-time": 1790585927,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "fingerprint": "03:7e:74:e5:1e:85:ff:c0:09:60:49:a0:56:08:86:d9:61:1c:cc:dc:d8:1b:c7:ac:8f:7a:04:ab:1a:31:dd:03",
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "encrypt",
+                    "size": 3000343
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "encrypt",
+                    "size": 66
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "sign-only",
+                    "size": 560
+                  }
+                ],
+                "size": 3000969,
+                "owner": "root@pam",
+                "protected": false
+              },
+              {
+                "backup-type": "host",
+                "backup-id": "web01",
+                "backup-time": 1790585924,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "none",
+                    "size": 3000338
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "none",
+                    "size": 66
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 451
+                  }
+                ],
+                "size": 3000855,
+                "owner": "root@pam",
+                "protected": false
+              },
+              {
+                "backup-type": "host",
+                "backup-id": "web01",
+                "backup-time": 1790585958,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "none",
+                    "size": 60000210
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "none",
+                    "size": 49
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 450
+                  }
+                ],
+                "size": 60000709,
+                "owner": "root@pam",
+                "protected": false
+              },
+              {
+                "backup-type": "host",
+                "backup-id": "web01",
+                "backup-time": 1790585926,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "none",
+                    "size": 3000343
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "none",
+                    "size": 66
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 452
+                  }
+                ],
+                "size": 3000861,
+                "owner": "root@pam",
+                "protected": false
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store2/groups?ns=clusterA": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-count": 0,
+                "backup-id": "100",
+                "backup-type": "vm",
+                "files": [],
+                "last-backup": 0,
+                "owner": "root@pam"
+              },
+              {
+                "backup-count": 1,
+                "backup-id": "101",
+                "backup-type": "vm",
+                "files": [
+                  "root.pxar.didx",
+                  "index.json.blob",
+                  "catalog.pcat1.didx"
+                ],
+                "last-backup": 1790585936,
+                "owner": "root@pam"
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store2/snapshots?ns=clusterA": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-type": "vm",
+                "backup-id": "101",
+                "backup-time": 1790585936,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "fingerprint": "03:7e:74:e5:1e:85:ff:c0:09:60:49:a0:56:08:86:d9:61:1c:cc:dc:d8:1b:c7:ac:8f:7a:04:ab:1a:31:dd:03",
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "encrypt",
+                    "size": 3000343
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "encrypt",
+                    "size": 66
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "sign-only",
+                    "size": 559
+                  }
+                ],
+                "size": 3000968,
+                "owner": "root@pam",
+                "protected": false
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store2/groups?ns=clusterA/sub": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-count": 1,
+                "backup-id": "200",
+                "backup-type": "ct",
+                "files": [
+                  "root.pxar.didx",
+                  "index.json.blob",
+                  "catalog.pcat1.didx"
+                ],
+                "last-backup": 1790585935,
+                "owner": "root@pam"
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store2/snapshots?ns=clusterA/sub": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-type": "ct",
+                "backup-id": "200",
+                "backup-time": 1790585935,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "none",
+                    "size": 3000343
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "none",
+                    "size": 66
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 446
+                  }
+                ],
+                "size": 3000855,
+                "owner": "root@pam",
+                "protected": false
+              }
+            ]
+          }
+        }
+      },
+      "payload": {
+        "pbs": {
+          "reachable": true,
+          "version": "4.2",
+          "release": "0",
+          "fingerprint": "b7:24:5c:7a:78:c1:25:6c:0d:a9:ff:4a:6c:30:2e:10:03:ce:82:2c:00:d7:e9:82:1e:fc:00:93:f4:de:85:4f",
+          "age_s": 0,
+          "built_at": 1790640000,
+          "scope": "full",
+          "datastores": [
+            {
+              "store": "store1",
+              "backend_type": "filesystem",
+              "mount_status": "nonremovable",
+              "maintenance_mode": null,
+              "maintenance_message": null,
+              "total": 62671097856,
+              "used": 31215251456,
+              "avail": 28239130624,
+              "estimated_full_date": null,
+              "gc": {
+                "schedule": "daily",
+                "next_run": 1790640000,
+                "last_run_starttime": 1790586058,
+                "last_run_state": "WARNINGS: 1",
+                "last_run_endtime": 1790586060,
+                "duration": 2,
+                "index_file_count": 13,
+                "index_data_bytes": 78002299,
+                "disk_bytes": 69539959,
+                "disk_chunks": 29,
+                "pending_bytes": 0,
+                "pending_chunks": 0,
+                "removed_bytes": 0,
+                "removed_chunks": 0,
+                "removed_bad": 0,
+                "still_bad": 0
+              },
+              "namespaces": [
+                "",
+                "clusterA",
+                "clusterA/sub"
+              ],
+              "unread_namespaces": []
+            },
+            {
+              "store": "store2",
+              "backend_type": "filesystem",
+              "mount_status": "nonremovable",
+              "maintenance_mode": null,
+              "maintenance_message": null,
+              "total": 62671097856,
+              "used": 31215251456,
+              "avail": 28239130624,
+              "estimated_full_date": null,
+              "gc": {
+                "schedule": null,
+                "next_run": null,
+                "last_run_starttime": null,
+                "last_run_state": null,
+                "last_run_endtime": null,
+                "duration": null,
+                "index_file_count": null,
+                "index_data_bytes": null,
+                "disk_bytes": null,
+                "disk_chunks": null,
+                "pending_bytes": null,
+                "pending_chunks": null,
+                "removed_bytes": null,
+                "removed_chunks": null,
+                "removed_bad": null,
+                "still_bad": null
+              },
+              "namespaces": [
+                "",
+                "clusterA",
+                "clusterA/sub"
+              ],
+              "unread_namespaces": []
+            }
+          ],
+          "groups": [
+            {
+              "store": "store1",
+              "ns": "",
+              "type": "host",
+              "id": "db01",
+              "last_backup": 1790585927,
+              "count": 1,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 3000969,
+              "crypt_mode": "encrypt",
+              "protected": false,
+              "verify_state": "ok",
+              "verify_time": 1790586038,
+              "last_verified_ok": 1790585927,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store1",
+              "ns": "",
+              "type": "host",
+              "id": "web01",
+              "last_backup": 1790585958,
+              "count": 4,
+              "in_progress": true,
+              "in_progress_since": 1790587027,
+              "size": 60000709,
+              "crypt_mode": "none",
+              "protected": false,
+              "verify_state": "ok",
+              "verify_time": 1790586038,
+              "last_verified_ok": 1790585958,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store1",
+              "ns": "clusterA",
+              "type": "vm",
+              "id": "100",
+              "last_backup": 1790585935,
+              "count": 1,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 3000389,
+              "crypt_mode": "none",
+              "protected": false,
+              "verify_state": "failed",
+              "verify_time": 1790586038,
+              "last_verified_ok": null,
+              "verify_failed_count": 1
+            },
+            {
+              "store": "store1",
+              "ns": "clusterA",
+              "type": "vm",
+              "id": "101",
+              "last_backup": 1790586948,
+              "count": 2,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 60000629,
+              "crypt_mode": "none",
+              "protected": false,
+              "verify_state": null,
+              "verify_time": null,
+              "last_verified_ok": 1790585936,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store1",
+              "ns": "clusterA/sub",
+              "type": "ct",
+              "id": "200",
+              "last_backup": 1790585935,
+              "count": 1,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 3000855,
+              "crypt_mode": "none",
+              "protected": false,
+              "verify_state": "ok",
+              "verify_time": 1790586038,
+              "last_verified_ok": 1790585935,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store2",
+              "ns": "",
+              "type": "host",
+              "id": "db01",
+              "last_backup": 1790585927,
+              "count": 1,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 3000969,
+              "crypt_mode": "encrypt",
+              "protected": false,
+              "verify_state": null,
+              "verify_time": null,
+              "last_verified_ok": null,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store2",
+              "ns": "",
+              "type": "host",
+              "id": "web01",
+              "last_backup": 1790585958,
+              "count": 3,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 60000709,
+              "crypt_mode": "none",
+              "protected": false,
+              "verify_state": null,
+              "verify_time": null,
+              "last_verified_ok": null,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store2",
+              "ns": "clusterA",
+              "type": "vm",
+              "id": "100",
+              "last_backup": null,
+              "count": 0,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": null,
+              "crypt_mode": null,
+              "protected": null,
+              "verify_state": null,
+              "verify_time": null,
+              "last_verified_ok": null,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store2",
+              "ns": "clusterA",
+              "type": "vm",
+              "id": "101",
+              "last_backup": 1790585936,
+              "count": 1,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 3000968,
+              "crypt_mode": "encrypt",
+              "protected": false,
+              "verify_state": null,
+              "verify_time": null,
+              "last_verified_ok": null,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store2",
+              "ns": "clusterA/sub",
+              "type": "ct",
+              "id": "200",
+              "last_backup": 1790585935,
+              "count": 1,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 3000855,
+              "crypt_mode": "none",
+              "protected": false,
+              "verify_state": null,
+              "verify_time": null,
+              "last_verified_ok": null,
+              "verify_failed_count": 0
+            }
+          ],
+          "sync_jobs": [
+            {
+              "id": "pushjob",
+              "store": "store1",
+              "ns": "",
+              "max_depth": null,
+              "schedule": "daily",
+              "next_run": 1790640000,
+              "last_run_starttime": null,
+              "last_run_state": null,
+              "last_run_endtime": null,
+              "remote": "selfremote",
+              "remote_store": "store2",
+              "remote_ns": "",
+              "direction": "push"
+            },
+            {
+              "id": "sjob-dead",
+              "store": "store2",
+              "ns": "",
+              "max_depth": null,
+              "schedule": "hourly",
+              "next_run": 1790589600,
+              "last_run_starttime": 1790586082,
+              "last_run_state": "client error (Connect)",
+              "last_run_endtime": 1790586089,
+              "remote": "deadremote",
+              "remote_store": "store1",
+              "remote_ns": "",
+              "direction": "pull"
+            },
+            {
+              "id": "sjob1",
+              "store": "store2",
+              "ns": "",
+              "max_depth": null,
+              "schedule": "hourly",
+              "next_run": 1790589600,
+              "last_run_starttime": 1790586081,
+              "last_run_state": "sync failed with some errors.",
+              "last_run_endtime": 1790586081,
+              "remote": "selfremote",
+              "remote_store": "store1",
+              "remote_ns": "",
+              "direction": "pull"
+            }
+          ],
+          "verify_jobs": [
+            {
+              "id": "vjob1",
+              "store": "store1",
+              "ns": "",
+              "max_depth": null,
+              "schedule": "daily",
+              "next_run": 1790640000,
+              "last_run_starttime": 1790586079,
+              "last_run_state": "OK",
+              "last_run_endtime": 1790586079,
+              "outdated_after": 30,
+              "ignore_verified": true
+            }
+          ],
+          "prune_jobs": [
+            {
+              "id": "pjob1",
+              "store": "store1",
+              "ns": "",
+              "max_depth": null,
+              "schedule": "daily",
+              "next_run": 1790640000,
+              "last_run_starttime": 1790586080,
+              "last_run_state": "OK",
+              "last_run_endtime": 1790586080,
+              "disabled": false
+            }
+          ],
+          "errors": []
+        }
+      }
+    },
+    "scoped_token": {
+      "description": "CAPTURED: a token whose Datastore.Audit is granted on ONE namespace only (/datastore/store1/clusterA) and no Remote.Audit. PBS hides instead of refusing: /admin/datastore lists only store1, the namespace listing omits the root, verify/prune listings are EMPTY although a root-level verify and prune job exist, and /admin/datastore/{store}/status would answer total/used/avail = 0 (not read: /status/datastore-usage omits the keys instead -> null). Hence: total/used/avail null, gc null + a 403 'gc' error, sync_jobs null + an error naming Remote.Audit, and a 'partial:' error on verify_jobs and prune_jobs so the server never reads [] as 'no job'.",
+      "config": {
+        "pbs": {
+          "host": "localhost",
+          "port": 8007,
+          "token_id": "scoped@pbs!t",
+          "token_secret": "00000000-0000-0000-0000-000000000000",
+          "verify_ssl": false,
+          "fingerprint": null
+        }
+      },
+      "peer_fingerprint": "b7:24:5c:7a:78:c1:25:6c:0d:a9:ff:4a:6c:30:2e:10:03:ce:82:2c:00:d7:e9:82:1e:fc:00:93:f4:de:85:4f",
+      "responses": {
+        "/version": {
+          "status": 200,
+          "json": {
+            "data": {
+              "release": "0",
+              "repoid": "51422cf876826ca6f8dde138e062e61ea4ffe8a8",
+              "version": "4.2"
+            }
+          }
+        },
+        "/access/permissions": {
+          "status": 200,
+          "json": {
+            "data": {
+              "/datastore/store1/clusterA": {
+                "Datastore.Audit": true
+              }
+            }
+          }
+        },
+        "/admin/datastore": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backend-type": "filesystem",
+                "comment": null,
+                "mount-status": "nonremovable",
+                "store": "store1"
+              }
+            ]
+          }
+        },
+        "/status/datastore-usage": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backend-type": "filesystem",
+                "mount-status": "nonremovable",
+                "store": "store1"
+              }
+            ]
+          }
+        },
+        "/admin/verify": {
+          "status": 200,
+          "json": {
+            "data": []
+          }
+        },
+        "/admin/prune": {
+          "status": 200,
+          "json": {
+            "data": []
+          }
+        },
+        "/admin/datastore/store1/gc": {
+          "status": 403,
+          "body": "permission check failed"
+        },
+        "/admin/datastore/store1/namespace": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "ns": "clusterA"
+              },
+              {
+                "ns": "clusterA/sub"
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store1/groups?ns=clusterA": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-count": 1,
+                "backup-id": "100",
+                "backup-type": "vm",
+                "files": [
+                  "index.json.blob",
+                  "drive-scsi0.img.fidx"
+                ],
+                "last-backup": 1790585935,
+                "owner": "backupuser@pbs"
+              },
+              {
+                "backup-count": 2,
+                "backup-id": "101",
+                "backup-type": "vm",
+                "files": [
+                  "root.pxar.didx",
+                  "index.json.blob",
+                  "catalog.pcat1.didx"
+                ],
+                "last-backup": 1790586948,
+                "owner": "backupuser@pbs"
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store1/snapshots?ns=clusterA": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-type": "vm",
+                "backup-id": "100",
+                "backup-time": 1790585935,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "failed"
+                },
+                "files": [
+                  {
+                    "filename": "drive-scsi0.img.fidx",
+                    "crypt-mode": "none",
+                    "size": 3000000
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 389
+                  }
+                ],
+                "size": 3000389,
+                "owner": "backupuser@pbs",
+                "protected": false
+              },
+              {
+                "backup-type": "vm",
+                "backup-id": "101",
+                "backup-time": 1790586948,
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "none",
+                    "size": 60000210
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "none",
+                    "size": 49
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 370
+                  }
+                ],
+                "size": 60000629,
+                "owner": "backupuser@pbs",
+                "protected": false
+              },
+              {
+                "backup-type": "vm",
+                "backup-id": "101",
+                "backup-time": 1790585936,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "fingerprint": "03:7e:74:e5:1e:85:ff:c0:09:60:49:a0:56:08:86:d9:61:1c:cc:dc:d8:1b:c7:ac:8f:7a:04:ab:1a:31:dd:03",
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "encrypt",
+                    "size": 3000343
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "encrypt",
+                    "size": 66
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "sign-only",
+                    "size": 559
+                  }
+                ],
+                "size": 3000968,
+                "owner": "backupuser@pbs",
+                "protected": false
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store1/groups?ns=clusterA/sub": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-count": 1,
+                "backup-id": "200",
+                "backup-type": "ct",
+                "files": [
+                  "root.pxar.didx",
+                  "index.json.blob",
+                  "catalog.pcat1.didx"
+                ],
+                "last-backup": 1790585935,
+                "owner": "backupuser@pbs"
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store1/snapshots?ns=clusterA/sub": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-type": "ct",
+                "backup-id": "200",
+                "backup-time": 1790585935,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "none",
+                    "size": 3000343
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "none",
+                    "size": 66
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 446
+                  }
+                ],
+                "size": 3000855,
+                "owner": "backupuser@pbs",
+                "protected": false
+              }
+            ]
+          }
+        }
+      },
+      "payload": {
+        "pbs": {
+          "reachable": true,
+          "version": "4.2",
+          "release": "0",
+          "fingerprint": "b7:24:5c:7a:78:c1:25:6c:0d:a9:ff:4a:6c:30:2e:10:03:ce:82:2c:00:d7:e9:82:1e:fc:00:93:f4:de:85:4f",
+          "age_s": 0,
+          "built_at": 1790640000,
+          "scope": "partial",
+          "datastores": [
+            {
+              "store": "store1",
+              "backend_type": "filesystem",
+              "mount_status": "nonremovable",
+              "maintenance_mode": null,
+              "maintenance_message": null,
+              "total": null,
+              "used": null,
+              "avail": null,
+              "estimated_full_date": null,
+              "gc": null,
+              "namespaces": [
+                "clusterA",
+                "clusterA/sub"
+              ],
+              "unread_namespaces": []
+            }
+          ],
+          "groups": [
+            {
+              "store": "store1",
+              "ns": "clusterA",
+              "type": "vm",
+              "id": "100",
+              "last_backup": 1790585935,
+              "count": 1,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 3000389,
+              "crypt_mode": "none",
+              "protected": false,
+              "verify_state": "failed",
+              "verify_time": 1790586038,
+              "last_verified_ok": null,
+              "verify_failed_count": 1
+            },
+            {
+              "store": "store1",
+              "ns": "clusterA",
+              "type": "vm",
+              "id": "101",
+              "last_backup": 1790586948,
+              "count": 2,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 60000629,
+              "crypt_mode": "none",
+              "protected": false,
+              "verify_state": null,
+              "verify_time": null,
+              "last_verified_ok": 1790585936,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store1",
+              "ns": "clusterA/sub",
+              "type": "ct",
+              "id": "200",
+              "last_backup": 1790585935,
+              "count": 1,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 3000855,
+              "crypt_mode": "none",
+              "protected": false,
+              "verify_state": "ok",
+              "verify_time": 1790586038,
+              "last_verified_ok": 1790585935,
+              "verify_failed_count": 0
+            }
+          ],
+          "sync_jobs": null,
+          "verify_jobs": [],
+          "prune_jobs": [],
+          "errors": [
+            {
+              "scope": "sync_jobs",
+              "store": null,
+              "ns": null,
+              "message": "the API token lacks Remote.Audit on /remote (with propagation): sync jobs are not visible"
+            },
+            {
+              "scope": "verify_jobs",
+              "store": null,
+              "ns": null,
+              "message": "partial: the API token's Datastore.Audit is scoped below /datastore, so jobs outside that scope are not listed"
+            },
+            {
+              "scope": "prune_jobs",
+              "store": null,
+              "ns": null,
+              "message": "partial: the API token's Datastore.Audit is scoped below /datastore, so jobs outside that scope are not listed"
+            },
+            {
+              "scope": "gc",
+              "store": "store1",
+              "ns": null,
+              "message": "HTTP 403: permission check failed"
+            }
+          ]
+        }
+      }
+    },
+    "offline_datastore": {
+      "description": "CAPTURED: store2 in OFFLINE maintenance ('offline,message=disk swap tonight', as the listing reports it). It is still listed (maintenance_mode offline + its message), /status/datastore-usage reports an 'error' for it instead of numbers, and its gc and namespace reads answer 400 -> scoped errors; its namespaces and unread_namespaces stay null and it contributes NO groups, which the server must read as unknown, never as deleted.",
+      "config": {
+        "pbs": {
+          "host": "localhost",
+          "port": 8007,
+          "token_id": "fivenines@pbs!monitoring",
+          "token_secret": "00000000-0000-0000-0000-000000000000",
+          "verify_ssl": false,
+          "fingerprint": null
+        }
+      },
+      "peer_fingerprint": "b7:24:5c:7a:78:c1:25:6c:0d:a9:ff:4a:6c:30:2e:10:03:ce:82:2c:00:d7:e9:82:1e:fc:00:93:f4:de:85:4f",
+      "responses": {
+        "/version": {
+          "status": 200,
+          "json": {
+            "data": {
+              "release": "0",
+              "repoid": "51422cf876826ca6f8dde138e062e61ea4ffe8a8",
+              "version": "4.2"
+            }
+          }
+        },
+        "/access/permissions": {
+          "status": 200,
+          "json": {
+            "data": {
+              "/datastore": {
+                "Datastore.Audit": true
+              },
+              "/datastore/store1": {
+                "Datastore.Audit": true
+              },
+              "/datastore/store1/clusterA": {
+                "Datastore.Audit": true
+              },
+              "/remote": {
+                "Remote.Audit": true
+              }
+            }
+          }
+        },
+        "/admin/datastore": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backend-type": "filesystem",
+                "comment": null,
+                "mount-status": "nonremovable",
+                "store": "store1"
+              },
+              {
+                "backend-type": "filesystem",
+                "comment": null,
+                "maintenance": "offline,message=disk swap tonight",
+                "mount-status": "nonremovable",
+                "store": "store2"
+              }
+            ]
+          }
+        },
+        "/status/datastore-usage": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backend-type": "filesystem",
+                "error": "datastore 'store2' is unavailable: offline maintenance mode: disk swap tonight",
+                "mount-status": "nonremovable",
+                "store": "store2"
+              },
+              {
+                "avail": 28239118336,
+                "backend-type": "filesystem",
+                "gc-status": {
+                  "cache-stats": {
+                    "hits": 7,
+                    "misses": 29
+                  },
+                  "disk-bytes": 69539959,
+                  "disk-chunks": 29,
+                  "index-data-bytes": 78002299,
+                  "index-file-count": 13,
+                  "pending-bytes": 0,
+                  "pending-chunks": 0,
+                  "removed-bad": 0,
+                  "removed-bytes": 0,
+                  "removed-chunks": 0,
+                  "still-bad": 0,
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:0000000A:6ABA2CCA:garbage_collection:store1:root@pam:"
+                },
+                "history": [
+                  null,
+                  null,
+                  null
+                ],
+                "history-delta": 1800,
+                "history-start": 1787995054,
+                "mount-status": "nonremovable",
+                "store": "store1",
+                "total": 62671097856,
+                "used": 31215263744
+              }
+            ]
+          }
+        },
+        "/admin/sync?sync-direction=all": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "id": "pushjob",
+                "next-run": 1790640000,
+                "remote": "selfremote",
+                "remote-store": "store2",
+                "schedule": "daily",
+                "store": "store1",
+                "sync-direction": "push"
+              },
+              {
+                "id": "sjob1",
+                "last-run-endtime": 1790586081,
+                "last-run-state": "sync failed with some errors.",
+                "last-run-upid": "UPID:541a750a1e0c:00000025:000023D8:0000000D:6ABA2CE1:syncjob:selfremote\\x3astore1\\x3astore2\\x3a\\x3asjob1:root@pam:",
+                "next-run": 1790589600,
+                "remote": "selfremote",
+                "remote-store": "store1",
+                "schedule": "hourly",
+                "store": "store2"
+              },
+              {
+                "id": "sjob-dead",
+                "last-run-endtime": 1790586089,
+                "last-run-state": "client error (Connect)",
+                "last-run-upid": "UPID:541a750a1e0c:00000025:000023D8:00000015:6ABA2CE2:syncjob:deadremote\\x3astore1\\x3astore2\\x3a\\x3asjob\\x2ddead:root@pam:",
+                "next-run": 1790589600,
+                "remote": "deadremote",
+                "remote-store": "store1",
+                "schedule": "hourly",
+                "store": "store2"
+              }
+            ]
+          }
+        },
+        "/admin/verify": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "id": "vjob1",
+                "ignore-verified": true,
+                "last-run-endtime": 1790586079,
+                "last-run-state": "OK",
+                "last-run-upid": "UPID:541a750a1e0c:00000025:000023D8:0000000B:6ABA2CDF:verificationjob:store1\\x3avjob1:root@pam:",
+                "next-run": 1790640000,
+                "outdated-after": 30,
+                "schedule": "daily",
+                "store": "store1"
+              }
+            ]
+          }
+        },
+        "/admin/prune": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "id": "pjob1",
+                "keep-last": 5,
+                "last-run-endtime": 1790586080,
+                "last-run-state": "OK",
+                "last-run-upid": "UPID:541a750a1e0c:00000025:000023D8:0000000C:6ABA2CE0:prunejob:store1:root@pam:",
+                "next-run": 1790640000,
+                "schedule": "daily",
+                "store": "store1"
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store1/gc": {
+          "status": 200,
+          "json": {
+            "data": {
+              "cache-stats": {
+                "hits": 7,
+                "misses": 29
+              },
+              "disk-bytes": 69539959,
+              "disk-chunks": 29,
+              "duration": 2,
+              "index-data-bytes": 78002299,
+              "index-file-count": 13,
+              "last-run-endtime": 1790586060,
+              "last-run-state": "WARNINGS: 1",
+              "next-run": 1790640000,
+              "pending-bytes": 0,
+              "pending-chunks": 0,
+              "removed-bad": 0,
+              "removed-bytes": 0,
+              "removed-chunks": 0,
+              "schedule": "daily",
+              "still-bad": 0,
+              "store": "store1",
+              "upid": "UPID:541a750a1e0c:00000025:000023D8:0000000A:6ABA2CCA:garbage_collection:store1:root@pam:"
+            }
+          }
+        },
+        "/admin/datastore/store1/namespace": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "ns": ""
+              },
+              {
+                "ns": "clusterA"
+              },
+              {
+                "ns": "clusterA/sub"
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store1/groups": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-count": 1,
+                "backup-id": "db01",
+                "backup-type": "host",
+                "files": [
+                  "root.pxar.didx",
+                  "index.json.blob",
+                  "catalog.pcat1.didx"
+                ],
+                "last-backup": 1790585927,
+                "owner": "backupuser@pbs"
+              },
+              {
+                "backup-count": 4,
+                "backup-id": "web01",
+                "backup-type": "host",
+                "files": [
+                  "root.pxar.didx",
+                  "index.json.blob",
+                  "catalog.pcat1.didx"
+                ],
+                "last-backup": 1790585958,
+                "owner": "backupuser@pbs"
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store1/snapshots": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-type": "host",
+                "backup-id": "db01",
+                "backup-time": 1790585927,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "fingerprint": "03:7e:74:e5:1e:85:ff:c0:09:60:49:a0:56:08:86:d9:61:1c:cc:dc:d8:1b:c7:ac:8f:7a:04:ab:1a:31:dd:03",
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "encrypt",
+                    "size": 3000343
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "encrypt",
+                    "size": 66
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "sign-only",
+                    "size": 560
+                  }
+                ],
+                "size": 3000969,
+                "owner": "backupuser@pbs",
+                "protected": false
+              },
+              {
+                "backup-type": "host",
+                "backup-id": "web01",
+                "backup-time": 1790585924,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "none",
+                    "size": 3000338
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "none",
+                    "size": 66
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 451
+                  }
+                ],
+                "size": 3000855,
+                "owner": "backupuser@pbs",
+                "protected": false
+              },
+              {
+                "backup-type": "host",
+                "backup-id": "web01",
+                "backup-time": 1790587027,
+                "files": [],
+                "owner": "backupuser@pbs",
+                "protected": false
+              },
+              {
+                "backup-type": "host",
+                "backup-id": "web01",
+                "backup-time": 1790585958,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "none",
+                    "size": 60000210
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "none",
+                    "size": 49
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 450
+                  }
+                ],
+                "size": 60000709,
+                "owner": "backupuser@pbs",
+                "protected": false
+              },
+              {
+                "backup-type": "host",
+                "backup-id": "web01",
+                "backup-time": 1790585926,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "none",
+                    "size": 3000343
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "none",
+                    "size": 66
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 452
+                  }
+                ],
+                "size": 3000861,
+                "owner": "backupuser@pbs",
+                "protected": false
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store1/groups?ns=clusterA": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-count": 1,
+                "backup-id": "100",
+                "backup-type": "vm",
+                "files": [
+                  "index.json.blob",
+                  "drive-scsi0.img.fidx"
+                ],
+                "last-backup": 1790585935,
+                "owner": "backupuser@pbs"
+              },
+              {
+                "backup-count": 2,
+                "backup-id": "101",
+                "backup-type": "vm",
+                "files": [
+                  "root.pxar.didx",
+                  "index.json.blob",
+                  "catalog.pcat1.didx"
+                ],
+                "last-backup": 1790586948,
+                "owner": "backupuser@pbs"
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store1/snapshots?ns=clusterA": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-type": "vm",
+                "backup-id": "100",
+                "backup-time": 1790585935,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "failed"
+                },
+                "files": [
+                  {
+                    "filename": "drive-scsi0.img.fidx",
+                    "crypt-mode": "none",
+                    "size": 3000000
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 389
+                  }
+                ],
+                "size": 3000389,
+                "owner": "backupuser@pbs",
+                "protected": false
+              },
+              {
+                "backup-type": "vm",
+                "backup-id": "101",
+                "backup-time": 1790586948,
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "none",
+                    "size": 60000210
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "none",
+                    "size": 49
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 370
+                  }
+                ],
+                "size": 60000629,
+                "owner": "backupuser@pbs",
+                "protected": false
+              },
+              {
+                "backup-type": "vm",
+                "backup-id": "101",
+                "backup-time": 1790585936,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "fingerprint": "03:7e:74:e5:1e:85:ff:c0:09:60:49:a0:56:08:86:d9:61:1c:cc:dc:d8:1b:c7:ac:8f:7a:04:ab:1a:31:dd:03",
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "encrypt",
+                    "size": 3000343
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "encrypt",
+                    "size": 66
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "sign-only",
+                    "size": 559
+                  }
+                ],
+                "size": 3000968,
+                "owner": "backupuser@pbs",
+                "protected": false
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store1/groups?ns=clusterA/sub": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-count": 1,
+                "backup-id": "200",
+                "backup-type": "ct",
+                "files": [
+                  "root.pxar.didx",
+                  "index.json.blob",
+                  "catalog.pcat1.didx"
+                ],
+                "last-backup": 1790585935,
+                "owner": "backupuser@pbs"
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store1/snapshots?ns=clusterA/sub": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-type": "ct",
+                "backup-id": "200",
+                "backup-time": 1790585935,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "none",
+                    "size": 3000343
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "none",
+                    "size": 66
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 446
+                  }
+                ],
+                "size": 3000855,
+                "owner": "backupuser@pbs",
+                "protected": false
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store2/gc": {
+          "status": 400,
+          "body": "datastore 'store2' is unavailable: offline maintenance mode: disk swap tonight"
+        },
+        "/admin/datastore/store2/namespace": {
+          "status": 400,
+          "body": "datastore 'store2' is unavailable: offline maintenance mode: disk swap tonight"
+        }
+      },
+      "payload": {
+        "pbs": {
+          "reachable": true,
+          "version": "4.2",
+          "release": "0",
+          "fingerprint": "b7:24:5c:7a:78:c1:25:6c:0d:a9:ff:4a:6c:30:2e:10:03:ce:82:2c:00:d7:e9:82:1e:fc:00:93:f4:de:85:4f",
+          "age_s": 0,
+          "built_at": 1790640000,
+          "scope": "full",
+          "datastores": [
+            {
+              "store": "store1",
+              "backend_type": "filesystem",
+              "mount_status": "nonremovable",
+              "maintenance_mode": null,
+              "maintenance_message": null,
+              "total": 62671097856,
+              "used": 31215263744,
+              "avail": 28239118336,
+              "estimated_full_date": null,
+              "gc": {
+                "schedule": "daily",
+                "next_run": 1790640000,
+                "last_run_starttime": 1790586058,
+                "last_run_state": "WARNINGS: 1",
+                "last_run_endtime": 1790586060,
+                "duration": 2,
+                "index_file_count": 13,
+                "index_data_bytes": 78002299,
+                "disk_bytes": 69539959,
+                "disk_chunks": 29,
+                "pending_bytes": 0,
+                "pending_chunks": 0,
+                "removed_bytes": 0,
+                "removed_chunks": 0,
+                "removed_bad": 0,
+                "still_bad": 0
+              },
+              "namespaces": [
+                "",
+                "clusterA",
+                "clusterA/sub"
+              ],
+              "unread_namespaces": []
+            },
+            {
+              "store": "store2",
+              "backend_type": "filesystem",
+              "mount_status": "nonremovable",
+              "maintenance_mode": "offline",
+              "maintenance_message": "disk swap tonight",
+              "total": null,
+              "used": null,
+              "avail": null,
+              "estimated_full_date": null,
+              "gc": null,
+              "namespaces": null,
+              "unread_namespaces": null
+            }
+          ],
+          "groups": [
+            {
+              "store": "store1",
+              "ns": "",
+              "type": "host",
+              "id": "db01",
+              "last_backup": 1790585927,
+              "count": 1,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 3000969,
+              "crypt_mode": "encrypt",
+              "protected": false,
+              "verify_state": "ok",
+              "verify_time": 1790586038,
+              "last_verified_ok": 1790585927,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store1",
+              "ns": "",
+              "type": "host",
+              "id": "web01",
+              "last_backup": 1790585958,
+              "count": 4,
+              "in_progress": true,
+              "in_progress_since": 1790587027,
+              "size": 60000709,
+              "crypt_mode": "none",
+              "protected": false,
+              "verify_state": "ok",
+              "verify_time": 1790586038,
+              "last_verified_ok": 1790585958,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store1",
+              "ns": "clusterA",
+              "type": "vm",
+              "id": "100",
+              "last_backup": 1790585935,
+              "count": 1,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 3000389,
+              "crypt_mode": "none",
+              "protected": false,
+              "verify_state": "failed",
+              "verify_time": 1790586038,
+              "last_verified_ok": null,
+              "verify_failed_count": 1
+            },
+            {
+              "store": "store1",
+              "ns": "clusterA",
+              "type": "vm",
+              "id": "101",
+              "last_backup": 1790586948,
+              "count": 2,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 60000629,
+              "crypt_mode": "none",
+              "protected": false,
+              "verify_state": null,
+              "verify_time": null,
+              "last_verified_ok": 1790585936,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store1",
+              "ns": "clusterA/sub",
+              "type": "ct",
+              "id": "200",
+              "last_backup": 1790585935,
+              "count": 1,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 3000855,
+              "crypt_mode": "none",
+              "protected": false,
+              "verify_state": "ok",
+              "verify_time": 1790586038,
+              "last_verified_ok": 1790585935,
+              "verify_failed_count": 0
+            }
+          ],
+          "sync_jobs": [
+            {
+              "id": "pushjob",
+              "store": "store1",
+              "ns": "",
+              "max_depth": null,
+              "schedule": "daily",
+              "next_run": 1790640000,
+              "last_run_starttime": null,
+              "last_run_state": null,
+              "last_run_endtime": null,
+              "remote": "selfremote",
+              "remote_store": "store2",
+              "remote_ns": "",
+              "direction": "push"
+            },
+            {
+              "id": "sjob-dead",
+              "store": "store2",
+              "ns": "",
+              "max_depth": null,
+              "schedule": "hourly",
+              "next_run": 1790589600,
+              "last_run_starttime": 1790586082,
+              "last_run_state": "client error (Connect)",
+              "last_run_endtime": 1790586089,
+              "remote": "deadremote",
+              "remote_store": "store1",
+              "remote_ns": "",
+              "direction": "pull"
+            },
+            {
+              "id": "sjob1",
+              "store": "store2",
+              "ns": "",
+              "max_depth": null,
+              "schedule": "hourly",
+              "next_run": 1790589600,
+              "last_run_starttime": 1790586081,
+              "last_run_state": "sync failed with some errors.",
+              "last_run_endtime": 1790586081,
+              "remote": "selfremote",
+              "remote_store": "store1",
+              "remote_ns": "",
+              "direction": "pull"
+            }
+          ],
+          "verify_jobs": [
+            {
+              "id": "vjob1",
+              "store": "store1",
+              "ns": "",
+              "max_depth": null,
+              "schedule": "daily",
+              "next_run": 1790640000,
+              "last_run_starttime": 1790586079,
+              "last_run_state": "OK",
+              "last_run_endtime": 1790586079,
+              "outdated_after": 30,
+              "ignore_verified": true
+            }
+          ],
+          "prune_jobs": [
+            {
+              "id": "pjob1",
+              "store": "store1",
+              "ns": "",
+              "max_depth": null,
+              "schedule": "daily",
+              "next_run": 1790640000,
+              "last_run_starttime": 1790586080,
+              "last_run_state": "OK",
+              "last_run_endtime": 1790586080,
+              "disabled": false
+            }
+          ],
+          "errors": [
+            {
+              "scope": "usage",
+              "store": "store2",
+              "ns": null,
+              "message": "datastore 'store2' is unavailable: offline maintenance mode: disk swap tonight"
+            },
+            {
+              "scope": "gc",
+              "store": "store2",
+              "ns": null,
+              "message": "HTTP 400: datastore 'store2' is unavailable: offline maintenance mode: disk swap tonight"
+            },
+            {
+              "scope": "namespaces",
+              "store": "store2",
+              "ns": null,
+              "message": "HTTP 400: datastore 'store2' is unavailable: offline maintenance mode: disk swap tonight"
+            }
+          ]
+        }
+      }
+    },
+    "over_privileged": {
+      "description": "CAPTURED: an admin@pbs token with the Admin role on /. Its effective privileges include Datastore.Read (a full restore of every backup) and Datastore.Modify/Prune (deleting them), so the agent refuses to use it: over_privileged envelope, nothing collected, no datastores key. The message lists the offending privileges (capped).",
+      "config": {
+        "pbs": {
+          "host": "localhost",
+          "port": 8007,
+          "token_id": "admin@pbs!adm",
+          "token_secret": "00000000-0000-0000-0000-000000000000",
+          "verify_ssl": false,
+          "fingerprint": null
+        }
+      },
+      "peer_fingerprint": "b7:24:5c:7a:78:c1:25:6c:0d:a9:ff:4a:6c:30:2e:10:03:ce:82:2c:00:d7:e9:82:1e:fc:00:93:f4:de:85:4f",
+      "responses": {
+        "/version": {
+          "status": 200,
+          "json": {
+            "data": {
+              "release": "0",
+              "repoid": "51422cf876826ca6f8dde138e062e61ea4ffe8a8",
+              "version": "4.2"
+            }
+          }
+        },
+        "/access/permissions": {
+          "status": 200,
+          "json": {
+            "data": {
+              "/": {
+                "Datastore.Allocate": true,
+                "Datastore.Audit": true,
+                "Datastore.Backup": true,
+                "Datastore.Modify": true,
+                "Datastore.Prune": true,
+                "Datastore.Read": true,
+                "Datastore.Verify": true,
+                "Permissions.Modify": true,
+                "Realm.Allocate": true,
+                "Remote.Audit": true,
+                "Remote.DatastoreBackup": true,
+                "Remote.DatastoreModify": true,
+                "Remote.DatastorePrune": true,
+                "Remote.Modify": true,
+                "Remote.Read": true,
+                "Sys.Audit": true,
+                "Sys.Console": true,
+                "Sys.Modify": true,
+                "Sys.PowerManagement": true,
+                "Tape.Audit": true,
+                "Tape.Modify": true,
+                "Tape.Read": true,
+                "Tape.Write": true
+              },
+              "/access": {
+                "Datastore.Allocate": true,
+                "Datastore.Audit": true,
+                "Datastore.Backup": true,
+                "Datastore.Modify": true,
+                "Datastore.Prune": true,
+                "Datastore.Read": true,
+                "Datastore.Verify": true,
+                "Permissions.Modify": true,
+                "Realm.Allocate": true,
+                "Remote.Audit": true,
+                "Remote.DatastoreBackup": true,
+                "Remote.DatastoreModify": true,
+                "Remote.DatastorePrune": true,
+                "Remote.Modify": true,
+                "Remote.Read": true,
+                "Sys.Audit": true,
+                "Sys.Console": true,
+                "Sys.Modify": true,
+                "Sys.PowerManagement": true,
+                "Tape.Audit": true,
+                "Tape.Modify": true,
+                "Tape.Read": true,
+                "Tape.Write": true
+              },
+              "/datastore": {
+                "Datastore.Allocate": true,
+                "Datastore.Audit": true,
+                "Datastore.Backup": true,
+                "Datastore.Modify": true,
+                "Datastore.Prune": true,
+                "Datastore.Read": true,
+                "Datastore.Verify": true,
+                "Permissions.Modify": true,
+                "Realm.Allocate": true,
+                "Remote.Audit": true,
+                "Remote.DatastoreBackup": true,
+                "Remote.DatastoreModify": true,
+                "Remote.DatastorePrune": true,
+                "Remote.Modify": true,
+                "Remote.Read": true,
+                "Sys.Audit": true,
+                "Sys.Console": true,
+                "Sys.Modify": true,
+                "Sys.PowerManagement": true,
+                "Tape.Audit": true,
+                "Tape.Modify": true,
+                "Tape.Read": true,
+                "Tape.Write": true
+              },
+              "/datastore/store1": {
+                "Datastore.Allocate": true,
+                "Datastore.Audit": true,
+                "Datastore.Backup": true,
+                "Datastore.Modify": true,
+                "Datastore.Prune": true,
+                "Datastore.Read": true,
+                "Datastore.Verify": true,
+                "Permissions.Modify": true,
+                "Realm.Allocate": true,
+                "Remote.Audit": true,
+                "Remote.DatastoreBackup": true,
+                "Remote.DatastoreModify": true,
+                "Remote.DatastorePrune": true,
+                "Remote.Modify": true,
+                "Remote.Read": true,
+                "Sys.Audit": true,
+                "Sys.Console": true,
+                "Sys.Modify": true,
+                "Sys.PowerManagement": true,
+                "Tape.Audit": true,
+                "Tape.Modify": true,
+                "Tape.Read": true,
+                "Tape.Write": true
+              },
+              "/datastore/store1/clusterA": {
+                "Datastore.Allocate": true,
+                "Datastore.Audit": true,
+                "Datastore.Backup": true,
+                "Datastore.Modify": true,
+                "Datastore.Prune": true,
+                "Datastore.Read": true,
+                "Datastore.Verify": true,
+                "Permissions.Modify": true,
+                "Realm.Allocate": true,
+                "Remote.Audit": true,
+                "Remote.DatastoreBackup": true,
+                "Remote.DatastoreModify": true,
+                "Remote.DatastorePrune": true,
+                "Remote.Modify": true,
+                "Remote.Read": true,
+                "Sys.Audit": true,
+                "Sys.Console": true,
+                "Sys.Modify": true,
+                "Sys.PowerManagement": true,
+                "Tape.Audit": true,
+                "Tape.Modify": true,
+                "Tape.Read": true,
+                "Tape.Write": true
+              },
+              "/remote": {
+                "Datastore.Allocate": true,
+                "Datastore.Audit": true,
+                "Datastore.Backup": true,
+                "Datastore.Modify": true,
+                "Datastore.Prune": true,
+                "Datastore.Read": true,
+                "Datastore.Verify": true,
+                "Permissions.Modify": true,
+                "Realm.Allocate": true,
+                "Remote.Audit": true,
+                "Remote.DatastoreBackup": true,
+                "Remote.DatastoreModify": true,
+                "Remote.DatastorePrune": true,
+                "Remote.Modify": true,
+                "Remote.Read": true,
+                "Sys.Audit": true,
+                "Sys.Console": true,
+                "Sys.Modify": true,
+                "Sys.PowerManagement": true,
+                "Tape.Audit": true,
+                "Tape.Modify": true,
+                "Tape.Read": true,
+                "Tape.Write": true
+              },
+              "/system": {
+                "Datastore.Allocate": true,
+                "Datastore.Audit": true,
+                "Datastore.Backup": true,
+                "Datastore.Modify": true,
+                "Datastore.Prune": true,
+                "Datastore.Read": true,
+                "Datastore.Verify": true,
+                "Permissions.Modify": true,
+                "Realm.Allocate": true,
+                "Remote.Audit": true,
+                "Remote.DatastoreBackup": true,
+                "Remote.DatastoreModify": true,
+                "Remote.DatastorePrune": true,
+                "Remote.Modify": true,
+                "Remote.Read": true,
+                "Sys.Audit": true,
+                "Sys.Console": true,
+                "Sys.Modify": true,
+                "Sys.PowerManagement": true,
+                "Tape.Audit": true,
+                "Tape.Modify": true,
+                "Tape.Read": true,
+                "Tape.Write": true
+              }
+            }
+          }
+        }
+      },
+      "payload": {
+        "pbs": {
+          "reachable": true,
+          "error_type": "over_privileged",
+          "error_message": "the API token holds privileges beyond Datastore.Audit and Remote.Audit: grant it the DatastoreAudit and RemoteAudit roles only (it holds Datastore.Allocate, Datastore.Backup, Datastore.Modify, Datastore.Prune, Datastore.Read, Datastore.Verify, Permissions.Modify, Realm.Allocate, Remote.DatastoreBackup, Remote.DatastoreModify, Remote.DatastorePrune, Remote.Modify, Remote.Read, Sys.Audit, Sys.Console, Sys.Modify, Sys.PowerManagement, Tape.Audit, Tape.Modify, Tape.Read, Tape.Write)"
+        }
+      }
+    },
+    "no_datastore_access": {
+      "description": "CAPTURED: a valid token with NO ACL. PBS answers /access/permissions with {} and EVERY listing with HTTP 200 and an empty list, so an empty read proves nothing: no_datastore_access envelope, never a block of empty arrays. (A DatastoreAudit grant on /datastore WITHOUT propagation, also captured, reads {'/datastore': {'Datastore.Audit': false}} and ends the same way.)",
+      "config": {
+        "pbs": {
+          "host": "localhost",
+          "port": 8007,
+          "token_id": "noacl@pbs!t",
+          "token_secret": "00000000-0000-0000-0000-000000000000",
+          "verify_ssl": false,
+          "fingerprint": null
+        }
+      },
+      "peer_fingerprint": "b7:24:5c:7a:78:c1:25:6c:0d:a9:ff:4a:6c:30:2e:10:03:ce:82:2c:00:d7:e9:82:1e:fc:00:93:f4:de:85:4f",
+      "responses": {
+        "/version": {
+          "status": 200,
+          "json": {
+            "data": {
+              "release": "0",
+              "repoid": "51422cf876826ca6f8dde138e062e61ea4ffe8a8",
+              "version": "4.2"
+            }
+          }
+        },
+        "/access/permissions": {
+          "status": 200,
+          "json": {
+            "data": {}
+          }
+        },
+        "/admin/datastore": {
+          "status": 200,
+          "json": {
+            "data": []
+          }
+        }
+      },
+      "payload": {
+        "pbs": {
+          "reachable": true,
+          "error_type": "no_datastore_access",
+          "error_message": "the API token cannot audit any datastore (grant DatastoreAudit on /datastore with propagation): PBS would answer every listing with an empty list"
+        }
+      }
+    },
+    "auth_failed": {
+      "description": "CAPTURED: a wrong token secret. /version answers HTTP 401 'authentication failed' -> auth_failed, reachable true. The agent then stops contacting this PBS for 300s unless the secret changes, and reports this same envelope meanwhile.",
+      "config": {
+        "pbs": {
+          "host": "localhost",
+          "port": 8007,
+          "token_id": "noacl@pbs!t",
+          "token_secret": "00000000-0000-0000-0000-000000000000",
+          "verify_ssl": false,
+          "fingerprint": null
+        }
+      },
+      "peer_fingerprint": "b7:24:5c:7a:78:c1:25:6c:0d:a9:ff:4a:6c:30:2e:10:03:ce:82:2c:00:d7:e9:82:1e:fc:00:93:f4:de:85:4f",
+      "responses": {
+        "/version": {
+          "status": 401,
+          "body": "authentication failed"
+        }
+      },
+      "payload": {
+        "pbs": {
+          "reachable": true,
+          "error_type": "auth_failed",
+          "error_message": "HTTP 401: authentication failed"
+        }
+      }
+    },
+    "unreachable": {
+      "description": "SYNTHETIC transport failure: nothing listens on the port (host 'localhost' with verification off is dialled as 127.0.0.1). reachable false, connection_refused. /version is read EVERY tick, so this envelope replaces a still-cached block immediately.",
+      "config": {
+        "pbs": {
+          "host": "localhost",
+          "port": 8007,
+          "token_id": "fivenines@pbs!monitoring",
+          "token_secret": "00000000-0000-0000-0000-000000000000",
+          "verify_ssl": false,
+          "fingerprint": null
+        }
+      },
+      "responses": {
+        "/version": {
+          "error": "connection_refused",
+          "message": "HTTPSConnectionPool(host='127.0.0.1', port=8007): Max retries exceeded with url: /api2/json/version (Caused by NewConnectionError(\"HTTPSConnection(host='127.0.0.1', port=8007): Failed to establish a new connection: [Errno 111] Connection refused\"))"
+        }
+      },
+      "payload": {
+        "pbs": {
+          "reachable": false,
+          "error_type": "connection_refused",
+          "error_message": "HTTPSConnectionPool(host='127.0.0.1', port=8007): Max retries exceeded with url: /api2/json/version (Caused by NewConnectionError(\"HTTPSConnection(host='127.0.0.1', port=8007): Failed to establish a new connection: [Errno 111] Connection refused\"))"
+        }
+      }
+    },
+    "tls_fingerprint_mismatch": {
+      "description": "SYNTHETIC (message as urllib3 words it, measured): a remote PBS with a pinned fingerprint that no longer matches the certificate it presents (a renewed certificate, or someone in the middle). tls_error, reachable false; the token was never sent. presented_fingerprint is the certificate the host presents, from a bare TLS handshake with no request -- what the operator pins if the renewal was theirs. (The fingerprints inside error_message are redacted as long blobs.)",
+      "config": {
+        "pbs": {
+          "host": "pbs.example",
+          "port": 8007,
+          "token_id": "fivenines@pbs!monitoring",
+          "token_secret": "00000000-0000-0000-0000-000000000000",
+          "verify_ssl": false,
+          "fingerprint": "00:24:5c:7a:78:c1:25:6c:0d:a9:ff:4a:6c:30:2e:10:03:ce:82:2c:00:d7:e9:82:1e:fc:00:93:f4:de:85:4f"
+        }
+      },
+      "presented_fingerprint": "b7:24:5c:7a:78:c1:25:6c:0d:a9:ff:4a:6c:30:2e:10:03:ce:82:2c:00:d7:e9:82:1e:fc:00:93:f4:de:85:4f",
+      "responses": {
+        "/version": {
+          "error": "tls_error",
+          "message": "HTTPSConnectionPool(host='pbs.example', port=8007): Max retries exceeded with url: /api2/json/version (Caused by SSLError('Fingerprints did not match. Expected \"00245c7a78c1256c0da9ff4a6c302e1003ce822c00d7e9821efc0093f4de854f\", got \"b7245c7a78c1256c0da9ff4a6c302e1003ce822c00d7e9821efc0093f4de854f\"'))"
+        }
+      },
+      "payload": {
+        "pbs": {
+          "reachable": false,
+          "error_type": "tls_error",
+          "error_message": "HTTPSConnectionPool(host='pbs.example', port=8007): Max retries exceeded with url: /api2/json/version (Caused by SSLError('Fingerprints did not match. Expected \"[REDACTED_BLOB]\", got \"[REDACTED_BLOB]\"'))",
+          "presented_fingerprint": "b7:24:5c:7a:78:c1:25:6c:0d:a9:ff:4a:6c:30:2e:10:03:ce:82:2c:00:d7:e9:82:1e:fc:00:93:f4:de:85:4f"
+        }
+      }
+    },
+    "remote_unverified_refused": {
+      "description": "Agent-side policy, no request made: a NON-loopback host with verify_ssl false and no fingerprint. The agent refuses to send the API token over unverified TLS -> config_error, reachable false.",
+      "config": {
+        "pbs": {
+          "host": "pbs.example",
+          "port": 8007,
+          "token_id": "fivenines@pbs!monitoring",
+          "token_secret": "00000000-0000-0000-0000-000000000000",
+          "verify_ssl": false,
+          "fingerprint": null
+        }
+      },
+      "responses": {},
+      "payload": {
+        "pbs": {
+          "reachable": false,
+          "error_type": "config_error",
+          "error_message": "refusing to send the API token to a non-loopback host without TLS verification: enable verify_ssl or set the certificate fingerprint"
+        }
+      }
+    },
+    "snapshots_unreadable": {
+      "description": "SYNTHETIC, derived from 'healthy': the /snapshots read of store1 namespace clusterA times out (a namespace with tens of thousands of snapshots). Its groups still ship, with last_backup/count from /groups (a lower bound on PBS < 4.0.17 while an upload runs: field_contract groups[]) and every snapshot detail null -- in_progress null marks the rows as 'details unknown', never 'never verified' -- and a 'snapshots' error names (store1, clusterA). PBS never finished its scan, so a group it left out of /groups (its snapshot directory unreadable -- only /snapshots would have failed on it) could be hiding: clusterA IS in unread_namespaces, and nothing may be pruned there (pruning_contract).",
+      "config": {
+        "pbs": {
+          "host": "localhost",
+          "port": 8007,
+          "token_id": "fivenines@pbs!monitoring",
+          "token_secret": "00000000-0000-0000-0000-000000000000",
+          "verify_ssl": false,
+          "fingerprint": null
+        }
+      },
+      "peer_fingerprint": "b7:24:5c:7a:78:c1:25:6c:0d:a9:ff:4a:6c:30:2e:10:03:ce:82:2c:00:d7:e9:82:1e:fc:00:93:f4:de:85:4f",
+      "responses_base": "healthy",
+      "responses": {
+        "/admin/datastore/store1/snapshots?ns=clusterA": {
+          "error": "timeout",
+          "message": "HTTPSConnectionPool(host='127.0.0.1', port=8007): Read timed out. (read timeout=10)"
+        }
+      },
+      "payload": {
+        "pbs": {
+          "reachable": true,
+          "version": "4.2",
+          "release": "0",
+          "fingerprint": "b7:24:5c:7a:78:c1:25:6c:0d:a9:ff:4a:6c:30:2e:10:03:ce:82:2c:00:d7:e9:82:1e:fc:00:93:f4:de:85:4f",
+          "age_s": 0,
+          "built_at": 1790640000,
+          "scope": "full",
+          "datastores": [
+            {
+              "store": "store1",
+              "backend_type": "filesystem",
+              "mount_status": "nonremovable",
+              "maintenance_mode": null,
+              "maintenance_message": null,
+              "total": 62671097856,
+              "used": 31215251456,
+              "avail": 28239130624,
+              "estimated_full_date": null,
+              "gc": {
+                "schedule": "daily",
+                "next_run": 1790640000,
+                "last_run_starttime": 1790586058,
+                "last_run_state": "WARNINGS: 1",
+                "last_run_endtime": 1790586060,
+                "duration": 2,
+                "index_file_count": 13,
+                "index_data_bytes": 78002299,
+                "disk_bytes": 69539959,
+                "disk_chunks": 29,
+                "pending_bytes": 0,
+                "pending_chunks": 0,
+                "removed_bytes": 0,
+                "removed_chunks": 0,
+                "removed_bad": 0,
+                "still_bad": 0
+              },
+              "namespaces": [
+                "",
+                "clusterA",
+                "clusterA/sub"
+              ],
+              "unread_namespaces": [
+                "clusterA"
+              ]
+            },
+            {
+              "store": "store2",
+              "backend_type": "filesystem",
+              "mount_status": "nonremovable",
+              "maintenance_mode": null,
+              "maintenance_message": null,
+              "total": 62671097856,
+              "used": 31215251456,
+              "avail": 28239130624,
+              "estimated_full_date": null,
+              "gc": {
+                "schedule": null,
+                "next_run": null,
+                "last_run_starttime": null,
+                "last_run_state": null,
+                "last_run_endtime": null,
+                "duration": null,
+                "index_file_count": null,
+                "index_data_bytes": null,
+                "disk_bytes": null,
+                "disk_chunks": null,
+                "pending_bytes": null,
+                "pending_chunks": null,
+                "removed_bytes": null,
+                "removed_chunks": null,
+                "removed_bad": null,
+                "still_bad": null
+              },
+              "namespaces": [
+                "",
+                "clusterA",
+                "clusterA/sub"
+              ],
+              "unread_namespaces": []
+            }
+          ],
+          "groups": [
+            {
+              "store": "store1",
+              "ns": "",
+              "type": "host",
+              "id": "db01",
+              "last_backup": 1790585927,
+              "count": 1,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 3000969,
+              "crypt_mode": "encrypt",
+              "protected": false,
+              "verify_state": "ok",
+              "verify_time": 1790586038,
+              "last_verified_ok": 1790585927,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store1",
+              "ns": "",
+              "type": "host",
+              "id": "web01",
+              "last_backup": 1790585958,
+              "count": 4,
+              "in_progress": true,
+              "in_progress_since": 1790587027,
+              "size": 60000709,
+              "crypt_mode": "none",
+              "protected": false,
+              "verify_state": "ok",
+              "verify_time": 1790586038,
+              "last_verified_ok": 1790585958,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store1",
+              "ns": "clusterA",
+              "type": "vm",
+              "id": "100",
+              "last_backup": 1790585935,
+              "count": 1,
+              "in_progress": null,
+              "in_progress_since": null,
+              "size": null,
+              "crypt_mode": null,
+              "protected": null,
+              "verify_state": null,
+              "verify_time": null,
+              "last_verified_ok": null,
+              "verify_failed_count": null
+            },
+            {
+              "store": "store1",
+              "ns": "clusterA",
+              "type": "vm",
+              "id": "101",
+              "last_backup": 1790586948,
+              "count": 2,
+              "in_progress": null,
+              "in_progress_since": null,
+              "size": null,
+              "crypt_mode": null,
+              "protected": null,
+              "verify_state": null,
+              "verify_time": null,
+              "last_verified_ok": null,
+              "verify_failed_count": null
+            },
+            {
+              "store": "store1",
+              "ns": "clusterA/sub",
+              "type": "ct",
+              "id": "200",
+              "last_backup": 1790585935,
+              "count": 1,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 3000855,
+              "crypt_mode": "none",
+              "protected": false,
+              "verify_state": "ok",
+              "verify_time": 1790586038,
+              "last_verified_ok": 1790585935,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store2",
+              "ns": "",
+              "type": "host",
+              "id": "db01",
+              "last_backup": 1790585927,
+              "count": 1,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 3000969,
+              "crypt_mode": "encrypt",
+              "protected": false,
+              "verify_state": null,
+              "verify_time": null,
+              "last_verified_ok": null,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store2",
+              "ns": "",
+              "type": "host",
+              "id": "web01",
+              "last_backup": 1790585958,
+              "count": 3,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 60000709,
+              "crypt_mode": "none",
+              "protected": false,
+              "verify_state": null,
+              "verify_time": null,
+              "last_verified_ok": null,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store2",
+              "ns": "clusterA",
+              "type": "vm",
+              "id": "100",
+              "last_backup": null,
+              "count": 0,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": null,
+              "crypt_mode": null,
+              "protected": null,
+              "verify_state": null,
+              "verify_time": null,
+              "last_verified_ok": null,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store2",
+              "ns": "clusterA",
+              "type": "vm",
+              "id": "101",
+              "last_backup": 1790585936,
+              "count": 1,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 3000968,
+              "crypt_mode": "encrypt",
+              "protected": false,
+              "verify_state": null,
+              "verify_time": null,
+              "last_verified_ok": null,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store2",
+              "ns": "clusterA/sub",
+              "type": "ct",
+              "id": "200",
+              "last_backup": 1790585935,
+              "count": 1,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 3000855,
+              "crypt_mode": "none",
+              "protected": false,
+              "verify_state": null,
+              "verify_time": null,
+              "last_verified_ok": null,
+              "verify_failed_count": 0
+            }
+          ],
+          "sync_jobs": [
+            {
+              "id": "pushjob",
+              "store": "store1",
+              "ns": "",
+              "max_depth": null,
+              "schedule": "daily",
+              "next_run": 1790640000,
+              "last_run_starttime": null,
+              "last_run_state": null,
+              "last_run_endtime": null,
+              "remote": "selfremote",
+              "remote_store": "store2",
+              "remote_ns": "",
+              "direction": "push"
+            },
+            {
+              "id": "sjob-dead",
+              "store": "store2",
+              "ns": "",
+              "max_depth": null,
+              "schedule": "hourly",
+              "next_run": 1790589600,
+              "last_run_starttime": 1790586082,
+              "last_run_state": "client error (Connect)",
+              "last_run_endtime": 1790586089,
+              "remote": "deadremote",
+              "remote_store": "store1",
+              "remote_ns": "",
+              "direction": "pull"
+            },
+            {
+              "id": "sjob1",
+              "store": "store2",
+              "ns": "",
+              "max_depth": null,
+              "schedule": "hourly",
+              "next_run": 1790589600,
+              "last_run_starttime": 1790586081,
+              "last_run_state": "sync failed with some errors.",
+              "last_run_endtime": 1790586081,
+              "remote": "selfremote",
+              "remote_store": "store1",
+              "remote_ns": "",
+              "direction": "pull"
+            }
+          ],
+          "verify_jobs": [
+            {
+              "id": "vjob1",
+              "store": "store1",
+              "ns": "",
+              "max_depth": null,
+              "schedule": "daily",
+              "next_run": 1790640000,
+              "last_run_starttime": 1790586079,
+              "last_run_state": "OK",
+              "last_run_endtime": 1790586079,
+              "outdated_after": 30,
+              "ignore_verified": true
+            }
+          ],
+          "prune_jobs": [
+            {
+              "id": "pjob1",
+              "store": "store1",
+              "ns": "",
+              "max_depth": null,
+              "schedule": "daily",
+              "next_run": 1790640000,
+              "last_run_starttime": 1790586080,
+              "last_run_state": "OK",
+              "last_run_endtime": 1790586080,
+              "disabled": false
+            }
+          ],
+          "errors": [
+            {
+              "scope": "snapshots",
+              "store": "store1",
+              "ns": "clusterA",
+              "message": "HTTPSConnectionPool(host='127.0.0.1', port=8007): Read timed out. (read timeout)"
+            }
+          ]
+        }
+      }
+    },
+    "older_pbs": {
+      "description": "SYNTHETIC, derived from 'healthy' (store1 only): a PBS that predates namespaces (2.1, 404 on the namespace endpoint -> the root namespace only), push sync (400 on sync-direction=all -> the bare /admin/sync, pull jobs only) and the GC job status (its gc body is the legacy shape: the last GC's task id and counters only -> last_run_starttime set, last_run_state null = 'not reported', not 'never ran'). Its listing names no backend (PBS < 4.1.7), so the backend comes from /config/datastore, where no backend property means a filesystem datastore -> backend_type 'filesystem' and its usage ships. Nor does it have the prune jobs API (added in 2.2, with namespaces): 404 -> prune_jobs null plus a 'prune_jobs' error -- unknown, never 'no prune jobs' (PBS 2.1 prunes on per-datastore schedules). Nothing else is an error.",
+      "config": {
+        "pbs": {
+          "host": "localhost",
+          "port": 8007,
+          "token_id": "fivenines@pbs!monitoring",
+          "token_secret": "00000000-0000-0000-0000-000000000000",
+          "verify_ssl": false,
+          "fingerprint": null
+        }
+      },
+      "peer_fingerprint": "b7:24:5c:7a:78:c1:25:6c:0d:a9:ff:4a:6c:30:2e:10:03:ce:82:2c:00:d7:e9:82:1e:fc:00:93:f4:de:85:4f",
+      "responses": {
+        "/access/permissions": {
+          "status": 200,
+          "json": {
+            "data": {
+              "/datastore": {
+                "Datastore.Audit": true
+              },
+              "/datastore/store1": {
+                "Datastore.Audit": true
+              },
+              "/remote": {
+                "Remote.Audit": true
+              }
+            }
+          }
+        },
+        "/admin/verify": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "id": "vjob1",
+                "ignore-verified": true,
+                "last-run-endtime": 1790586079,
+                "last-run-state": "OK",
+                "last-run-upid": "UPID:541a750a1e0c:00000025:000023D8:0000000B:6ABA2CDF:verificationjob:store1\\x3avjob1:root@pam:",
+                "next-run": 1790640000,
+                "outdated-after": 30,
+                "schedule": "daily",
+                "store": "store1"
+              }
+            ]
+          }
+        },
+        "/admin/prune": {
+          "status": 404,
+          "body": "Path '/api2/json/admin/prune' not found."
+        },
+        "/admin/datastore/store1/groups": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-count": 1,
+                "backup-id": "db01",
+                "backup-type": "host",
+                "files": [
+                  "root.pxar.didx",
+                  "index.json.blob",
+                  "catalog.pcat1.didx"
+                ],
+                "last-backup": 1790585927,
+                "owner": "backupuser@pbs"
+              },
+              {
+                "backup-count": 4,
+                "backup-id": "web01",
+                "backup-type": "host",
+                "files": [
+                  "root.pxar.didx",
+                  "index.json.blob",
+                  "catalog.pcat1.didx"
+                ],
+                "last-backup": 1790585958,
+                "owner": "backupuser@pbs"
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store1/snapshots": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-type": "host",
+                "backup-id": "db01",
+                "backup-time": 1790585927,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "fingerprint": "03:7e:74:e5:1e:85:ff:c0:09:60:49:a0:56:08:86:d9:61:1c:cc:dc:d8:1b:c7:ac:8f:7a:04:ab:1a:31:dd:03",
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "encrypt",
+                    "size": 3000343
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "encrypt",
+                    "size": 66
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "sign-only",
+                    "size": 560
+                  }
+                ],
+                "size": 3000969,
+                "owner": "backupuser@pbs",
+                "protected": false
+              },
+              {
+                "backup-type": "host",
+                "backup-id": "web01",
+                "backup-time": 1790585924,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "none",
+                    "size": 3000338
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "none",
+                    "size": 66
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 451
+                  }
+                ],
+                "size": 3000855,
+                "owner": "backupuser@pbs",
+                "protected": false
+              },
+              {
+                "backup-type": "host",
+                "backup-id": "web01",
+                "backup-time": 1790587027,
+                "files": [],
+                "owner": "backupuser@pbs",
+                "protected": false
+              },
+              {
+                "backup-type": "host",
+                "backup-id": "web01",
+                "backup-time": 1790585958,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "none",
+                    "size": 60000210
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "none",
+                    "size": 49
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 450
+                  }
+                ],
+                "size": 60000709,
+                "owner": "backupuser@pbs",
+                "protected": false
+              },
+              {
+                "backup-type": "host",
+                "backup-id": "web01",
+                "backup-time": 1790585926,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "none",
+                    "size": 3000343
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "none",
+                    "size": 66
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 452
+                  }
+                ],
+                "size": 3000861,
+                "owner": "backupuser@pbs",
+                "protected": false
+              }
+            ]
+          }
+        },
+        "/version": {
+          "status": 200,
+          "json": {
+            "data": {
+              "release": "5",
+              "repoid": "0000000000000000000000000000000000000000",
+              "version": "2.1"
+            }
+          }
+        },
+        "/admin/datastore": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "comment": null,
+                "store": "store1"
+              }
+            ]
+          }
+        },
+        "/status/datastore-usage": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "avail": 28239130624,
+                "history": [
+                  null,
+                  null,
+                  null
+                ],
+                "history-delta": 1800,
+                "history-start": 1787995033,
+                "store": "store1",
+                "total": 62671097856,
+                "used": 31215251456
+              }
+            ]
+          }
+        },
+        "/admin/sync?sync-direction=all": {
+          "status": 400,
+          "body": "parameter verification failed - 'sync-direction': schema does not allow additional properties."
+        },
+        "/admin/sync": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "id": "sjob1",
+                "last-run-endtime": 1790586081,
+                "last-run-state": "sync failed with some errors.",
+                "last-run-upid": "UPID:541a750a1e0c:00000025:000023D8:0000000D:6ABA2CE1:syncjob:selfremote\\x3aoffsite\\x3astore1\\x3a\\x3asjob1:root@pam:",
+                "next-run": 1790589600,
+                "remote": "selfremote",
+                "remote-store": "offsite",
+                "schedule": "hourly",
+                "store": "store1"
+              },
+              {
+                "id": "sjob-dead",
+                "last-run-endtime": 1790586089,
+                "last-run-state": "client error (Connect)",
+                "last-run-upid": "UPID:541a750a1e0c:00000025:000023D8:00000015:6ABA2CE2:syncjob:deadremote\\x3aoffsite\\x3astore1\\x3a\\x3asjob\\x2ddead:root@pam:",
+                "next-run": 1790589600,
+                "remote": "deadremote",
+                "remote-store": "offsite",
+                "schedule": "hourly",
+                "store": "store1"
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store1/namespace": {
+          "status": 404,
+          "body": "Path '/api2/json/admin/datastore/store1/namespace' not found."
+        },
+        "/admin/datastore/store1/gc": {
+          "status": 200,
+          "json": {
+            "data": {
+              "disk-bytes": 69539959,
+              "disk-chunks": 29,
+              "index-data-bytes": 78002299,
+              "index-file-count": 13,
+              "pending-bytes": 0,
+              "pending-chunks": 0,
+              "removed-bad": 0,
+              "removed-bytes": 0,
+              "removed-chunks": 0,
+              "still-bad": 0,
+              "upid": "UPID:541a750a1e0c:00000025:000023D8:0000000A:6ABA2CCA:garbage_collection:store1:root@pam:"
+            }
+          }
+        },
+        "/config/datastore": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "name": "store1",
+                "path": "/mnt/datastore/store1"
+              }
+            ]
+          }
+        }
+      },
+      "payload": {
+        "pbs": {
+          "reachable": true,
+          "version": "2.1",
+          "release": "5",
+          "fingerprint": "b7:24:5c:7a:78:c1:25:6c:0d:a9:ff:4a:6c:30:2e:10:03:ce:82:2c:00:d7:e9:82:1e:fc:00:93:f4:de:85:4f",
+          "age_s": 0,
+          "built_at": 1790640000,
+          "scope": "full",
+          "datastores": [
+            {
+              "store": "store1",
+              "backend_type": "filesystem",
+              "mount_status": null,
+              "maintenance_mode": null,
+              "maintenance_message": null,
+              "total": 62671097856,
+              "used": 31215251456,
+              "avail": 28239130624,
+              "estimated_full_date": null,
+              "gc": {
+                "schedule": null,
+                "next_run": null,
+                "last_run_starttime": 1790586058,
+                "last_run_state": null,
+                "last_run_endtime": null,
+                "duration": null,
+                "index_file_count": 13,
+                "index_data_bytes": 78002299,
+                "disk_bytes": 69539959,
+                "disk_chunks": 29,
+                "pending_bytes": 0,
+                "pending_chunks": 0,
+                "removed_bytes": 0,
+                "removed_chunks": 0,
+                "removed_bad": 0,
+                "still_bad": 0
+              },
+              "namespaces": [
+                ""
+              ],
+              "unread_namespaces": []
+            }
+          ],
+          "groups": [
+            {
+              "store": "store1",
+              "ns": "",
+              "type": "host",
+              "id": "db01",
+              "last_backup": 1790585927,
+              "count": 1,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 3000969,
+              "crypt_mode": "encrypt",
+              "protected": false,
+              "verify_state": "ok",
+              "verify_time": 1790586038,
+              "last_verified_ok": 1790585927,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store1",
+              "ns": "",
+              "type": "host",
+              "id": "web01",
+              "last_backup": 1790585958,
+              "count": 4,
+              "in_progress": true,
+              "in_progress_since": 1790587027,
+              "size": 60000709,
+              "crypt_mode": "none",
+              "protected": false,
+              "verify_state": "ok",
+              "verify_time": 1790586038,
+              "last_verified_ok": 1790585958,
+              "verify_failed_count": 0
+            }
+          ],
+          "sync_jobs": [
+            {
+              "id": "sjob-dead",
+              "store": "store1",
+              "ns": "",
+              "max_depth": null,
+              "schedule": "hourly",
+              "next_run": 1790589600,
+              "last_run_starttime": 1790586082,
+              "last_run_state": "client error (Connect)",
+              "last_run_endtime": 1790586089,
+              "remote": "deadremote",
+              "remote_store": "offsite",
+              "remote_ns": "",
+              "direction": "pull"
+            },
+            {
+              "id": "sjob1",
+              "store": "store1",
+              "ns": "",
+              "max_depth": null,
+              "schedule": "hourly",
+              "next_run": 1790589600,
+              "last_run_starttime": 1790586081,
+              "last_run_state": "sync failed with some errors.",
+              "last_run_endtime": 1790586081,
+              "remote": "selfremote",
+              "remote_store": "offsite",
+              "remote_ns": "",
+              "direction": "pull"
+            }
+          ],
+          "verify_jobs": [
+            {
+              "id": "vjob1",
+              "store": "store1",
+              "ns": "",
+              "max_depth": null,
+              "schedule": "daily",
+              "next_run": 1790640000,
+              "last_run_starttime": 1790586079,
+              "last_run_state": "OK",
+              "last_run_endtime": 1790586079,
+              "outdated_after": 30,
+              "ignore_verified": true
+            }
+          ],
+          "prune_jobs": null,
+          "errors": [
+            {
+              "scope": "prune_jobs",
+              "store": null,
+              "ns": null,
+              "message": "HTTP 404: Path '/api2/json/admin/prune' not found."
+            }
+          ]
+        }
+      }
+    },
+    "first_backup_in_progress": {
+      "description": "CAPTURED, over 'healthy': store1's root namespace while the FIRST backup of a new group (host/fresh01) is still uploading. PBS reports that upload as the group's last-backup (backup-count 1, files [] -- it skips its finished filter for a lone snapshot), while web01's upload that was still running in 'healthy' (1790587027) has finished and is now its last_backup. The agent discards an unfinished last-backup: fresh01 ships last_backup null and in_progress true, never 'backed up'.",
+      "config": {
+        "pbs": {
+          "host": "localhost",
+          "port": 8007,
+          "token_id": "fivenines@pbs!monitoring",
+          "token_secret": "00000000-0000-0000-0000-000000000000",
+          "verify_ssl": false,
+          "fingerprint": null
+        }
+      },
+      "peer_fingerprint": "b7:24:5c:7a:78:c1:25:6c:0d:a9:ff:4a:6c:30:2e:10:03:ce:82:2c:00:d7:e9:82:1e:fc:00:93:f4:de:85:4f",
+      "responses_base": "healthy",
+      "responses": {
+        "/admin/datastore/store1/groups": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-count": 1,
+                "backup-id": "db01",
+                "backup-type": "host",
+                "files": [
+                  "root.pxar.didx",
+                  "index.json.blob",
+                  "catalog.pcat1.didx"
+                ],
+                "last-backup": 1790585927,
+                "owner": "backupuser@pbs"
+              },
+              {
+                "backup-count": 4,
+                "backup-id": "web01",
+                "backup-type": "host",
+                "files": [
+                  "root.pxar.didx",
+                  "index.json.blob",
+                  "catalog.pcat1.didx"
+                ],
+                "last-backup": 1790587027,
+                "owner": "backupuser@pbs"
+              },
+              {
+                "backup-count": 1,
+                "backup-id": "fresh01",
+                "backup-type": "host",
+                "files": [],
+                "last-backup": 1790594854,
+                "owner": "backupuser@pbs"
+              }
+            ]
+          }
+        },
+        "/admin/datastore/store1/snapshots": {
+          "status": 200,
+          "json": {
+            "data": [
+              {
+                "backup-type": "host",
+                "backup-id": "db01",
+                "backup-time": 1790585927,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "fingerprint": "03:7e:74:e5:1e:85:ff:c0:09:60:49:a0:56:08:86:d9:61:1c:cc:dc:d8:1b:c7:ac:8f:7a:04:ab:1a:31:dd:03",
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "encrypt",
+                    "size": 3000343
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "encrypt",
+                    "size": 66
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "sign-only",
+                    "size": 560
+                  }
+                ],
+                "size": 3000969,
+                "owner": "backupuser@pbs",
+                "protected": false
+              },
+              {
+                "backup-type": "host",
+                "backup-id": "web01",
+                "backup-time": 1790585924,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "none",
+                    "size": 3000338
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "none",
+                    "size": 66
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 451
+                  }
+                ],
+                "size": 3000855,
+                "owner": "backupuser@pbs",
+                "protected": false
+              },
+              {
+                "backup-type": "host",
+                "backup-id": "web01",
+                "backup-time": 1790587027,
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "none",
+                    "size": 60000210
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "none",
+                    "size": 49
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 372
+                  }
+                ],
+                "size": 60000631,
+                "owner": "backupuser@pbs",
+                "protected": false
+              },
+              {
+                "backup-type": "host",
+                "backup-id": "web01",
+                "backup-time": 1790585958,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "none",
+                    "size": 60000210
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "none",
+                    "size": 49
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 450
+                  }
+                ],
+                "size": 60000709,
+                "owner": "backupuser@pbs",
+                "protected": false
+              },
+              {
+                "backup-type": "host",
+                "backup-id": "web01",
+                "backup-time": 1790585926,
+                "verification": {
+                  "upid": "UPID:541a750a1e0c:00000025:000023D8:00000009:6ABA2CB6:verify:store1:root@pam:",
+                  "state": "ok"
+                },
+                "files": [
+                  {
+                    "filename": "root.pxar.didx",
+                    "crypt-mode": "none",
+                    "size": 3000343
+                  },
+                  {
+                    "filename": "catalog.pcat1.didx",
+                    "crypt-mode": "none",
+                    "size": 66
+                  },
+                  {
+                    "filename": "index.json.blob",
+                    "crypt-mode": "none",
+                    "size": 452
+                  }
+                ],
+                "size": 3000861,
+                "owner": "backupuser@pbs",
+                "protected": false
+              },
+              {
+                "backup-type": "host",
+                "backup-id": "fresh01",
+                "backup-time": 1790594854,
+                "files": [],
+                "owner": "backupuser@pbs",
+                "protected": false
+              }
+            ]
+          }
+        }
+      },
+      "payload": {
+        "pbs": {
+          "reachable": true,
+          "version": "4.2",
+          "release": "0",
+          "fingerprint": "b7:24:5c:7a:78:c1:25:6c:0d:a9:ff:4a:6c:30:2e:10:03:ce:82:2c:00:d7:e9:82:1e:fc:00:93:f4:de:85:4f",
+          "age_s": 0,
+          "built_at": 1790640000,
+          "scope": "full",
+          "datastores": [
+            {
+              "store": "store1",
+              "backend_type": "filesystem",
+              "mount_status": "nonremovable",
+              "maintenance_mode": null,
+              "maintenance_message": null,
+              "total": 62671097856,
+              "used": 31215251456,
+              "avail": 28239130624,
+              "estimated_full_date": null,
+              "gc": {
+                "schedule": "daily",
+                "next_run": 1790640000,
+                "last_run_starttime": 1790586058,
+                "last_run_state": "WARNINGS: 1",
+                "last_run_endtime": 1790586060,
+                "duration": 2,
+                "index_file_count": 13,
+                "index_data_bytes": 78002299,
+                "disk_bytes": 69539959,
+                "disk_chunks": 29,
+                "pending_bytes": 0,
+                "pending_chunks": 0,
+                "removed_bytes": 0,
+                "removed_chunks": 0,
+                "removed_bad": 0,
+                "still_bad": 0
+              },
+              "namespaces": [
+                "",
+                "clusterA",
+                "clusterA/sub"
+              ],
+              "unread_namespaces": []
+            },
+            {
+              "store": "store2",
+              "backend_type": "filesystem",
+              "mount_status": "nonremovable",
+              "maintenance_mode": null,
+              "maintenance_message": null,
+              "total": 62671097856,
+              "used": 31215251456,
+              "avail": 28239130624,
+              "estimated_full_date": null,
+              "gc": {
+                "schedule": null,
+                "next_run": null,
+                "last_run_starttime": null,
+                "last_run_state": null,
+                "last_run_endtime": null,
+                "duration": null,
+                "index_file_count": null,
+                "index_data_bytes": null,
+                "disk_bytes": null,
+                "disk_chunks": null,
+                "pending_bytes": null,
+                "pending_chunks": null,
+                "removed_bytes": null,
+                "removed_chunks": null,
+                "removed_bad": null,
+                "still_bad": null
+              },
+              "namespaces": [
+                "",
+                "clusterA",
+                "clusterA/sub"
+              ],
+              "unread_namespaces": []
+            }
+          ],
+          "groups": [
+            {
+              "store": "store1",
+              "ns": "",
+              "type": "host",
+              "id": "db01",
+              "last_backup": 1790585927,
+              "count": 1,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 3000969,
+              "crypt_mode": "encrypt",
+              "protected": false,
+              "verify_state": "ok",
+              "verify_time": 1790586038,
+              "last_verified_ok": 1790585927,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store1",
+              "ns": "",
+              "type": "host",
+              "id": "fresh01",
+              "last_backup": null,
+              "count": 1,
+              "in_progress": true,
+              "in_progress_since": 1790594854,
+              "size": null,
+              "crypt_mode": null,
+              "protected": null,
+              "verify_state": null,
+              "verify_time": null,
+              "last_verified_ok": null,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store1",
+              "ns": "",
+              "type": "host",
+              "id": "web01",
+              "last_backup": 1790587027,
+              "count": 4,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 60000631,
+              "crypt_mode": "none",
+              "protected": false,
+              "verify_state": null,
+              "verify_time": null,
+              "last_verified_ok": 1790585958,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store1",
+              "ns": "clusterA",
+              "type": "vm",
+              "id": "100",
+              "last_backup": 1790585935,
+              "count": 1,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 3000389,
+              "crypt_mode": "none",
+              "protected": false,
+              "verify_state": "failed",
+              "verify_time": 1790586038,
+              "last_verified_ok": null,
+              "verify_failed_count": 1
+            },
+            {
+              "store": "store1",
+              "ns": "clusterA",
+              "type": "vm",
+              "id": "101",
+              "last_backup": 1790586948,
+              "count": 2,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 60000629,
+              "crypt_mode": "none",
+              "protected": false,
+              "verify_state": null,
+              "verify_time": null,
+              "last_verified_ok": 1790585936,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store1",
+              "ns": "clusterA/sub",
+              "type": "ct",
+              "id": "200",
+              "last_backup": 1790585935,
+              "count": 1,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 3000855,
+              "crypt_mode": "none",
+              "protected": false,
+              "verify_state": "ok",
+              "verify_time": 1790586038,
+              "last_verified_ok": 1790585935,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store2",
+              "ns": "",
+              "type": "host",
+              "id": "db01",
+              "last_backup": 1790585927,
+              "count": 1,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 3000969,
+              "crypt_mode": "encrypt",
+              "protected": false,
+              "verify_state": null,
+              "verify_time": null,
+              "last_verified_ok": null,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store2",
+              "ns": "",
+              "type": "host",
+              "id": "web01",
+              "last_backup": 1790585958,
+              "count": 3,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 60000709,
+              "crypt_mode": "none",
+              "protected": false,
+              "verify_state": null,
+              "verify_time": null,
+              "last_verified_ok": null,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store2",
+              "ns": "clusterA",
+              "type": "vm",
+              "id": "100",
+              "last_backup": null,
+              "count": 0,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": null,
+              "crypt_mode": null,
+              "protected": null,
+              "verify_state": null,
+              "verify_time": null,
+              "last_verified_ok": null,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store2",
+              "ns": "clusterA",
+              "type": "vm",
+              "id": "101",
+              "last_backup": 1790585936,
+              "count": 1,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 3000968,
+              "crypt_mode": "encrypt",
+              "protected": false,
+              "verify_state": null,
+              "verify_time": null,
+              "last_verified_ok": null,
+              "verify_failed_count": 0
+            },
+            {
+              "store": "store2",
+              "ns": "clusterA/sub",
+              "type": "ct",
+              "id": "200",
+              "last_backup": 1790585935,
+              "count": 1,
+              "in_progress": false,
+              "in_progress_since": null,
+              "size": 3000855,
+              "crypt_mode": "none",
+              "protected": false,
+              "verify_state": null,
+              "verify_time": null,
+              "last_verified_ok": null,
+              "verify_failed_count": 0
+            }
+          ],
+          "sync_jobs": [
+            {
+              "id": "pushjob",
+              "store": "store1",
+              "ns": "",
+              "max_depth": null,
+              "schedule": "daily",
+              "next_run": 1790640000,
+              "last_run_starttime": null,
+              "last_run_state": null,
+              "last_run_endtime": null,
+              "remote": "selfremote",
+              "remote_store": "store2",
+              "remote_ns": "",
+              "direction": "push"
+            },
+            {
+              "id": "sjob-dead",
+              "store": "store2",
+              "ns": "",
+              "max_depth": null,
+              "schedule": "hourly",
+              "next_run": 1790589600,
+              "last_run_starttime": 1790586082,
+              "last_run_state": "client error (Connect)",
+              "last_run_endtime": 1790586089,
+              "remote": "deadremote",
+              "remote_store": "store1",
+              "remote_ns": "",
+              "direction": "pull"
+            },
+            {
+              "id": "sjob1",
+              "store": "store2",
+              "ns": "",
+              "max_depth": null,
+              "schedule": "hourly",
+              "next_run": 1790589600,
+              "last_run_starttime": 1790586081,
+              "last_run_state": "sync failed with some errors.",
+              "last_run_endtime": 1790586081,
+              "remote": "selfremote",
+              "remote_store": "store1",
+              "remote_ns": "",
+              "direction": "pull"
+            }
+          ],
+          "verify_jobs": [
+            {
+              "id": "vjob1",
+              "store": "store1",
+              "ns": "",
+              "max_depth": null,
+              "schedule": "daily",
+              "next_run": 1790640000,
+              "last_run_starttime": 1790586079,
+              "last_run_state": "OK",
+              "last_run_endtime": 1790586079,
+              "outdated_after": 30,
+              "ignore_verified": true
+            }
+          ],
+          "prune_jobs": [
+            {
+              "id": "pjob1",
+              "store": "store1",
+              "ns": "",
+              "max_depth": null,
+              "schedule": "daily",
+              "next_run": 1790640000,
+              "last_run_starttime": 1790586080,
+              "last_run_state": "OK",
+              "last_run_endtime": 1790586080,
+              "disabled": false
+            }
+          ],
+          "errors": []
+        }
+      }
+    }
+  }
+}

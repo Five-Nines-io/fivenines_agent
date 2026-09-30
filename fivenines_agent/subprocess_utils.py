@@ -60,7 +60,7 @@ def run_privileged(cmd: List[str], timeout: int, **kwargs):
 
     Killing the process group instead does not help: the group is root-owned
     too, so the kill fails the same way. What protects the loop is not waiting:
-    bounded.call_bounded (shared with the libvirt probe and io_topology) runs it
+    bounded.call_bounded (shared with the libvirt probe, io_topology and pbs) runs it
     in a daemon worker, gives up at the deadline, and lets the wedged child and
     its thread finish in the background whenever sudo returns.
 

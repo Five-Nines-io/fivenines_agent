@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import fivenines_agent.proxmox as proxmox_module
+import fivenines_agent.scrub as scrub_module
 from fivenines_agent.cache import TTLCache
 from fivenines_agent.proxmox import ProxmoxCollector, _record_failure, proxmox_metrics
 
@@ -1424,6 +1425,88 @@ def test_collect_storage_pool_enrichment_sets_zfspool_omits_dir():
     assert "pool" not in by_name["local"]
 
 
+def test_collect_storage_pbs_join_key():
+    """A 'pbs' storage carries where it points (the PBS collector's join key);
+    it is omitted when the config does not name a server and a datastore, and
+    no other storage type ever carries it."""
+    fingerprint = "B7:24:5C:7A:78:C1:25:6C:0D:A9:FF:4A:6C:30:2E:10:03:CE:82:2C:00:D7:E9:82:1E:FC:00:93:F4:DE:85:4F"
+    pmock = make_proxmox_mock(
+        nodes=[{"node": "pve1"}],
+        storage_by_node={
+            "pve1": [
+                {"storage": "pbs-a", "type": "pbs", "active": 1},
+                {"storage": "pbs-b", "type": "pbs", "active": 1},
+                {"storage": "pbs-c", "type": "pbs", "active": 1},
+                {"storage": "local", "type": "dir", "active": 1},
+            ]
+        },
+        storage_config=[
+            {
+                "storage": "pbs-a", "type": "pbs", "server": "10.0.0.5", "port": "8008",
+                "datastore": "main", "namespace": "clusterA", "username": "backup@pbs",
+                "fingerprint": fingerprint,
+            },
+            {"storage": "pbs-b", "type": "pbs", "server": "pbs.example", "datastore": "main"},
+            {"storage": "pbs-c", "type": "pbs", "datastore": "main"},
+            {"storage": "local", "type": "dir", "server": "ignored", "datastore": "ignored"},
+        ],
+    )
+    by_name = {p["name"]: p for p in make_collector(proxmox_mock=pmock)._collect_storage()}
+    assert by_name["pbs-a"]["pbs"] == {
+        "server": "10.0.0.5", "port": 8008, "datastore": "main",
+        "namespace": "clusterA", "fingerprint": fingerprint.lower(),
+    }
+    assert by_name["pbs-b"]["pbs"] == {
+        "server": "pbs.example", "port": None, "datastore": "main",
+        "namespace": "", "fingerprint": None,
+    }
+    assert "pbs" not in by_name["pbs-c"]
+    assert "pbs" not in by_name["local"]
+
+
+def test_pbs_storage_ref_scrubs_and_ships_only_the_join_fields():
+    """The join key is customer-controlled config: every string is scrubbed and
+    capped, a blank fingerprint is null (never ""), and nothing beyond the five
+    join fields (username, password, encryption-key...) ever ships."""
+    ref = proxmox_module._pbs_storage_ref({
+        "server": "pbs\x00.example", "datastore": "d" * 600, "port": "junk",
+        "namespace": None, "fingerprint": "  AB:CD  ", "username": "backup@pbs",
+        "password": "hunter2", "encryption-key": "secret-key",
+    })
+    assert ref == {
+        "server": "pbs.example", "port": None, "datastore": "d" * 500,
+        "namespace": "", "fingerprint": "ab:cd",
+    }
+    blank = proxmox_module._pbs_storage_ref(
+        {"server": "s", "datastore": "d", "fingerprint": "   "}
+    )
+    assert blank["fingerprint"] is None
+    assert proxmox_module._pbs_storage_ref({"server": "", "datastore": "d"}) is None
+    assert proxmox_module._pbs_storage_ref({"server": "s", "datastore": ""}) is None
+
+
+def test_collect_storage_pbs_join_key_is_best_effort():
+    """A token that cannot read /storage degrades to no 'pbs' key on a pbs
+    storage row -- the row still ships and storage_ok stays True, exactly like
+    the 'pool' enrichment."""
+    pmock = make_proxmox_mock(
+        version={"version": "8"},
+        cluster_status=[],
+        nodes=[{"node": "pve1"}],
+        node_status_by_name={"pve1": {"uptime": 1}},
+        qemu_by_node={"pve1": []},
+        lxc_by_node={"pve1": []},
+        storage_by_node={
+            "pve1": [{"storage": "pbs-main", "type": "pbs", "active": 1}]
+        },
+        storage_config_raises=True,
+    )
+    result = make_collector(proxmox_mock=pmock).collect()
+    assert [p["name"] for p in result["storage"]] == ["pbs-main"]
+    assert "pbs" not in result["storage"][0]
+    assert result["collection"]["storage_ok"] is True
+
+
 def test_collect_storage_pool_omitted_when_absent_from_config():
     """T80 [#49]: a storage present in per-node runtime status but absent from
     the datacenter /storage config gets no 'pool' (omitted, never null)."""
@@ -1554,9 +1637,11 @@ _GUEST_KEYS = {
     "uptime",
 }
 _STORAGE_KEYS = {"name", "node", "type", "total", "used", "available", "active"}
-# 'pool' (#49) is the only key a storage entry may carry beyond the base 7 --
-# present for pool-backed types (zfspool/rbd/cephfs), omitted otherwise.
-_STORAGE_OPTIONAL_KEYS = {"pool"}
+# The only keys a storage entry may carry beyond the base 7: 'pool' (#49),
+# present for pool-backed types (zfspool/rbd/cephfs), and 'pbs' (agent 1.21.0+),
+# present for type 'pbs'; each omitted otherwise.
+_STORAGE_OPTIONAL_KEYS = {"pool", "pbs"}
+_PBS_REF_KEYS = {"server", "port", "datastore", "namespace", "fingerprint"}
 # backups block (#156, agent 1.19.0+)
 _BACKUPS_KEYS = {"age_s", "guest_backups", "tasks", "jobs", "not_backed_up", "errors"}
 _GUEST_BACKUP_KEYS = {
@@ -1621,6 +1706,9 @@ def test_contract_payload_key_sets(scenario_name):
         keys = set(storage)
         assert _STORAGE_KEYS <= keys
         assert keys - _STORAGE_KEYS <= _STORAGE_OPTIONAL_KEYS
+        if "pbs" in keys:
+            assert storage["type"] == "pbs"
+            assert set(storage["pbs"]) == _PBS_REF_KEYS
     backups = payload["backups"]
     if backups is None:  # 'backups_block_failed' -> node listing failed
         return
@@ -1867,7 +1955,7 @@ def test_scrub_str_sanitizes_and_caps():
     assert scrub("a\x00b\x00") == "ab"
     assert "\ud800" not in scrub("x\ud800y")  # lone surrogate replaced
     assert scrub(100) == "100"
-    assert len(scrub("z" * 10_000)) == proxmox_module._BACKUP_FIELD_MAX_LEN
+    assert len(scrub("z" * 10_000)) == scrub_module.FIELD_MAX_LEN
     assert scrub("abc", max_len=2) == "ab"
 
 
@@ -1875,10 +1963,11 @@ def test_log_safe_bounds_input_before_redact():
     """F1 (adversarial): a proxmoxer exception's str() carries the full HTTP
     error body; redact() must see a PREFIX-BOUNDED string (like the wire path),
     never an unbounded customer blob, or it is a CPU/mem sink on the watchdog
-    loop. Assert redact() is handed at most _ERROR_PRE_REDACT_MAX_LEN chars."""
-    with patch.object(proxmox_module, "redact", side_effect=lambda t: t) as m:
+    loop. Assert redact() is handed at most scrub.ERROR_PRE_REDACT_MAX_LEN chars.
+    (_log_safe is the shared scrub.log_safe, so redact is patched there.)"""
+    with patch.object(scrub_module, "redact", side_effect=lambda t: t) as m:
         proxmox_module._log_safe("z" * 100000)
-    assert len(m.call_args[0][0]) == proxmox_module._ERROR_PRE_REDACT_MAX_LEN
+    assert len(m.call_args[0][0]) == scrub_module.ERROR_PRE_REDACT_MAX_LEN
 
 
 def test_node_name_is_scrubbed_on_the_wire():
@@ -1905,7 +1994,7 @@ def test_log_safe_collapses_control_chars_and_redacts():
     assert safe("a\nb") == "a b"
     assert safe("secret=AKIAIOSFODNN7EXAMPLE") == "secret=[REDACTED]"
     assert safe(RuntimeError("boom\n403")) == "boom 403"
-    assert len(safe("a b " * 2000)) == proxmox_module._ERROR_MAX_LEN
+    assert len(safe("a b " * 2000)) == scrub_module.ERROR_MAX_LEN
 
 
 def test_scrub_csv_truncates_at_comma_never_splits_an_id():
@@ -1917,12 +2006,12 @@ def test_scrub_csv_truncates_at_comma_never_splits_an_id():
     # Over the cap: truncate at the last comma, keeping only whole ids.
     ids = ",".join(str(n) for n in range(100, 400))  # > 500 chars
     out = csv(ids)
-    assert len(out) <= proxmox_module._BACKUP_FIELD_MAX_LEN
+    assert len(out) <= scrub_module.FIELD_MAX_LEN
     assert all(part.isdigit() for part in out.split(","))  # no split id
     assert not out.endswith(",")
     # A single over-long token with no comma before the cap: hard char cut.
     out2 = csv("9" * 800)
-    assert len(out2) == proxmox_module._BACKUP_FIELD_MAX_LEN
+    assert len(out2) == scrub_module.FIELD_MAX_LEN
 
 
 def test_build_backups_block_null_when_node_listing_not_a_list():
@@ -2839,3 +2928,17 @@ def test_deadline_hit_none_means_unbounded():
     assert errors == [
         {"scope": "jobs", "node": None, "storage": None, "message": proxmox_module._DEADLINE_MESSAGE}
     ]
+
+
+def test_sanitation_is_the_shared_scrub_module_not_a_copy():
+    """Regression for the scrub.py extraction: proxmox keeps its old private
+    names, but they must BE the shared helpers (its caps are scrub's own), so
+    the PVE backups block and the PBS collector cannot drift apart."""
+    assert proxmox_module._scrub_str is scrub_module.scrub_str
+    assert proxmox_module._log_safe is scrub_module.log_safe
+    assert proxmox_module._as_int is scrub_module.as_int
+    assert proxmox_module._as_bool is scrub_module.as_bool
+    assert proxmox_module.scrub_message is scrub_module.scrub_message
+    # The one behaviour the extraction changed for proxmox: its log lines are
+    # now ASCII-only, so print() cannot raise on a non-UTF-8 stdout.
+    assert proxmox_module._log_safe("stor\xe9\nage") == "stor\\xe9 age"

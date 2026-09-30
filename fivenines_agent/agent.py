@@ -48,6 +48,7 @@ from fivenines_agent.logs import build_capture_bundle
 from fivenines_agent.machine_id import get_machine_id
 from fivenines_agent.mqtt import mqtt_metrics, shutdown_mqtt
 from fivenines_agent.packages import packages_sync
+from fivenines_agent.pbs import reset_timeout_holds as reset_pbs_timeout_holds
 from fivenines_agent.permissions import get_permissions, print_capabilities_banner
 from fivenines_agent.ping import tcp_ping
 from fivenines_agent.synchronization_queue import SynchronizationQueue
@@ -631,6 +632,9 @@ class Agent:
             # journal_units.allow gets it applied now rather than on the next
             # stat. (The policy is stat-cached, so this is belt and braces.)
             journal_policy.reset_cache()
+            # And the one a PBS read held after it timed out waits for: its
+            # datastore is repaired, send it again (pbs._timeout_backoff).
+            reset_pbs_timeout_holds()
 
     def _apply_config_driven_refresh(self, config):
         """Run config-driven permission refresh for this tick, then republish

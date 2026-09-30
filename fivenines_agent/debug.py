@@ -73,8 +73,9 @@ def adopt_log_capture(buffer):
     dispatcher's telemetry. list.append is atomic. A worker abandoned past its
     deadline keeps the list it was given: a line it logs later lands in that
     tick's telemetry if the list was already non-empty (stop_log_capture
-    returns it as is) and is lost otherwise. No bounded call logs from its
-    worker today; a per-collector bound (TODOS.md) would have to settle that.
+    returns it as is) and is lost otherwise. pbs.py logs from its worker (its
+    whole collection runs there), so its late lines follow that rule; the
+    stall itself is logged on the caller's thread.
     """
     _thread_local.log_buffer = buffer
 

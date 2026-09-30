@@ -3,6 +3,8 @@
 import sys
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 # Mock libvirt before any fivenines_agent imports that transitively need it
 sys.modules.setdefault("libvirt", MagicMock())
 
@@ -47,6 +49,7 @@ def test_registry_has_expected_config_keys():
         "mysql",
         "rabbitmq",
         "proxmox",
+        "pbs",
         "wireguard",
         "tailscale",
         "openvpn",
@@ -104,6 +107,35 @@ def test_collect_metrics_kwargs_with_non_dict_config():
 
     mock_fn.assert_called_once_with()
     assert data == {"svc": "result"}
+
+
+def test_pbs_registry_entry_splats_config_and_never_nulls():
+    """config['pbs'] is splatted into the real pbs_metrics: a key the server adds
+    later is ignored rather than a TypeError (which the dispatcher would turn
+    into data['pbs'] = None), and a bare `true` still yields an envelope. Both
+    configs fail agent-side before any request, so nothing touches the network."""
+    data = {}
+    collect_metrics(
+        {
+            "pbs": {
+                "host": "pbs.example",
+                "verify_ssl": False,
+                "token_id": "a@pbs!t",
+                "token_secret": "s",
+                "future_key": 1,
+            }
+        },
+        data,
+    )
+    assert data["pbs"]["error_type"] == "config_error"
+    assert data["pbs"]["error_message"].startswith("refusing to send the API token")
+    data = {}
+    collect_metrics({"pbs": True}, data)
+    assert data["pbs"] == {
+        "reachable": False,
+        "error_type": "config_error",
+        "error_message": "no API token configured",
+    }
 
 
 def test_collect_metrics_multi_key():
@@ -539,3 +571,42 @@ def test_qemu_refused_uri_is_still_capability_gated_through_registry(
     )
     assert "qemu" not in data
     fake_libvirt.openReadOnly.assert_not_called()
+
+
+@pytest.mark.parametrize("key", ["name", "fn", "telemetry"])
+def test_a_pushed_key_named_like_the_wrapper_arguments_reaches_the_collector(key):
+    """A server-pushed dict is splatted through _collect_with_telemetry: a key
+    named like one of ITS parameters must reach the collector (which ignores
+    it) instead of raising a TypeError outside the collector's error handling,
+    where it would stop the whole agent."""
+    data = {}
+    collect_metrics({"pbs": {"host": "pbs.example", key: "x"}}, data, telemetry={})
+    assert data["pbs"]["error_type"] == "config_error"
+
+
+def test_a_pbs_failure_logged_on_its_bounded_worker_reaches_telemetry(monkeypatch):
+    """pbs_metrics runs its collection on a bounded worker thread, while log
+    capture is thread-local: the error line the worker logs must still land in
+    the dispatcher's telemetry for "pbs", as it did when the collection ran on
+    the calling thread. (Reset first: a steady failure logs at error only once
+    per process, and other tests here hit the same config error.)"""
+    from fivenines_agent import pbs
+
+    monkeypatch.setattr(pbs, "_last_logged_failure", None)
+    data, telemetry = {}, {}
+    collect_metrics(
+        {
+            "pbs": {
+                "host": "pbs.example",
+                "verify_ssl": False,
+                "token_id": "a@pbs!t",
+                "token_secret": "s",
+            }
+        },
+        data,
+        telemetry,
+    )
+    assert data["pbs"]["error_type"] == "config_error"
+    assert telemetry["pbs"]["errors"] == [
+        "PBS collection failed (config_error): " + data["pbs"]["error_message"]
+    ]
