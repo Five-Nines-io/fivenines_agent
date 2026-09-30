@@ -550,9 +550,9 @@ def test_resync_systemd_runtime_noop_on_non_systemd_host(mock_refresh):
 def test_handle_sighup_refresh_releases_held_pbs_reads(
     mock_reset, mock_policy, mock_force, mock_refresh, mock_banner
 ):
-    """A PBS read held after it timed out (a namespace walk PBS may still be
-    running) is sent again only on SIGHUP: the operator's 'datastore
-    repaired' signal."""
+    """The PBS namespace walks held since one timed out (a walk PBS may still
+    be running) are sent again only on SIGHUP -- the operator's 'storage
+    repaired' signal -- or a restart."""
     from fivenines_agent.agent import refresh_permissions_event
 
     agent = make_agent()
@@ -588,7 +588,7 @@ def test_only_sighup_releases_a_held_pbs_read(
     from fivenines_agent import pbs
     from fivenines_agent.agent import refresh_permissions_event
 
-    held = ("/admin/datastore/ds/namespace", ())
+    held = pbs._WALK_HOLD
     monkeypatch.setattr(pbs, "_timeout_backoff", {held: (math.inf, 1, None)})
     # Patched too: SIGHUP replaces the module's block cache, which must not
     # leak into the tests that run after this one.

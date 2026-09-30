@@ -632,8 +632,9 @@ class Agent:
             # journal_units.allow gets it applied now rather than on the next
             # stat. (The policy is stat-cached, so this is belt and braces.)
             journal_policy.reset_cache()
-            # And the one a PBS read held after it timed out waits for: its
-            # datastore is repaired, send it again (pbs._timeout_backoff).
+            # And the PBS namespace walks held since one timed out (and the
+            # backed-off reads): the storage is repaired, send them again
+            # (pbs.reset_timeout_holds).
             reset_pbs_timeout_holds()
 
     def _apply_config_driven_refresh(self, config):

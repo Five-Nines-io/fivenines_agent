@@ -53,6 +53,7 @@ def _fresh_state(monkeypatch):
     monkeypatch.setattr(pbs, "_last_logged_failure", None)
     monkeypatch.setattr(pbs, "_store_rotation", 0)
     monkeypatch.setattr(pbs, "_read_failures", {"previous": set(), "current": set()})
+    monkeypatch.setattr(pbs, "_read_failure_lines", {"error": 0, "quieted": 0})
 
 
 # --- test doubles ----------------------------------------------------------
@@ -365,6 +366,7 @@ _SUCCESS_KEYS = {
     "fingerprint",
     "age_s",
     "built_at",
+    "walks_held",
     "datastores",
     "groups",
     "sync_jobs",
@@ -5670,6 +5672,7 @@ def test_a_timed_out_namespace_listing_is_held_until_a_reload(monkeypatch):
     assert out["datastores"][0]["namespaces"] is None
     [key] = pbs._timeout_backoff
     assert key == pbs._WALK_HOLD
+    assert out["walks_held"] is True
     failure = ("namespaces", "ds", None, "t")
     assert pbs._timeout_backoff[key] == (math.inf, 1, failure)
     assert (
@@ -5692,6 +5695,7 @@ def test_a_timed_out_namespace_listing_is_held_until_a_reload(monkeypatch):
     assert len(_ns_calls(session)) == 1
     assert out["datastores"][0]["namespaces"] == [""]
     assert pbs._timeout_backoff == {}
+    assert out["walks_held"] is False
 
 
 # Value: protects=a hold surviving any configuration change -- a pasted
@@ -5726,9 +5730,13 @@ def test_a_hold_survives_any_configuration_change(monkeypatch, change, url):
 
 
 # Value: protects=the one deeper ACL entry the permissions map DOES show (a
-#   path present under an absent ancestor); fails_when=the ancestor walk is
-#   dropped, or a namespace-level gap is read as a datastore one;
+#   path present under an absent ancestor); fails_when=the parent/datastore
+#   check is dropped, or a namespace-level gap is read as a datastore one;
 #   why_new=nothing read the map's shape below /datastore before; seam=none
+# Value (row): protects=a gap two namespace levels deep, below an audited
+#   namespace, still reads hidden now that each path checks only its parent;
+#   fails_when=the parent check is narrowed to one fixed namespace depth;
+#   why_new=every hidden case sat at the first namespace level; seam=none
 def test_a_path_below_an_absent_one_names_a_hidden_datastore_or_namespace():
     audit = {"Datastore.Audit": True}
     assert pbs._hidden_below(PERMS_FULL) == (False, set())
@@ -5742,6 +5750,9 @@ def test_a_path_below_an_absent_one_names_a_hidden_datastore_or_namespace():
     # A namespace hidden inside an audited datastore: not the datastore.
     deep = {**PERMS_FULL, "/datastore/s1": audit, "/datastore/s1/a/b": audit}
     assert pbs._hidden_below(deep) == (True, set())
+    # NoAccess on s1/a/b below an audited s1/a, an audit grant deeper still.
+    deeper = {**visible, "/datastore/s1/a/b/c": audit}
+    assert pbs._hidden_below(deeper) == (True, set())
     odd = {**PERMS_FULL, "/remote/r/x": audit, "/datastore/s3/a": "junk"}
     assert pbs._hidden_below(odd) == (False, set())
 
@@ -5870,10 +5881,24 @@ def test_a_deep_permissions_chain_is_checked_in_linear_time():
 #   the jobs of what it hides); fails_when=only a scoped token flags them, so
 #   the server prunes jobs that still exist; why_new=reproduced live by the
 #   red team (vjob1/pjob1 gone, no flag); seam=none
-def test_a_hidden_path_flags_the_job_lists_partial(monkeypatch):
-    audit = {"Datastore.Audit": True}
+# Value (row): protects=a namespace hidden inside an audited datastore flags
+#   the job lists too (PBS filters jobs by their namespace); fails_when=the
+#   flag keys on the datastore-level gaps alone; why_new=the first row hid a
+#   datastore, where both signals are set; seam=none
+@pytest.mark.parametrize(
+    "hidden",
+    [
+        {"/datastore/ds/a/b": {"Datastore.Audit": True}},
+        {
+            "/datastore/ds": {"Datastore.Audit": True},
+            "/datastore/ds/a/b": {"Datastore.Audit": True},
+        },
+    ],
+    ids=["datastore_hidden", "namespace_hidden"],
+)
+def test_a_hidden_path_flags_the_job_lists_partial(monkeypatch, hidden):
     responses = minimal_responses(
-        **{"/access/permissions": ok({**PERMS_FULL, "/datastore/ds/a/b": audit})}
+        **{"/access/permissions": ok({**PERMS_FULL, **hidden})}
     )
     out, _ = collect(monkeypatch, responses)
     assert out["scope"] == "partial"
@@ -5918,8 +5943,9 @@ def test_a_stalled_tls_handshake_late_in_the_budget_holds_nothing(monkeypatch):
 
 
 def test_a_timeout_backoff_is_capped_and_per_request(monkeypatch):
-    """A retried read's delay stops doubling at _TIMEOUT_BACKOFF_MAX; a held
-    one never expires. The key is the exact request, and nothing else."""
+    """A retried read's delay stops doubling at _TIMEOUT_BACKOFF_MAX; the
+    walk hold never expires. A retry's key is the exact request, and nothing
+    else."""
     use_clock(monkeypatch, Clock())
     key = pbs._timeout_backoff_key("/p", {"ns": "a"})
     assert key == ("/p", (("ns", "a"),))
@@ -5932,23 +5958,24 @@ def test_a_timeout_backoff_is_capped_and_per_request(monkeypatch):
         12,
         failure,
     )
-    pbs._arm_timeout_backoff(key, failure, hold=True)
-    assert pbs._timeout_backoff[key] == (math.inf, 13, failure)
+    held = ("namespaces", "ds", None, "t")
+    pbs._arm_timeout_backoff(pbs._WALK_HOLD, held, hold=True)
+    assert pbs._timeout_backoff[pbs._WALK_HOLD] == (math.inf, 1, held)
 
 
-# Value: protects=the backoff dict's bound, a hold (which never expires)
-# included; fails_when=the cap check is dropped or
-# evicts the newest entry; why_new=no other test arms past the cap; seam=none
+# Value: protects=the backoff dict's bound; fails_when=the cap check is
+#   dropped or evicts the newest entry; why_new=no other test arms past the
+#   cap; seam=none
 def test_the_timeout_backoff_drops_its_oldest_entry_at_the_cap(monkeypatch):
     use_clock(monkeypatch, Clock())
     monkeypatch.setattr(pbs, "_TIMEOUT_BACKOFF_ENTRIES", 3)
-    failure = ("namespaces", "ds", None, "t")
+    failure = ("groups", "ds", "a", "t")
     keys = [(f"/p{i}", ()) for i in range(4)]
     for key in keys[:3]:
-        pbs._arm_timeout_backoff(key, failure, hold=True)
-    pbs._arm_timeout_backoff(keys[1], failure, hold=True)  # re-armed: no drop
+        pbs._arm_timeout_backoff(key, failure, hold=False)
+    pbs._arm_timeout_backoff(keys[1], failure, hold=False)  # re-armed: no drop
     assert list(pbs._timeout_backoff) == keys[:3]
-    pbs._arm_timeout_backoff(keys[3], failure, hold=True)
+    pbs._arm_timeout_backoff(keys[3], failure, hold=False)
     assert list(pbs._timeout_backoff) == keys[1:]
     assert pbs._timeout_backoff[keys[1]][1] == 2
 
@@ -5960,7 +5987,7 @@ def test_the_timeout_backoff_cap_drops_a_retry_before_a_hold(monkeypatch):
     use_clock(monkeypatch, Clock())
     monkeypatch.setattr(pbs, "_TIMEOUT_BACKOFF_ENTRIES", 3)
     held, retried = ("namespaces", "ds", None, "t"), ("groups", "ds", "a", "t")
-    keys = [(f"/p{i}", ()) for i in range(4)]
+    keys = [pbs._WALK_HOLD] + [(f"/p{i}", ()) for i in range(1, 4)]
     pbs._arm_timeout_backoff(keys[0], held, hold=True)
     pbs._arm_timeout_backoff(keys[1], retried, hold=False)
     pbs._arm_timeout_backoff(keys[2], retried, hold=False)
@@ -6246,6 +6273,7 @@ def test_a_block_too_large_to_ship_fails_the_build(monkeypatch):
         "prune_jobs",
         "errors",
         "built_at",
+        "walks_held",
     )
     raw = json.dumps({key: out[key] for key in keys}).encode()
     size, packed = len(raw), len(gzip.compress(raw, 1))
@@ -6468,13 +6496,15 @@ def test_a_timed_out_read_that_is_not_a_walk_is_sent_again_next_build(
     assert out["errors"] == []
 
 
-# Value: protects=the held error line names the datastore to repair, and none for the aggregate usage read;
-#   fails_when=the location part of the hold log line is dropped or wrong;
-#   why_new=no test read the text of the hold log line; seam=none
+# Value: protects=only the first walk that timed out is logged as held, with
+#   no datastore for the usage status (the listing's 'on ds' line is pinned by
+#   test_a_timed_out_namespace_listing_is_held_until_a_reload);
+#   fails_when=every held walk logs its own line, or the usage line names a
+#   datastore; why_new=no test read the text of the hold log line; seam=none
 def test_a_hold_names_the_read_it_holds_in_the_log(monkeypatch):
-    """The held line is the operator's pointer to WHAT to repair: it names the
-    datastore when the read has one (its namespace listing), and none for
-    the aggregate usage status."""
+    """The held line is the operator's pointer to WHAT to repair: logged once,
+    for the walk that timed out -- here the aggregate usage status, which
+    names no datastore."""
     use_clock(monkeypatch, Clock())
     logged = capture_logs(monkeypatch)
     collect(

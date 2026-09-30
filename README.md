@@ -1218,6 +1218,10 @@ Install the agent on the Proxmox Backup Server itself (the
 [standard Linux installation](#standard-installation-linux)). It then also
 monitors the PBS host (disks, SMART, ZFS), the agent only ever sends the API
 token to the PBS on the same machine, and each PBS is reported exactly once.
+Configure each PBS on one agent only: an agent that finds a datastore's
+namespace walk stuck stops sending walks until it is reloaded, but that
+protection is per agent, so every extra agent polling the same PBS can pin one
+more of its proxy threads.
 The token secret itself is stored in your fivenines account and delivered to
 the agent in its configuration -- which is why it must be read-only. Create
 one on the PBS:

@@ -632,9 +632,11 @@ def _get(
         connect, read = min(connect, remaining), max(min(read, remaining), min_wait)
     if min_wait:
         # A TLS handshake that stalls takes the TCP connect plus the connect
-        # timeout -- under twice the connect timeout -- and urllib3 reports it
-        # as a READ timeout: half the read timeout at most keeps it short of
-        # `pending` below, however little budget is left.
+        # timeout -- under twice the connect timeout, for one address -- and
+        # urllib3 reports it as a READ timeout: half the read timeout at most
+        # keeps it short of `pending` below, however little budget is left. (A
+        # host resolving to several dead addresses before the live one can
+        # still read as pending: a hold, the safe side for the PBS.)
         connect = min(connect, read / 2)
     sent = time.monotonic()
     try:
@@ -1021,8 +1023,8 @@ _TIMEOUT_BACKOFF_MAX = 6 * 3600
 _WALK_HOLD = ("namespace walks", ())
 # One build backs off at most this many reads -- a status per datastore, a
 # /groups and a /snapshots per namespace -- plus the walk hold. Past it the
-# oldest entry is dropped, a retry first: the hold dropped would re-send a
-# walk that never ends.
+# oldest retry is dropped, never the hold: that would re-send a walk that
+# never ends.
 _TIMEOUT_BACKOFF_ENTRIES = MAX_DATASTORES + 2 * MAX_NAMESPACES + 1
 # The read timeout a held or backed-off read always gets (see _get): its
 # timing out then means PBS did not answer, not that the budget ran out.
@@ -1050,8 +1052,10 @@ def _arm_timeout_backoff(key, failure, hold):
         key not in _timeout_backoff
         and len(_timeout_backoff) >= _TIMEOUT_BACKOFF_ENTRIES
     ):
-        retries = (k for k, v in _timeout_backoff.items() if v[0] != math.inf)
-        del _timeout_backoff[next(retries, next(iter(_timeout_backoff)))]
+        # The oldest retry; never the one hold (the cap leaves room for it).
+        del _timeout_backoff[
+            next(k for k, v in _timeout_backoff.items() if v[0] != math.inf)
+        ]
     if hold:
         _timeout_backoff[key] = (math.inf, timeouts, failure)
         # Only the namespace listings (their datastore) and the usage status
@@ -1066,8 +1070,8 @@ def _arm_timeout_backoff(key, failure, hold):
 
 def _forget_stale_backoffs():
     """Retries expired this long ago (never sent again: the namespace or
-    datastore is gone) are dropped. A hold never expires:
-    _TIMEOUT_BACKOFF_ENTRIES bounds those."""
+    datastore is gone) are dropped. The one hold never expires (a SIGHUP or
+    a restart clears it)."""
     now = time.monotonic()
     for key in [
         key
@@ -1413,6 +1417,11 @@ def _build_block(session, target, deadline):
         # the same value, so the server counts BUILDS (its two-absences prune
         # rule), never payloads (a block is re-emitted ~5 times per TTL).
         "built_at": _epoch(),
+        # Every namespace walk is held (_WALK_HOLD) until a reload: every
+        # datastore's namespaces are null and no group is read, so what the
+        # server stored for this PBS is of UNKNOWN freshness -- the one signal
+        # it needs for that, outside the capped errors[].
+        "walks_held": _WALK_HOLD in _timeout_backoff,
     }
     too_large = _oversize(block)
     if too_large is not None:
@@ -1673,17 +1682,18 @@ def _ns_params(ns):
 def _read_usage(session, target, errors, deadline, listed):
     """(store -> its /status/datastore-usage row, or None when unread; whether
     the read FAILED -- an HTTP or transport error, a body that is not the
-    JSON envelope, or a read held after it timed out (_timeout_backoff) --
-    rather than being skipped past the budget or answering a well-formed
-    non-list, which is when a per-datastore fallback is worth trying). The endpoint omits what a scoped token may not see
-    (measurement 6). A row's own error is recorded once per datastore in
+    JSON envelope, or a read skipped by the walk hold (_WALK_HOLD, armed by
+    ANY namespace walk that timed out) -- rather than being skipped past the
+    budget or answering a well-formed non-list, which is when a per-datastore
+    fallback is worth trying). The endpoint omits what a scoped token may not
+    see (measurement 6). A row's own error is recorded once per datastore in
     `listed` (at most MAX_DATASTORES), however many rows name it: a flood of
     rows must not crowd the job lists' 'partial:' flags out of the capped
     errors[]. PBS walks the namespaces of every datastore the token cannot
     audit (all of them for a scoped token; for a full-scope one, any a deeper
-    ACL entry hides), which never ends on an unreadable one: a timeout holds
-    the read (_timeout_backoff), and a full-scope token then reads each
-    datastore's own status instead."""
+    ACL entry hides), which never ends on an unreadable one: a timeout of
+    any walk holds every walk, this one included (_timeout_backoff), and a
+    full-scope token then reads each datastore's own status instead."""
     failures = []
     rows = _sub_read(
         session,
