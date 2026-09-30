@@ -567,3 +567,45 @@ def test_handle_sighup_refresh_releases_held_pbs_reads(
         refresh_permissions_event.clear()
 
     mock_reset.assert_called_once_with()
+
+
+# Value: protects=only SIGHUP releases the held PBS reads in the agent loop;
+#   fails_when=_handle_sighup_refresh resets the PBS holds on every tick;
+#   why_new=the mock test only checked that SIGHUP makes the call; seam=none
+@patch("fivenines_agent.agent.print_capabilities_banner")
+@patch("fivenines_agent.agent.refresh_runtime_caches")
+@patch("fivenines_agent.agent.force_inventory_resend")
+@patch("fivenines_agent.agent.journal_policy")
+def test_only_sighup_releases_a_held_pbs_read(
+    mock_policy, mock_force, mock_refresh, mock_banner, monkeypatch
+):
+    """_handle_sighup_refresh runs at the top of EVERY tick: a held PBS read (a
+    namespace walk PBS may still be running) must survive the ticks without
+    the signal -- released each tick, every rebuild would pin one more PBS
+    proxy thread -- and only SIGHUP clears it, through the real pbs state."""
+    import math
+
+    from fivenines_agent import pbs
+    from fivenines_agent.agent import refresh_permissions_event
+
+    held = ("https://pbs:8007/api2/json", "/admin/datastore/ds/namespace", ())
+    monkeypatch.setattr(pbs, "_timeout_backoff", {held: (math.inf, 1, None)})
+    # Patched too: SIGHUP replaces the module's block cache, which must not
+    # leak into the tests that run after this one.
+    cached = pbs.TTLCache()
+    monkeypatch.setattr(pbs, "_cache", cached)
+    agent = make_agent()
+    agent._systemd_force_resend = False
+    agent.permissions = MagicMock()
+    agent.static_data = {}
+    try:
+        refresh_permissions_event.clear()
+        agent._handle_sighup_refresh()
+        assert pbs._timeout_backoff == {held: (math.inf, 1, None)}
+        assert pbs._cache is cached
+        refresh_permissions_event.set()
+        agent._handle_sighup_refresh()
+        assert pbs._timeout_backoff == {}
+        assert pbs._cache is not cached  # the block reporting the hold, dropped
+    finally:
+        refresh_permissions_event.clear()

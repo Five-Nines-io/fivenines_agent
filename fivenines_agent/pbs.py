@@ -86,10 +86,12 @@ reading backup metadata):
   authentication failure to the PBS auth log every tick.
 - A read that TIMED OUT after it was sent may still be running in PBS: its
   namespace walk never ends while a <store>/ns cannot be read, holding one
-  proxy thread for good per request. So a namespace, group or usage read is
-  HELD after such a timeout -- not sent again until the agent is reloaded
-  (SIGHUP) or restarted -- and a snapshot listing is retried on a backoff
-  (_timeout_backoff).
+  proxy thread for good per request. So the two reads that walk namespaces
+  (a datastore's namespace listing; the usage status, for a scoped token)
+  are HELD after such a timeout -- not sent again until the agent is
+  reloaded (SIGHUP) or restarted -- and every other read that can take long
+  (groups, snapshots, a datastore's own status, the usage status for a
+  full-scope token) is retried on a backoff (_timeout_backoff).
 - Every request's timeouts are clamped to what is left of the tick's
   wall-clock budget, or of the per-datastore reads' half of it (so the
   collector stays NEAR it: one request can still overrun by its own clamped
@@ -130,7 +132,6 @@ call and backup state moves in hours), but /version is read EVERY tick, so a
 PBS that goes down reads unreachable on the next tick, not after the TTL.
 """
 
-import gzip
 import hashlib
 import heapq
 import ipaddress
@@ -140,6 +141,7 @@ import re
 import ssl
 import time
 import warnings
+import zlib
 from collections import Counter
 from urllib.parse import quote
 
@@ -193,6 +195,9 @@ _SMALL_MAX_BYTES = 4 * 1024 * 1024
 # identifiers barely do, so the gzipped size is bounded too.
 _MAX_BLOCK_JSON_BYTES = 8 * 1024 * 1024
 _MAX_BLOCK_GZIP_BYTES = 1024 * 1024
+# Both are counted while the block is encoded, this many characters at a time
+# (_encoded), so the build stops at the first limit crossed.
+_ENCODE_BATCH_CHARS = 64 * 1024
 
 # An error response body is only read for its message.
 _ERROR_BODY_MAX_BYTES = 4096
@@ -977,16 +982,26 @@ _UNSET = object()
 # entry; its log line stays at debug on a later identical failure).
 #
 # But every re-send of a walk that never ends pins ONE MORE proxy thread, for
-# good, and the proxy has one per core: two kill a 2-vCPU PBS. So the walks --
-# the namespace listing, /groups, the usage status, a datastore's own status
-# -- are HELD instead after a timeout: never sent again until the agent is
-# reloaded (SIGHUP: reset_timeout_holds) or restarted, the operator's signal
-# that the datastore is repaired. Only /snapshots (a bounded scan, run off the
-# proxy's core threads) retries on the backoff above.
-# {(target cache key, path, params): (retry-after monotonic time -- inf for a
-#  hold --, timeouts, the _read_failures key of its failure)}.
+# good, and the proxy has one per core: two kill a 2-vCPU PBS. So the two
+# reads that walk namespaces -- a datastore's namespace listing, and the
+# usage status for a scoped token -- are HELD instead after a timeout: never
+# sent again until the agent is reloaded (SIGHUP: reset_timeout_holds) or
+# restarted, the operator's signal that the datastore is repaired. The other
+# reads that can take long all END (PBS source: /groups reads one level and
+# stops at its first error, a datastore's status is one statfs, the usage
+# status of a full-scope token walks nothing), so holding them for good
+# would only blind a PBS that is slow: they retry on the backoff above.
+# {(target base URL, path, params): (retry-after monotonic time -- inf for a
+#  hold --, timeouts, the _read_failures key of its failure)}. Keyed on the
+# PBS's address, not the token: the stuck walk pins that PBS's proxy whoever
+# asked, so a rotated token or a pasted fingerprint must not re-send it.
 _timeout_backoff: dict = {}
 _TIMEOUT_BACKOFF_MAX = 6 * 3600
+# Every read one build can back off or hold is a namespace listing or status
+# per datastore, or a /groups or /snapshots per namespace, plus the usage
+# status; twice that, so namespaces renamed away (their holds never expire)
+# cannot crowd out the current ones before the oldest entry is dropped.
+_TIMEOUT_BACKOFF_ENTRIES = 2 * (MAX_DATASTORES + MAX_NAMESPACES) + 1
 # The read timeout a held or backed-off read always gets (see _get): its
 # timing out then means PBS did not answer, not that the budget ran out.
 _TIMEOUT_BACKOFF_MIN_WAIT = _CONNECT_TIMEOUT
@@ -997,17 +1012,22 @@ _TIMEOUT_BACKOFF_MESSAGE = (
 _TIMEOUT_HOLD_MESSAGE = (
     "skipped: this read timed out and PBS may still be running it (a "
     "namespace walk stuck on an unreadable datastore holds a proxy thread for "
-    "good): not sent again until the agent is reloaded (SIGHUP) -- repair the "
-    "datastore and restart proxmox-backup-proxy first"
+    "good): not sent again until the agent is reloaded (SIGHUP) -- if a "
+    "datastore is broken, repair it and restart proxmox-backup-proxy first"
 )
 
 
 def _timeout_backoff_key(target, path, params):
-    return (target.cache_key, path, tuple(sorted((params or {}).items())))
+    return (target.base, path, tuple(sorted((params or {}).items())))
 
 
 def _arm_timeout_backoff(key, failure, hold):
     timeouts = _timeout_backoff.get(key, (0, 0, None))[1] + 1
+    if (
+        key not in _timeout_backoff
+        and len(_timeout_backoff) >= _TIMEOUT_BACKOFF_ENTRIES
+    ):
+        del _timeout_backoff[next(iter(_timeout_backoff))]  # the oldest
     if hold:
         _timeout_backoff[key] = (math.inf, timeouts, failure)
         scope, store, ns, _ = failure
@@ -1020,22 +1040,26 @@ def _arm_timeout_backoff(key, failure, hold):
 
 
 def _forget_stale_backoffs(target):
-    """Entries of another target (the config changed) or expired this long
-    ago (never retried: the namespace or datastore is gone) are dropped: a
-    bound on the dict. A hold never expires."""
+    """Entries of another PBS (its host or port changed) or expired this long
+    ago (never retried: the namespace or datastore is gone) are dropped. A
+    hold never expires: _TIMEOUT_BACKOFF_ENTRIES bounds those."""
     now = time.monotonic()
     for key in [
         key
         for key, (retry_at, _, _) in _timeout_backoff.items()
-        if key[0] != target.cache_key or now - retry_at > _TIMEOUT_BACKOFF_MAX
+        if key[0] != target.base or now - retry_at > _TIMEOUT_BACKOFF_MAX
     ]:
         del _timeout_backoff[key]
 
 
 def reset_timeout_holds():
     """SIGHUP: the operator repaired a datastore (and restarted
-    proxmox-backup-proxy), so every held or backed-off read is sent again."""
+    proxmox-backup-proxy), so every held or backed-off read is sent again --
+    on the next tick: the cached block, which still reports them held, is
+    dropped too."""
+    global _cache
     _timeout_backoff.clear()
+    _cache = TTLCache()
 
 
 def _sub_read(
@@ -1256,7 +1280,12 @@ def _build_block(session, target, deadline):
     scope = "full" if full_scope and len(kept_stores) == len(stores) else "partial"
     del stores  # past the cap, not kept alive for the whole build
     usage, usage_failed = _read_usage(
-        session, target, errors, deadline, {entry["store"] for entry in kept_stores}
+        session,
+        target,
+        errors,
+        deadline,
+        {entry["store"] for entry in kept_stores},
+        full_scope,
     )
     backends = _read_backends(session, target, errors, deadline, kept_stores, usage)
     sync_jobs = _read_sync_jobs(session, target, errors, deadline, remote_audit)
@@ -1315,18 +1344,13 @@ def _build_block(session, target, deadline):
         # rule), never payloads (a block is re-emitted ~5 times per TTL).
         "built_at": _epoch(),
     }
-    raw = json.dumps(block).encode()
-    packed = len(gzip.compress(raw, 1)) if len(raw) <= _MAX_BLOCK_JSON_BYTES else None
-    if packed is None or packed > _MAX_BLOCK_GZIP_BYTES:
+    too_large = _oversize(block)
+    if too_large is not None:
         # Returned, not raised: cached like a block (a failed build is not),
         # so a broken PBS costs one such build per TTL, not one per tick.
-        size = f"{len(raw)} bytes of JSON"
-        if packed is not None:
-            size += f", {packed} gzipped"
         block = {
-            "too_large": f"block too large to ship: {size} (limits "
-            f"{_MAX_BLOCK_JSON_BYTES} and {_MAX_BLOCK_GZIP_BYTES} gzipped; a "
-            "working PBS keeps its fields short)"
+            "too_large": f"block too large to ship: {too_large} (a working "
+            "PBS keeps its fields short)"
         }
     _read_failures["previous"] = _read_failures["current"]
     if _read_failure_lines["quieted"]:
@@ -1337,6 +1361,40 @@ def _build_block(session, target, deadline):
         )
     # Stamped AFTER the reads, like TTLCache's own timestamp.
     return (time.monotonic(), block)
+
+
+def _encoded(block):
+    """`block` as json.dumps encodes it (ASCII), in pieces of about
+    _ENCODE_BATCH_CHARS: one zlib call each, not one per JSON token."""
+    pieces, length = [], 0
+    for piece in json.JSONEncoder().iterencode(block):
+        pieces.append(piece)
+        length += len(piece)
+        if length >= _ENCODE_BATCH_CHARS:
+            yield "".join(pieces)
+            pieces, length = [], 0
+    yield "".join(pieces)
+
+
+def _oversize(block):
+    """Which limit `block` crosses, or None. Its JSON and gzipped sizes are
+    counted as it is encoded and the count stops at the first limit crossed,
+    so the block of a broken PBS (~90 MB of JSON) is never built whole, in
+    either form."""
+    packer = zlib.compressobj(1, zlib.DEFLATED, 31)  # gzip, like the payload
+    size = packed = 0
+    for text in _encoded(block):
+        size += len(text)  # ASCII: characters are bytes
+        if size > _MAX_BLOCK_JSON_BYTES:
+            return f"over {_MAX_BLOCK_JSON_BYTES} bytes of JSON"
+        packed += len(packer.compress(text.encode()))
+        if packed > _MAX_BLOCK_GZIP_BYTES:
+            break
+    else:
+        packed += len(packer.flush())
+    if packed > _MAX_BLOCK_GZIP_BYTES:
+        return f"over {_MAX_BLOCK_GZIP_BYTES} bytes gzipped"
+    return None
 
 
 def _resume_index(order_length, start, cut):
@@ -1431,7 +1489,7 @@ def _read_store_status(session, target, errors, deadline, store):
         _store_path(store, "status"),
         store=store,
         kind=dict,
-        backoff="hold",
+        backoff="retry",
     )
     return {} if status is None else status
 
@@ -1529,7 +1587,7 @@ def _ns_params(ns):
     return {"ns": ns} if ns else None
 
 
-def _read_usage(session, target, errors, deadline, listed):
+def _read_usage(session, target, errors, deadline, listed, full_scope):
     """(store -> its /status/datastore-usage row, or None when unread; whether
     the read FAILED -- an HTTP or transport error, a body that is not the
     JSON envelope, or a read held after it timed out (_timeout_backoff) --
@@ -1538,7 +1596,9 @@ def _read_usage(session, target, errors, deadline, listed):
     (measurement 6). A row's own error is recorded once per datastore in
     `listed` (at most MAX_DATASTORES), however many rows name it: a flood of
     rows must not crowd the job lists' 'partial:' flags out of the capped
-    errors[]."""
+    errors[]. For a scoped token PBS walks the namespaces of every datastore
+    the token cannot audit, which never ends on an unreadable one: a timeout
+    then holds the read (_timeout_backoff)."""
     failures = []
     rows = _sub_read(
         session,
@@ -1548,7 +1608,7 @@ def _read_usage(session, target, errors, deadline, listed):
         "usage",
         "/status/datastore-usage",
         on_error=failures.append,
-        backoff="hold",
+        backoff="retry" if full_scope else "hold",
     )
     if rows is None:
         # A 200 whose headers came in past the budget is a skip, not a failure;
@@ -1805,7 +1865,7 @@ def _read_groups(session, target, errors, deadline, store, ns, room):
         params,
         store=store,
         ns=ns,
-        backoff="hold",
+        backoff="retry",
     )
     if listing is None:
         return None
@@ -2101,8 +2161,10 @@ def _group_row(store, ns, group, summary):
         # start time, and a pull sync writes the source's (days old while the
         # sync is live). PBS also keeps an upload orphaned by a crash (prune
         # keeps the newest unfinished snapshot). Age alone cannot tell a dead
-        # upload from a live one: a running job on that store, or the same
-        # value persisting past the job's schedule, can.
+        # upload from a live one, and what can depends on the uploader: a
+        # pull sync's running job row here, a PVE backup's vzdump task on the
+        # PVE host (through the pbs join key); a proxmox-backup-client upload
+        # or a push from another PBS leaves nothing this token can see.
         row["in_progress_since"] = newest_unfinished
     row["last_verified_ok"] = summary.get("last_verified_ok")
     row["verify_failed_count"] = summary.get("verify_failed_count", 0)

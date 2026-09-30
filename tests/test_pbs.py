@@ -15,6 +15,7 @@ import importlib.util
 import json
 import math
 import os
+import random
 import re
 import shutil
 import ssl
@@ -867,9 +868,13 @@ def test_budget_constants_are_pinned():
     assert pbs._VERSION_MAX_BYTES == 64 * 1024
     assert pbs._SMALL_MAX_BYTES == 4 * 1024 * 1024
     assert pbs._MAX_BLOCK_JSON_BYTES == 8 * 1024 * 1024
+    assert pbs._MAX_BLOCK_GZIP_BYTES == 1024 * 1024
     assert pbs._TIMEOUT_BACKOFF_MAX == 6 * 3600
     assert pbs._TIMEOUT_BACKOFF_MIN_WAIT == 5
     assert pbs._MAX_READ_FAILURE_LINES == 20
+    # Every read a build can back off or hold, twice over: a namespace
+    # renamed away cannot crowd out the holds of the current ones.
+    assert pbs._TIMEOUT_BACKOFF_ENTRIES == 2 * (100 + 1000) + 1
 
 
 # --- pbs_metrics -----------------------------------------------------------
@@ -1636,6 +1641,9 @@ def test_an_unparseable_group_row_marks_the_namespace_unread(monkeypatch):
     ]
 
 
+# Value: protects=a snapshot list missing the last_backup manifest keeps its namespace read;
+#   fails_when=a details-unknown row starts marking its namespace unread;
+#   why_new=pins the contract's list-means-read rule for this case; seam=none
 def test_a_last_backup_missing_from_the_listing_reads_unknown(monkeypatch):
     """/groups names a finished last backup that the snapshot listing does not
     show finished (an unreadable manifest, or a listing that raced a prune):
@@ -1664,6 +1672,8 @@ def test_a_last_backup_missing_from_the_listing_reads_unknown(monkeypatch):
                 "the snapshot listing",
             }
         ]
+        # A list came back: PBS's scan ended, the namespace stays read.
+        assert out["datastores"][0]["unread_namespaces"] == []
 
 
 def test_the_group_cap_marks_every_truncated_namespace_unread(monkeypatch):
@@ -2761,6 +2771,9 @@ def test_an_http_error_on_snapshots_marks_the_namespace_unread(status, monkeypat
     assert out["datastores"][0]["unread_namespaces"] == [""]
 
 
+# Value: protects=a snapshot list with an unparseable row keeps its namespace read, since the scan ended;
+#   fails_when=any snapshot error starts marking the namespace unread;
+#   why_new=the contract now states it and no test pinned it; seam=none
 def test_an_unparseable_snapshot_row_makes_the_details_unknown(monkeypatch):
     snaps = [snapshot("vm", "100", 200), {"backup-type": "vm", "backup-id": 7}]
     out, _ = collect(
@@ -2776,6 +2789,8 @@ def test_an_unparseable_snapshot_row_makes_the_details_unknown(monkeypatch):
             "message": "1 unparseable snapshot row(s): details unknown",
         }
     ]
+    # A list came back: PBS's scan ended, the namespace stays read.
+    assert out["datastores"][0]["unread_namespaces"] == []
 
 
 def test_an_unparseable_job_row_flags_the_list_partial(monkeypatch):
@@ -4577,6 +4592,32 @@ def test_budget_out_inside_a_groups_read_resumes_there(monkeypatch):
     assert pbs._rotation == 1  # "b", where the budget ran out -- not "c"
 
 
+# Value: protects=a unit whose groups were read but whose snapshot details
+#   were not (an unparseable row) as the budget ran out is read first next
+#   time; fails_when=the rotation counts it finished on its groups alone
+#   (finished = complete); why_new=every other budget test cuts a unit whose
+#   groups are unread too; seam=none
+def test_a_unit_whose_snapshot_details_outlast_the_budget_is_read_first_next_time(
+    monkeypatch,
+):
+    # test_a_unit_finished_as_the_budget_ran_out_is_not_read_first_again, but
+    # b's snapshot listing has an unparseable row.
+    clock = use_clock(monkeypatch, Clock())
+    order = _slow_groups(monkeypatch, clock, seconds=15)
+    responses = minimal_responses(
+        **{
+            "/admin/datastore/ds/namespace": ok([{"ns": ""}, {"ns": "b"}, {"ns": "c"}]),
+            "/admin/datastore/ds/groups?ns=b": ok([]),
+            "/admin/datastore/ds/snapshots?ns=b": ok([{"backup-type": "vm"}]),
+        }
+    )
+    out, _ = collect(monkeypatch, responses)
+    assert order == ["", "b"]
+    # The listing came back: b is read, its details unknown; c never started.
+    assert out["datastores"][0]["unread_namespaces"] == ["c"]
+    assert pbs._rotation == 1  # "b" again, whose details are still missing
+
+
 def test_a_hyphenated_datastore_matches_its_escaped_worker_id():
     """PBS escapes '-' in a worker id as \\x2d (the fixture's 'sjob\\x2ddead')."""
     upid = "UPID:n:1:2:3:0000000A:verify:pbs\\x2dlocal:root@pam:"
@@ -5613,11 +5654,11 @@ def test_a_timed_out_namespace_listing_is_held_until_a_reload(monkeypatch):
 
 def test_a_timeout_backoff_is_capped_and_per_request(monkeypatch):
     """A retried read's delay stops doubling at _TIMEOUT_BACKOFF_MAX; a held
-    one never expires. The key is the exact request, for one PBS target."""
+    one never expires. The key is the exact request, for one PBS address."""
     use_clock(monkeypatch, Clock())
     target = _target()
     key = pbs._timeout_backoff_key(target, "/p", {"ns": "a"})
-    assert key == (target.cache_key, "/p", (("ns", "a"),))
+    assert key == (target.base, "/p", (("ns", "a"),))
     assert pbs._timeout_backoff_key(target, "/p", None) != key
     failure = ("snapshots", "ds", "a", "t")
     for _ in range(12):
@@ -5631,6 +5672,29 @@ def test_a_timeout_backoff_is_capped_and_per_request(monkeypatch):
     assert pbs._timeout_backoff[key] == (math.inf, 13, failure)
     other = _target(port=8008)  # (localhost IS 127.0.0.1: one target)
     assert pbs._timeout_backoff_key(other, "/p", {"ns": "a"}) != key
+    # Value: protects=a hold surviving a token rotation or a pasted pin;
+    # fails_when=holds are keyed on the token (cache_key) again;
+    # why_new=the walk pins the PBS proxy whoever asked; seam=none
+    rotated = _target(host="127.0.0.1", token_id="o@pbs!t", fingerprint=FINGERPRINT)
+    assert rotated.cache_key != target.cache_key
+    assert pbs._timeout_backoff_key(rotated, "/p", {"ns": "a"}) == key
+
+
+# Value: protects=the backoff dict's bound once holds (which never expire)
+# pile up from namespaces renamed away; fails_when=the cap check is dropped or
+# evicts the newest entry; why_new=no other test arms past the cap; seam=none
+def test_the_timeout_backoff_drops_its_oldest_entry_at_the_cap(monkeypatch):
+    use_clock(monkeypatch, Clock())
+    monkeypatch.setattr(pbs, "_TIMEOUT_BACKOFF_ENTRIES", 3)
+    failure = ("groups", "ds", "a", "t")
+    keys = [("base", f"/p{i}", ()) for i in range(4)]
+    for key in keys[:3]:
+        pbs._arm_timeout_backoff(key, failure, hold=True)
+    pbs._arm_timeout_backoff(keys[1], failure, hold=True)  # re-armed: no drop
+    assert list(pbs._timeout_backoff) == keys[:3]
+    pbs._arm_timeout_backoff(keys[3], failure, hold=True)
+    assert list(pbs._timeout_backoff) == keys[1:]
+    assert pbs._timeout_backoff[keys[1]][1] == 2
 
 
 def test_a_snapshots_timeout_holds_back_only_that_namespace(monkeypatch):
@@ -5652,7 +5716,7 @@ def test_a_snapshots_timeout_holds_back_only_that_namespace(monkeypatch):
     skipped = [e for e in out["errors"] if e["message"] == pbs._TIMEOUT_BACKOFF_MESSAGE]
     assert [(e["scope"], e["ns"]) for e in skipped] == [("snapshots", "a")]
     # Held back, it never looked for the 400 that would reveal a group PBS
-    # left out of /groups: the namespace is unread (a mere timeout is not).
+    # left out of /groups: the namespace is unread, as after the timeout.
     assert out["datastores"][0]["unread_namespaces"] == ["a"]
 
 
@@ -5676,12 +5740,12 @@ def test_an_answer_past_the_budget_arms_no_backoff(monkeypatch):
 
 def test_stale_backoffs_are_forgotten_at_the_next_build(monkeypatch):
     """An entry expired long ago and never retried (its namespace or
-    datastore is gone), or another target's (the config changed), is dropped:
-    a bound on the dict. A hold stays."""
+    datastore is gone), or another PBS's (its address changed), is dropped. A
+    hold stays."""
     clock = use_clock(monkeypatch, Clock(now=100_000.0))
     mine = pbs._Target(
         **{"port": pbs.DEFAULT_PORT, "fingerprint": None, **LOOPBACK}
-    ).cache_key
+    ).base
     gone = (mine, "/gone", ())
     recent = (mine, "/recent", ())
     held = (mine, "/held", ())
@@ -5694,7 +5758,11 @@ def test_stale_backoffs_are_forgotten_at_the_next_build(monkeypatch):
     assert sorted(pbs._timeout_backoff) == sorted([recent, held])
 
 
-def test_a_groups_timeout_holds_back_that_namespace_and_leaves_it_unread(
+# Value: protects=a slow /groups is retried, never blinded until a reload;
+#   fails_when=/groups is held like the namespace walk again;
+#   why_new=PBS's /groups reads one level and ends, so a hold only blinds a
+#   slow PBS (the red team's upstream reading); seam=none
+def test_a_groups_timeout_backs_off_that_namespace_and_leaves_it_unread(
     monkeypatch,
 ):
     clock = use_clock(monkeypatch, Clock())
@@ -5711,8 +5779,12 @@ def test_a_groups_timeout_holds_back_that_namespace_and_leaves_it_unread(
     assert "/admin/datastore/ds/groups" in sent  # the root's, still read
     assert "/admin/datastore/ds/groups?ns=a" not in sent
     assert out["datastores"][0]["unread_namespaces"] == ["a"]
-    skipped = [e for e in out["errors"] if e["message"] == pbs._TIMEOUT_HOLD_MESSAGE]
+    skipped = [e for e in out["errors"] if e["message"] == pbs._TIMEOUT_BACKOFF_MESSAGE]
     assert [(e["scope"], e["ns"]) for e in skipped] == [("groups", "a")]
+    # Past its backoff (two rebuilds after one timeout) it is sent again.
+    clock.now += pbs.PBS_CACHE_TTL
+    _, session = collect(monkeypatch, responses)
+    assert "/admin/datastore/ds/groups?ns=a" in [route(u) for u in session.calls]
 
 
 def test_groups_past_the_cap_are_counted_not_built(monkeypatch):
@@ -5841,7 +5913,8 @@ def test_a_timed_out_usage_status_is_held_back_too(monkeypatch):
 
 def test_a_held_back_usage_status_still_falls_back_per_datastore(monkeypatch):
     """For a full-scope token an aggregate held back by its backoff reads as
-    failed, so each filesystem datastore's own status is read instead."""
+    failed, so each filesystem datastore's own status is read instead. For
+    that token PBS walks nothing to answer it, so it is retried, not held."""
     clock = use_clock(monkeypatch, Clock())
     responses = minimal_responses(
         **{
@@ -5856,9 +5929,20 @@ def test_a_held_back_usage_status_still_falls_back_per_datastore(monkeypatch):
     assert "/status/datastore-usage" not in sent
     assert "/admin/datastore/ds/status" in sent
     assert out["datastores"][0]["total"] == 9
+    # Value: protects=a full-scope usage status is retried, never held;
+    #   fails_when=it is held whatever the token's scope;
+    #   why_new=only a scoped token makes PBS walk namespaces here; seam=none
+    skipped = [e["message"] for e in out["errors"] if e["scope"] == "usage"]
+    assert skipped == [pbs._TIMEOUT_BACKOFF_MESSAGE]
+    clock.now += pbs.PBS_CACHE_TTL
+    _, session = collect(monkeypatch, responses)
+    assert "/status/datastore-usage" in [route(u) for u in session.calls]
 
 
-def test_a_timed_out_per_datastore_status_is_held_back(monkeypatch):
+# Value: protects=a datastore's own status is retried after a timeout;
+#   fails_when=it is held until a reload again;
+#   why_new=it is one statfs that ends, so a hold only blinds; seam=none
+def test_a_timed_out_per_datastore_status_backs_off(monkeypatch):
     clock = use_clock(monkeypatch, Clock())
     responses = minimal_responses(
         **{
@@ -5871,8 +5955,11 @@ def test_a_timed_out_per_datastore_status_is_held_back(monkeypatch):
     out, session = collect(monkeypatch, responses)
     assert "/admin/datastore/ds/status" not in [route(u) for u in session.calls]
     assert out["datastores"][0]["total"] is None
-    held = [e for e in out["errors"] if e["message"] == pbs._TIMEOUT_HOLD_MESSAGE]
-    assert [(e["scope"], e["store"]) for e in held] == [("usage", "ds")]
+    skipped = [e for e in out["errors"] if e["message"] == pbs._TIMEOUT_BACKOFF_MESSAGE]
+    assert [(e["scope"], e["store"]) for e in skipped] == [("usage", "ds")]
+    clock.now += pbs.PBS_CACHE_TTL
+    _, session = collect(monkeypatch, responses)
+    assert "/admin/datastore/ds/status" in [route(u) for u in session.calls]
 
 
 def test_a_block_too_large_to_ship_fails_the_build(monkeypatch):
@@ -5902,23 +5989,52 @@ def test_a_block_too_large_to_ship_fails_the_build(monkeypatch):
     assert out == {
         "reachable": True,
         "error_type": "http_error",
-        "error_message": f"block too large to ship: {size} bytes of JSON "
-        f"(limits {size - 1} and {packed} gzipped; a working PBS keeps its "
-        "fields short)",
+        "error_message": f"block too large to ship: over {size - 1} bytes of "
+        "JSON (a working PBS keeps its fields short)",
     }
     monkeypatch.setattr(pbs, "_MAX_BLOCK_JSON_BYTES", size)
     monkeypatch.setattr(pbs, "_MAX_BLOCK_GZIP_BYTES", packed - 1)
     out, _ = collect(monkeypatch, minimal_responses())
     assert out["error_message"] == (
-        f"block too large to ship: {size} bytes of JSON, {packed} gzipped "
-        f"(limits {size} and {packed - 1} gzipped; a working PBS keeps its "
-        "fields short)"
+        f"block too large to ship: over {packed - 1} bytes gzipped (a working "
+        "PBS keeps its fields short)"
     )
     # Cached for the TTL: the next tick reads /version only, same envelope.
     clock.now += 60
     again, session = collect(monkeypatch, minimal_responses(), keep_cache=True)
     assert again == out
     assert [route(u) for u in session.calls] == ["/version"]
+
+
+# Value: protects=the build's memory against a broken PBS's ~90 MB block;
+# fails_when=the whole block is encoded (json.dumps) before either limit is
+# checked; why_new=the too-large test above only proves the verdict, not that
+# the encoding stops; seam=none
+@pytest.mark.parametrize("limit", ["_MAX_BLOCK_JSON_BYTES", "_MAX_BLOCK_GZIP_BYTES"])
+def test_an_oversized_block_stops_encoding_at_the_first_limit(monkeypatch, limit):
+    rng = random.Random(7)
+    block = {
+        "ids": ["".join(rng.choices("0123456789abcdef", k=64)) for _ in range(8000)]
+    }
+    raw = json.dumps(block)
+    monkeypatch.setattr(pbs, "_ENCODE_BATCH_CHARS", 1024)
+    monkeypatch.setattr(pbs, limit, 4096)
+    drawn = []
+    real = pbs._encoded
+
+    def spy(value):
+        for text in real(value):
+            drawn.append(text)
+            yield text
+
+    monkeypatch.setattr(pbs, "_encoded", spy)
+    assert pbs._oversize(block) is not None
+    # Every piece but the last one drawn was under the limit: it stopped
+    # there (zlib holds ~48 KB before it emits), a fraction of ~540 KB.
+    assert "".join(drawn) == raw[: len("".join(drawn))]
+    assert len("".join(drawn)) < len(raw) // 4
+    monkeypatch.setattr(pbs, limit, 10 * len(raw))
+    assert pbs._oversize(block) is None
 
 
 def test_only_the_kept_groups_are_summarized():
@@ -5928,3 +6044,195 @@ def test_only_the_kept_groups_are_summarized():
     summaries, unparseable = pbs._summarize_snapshots(snaps, "ds", {("vm", "1")})
     assert list(summaries) == [("vm", "1")] and unparseable == 0
     assert set(pbs._summarize_snapshots(snaps, "ds")[0]) == {("vm", "1"), ("vm", "2")}
+
+
+# Value: protects=a walk read keeps a 5s read timeout near the end of the budget, so a late answer never holds a healthy PBS;
+#   fails_when=min_wait is not passed to walk reads, or the max() floor in _get is dropped;
+#   why_new=the only test that walk and snapshot reads get min_wait while other
+#   reads stay clamped; seam=none
+def test_a_walk_sent_as_the_budget_runs_out_is_late_never_held(monkeypatch):
+    """A walk (or snapshot) read waits _TIMEOUT_BACKOFF_MIN_WAIT whatever
+    budget is left: sent with 1s left and answered 2s later it is merely late
+    (a skip, sent again next build). Clamped to that 1s it would read as a
+    READ TIMEOUT and HOLD a healthy PBS's namespace listing until the next
+    SIGHUP. Every other read stays clamped to the budget left."""
+    clock = use_clock(monkeypatch, Clock())
+    handler = responses_handler(minimal_responses())
+
+    def answers_in_two_seconds(url):
+        if session.timeouts[-1][1] < 2:  # what a socket read timeout does
+            raise requests.exceptions.ReadTimeout("Read timed out.")
+        clock.now += 2
+        return handler(url)
+
+    session = FakeSession(answers_in_two_seconds)
+    target = _target()
+    for scope, path, backoff in (
+        ("namespaces", _NS_PATH, "hold"),
+        ("snapshots", "/admin/datastore/ds/snapshots", "retry"),
+    ):
+        errors = pbs._Errors(target.redact)
+        read = pbs._sub_read(
+            session, target, errors, clock.now + 1, scope, path, backoff=backoff
+        )
+        assert read is None
+        assert session.timeouts[-1] == (1, pbs._TIMEOUT_BACKOFF_MIN_WAIT)
+        assert [e["message"] for e in errors] == [pbs._DEADLINE_MESSAGE]
+    assert pbs._timeout_backoff == {}
+    errors = pbs._Errors(target.redact)
+    gc = pbs._sub_read(
+        session, target, errors, clock.now + 1, "gc", "/admin/datastore/ds/gc"
+    )
+    assert gc is None and session.timeouts[-1] == (1, 1)
+    assert [e["message"] for e in errors] == ["Read timed out."]
+    assert pbs._timeout_backoff == {}
+
+
+# Value: protects=a successful /snapshots read clears its retry backoff, so a later timeout restarts at one skipped rebuild;
+#   fails_when=the success path stops popping the backoff entry;
+#   why_new=no test followed a success with a new timeout; seam=none
+def test_a_snapshot_listing_that_answers_again_restarts_its_backoff(monkeypatch):
+    """A success clears a retried read's backoff: the next timeout starts the
+    ladder over (one skipped rebuild), not where the old streak left off."""
+    clock = use_clock(monkeypatch, Clock())
+    path = "/admin/datastore/ds/snapshots"
+    stuck = minimal_responses(**{path: {"error": "timeout", "message": "t"}})
+    collect(monkeypatch, stuck)
+    [key] = pbs._timeout_backoff
+    assert pbs._timeout_backoff[key][:2] == (1000.0 + 2 * pbs.PBS_CACHE_TTL, 1)
+    clock.now = 1000.0 + 2 * pbs.PBS_CACHE_TTL  # the retry, answered this time
+    out, _ = collect(monkeypatch, minimal_responses())
+    assert out["groups"][0]["in_progress"] is False
+    assert out["datastores"][0]["unread_namespaces"] == []
+    assert pbs._timeout_backoff == {}
+    collect(monkeypatch, stuck)  # and times out again later
+    assert pbs._timeout_backoff[key][:2] == (clock.now + 2 * pbs.PBS_CACHE_TTL, 1)
+
+
+# Value: protects=SIGHUP releases a /snapshots retry backoff, not only the held walks;
+#   fails_when=reset_timeout_holds clears only the hold entries;
+#   why_new=the hold tests covered the walks only; seam=none
+def test_a_reload_also_releases_a_snapshot_listing_backing_off(monkeypatch):
+    """SIGHUP sends again every read waiting on a timeout -- a retried
+    snapshot listing too, not only the held walks: the operator just repaired
+    the datastore, and the namespace must not stay unread for hours."""
+    clock = use_clock(monkeypatch, Clock())
+    path = "/admin/datastore/ds/snapshots"
+    collect(
+        monkeypatch, minimal_responses(**{path: {"error": "timeout", "message": "t"}})
+    )
+    [(retry_at, _, _)] = pbs._timeout_backoff.values()
+    assert retry_at != math.inf  # backing off, not held
+    pbs.reset_timeout_holds()
+    clock.now += pbs.PBS_CACHE_TTL + 5  # the next rebuild, inside the backoff
+    out, session = collect(monkeypatch, minimal_responses())
+    assert path in [route(u) for u in session.calls]
+    assert out["datastores"][0]["unread_namespaces"] == []
+    assert out["errors"] == []
+
+
+# Value: protects=GC and job-list reads that time out are never backed off or held;
+#   fails_when=a backoff= argument is added to the gc or job-list reads;
+#   why_new=the backoff tests covered walk and snapshot reads only; seam=none
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/admin/datastore/ds/gc",
+        "/admin/verify",
+        "/admin/prune",
+        "/admin/sync?sync-direction=all",
+    ],
+)
+def test_a_timed_out_read_that_is_not_a_walk_is_sent_again_next_build(
+    path, monkeypatch
+):
+    """Only the namespace walks are held and only the reads that can take
+    long back off: a GC status or a job list that timed out is simply read
+    again at the next build."""
+    clock = use_clock(monkeypatch, Clock())
+    out, _ = collect(
+        monkeypatch, minimal_responses(**{path: {"error": "timeout", "message": "t"}})
+    )
+    assert "datastores" in out  # a scoped failure, not the envelope
+    assert [e["message"] for e in out["errors"]] == ["t"]
+    assert pbs._timeout_backoff == {}
+    clock.now += pbs.PBS_CACHE_TTL + 5
+    out, session = collect(monkeypatch, minimal_responses())
+    assert path in [route(u) for u in session.calls]
+    assert out["errors"] == []
+
+
+# Value: protects=the held error line names the datastore to repair, and none for the aggregate usage read;
+#   fails_when=the location part of the hold log line is dropped or wrong;
+#   why_new=no test read the text of the hold log line; seam=none
+def test_a_hold_names_the_read_it_holds_in_the_log(monkeypatch):
+    """The held line is the operator's pointer to WHAT to repair: it names the
+    datastore when the read has one (its namespace listing), and none for
+    the aggregate usage status."""
+    logged = capture_logs(monkeypatch)
+    collect(
+        monkeypatch,
+        minimal_responses(
+            **{
+                "/access/permissions": ok({"/datastore/ds": {"Datastore.Audit": True}}),
+                _NS_PATH: {"error": "timeout", "message": "t"},
+                "/status/datastore-usage": {"error": "timeout", "message": "t"},
+            }
+        ),
+    )
+    held = [(lvl, m) for lvl, m in logged if " held: " in m]
+    assert held == [
+        ("error", f"PBS usage read held: {pbs._TIMEOUT_HOLD_MESSAGE}"),
+        ("error", f"PBS namespaces read on ds held: {pbs._TIMEOUT_HOLD_MESSAGE}"),
+    ]
+
+
+# Value: protects=_read_groups passes only the groups the cap kept to the snapshot summary;
+#   fails_when=the wanted set is no longer passed to _summarize_snapshots;
+#   why_new=the summary filter was tested alone, not its wiring; seam=none
+def test_a_namespace_summarizes_only_the_groups_the_cap_kept(monkeypatch):
+    """_read_groups hands the snapshot summary the groups the cap KEPT: a
+    hostile listing naming thousands of other groups (or groups /groups never
+    listed) costs no summary each."""
+    monkeypatch.setattr(pbs, "MAX_GROUPS", 1)
+    wanted = []
+    real = pbs._summarize_snapshots
+
+    def spy(snapshots, store, keys=None):
+        wanted.append(keys)
+        return real(snapshots, store, keys)
+
+    monkeypatch.setattr(pbs, "_summarize_snapshots", spy)
+    listing = [
+        {"backup-type": "vm", "backup-id": str(n), "last-backup": 100} for n in range(3)
+    ]
+    snaps = [snapshot("vm", str(n), 100) for n in range(3)] + [snapshot("ct", "9", 100)]
+    out, _ = collect(
+        monkeypatch,
+        minimal_responses(
+            **{
+                "/admin/datastore/ds/groups": ok(listing),
+                "/admin/datastore/ds/snapshots": ok(snaps),
+            }
+        ),
+    )
+    assert wanted == [{("vm", "0")}]
+    assert [(g["id"], g["size"]) for g in out["groups"]] == [("0", 100)]
+
+
+# Value: protects=SIGHUP drops the cached PBS block so the next tick rebuilds it;
+#   fails_when=reset_timeout_holds stops replacing the block cache;
+#   why_new=the hold tests reset the cache themselves through collect(); seam=none
+def test_a_reload_drops_the_cached_block_that_reports_the_hold(monkeypatch):
+    """After SIGHUP the next tick rebuilds: the cached block still says the
+    read is held, which would otherwise ship for up to PBS_CACHE_TTL after
+    the operator reloaded the agent."""
+    use_clock(monkeypatch, Clock(), cache_too=True)
+    stuck = minimal_responses(**{_NS_PATH: {"error": "timeout", "message": "t"}})
+    collect(monkeypatch, stuck)
+    _, session = collect(monkeypatch, minimal_responses(), keep_cache=True)
+    assert [route(u) for u in session.calls] == ["/version"]  # cached
+    pbs.reset_timeout_holds()
+    out, session = collect(monkeypatch, minimal_responses(), keep_cache=True)
+    assert len(_ns_calls(session)) == 1
+    assert out["datastores"][0]["namespaces"] == [""]
