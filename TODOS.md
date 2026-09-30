@@ -737,11 +737,11 @@ out at and how far the walk got. A collection that ran out of time backs off
 60s then 120s, so a VM that stays stuck does not cost the timeout on every
 tick, and a listed VM that cannot be read (a daemon restarted mid-walk,
 directly or behind `virtproxyd`) also reports `None` instead of the VMs read
-before it; only `VIR_ERR_NO_DOMAIN` is skipped alone. The same change fixed `vm_vm_uptime_seconds_total`, which read a sixth
-`dom.info()` field libvirt never returns and was always 0: it is now the age
-of the VM's QEMU process.
+before it; only `VIR_ERR_NO_DOMAIN` is skipped alone. The same change fixed
+`vm_vm_uptime_seconds_total`, which read a sixth `dom.info()` field libvirt
+never returns and was always 0: it is now the age of the VM's QEMU process.
 
-**Completed:** v1.20.2 (2026-09-29)
+**Completed:** v1.20.3 (2026-09-30)
 
 ### P3: Nightly distro matrix runs
 
