@@ -607,6 +607,26 @@ def test_parse_reverse_deps_root_mount_survives_marks():
     assert _parse_reverse_deps(output) == ["-.mount"]
 
 
+def test_parse_reverse_deps_c_locale_ascii_tree():
+    """#172: every child runs under LC_ALL=C, where systemctl draws the tree in
+    ASCII ("|-", "`-", "| ") and the state marks as "*". Should a systemctl
+    ever ignore --plain, the names must still come out clean -- and the glyph
+    pairs are stripped whole, so the root mount keeps its leading dash."""
+    output = (
+        "local-fs.target\n"
+        "* |-bar.service\n"
+        "* | |-baz.service\n"
+        "* `--.mount\n"
+        "  |-plain.service\n"
+    )
+    assert _parse_reverse_deps(output) == [
+        "bar.service",
+        "baz.service",
+        "-.mount",
+        "plain.service",
+    ]
+
+
 def test_reverse_deps_argv_plain_full_and_guard():
     """list-dependencies must request --plain --full and use the -- guard so
     a dash-leading unit (-.mount) is never parsed as an option."""

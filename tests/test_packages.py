@@ -345,8 +345,9 @@ def test_get_packages_dpkg_normalizes_whitespace_around_every_field(
 @patch("fivenines_agent.packages.get_clean_env", return_value={})
 @patch("fivenines_agent.packages.subprocess.run")
 def test_get_packages_dpkg_pins_the_locale(mock_run, mock_env):
-    """The parser matches dpkg's status words byte-for-byte and get_clean_env()
-    passes the host's LANG/LC_* through untouched."""
+    """The parser matches dpkg's status words byte-for-byte, so the reader pins
+    the locale itself rather than resting on get_clean_env()'s default (mocked
+    to {} here, i.e. a helper that pins nothing)."""
     mock_run.return_value = MagicMock(returncode=0, stdout="")
     _get_packages_dpkg()
     assert mock_run.call_args[1]["env"]["LC_ALL"] == "C"
@@ -696,8 +697,8 @@ def test_get_packages_rpm_success(mock_run, mock_env):
 @patch("fivenines_agent.packages.get_clean_env", return_value={})
 @patch("fivenines_agent.packages.subprocess.run")
 def test_get_packages_rpm_pins_the_locale(mock_run, mock_env):
-    """The parser matches rpm's "(none)" byte-for-byte and get_clean_env passes
-    the host's LANG/LC_* through, so the locale is pinned at the call site. A
+    """The parser matches rpm's "(none)" byte-for-byte, so the locale is pinned
+    at the call site even when get_clean_env() pins nothing (mocked to {}). A
     localized sentinel would fail every no-epoch line -- i.e. every package."""
     mock_run.return_value = MagicMock(returncode=0, stdout="bash\t(none)\t5.2.15-3.el9\n")
     _get_packages_rpm()
