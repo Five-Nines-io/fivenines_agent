@@ -872,8 +872,8 @@ def test_budget_constants_are_pinned():
     assert pbs._TIMEOUT_BACKOFF_MAX == 6 * 3600
     assert pbs._TIMEOUT_BACKOFF_MIN_WAIT == 5
     assert pbs._MAX_READ_FAILURE_LINES == 20
-    # Every read a build can back off or hold, twice over: a namespace
-    # renamed away cannot crowd out the holds of the current ones.
+    # Every read one build can back off or hold: a namespace listing and a
+    # status per datastore, a /groups and a /snapshots per namespace, usage.
     assert pbs._TIMEOUT_BACKOFF_ENTRIES == 2 * (100 + 1000) + 1
 
 
@@ -4597,25 +4597,41 @@ def test_budget_out_inside_a_groups_read_resumes_there(monkeypatch):
 #   time; fails_when=the rotation counts it finished on its groups alone
 #   (finished = complete); why_new=every other budget test cuts a unit whose
 #   groups are unread too; seam=none
-def test_a_unit_whose_snapshot_details_outlast_the_budget_is_read_first_next_time(
-    monkeypatch,
+# Value: protects=the same for a unit whose GROUP listing had an unparseable
+#   row (complete is False, its details are not); fails_when=the rotation
+#   counts it finished on its snapshot details alone (finished = detailed);
+#   why_new=the first row only pins the detailed half of the rule; seam=none
+@pytest.mark.parametrize(
+    "override, unread",
+    [
+        # b's snapshot listing has an unparseable row: its details are unknown,
+        # but the listing came back, so b stays read.
+        ({"/admin/datastore/ds/snapshots?ns=b": ok([{"backup-type": "vm"}])}, ["c"]),
+        # b's group listing has an unparseable row: b is unread.
+        ({"/admin/datastore/ds/groups?ns=b": ok([{"backup-type": "vm"}])}, ["b", "c"]),
+    ],
+    ids=["unparseable_snapshot_row", "unparseable_group_row"],
+)
+def test_a_unit_left_incomplete_as_the_budget_ran_out_is_read_first_next_time(
+    monkeypatch, override, unread
 ):
     # test_a_unit_finished_as_the_budget_ran_out_is_not_read_first_again, but
-    # b's snapshot listing has an unparseable row.
+    # one of b's listings has an unparseable row.
     clock = use_clock(monkeypatch, Clock())
     order = _slow_groups(monkeypatch, clock, seconds=15)
     responses = minimal_responses(
         **{
             "/admin/datastore/ds/namespace": ok([{"ns": ""}, {"ns": "b"}, {"ns": "c"}]),
             "/admin/datastore/ds/groups?ns=b": ok([]),
-            "/admin/datastore/ds/snapshots?ns=b": ok([{"backup-type": "vm"}]),
+            "/admin/datastore/ds/snapshots?ns=b": ok([]),
+            **override,
         }
     )
     out, _ = collect(monkeypatch, responses)
     assert order == ["", "b"]
-    # The listing came back: b is read, its details unknown; c never started.
-    assert out["datastores"][0]["unread_namespaces"] == ["c"]
-    assert pbs._rotation == 1  # "b" again, whose details are still missing
+    # c never started.
+    assert out["datastores"][0]["unread_namespaces"] == unread
+    assert pbs._rotation == 1  # "b" again, still incomplete
 
 
 def test_a_hyphenated_datastore_matches_its_escaped_worker_id():
@@ -5658,7 +5674,7 @@ def test_a_timeout_backoff_is_capped_and_per_request(monkeypatch):
     use_clock(monkeypatch, Clock())
     target = _target()
     key = pbs._timeout_backoff_key(target, "/p", {"ns": "a"})
-    assert key == (target.base, "/p", (("ns", "a"),))
+    assert key == (("127.0.0.1", 8007), "/p", (("ns", "a"),))
     assert pbs._timeout_backoff_key(target, "/p", None) != key
     failure = ("snapshots", "ds", "a", "t")
     for _ in range(12):
@@ -5673,20 +5689,23 @@ def test_a_timeout_backoff_is_capped_and_per_request(monkeypatch):
     other = _target(port=8008)  # (localhost IS 127.0.0.1: one target)
     assert pbs._timeout_backoff_key(other, "/p", {"ns": "a"}) != key
     # Value: protects=a hold surviving a token rotation or a pasted pin;
-    # fails_when=holds are keyed on the token (cache_key) again;
+    # fails_when=holds are keyed on the token (cache_key) or the URL (base,
+    # where an unverified localhost becomes 127.0.0.1) again;
     # why_new=the walk pins the PBS proxy whoever asked; seam=none
-    rotated = _target(host="127.0.0.1", token_id="o@pbs!t", fingerprint=FINGERPRINT)
-    assert rotated.cache_key != target.cache_key
+    rotated = _target(token_id="o@pbs!t", fingerprint=FINGERPRINT)
+    assert rotated.base != target.base  # the pinned name stays in the URL
     assert pbs._timeout_backoff_key(rotated, "/p", {"ns": "a"}) == key
+    loopback = _target(host="127.0.0.1", verify_ssl=True)
+    assert pbs._timeout_backoff_key(loopback, "/p", {"ns": "a"}) == key
 
 
 # Value: protects=the backoff dict's bound once holds (which never expire)
-# pile up from namespaces renamed away; fails_when=the cap check is dropped or
+# pile up from datastores renamed away; fails_when=the cap check is dropped or
 # evicts the newest entry; why_new=no other test arms past the cap; seam=none
 def test_the_timeout_backoff_drops_its_oldest_entry_at_the_cap(monkeypatch):
     use_clock(monkeypatch, Clock())
     monkeypatch.setattr(pbs, "_TIMEOUT_BACKOFF_ENTRIES", 3)
-    failure = ("groups", "ds", "a", "t")
+    failure = ("namespaces", "ds", None, "t")
     keys = [("base", f"/p{i}", ()) for i in range(4)]
     for key in keys[:3]:
         pbs._arm_timeout_backoff(key, failure, hold=True)
@@ -5695,6 +5714,22 @@ def test_the_timeout_backoff_drops_its_oldest_entry_at_the_cap(monkeypatch):
     pbs._arm_timeout_backoff(keys[3], failure, hold=True)
     assert list(pbs._timeout_backoff) == keys[1:]
     assert pbs._timeout_backoff[keys[1]][1] == 2
+
+
+# Value: protects=a hold (a walk that never ends) outliving newer retries at
+#   the cap; fails_when=the cap drops the oldest entry whatever it is;
+#   why_new=the test above holds only; seam=none
+def test_the_timeout_backoff_cap_drops_a_retry_before_a_hold(monkeypatch):
+    use_clock(monkeypatch, Clock())
+    monkeypatch.setattr(pbs, "_TIMEOUT_BACKOFF_ENTRIES", 3)
+    held, retried = ("namespaces", "ds", None, "t"), ("groups", "ds", "a", "t")
+    keys = [("base", f"/p{i}", ()) for i in range(4)]
+    pbs._arm_timeout_backoff(keys[0], held, hold=True)
+    pbs._arm_timeout_backoff(keys[1], retried, hold=False)
+    pbs._arm_timeout_backoff(keys[2], retried, hold=False)
+    pbs._arm_timeout_backoff(keys[3], retried, hold=False)
+    assert list(pbs._timeout_backoff) == [keys[0], keys[2], keys[3]]
+    assert pbs._timeout_backoff[keys[0]][0] == math.inf
 
 
 def test_a_snapshots_timeout_holds_back_only_that_namespace(monkeypatch):
@@ -5745,7 +5780,7 @@ def test_stale_backoffs_are_forgotten_at_the_next_build(monkeypatch):
     clock = use_clock(monkeypatch, Clock(now=100_000.0))
     mine = pbs._Target(
         **{"port": pbs.DEFAULT_PORT, "fingerprint": None, **LOOPBACK}
-    ).base
+    ).address
     gone = (mine, "/gone", ())
     recent = (mine, "/recent", ())
     held = (mine, "/held", ())
@@ -5890,10 +5925,10 @@ def test_steady_repeats_do_not_use_up_the_error_line_cap(monkeypatch):
 
 
 def test_a_timed_out_usage_status_is_held_back_too(monkeypatch):
-    """Under a scoped token PBS walks, for /status/datastore-usage, the
-    namespace tree of every datastore the token cannot audit -- the walk that
-    never ends on an unreadable <store>/ns (reproduced on PBS 4.2): a timeout
-    there is held back like a listing's."""
+    """PBS walks, for /status/datastore-usage, the namespace tree of every
+    datastore the token cannot audit -- under a scoped token, all the others --
+    the walk that never ends on an unreadable <store>/ns (reproduced on PBS
+    4.2): a timeout there is held back like a listing's."""
     clock = use_clock(monkeypatch, Clock())
     scoped = {"/datastore/ds": {"Datastore.Audit": True}}
     stuck = minimal_responses(
@@ -5913,8 +5948,9 @@ def test_a_timed_out_usage_status_is_held_back_too(monkeypatch):
 
 def test_a_held_back_usage_status_still_falls_back_per_datastore(monkeypatch):
     """For a full-scope token an aggregate held back by its backoff reads as
-    failed, so each filesystem datastore's own status is read instead. For
-    that token PBS walks nothing to answer it, so it is retried, not held."""
+    failed, so each filesystem datastore's own status is read instead. It is
+    HELD for that token too: PBS walks any datastore a deeper ACL entry hides
+    from it, which the agent cannot see (reproduced on PBS 4.2)."""
     clock = use_clock(monkeypatch, Clock())
     responses = minimal_responses(
         **{
@@ -5929,14 +5965,15 @@ def test_a_held_back_usage_status_still_falls_back_per_datastore(monkeypatch):
     assert "/status/datastore-usage" not in sent
     assert "/admin/datastore/ds/status" in sent
     assert out["datastores"][0]["total"] == 9
-    # Value: protects=a full-scope usage status is retried, never held;
-    #   fails_when=it is held whatever the token's scope;
-    #   why_new=only a scoped token makes PBS walk namespaces here; seam=none
+    # Value: protects=a full-scope usage status held after a timeout, the
+    #   hidden-datastore walk; fails_when=it is retried for a full-scope token
+    #   (each re-send pins one more PBS proxy thread); why_new=the held-usage
+    #   test above uses a scoped token; seam=none
     skipped = [e["message"] for e in out["errors"] if e["scope"] == "usage"]
-    assert skipped == [pbs._TIMEOUT_BACKOFF_MESSAGE]
-    clock.now += pbs.PBS_CACHE_TTL
+    assert skipped == [pbs._TIMEOUT_HOLD_MESSAGE]
+    clock.now += pbs._TIMEOUT_BACKOFF_MAX + pbs.PBS_CACHE_TTL
     _, session = collect(monkeypatch, responses)
-    assert "/status/datastore-usage" in [route(u) for u in session.calls]
+    assert "/status/datastore-usage" not in [route(u) for u in session.calls]
 
 
 # Value: protects=a datastore's own status is retried after a timeout;
@@ -6029,12 +6066,47 @@ def test_an_oversized_block_stops_encoding_at_the_first_limit(monkeypatch, limit
 
     monkeypatch.setattr(pbs, "_encoded", spy)
     assert pbs._oversize(block) is not None
+    # It streamed, and stopped AT the limit (4096), not before it: json.dumps
+    # of the whole block would draw no piece at all.
+    assert len(drawn) > 1 and len("".join(drawn)) > 4096
     # Every piece but the last one drawn was under the limit: it stopped
     # there (zlib holds ~48 KB before it emits), a fraction of ~540 KB.
     assert "".join(drawn) == raw[: len("".join(drawn))]
     assert len("".join(drawn)) < len(raw) // 4
     monkeypatch.setattr(pbs, limit, 10 * len(raw))
     assert pbs._oversize(block) is None
+
+
+# Value: protects=each limit is checked against the block as the payload
+#   ships it (json.dumps, non-ASCII escaped; the gzipped size of every piece
+#   summed); fails_when=the JSON count uses ensure_ascii=False, or the gzipped
+#   size is one piece's output, not the running total; why_new=the other size
+#   tests use ASCII blocks, or a limit one zlib emission crosses; seam=none
+def test_the_block_limits_count_the_block_as_the_payload_ships_it(monkeypatch):
+    """The synchronizer json.dumps the payload (an astral character is 12
+    escaped bytes on the wire, not 1) and gzips it whole: the verdict counts
+    exactly that JSON, and the gzipped bytes of EVERY piece -- zlib emits in
+    chunks far below the gzip limit, so counting one piece never trips it."""
+    rng = random.Random(7)
+    block = {
+        "ids": ["".join(rng.choices("0123456789abcdef", k=64)) for _ in range(8000)],
+        # A maintenance message or a PBS error body: scrubbed, not ASCII-only.
+        "notes": [
+            "".join(rng.choices(["a", "b", chr(0xE9), chr(0x1F600)], k=64))
+            for _ in range(500)
+        ],
+    }
+    raw = json.dumps(block)
+    gzipped = len(gzip.compress(raw.encode(), 1))
+    monkeypatch.setattr(pbs, "_ENCODE_BATCH_CHARS", 1024)  # many pieces
+    for json_limit, gzip_limit, verdict in (
+        (len(raw), 2 * gzipped, None),
+        (len(raw) - 1, 2 * gzipped, f"over {len(raw) - 1} bytes of JSON"),
+        (len(raw), gzipped // 2, f"over {gzipped // 2} bytes gzipped"),
+    ):
+        monkeypatch.setattr(pbs, "_MAX_BLOCK_JSON_BYTES", json_limit)
+        monkeypatch.setattr(pbs, "_MAX_BLOCK_GZIP_BYTES", gzip_limit)
+        assert pbs._oversize(block) == verdict
 
 
 def test_only_the_kept_groups_are_summarized():

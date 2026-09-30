@@ -86,12 +86,12 @@ reading backup metadata):
   authentication failure to the PBS auth log every tick.
 - A read that TIMED OUT after it was sent may still be running in PBS: its
   namespace walk never ends while a <store>/ns cannot be read, holding one
-  proxy thread for good per request. So the two reads that walk namespaces
-  (a datastore's namespace listing; the usage status, for a scoped token)
-  are HELD after such a timeout -- not sent again until the agent is
-  reloaded (SIGHUP) or restarted -- and every other read that can take long
-  (groups, snapshots, a datastore's own status, the usage status for a
-  full-scope token) is retried on a backoff (_timeout_backoff).
+  proxy thread for good per request. So the two reads that can walk
+  namespaces (a datastore's namespace listing; the usage status) are HELD
+  after such a timeout -- not sent again until the agent is reloaded
+  (SIGHUP) or restarted -- and every other read that can take long (groups,
+  snapshots, a datastore's own status) is retried on a backoff
+  (_timeout_backoff).
 - Every request's timeouts are clamped to what is left of the tick's
   wall-clock budget, or of the per-datastore reads' half of it (so the
   collector stays NEAR it: one request can still overrun by its own clamped
@@ -400,6 +400,10 @@ class _Target:
                 "fingerprint"
             )
         self.base = f"https://{url_host}:{self.port}/api2/json"
+        # Which PBS this is, whatever the TLS policy: a pinned or verified
+        # "localhost" keeps its name in the URL, an unverified one does not.
+        name = self.host.lower()
+        self.address = ("127.0.0.1" if name == "localhost" else name, self.port)
         # The secret is deliberately not part of the key (the proxmox
         # _backups_cache_key posture): it must never sit in a cache key, and a
         # rotated secret on the same token serves the same PBS's block.
@@ -983,24 +987,28 @@ _UNSET = object()
 #
 # But every re-send of a walk that never ends pins ONE MORE proxy thread, for
 # good, and the proxy has one per core: two kill a 2-vCPU PBS. So the two
-# reads that walk namespaces -- a datastore's namespace listing, and the
-# usage status for a scoped token -- are HELD instead after a timeout: never
-# sent again until the agent is reloaded (SIGHUP: reset_timeout_holds) or
+# reads that can walk namespaces -- a datastore's namespace listing, and the
+# usage status, which walks every datastore the token cannot audit (all of
+# them for a scoped token; for a full-scope one, any a deeper ACL entry hides,
+# which the agent cannot see) -- are HELD instead after a timeout: never sent
+# again until the agent is reloaded (SIGHUP: reset_timeout_holds) or
 # restarted, the operator's signal that the datastore is repaired. The other
-# reads that can take long all END (PBS source: /groups reads one level and
-# stops at its first error, a datastore's status is one statfs, the usage
-# status of a full-scope token walks nothing), so holding them for good
-# would only blind a PBS that is slow: they retry on the backoff above.
-# {(target base URL, path, params): (retry-after monotonic time -- inf for a
+# reads that can take long all END (PBS source: /groups reads one level,
+# never walking namespaces; a datastore's status is one statfs), so holding
+# them for good would only blind a PBS that is slow: they retry on the
+# backoff above.
+# {(target address, path, params): (retry-after monotonic time -- inf for a
 #  hold --, timeouts, the _read_failures key of its failure)}. Keyed on the
-# PBS's address, not the token: the stuck walk pins that PBS's proxy whoever
-# asked, so a rotated token or a pasted fingerprint must not re-send it.
+# PBS's address, not the token or the TLS policy: the stuck walk pins that
+# PBS's proxy whoever asked, so a rotated token or a pasted fingerprint must
+# not re-send it.
 _timeout_backoff: dict = {}
 _TIMEOUT_BACKOFF_MAX = 6 * 3600
-# Every read one build can back off or hold is a namespace listing or status
-# per datastore, or a /groups or /snapshots per namespace, plus the usage
-# status; twice that, so namespaces renamed away (their holds never expire)
-# cannot crowd out the current ones before the oldest entry is dropped.
+# One build backs off or holds at most this many reads: a namespace listing
+# and a status per datastore, a /groups and a /snapshots per namespace, the
+# usage status. Past it the oldest entry is dropped -- a retry first, since a
+# hold dropped would re-send a walk that never ends (holds pile up only from
+# datastores renamed away while held).
 _TIMEOUT_BACKOFF_ENTRIES = 2 * (MAX_DATASTORES + MAX_NAMESPACES) + 1
 # The read timeout a held or backed-off read always gets (see _get): its
 # timing out then means PBS did not answer, not that the budget ran out.
@@ -1018,7 +1026,7 @@ _TIMEOUT_HOLD_MESSAGE = (
 
 
 def _timeout_backoff_key(target, path, params):
-    return (target.base, path, tuple(sorted((params or {}).items())))
+    return (target.address, path, tuple(sorted((params or {}).items())))
 
 
 def _arm_timeout_backoff(key, failure, hold):
@@ -1027,12 +1035,14 @@ def _arm_timeout_backoff(key, failure, hold):
         key not in _timeout_backoff
         and len(_timeout_backoff) >= _TIMEOUT_BACKOFF_ENTRIES
     ):
-        del _timeout_backoff[next(iter(_timeout_backoff))]  # the oldest
+        retries = (k for k, v in _timeout_backoff.items() if v[0] != math.inf)
+        del _timeout_backoff[next(retries, next(iter(_timeout_backoff)))]
     if hold:
         _timeout_backoff[key] = (math.inf, timeouts, failure)
-        scope, store, ns, _ = failure
+        # Only the namespace listing (its datastore) and the usage status are
+        # held: neither has a namespace.
+        scope, store, _, _ = failure
         where = "" if store is None else f" on {log_safe(store)}"
-        where += f"/{log_safe(ns)}" if ns else ""
         log(f"PBS {scope} read{where} held: {_TIMEOUT_HOLD_MESSAGE}", "error")
         return
     delay = min(PBS_CACHE_TTL * 2**timeouts, _TIMEOUT_BACKOFF_MAX)
@@ -1047,7 +1057,7 @@ def _forget_stale_backoffs(target):
     for key in [
         key
         for key, (retry_at, _, _) in _timeout_backoff.items()
-        if key[0] != target.base or now - retry_at > _TIMEOUT_BACKOFF_MAX
+        if key[0] != target.address or now - retry_at > _TIMEOUT_BACKOFF_MAX
     ]:
         del _timeout_backoff[key]
 
@@ -1285,7 +1295,6 @@ def _build_block(session, target, deadline):
         errors,
         deadline,
         {entry["store"] for entry in kept_stores},
-        full_scope,
     )
     backends = _read_backends(session, target, errors, deadline, kept_stores, usage)
     sync_jobs = _read_sync_jobs(session, target, errors, deadline, remote_audit)
@@ -1587,7 +1596,7 @@ def _ns_params(ns):
     return {"ns": ns} if ns else None
 
 
-def _read_usage(session, target, errors, deadline, listed, full_scope):
+def _read_usage(session, target, errors, deadline, listed):
     """(store -> its /status/datastore-usage row, or None when unread; whether
     the read FAILED -- an HTTP or transport error, a body that is not the
     JSON envelope, or a read held after it timed out (_timeout_backoff) --
@@ -1596,9 +1605,11 @@ def _read_usage(session, target, errors, deadline, listed, full_scope):
     (measurement 6). A row's own error is recorded once per datastore in
     `listed` (at most MAX_DATASTORES), however many rows name it: a flood of
     rows must not crowd the job lists' 'partial:' flags out of the capped
-    errors[]. For a scoped token PBS walks the namespaces of every datastore
-    the token cannot audit, which never ends on an unreadable one: a timeout
-    then holds the read (_timeout_backoff)."""
+    errors[]. PBS walks the namespaces of every datastore the token cannot
+    audit (all of them for a scoped token; for a full-scope one, any a deeper
+    ACL entry hides), which never ends on an unreadable one: a timeout holds
+    the read (_timeout_backoff), and a full-scope token then reads each
+    datastore's own status instead."""
     failures = []
     rows = _sub_read(
         session,
@@ -1608,7 +1619,7 @@ def _read_usage(session, target, errors, deadline, listed, full_scope):
         "usage",
         "/status/datastore-usage",
         on_error=failures.append,
-        backoff="retry" if full_scope else "hold",
+        backoff="hold",
     )
     if rows is None:
         # A 200 whose headers came in past the budget is a skip, not a failure;

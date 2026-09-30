@@ -1296,13 +1296,14 @@ configuration change); the next refresh starts where this one was cut off, so
 a slow tail is not starved, and a datastore or namespace that alone outlasts
 the budget is moved to the back instead of blocking the others. A read the
 Proxmox Backup Server may still be working on after it timed out is not
-requested again blindly. A datastore's namespace listing (and, for a token
-scoped to some datastores, the usage summary, which then walks the others) is
-held until the agent is reloaded or restarted -- with a datastore on a stale
-or broken mount, PBS never finishes that walk and each request holds one of
-its proxy threads for good. Every other slow read is retried later, less and
-less often (at most every 6 hours). The dashboard shows what they cover as
-unknown meanwhile. Once the datastore is repaired, restart
+requested again blindly. A datastore's namespace listing and the usage
+summary (which walks every datastore the token cannot audit) are held until
+the agent is reloaded or restarted -- with a datastore on a stale or broken
+mount, PBS never finishes that walk and each request holds one of its proxy
+threads for good. Every other slow read is retried later, less and less often
+(at most every 6 hours). The dashboard shows what they cover as unknown
+meanwhile; a full-scope token still reports each datastore's usage, without
+its estimated full date. Once the datastore is repaired, restart
 `proxmox-backup-proxy` on the PBS, then reload the agent
 (`sudo kill -HUP $(pgrep -f fivenines_agent)`; on Windows, restart the
 service). A first backup that is still uploading is never shown as the
