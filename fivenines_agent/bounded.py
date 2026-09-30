@@ -8,8 +8,8 @@ waiting: run the call on a daemon worker, stop waiting at the deadline, and
 leave the worker to finish in the background.
 
 Used by subprocess_utils.run_privileged, the libvirt capability probe and the
-io_topology collector. Each caller keeps its own policy for the abandoned
-worker (single-flight on it, or not) and its own failure value.
+io_topology and qemu collectors. Each caller keeps its own policy for the
+abandoned worker (single-flight on it, or not) and its own failure value.
 """
 
 import threading
