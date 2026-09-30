@@ -1129,7 +1129,17 @@ def _sub_read(
             on_error(_PbsError("timeout", message, True, skipped="backoff"))
         _error(errors, scope, message, store=store, ns=ns)
         return None
-    if _deadline_hit(deadline, errors, scope, store=store, ns=ns):
+    # A hold lasts until a reload, so only a walk that can wait its WHOLE read
+    # timeout may arm one: late in the tick the budget would cut it short,
+    # and a PBS merely slow would read as stuck. It is not sent then.
+    hold = backoff == "hold"
+    if _deadline_hit(
+        deadline - _READ_TIMEOUT if hold else deadline,
+        errors,
+        scope,
+        store=store,
+        ns=ns,
+    ):
         return None
     min_wait = _TIMEOUT_BACKOFF_MIN_WAIT if backoff else 0
     try:
@@ -1275,6 +1285,20 @@ def _hidden_below(permissions):
     return hidden, unaudited
 
 
+def _audited_stores(permissions):
+    """The datastores the token audits AT the datastore level: a scoped token
+    reads their usage from their own status (below that level PBS answers it
+    0/0/0, measurement 6)."""
+    return {
+        str(path).split("/", 2)[2]
+        for path, privileges in permissions.items()
+        if isinstance(privileges, dict)
+        and str(path).startswith("/datastore/")
+        and str(path).count("/") == 2
+        and "Datastore.Audit" in privileges
+    }
+
+
 def _is_name(value, namespace=False):
     """A datastore (or, with `namespace`, a namespace: "" is the root) name as
     PBS's own schema spells it (_SAFE_ID). Anything else -- a lone surrogate
@@ -1328,6 +1352,7 @@ def _build_block(session, target, deadline):
     permissions = _get(session, target, "/access/permissions", deadline=deadline)
     remote_audit, full_scope = _check_privileges(permissions, target.redact)
     hidden, unaudited = _hidden_below(permissions)
+    audited = _audited_stores(permissions)
     del permissions
     stores = _datastore_entries(
         _get(session, target, "/admin/datastore", deadline=deadline)
@@ -1348,13 +1373,23 @@ def _build_block(session, target, deadline):
     whole = full_scope and not hidden and len(kept_stores) == len(stores)
     scope = "full" if whole else "partial"
     del stores  # past the cap, not kept alive for the whole build
-    usage, usage_failed = _read_usage(
-        session,
-        target,
-        errors,
-        deadline,
-        {entry["store"] for entry in kept_stores},
-    )
+    names = {entry["store"] for entry in kept_stores}
+    if full_scope:
+        usage, usage_failed = _read_usage(session, target, errors, deadline, names)
+    else:
+        # To answer a scoped token, PBS walks the namespaces of every datastore
+        # it cannot audit -- visible to it or not, so another tenant's broken
+        # datastore would hold this one's walks -- and tells it nothing its
+        # datastore listing lacks: a scoped token never reads it.
+        usage, usage_failed = None, False
+    # The datastores whose own status is read: all but a hidden one (PBS
+    # answers it 0/0/0) when a full-scope token's aggregate failed or is held;
+    # for a scoped token, those it audits at the datastore level (below it,
+    # PBS answers 0/0/0 too, measurement 6).
+    if full_scope:
+        own_status = names - unaudited if usage_failed else set()
+    else:
+        own_status = names & audited
     backends = _read_backends(session, target, errors, deadline, kept_stores, usage)
     sync_jobs = _read_sync_jobs(session, target, errors, deadline, remote_audit)
     verify_jobs = _read_jobs(
@@ -1389,9 +1424,8 @@ def _build_block(session, target, deadline):
         deadline,
         kept_stores,
         usage,
-        full_scope and usage_failed,
+        own_status,
         backends,
-        unaudited,
     )
     # After the job lists and the GC reads: they teach _local_nodes, which
     # decides which verifications the group rows count.
@@ -1417,10 +1451,11 @@ def _build_block(session, target, deadline):
         # the same value, so the server counts BUILDS (its two-absences prune
         # rule), never payloads (a block is re-emitted ~5 times per TTL).
         "built_at": _epoch(),
-        # Every namespace walk is held (_WALK_HOLD) until a reload: every
-        # datastore's namespaces are null and no group is read, so what the
-        # server stored for this PBS is of UNKNOWN freshness -- the one signal
-        # it needs for that, outside the capped errors[].
+        # Every namespace walk is held (_WALK_HOLD) until a reload: from the
+        # next build on, every datastore's namespaces are null and no group
+        # is read (this one may still carry what it read before the timeout),
+        # so what the server stored for this PBS is of UNKNOWN freshness --
+        # the one signal it needs for that, outside the capped errors[].
         "walks_held": _WALK_HOLD in _timeout_backoff,
     }
     too_large = _oversize(block)
@@ -1496,9 +1531,8 @@ def _read_datastores(
     deadline,
     stores,
     usage,
-    per_store_usage,
+    own_status,
     backends,
-    unaudited,
 ):
     """(name -> datastore, sorted (store, ns) units).
 
@@ -1507,12 +1541,10 @@ def _read_datastores(
     leave the per-namespace reads with nothing; they start at
     `_store_rotation`, and the next build resumes at the first datastore this
     one could not finish (see _resume_index), so one wedged datastore cannot
-    starve the ones after it on every build either. `per_store_usage`: the
-    aggregate usage read FAILED (PBS fails it whole when ONE datastore's
-    statfs errors) and the token is full-scope, so each datastore's own status
-    is read instead -- for a FILESYSTEM datastore only: any other backend's
-    usage is withheld anyway -- and never for one in `unaudited`, which PBS
-    answers with 0/0/0 (_hidden_below).
+    starve the ones after it on every build either. `own_status`: the
+    datastores whose own status is read for their usage (see _build_block:
+    the aggregate failed or is held, or a scoped token) -- a FILESYSTEM
+    datastore only: any other backend's usage is withheld anyway.
     """
     global _store_rotation
     datastores = {}
@@ -1528,18 +1560,16 @@ def _read_datastores(
         name = entry["store"]
         if usage is not None:
             row = usage.get(name, {})
-        elif (
-            per_store_usage
-            and backends.get(name) == "filesystem"
-            and name not in unaudited
-        ):
+        elif name in own_status and backends.get(name) == "filesystem":
             # Only where it can ship: any other backend's usage is withheld.
             row = _read_store_status(session, target, errors, phase_deadline, name)
         else:
             row = {}
         datastore = _datastore(entry, row, backends.get(name))
         datastore["gc"] = _read_gc(session, target, errors, phase_deadline, name)
-        namespaces = _read_namespaces(session, target, errors, phase_deadline, name)
+        # The tick's deadline, not the phase's: a namespace walk is sent only
+        # with its whole read timeout ahead of it (_sub_read).
+        namespaces = _read_namespaces(session, target, errors, deadline, name)
         trimmed = False
         if namespaces is not None:
             kept = _cap(
@@ -1689,11 +1719,11 @@ def _read_usage(session, target, errors, deadline, listed):
     see (measurement 6). A row's own error is recorded once per datastore in
     `listed` (at most MAX_DATASTORES), however many rows name it: a flood of
     rows must not crowd the job lists' 'partial:' flags out of the capped
-    errors[]. PBS walks the namespaces of every datastore the token cannot
-    audit (all of them for a scoped token; for a full-scope one, any a deeper
-    ACL entry hides), which never ends on an unreadable one: a timeout of
-    any walk holds every walk, this one included (_timeout_backoff), and a
-    full-scope token then reads each datastore's own status instead."""
+    errors[]. Read for a full-scope token only (see _build_block). PBS walks
+    the namespaces of every datastore the token cannot audit (any a deeper ACL
+    entry hides), which never ends on an unreadable one: a timeout of any walk
+    holds every walk, this one included (_timeout_backoff), and the token then
+    reads each datastore's own status instead."""
     failures = []
     rows = _sub_read(
         session,

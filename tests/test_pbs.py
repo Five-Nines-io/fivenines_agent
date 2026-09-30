@@ -198,6 +198,9 @@ FIXTURE_BUILT_AT = 1790640000
 
 
 def run_scenario(fixture, scenario, monkeypatch):
+    # A simulated clock, so a replayed read timeout takes its read timeout
+    # (as on the wire) and a timed-out walk arms the hold.
+    use_clock(monkeypatch, Clock())
     monkeypatch.setattr(pbs, "_epoch", lambda: FIXTURE_BUILT_AT)
     install(
         monkeypatch,
@@ -437,6 +440,7 @@ _SCENARIOS = [
     "snapshots_unreadable",
     "older_pbs",
     "first_backup_in_progress",
+    "namespace_walk_held",
 ]
 
 
@@ -1286,7 +1290,13 @@ def test_scoped_token_marks_every_job_list_partial(monkeypatch):
         "/remote": {"Remote.Audit": True},
     }
     out, _ = collect(
-        monkeypatch, minimal_responses(**{"/access/permissions": ok(perms)})
+        monkeypatch,
+        minimal_responses(
+            **{
+                "/access/permissions": ok(perms),
+                "/admin/datastore/ds/status": ok({"total": 9, "used": 4, "avail": 5}),
+            }
+        ),
     )
     assert [e["scope"] for e in out["errors"]] == [
         "sync_jobs",
@@ -2614,7 +2624,13 @@ def test_the_block_says_whether_absence_means_gone(monkeypatch):
     assert out["scope"] == "full"
     perms = {"/datastore/ds": {"Datastore.Audit": True}}
     out, _ = collect(
-        monkeypatch, minimal_responses(**{"/access/permissions": ok(perms)})
+        monkeypatch,
+        minimal_responses(
+            **{
+                "/access/permissions": ok(perms),
+                "/admin/datastore/ds/status": ok({"total": 9, "used": 4, "avail": 5}),
+            }
+        ),
     )
     assert out["scope"] == "partial"
     monkeypatch.setattr(pbs, "MAX_DATASTORES", 1)
@@ -2732,7 +2748,9 @@ def test_every_request_of_a_tick_is_clamped_to_the_budget_left(monkeypatch):
 
     def slow(url):
         left.append(deadline - clock.now)
-        clock.now += 11 if route(url) == "/version" else 0.5
+        # /version eats a quarter of the budget: the later reads are clamped,
+        # and the namespace walk still has its whole read timeout ahead.
+        clock.now += 5 if route(url) == "/version" else 0.5
         return handler(url)
 
     real = pbs.read_capped_body
@@ -2877,8 +2895,9 @@ def test_a_failed_aggregate_usage_falls_back_to_each_datastore(monkeypatch):
     datastore = out["datastores"][0]
     assert (datastore["total"], datastore["used"], datastore["avail"]) == (9, 4, 5)
     assert datastore["estimated_full_date"] is None
-    # A scoped token never reads it: to that token it answers a false 0/0/0.
-    perms = {"/datastore/ds": {"Datastore.Audit": True}}
+    # A token scoped BELOW the datastore never reads it: PBS answers it a
+    # false 0/0/0 (measurement 6).
+    perms = {"/datastore/ds/a": {"Datastore.Audit": True}}
     responses["/access/permissions"] = ok(perms)
     out, session = collect(monkeypatch, responses)
     assert out["datastores"][0]["total"] is None
@@ -2981,6 +3000,7 @@ def test_the_errors_cap_keeps_the_block_level_entries(monkeypatch):
         **{
             "/access/permissions": ok(perms),
             "/admin/datastore/ds/namespace": ok([{"ns": n} for n in names]),
+            "/admin/datastore/ds/status": ok({"total": 9, "used": 4, "avail": 5}),
         }
     )
     for ns in names:
@@ -5911,11 +5931,12 @@ def test_a_hidden_path_flags_the_job_lists_partial(monkeypatch, hidden):
     )
 
 
-# Value: protects=a stalled TLS handshake arms no hold even late in the budget,
-#   where the read timeout is clamped to the connect timeout; fails_when=the
-#   connect timeout of a held read is not kept under half its read timeout;
-#   why_new=the handshake test ran unclamped only (QA 003 reproduced a hold at
-#   a 5s budget); seam=none
+# Value: protects=a walk that could not wait its whole read timeout is never
+#   sent (so neither a stalled TLS handshake nor a PBS merely slow late in the
+#   tick can arm the hold), and one that is sent keeps its connect under half
+#   its read; fails_when=a walk is sent with a clamped read, or the connect is
+#   not kept under read/2; why_new=QA 003 reproduced a hold at a 5s budget;
+#   seam=none
 def test_a_stalled_tls_handshake_late_in_the_budget_holds_nothing(monkeypatch):
     clock = use_clock(monkeypatch, Clock())
 
@@ -5924,7 +5945,7 @@ def test_a_stalled_tls_handshake_late_in_the_budget_holds_nothing(monkeypatch):
 
     session = FakeSession(stall)
     target = _target()
-    for left in (5.0, 5.5, 1.0):  # QA 003: (5, 5) held before the fix
+    for left in (9.9, 5.0, 1.0):  # QA 003: (5, 5) held before the fix
         errors = pbs._Errors(target.redact)
         read = pbs._sub_read(
             session,
@@ -5937,9 +5958,22 @@ def test_a_stalled_tls_handshake_late_in_the_budget_holds_nothing(monkeypatch):
             backoff="hold",
         )
         assert read is None
-        connect, wait = session.timeouts[-1]
-        assert connect <= wait / 2
-        assert pbs._timeout_backoff == {}
+        assert session.calls == []  # not sent: its read would be cut short
+        assert [e["message"] for e in errors] == [pbs._DEADLINE_MESSAGE]
+    errors = pbs._Errors(target.redact)
+    pbs._sub_read(
+        session,
+        target,
+        errors,
+        clock.now + pbs.PBS_COLLECT_DEADLINE,
+        "namespaces",
+        _NS_PATH,
+        store="ds",
+        backoff="hold",
+    )
+    assert session.timeouts == [(pbs._CONNECT_TIMEOUT, pbs._READ_TIMEOUT)]
+    assert pbs._CONNECT_TIMEOUT <= pbs._READ_TIMEOUT / 2
+    assert pbs._timeout_backoff == {}
 
 
 def test_a_timeout_backoff_is_capped_and_per_request(monkeypatch):
@@ -6182,26 +6216,33 @@ def test_steady_repeats_do_not_use_up_the_error_line_cap(monkeypatch):
     ]
 
 
-def test_a_timed_out_usage_status_is_held_back_too(monkeypatch):
-    """PBS walks, for /status/datastore-usage, the namespace tree of every
-    datastore the token cannot audit -- under a scoped token, all the others --
-    the walk that never ends on an unreadable <store>/ns (reproduced on PBS
-    4.2): a timeout there is held back like a listing's."""
-    clock = use_clock(monkeypatch, Clock())
-    scoped = {"/datastore/ds": {"Datastore.Audit": True}}
-    stuck = minimal_responses(
+# Value: protects=a scoped token never reads the aggregate usage status (PBS
+#   walks every datastore it cannot audit, visible or not, so another tenant's
+#   broken datastore would hold this one's walks); a datastore it audits at
+#   the datastore level reports its usage from its own status;
+#   fails_when=a scoped token reads the aggregate again, or its datastore-level
+#   stores lose their usage; why_new=the red team traced the out-of-scope walk
+#   in PBS's datastore_status; seam=none
+@pytest.mark.parametrize(
+    "grant, own_status",
+    [("/datastore/ds", True), ("/datastore/ds/a", False)],
+    ids=["datastore_level", "namespace_level"],
+)
+def test_a_scoped_token_never_reads_the_aggregate_usage(monkeypatch, grant, own_status):
+    responses = minimal_responses(
         **{
-            "/access/permissions": ok(scoped),
+            "/access/permissions": ok({grant: {"Datastore.Audit": True}}),
             "/status/datastore-usage": {"error": "timeout", "message": "t"},
+            "/admin/datastore/ds/status": ok({"total": 9, "used": 4, "avail": 5}),
         }
     )
-    collect(monkeypatch, stuck)
-    clock.now += pbs.PBS_CACHE_TTL + 5
-    out, session = collect(monkeypatch, stuck)
-    assert "/status/datastore-usage" not in [route(u) for u in session.calls]
-    assert [e["message"] for e in out["errors"] if e["scope"] == "usage"] == [
-        pbs._TIMEOUT_HOLD_MESSAGE
-    ]
+    out, session = collect(monkeypatch, responses)
+    sent = [route(u) for u in session.calls]
+    assert "/status/datastore-usage" not in sent
+    assert ("/admin/datastore/ds/status" in sent) is own_status
+    assert out["datastores"][0]["total"] == (9 if own_status else None)
+    assert out["datastores"][0]["estimated_full_date"] is None
+    assert pbs._timeout_backoff == {}
 
 
 def test_a_held_back_usage_status_still_falls_back_per_datastore(monkeypatch):
@@ -6377,16 +6418,17 @@ def test_only_the_kept_groups_are_summarized():
     assert set(pbs._summarize_snapshots(snaps, "ds")[0]) == {("vm", "1"), ("vm", "2")}
 
 
-# Value: protects=a walk read keeps a 5s read timeout near the end of the budget, so a late answer never holds a healthy PBS;
-#   fails_when=min_wait is not passed to walk reads, or the max() floor in _get is dropped;
+# Value: protects=a backed-off read keeps a 5s read timeout near the end of the budget, and a walk is not sent then, so a late answer never holds or backs off a healthy PBS;
+#   fails_when=min_wait is not passed to backed-off reads, the max() floor in _get is dropped, or a walk is sent late;
 #   why_new=the only test that walk and snapshot reads get min_wait while other
 #   reads stay clamped; seam=none
 def test_a_walk_sent_as_the_budget_runs_out_is_late_never_held(monkeypatch):
-    """A walk (or snapshot) read waits _TIMEOUT_BACKOFF_MIN_WAIT whatever
-    budget is left: sent with 1s left and answered 2s later it is merely late
-    (a skip, sent again next build). Clamped to that 1s it would read as a
-    READ TIMEOUT and HOLD a healthy PBS's namespace listing until the next
-    SIGHUP. Every other read stays clamped to the budget left."""
+    """A backed-off read (a snapshot listing) waits _TIMEOUT_BACKOFF_MIN_WAIT
+    whatever budget is left: sent with 1s left and answered 2s later it is
+    merely late (a skip, sent again next build) -- clamped to that 1s it would
+    read as a READ TIMEOUT and back off. A walk is not even sent with less
+    than its whole read timeout left. Every other read stays clamped to the
+    budget left."""
     clock = use_clock(monkeypatch, Clock())
     handler = responses_handler(minimal_responses())
 
@@ -6398,17 +6440,25 @@ def test_a_walk_sent_as_the_budget_runs_out_is_late_never_held(monkeypatch):
 
     session = FakeSession(answers_in_two_seconds)
     target = _target()
-    for scope, path, backoff in (
-        ("namespaces", _NS_PATH, "hold"),
-        ("snapshots", "/admin/datastore/ds/snapshots", "retry"),
-    ):
-        errors = pbs._Errors(target.redact)
-        read = pbs._sub_read(
-            session, target, errors, clock.now + 1, scope, path, backoff=backoff
-        )
-        assert read is None
-        assert session.timeouts[-1] == (1, pbs._TIMEOUT_BACKOFF_MIN_WAIT)
-        assert [e["message"] for e in errors] == [pbs._DEADLINE_MESSAGE]
+    errors = pbs._Errors(target.redact)
+    held = pbs._sub_read(
+        session, target, errors, clock.now + 1, "namespaces", _NS_PATH, backoff="hold"
+    )
+    assert held is None and session.calls == []  # a walk: not sent at all
+    assert [e["message"] for e in errors] == [pbs._DEADLINE_MESSAGE]
+    errors = pbs._Errors(target.redact)
+    read = pbs._sub_read(
+        session,
+        target,
+        errors,
+        clock.now + 1,
+        "snapshots",
+        "/admin/datastore/ds/snapshots",
+        backoff="retry",
+    )
+    assert read is None
+    assert session.timeouts[-1] == (1, pbs._TIMEOUT_BACKOFF_MIN_WAIT)
+    assert [e["message"] for e in errors] == [pbs._DEADLINE_MESSAGE]
     assert pbs._timeout_backoff == {}
     errors = pbs._Errors(target.redact)
     gc = pbs._sub_read(
@@ -6511,9 +6561,9 @@ def test_a_hold_names_the_read_it_holds_in_the_log(monkeypatch):
         monkeypatch,
         minimal_responses(
             **{
-                "/access/permissions": ok({"/datastore/ds": {"Datastore.Audit": True}}),
                 _NS_PATH: {"error": "timeout", "message": "t"},
                 "/status/datastore-usage": {"error": "timeout", "message": "t"},
+                "/admin/datastore/ds/status": ok({"total": 9, "used": 4, "avail": 5}),
             }
         ),
     )
