@@ -6,8 +6,11 @@
 
 This agent collects server metrics from the monitored host and sends it to the [fivenines](https://fivenines.io) API.
 
-Runs on **Linux** (glibc + musl, amd64 + arm64), **Windows** (Server 2019+,
-Windows 10/11), **Synology DSM 7** and **UNRAID**.
+Runs on **Linux** (glibc + musl, 64-bit amd64 + arm64 only: the installers
+refuse 32-bit ARM, i686 and every other architecture, and -- wherever `getconf`
+is installed, as on Debian, Raspberry Pi OS and Alpine -- a 32-bit OS on 64-bit
+hardware such as 32-bit Raspberry Pi OS on a Pi 4 or 5), **Windows** (Server
+2019+, Windows 10/11), **Synology DSM 7** and **UNRAID**.
 
 ## Contents
 
@@ -76,7 +79,10 @@ wget -T 3 -q -O fivenines_setup.sh https://releases.fivenines.io/latest/fivenine
 
 One script covers every Linux init system: it detects **systemd**, **OpenRC**
 (Alpine) and **UNRAID** and installs the matching service integration, and it
-detects glibc vs musl and downloads the matching binary. See
+detects the architecture and glibc vs musl and downloads the matching binary.
+On a host no release has a binary for (see the platforms listed at the top),
+the install and update scripts stop with `Unsupported architecture` or
+`Unsupported system` before they create, download or stop anything. See
 [Alpine Linux (OpenRC)](#alpine-linux-openrc) and [UNRAID](#unraid) for the
 platform-specific notes.
 
