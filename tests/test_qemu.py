@@ -835,13 +835,21 @@ def test_a_spent_budget_reports_none_and_makes_no_further_call(fake_libvirt):
 def test_a_spent_budget_escapes_the_hypervisor_totals_handler(fake_libvirt):
     """The hypervisor totals read each domain's state inside two
     `except Exception` blocks; a budget spent there is still None, not the
-    totals alone or "listAllDomains failed"."""
+    totals alone or "listAllDomains failed". A listing that spent the
+    budget is reported as the listing."""
+    clock = [1000.0]
+    fake_time = SimpleNamespace(monotonic=lambda: clock[0], time=time.time)
     dom = _running_domain("a")
     conn = fake_libvirt.openReadOnly.return_value
     conn.getInfo.return_value = (None, 2048, 8)
-    conn.listAllDomains.return_value = [dom]
 
-    with patch.object(qemu, "COLLECT_BUDGET", 0), patch(
+    def slow_listing():
+        clock[0] += qemu.COLLECT_BUDGET
+        return [dom]
+
+    conn.listAllDomains.side_effect = slow_listing
+
+    with patch.object(qemu, "time", fake_time), patch(
         "fivenines_agent.qemu.log"
     ) as mock_log:
         assert qemu_metrics() is None
@@ -909,7 +917,7 @@ def test_the_budget_starts_before_the_open(fake_libvirt):
     assert dom.method_calls == []
     errors = _errors(mock_log)
     assert len(errors) == 1
-    assert "budget" in errors[0]
+    assert "budget while opening the libvirt connection" in errors[0]
     assert conn.close.call_count == 2
 
 
@@ -1253,6 +1261,8 @@ class _FakeProcess:
 
     def __init__(self, pid):
         entry = self.table[pid]
+        if isinstance(entry, list):  # successive processes on one pid
+            entry = entry.pop(0) if len(entry) > 1 else entry[0]
         if isinstance(entry, Exception):
             raise entry
         self._cmdline, self._created = entry
@@ -1671,3 +1681,53 @@ def test_a_reused_pid_reports_the_new_process_start_time(fake_libvirt):
 
     assert 3599 <= uptime_of_web({7: (_qemu_cmdline("uuid-web"), now - 3600)}) <= 3601
     assert 29 <= uptime_of_web({7: (_qemu_cmdline("uuid-web"), now - 30)}) <= 31
+
+
+def test_a_pid_reused_while_its_cmdline_is_read_is_skipped(fake_libvirt):
+    """The start time is read before the command line and checked again
+    after it: a pid that changed owner in between (another process's start
+    time) is skipped rather than paired with this UUID."""
+    now = time.time()
+    fake_libvirt.openReadOnly.return_value.listAllDomains.return_value = [
+        _running_domain("web")
+    ]
+    processes = {
+        7: [
+            (_qemu_cmdline("uuid-web"), now - 3600),  # read by the scan
+            (["bash"], now - 1),  # the pid's owner by the re-check
+        ]
+    }
+
+    with _host_processes(processes):
+        result = qemu_metrics()
+
+    (uptime,) = [
+        m["value"] for m in result if m["name"] == "vm_vm_uptime_seconds_total"
+    ]
+    assert uptime == 0
+
+
+def test_a_slow_last_process_read_still_spends_the_budget(fake_libvirt):
+    """The budget is re-checked after every process, the last one too: a
+    final read that overran must not ship a result and clear the backoff."""
+    clock = [1000.0]
+    fake_time = SimpleNamespace(monotonic=lambda: clock[0], time=time.time)
+    fake_libvirt.openReadOnly.return_value.listAllDomains.return_value = [
+        _running_domain("a")
+    ]
+
+    class SlowLastProcess(_FakeProcess):
+        table = {0: (["bash"], 0.0)}
+
+        def cmdline(self):
+            clock[0] += qemu.COLLECT_BUDGET
+            return super().cmdline()
+
+    with patch.object(qemu, "time", fake_time), patch.multiple(
+        qemu.psutil, pids=MagicMock(return_value=[0]), Process=SlowLastProcess
+    ), patch("fivenines_agent.qemu.log") as mock_log:
+        assert qemu_metrics() is None
+
+    (error,) = _errors(mock_log)
+    assert "while reading QEMU process start times" in error
+    assert qemu._backoff_failures == 1

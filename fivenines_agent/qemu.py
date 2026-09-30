@@ -749,7 +749,10 @@ class QEMUCollector:
 
     def _collect(self):
         data = []
-        self.position = ("list", None)
+        # An open that already spent the budget stays reported as the open:
+        # the next budget check fires under whatever position is current.
+        if time.monotonic() < self.deadline:
+            self.position = ("list", None)
 
         try:
             doms = [_Budgeted(dom, self.deadline) for dom in self.conn.listAllDomains()]
@@ -915,7 +918,7 @@ def _qemu_start_times(deadline):
     themselves, through psutil's name() for a 15-character comm such as
     qemu-system-x86: the per-collector bound in TODOS.md.) A fresh object
     reads create_time now, against the current boot time. COLLECT_BUDGET is
-    checked per process, so an abandoned worker stops."""
+    checked after every process, so an abandoned worker stops."""
     started = {}
     try:
         pids = psutil.pids()
@@ -923,26 +926,34 @@ def _qemu_start_times(deadline):
         log(f"Cannot list processes for QEMU start times: {e}", "debug")
         return started
     for pid in pids:
-        if time.monotonic() >= deadline:
-            raise _BudgetSpent()
         found = _qemu_uuid_and_start(pid)
         if found is not None:
             uuid, created = found
             started[uuid] = min(created, started.get(uuid, created))
+        # After each read, the last one included (_append_uptimes checked
+        # before the first): a slow final read must not ship past budget.
+        if time.monotonic() >= deadline:
+            raise _BudgetSpent()
     return started
 
 
 def _qemu_uuid_and_start(pid):
     """(lower-cased -uuid argument, start time) of one QEMU process, or None
-    for any other process, or one that is gone or not readable."""
+    for any other process, or one that is gone or not readable. The start
+    time is read BEFORE the command line and checked again after it through
+    a fresh object: a pid reused in between would pair one process's UUID
+    with another's start time."""
     try:
         proc = psutil.Process(pid)
+        created = proc.create_time()
         cmdline = proc.cmdline()
         if "-uuid" not in cmdline:
             return None
         position = cmdline.index("-uuid") + 1
         if position >= len(cmdline):
             return None
-        return cmdline[position].lower(), proc.create_time()
+        if psutil.Process(pid).create_time() != created:
+            return None
+        return cmdline[position].lower(), created
     except Exception:
         return None
