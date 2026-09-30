@@ -97,7 +97,8 @@ architectures, armv7 and i686, in this order:
 armv7 and i686 gate GA like the other two architectures, so they need what
 x86_64 and aarch64 already have:
 - a mapping in every installer and update script (root and user; UNRAID is
-  x86_64 only), as `armv7l` and `i686`/`i386`. The mapping follows the
+  x86_64 only), as `armv7l` (and `armv8l`, which an arm64 kernel reports
+  to a 32-bit personality) and `i686`/`i386`. The mapping follows the
   userland, not only `uname -m`, which names the kernel: 32-bit Raspberry Pi
   OS boots a 64-bit kernel on a Pi 4 or 5, so it reports `aarch64` over an
   armhf userland with no arm64 loader. The #170 fix already refuses that case
@@ -126,7 +127,8 @@ harness has to catch on those targets, not only on 64-bit hosts.
 installers sent every `uname -m` other than `aarch64` to the amd64
 artifact, which an armv7l or i686 host cannot execute. Every Linux
 installer now refuses a host no release has a binary for, including a
-32-bit userland on a 64-bit kernel, until the Rust artifacts exist.
+32-bit userland on a 64-bit kernel whose `getconf LONG_BIT` prints 32 (a
+host without `getconf` is not guessed at), until the Rust artifacts exist.
 
 The Windows gap is a Python packaging bug, not a platform limit. NVIDIA
 ships NVML on Windows as `nvml.dll`, which pynvml knows how to load, and the
@@ -224,7 +226,8 @@ makes:
     `get_clean_env` drops today (`LD_LIBRARY_PATH`, `LD_PRELOAD`, `LIBPATH`,
     the `DYLD_*` pair), operator-set ones included, since no child sees
     them today.
-- **musl hosts** (Alpine): fully static, using the musl that Rust bundles.
+- **musl hosts** (Alpine): fully static, using the musl that Rust bundles
+  (or zig's, where section 4 lets zig link armv7).
 
 **Why.** Parity comes from the construction: each Rust build inherits the
 name-service and resolver behavior of the Python build it replaces, and the
@@ -363,6 +366,9 @@ exactly the kind of divergence constraint 1 of #169 exists to catch.
     runtime;
   - the runtime is built once and driven with `block_on`;
   - it is called through `call_bounded`.
+  The one exception is a long-lived connection (MQTT, below): its runtime
+  lives on the thread that owns the connection, and only the snapshot read
+  goes through `call_bounded`.
 - No multi-threaded runtime is allowed anywhere. CI fails if tokio's
   `rt-multi-thread` feature appears in the dependency graph.
 
@@ -371,8 +377,8 @@ exactly the kind of divergence constraint 1 of #169 exists to catch.
 | psutil                     | Our own /proc and /sys readers, following psutil 7.2.1 (constraint 2) | none |
 | requests, urllib3, certifi | ureq 3 with rustls and webpki-roots (the Mozilla bundle, like certifi); for pg8000 and paho, which use OpenSSL's default verify paths, the store the frozen binaries actually reach is measured in their steps | none |
 | dnspython (API host, `ip.fivenines.io`) | Chosen in the synchronizer step: a minimal stub resolver or hickory | none, or current-thread |
-| docker-py                  | HTTP/1.1 over the endpoint docker-py reaches today (the unix socket, a `tcp://` `socket_url`, or `DOCKER_HOST` with `DOCKER_TLS_VERIFY` / `DOCKER_CERT_PATH` client certificates), with our own string-typed models, **not bollard** (below) | none |
-| python-dotenv              | `<config_dir>/.env` read into the environment at startup, same grammar (`${VAR}` interpolation), never overriding a variable already set | none |
+| docker-py                  | HTTP/1.1 over the endpoint docker-py reaches today (the unix socket, a `tcp://` `socket_url`, or `DOCKER_HOST` with `DOCKER_TLS_VERIFY` / `DOCKER_CERT_PATH` client certificates), with our own string-typed models, **not bollard** (below). `ssh://` passes the probe but fails at runtime (paramiko is not bundled) and ships `null`; the Rust agent keeps that outcome | none |
+| python-dotenv              | `<config_dir>/.env` read into the environment at startup, same grammar (`${VAR}` interpolation), never overriding a variable already set. Python reads it after `CONFIG_DIR` is resolved, so a `CONFIG_DIR` set in `.env` moves `machine_id`, the journal allowlist and the TOKEN swap but not the TOKEN read: the Rust agent keeps that order, or Python fixes it first | none |
 | pg8000                     | Chosen in its step: a minimal wire client, or an async client behind the rule above. Not the `postgres` crate as it stands: it builds a runtime per connection, and the collector connects on every tick | current-thread at most |
 | paho-mqtt                  | Chosen in the mqtt step. Like paho's network thread, one long-lived thread per broker keeps the connection and its keepalives; only the snapshot read goes through `call_bounded`, since a runtime driven only at tick time would batch messages and corrupt their ages | none, or current-thread on that thread |
 | pynvml                     | nvml-wrapper (libloading): glibc and Windows (`nvml.dll`) builds, never musl | none |
@@ -405,15 +411,25 @@ bollard is ruled out by what the prototype's docker port found:
   `"abort"` (the prototype relied on the default). With it, a panic costs
   one collector a `null`; the prototype confirmed this when its own
   `tokio::time::timeout`, built outside the runtime, panicked.
-- requests reads its environment on every call, and ureq with webpki-roots
-  does not: proxies per scheme from `HTTP(S)_PROXY` and `ALL_PROXY`
+- requests reads its environment on every call: a proxy per scheme
+  (`HTTPS_PROXY` for https, `HTTP_PROXY` for http, `ALL_PROXY` last)
   honoring `NO_PROXY`, a CA bundle from `REQUESTS_CA_BUNDLE` or
   `CURL_CA_BUNDLE`, and `~/.netrc` credentials when no auth is set. Every
   HTTP collector (nginx, apache, caddy, haproxy, php-fpm, rabbitmq, tsdb,
   vllm, sglang, proxmox, and docker over `tcp://`, whose client is a
-  requests session) relies on it, so a host behind a proxy or trusting
-  an internal CA would lose them on migration. Their steps reproduce these
-  behaviors, and the harness runs one input that sets them.
+  requests session) relies on it. ureq 3 reads proxy variables too, but
+  differently: its default configuration takes one proxy for every scheme,
+  `ALL_PROXY` first, and it ignores the CA bundle and netrc variables. So:
+  - the API and `ip.fivenines.io` clients set no proxy (`proxy(None)`):
+    Python never proxies them (they connect through their own resolver),
+    and a proxy in the service environment or in `.env` must not start
+    carrying `/collect` after migration;
+  - the HTTP collectors reproduce requests' per-scheme order, CA bundle
+    and netrc handling, and the harness runs one input where
+    `ALL_PROXY`, `HTTP_PROXY` and `HTTPS_PROXY` all differ;
+  - rustls has no TLS 1.2 DHE or CBC suites, which Python's OpenSSL still
+    offers: an endpoint that offers only those works today and would fail
+    in Rust. The HTTP steps check for it or document the change.
 - **Mutex poisoning.** A collector that panics while holding shared state
   poisons the lock, and every later `.lock().unwrap()` panics too. The
   prototype's `processes` and `cpu` state take their lock that way, so one
@@ -424,9 +440,9 @@ bollard is ruled out by what the prototype's docker port found:
   enforces it with clippy `disallowed-methods` entries on every std call
   that reports poisoning (`Mutex::lock` and `try_lock`, `RwLock::read`,
   `write` and their `try_` forms, the `Condvar::wait` family), so locking
-  goes through a wrapper that recovers. A `LazyLock` or `OnceLock`
-  initializer stays infallible: a panic there poisons it for good, so
-  fallible reads belong in the collector call.
+  goes through a wrapper that recovers. A `LazyLock` initializer stays
+  infallible: a panic there poisons it for good (a `OnceLock` retries
+  instead), so fallible reads belong in the collector call.
 - An abandoned worker can still hold shared state. Single-flight per name
   protects the next tick only if every path into that state goes through the
   same name.
@@ -535,10 +551,13 @@ unix socket only, implementing only the procedures the collector uses.
   and `null` rather than a partial VM list; and the uptime read from a
   `/proc` scan, so the test inputs include a fake `/proc` with QEMU
   processes next to the RPC server below;
-- libvirt's socket selection for `qemu:///system` and `qemu:///session` with
-  `mode=auto|direct|legacy`: the monolithic `libvirt-sock-ro` versus the
-  modular `virtqemud-sock-ro`, and `$XDG_RUNTIME_DIR` for session. This
-  selection is parity-critical and is tested against both daemon layouts;
+- libvirt's socket selection with `mode=auto|direct|legacy`: for
+  `qemu:///system`, the monolithic `libvirt-sock-ro` versus the modular
+  `virtqemud-sock-ro` under the libvirt run directory; for
+  `qemu:///session`, which has no read-only socket, `libvirt-sock` versus
+  `virtqemud-sock` under `$XDG_RUNTIME_DIR/libvirt`, opened with the
+  read-only connect flag. This selection is parity-critical and is tested
+  against both daemon layouts, system and session;
 - a test input both clients can talk to: a scripted libvirt RPC server on a
   unix socket, serving both socket layouts, with failure modes (a stuck
   call, a failed domain listing). Today's tests mock the Python binding,
@@ -605,7 +624,10 @@ this record decides.
   a recorded `/proc` fault) that the harness runs against both agents.
   Once a collector's Rust step has closed, any PR that changes its payload in
   Python must change the Rust side in the same PR. The differential harness
-  fails otherwise (section 1), so CI enforces this, not process.
+  fails otherwise (section 1), so CI enforces this, not process, for every
+  path its recorded inputs reach; a PR that changes a closed collector's
+  Python therefore also adds or changes a harness input for it (a CI path
+  rule the harness step sets up).
 - **At GA, per platform.**
   - Installers and update scripts install the Rust agent.
   - The update script migrates a Python install in place; the state files are
@@ -628,8 +650,10 @@ this record decides.
   - Maintenance releases come from a maintenance branch cut at GA from the
     last commit that shipped that platform's Python agent. Its tags take
     the next patch versions of that release line (1.x.y after the Linux
-    GA), so they never collide with main's, and build only that platform's
-    Python artifacts.
+    GA) and build only that platform's Python artifacts. Every platform
+    GA bumps at least the minor version on main, so a later GA's
+    maintenance patches (say 2.3.5 after a Windows GA in 2.4.0) never
+    collide with main's tags either.
   - They go through the same signed pipeline but never become `latest`:
     not on GitHub, not in R2's `latest/`, which every installer reads. A
     maintenance release published as `latest` would downgrade every Rust
@@ -690,16 +714,23 @@ no list of known differences, which gives "exact" a precise meaning:
   `capability_reasons` (`pynvml not installed`); the error entries of
   openvpn, snmp, ceph, systemd, proxmox backups and the image inventory;
   `error_message` in rabbitmq, tsdb, vllm and sglang; `error_detail` in
-  postgresql and mysql; mqtt's broker `error`; `_telemetry[*].errors`; and
-  `uname.processor` (from `uname -p`). Each collector step checks its
-  collector for sites added since.
+  postgresql and mysql; mqtt's broker `error`; and `_telemetry[*].errors`.
+  Each collector step checks its collector for sites added since.
+  `uname.processor` is different: it is the output of `uname -p`, which
+  CPython's `platform` module runs outside `get_clean_env` (`x86_64` on
+  RHEL, empty on Debian), so the Rust agent runs the same command through
+  its clean runner, or Python stops running it first (#184).
 - Names that are not valid UTF-8 (a process name, a mount point, a device
-  name: any local user can create one) are decoded with U+FFFD replacement
-  in Python first. Today Python keeps them with `surrogateescape` and the
-  JSON carries lone `\udcXX` escapes, which a Rust `String` cannot hold and
-  the server reads as invalid text. The replacement matches Rust's
-  `from_utf8_lossy` (both replace each maximal invalid subpart), and the
-  recorded inputs include such names.
+  name: any local user can create one) keep Python's encoding. Python
+  decodes them with `surrogateescape` and its JSON carries one lone
+  `\udcXX` escape per invalid byte, which is one-to-one. The Rust agent
+  keeps such names as bytes and writes the same escapes through its own
+  serializer, since a Rust `String` cannot hold them. Any lossy decoding
+  (U+FFFD) is ruled out: these names are keys (`partitions_usage` by mount
+  point, `io` and `io_topology` by device, network rows by interface), and
+  two names that differ only in invalid bytes would merge into one row.
+  The recorded inputs include two such names that a lossy decoding would
+  merge.
 - Only three fields are excluded, by name: the implementation name
   (section 8), and `running_time` and `_telemetry[*].duration_ms`, which
   measure the agent, not the host. `version` is compared: both agents are
@@ -740,8 +771,9 @@ Found while preparing this record (status as of v1.20.4):
 - Crate layout, lint set, coverage tool and threshold, the cargo-deny and
   cargo-audit policy, and whether to adopt cargo-vet: the workspace and CI
   step (#175). It also checks that `rust/rust-toolchain.toml` and the
-  workspace `rust-version` agree, since edition 2024's resolver caps
-  dependency versions at `rust-version`.
+  workspace `rust-version` agree: edition 2024's resolver prefers
+  dependency versions compatible with `rust-version`, and compiling with
+  the pinned toolchain is what enforces it.
 - The DNS client for the API host and `ip.fivenines.io`: the synchronizer
   step. It must match how the agent uses dnspython 2.8 today:
   - common to both names: one resolver per process, built once from
@@ -791,7 +823,8 @@ Found while preparing this record (status as of v1.20.4):
     so the time-driven branches (qemu's budget and backoff, snmp's
     interval replay, the docker, openvpn and ping deadlines) are reachable.
     Which clocks it controls decides whether the ages read from the
-    monotonic clock (mqtt's, proxmox's `age_s`) are compared or join the
+    monotonic clock (mqtt's, proxmox's `age_s`) and the ping latencies
+    (Python times them with the wall clock) are compared or join the
     exclusions of section 9;
   - the scope before GA: the mock config enables only the collectors whose
     step has closed, and capabilities are compared only for their probes.
@@ -813,9 +846,17 @@ Found while preparing this record (status as of v1.20.4):
     tail (ping, snmp, mqtt) on every tick, so the start rotates or the tail
     keeps a reserve; mqtt's reconcile always runs, and a skipped mqtt ships
     its error envelope, never a missing key; snmp keeps its in-flight
-    accounting;
+    accounting. More generally, each collector's skip value follows its
+    contract: tsdb, vllm, sglang and rabbitmq never ship `null` (their
+    `reachable: false` envelope), so a deadline or a skip ships that
+    envelope instead;
   - whether the interval cap of section 5 stays once the sleep feeds the
     watchdog, since a cap rewrites a valid server interval such as 300s.
+- The beta and GA steps (#209, #210): one pre-release spelling for both
+  manifests (PEP 440 writes `2.0.0b1`, SemVer `2.0.0-beta.1`, and the MSI
+  takes no suffix), and the limits of pinned mode: it starts at v1.18.1,
+  the first release that publishes the startup definitions, and a signing
+  key rotation keeps the previous key for verifying older releases.
 - The system core step (#184) checks the libc-dependent sources: under
   musl, `os.getloadavg` and `os.cpu_count` come from `sysinfo` and
   `sched_getaffinity` rather than `/proc/loadavg` and `/sys`, so the Alpine
