@@ -69,7 +69,7 @@ native multipath is covered: `/sys/block/<head>/multipath/` on Linux 6.15+ and,
 on any kernel, the head derived from the hidden path's kernel-assigned name
 (`nvme{S}c{C}n{H}` -> `nvme{S}n{H}`).
 
-## P3: Per-collector wall-clock bound against a kernfs stall (only io_topology and pbs have one)
+## P3: Per-collector wall-clock bound against a kernfs stall (only io_topology bounds its sysfs read)
 
 Found by the Codex review of #155. Under memory pressure a sysfs reader can fault
 into reclaim while holding `kernfs_rwsem`, and a queued writer then blocks every
@@ -83,14 +83,21 @@ is the first to bound its own read (a single-flight worker abandoned after
 (`PBS_HARD_DEADLINE`, which also covers DNS and connecting to every address of
 a host name); the others are not. The uniform fix is a per-collector
 wall-clock bound in `collectors.collect_metrics` built on `bounded.call_bounded`
-(already shared by `run_privileged`, the libvirt probe, `io_topology` and `pbs`), which
-changes every collector's failure mode -- hence its own change. Two things it must
-handle, both found reviewing #155: `run_privileged` has no single-flight, so a
-wedged sudoers backend leaks one thread and one blocked root `sudo` per call site
-per tick, and its per-call bounds (30s + 2s for `smartctl --scan`, then mdadm,
-fail2ban, wg) can add up past `WatchdogSec=90` in one tick; and a collector that
-keeps per-THREAD state -- docker's thread-local client cache -- would rebuild it
-every tick if moved onto a fresh worker, so it needs its own posture.
+(already shared by `run_privileged`, the libvirt probe, `io_topology` and the
+`qemu` and `pbs` collectors), which changes every collector's failure mode -- hence its own
+change. Two things it must handle, both found reviewing #155: `run_privileged`
+has no single-flight, so a wedged sudoers backend leaks one thread and one
+blocked root `sudo` per call site per tick, and its per-call bounds (30s + 2s for
+`smartctl --scan`, then mdadm, fail2ban, wg) can add up past `WatchdogSec=90` in
+one tick; and a collector that keeps per-THREAD state -- docker's thread-local
+client cache -- would rebuild it every tick if moved onto a fresh worker, so it
+needs its own posture. `qemu` (#171) already bounds its whole collection, with a
+contract a generic bound must not replace: its budget stops the worker between
+libvirt calls and reports `None`, never a partial VM list. The same exposure
+exists outside sysfs: `processes` and `openvpn` read every QEMU process's
+`/proc/<pid>/cmdline` on the collection thread, through psutil's `name()` (it
+falls back to `cmdline()` for a 15-character comm such as `qemu-system-x86`),
+and that read waits on the process's mmap lock.
 
 ## Proxmox backups phase 2 -- server half tracked in fivenines_server#1164
 
@@ -698,26 +705,6 @@ generate one at spec time from the declared enum rather than committing it.
 - **Depends on:** nothing
 - **Files:** `tests/fixtures/docker_image_inventory_contract_payload.json`, `tests/test_docker_image_inventory.py`
 
-## P3: Bound the QEMU collector's libvirt connection with a timeout
-
-`QEMUCollector._connect` calls `libvirt.openReadOnly` with no deadline, on the
-collection thread. The permissions probe already wraps its own open in a worker
-with `LIBVIRT_PROBE_TIMEOUT` (3s) for exactly this reason: a wedged libvirt
-stack (socket activation, daemon handshake, polkit, NSS) blocks indefinitely,
-and the collection loop is bounded by `WatchdogSec=90`.
-
-Agent #142 closed the backend-steerable half of this by constraining
-`?socket=` to libvirt's own socket directories, so a hostile config can no
-longer point the agent at a peer that reads and waits (docker.sock, a
-socket-activated service). What remains is the honest case: a real libvirt that
-hangs. The fix mirrors `_can_access_libvirt` -- worker thread, hard timeout,
-single-flight so a hung open cannot leak one thread per tick -- and reports
-`None` on timeout (a collection failure, which the collector now distinguishes
-from `[]`).
-
-- **Effort:** M (human) / S (CC)
-- **Files:** `fivenines_agent/qemu.py`, `tests/test_qemu.py`
-
 ## P3: Thread the configured QEMU URI through the capability probe
 
 `permissions._can_access_libvirt` opens `DEFAULT_LIBVIRT_URI` while the
@@ -785,6 +772,27 @@ bake's `poetry install` re-syncs poetry's own dependencies to the lock.)
 - **Files:** `ci/requirements/`, `.github/workflows/`
 
 ## Completed
+
+### P3: Bound the QEMU collector's libvirt connection with a timeout (#171)
+
+`QEMUCollector._connect` opened libvirt with no deadline on the collection
+thread, and no domain call had one either: every call through a VM's QEMU
+monitor waits up to 30s for the domain job lock, so one VM with a stuck
+monitor (or a wedged libvirtd) pushed the tick past `WatchdogSec=90` and
+systemd restarted the agent on every tick. The whole collection (open, list,
+per-domain loop, close) now runs on a single-flight `bounded.call_bounded`
+worker the tick stops waiting for after `COLLECT_TIMEOUT` (15s), and inside
+it every libvirt call on a domain checks `COLLECT_BUDGET` (10s) first. Both
+report `None`, never a partial VM list; the budget line names the VM it ran
+out at and how far the walk got. A collection that ran out of time backs off
+60s then 120s, so a VM that stays stuck does not cost the timeout on every
+tick, and a listed VM that cannot be read (a daemon restarted mid-walk,
+directly or behind `virtproxyd`) also reports `None` instead of the VMs read
+before it; only `VIR_ERR_NO_DOMAIN` is skipped alone. The same change fixed
+`vm_vm_uptime_seconds_total`, which read a sixth `dom.info()` field libvirt
+never returns and was always 0: it is now the age of the VM's QEMU process.
+
+**Completed:** v1.20.4 (2026-09-30)
 
 ### P3: Nightly distro matrix runs
 

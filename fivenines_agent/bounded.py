@@ -7,10 +7,10 @@ a kernfs readdir stuck behind reclaim. For those, the only protection is not
 waiting: run the call on a daemon worker, stop waiting at the deadline, and
 leave the worker to finish in the background.
 
-Used by subprocess_utils.run_privileged, the libvirt capability probe, the
-io_topology collector and the pbs collector (its whole collection). Each
-caller keeps its own policy for the abandoned worker (single-flight on it, or
-not) and its own failure value.
+Used by subprocess_utils.run_privileged, the libvirt capability probe and the
+io_topology, qemu and pbs collectors (qemu and pbs bound their whole
+collection). Each caller keeps its own policy for the abandoned worker
+(single-flight on it, or not) and its own failure value.
 """
 
 import threading

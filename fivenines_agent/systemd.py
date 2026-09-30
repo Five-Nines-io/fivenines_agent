@@ -513,6 +513,11 @@ def _parse_journalctl_failed(stdout):
 _REVERSE_DEP_TREE_CHARS = (
     "".join(chr(c) for c in (0x2502, 0x2500, 0x251C, 0x2514)) + " \t"
 )
+# Every child runs under LC_ALL=C (#172), where systemctl draws its tree in
+# ASCII: "| " (vertical), "|-" (branch), "`-" (last branch), "  " (space). Those
+# are stripped as WHOLE glyph pairs, never as single characters: '|' and '`'
+# cannot start a unit name, so "`--.mount" loses "`-" and keeps "-.mount".
+_ASCII_TREE_PREFIX_RE = re.compile(r"^(?:[|`][ -]|\s)+")
 # Unit-state marks systemctl prefixes in list-dependencies tree output and in
 # list-units rows on versions where --plain does not suppress them: U+25CF
 # (active), U+25CB (inactive), U+00D7 (failed), U+21BB (reloading), plus their
@@ -533,10 +538,11 @@ def _parse_reverse_deps(stdout):
     With --plain the output is the queried unit on the first line, then one
     indented dependency name per line. Defense-in-depth for non-plain forms:
     a leading unit-state mark token (see _UNIT_STATE_MARKS) is dropped,
-    and Unicode tree-drawing prefixes (U+251C, U+2502, U+2500, U+2514) are
-    stripped -- exactly those characters, not "any punctuation", so names
-    like the root mount "-.mount" survive intact. Returns a deduplicated
-    list of dependent unit names, capped at MAX_REVERSE_DEPS.
+    and tree-drawing prefixes are stripped -- the Unicode characters (U+251C,
+    U+2502, U+2500, U+2514) and the C-locale ASCII glyph pairs ("|-", "`-",
+    "| "), not "any punctuation", so names like the root mount "-.mount"
+    survive intact. Returns a deduplicated list of dependent unit names,
+    capped at MAX_REVERSE_DEPS.
     """
     if not stdout:
         return []
@@ -550,12 +556,14 @@ def _parse_reverse_deps(stdout):
         # then strip tree chars again for the glyph-prefixed tree form where
         # the mark precedes the branch ("* <tree>name").
         cleaned = line.lstrip(_REVERSE_DEP_TREE_CHARS)
-        tokens = cleaned.split()
-        if tokens and tokens[0] in _UNIT_STATE_MARKS:
-            tokens = tokens[1:]
+        parts = cleaned.split(None, 1)
+        if parts and parts[0] in _UNIT_STATE_MARKS:
+            cleaned = parts[1] if len(parts) > 1 else ""
+        cleaned = _ASCII_TREE_PREFIX_RE.sub("", cleaned)
+        tokens = cleaned.lstrip(_REVERSE_DEP_TREE_CHARS).split()
         if not tokens:
             continue
-        name = tokens[0].lstrip(_REVERSE_DEP_TREE_CHARS)
+        name = tokens[0]
         if name and name not in seen:
             seen.add(name)
             deps.append(name)

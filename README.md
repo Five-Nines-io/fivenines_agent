@@ -6,8 +6,11 @@
 
 This agent collects server metrics from the monitored host and sends it to the [fivenines](https://fivenines.io) API.
 
-Runs on **Linux** (glibc + musl, amd64 + arm64), **Windows** (Server 2019+,
-Windows 10/11), **Synology DSM 7** and **UNRAID**.
+Runs on **Linux** (glibc + musl, 64-bit amd64 + arm64 only: the installers
+refuse 32-bit ARM, i686 and every other architecture, and -- wherever `getconf`
+is installed, as on Debian, Raspberry Pi OS and Alpine -- a 32-bit OS on 64-bit
+hardware such as 32-bit Raspberry Pi OS on a Pi 4 or 5), **Windows** (Server
+2019+, Windows 10/11), **Synology DSM 7** and **UNRAID**.
 
 ## Contents
 
@@ -77,7 +80,10 @@ wget -T 3 -q -O fivenines_setup.sh https://releases.fivenines.io/latest/fivenine
 
 One script covers every Linux init system: it detects **systemd**, **OpenRC**
 (Alpine) and **UNRAID** and installs the matching service integration, and it
-detects glibc vs musl and downloads the matching binary. See
+detects the architecture and glibc vs musl and downloads the matching binary.
+On a host no release has a binary for (see the platforms listed at the top),
+the install and update scripts stop with `Unsupported architecture` or
+`Unsupported system` before they create, download or stop anything. See
 [Alpine Linux (OpenRC)](#alpine-linux-openrc) and [UNRAID](#unraid) for the
 platform-specific notes.
 
@@ -1315,6 +1321,13 @@ vCPU/memory/domain totals. With the default `qemu:///system` URI it needs
 `libvirt` group membership (see [Permissions](#permissions)); a
 `qemu:///session` URI sees only the VMs of the account the agent runs as.
 
+A VM's uptime is the age of its QEMU process, found by the `-uuid` argument
+libvirt starts it with, because libvirt has no API for a VM's start time
+(agent **1.20.4+**; earlier agents always reported 0). A VM that is not running,
+or whose QEMU process the agent cannot see, reports 0: `/proc` mounted with
+`hidepid=`, or SELinux confining QEMU as `svirt_t` (RHEL family), which the
+agent's policy does not grant access to.
+
 The **libvirt URI** defaults to `qemu:///system` and is configurable from the
 dashboard, but the agent enforces its own allowlist before connecting
 (agent **1.17.5+**). A libvirt URI selects a *transport* as well as a
@@ -1327,8 +1340,10 @@ open a network/SSH connection (`qemu+ssh://`, `qemu+tcp://`, `qemu+tls://`,
   `?mode=auto|direct|legacy`, the only two parameters the local socket
   transport reads. `socket=` must point at a file inside a libvirt socket
   directory (`/run/libvirt/`, `/var/run/libvirt/` or
-  `$XDG_RUNTIME_DIR/libvirt/`), because the collector's connection has no
-  timeout and any other local socket could stall a collection tick.
+  `$XDG_RUNTIME_DIR/libvirt/`), because any other local socket that accepts
+  and never answers (such as `docker.sock`) would block the collection for
+  good: QEMU would report `null` until the agent restarts (see the time
+  bound below).
 
 Everything else -- any other scheme (spelled exactly as libvirt matches it),
 any URI with a host component (`qemu://HOST/system` is an implicit TLS
@@ -1341,6 +1356,33 @@ the journal), makes no libvirt call at all, and reports `null` for QEMU, which
 the dashboard shows as a collection failure rather than as zero VMs. A failed
 connection or domain listing also reports `null` (agent **1.17.5+**); `[]`
 now means libvirt answered and listed zero VMs.
+
+Each collection is also bounded in time (agent **1.20.4+**). libvirt calls
+carry no timeout, and on a VM whose QEMU monitor is stuck (a hung QEMU, a
+long-running job, storage stalled under the guest) every monitor call waits up
+to 30s for the VM's job lock -- enough, with a couple of disks, to stall the
+agent past its systemd watchdog, which restarted it and lost every host metric
+on each tick. The agent now gives up on QEMU after 15s and reports `null` for
+that tick (a collection failure, never a partial VM list, which would read as
+the missing VMs being gone); every other metric is sent as usual. A libvirt
+call that never returns is left to finish in the background, and no second
+collection starts behind it. So a VM with a stuck monitor shows up as QEMU
+collection failing for as long as it stays stuck, and the agent's journal
+says where the collection ran out of time: the VM it was reading, or the step
+it was on (opening or closing the connection, listing the VMs, reading the
+QEMU processes' start times).
+
+After a collection that ran out of time the agent skips QEMU for 60s, then
+120s, counted from the end of that collection (every 2nd, then every 3rd
+collection at the default 60s interval), so a VM that stays stuck does not
+cost 15s of every collection; QEMU shows up again within about 3 minutes of it
+recovering. A VM that libvirt listed but cannot read -- the daemon restarted
+mid-collection by an update, directly or behind `virtproxyd` -- also makes the
+collection report `null`, never the VMs read before it; only a VM deleted
+during the collection is left out on its own. The bound also caps how large a
+host can be: one whose VMs cannot all be read in 10s -- a budget that also
+covers the uptime lookup, about 0.1ms per process on the host -- reports `null`
+on every tick, and the same journal line says how many VMs it got through.
 
 The agent also never starts a hypervisor daemon on your behalf: it sets
 `LIBVIRT_AUTOSTART=0` at startup, so a `qemu:///session` URI needs the session

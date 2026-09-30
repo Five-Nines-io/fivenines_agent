@@ -14,6 +14,7 @@ parametrized parser/replication cases.
 import json
 import os
 import subprocess
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -238,6 +239,73 @@ def test_run_mysql_tcp_command_and_success():
     assert "-h" in cmd and "localhost" in cmd
     assert "-P" in cmd and "3306" in cmd
     assert cmd[-4:] == ["-N", "-B", "-e", "SHOW GLOBAL STATUS"]
+
+
+@pytest.mark.parametrize("vertical", [False, True])
+@pytest.mark.parametrize(
+    "over",
+    [
+        {},  # TCP defaults
+        {"socket": "/run/mysqld/mysqld.sock"},  # cPanel/Plesk unix socket
+        {"database": "appdb"},
+        {
+            "socket": "/run/mysqld/mysqld.sock",
+            "database": "appdb",
+            "password": "s3cret",
+        },
+    ],
+)
+def test_run_mysql_charset_flag_in_every_connection_shape(over, vertical):
+    """#172: the client derives its charset from the locale, and every child now
+    runs in C, where MariaDB negotiates latin1: a replica whose Last_SQL_Error
+    quotes a non-ASCII duplicate key then prints a latin1 byte, which the UTF-8
+    decode can only turn into U+FFFD. Measured on MariaDB 10.11: b'M\\xfcller'
+    under C, b'M\\xc3\\xbcller' with the flag.
+
+    The flag is unconditional. A socket install (the cPanel/Plesk
+    shape) derives its charset from the locale exactly like a TCP one, so a
+    refactor moving the flag into the TCP branch would bring latin1 text back
+    for every socket host. Exactly once, and ahead of -e: the SQL
+    must stay the LAST argument, since it is what -e consumes (and what every
+    fake in this file dispatches on). The password never joins argv -- it
+    rides MYSQL_PWD, out of `ps`."""
+    sql = "SHOW REPLICA STATUS\\G" if vertical else "SHOW GLOBAL STATUS"
+    with patch(f"{MY}.subprocess.run", return_value=completed("", "")) as run:
+        _run_mysql("mysql", sql, _conn(**over), vertical=vertical)
+    cmd = run.call_args.args[0]
+    assert cmd.count("--default-character-set=utf8mb4") == 1
+    assert cmd[-2:] == ["-e", sql]
+    assert not any("s3cret" in arg for arg in cmd)
+
+
+def test_run_mysql_survives_a_byte_that_is_not_utf8():
+    """#172: the flag fixes what the server sends, not how the agent decodes it.
+    A server running skip-character-set-client-handshake still answers in its
+    own charset, and a strict decode of one latin1 byte in a replica row nobody
+    ships used to raise out of _run_mysql and null the whole payload. A real
+    child writes the bytes; only the argv is swapped, every kwarg is the
+    agent's own."""
+    row = (
+        b"Slave_IO_Running: Yes\nSlave_SQL_Running: No\n"
+        b"Last_SQL_Error: Duplicate entry 'M\xfcller'\n"
+    )
+    real_run = subprocess.run
+
+    def child_writing_latin1(cmd, **kwargs):
+        # Pinned here, not only through the result: on a UTF-8 host the
+        # locale codec would also yield U+FFFD, so only Windows (cp1252) would
+        # notice a lost encoding= without this line.
+        assert kwargs["encoding"] == "utf-8"
+        script = "import sys; sys.stdout.buffer.write(%r)" % row
+        return real_run([sys.executable, "-c", script], **kwargs)
+
+    with patch(f"{MY}.subprocess.run", side_effect=child_writing_latin1):
+        out, err, _ = _run_mysql(
+            "mysql", "SHOW REPLICA STATUS\\G", _conn(), vertical=True
+        )
+    assert err is None
+    assert "Slave_IO_Running: Yes" in out
+    assert "Duplicate entry 'M\ufffdller'" in out
 
 
 def test_run_mysql_socket_ignores_host_port():
