@@ -6,7 +6,8 @@
 - Inputs: the Go and Rust prototypes and their harness on
   `experiments/agent-rewrite-prototypes` (7de6404), memory re-measurements
   made for this record on aarch64 and x86_64 (section 3), and an inventory of
-  the Python agent at v1.20.1 (86f9857)
+  the Python agent at v1.20.1 (b146ea7), with later fixes noted where they
+  change a fact (up to v1.20.4)
 
 This record settles the questions every later step of #169 depends on:
 platform scope and order, glibc vs musl, toolchain and MSRV, the concurrency
@@ -120,14 +121,11 @@ for the Rust artifacts anyway; they are the only platform widening in the
 port. They carry their own class of bugs (section 5, counters), which the
 harness has to catch on those targets, not only on 64-bit hosts.
 
-**Found while taking the inventory.** The root installers
-(`fivenines_setup.sh`, `fivenines_update.sh`) send every `uname -m` other
-than `aarch64` to the amd64 artifact. An armv7l or i686 host therefore
-downloads a binary it cannot execute. The user-mode scripts already reject
-unknown architectures. Fixed independently of the port in v1.20.2 (#170):
-every Linux installer now refuses a host no release has a binary for,
-including a 32-bit userland on a 64-bit kernel, until the Rust artifacts
-exist.
+**Found while taking the inventory.** Until v1.20.2 (#170), the root
+installers sent every `uname -m` other than `aarch64` to the amd64
+artifact, which an armv7l or i686 host cannot execute. Every Linux
+installer now refuses a host no release has a binary for, including a
+32-bit userland on a 64-bit kernel, until the Rust artifacts exist.
 
 The Windows gap is a Python packaging bug, not a platform limit. NVIDIA
 ships NVML on Windows as `nvml.dll`, which pynvml knows how to load, and the
@@ -220,7 +218,11 @@ makes:
 - **glibc hosts** (every glibc distribution, and Synology):
   - Dynamically linked against glibc, floor 2.17 (armv7: see consequences).
   - Links only glibc's own libraries, plus `libgcc_s` for unwinding.
-  - No bundled `.so`, and no `LD_LIBRARY_PATH` to strip from children.
+  - No bundled `.so`, so no `LD_LIBRARY_PATH` of our own to strip from
+    children. The Rust command runner still drops the same variables
+    `get_clean_env` drops today (`LD_LIBRARY_PATH`, `LD_PRELOAD`, `LIBPATH`,
+    the `DYLD_*` pair), operator-set ones included, since no child sees
+    them today.
 - **musl hosts** (Alpine): fully static, using the musl that Rust bundles.
 
 **Why.** Parity comes from the construction: each Rust build inherits the
@@ -256,11 +258,16 @@ exactly the kind of divergence constraint 1 of #169 exists to catch.
   Alpine 3.19 floor (the current musl binary needs `pwritev2`, which Alpine
   3.18 lacks) no longer applies to it, but it is lowered only once the
   distro matrix tests an older Alpine.
-- `detect_libc()` knows only the x86_64 and aarch64 musl loaders today, and
-  falls back to glibc when `ldd` says nothing. The Rust installers add the
-  armhf and i386 loaders (`ld-musl-armhf.so.1`, `ld-musl-i386.so.1`), and
-  pick the static musl build whenever detection is inconclusive, since it
-  runs on any Linux of its architecture.
+- `detect_libc()` recognizes glibc only when `ldd --version` contains
+  `glibc`, which the RHEL family (`ldd (GNU libc) 2.x`) does not print:
+  those hosts get glibc from the final fallback today. It also knows only
+  the x86_64 and aarch64 musl loaders. The Rust installers detect each libc
+  positively: glibc through `getconf GNU_LIBC_VERSION` or its loader, musl
+  through `ldd` or its loader (armhf and i386 added). Only a host where
+  neither is found gets the static musl build, which runs on any Linux of
+  its architecture. An armv7 host gets the glibc build only where the
+  armhf loader exists (`/lib/ld-linux-armhf.so.3`), so a soft-float
+  userland falls back to musl too.
 - `call_bounded` starts one thread per collector call, and glibc binds
   threads to extra malloc arenas that keep freed memory. The glibc build
   caps the arena count with `mallopt(M_ARENA_MAX, ...)` at startup, before
@@ -319,9 +326,9 @@ exactly the kind of divergence constraint 1 of #169 exists to catch.
 - a per-tick SNMP pool (at most 10 threads per tick; a poll can outlive its
   tick, so polls from earlier pools can add to that);
 - a systemd drilldown pool (at most 10 threads, joined within the tick);
-- `call_bounded` workers: sudo commands, the libvirt probe and io_topology.
-  Only the last two are single-flight; each timed-out sudo call leaves one
-  thread behind.
+- `call_bounded` workers: sudo commands, the libvirt probe, io_topology
+  and, since v1.20.4, the whole qemu collection. All but the sudo commands
+  are single-flight; each timed-out sudo call leaves one thread behind.
 
 **Decision.**
 - The agent is synchronous, uses std threads, and keeps the Python agent's
@@ -334,14 +341,21 @@ exactly the kind of divergence constraint 1 of #169 exists to catch.
   and state kept per thread (docker's cached client) would be rebuilt on
   every fresh worker. So:
   - a whole-tick budget under `WatchdogSec` sits above the per-collector
-    deadlines: once it is spent, the collectors left in that tick report
+    deadlines and covers the tick's synchronous sends too (the packages
+    and systemd inventory syncs can each take about 45s during an API
+    outage): once it is spent, the collectors left in that tick report
     `null` without running (the posture of today's docker, openvpn and
     proxmox backups budgets);
+  - the watchdog is fed during the sleep between ticks, and a
+    server-pushed interval is capped below `WatchdogSec`: today the sleep
+    feeds nothing and the interval has no cap, so an interval of 90s or
+    more gets the agent killed on every tick;
   - state a collector keeps across ticks belongs to the collector, never to
     the worker thread that happens to run it;
-  - both bounds change what a stalled tick reports (Python blocks today,
-    until the watchdog restarts it), so by section 9 they land in Python
-    first, as the P3 entry already plans.
+  - these rules change what a stalled or slow tick does (Python blocks
+    today, until the watchdog restarts it), so by section 9 they land in
+    Python first, as the P3 entry already plans for the per-collector
+    bound.
 - The agent's own code uses no async runtime.
 - An async-only dependency is allowed only if all of this holds:
   - it sits behind a module boundary that owns one current-thread tokio
@@ -358,9 +372,9 @@ exactly the kind of divergence constraint 1 of #169 exists to catch.
 | dnspython (API host, `ip.fivenines.io`) | Chosen in the synchronizer step: a minimal stub resolver or hickory | none, or current-thread |
 | docker-py                  | HTTP/1.1 over the endpoint docker-py reaches today (the unix socket, a `tcp://` `socket_url`, or `DOCKER_HOST` with `DOCKER_TLS_VERIFY` / `DOCKER_CERT_PATH` client certificates), with our own string-typed models, **not bollard** (below) | none |
 | python-dotenv              | `<config_dir>/.env` read into the environment at startup, same grammar (`${VAR}` interpolation), never overriding a variable already set | none |
-| pg8000                     | Chosen in its step: the `postgres` crate (a blocking wrapper over tokio-postgres) or a minimal wire client | current-thread at most |
-| paho-mqtt                  | Chosen in the mqtt step                                           | current-thread at most |
-| pynvml                     | nvml-wrapper (libloading); glibc build only                       | none |
+| pg8000                     | Chosen in its step: a minimal wire client, or an async client behind the rule above. Not the `postgres` crate as it stands: it builds a runtime per connection, and the collector connects on every tick | current-thread at most |
+| paho-mqtt                  | Chosen in the mqtt step. Like paho's network thread, one long-lived thread per broker keeps the connection and its keepalives; only the snapshot read goes through `call_bounded`, since a runtime driven only at tick time would batch messages and corrupt their ages | none, or current-thread on that thread |
+| pynvml                     | nvml-wrapper (libloading): glibc and Windows (`nvml.dll`) builds, never musl | none |
 | libvirt-python             | Our own RPC client (section 6)                                    | none |
 | proxmoxer                  | ureq                                                              | none |
 | systemd-watchdog           | An `sd_notify` datagram, written directly                         | none |
@@ -390,6 +404,14 @@ bollard is ruled out by what the prototype's docker port found:
   `"abort"` (the prototype relied on the default). With it, a panic costs
   one collector a `null`; the prototype confirmed this when its own
   `tokio::time::timeout`, built outside the runtime, panicked.
+- requests reads its environment on every call, and ureq with webpki-roots
+  does not: proxies per scheme from `HTTP(S)_PROXY` and `ALL_PROXY`
+  honoring `NO_PROXY`, a CA bundle from `REQUESTS_CA_BUNDLE` or
+  `CURL_CA_BUNDLE`, and `~/.netrc` credentials when no auth is set. Every
+  HTTP collector (nginx, apache, caddy, haproxy, php-fpm, rabbitmq, tsdb,
+  vllm, sglang, proxmox) relies on it, so a host behind a proxy or trusting
+  an internal CA would lose them on migration. Their steps reproduce these
+  behaviors, and the harness runs one input that sets them.
 - **Mutex poisoning.** A collector that panics while holding shared state
   poisons the lock, and every later `.lock().unwrap()` panics too. The
   prototype's `processes` and `cpu` state take their lock that way, so one
@@ -397,9 +419,12 @@ bollard is ruled out by what the prototype's docker port found:
   (its `docker` state already recovers the guard). So shared state must
   either recover the guard (`PoisonError::into_inner`) and reset what it
   protects, or use a lock that cannot be poisoned. The workspace step
-  enforces it with a clippy `disallowed-methods` entry on
-  `std::sync::Mutex::lock`, so locking goes through a wrapper that
-  recovers.
+  enforces it with clippy `disallowed-methods` entries on every std call
+  that reports poisoning (`Mutex::lock` and `try_lock`, `RwLock::read`,
+  `write` and their `try_` forms, the `Condvar::wait` family), so locking
+  goes through a wrapper that recovers. A `LazyLock` or `OnceLock`
+  initializer stays infallible: a panic there poisons it for good, so
+  fallible reads belong in the collector call.
 - An abandoned worker can still hold shared state. Single-flight per name
   protects the next tick only if every path into that state goes through the
   same name.
@@ -409,6 +434,13 @@ bollard is ruled out by what the prototype's docker port found:
   network and disk byte counters) stay integers in the JSON, and SNMP
   Counter64 values use the whole unsigned range, so `i64` is not enough
   either.
+- Where Python sums counters with unbounded integers (docker's block I/O
+  across devices, qemu's per-vCPU times, openvpn's bytes across sessions of
+  one common name), the Rust sum is a `u128`, which serde_json writes
+  exactly, so the payload matches even above `u64::MAX`. The release profile
+  also states `overflow-checks = true` next to `panic = "unwind"`: an
+  overflow nobody planned for costs a `null`, never a silently wrapped
+  counter.
 - psutil's `nowrap`, on by default in the `disk_io_counters` and
   `net_io_counters` calls the agent makes, adds a counter that wrapped back
   across reads; it is part of the psutil 7.2.1 behavior to reproduce. No
@@ -444,9 +476,16 @@ bollard is ruled out by what the prototype's docker port found:
   with the host's sudo is why `get_clean_env` exists. The Alpine build
   bundles the libvirt of its Alpine 3.21 builder image. Windows and Synology
   exclude libvirt, so qemu never runs there.
-- The collector's own libvirt calls have no timeout; only the 3s probe is
-  bounded (#171, in review as #215). No event loop is registered, so
-  libvirt's keepalive is off too.
+- Since v1.20.4 (#171, #215) the whole collection runs on a single-flight
+  `call_bounded` worker: the tick stops waiting after 15s, a 10s budget is
+  checked before every call on a domain, a collection that ran out of time
+  is retried after 60s then 120s, and a listed VM that cannot be read, or a
+  connection lost mid-walk, makes the collection `null`, never a partial VM
+  list. The libvirt calls themselves still block with no timeout: only the
+  worker around them is abandoned. No event loop is registered, so
+  libvirt's keepalive is off.
+- The VM uptime no longer comes from libvirt: it is the age of the QEMU
+  process found in `/proc` by its `-uuid` argument.
 - Much of the allowlist exists to fence behaviors of the C client itself:
   - transports that run commands (`ssh`, `ext`);
   - `LIBVIRT_DEFAULT_URI` and `libvirt.conf`;
@@ -472,7 +511,8 @@ unix socket only, implementing only the procedures the collector uses.
   directories is not C-client fencing, though: it keeps a server-pushed URI
   from pointing the agent at any other local socket (#142), so the Rust
   client keeps it, in step with the server-side allowlist.
-- Every read gets a socket timeout, which today's calls do not have.
+- Every read gets a socket timeout; today's calls have none, so a stuck one
+  costs an abandoned thread.
 - Loading the host's `libvirt.so.0` with `dlopen` would remove the bundling,
   but only on glibc, and it would keep every C-client behavior listed above.
 - The remote protocol is also how today's bundled 6.10 client talks to
@@ -485,6 +525,10 @@ unix socket only, implementing only the procedures the collector uses.
 - the same accepted URI set as the Python allowlist (both schemes, both
   paths, `socket=` and `mode=`), everything else refused and reported as
   `null`;
+- the v1.20.4 contract: the timeout, the per-domain budget, the backoff,
+  and `null` rather than a partial VM list; and the uptime read from a
+  `/proc` scan, so the test inputs include a fake `/proc` with QEMU
+  processes next to the RPC server below;
 - libvirt's socket selection for `qemu:///system` and `qemu:///session` with
   `mode=auto|direct|legacy`: the monolithic `libvirt-sock-ro` versus the
   modular `virtqemud-sock-ro`, and `$XDG_RUNTIME_DIR` for session. This
@@ -520,7 +564,10 @@ handshake the C client would give us for free.
 - From the first workspace commit, CI runs `cargo check` and clippy for
   `x86_64-pc-windows-msvc` on the runtime: loop, synchronizer, config, queue
   and bounded calls. Unix-only code sits behind `cfg(unix)`, so doing Linux
-  first cannot bake Unix assumptions into the runtime.
+  first cannot bake Unix assumptions into the runtime. The check runs on a
+  `windows-latest` runner, as `windows.yml` already does: ring and aws-lc-rs
+  compile C for the target, which a Linux runner cannot do without an
+  MSVC-compatible toolchain.
 
 **Why.** Windows shares the runtime but almost none of the collection code or
 the packaging. Its collector set is small enough to port in one step once the
@@ -587,6 +634,19 @@ this record decides.
     included, against that release's own signed `SHA256SUMS`. It is how an
     operator stays on Python, and how a Rust host rolls back; the unverified
     `FIVENINES_AGENT_URL` path is not enough for either.
+  - The Windows MSI accepts a downgrade and keeps the config directory and
+    `TOKEN` across it. Today `MajorUpgrade` refuses any lower version and
+    uninstalling removes the config directory, so a Rust host could only
+    go back by re-enrolling. The Windows step tests the downgrade before
+    the Windows GA.
+  - The maintenance branch carries main's protection (required review,
+    required checks including the harness, no direct pushes) before the
+    release job's ancestry check accepts it, under one exact branch
+    pattern: that check is the only review gate before signing.
+  - It gets its own security coverage, since Dependabot, the weekly cold
+    build and CodeQL only watch the default branch: scheduled jobs on main
+    check the branch out for a cold build, CodeQL and a dependency audit
+    (pip-audit), and certifi bumps stay a standing maintenance item.
   - Its last release stays downloadable, for rollback.
   - After that, its builds stop. The README states the date from GA onward.
   - Payloads are identical apart from the implementation name, so nothing
@@ -604,34 +664,53 @@ wrong (rather than the port), the fix lands in Python first, with its test and
 fixture. The Rust port then reproduces the fixed behavior. The harness keeps
 no list of known differences, which gives "exact" a precise meaning:
 - The comparison that gates runs both agents on recorded inputs: a fake
-  `/proc` and `/sys` root, the mock services, a frozen clock. On those, the
-  two payloads must be equal as JSON values.
+  `/proc` and `/sys` root, the mock services, scripted command output
+  (behind a fake `sudo` that honors the pinned argv), shims for the values
+  that come from syscalls rather than files (`statvfs`, `getifaddrs`, the
+  ethtool ioctls, name-service lookups), and a frozen clock. On those, the
+  two payloads must be equal, and type-strictly: a boolean is not a number,
+  an integer is not a float, and the key sets match.
 - A comparison on a live host tolerates sampling drift (the prototype's
   `diff_payloads.py` tolerances) and never gates: two agents reading a live
-  host at different instants never produce equal counters.
-- Text the Python runtime makes up is normalized in Python first: the
-  `capability_reasons` strings (`pynvml not installed`), exception text in
-  collector error entries (openvpn, snmp, ceph, systemd), Python `repr` in
-  image-inventory errors, and `uname.processor` (from `uname -p`). Stable
-  reason codes replace exception text, and the fixtures are updated. Only
-  `version`, which differs by construction, and the implementation name
-  (section 8) are excluded, by name.
+  host at different instants never produce equal counters. Its comparator
+  is never reused for the gate.
+- Every payload string built from a Python exception, a `repr()`, a class
+  name or captured log text is replaced in Python first by a stable reason
+  code, and the fixtures are updated. As of v1.20.4 that covers
+  `capability_reasons` (`pynvml not installed`); the error entries of
+  openvpn, snmp, ceph, systemd, proxmox backups and the image inventory;
+  `error_message` in rabbitmq, tsdb, vllm and sglang; `error_detail` in
+  postgresql and mysql; mqtt's broker `error`; `_telemetry[*].errors`; and
+  `uname.processor` (from `uname -p`). Each collector step checks its
+  collector for sites added since.
+- Names that are not valid UTF-8 (a process name, a mount point, a device
+  name: any local user can create one) are decoded with U+FFFD replacement
+  in Python first. Today Python keeps them with `surrogateescape` and the
+  JSON carries lone `\udcXX` escapes, which a Rust `String` cannot hold and
+  the server reads as invalid text. The replacement matches Rust's
+  `from_utf8_lossy` (both replace each maximal invalid subpart), and the
+  recorded inputs include such names.
+- Only three fields are excluded, by name: the implementation name
+  (section 8), and `running_time` and `_telemetry[*].duration_ms`, which
+  measure the agent, not the host. `version` is compared: both agents are
+  built from the same commit and carry the same version, so a difference
+  is a bug.
 
 **Why.** A list of known differences is where real divergences hide. And the
 fix reaches today's hosts months before the Rust agent does.
 
-Found while preparing this record (status as of v1.20.3):
+Found while preparing this record (status as of v1.20.4):
 - `vm_vm_uptime_seconds_total` is always 0. `_get_vm_uptime` reads
   `dom.info()[5]` only when `info()` has six fields, and `virDomainGetInfo`
-  returns five. The fix is in review as #215 (#171): the uptime becomes the
-  age of the QEMU process found by its `-uuid` argument.
+  returns five. Fixed in v1.20.4 (#215): the uptime is now the age of the
+  QEMU process found by its `-uuid` argument.
 - `vm_vcpu_time_nanoseconds_total` labels host CPUs as vCPUs on cgroup v1
   hosts: `getCPUStats(False)` returns one entry per host CPU, not per vCPU,
   and each is shipped with `vcpu` set to its index. On cgroup v2 that call
   fails and the `vcpus()` fallback reports real vCPUs (issue to be filed).
 - The qemu collector's libvirt calls have no timeout, so one VM with a stuck
-  QEMU monitor can stall the tick past `WatchdogSec` (#171, in review as
-  #215).
+  QEMU monitor can stall the tick past `WatchdogSec` (fixed in v1.20.4,
+  #171).
 - The root installers map every unknown architecture to amd64 (section 2;
   fixed in v1.20.2, #170).
 - The Windows binary ships without pynvml, so Windows hosts report no
@@ -666,11 +745,22 @@ Found while preparing this record (status as of v1.20.3):
   mock, long enough to see slow growth (the glibc build still crept after 5
   minutes), and fails on the slope of `Private_Dirty` rather than on an
   absolute RSS. It also says how armv7 is measured, since QEMU user
-  emulation adds its own memory to the process.
-- What the harness compares the armv7 and i686 Rust agents against, since no
-  Python build exists there (the Python agent run from source in the same
-  emulated container, or recorded fixtures only): the harness step (#176).
-  `uname` and the CPU model then follow the emulated target.
+  emulation adds its own memory to the process. It must run on a pull
+  request too, path-filtered on `rust/rust-toolchain.toml`, the zig pin and
+  `rust/Cargo.lock`, since section 4 makes it a gate on every toolchain
+  change and `build-release.yml` has no `pull_request` trigger.
+- The harness step (#176) settles how the recorded inputs of section 9
+  reach both agents: a mount namespace with bind-mounted `/proc` and `/sys`
+  trees, for example, and a clock source that also works for a static
+  binary, which `LD_PRELOAD` tools such as libfaketime cannot reach. It
+  also names the Python each platform is compared against: the source
+  tree, or the frozen artifact that hosts actually run (the Alpine binary
+  lacks pynvml, for example); comparing against the artifacts adds
+  `Dockerfile*`, `py2exe*.sh` and `ci/requirements/` to the trigger paths
+  of section 1. And it says what the armv7 and i686 Rust agents are
+  compared against, since no Python build exists there (the Python agent
+  run from source in the same emulated container, or recorded fixtures
+  only); `uname` and the CPU model then follow the emulated target.
 
 ## References
 
