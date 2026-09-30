@@ -21,6 +21,7 @@ import shutil
 import ssl
 import subprocess
 import threading
+import time
 import tracemalloc
 import warnings
 from unittest.mock import MagicMock
@@ -886,9 +887,9 @@ def test_budget_constants_are_pinned():
     assert pbs._TIMEOUT_BACKOFF_MAX == 6 * 3600
     assert pbs._TIMEOUT_BACKOFF_MIN_WAIT == 5
     assert pbs._MAX_READ_FAILURE_LINES == 20
-    # Every read one build can back off or hold: a namespace listing and a
-    # status per datastore, a /groups and a /snapshots per namespace, usage.
-    assert pbs._TIMEOUT_BACKOFF_ENTRIES == 2 * (100 + 1000) + 1
+    # Every read one build can back off -- a status per datastore, a /groups
+    # and a /snapshots per namespace -- plus the one walk hold.
+    assert pbs._TIMEOUT_BACKOFF_ENTRIES == 100 + 2 * 1000 + 1
 
 
 # --- pbs_metrics -----------------------------------------------------------
@@ -5653,15 +5654,22 @@ def test_a_timed_out_namespace_listing_is_held_until_a_reload(monkeypatch):
     """Every re-send of a namespace walk PBS may still be running pins one
     more proxy thread for good (two kill a 2-vCPU PBS): after a read timeout
     it is HELD -- never sent again, its scope unknown -- until the operator
-    reloads the agent (reset_timeout_holds, on SIGHUP)."""
+    reloads the agent (reset_timeout_holds, on SIGHUP). So is every other
+    walk: the usage status too, a full-scope token then reading each
+    datastore's own status."""
     clock = use_clock(monkeypatch, Clock())
     logged = capture_logs(monkeypatch)
-    stuck = minimal_responses(**{_NS_PATH: {"error": "timeout", "message": "t"}})
+    stuck = minimal_responses(
+        **{
+            _NS_PATH: {"error": "timeout", "message": "t"},
+            "/admin/datastore/ds/status": ok({"total": 9, "used": 4, "avail": 5}),
+        }
+    )
     out, session = collect(monkeypatch, stuck)
     assert len(_ns_calls(session)) == 1
     assert out["datastores"][0]["namespaces"] is None
     [key] = pbs._timeout_backoff
-    assert key == (_NS_PATH, ())
+    assert key == pbs._WALK_HOLD
     failure = ("namespaces", "ds", None, "t")
     assert pbs._timeout_backoff[key] == (math.inf, 1, failure)
     assert (
@@ -5675,6 +5683,10 @@ def test_a_timed_out_namespace_listing_is_held_until_a_reload(monkeypatch):
         assert out["datastores"][0]["namespaces"] is None
         held = [e["message"] for e in out["errors"] if e["scope"] == "namespaces"]
         assert held == [pbs._TIMEOUT_HOLD_MESSAGE]
+        usage = [e["message"] for e in out["errors"] if e["scope"] == "usage"]
+        assert usage == [pbs._TIMEOUT_HOLD_MESSAGE]
+        assert "/status/datastore-usage" not in [route(u) for u in session.calls]
+        assert out["datastores"][0]["total"] == 9  # from its own status
     pbs.reset_timeout_holds()  # SIGHUP: the datastore is repaired
     out, session = collect(monkeypatch, minimal_responses())
     assert len(_ns_calls(session)) == 1
@@ -5699,7 +5711,12 @@ def test_a_timed_out_namespace_listing_is_held_until_a_reload(monkeypatch):
 )
 def test_a_hold_survives_any_configuration_change(monkeypatch, change, url):
     clock = use_clock(monkeypatch, Clock())
-    stuck = minimal_responses(**{_NS_PATH: {"error": "timeout", "message": "t"}})
+    stuck = minimal_responses(
+        **{
+            _NS_PATH: {"error": "timeout", "message": "t"},
+            "/admin/datastore/ds/status": ok({"total": 9, "used": 4, "avail": 5}),
+        }
+    )
     collect(monkeypatch, stuck)  # unverified localhost: https://127.0.0.1
     clock.now += pbs.PBS_CACHE_TTL + 5
     out, session = collect(monkeypatch, stuck, **change)
@@ -5729,24 +5746,63 @@ def test_a_path_below_an_absent_one_names_a_hidden_datastore_or_namespace():
     assert pbs._hidden_below(odd) == (False, set())
 
 
+_AUDIT = {"Datastore.Audit": True}
+
+
 # Value: protects=a datastore a deeper ACL entry hides at its own level ships
 #   as partial scope with usage unknown, never PBS's 0/0/0; fails_when=the
 #   fallback reads its /status (a false "0 bytes free") or scope stays full
 #   (its root groups would be pruned); why_new=reproduced on PBS 4.2 by the
 #   pass-3 red team; seam=none
-def test_a_datastore_audited_only_below_is_partial_and_never_zero(monkeypatch):
-    audit = {"Datastore.Audit": True}
-    responses = minimal_responses(
+# Value (rows): protects=a namespace hidden inside an audited datastore reads
+#   partial too, and only a datastore hidden at its own level loses its
+#   /status fallback -- an audited one beside it keeps its usage;
+#   fails_when=scope is derived from the datastore-level gaps alone, or the
+#   fallback guard is widened to every datastore once anything is hidden;
+#   why_new=the test had one datastore hidden whole, and the _hidden_below
+#   unit test never reaches _build_block; seam=none
+@pytest.mark.parametrize(
+    "hidden, a_status, read, a_usage",
+    [
+        # NoAccess on /datastore/a (absent), an audit grant on a namespace:
+        # PBS lists a only for a token with an ACL entry of its own below it
+        # (else a is simply absent); its own status answers 0/0/0 and is
+        # never read.
+        (
+            {"/datastore/a/x": _AUDIT},
+            {"total": 0, "used": 0, "avail": 0},
+            ["b"],
+            (None, None, None),
+        ),
+        # NoAccess on namespace a/x (absent) below an audited a: a is still
+        # audited, so its own status is real and read.
+        (
+            {"/datastore/a": _AUDIT, "/datastore/a/x/y": _AUDIT},
+            {"total": 7, "used": 2, "avail": 5},
+            ["a", "b"],
+            (7, 2, 5),
+        ),
+    ],
+    ids=["datastore_hidden", "namespace_hidden"],
+)
+def test_a_datastore_audited_only_below_is_partial_and_never_zero(
+    monkeypatch, hidden, a_status, read, a_usage
+):
+    responses = _two_backend_datastores(
         **{
-            "/access/permissions": ok({**PERMS_FULL, "/datastore/ds/a": audit}),
+            "/access/permissions": ok({**PERMS_FULL, **hidden}),
             "/status/datastore-usage": fail(500, "EIO"),
-            "/admin/datastore/ds/status": ok({"total": 0, "used": 0, "avail": 0}),
+            "/admin/datastore/a/status": ok(a_status),
+            "/admin/datastore/b/status": ok({"total": 9, "used": 4, "avail": 5}),
         }
     )
     out, session = collect(monkeypatch, responses)
     assert out["scope"] == "partial"
-    assert "/admin/datastore/ds/status" not in [route(u) for u in session.calls]
-    assert out["datastores"][0]["total"] is None
+    sent = [route(u) for u in session.calls]
+    assert [s for s in "ab" if f"/admin/datastore/{s}/status" in sent] == read
+    a, b = out["datastores"]
+    assert (a["total"], a["used"], a["avail"]) == a_usage
+    assert (b["total"], b["used"], b["avail"]) == (9, 4, 5)
 
 
 # Value: protects=a TLS handshake that stalled (urllib3 calls it a read
@@ -5765,6 +5821,100 @@ def test_a_stalled_tls_handshake_holds_nothing(monkeypatch):
     out, session = collect(monkeypatch, minimal_responses())
     assert len(_ns_calls(session)) == 1  # sent again: nothing held
     assert out["datastores"][0]["namespaces"] == [""]
+
+
+# Value: protects=one broken storage pins ONE proxy thread: the first walk
+#   that times out holds every other walk, the other datastores' namespace
+#   listings in the same build and the usage status after it; fails_when=the
+#   walks are held per request again (N datastores, N threads); why_new=the
+#   red team reproduced two and three pinned threads live; seam=none
+def test_one_timed_out_walk_holds_every_walk(monkeypatch):
+    clock = use_clock(monkeypatch, Clock())
+    responses = _two_backend_datastores(
+        **{
+            "/admin/datastore/a/namespace": {"error": "timeout", "message": "t"},
+            "/admin/datastore/a/status": ok({"total": 9, "used": 4, "avail": 5}),
+            "/admin/datastore/b/status": ok({"total": 7, "used": 2, "avail": 5}),
+        }
+    )
+    out, session = collect(monkeypatch, responses)
+    sent = [route(u) for u in session.calls]
+    assert "/admin/datastore/a/namespace" in sent
+    assert "/admin/datastore/b/namespace" not in sent  # held with a's
+    assert [d["namespaces"] for d in out["datastores"]] == [None, None]
+    assert list(pbs._timeout_backoff) == [pbs._WALK_HOLD]
+    clock.now += pbs.PBS_CACHE_TTL + 5
+    out, session = collect(monkeypatch, responses)
+    sent = [route(u) for u in session.calls]
+    walks = [p for p in sent if p.endswith("/namespace") or "usage" in p]
+    assert walks == []  # nothing that walks namespaces is sent
+    assert [d["total"] for d in out["datastores"]] == [9, 7]  # own status
+
+
+# Value: protects=the collection loop against a hostile permissions map (one
+#   deep chain with every ancestor present, 4 MB): the hidden-path check is
+#   linear; fails_when=it rebuilds every ancestor of every path again (37s of
+#   CPU measured); why_new=nothing bounded its cost; seam=none
+def test_a_deep_permissions_chain_is_checked_in_linear_time():
+    chain = {"/datastore": {"Datastore.Audit": True}}
+    path = "/datastore/s"
+    for _ in range(3000):
+        chain[path] = {}
+        path += "/x"
+    started = time.perf_counter()
+    assert pbs._hidden_below(chain) == (False, set())
+    assert time.perf_counter() - started < 2  # ~10 ms linear, ~40 s cubic
+
+
+# Value: protects=a hidden path flags every job list 'partial:' (PBS drops
+#   the jobs of what it hides); fails_when=only a scoped token flags them, so
+#   the server prunes jobs that still exist; why_new=reproduced live by the
+#   red team (vjob1/pjob1 gone, no flag); seam=none
+def test_a_hidden_path_flags_the_job_lists_partial(monkeypatch):
+    audit = {"Datastore.Audit": True}
+    responses = minimal_responses(
+        **{"/access/permissions": ok({**PERMS_FULL, "/datastore/ds/a/b": audit})}
+    )
+    out, _ = collect(monkeypatch, responses)
+    assert out["scope"] == "partial"
+    partial = {e["scope"] for e in out["errors"] if e["message"].startswith("partial:")}
+    assert partial == {"sync_jobs", "verify_jobs", "prune_jobs"}
+    assert all(
+        "deeper ACL entry" in e["message"]
+        for e in out["errors"]
+        if e["message"].startswith("partial:")
+    )
+
+
+# Value: protects=a stalled TLS handshake arms no hold even late in the budget,
+#   where the read timeout is clamped to the connect timeout; fails_when=the
+#   connect timeout of a held read is not kept under half its read timeout;
+#   why_new=the handshake test ran unclamped only (QA 003 reproduced a hold at
+#   a 5s budget); seam=none
+def test_a_stalled_tls_handshake_late_in_the_budget_holds_nothing(monkeypatch):
+    clock = use_clock(monkeypatch, Clock())
+
+    def stall(url):
+        raise HandshakeStall("t")
+
+    session = FakeSession(stall)
+    target = _target()
+    for left in (5.0, 5.5, 1.0):  # QA 003: (5, 5) held before the fix
+        errors = pbs._Errors(target.redact)
+        read = pbs._sub_read(
+            session,
+            target,
+            errors,
+            clock.now + left,
+            "namespaces",
+            _NS_PATH,
+            store="ds",
+            backoff="hold",
+        )
+        assert read is None
+        connect, wait = session.timeouts[-1]
+        assert connect <= wait / 2
+        assert pbs._timeout_backoff == {}
 
 
 def test_a_timeout_backoff_is_capped_and_per_request(monkeypatch):
@@ -5786,14 +5936,14 @@ def test_a_timeout_backoff_is_capped_and_per_request(monkeypatch):
     assert pbs._timeout_backoff[key] == (math.inf, 13, failure)
 
 
-# Value: protects=the backoff dict's bound once holds (which never expire)
-# pile up from datastores renamed away; fails_when=the cap check is dropped or
+# Value: protects=the backoff dict's bound, a hold (which never expires)
+# included; fails_when=the cap check is dropped or
 # evicts the newest entry; why_new=no other test arms past the cap; seam=none
 def test_the_timeout_backoff_drops_its_oldest_entry_at_the_cap(monkeypatch):
     use_clock(monkeypatch, Clock())
     monkeypatch.setattr(pbs, "_TIMEOUT_BACKOFF_ENTRIES", 3)
     failure = ("namespaces", "ds", None, "t")
-    keys = [("base", f"/p{i}", ()) for i in range(4)]
+    keys = [(f"/p{i}", ()) for i in range(4)]
     for key in keys[:3]:
         pbs._arm_timeout_backoff(key, failure, hold=True)
     pbs._arm_timeout_backoff(keys[1], failure, hold=True)  # re-armed: no drop
@@ -5810,7 +5960,7 @@ def test_the_timeout_backoff_cap_drops_a_retry_before_a_hold(monkeypatch):
     use_clock(monkeypatch, Clock())
     monkeypatch.setattr(pbs, "_TIMEOUT_BACKOFF_ENTRIES", 3)
     held, retried = ("namespaces", "ds", None, "t"), ("groups", "ds", "a", "t")
-    keys = [("base", f"/p{i}", ()) for i in range(4)]
+    keys = [(f"/p{i}", ()) for i in range(4)]
     pbs._arm_timeout_backoff(keys[0], held, hold=True)
     pbs._arm_timeout_backoff(keys[1], retried, hold=False)
     pbs._arm_timeout_backoff(keys[2], retried, hold=False)
@@ -5948,7 +6098,9 @@ def test_a_walk_read_always_gets_a_real_wait(monkeypatch):
 
 def test_only_a_read_timeout_arms_the_hold(monkeypatch):
     """A connect timeout never reached PBS: nothing to wait for, the read is
-    sent again next build. A read timeout was sent and may still be running."""
+    sent again next build. A read timeout that waited its whole read timeout
+    was sent and may still be running (a stalled handshake was not: see
+    test_a_stalled_tls_handshake_holds_nothing)."""
     clock = use_clock(monkeypatch, Clock())
     responses = minimal_responses(
         **{_NS_PATH: {"error": "connect_timeout", "message": "t"}}
@@ -6029,7 +6181,7 @@ def test_a_held_back_usage_status_still_falls_back_per_datastore(monkeypatch):
     """For a full-scope token an aggregate held back by its backoff reads as
     failed, so each filesystem datastore's own status is read instead. It is
     HELD for that token too: PBS walks any datastore a deeper ACL entry hides
-    from it, which the agent cannot see (reproduced on PBS 4.2)."""
+    from it, which the agent cannot always see (reproduced on PBS 4.2)."""
     clock = use_clock(monkeypatch, Clock())
     responses = minimal_responses(
         **{
@@ -6336,10 +6488,9 @@ def test_a_hold_names_the_read_it_holds_in_the_log(monkeypatch):
         ),
     )
     held = [(lvl, m) for lvl, m in logged if " held: " in m]
-    assert held == [
-        ("error", f"PBS usage read held: {pbs._TIMEOUT_HOLD_MESSAGE}"),
-        ("error", f"PBS namespaces read on ds held: {pbs._TIMEOUT_HOLD_MESSAGE}"),
-    ]
+    # The usage status timed out first: every walk is held from then on, so
+    # the namespace listing is never sent -- one pinned proxy thread, not two.
+    assert held == [("error", f"PBS usage read held: {pbs._TIMEOUT_HOLD_MESSAGE}")]
 
 
 # Value: protects=_read_groups passes only the groups the cap kept to the snapshot summary;

@@ -86,11 +86,12 @@ reading backup metadata):
   authentication failure to the PBS auth log every tick.
 - A read that TIMED OUT after it was sent may still be running in PBS: its
   namespace walk never ends while a <store>/ns cannot be read, holding one
-  proxy thread for good per request. So the two reads that can walk
-  namespaces (a datastore's namespace listing; the usage status) are HELD
-  after such a timeout -- not sent again until the agent is reloaded
-  (SIGHUP) or restarted -- and every other read that can take long (groups,
-  snapshots, a datastore's own status) is retried on a backoff
+  proxy thread for good per request. So the reads that can walk namespaces
+  (every datastore's namespace listing; the usage status) share ONE hold:
+  once any of them times out, none is sent again until the agent is reloaded
+  (SIGHUP) or restarted -- one broken storage pins one proxy thread, however
+  many datastores it carries -- and every other read that can take long
+  (groups, snapshots, a datastore's own status) is retried on a backoff
   (_timeout_backoff).
 - Every request's timeouts are clamped to what is left of the tick's
   wall-clock budget, or of the per-datastore reads' half of it (so the
@@ -113,7 +114,9 @@ failed or was skipped names its scope (and datastore/namespace). What gates
 pruning lives outside ``errors[]`` (that list is capped), with one exception
 described below: ``scope`` is "partial" when a datastore or namespace absent
 from the block may simply be invisible to the token (and "full" cannot see a
-deeper ACL entry hiding one: see _check_privileges); a datastore's
+deeper ACL entry hiding one -- unless the token still audits a path below it,
+which makes the block "partial": see _check_privileges, _hidden_below); a
+datastore's
 ``namespaces`` is null when its set is unknown and ``unread_namespaces`` lists
 every listed namespace whose groups are unknown this build; a group whose
 snapshot details could not be read has ``in_progress: null``. An unparseable
@@ -627,6 +630,12 @@ def _get(
     if deadline is not None:
         remaining = _remaining(deadline)
         connect, read = min(connect, remaining), max(min(read, remaining), min_wait)
+    if min_wait:
+        # A TLS handshake that stalls takes the TCP connect plus the connect
+        # timeout -- under twice the connect timeout -- and urllib3 reports it
+        # as a READ timeout: half the read timeout at most keeps it short of
+        # `pending` below, however little budget is left.
+        connect = min(connect, read / 2)
     sent = time.monotonic()
     try:
         response = session.get(
@@ -985,31 +994,36 @@ _UNSET = object()
 # the proxy's own runtime thread for good, and so does /status/datastore-usage
 # (reproduced on PBS 4.2, one pinned proxy thread per request). Every re-send
 # of a walk that never ends pins ONE MORE proxy thread, for good, and the
-# proxy has one per core: two kill a 2-vCPU PBS. So the two
-# reads that can walk namespaces -- a datastore's namespace listing, and the
-# usage status, which walks every datastore the token cannot audit (all of
-# them for a scoped token; for a full-scope one, any a deeper ACL entry hides,
-# which the agent cannot see) -- are HELD instead after a timeout: never sent
-# again until the agent is reloaded (SIGHUP: reset_timeout_holds) or
-# restarted, the operator's signal that the datastore is repaired. The other
+# proxy has one per core: two kill a 2-vCPU PBS. So the reads that can walk
+# namespaces -- every datastore's namespace listing, and the usage status,
+# which walks every datastore the token cannot audit (all of them for a scoped
+# token; for a full-scope one, any a deeper ACL entry hides, which the agent
+# cannot always see) -- share ONE hold (_WALK_HOLD): once any of them times
+# out, NONE is sent again until the agent is reloaded (SIGHUP:
+# reset_timeout_holds) or restarted, the operator's signal that the storage is
+# repaired. One dead NAS under several datastores, or a scoped token whose
+# usage status and namespace listing both walk the same broken datastore,
+# then pins one proxy thread, not one per datastore or per read. The other
 # reads that can take long all END (PBS source: /groups reads one level,
 # never walking namespaces; a datastore's status is one statfs), so holding
 # them for good would only blind a PBS that is slow: they retry on the
 # backoff above.
-# {(path, params): (retry-after monotonic time -- inf for a hold --, timeouts,
-#  the _read_failures key of its failure)}. Keyed on the request alone, not on
-# the PBS's address, token or TLS policy: the stuck walk pins that PBS's proxy
-# whoever asks and however its host is spelled (localhost, 127.0.0.2, ::1,
-# its FQDN), so no configuration change may re-send it -- only a reload or a
-# restart. After a move to another PBS, its holds wait for that reload too.
+# {(path, params) or _WALK_HOLD: (retry-after monotonic time -- inf for the
+#  hold --, timeouts, the _read_failures key of its failure)}. Keyed on the
+# request alone, not on the PBS's address, token or TLS policy: the stuck walk
+# pins that PBS's proxy whoever asks and however its host is spelled
+# (localhost, 127.0.0.2, ::1, its FQDN), so no configuration change may
+# re-send it -- only a reload or a restart. After a move to another PBS, the
+# hold waits for that reload too.
 _timeout_backoff: dict = {}
 _TIMEOUT_BACKOFF_MAX = 6 * 3600
-# One build backs off or holds at most this many reads: a namespace listing
-# and a status per datastore, a /groups and a /snapshots per namespace, the
-# usage status. Past it the oldest entry is dropped -- a retry first, since a
-# hold dropped would re-send a walk that never ends (holds pile up only from
-# datastores renamed away while held).
-_TIMEOUT_BACKOFF_ENTRIES = 2 * (MAX_DATASTORES + MAX_NAMESPACES) + 1
+# The one key every namespace walk is held under.
+_WALK_HOLD = ("namespace walks", ())
+# One build backs off at most this many reads -- a status per datastore, a
+# /groups and a /snapshots per namespace -- plus the walk hold. Past it the
+# oldest entry is dropped, a retry first: the hold dropped would re-send a
+# walk that never ends.
+_TIMEOUT_BACKOFF_ENTRIES = MAX_DATASTORES + 2 * MAX_NAMESPACES + 1
 # The read timeout a held or backed-off read always gets (see _get): its
 # timing out then means PBS did not answer, not that the budget ran out.
 _TIMEOUT_BACKOFF_MIN_WAIT = _CONNECT_TIMEOUT
@@ -1018,10 +1032,11 @@ _TIMEOUT_BACKOFF_MESSAGE = (
     "retried later"
 )
 _TIMEOUT_HOLD_MESSAGE = (
-    "skipped: this read timed out and PBS may still be running it (a "
-    "namespace walk stuck on an unreadable datastore holds a proxy thread for "
-    "good): not sent again until the agent is reloaded (SIGHUP) -- if a "
-    "datastore is broken, repair it and restart proxmox-backup-proxy first"
+    "skipped: a namespace walk timed out and PBS may still be running it (a "
+    "walk stuck on an unreadable datastore holds a proxy thread for good), so "
+    "no walk (namespace listing, usage status) is sent again until the agent "
+    "is reloaded (SIGHUP) -- if a datastore is broken, repair it and restart "
+    "proxmox-backup-proxy first"
 )
 
 
@@ -1039,8 +1054,8 @@ def _arm_timeout_backoff(key, failure, hold):
         del _timeout_backoff[next(retries, next(iter(_timeout_backoff)))]
     if hold:
         _timeout_backoff[key] = (math.inf, timeouts, failure)
-        # Only the namespace listing (its datastore) and the usage status are
-        # held: neither has a namespace.
+        # Only the namespace listings (their datastore) and the usage status
+        # are held: none has a namespace.
         scope, store, _, _ = failure
         where = "" if store is None else f" on {log_safe(store)}"
         log(f"PBS {scope} read{where} held: {_TIMEOUT_HOLD_MESSAGE}", "error")
@@ -1094,7 +1109,10 @@ def _sub_read(
     `missing` when one is given (an endpoint an older PBS does not have);
     `on_error` receives the failure, a backoff skip included, for a caller
     that must know what happened."""
-    key = _timeout_backoff_key(path, params) if backoff else None
+    if backoff == "hold":
+        key = _WALK_HOLD  # one hold for every walk (see _timeout_backoff)
+    else:
+        key = _timeout_backoff_key(path, params) if backoff else None
     waiting = _timeout_backoff.get(key)
     if waiting is not None and time.monotonic() < waiting[0]:
         _read_failures["current"].add(waiting[2])  # stays quiet on retry
@@ -1154,9 +1172,9 @@ def _check_privileges(permissions, redact=str):
       /datastore or /remote on the token or its user makes one when its role
       lacks the audited privilege: a deeper entry REPLACES the inherited role
       (a NoAccess, or a DatastoreBackup the user also holds, leaves the token
-      nothing there). That path is then invisible here -- unless the token
-      can still audit a path below it (_hidden_below) -- so the README gives
-      the token's user no other ACL.
+      nothing there). That path is then invisible here -- unless, below
+      /datastore, the token can still audit a path below it (_hidden_below)
+      -- so the README gives the token's user no other ACL.
     A grant on /datastore/<store>[/ns] is a scoped token whatever its
     propagate flag: it audits at least that path.
     """
@@ -1226,9 +1244,15 @@ def _hidden_below(permissions):
     PBS puts every node of its ACL tree in this map, a node's ancestors are
     nodes too, and it leaves out only a node where the token holds NO
     privilege. So a path present under an absent one names a deeper entry
-    that took the token's privilege away there. PBS still lists such a
-    datastore (the token audits something below it), but not its root
-    namespace or groups, and its own status answers 0/0/0."""
+    that took the token's privilege away there (below /datastore only: an
+    entry hiding a remote shows nothing). Such a datastore is listed only
+    when the token has an ACL entry of its own below it -- then without its
+    root namespace or groups, and its own status answers 0/0/0 -- and is
+    simply absent otherwise; either way the block is partial.
+
+    Linear in the map (PBS input, up to _SMALL_MAX_BYTES): the shallowest
+    present node below an absent ancestor has an absent PARENT, so each path
+    checks its parent and its datastore only, never every ancestor."""
     paths = {
         str(path)
         for path, privileges in permissions.items()
@@ -1236,15 +1260,14 @@ def _hidden_below(permissions):
     }
     hidden, unaudited = False, set()
     for path in paths:
-        parts = path.split("/")  # "", "datastore", store, ns...
+        parts = path.split("/", 3)  # "", "datastore", store, ns path
         if len(parts) < 4 or parts[1] != "datastore":
             continue
-        for depth in range(3, len(parts)):
-            if "/".join(parts[:depth]) not in paths:
-                hidden = True
-                if depth == 3:
-                    unaudited.add(parts[2])
-                break
+        if "/".join(parts[:3]) not in paths:
+            hidden = True
+            unaudited.add(parts[2])
+        elif path.rpartition("/")[0] not in paths:
+            hidden = True
     return hidden, unaudited
 
 
@@ -1336,19 +1359,24 @@ def _build_block(session, target, deadline):
     prune_jobs = _read_jobs(
         session, target, errors, deadline, "prune_jobs", "/admin/prune", _prune_job
     )
-    if not full_scope:
+    # PBS lists a job only to a token that can audit its datastore (or
+    # namespace): below full scope, or with part of /datastore hidden, a job
+    # list may be short.
+    if not full_scope or hidden:
+        why = (
+            "the API token's Datastore.Audit is scoped below /datastore, so jobs "
+            "outside that scope are not listed"
+            if not full_scope
+            else "a deeper ACL entry hides part of /datastore from the API token, "
+            "so jobs defined there are not listed"
+        )
         for name, rows in (
             ("sync_jobs", sync_jobs),
             ("verify_jobs", verify_jobs),
             ("prune_jobs", prune_jobs),
         ):
             if rows is not None:
-                _error(
-                    errors,
-                    name,
-                    "partial: the API token's Datastore.Audit is scoped below "
-                    "/datastore, so jobs outside that scope are not listed",
-                )
+                _error(errors, name, "partial: " + why)
 
     datastores, units = _read_datastores(
         session,
@@ -1461,7 +1489,7 @@ def _read_datastores(
     usage,
     per_store_usage,
     backends,
-    unaudited=frozenset(),
+    unaudited,
 ):
     """(name -> datastore, sorted (store, ns) units).
 

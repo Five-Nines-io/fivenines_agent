@@ -1244,7 +1244,9 @@ without the audit privilege -- `NoAccess`, but also a `DatastoreBackup` the
 user holds for backups on `/datastore/store1` -- leaves the token no
 privilege there, and PBS then hides `store1` from it without an error. The
 agent cannot tell a datastore, namespace or remote hidden that way from a
-deleted one.
+deleted one -- unless the entry sits below `/datastore` and the token still
+audits something below it: the agent then reports the block (and its job
+lists) as partial, so nothing is taken for deleted.
 
 ### A read-only token, enforced
 
@@ -1300,14 +1302,16 @@ configuration change); the next refresh starts where this one was cut off, so
 a slow tail is not starved, and a datastore or namespace that alone outlasts
 the budget is moved to the back instead of blocking the others. A read the
 Proxmox Backup Server may still be working on after it timed out is not
-requested again blindly. A datastore's namespace listing and the usage
-summary (which walks every datastore the token cannot audit) are held until
-the agent is reloaded or restarted -- with a datastore on a stale or broken
-mount, PBS never finishes that walk and each request holds one of its proxy
-threads for good. Every other slow read is retried later, less and less often
-(at most every 6 hours). The dashboard shows what they cover as unknown
-meanwhile; a full-scope token still reports each datastore's usage, without
-its estimated full date. Once the datastore is repaired, restart
+requested again blindly. The reads that walk namespaces -- every datastore's
+namespace listing and the usage summary -- are held together: as soon as one
+of them times out, none is sent again until the agent is reloaded or
+restarted. With a datastore on a stale or broken mount, PBS never finishes
+that walk and each request holds one of its proxy threads for good, so one
+broken storage costs one thread however many datastores it carries. Every
+other slow read is retried later, less and less often (at most every 6
+hours). The dashboard shows the namespaces and backups of every datastore as
+unknown meanwhile; a full-scope token still reports each datastore's usage,
+without its estimated full date. Once the datastore is repaired, restart
 `proxmox-backup-proxy` on the PBS, then reload the agent
 (`sudo kill -HUP $(pgrep -f fivenines_agent)`; on Windows, restart the
 service). Any reload or restart releases them -- one sent for another reason,

@@ -588,7 +588,7 @@ def test_only_sighup_releases_a_held_pbs_read(
     from fivenines_agent import pbs
     from fivenines_agent.agent import refresh_permissions_event
 
-    held = ("https://pbs:8007/api2/json", "/admin/datastore/ds/namespace", ())
+    held = ("/admin/datastore/ds/namespace", ())
     monkeypatch.setattr(pbs, "_timeout_backoff", {held: (math.inf, 1, None)})
     # Patched too: SIGHUP replaces the module's block cache, which must not
     # leak into the tests that run after this one.
