@@ -741,7 +741,7 @@ before it; only `VIR_ERR_NO_DOMAIN` is skipped alone. The same change fixed
 `vm_vm_uptime_seconds_total`, which read a sixth `dom.info()` field libvirt
 never returns and was always 0: it is now the age of the VM's QEMU process.
 
-**Completed:** v1.20.3 (2026-09-30)
+**Completed:** v1.20.4 (2026-09-30)
 
 ### P3: Nightly distro matrix runs
 

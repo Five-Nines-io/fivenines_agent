@@ -1178,7 +1178,7 @@ vCPU/memory/domain totals. With the default `qemu:///system` URI it needs
 
 A VM's uptime is the age of its QEMU process, found by the `-uuid` argument
 libvirt starts it with, because libvirt has no API for a VM's start time
-(agent **1.20.3+**; earlier agents always reported 0). A VM that is not running,
+(agent **1.20.4+**; earlier agents always reported 0). A VM that is not running,
 or whose QEMU process the agent cannot see, reports 0: `/proc` mounted with
 `hidepid=`, or SELinux confining QEMU as `svirt_t` (RHEL family), which the
 agent's policy does not grant access to.
@@ -1212,7 +1212,7 @@ the dashboard shows as a collection failure rather than as zero VMs. A failed
 connection or domain listing also reports `null` (agent **1.17.5+**); `[]`
 now means libvirt answered and listed zero VMs.
 
-Each collection is also bounded in time (agent **1.20.3+**). libvirt calls
+Each collection is also bounded in time (agent **1.20.4+**). libvirt calls
 carry no timeout, and on a VM whose QEMU monitor is stuck (a hung QEMU, a
 long-running job, storage stalled under the guest) every monitor call waits up
 to 30s for the VM's job lock -- enough, with a couple of disks, to stall the
