@@ -232,12 +232,14 @@ def _get_packages_dpkg():
     packages_sync as "no data" and skips the send -- stale, but never a
     manufactured all-clear.
     """
-    # LC_ALL=C for the same reason as the rpm reader: get_clean_env() passes the
-    # host's LANG/LC_* through untouched, and this parser matches dpkg's status
-    # words byte-for-byte. Those words are bare C literals in statusinfos[] with
-    # no gettext wrapper, so this is belt-and-braces rather than load-bearing --
-    # but it is one line, and the failure it forecloses would fire fleet-wide on
-    # a single day. It also keeps the stderr quoted below readable.
+    # LC_ALL=C for the same reason as the rpm reader: this parser matches dpkg's
+    # status words byte-for-byte. Those words are bare C literals in
+    # statusinfos[] with no gettext wrapper, and get_clean_env() already pins
+    # LC_ALL=C for every child (#172), so this is belt-and-braces rather than
+    # load-bearing -- but it is one line, it keeps this reader's locale from
+    # resting on a shared helper's default, and the failure it forecloses would
+    # fire fleet-wide on a single day. It also keeps the stderr quoted below
+    # readable.
     env = get_clean_env()
     env["LC_ALL"] = "C"
     result = subprocess.run(
@@ -368,10 +370,10 @@ def _get_packages_rpm():
     is only safe while someone can SEE the host went quiet. The server stores
     last_packages_received_at; surfacing it is tracked in TODOS.md.
     """
-    # LC_ALL=C: the parser matches rpm's "(none)" sentinel byte-for-byte, and
-    # get_clean_env() passes the host's LANG/LC_* through untouched. Pinning the
-    # locale keeps any localized formatting out of a machine-parsed surface --
-    # a translated sentinel would fail EVERY no-epoch line, i.e. every package.
+    # LC_ALL=C: the parser matches rpm's "(none)" sentinel byte-for-byte.
+    # get_clean_env() already pins LC_ALL=C for every child (#172); pinned again
+    # here so this reader does not rest on a shared helper's default, since a
+    # translated sentinel would fail EVERY no-epoch line, i.e. every package.
     env = get_clean_env()
     env["LC_ALL"] = "C"
     result = subprocess.run(
