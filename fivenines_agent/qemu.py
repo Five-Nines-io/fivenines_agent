@@ -899,6 +899,29 @@ def _reset_backoff():
 # A libvirt UUID string is 36 characters; anything longer is not one.
 _UUID_MAX_CHARS = 64
 
+# The longest command line the uptime scan reads: a libvirt QEMU command line
+# is a few KB, tens with many devices. A longer one is skipped, unread past
+# this -- any local user can make their own command line megabytes long.
+_CMDLINE_MAX_BYTES = 256 * 1024
+_PROC_CMDLINE = "/proc/{}/cmdline"
+
+
+def _read_cmdline(pid):
+    """argv of *pid* read straight from procfs, at most _CMDLINE_MAX_BYTES:
+    None for a longer one. psutil's cmdline() reads, decodes and splits the
+    whole of it first. Linux only, like the libvirt collection it serves."""
+    limit = _CMDLINE_MAX_BYTES
+    raw = bytearray()
+    with open(_PROC_CMDLINE.format(int(pid)), "rb", buffering=0) as f:
+        while len(raw) <= limit:
+            chunk = f.read(limit + 1 - len(raw))
+            if not chunk:
+                break
+            raw += chunk
+    if len(raw) > limit:
+        return None
+    return raw.decode("utf-8", "replace").split("\0")
+
 
 def _is_no_domain(error):
     """True for libvirt's "domain not found": a VM undefined or destroyed
@@ -960,8 +983,8 @@ def _qemu_uuid_and_start(pid, wanted):
     try:
         proc = psutil.Process(pid)
         created = proc.create_time()
-        cmdline = proc.cmdline()
-        if "-uuid" not in cmdline:
+        cmdline = _read_cmdline(pid)
+        if cmdline is None or "-uuid" not in cmdline:
             return None
         position = cmdline.index("-uuid") + 1
         if position >= len(cmdline) or len(cmdline[position]) > _UUID_MAX_CHARS:

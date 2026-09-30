@@ -12,6 +12,7 @@ waiting for (COLLECT_TIMEOUT) and stops calling libvirt once its budget is
 spent (COLLECT_BUDGET) -- None in both cases, never a partial VM list.
 """
 
+import contextlib
 import os
 import re
 import threading
@@ -1255,9 +1256,13 @@ def _qemu_cmdline(uuid):
 class _FakeProcess:
     """psutil.Process over a {pid: (cmdline, create_time)} table; an entry
     that is an exception is raised by the constructor (the process is gone),
-    a cmdline that is one by cmdline() (not ours to read)."""
+    a cmdline that is one by argv() (not ours to read). There is no
+    cmdline(): the scan must read a command line through the bounded
+    qemu._read_cmdline, which _host_processes serves from the object last
+    constructed for that pid."""
 
     table: dict = {}
+    last: dict = {}
 
     def __init__(self, pid):
         entry = self.table[pid]
@@ -1266,8 +1271,9 @@ class _FakeProcess:
         if isinstance(entry, Exception):
             raise entry
         self._cmdline, self._created = entry
+        type(self).last[pid] = self
 
-    def cmdline(self):
+    def argv(self):
         if isinstance(self._cmdline, Exception):
             raise self._cmdline
         return self._cmdline
@@ -1276,12 +1282,14 @@ class _FakeProcess:
         return self._created
 
 
-def _host_processes(table):
+@contextlib.contextmanager
+def _host_processes(table, process_class=_FakeProcess):
     """Patch the uptime scan's view of the host's processes."""
-    fake = type("FakeProcess", (_FakeProcess,), {"table": table})
-    return patch.multiple(
+    fake = type("FakeProcess", (process_class,), {"table": table, "last": {}})
+    with patch.multiple(
         qemu.psutil, pids=MagicMock(return_value=list(table)), Process=fake
-    )
+    ), patch.object(qemu, "_read_cmdline", lambda pid: fake.last[pid].argv()):
+        yield
 
 
 def test_uptime_comes_from_the_qemu_process_start_time(fake_libvirt):
@@ -1485,6 +1493,9 @@ def test_no_domain_needs_libvirts_own_error_code():
         assert not qemu._is_no_domain(RuntimeError("Domain not found"))
 
 
+@pytest.mark.skipif(
+    not os.path.isdir("/proc/self"), reason="the uptime scan reads Linux procfs"
+)
 def test_uptime_is_read_from_a_real_process_through_private_objects():
     """The real psutil path, which the fakes above cannot vouch for: a child
     started with `-uuid` is found, with its fresh start time, and psutil's
@@ -1525,15 +1536,14 @@ def test_the_process_scan_counts_against_the_budget(fake_libvirt):
     reads = []
 
     class SlowProcess(_FakeProcess):
-        table = {pid: (["bash"], 0.0) for pid in range(3)}
-
-        def cmdline(self):
+        def argv(self):
             reads.append(1)
             clock[0] += qemu.COLLECT_BUDGET
-            return super().cmdline()
+            return super().argv()
 
-    with patch.object(qemu, "time", fake_time), patch.multiple(
-        qemu.psutil, pids=MagicMock(return_value=[0, 1, 2]), Process=SlowProcess
+    table = {pid: (["bash"], 0.0) for pid in range(3)}
+    with patch.object(qemu, "time", fake_time), _host_processes(
+        table, SlowProcess
     ), patch("fivenines_agent.qemu.log") as mock_log:
         assert qemu_metrics() is None
 
@@ -1717,14 +1727,12 @@ def test_a_slow_last_process_read_still_spends_the_budget(fake_libvirt):
     ]
 
     class SlowLastProcess(_FakeProcess):
-        table = {0: (["bash"], 0.0)}
-
-        def cmdline(self):
+        def argv(self):
             clock[0] += qemu.COLLECT_BUDGET
-            return super().cmdline()
+            return super().argv()
 
-    with patch.object(qemu, "time", fake_time), patch.multiple(
-        qemu.psutil, pids=MagicMock(return_value=[0]), Process=SlowLastProcess
+    with patch.object(qemu, "time", fake_time), _host_processes(
+        {0: (["bash"], 0.0)}, SlowLastProcess
     ), patch("fivenines_agent.qemu.log") as mock_log:
         assert qemu_metrics() is None
 
@@ -1769,3 +1777,47 @@ def test_an_oversized_uuid_argument_is_refused_before_it_is_copied():
         started = qemu._qemu_start_times(float("inf"), {at_limit.lower()})
     assert started == {at_limit.lower(): now - 5}
     assert copied == []
+
+
+class _CountingFile:
+    """A file whose reads are counted, to prove a bounded read stays bounded."""
+
+    def __init__(self, f, counted):
+        self._f, self._counted = f, counted
+
+    def read(self, n):
+        chunk = self._f.read(n)
+        self._counted.append(len(chunk))
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._f.close()
+
+
+def test_cmdline_is_read_bounded_straight_from_procfs(tmp_path):
+    """A normal command line is split on NUL; one past _CMDLINE_MAX_BYTES is
+    skipped after reading at most one byte past the limit -- never the whole
+    thing, which any local user can make megabytes long; a pid that is gone
+    raises, and the scan skips it."""
+    (tmp_path / "1.cmdline").write_bytes(b"qemu\0-uuid\0ABC\0")
+    (tmp_path / "2.cmdline").write_bytes(b"x" * 100_000)
+    counted = []
+    real_open = open
+
+    def counting_open(*args, **kwargs):
+        return _CountingFile(real_open(*args, **kwargs), counted)
+
+    with patch.object(
+        qemu, "_PROC_CMDLINE", str(tmp_path / "{}.cmdline")
+    ), patch.object(qemu, "_CMDLINE_MAX_BYTES", 16), patch(
+        "fivenines_agent.qemu.open", counting_open, create=True
+    ):
+        assert qemu._read_cmdline(1) == ["qemu", "-uuid", "ABC", ""]
+        counted.clear()
+        assert qemu._read_cmdline(2) is None
+        assert sum(counted) == 17
+        with pytest.raises(OSError):
+            qemu._read_cmdline(3)
