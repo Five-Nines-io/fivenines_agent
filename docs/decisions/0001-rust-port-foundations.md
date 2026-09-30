@@ -1,6 +1,6 @@
 # 0001 -- Rust port foundations
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-09-29
 - Tracking: #173 (Phase 0 "Decision record" of #169)
 - Inputs: the Go and Rust prototypes and their harness on
@@ -25,8 +25,8 @@ section).
 | 5 | Concurrency                  | Synchronous code on std threads, same thread layout as today. tokio only inside an SDK that needs it, current-thread runtime only |
 | 6 | libvirt                      | Our own client for the libvirt RPC protocol, local unix socket only. No C library |
 | 7 | Windows                      | After Linux GA; the runtime must compile for Windows from the first commit |
-| 8 | Side-by-side support         | Python stays in maintenance for 12 months after each platform's Rust GA |
-| 9 | Python bugs found by the port | Fixed in Python first; the harness requires exact equality |
+| 8 | Side-by-side support         | Python stays in maintenance for 12 months after each platform's Rust GA, released from a maintenance branch that never becomes `latest`; installers gain a verified pinned-version mode; the payload names its implementation |
+| 9 | Python bugs found by the port | Fixed in Python first; the harness requires equality on recorded inputs, with Python-made text normalized in Python first |
 
 ## 1. Where the code lives
 
@@ -42,13 +42,25 @@ section).
 - A change to a payload and its fixture lands in one PR.
 
 **Consequences.**
-- CI jobs are path-filtered, except the harness, which runs whenever either
-  agent or a fixture changes.
+- CI jobs are path-filtered, except the harness:
+  - it runs on every pull request and is a required status check on main,
+    a branch-protection setting the harness step (#176) asks the maintainer
+    to make, since no file in the repository can;
+  - it filters paths inside the job rather than in `on:`, so the required
+    check always reports instead of leaving a pull request on "Expected";
+  - it does the work when either agent, a fixture, `pyproject.toml`,
+    `poetry.lock`, `rust/Cargo.lock`, `rust/rust-toolchain.toml`, the
+    harness or a mock changes (a lockfile-only psutil bump changes Python
+    payloads), and on a weekly schedule.
 - The ASCII-only rule and the security checks cover `rust/` too. The CI
   ASCII check in `build-release.yml` matches only `*.py`, `*.toml`, `*.yml`,
   `*.yaml`, `*.json` and `*.sh` files today, and that workflow has no
   `pull_request` trigger. The workspace step adds `*.rs` and runs the check
   on pull requests.
+- Neither security check sees Rust today: Bandit is Python-only and the
+  CodeQL matrix is `python` and `actions`. The workspace step (#175) adds
+  CodeQL for Rust, cargo-deny / cargo-audit and a `cargo` entry in
+  Dependabot.
 
 ## 2. Platform scope and order
 
@@ -74,9 +86,10 @@ architectures, armv7 and i686, in this order:
 
 1. Linux x86_64, aarch64, armv7 and i686, glibc and musl builds together.
    The harness and the distro matrix run on Linux first.
-2. Synology DSM 7: the Linux glibc binary in an SPK. Only the packaging
-   changes; the per-module exclusions go away because Rust has no per-module
-   bundle.
+2. Synology DSM 7: the Linux glibc binary in an SPK, built without the
+   collectors the Python SPK excludes today (qemu, proxmox, nvidia_gpu), so
+   the Synology payload stays what Python reports. Adding them later is a
+   payload change like any other.
 3. Windows x64 (section 7).
 
 armv7 and i686 gate GA like the other two architectures, so they need what
@@ -93,6 +106,9 @@ x86_64 and aarch64 already have:
 - the same harness parity as x86_64 and aarch64.
 
 i686 means Rust's baseline for that target: SSE2, i.e. a Pentium 4 or later.
+Linux reports `i686` for older CPUs too (Pentium III, VIA C3), where the
+binary would die with SIGILL on every restart, so the installers check for
+the `sse2` flag in `/proc/cpuinfo` and refuse the host without it.
 
 Out of scope: macOS, FreeBSD, Windows arm64, 32-bit Windows.
 
@@ -108,17 +124,18 @@ harness has to catch on those targets, not only on 64-bit hosts.
 (`fivenines_setup.sh`, `fivenines_update.sh`) send every `uname -m` other
 than `aarch64` to the amd64 artifact. An armv7l or i686 host therefore
 downloads a binary it cannot execute. The user-mode scripts already reject
-unknown architectures. This should be fixed in the current installers now,
-independently of the port: until the Rust artifacts exist, such a host
-should be refused with a clear message rather than handed a binary it
-cannot run (#170).
+unknown architectures. Fixed independently of the port in v1.20.2 (#170):
+every Linux installer now refuses a host no release has a binary for,
+including a 32-bit userland on a 64-bit kernel, until the Rust artifacts
+exist.
 
 The Windows gap is a Python packaging bug, not a platform limit. NVIDIA
 ships NVML on Windows as `nvml.dll`, which pynvml knows how to load, and the
 Windows capability set already probes `nvidia_gpu`. A Windows host with an
 NVIDIA GPU therefore reports no GPU metrics today, where a Rust build using
 nvml-wrapper would. By section 9 it is fixed in Python first (issue to be
-filed). The Alpine gaps change no payload: the proxmox probe requires a
+filed). The Alpine gaps change no collected data, only the text of
+`capability_reasons` (`pynvml not installed`): the proxmox probe requires a
 local Proxmox VE node (`/etc/pve` or `pvesh`), which is never Alpine, and
 the Rust musl build has no NVML either, since a static binary cannot
 `dlopen` (section 3).
@@ -177,7 +194,7 @@ approximate; `smaps_rollup` is exact.)
 
 Very few processes mapped libc in that VM, so the glibc PSS above is an upper
 bound. On a real host the shared part tends to zero, and the actual difference
-is the private memory: about 0.56 MB here.
+is the private dirty memory (heap and stacks): about 0.56 MB here.
 
 That difference grows with the workload. The same binaries as the #169 table
 were run again on its 16-core x86_64 host (1s interval, 40 mock containers
@@ -223,6 +240,11 @@ exactly the kind of divergence constraint 1 of #169 exists to catch.
 - CI checks the glibc floor on the binary itself: no symbol may require a
   `GLIBC_` version above 2.17. The Python build never had this check. The
   `centos:7` distro job stays.
+- CI also checks the link shape, which the symbol-version check cannot see:
+  the glibc artifact's `DT_NEEDED` entries stay within libc, libm,
+  libpthread, libdl, librt, the dynamic loader and libgcc_s (a crate that
+  pulls in `libssl.so` or `libz.so` fails), and the musl artifact has
+  neither `PT_INTERP` nor `DT_NEEDED`.
 - The glibc build runs in a glibc 2.17 sysroot: the manylinux2014-based
   builder images already exist, on native x86_64 and aarch64
   runners, and manylinux2014 also has an i686 image that runs on the x86_64
@@ -234,6 +256,11 @@ exactly the kind of divergence constraint 1 of #169 exists to catch.
   Alpine 3.19 floor (the current musl binary needs `pwritev2`, which Alpine
   3.18 lacks) no longer applies to it, but it is lowered only once the
   distro matrix tests an older Alpine.
+- `detect_libc()` knows only the x86_64 and aarch64 musl loaders today, and
+  falls back to glibc when `ldd` says nothing. The Rust installers add the
+  armhf and i386 loaders (`ld-musl-armhf.so.1`, `ld-musl-i386.so.1`), and
+  pick the static musl build whenever detection is inconclusive, since it
+  runs on any Linux of its architecture.
 - `call_bounded` starts one thread per collector call, and glibc binds
   threads to extra malloc arenas that keep freed memory. The glibc build
   caps the arena count with `mallopt(M_ARENA_MAX, ...)` at startup, before
@@ -271,7 +298,9 @@ exactly the kind of divergence constraint 1 of #169 exists to catch.
     on the x86_64 runner).
   - armv7 has no native runner, so it is cross-compiled: cargo-zigbuild or a
     pinned cross sysroot, chosen by the release pipeline step. A zig
-    version, if used, is pinned exactly.
+    version, if used, is pinned exactly. A musl artifact linked by zig
+    carries zig's musl, not the one Rust bundles, so the musl 1.2.4 floor
+    above applies to that zig version too.
   - The cross toolchain includes a C compiler for every target: ring, the
     rustls crypto provider in the prototype, compiles C and assembly (so
     does aws-lc-rs, the alternative).
@@ -299,8 +328,20 @@ exactly the kind of divergence constraint 1 of #169 exists to catch.
   thread layout.
 - The collection loop runs collectors in sequence. Each collector call goes
   through `call_bounded`, which gives each call its own thread, a deadline,
-  single-flight per name and `catch_unwind`. That also delivers the
-  per-collector bound listed as P3 in TODOS.md.
+  single-flight per name and `catch_unwind`. That delivers the
+  per-collector deadline of the P3 entry in TODOS.md, not its two other
+  points: deadlines run in sequence can still add up past `WatchdogSec`,
+  and state kept per thread (docker's cached client) would be rebuilt on
+  every fresh worker. So:
+  - a whole-tick budget under `WatchdogSec` sits above the per-collector
+    deadlines: once it is spent, the collectors left in that tick report
+    `null` without running (the posture of today's docker, openvpn and
+    proxmox backups budgets);
+  - state a collector keeps across ticks belongs to the collector, never to
+    the worker thread that happens to run it;
+  - both bounds change what a stalled tick reports (Python blocks today,
+    until the watchdog restarts it), so by section 9 they land in Python
+    first, as the P3 entry already plans.
 - The agent's own code uses no async runtime.
 - An async-only dependency is allowed only if all of this holds:
   - it sits behind a module boundary that owns one current-thread tokio
@@ -313,9 +354,10 @@ exactly the kind of divergence constraint 1 of #169 exists to catch.
 | Python dependency          | Rust                                                              | Async runtime |
 |----------------------------|-------------------------------------------------------------------|---------------|
 | psutil                     | Our own /proc and /sys readers, following psutil 7.2.1 (constraint 2) | none |
-| requests, urllib3, certifi | ureq 3 with rustls and webpki-roots (the Mozilla bundle, like certifi); system roots where Python uses them today (pg8000, paho) | none |
-| dnspython (API host)       | Chosen in the synchronizer step: a minimal stub resolver or hickory | none, or current-thread |
-| docker-py                  | HTTP/1.1 over the unix socket with our own string-typed models, **not bollard** (below) | none |
+| requests, urllib3, certifi | ureq 3 with rustls and webpki-roots (the Mozilla bundle, like certifi); for pg8000 and paho, which use OpenSSL's default verify paths, the store the frozen binaries actually reach is measured in their steps | none |
+| dnspython (API host, `ip.fivenines.io`) | Chosen in the synchronizer step: a minimal stub resolver or hickory | none, or current-thread |
+| docker-py                  | HTTP/1.1 over the endpoint docker-py reaches today (the unix socket, a `tcp://` `socket_url`, or `DOCKER_HOST` with `DOCKER_TLS_VERIFY` / `DOCKER_CERT_PATH` client certificates), with our own string-typed models, **not bollard** (below) | none |
+| python-dotenv              | `<config_dir>/.env` read into the environment at startup, same grammar (`${VAR}` interpolation), never overriding a variable already set | none |
 | pg8000                     | Chosen in its step: the `postgres` crate (a blocking wrapper over tokio-postgres) or a minimal wire client | current-thread at most |
 | paho-mqtt                  | Chosen in the mqtt step                                           | current-thread at most |
 | pynvml                     | nvml-wrapper (libloading); glibc build only                       | none |
@@ -354,7 +396,10 @@ bollard is ruled out by what the prototype's docker port found:
   panic there would become a `null` on every tick until the agent restarts
   (its `docker` state already recovers the guard). So shared state must
   either recover the guard (`PoisonError::into_inner`) and reset what it
-  protects, or use a lock that cannot be poisoned.
+  protects, or use a lock that cannot be poisoned. The workspace step
+  enforces it with a clippy `disallowed-methods` entry on
+  `std::sync::Mutex::lock`, so locking goes through a wrapper that
+  recovers.
 - An abandoned worker can still hold shared state. Single-flight per name
   protects the next tick only if every path into that state goes through the
   same name.
@@ -364,6 +409,17 @@ bollard is ruled out by what the prototype's docker port found:
   network and disk byte counters) stay integers in the JSON, and SNMP
   Counter64 values use the whole unsigned range, so `i64` is not enough
   either.
+- psutil's `nowrap`, on by default in the `disk_io_counters` and
+  `net_io_counters` calls the agent makes, adds a counter that wrapped back
+  across reads; it is part of the psutil 7.2.1 behavior to reproduce. No
+  live run reaches these boundaries, so the fixtures and harness inputs
+  carry values above 2^32 and 2^53, `u64::MAX`, and a two-read sequence in
+  which a counter wraps, and they run on the armv7 and i686 artifacts too.
+- The armv7 and i686 glibc builds use the 64-bit file interfaces
+  (`statvfs64` and the like, or the libc crate's 64-bit file-offset mode).
+  With the 32-bit ones, `statvfs` fails with EOVERFLOW on a filesystem over
+  2^32 blocks (16 TiB at 4 KiB), which Python's large-file build reads fine.
+  musl is 64-bit there already.
 
 ## 6. libvirt
 
@@ -377,9 +433,10 @@ bollard is ruled out by what the prototype's docker port found:
   - per running domain: max vCPUs, CPU stats (per host CPU and total),
     vCPUs, memory stats, XML description, then block stats per disk and
     interface stats per interface.
-- The URI allowlist already limits it to local unix sockets
-  (`qemu:///system`, `qemu:///session`, `qemu+unix` with a socket in a libvirt
-  run directory).
+- The URI allowlist already limits it to local unix sockets:
+  `qemu:///system` and `qemu:///session`, over the `qemu` or `qemu+unix`
+  scheme, with an optional `socket=` confined to a libvirt run directory
+  and `mode=auto|direct|legacy`.
 - The glibc build bundles libvirt 6.10.0 and libtirpc 1.3.3, built from
   source with the hypervisor drivers disabled. `libvirt.so.0` brings its
   own dependencies into the v1.20.1 bundle: libxml2, gnutls (with nettle,
@@ -388,8 +445,8 @@ bollard is ruled out by what the prototype's docker port found:
   bundles the libvirt of its Alpine 3.21 builder image. Windows and Synology
   exclude libvirt, so qemu never runs there.
 - The collector's own libvirt calls have no timeout; only the 3s probe is
-  bounded (#171). No event loop is registered, so libvirt's keepalive is
-  off too.
+  bounded (#171, in review as #215). No event loop is registered, so
+  libvirt's keepalive is off too.
 - Much of the allowlist exists to fence behaviors of the C client itself:
   - transports that run commands (`ssh`, `ext`);
   - `LIBVIRT_DEFAULT_URI` and `libvirt.conf`;
@@ -411,7 +468,10 @@ unix socket only, implementing only the procedures the collector uses.
 - The allowlist becomes structural: the client has no TLS, SSH or `ext`
   transport to refuse, reads no `libvirt.conf` and cannot autostart a daemon.
   No environment variable needs setting, and there is no parse to keep in step
-  with libvirt's.
+  with libvirt's. The confinement of `socket=` to the libvirt run
+  directories is not C-client fencing, though: it keeps a server-pushed URI
+  from pointing the agent at any other local socket (#142), so the Rust
+  client keeps it, in step with the server-side allowlist.
 - Every read gets a socket timeout, which today's calls do not have.
 - Loading the host's `libvirt.so.0` with `dlopen` would remove the bundling,
   but only on glibc, and it would keep every C-client behavior listed above.
@@ -422,13 +482,21 @@ unix socket only, implementing only the procedures the collector uses.
 - XDR encoding for about 15 procedures;
 - the read-only connect and authentication handshake: none, or polkit on the
   read-only socket;
+- the same accepted URI set as the Python allowlist (both schemes, both
+  paths, `socket=` and `mode=`), everything else refused and reported as
+  `null`;
 - libvirt's socket selection for `qemu:///system` and `qemu:///session` with
   `mode=auto|direct|legacy`: the monolithic `libvirt-sock-ro` versus the
   modular `virtqemud-sock-ro`, and `$XDG_RUNTIME_DIR` for session. This
-  selection is parity-critical and is tested against both daemon layouts.
+  selection is parity-critical and is tested against both daemon layouts;
+- a test input both clients can talk to: a scripted libvirt RPC server on a
+  unix socket, serving both socket layouts, with failure modes (a stuck
+  call, a failed domain listing). Today's tests mock the Python binding,
+  which the Rust client, speaking XDR, cannot consume.
 
 qemu has no contract fixture yet, so its step first writes one from the
-Python agent's output, after the Python fixes listed in section 9.
+Python agent talking to that server, after the Python fixes listed in
+section 9.
 
 **Reopen if** real hosts set `auth_unix_ro = "sasl"`. SASL is the one
 handshake the C client would give us for free.
@@ -477,26 +545,53 @@ this record decides.
 - **Before a platform's Rust GA.** Python is the shipping agent there and
   still gets features. A new collector lands in Python first, with its
   contract fixture, and that collector's Rust step reproduces the fixture.
+  A collector with no fixture gets one first, written from the Python
+  agent's output: 21 exist today, and cpu, memory, processes, systemd and
+  snmp, among others, have none. Each step also covers the collector's
+  `null`, empty and absent-key branches with failure inputs (a mock service,
+  a recorded `/proc` fault) that the harness runs against both agents.
   Once a collector's Rust step has closed, any PR that changes its payload in
   Python must change the Rust side in the same PR. The differential harness
-  fails otherwise, so CI enforces this, not process.
+  fails otherwise (section 1), so CI enforces this, not process.
 - **At GA, per platform.**
   - Installers and update scripts install the Rust agent.
   - The update script migrates a Python install in place; the state files are
-    compatible (Phase 3).
-  - The Rust GA is the next major version (2.0.0) on the same version line.
-    Nothing agent-side depends on a 1.x prefix: the installers compare no
-    versions, and the MSI's major upgrade only needs a higher version.
+    compatible (Phase 3), `<config_dir>/.env` included: it can set
+    `API_URL` and every variable a library or child reads.
+  - The first Rust GA is the next major version (2.0.0) on the same version
+    line. Nothing agent-side depends on a 1.x prefix: the installers compare
+    no versions, and the MSI's major upgrade only needs a higher version.
     Version checks on the server side are outside this repository; the GA
     step (#210) reviews them.
+  - One tag still builds every platform, so after the first GA a 2.x
+    release carries Rust where it has shipped and Python elsewhere, and the
+    version no longer says which agent runs. The payload's static data
+    therefore names its implementation (`python` or `rust`).
+    `pyproject.toml` and `rust/Cargo.toml` carry the same version on main,
+    and the release job checks the tag against both.
 - **After GA.**
   - The Python agent for that platform stays in maintenance for 12 months:
     security fixes and fixes that keep its payload valid, no new collectors.
+  - Maintenance releases come from a maintenance branch cut at GA from the
+    last commit that shipped that platform's Python agent. Its tags take
+    the next patch versions of that release line (1.x.y after the Linux
+    GA), so they never collide with main's, and build only that platform's
+    Python artifacts.
+  - They go through the same signed pipeline but never become `latest`:
+    not on GitHub, not in R2's `latest/`, which every installer reads. A
+    maintenance release published as `latest` would downgrade every Rust
+    host that next runs an installer. The release job's main-ancestry check
+    accepts a maintenance branch for its own tags only.
+  - The installers and update scripts gain a pinned-version mode that
+    downloads a given release and verifies it, startup definitions
+    included, against that release's own signed `SHA256SUMS`. It is how an
+    operator stays on Python, and how a Rust host rolls back; the unverified
+    `FIVENINES_AGENT_URL` path is not enough for either.
   - Its last release stays downloadable, for rollback.
   - After that, its builds stop. The README states the date from GA onward.
-  - Payloads are identical, so nothing needs retiring on the receiving side.
-    An old Python agent keeps working after its end of support; it just
-    stops getting fixes.
+  - Payloads are identical apart from the implementation name, so nothing
+    needs retiring on the receiving side. An old Python agent keeps working
+    after its end of support; it just stops getting fixes.
 
 **Why 12 months.** Updates are started by operators, so the window exists for
 them, not for us. It is the one number in this record that the Phase 4 beta's
@@ -506,44 +601,76 @@ version distribution should confirm or change before GA.
 
 **Decision.** When the harness or a port shows that the Python agent is
 wrong (rather than the port), the fix lands in Python first, with its test and
-fixture. The Rust port then reproduces the fixed behavior. The harness stays
-an exact comparison, with no list of known differences.
+fixture. The Rust port then reproduces the fixed behavior. The harness keeps
+no list of known differences, which gives "exact" a precise meaning:
+- The comparison that gates runs both agents on recorded inputs: a fake
+  `/proc` and `/sys` root, the mock services, a frozen clock. On those, the
+  two payloads must be equal as JSON values.
+- A comparison on a live host tolerates sampling drift (the prototype's
+  `diff_payloads.py` tolerances) and never gates: two agents reading a live
+  host at different instants never produce equal counters.
+- Text the Python runtime makes up is normalized in Python first: the
+  `capability_reasons` strings (`pynvml not installed`), exception text in
+  collector error entries (openvpn, snmp, ceph, systemd), Python `repr` in
+  image-inventory errors, and `uname.processor` (from `uname -p`). Stable
+  reason codes replace exception text, and the fixtures are updated. Only
+  `version`, which differs by construction, and the implementation name
+  (section 8) are excluded, by name.
 
 **Why.** A list of known differences is where real divergences hide. And the
 fix reaches today's hosts months before the Rust agent does.
 
-Found while preparing this record:
+Found while preparing this record (status as of v1.20.3):
 - `vm_vm_uptime_seconds_total` is always 0. `_get_vm_uptime` reads
   `dom.info()[5]` only when `info()` has six fields, and `virDomainGetInfo`
-  returns five (issue to be filed).
+  returns five. The fix is in review as #215 (#171): the uptime becomes the
+  age of the QEMU process found by its `-uuid` argument.
 - `vm_vcpu_time_nanoseconds_total` labels host CPUs as vCPUs on cgroup v1
   hosts: `getCPUStats(False)` returns one entry per host CPU, not per vCPU,
   and each is shipped with `vcpu` set to its index. On cgroup v2 that call
   fails and the `vcpus()` fallback reports real vCPUs (issue to be filed).
 - The qemu collector's libvirt calls have no timeout, so one VM with a stuck
-  QEMU monitor can stall the tick past `WatchdogSec` (#171).
-- The root installers map every unknown architecture to amd64 (section 2,
-  #170).
+  QEMU monitor can stall the tick past `WatchdogSec` (#171, in review as
+  #215).
+- The root installers map every unknown architecture to amd64 (section 2;
+  fixed in v1.20.2, #170).
 - The Windows binary ships without pynvml, so Windows hosts report no
   NVIDIA GPU metrics (section 2, issue to be filed).
-- Child processes inherit the host locale: `get_clean_env` sets no `LC_ALL`,
-  and only `dpkg-query` and `rpm` force `C`. smartctl formats `User
-  Capacity`, which is shipped verbatim as `total_capacity`, with the locale's
-  thousands separator (#172). Until Python changes this, parity means the
-  Rust command runner passes the same environment.
+- Child processes inherited the host locale, and only `dpkg-query` and
+  `rpm` forced `C`: smartctl formats `User Capacity`, which is shipped
+  verbatim as `total_capacity`, with the locale's thousands separator.
+  Fixed in v1.20.3 (#172): `get_clean_env` now sets `LC_ALL=C` and drops
+  `LANGUAGE` for every child, and the Rust command runner does the same.
 
 ## Left to later steps
 
 - Crate layout, lint set, coverage tool and threshold, and the cargo-deny /
   cargo-vet policy: the workspace and CI step.
-- The API host's DNS client: the synchronizer step. It must match how the
-  agent uses dnspython: `/etc/resolv.conf` read once per process,
-  `/etc/hosts` never read, `search` and `ndots` honored; A first, and AAAA
-  only when the A lookup fails or its first address fails to connect or
-  complete TLS; only the first address of an answer tried; TTL cache
-  flushed on any failure.
+- The DNS client for the API host and `ip.fivenines.io`: the synchronizer
+  step. It must match how the agent uses dnspython 2.8 today:
+  - common to both names: one resolver per process, built once from
+    `/etc/resolv.conf` (from the registry on Windows, which the Windows step
+    reconciles); `/etc/hosts` never read; every name queried as absolute,
+    with no search list and `ndots` ignored (dnspython's
+    `use_search_by_default` is off); the TTL cache flushed on any
+    resolution failure, not on a connect or TLS failure;
+  - the API host: A first, and AAAA only when the A lookup fails or its
+    first address fails to connect or complete TLS; only the first address
+    of an answer tried;
+  - `ip.fivenines.io`: one family per lookup (A for the IPv4 address, AAAA
+    for the IPv6 one), every address of the answer tried in order.
 - The PostgreSQL and MQTT clients: their steps, within section 5.
 - How the Windows service is run: the Windows step.
+- The RSS soak test used as a gate in sections 3 and 4: the release
+  pipeline step (#177). It runs a fixed profile that includes the Docker
+  mock, long enough to see slow growth (the glibc build still crept after 5
+  minutes), and fails on the slope of `Private_Dirty` rather than on an
+  absolute RSS. It also says how armv7 is measured, since QEMU user
+  emulation adds its own memory to the process.
+- What the harness compares the armv7 and i686 Rust agents against, since no
+  Python build exists there (the Python agent run from source in the same
+  emulated container, or recorded fixtures only): the harness step (#176).
+  `uname` and the CPU model then follow the emulated target.
 
 ## References
 
