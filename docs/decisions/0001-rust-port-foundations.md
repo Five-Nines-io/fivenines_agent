@@ -50,8 +50,9 @@ section).
   - it filters paths inside the job rather than in `on:`, so the required
     check always reports instead of leaving a pull request on "Expected";
   - it does the work when either agent, a fixture, `pyproject.toml`,
-    `poetry.lock`, `rust/Cargo.lock`, `rust/rust-toolchain.toml`, the
-    harness or a mock changes (a lockfile-only psutil bump changes Python
+    `poetry.lock`, `rust/Cargo.lock`, `rust/rust-toolchain.toml`, the zig
+    or cross-sysroot pin (it chooses the armv7 musl), the harness or a mock
+    changes (a lockfile-only psutil bump changes Python
     payloads), and on a weekly schedule.
 - The ASCII-only rule and the security checks cover `rust/` too. The CI
   ASCII check in `build-release.yml` matches only `*.py`, `*.toml`, `*.yml`,
@@ -409,7 +410,8 @@ bollard is ruled out by what the prototype's docker port found:
   honoring `NO_PROXY`, a CA bundle from `REQUESTS_CA_BUNDLE` or
   `CURL_CA_BUNDLE`, and `~/.netrc` credentials when no auth is set. Every
   HTTP collector (nginx, apache, caddy, haproxy, php-fpm, rabbitmq, tsdb,
-  vllm, sglang, proxmox) relies on it, so a host behind a proxy or trusting
+  vllm, sglang, proxmox, and docker over `tcp://`, whose client is a
+  requests session) relies on it, so a host behind a proxy or trusting
   an internal CA would lose them on migration. Their steps reproduce these
   behaviors, and the harness runs one input that sets them.
 - **Mutex poisoning.** A collector that panics while holding shared state
@@ -436,8 +438,11 @@ bollard is ruled out by what the prototype's docker port found:
   either.
 - Where Python sums counters with unbounded integers (docker's block I/O
   across devices, qemu's per-vCPU times, openvpn's bytes across sessions of
-  one common name), the Rust sum is a `u128`, which serde_json writes
-  exactly, so the payload matches even above `u64::MAX`. The release profile
+  one common name, and psutil's `nowrap`, below, which adds a wrapped
+  counter's old value to the new one), the Rust sum is a `u128`, so the
+  payload matches even above `u64::MAX`. It is serialized through typed
+  `Serialize` structs or serde_json's `arbitrary_precision` feature, since
+  serde_json's `Value` refuses a `u128` above `u64::MAX`. The release profile
   also states `overflow-checks = true` next to `panic = "unwind"`: an
   overflow nobody planned for costs a `null`, never a silently wrapped
   counter.
@@ -461,10 +466,11 @@ bollard is ruled out by what the prototype's docker port found:
   domain's name and UUID, that the client answers locally):
   - connection: open read-only, version and type (every tick; the result is
     only logged), node info, list all domains, close;
-  - per domain: state and info;
-  - per running domain: max vCPUs, CPU stats (per host CPU and total),
-    vCPUs, memory stats, XML description, then block stats per disk and
-    interface stats per interface.
+  - per domain: state;
+  - per running domain: max vCPUs; CPU time through a fallback chain (CPU
+    stats per host CPU, then vCPU info, then total CPU stats, then
+    `info()`); memory stats; XML description; then block stats per disk
+    (`blockStatsFlags` first) and interface stats per interface.
 - The URI allowlist already limits it to local unix sockets:
   `qemu:///system` and `qemu:///session`, over the `qemu` or `qemu+unix`
   scheme, with an optional `socket=` confined to a libvirt run directory
@@ -635,10 +641,13 @@ this record decides.
     operator stays on Python, and how a Rust host rolls back; the unverified
     `FIVENINES_AGENT_URL` path is not enough for either.
   - The Windows MSI accepts a downgrade and keeps the config directory and
-    `TOKEN` across it. Today `MajorUpgrade` refuses any lower version and
-    uninstalling removes the config directory, so a Rust host could only
-    go back by re-enrolling. The Windows step tests the downgrade before
-    the Windows GA.
+    `TOKEN` across it. Today `MajorUpgrade` refuses any lower version, so
+    a Rust host cannot go back in place. Whether an uninstall keeps the
+    config directory is unverified: the MSI's `RemoveFolder` removes only
+    an empty folder, and the `TOKEN` is written by a custom action. The
+    Windows step tests both paths before the Windows GA: a downgrade in
+    place, and an uninstall followed by a reinstall with the existing
+    `TOKEN`.
   - The maintenance branch carries main's protection (required review,
     required checks including the harness, no direct pushes) before the
     release job's ancestry check accepts it, under one exact branch
@@ -667,7 +676,8 @@ no list of known differences, which gives "exact" a precise meaning:
   `/proc` and `/sys` root, the mock services, scripted command output
   (behind a fake `sudo` that honors the pinned argv), shims for the values
   that come from syscalls rather than files (`statvfs`, `getifaddrs`, the
-  ethtool ioctls, name-service lookups), and a frozen clock. On those, the
+  ethtool ioctls, name-service lookups), and a clock the harness controls
+  (below, left to the harness step). On those, the
   two payloads must be equal, and type-strictly: a boolean is not a number,
   an integer is not a float, and the key sets match.
 - A comparison on a live host tolerates sampling drift (the prototype's
@@ -715,6 +725,10 @@ Found while preparing this record (status as of v1.20.4):
   fixed in v1.20.2, #170).
 - The Windows binary ships without pynvml, so Windows hosts report no
   NVIDIA GPU metrics (section 2, issue to be filed).
+- The synchronizer thread dies on a `/collect` answer without a `config`
+  key: `send_metrics` reads `response["config"]` outside any `try`, and
+  `run()` catches nothing. The main loop keeps feeding the watchdog, so the
+  host stops reporting and systemd never restarts it (issue to be filed).
 - Child processes inherited the host locale, and only `dpkg-query` and
   `rpm` forced `C`: smartctl formats `User Capacity`, which is shipped
   verbatim as `total_capacity`, with the locale's thousands separator.
@@ -723,8 +737,11 @@ Found while preparing this record (status as of v1.20.4):
 
 ## Left to later steps
 
-- Crate layout, lint set, coverage tool and threshold, and the cargo-deny /
-  cargo-vet policy: the workspace and CI step.
+- Crate layout, lint set, coverage tool and threshold, the cargo-deny and
+  cargo-audit policy, and whether to adopt cargo-vet: the workspace and CI
+  step (#175). It also checks that `rust/rust-toolchain.toml` and the
+  workspace `rust-version` agree, since edition 2024's resolver caps
+  dependency versions at `rust-version`.
 - The DNS client for the API host and `ip.fivenines.io`: the synchronizer
   step. It must match how the agent uses dnspython 2.8 today:
   - common to both names: one resolver per process, built once from
@@ -746,9 +763,17 @@ Found while preparing this record (status as of v1.20.4):
   minutes), and fails on the slope of `Private_Dirty` rather than on an
   absolute RSS. It also says how armv7 is measured, since QEMU user
   emulation adds its own memory to the process. It must run on a pull
-  request too, path-filtered on `rust/rust-toolchain.toml`, the zig pin and
-  `rust/Cargo.lock`, since section 4 makes it a gate on every toolchain
-  change and `build-release.yml` has no `pull_request` trigger.
+  request too, path-filtered on `rust/rust-toolchain.toml`, the zig or
+  sysroot pin, `rust/Cargo.lock`, the source that sets the arena cap and
+  the builder Dockerfiles, since section 4 makes it a gate on every
+  toolchain change and `build-release.yml` has no `pull_request` trigger.
+- The release pipeline step (#177) also settles the armv7 glibc floor and
+  how it is built, the cross toolchain for armv7 (zig or a sysroot) and its
+  pin, and the `M_ARENA_MAX` value. It verifies every toolchain download
+  the way every other build download is verified today: rustup-init, the
+  toolchains, the zig or sysroot tarball and every cargo subcommand against
+  digests committed in the repository (`cargo install --locked` at pinned
+  versions), with no `curl | sh`.
 - The harness step (#176) settles how the recorded inputs of section 9
   reach both agents: a mount namespace with bind-mounted `/proc` and `/sys`
   trees, for example, and a clock source that also works for a static
@@ -760,7 +785,42 @@ Found while preparing this record (status as of v1.20.4):
   of section 1. And it says what the armv7 and i686 Rust agents are
   compared against, since no Python build exists there (the Python agent
   run from source in the same emulated container, or recorded fixtures
-  only); `uname` and the CPU model then follow the emulated target.
+  only); `uname` and the CPU model then follow the emulated target. The
+  same step also settles:
+  - the clock: stepped between ticks by the same amount for both agents,
+    so the time-driven branches (qemu's budget and backoff, snmp's
+    interval replay, the docker, openvpn and ping deadlines) are reachable.
+    Which clocks it controls decides whether the ages read from the
+    monotonic clock (mqtt's, proxmox's `age_s`) are compared or join the
+    exclusions of section 9;
+  - the scope before GA: the mock config enables only the collectors whose
+    step has closed, and capabilities are compared only for their probes.
+    That list only grows, and goes at GA;
+  - the scope after each GA: collectors that only platforms past GA run are
+    compared against their fixtures or the maintenance branch's Python, not
+    main's, and the maintenance branch's own harness compares Python
+    against its fixtures;
+  - the Windows `cargo check` of section 7 runs on pull requests and is a
+    required check, like the harness.
+- The collection loop step (#180) settles:
+  - a panic policy for the long-lived threads (synchronizer, uploaders,
+    MQTT), which `call_bounded` does not cover: catch the panic, log it and
+    resume, or abort so `Restart=always` recovers; the watchdog is fed only
+    while the synchronizer is alive (section 9 lists the Python bug); and
+    threads start through `thread::Builder::spawn`, with a failed spawn
+    mapped to `null`, since `thread::spawn` panics under a pids limit;
+  - the order under the tick budget: a fixed order would starve the same
+    tail (ping, snmp, mqtt) on every tick, so the start rotates or the tail
+    keeps a reserve; mqtt's reconcile always runs, and a skipped mqtt ships
+    its error envelope, never a missing key; snmp keeps its in-flight
+    accounting;
+  - whether the interval cap of section 5 stays once the sleep feeds the
+    watchdog, since a cap rewrites a valid server interval such as 300s.
+- The system core step (#184) checks the libc-dependent sources: under
+  musl, `os.getloadavg` and `os.cpu_count` come from `sysinfo` and
+  `sched_getaffinity` rather than `/proc/loadavg` and `/sys`, so the Alpine
+  Python may ship unrounded load averages and the affinity CPU count. The
+  step matches each Python build per libc, or normalizes Python first.
 
 ## References
 
