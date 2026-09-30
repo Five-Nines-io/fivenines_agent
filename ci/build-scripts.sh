@@ -30,9 +30,12 @@ fi
 # drifts in one script is a security regression, not a style nit.
 # release_signing_pubkey is here for the same reason - a public key pasted
 # into three scripts out of four leaves the fourth verifying nothing.
-SHARED_FUNCTIONS="detect_libc make_work_dir compute_sha256 sha256_from_sums verify_sha256 \
-release_signing_pubkey verify_sums_signature verification_preflight \
-verify_from_manifest verify_agent_tarball"
+# select_agent_binary is the one uname -m -> artifact mapping: separate copies
+# are how the system scripts came to hand every unknown architecture the amd64
+# build while the user scripts refused it (issue #170).
+SHARED_FUNCTIONS="detect_libc select_agent_binary make_work_dir compute_sha256 \
+sha256_from_sums verify_sha256 release_signing_pubkey verify_sums_signature \
+verification_preflight verify_from_manifest verify_agent_tarball"
 
 # Only the two SYSTEM installers place the startup definitions (systemd unit,
 # OpenRC init script, UNRAID boot script), so only they carry the helper that

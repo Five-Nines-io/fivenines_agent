@@ -671,6 +671,7 @@ jobs:
             ci/test-distro.sh \
             ci/test-selinux-vm.sh \
             ci/test-signing.sh \
+            ci/test-32bit-userland.sh \
             ci/check-nosec.sh \
             ci/requirements/compile.sh
 
@@ -681,6 +682,16 @@ jobs:
       # drifted copy of those in one installer is a security regression.
       - name: Verify shared functions are in sync
         run: sh ci/build-scripts.sh --check
+
+      # ci/test-signing.sh only fakes getconf; the installers' 32-bit userland
+      # refusal (#170) rests on the real one printing 32 under a 64-bit kernel.
+      # i386 images run natively on this x86_64 runner, so this checks the
+      # premise itself, on glibc and on musl, with amd64 controls. Last in the
+      # job, and time-boxed: it is the only step that pulls from Docker Hub,
+      # and a failed or hung pull must not skip the checks above.
+      - name: Verify the 32-bit userland refusal on real userlands
+        timeout-minutes: 10
+        run: sh ci/test-32bit-userland.sh
 
   # Distro regression testing
   test-distro-matrix:
