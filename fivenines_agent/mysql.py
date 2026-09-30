@@ -137,6 +137,17 @@ def _run_mysql(binary, sql, conn, vertical=False):
         cmd += ["-h", str(conn.get("host", "localhost")), "-P", str(conn.get("port", 3306))]
     if conn.get("database"):
         cmd += ["-D", str(conn["database"])]
+    # Name the connection charset instead of letting the client derive it from
+    # the locale. get_clean_env() pins every child to C (#172), where MariaDB
+    # negotiates latin1: one non-ASCII character anywhere in the output (a
+    # replica's Last_SQL_Error quoting a duplicate key such as a German surname)
+    # then arrives as a latin1 byte, which the UTF-8 decode below can only turn
+    # into U+FFFD (a strict decode used to raise there and null the collector
+    # exactly when replication broke). Naming utf8mb4 makes the server send
+    # what that decode expects; its errors="replace" is only the backstop.
+    # Measured on MariaDB 10.11. Every client since MySQL/MariaDB 5.5 knows
+    # utf8mb4.
+    cmd += ["--default-character-set=utf8mb4"]
     if not vertical:
         # -N: no column names, -B: batch (tab-separated) output.
         cmd += ["-N", "-B"]
@@ -154,6 +165,14 @@ def _run_mysql(binary, sql, conn, vertical=False):
             cmd,
             capture_output=True,
             text=True,
+            # Decode with the charset the flag above names, not the agent's
+            # locale codec: on Windows that is the ANSI code page (cp1252),
+            # which turns utf8mb4 into silent mojibake. errors="replace" for
+            # the bytes the flag cannot reach (a server running
+            # skip-character-set-client-handshake): one stray byte in a row
+            # nobody ships must not raise and null the whole payload.
+            encoding="utf-8",
+            errors="replace",
             timeout=CLI_TIMEOUT,
             env=env,
         )

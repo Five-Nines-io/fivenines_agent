@@ -546,6 +546,26 @@ def test_data_path_subprocess_calls_set_timeout(monkeypatch):
     ), f"a data-path call did not use the shared timeout: {seen}"
 
 
+def test_identification_runs_smartctl_in_the_c_locale(monkeypatch):
+    """#172: smartctl formats `User Capacity` with the locale's thousands
+    separator and total_capacity ships that string as is, so the same disk read
+    "500,107,862,016 bytes" or "500.107.862.016 bytes" depending on the host's
+    LANG. Under C smartctl falls back to its own ",", the en_US spelling. The
+    stand-in answers like smartctl does -- the de_DE "." unless the child runs
+    in C -- so losing the pin fails the total_capacity assertion itself."""
+    monkeypatch.setenv("LC_ALL", "de_DE.UTF-8")
+
+    def locale_aware_smartctl(cmd, **kwargs):
+        sep = "," if kwargs["env"].get("LC_ALL") == "C" else "."
+        return _proc(
+            stdout=f"User Capacity:    500{sep}107{sep}862{sep}016 bytes [500 GB]\n"
+        )
+
+    monkeypatch.setattr(smart_storage.subprocess, "run", locale_aware_smartctl)
+    info = smart_storage.get_storage_identification("/dev/sda")
+    assert info["total_capacity"] == "500,107,862,016 bytes [500 GB]"
+
+
 def test_data_path_degrades_on_timeout(monkeypatch):
     """A timed-out data call degrades to a safe value instead of propagating."""
 

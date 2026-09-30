@@ -66,6 +66,7 @@ class FakeProc:
 
 def test_run_passes_through_to_subprocess(monkeypatch):
     """_run is a thin wrapper: clean env, no raise, pipes captured."""
+    monkeypatch.setenv("LC_ALL", "de_DE.UTF-8")
     captured = {}
 
     def fake(cmd, **kwargs):
@@ -79,6 +80,10 @@ def test_run_passes_through_to_subprocess(monkeypatch):
     assert captured["cmd"] == ["zpool", "version"]
     assert captured["kwargs"]["check"] is False
     assert captured["kwargs"]["timeout"] == zfs._SUBPROCESS_TIMEOUT
+    # #172: zpool before OpenZFS 2.0 (Ubuntu 18.04/20.04) does not pin
+    # LC_NUMERIC itself, so on a comma-decimal host a resilver reads
+    # "45,67% done" and the "% done" regex, which reads only '.', takes 67.
+    assert captured["kwargs"]["env"]["LC_ALL"] == "C"
 
 
 def test_run_timeout_returns_synthetic_failure(monkeypatch):
