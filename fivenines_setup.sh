@@ -538,6 +538,56 @@ detect_libc() {
     fi
 }
 
+# Which published build runs on this host. Sets CURRENT_ARCH, LIBC_TYPE and
+# BINARY_NAME, or says why there is none and returns non-zero.
+#
+# Only the architectures a release actually ships are mapped. The two system
+# installers used to hand everything else the amd64 build, which verified
+# against SHA256SUMS, installed, and then failed at exec with "Exec format
+# error" on every restart (armv7l on 32-bit Raspberry Pi OS, i686, ppc64le,
+# s390x, riscv64; issue #170). Every installer calls this before anything is
+# downloaded, stopped or changed, so a refused host is left exactly as it was.
+# amd64 and arm64 are deliberately not accepted: Linux always reports x86_64
+# and aarch64, while amd64 and arm64 are what FreeBSD and Apple-silicon macOS
+# report, and a Linux binary cannot run there either.
+select_agent_binary() {
+    CURRENT_ARCH=$(uname -m)
+    LIBC_TYPE=$(detect_libc)
+    BINARY_NAME=""
+    case "$CURRENT_ARCH" in
+        x86_64)
+            agent_arch="amd64"
+            ;;
+        aarch64)
+            agent_arch="arm64"
+            ;;
+        *)
+            print_error "Unsupported architecture: $CURRENT_ARCH"
+            print_error "Agent binaries are published for x86_64 and aarch64 (64-bit ARM) only."
+            return 1
+            ;;
+    esac
+    # uname -m names the KERNEL, not the userland the agent has to run in.
+    # 32-bit Raspberry Pi OS on a Pi 4 or 5 boots a 64-bit kernel by default,
+    # so it reports aarch64 and would be handed a build it has no loader for.
+    # getconf LONG_BIT is the userland's word size. Only an explicit 32
+    # refuses: a host with no getconf is not guessed at.
+    if [ "$(getconf LONG_BIT 2>/dev/null)" = "32" ]; then
+        print_error "Unsupported system: 32-bit userland on a 64-bit $CURRENT_ARCH kernel"
+        print_error "Agent binaries are published for 64-bit x86_64 and aarch64 systems only."
+        return 1
+    fi
+    if [ "$LIBC_TYPE" = "musl" ]; then
+        BINARY_NAME="fivenines-agent-alpine-${agent_arch}"
+    else
+        BINARY_NAME="fivenines-agent-linux-${agent_arch}"
+    fi
+    print_success "Detected architecture: $CURRENT_ARCH, libc: $LIBC_TYPE ($BINARY_NAME)"
+    # Explicit: the status is the verdict on the host, never whether that line
+    # could be written (a closed or full stdout would otherwise refuse here).
+    return 0
+}
+
 detect_system() {
   # Check if this is UNRAID
   if [ -f "/etc/unraid-version" ] || [ -d "/boot/config" ]; then
@@ -795,6 +845,10 @@ if [ "$(id -u)" -ne 0 ]; then
   exit_with_contact "This script must be run as root"
 fi
 
+# Refuse a host no release has a binary for before the user, the token or the
+# install directory is created (issue #170).
+select_agent_binary || exit_with_contact "No agent binary runs on this host -- nothing was installed."
+
 # Refuse early if this host cannot verify a release at all, rather than after
 # the download (issue #154).
 verification_preflight "with-startup-files" || exit_with_contact "Cannot verify a release on this host -- nothing was installed."
@@ -849,9 +903,8 @@ else
   chmod 600 /etc/fivenines_agent/TOKEN
 fi
 
-CURRENT_ARCH=$(uname -m)
-
-# Set install directory and binary name based on system type and architecture
+# Set install directory based on system type (BINARY_NAME was chosen by
+# select_agent_binary, above)
 if [ "$SYSTEM_TYPE" = "unraid" ]; then
   INSTALL_DIR="/boot/config/custom/fivenines_agent"
 else
@@ -860,24 +913,6 @@ fi
 
 # Ensure install directory exists
 mkdir -p "$INSTALL_DIR"
-
-# Download the agent tarball based on the architecture and libc
-LIBC_TYPE=$(detect_libc)
-print_success "Detected architecture: $CURRENT_ARCH"
-print_success "Detected libc: $LIBC_TYPE"
-if [ "$LIBC_TYPE" = "musl" ]; then
-  if [ "$CURRENT_ARCH" = "aarch64" ]; then
-    BINARY_NAME="fivenines-agent-alpine-arm64"
-  else
-    BINARY_NAME="fivenines-agent-alpine-amd64"
-  fi
-else
-  if [ "$CURRENT_ARCH" = "aarch64" ]; then
-    BINARY_NAME="fivenines-agent-linux-arm64"
-  else
-    BINARY_NAME="fivenines-agent-linux-amd64"
-  fi
-fi
 
 TARBALL_NAME="${BINARY_NAME}.tar.gz"
 

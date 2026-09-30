@@ -15,6 +15,11 @@
 # the command always runs the file wget just wrote, never a copy left by an
 # earlier attempt (issue #160).
 #
+# And it runs the uname -m -> artifact mapping of the installers and of the
+# UNRAID boot script with a faked uname (and getconf), so an architecture or a
+# 32-bit userland no release ships for is refused instead of handed a build it
+# cannot run (issue #170).
+#
 # Usage: sh ci/test-signing.sh
 
 set -u
@@ -30,7 +35,8 @@ print_error()   { printf '%s\n' "[-] $1"; }
 
 # Source the verification chain under test: the signature check, the manifest
 # policy built on it, and the helper that installs a startup definition only
-# once it verified.
+# once it verified -- plus the uname -m -> artifact mapping
+# (select_agent_binary, issue #170).
 sed -n '/^release_signing_pubkey()/,/^}/p
         /^verify_sums_signature()/,/^}/p
         /^verification_preflight()/,/^}/p
@@ -39,7 +45,8 @@ sed -n '/^release_signing_pubkey()/,/^}/p
         /^verify_sha256()/,/^}/p
         /^verify_from_manifest()/,/^}/p
         /^verify_agent_tarball()/,/^}/p
-        /^install_verified_release_file()/,/^}/p' "$COMMON" > "$WORK/funcs.sh"
+        /^install_verified_release_file()/,/^}/p
+        /^select_agent_binary()/,/^}/p' "$COMMON" > "$WORK/funcs.sh"
 # shellcheck source=/dev/null
 . "$WORK/funcs.sh"
 
@@ -231,6 +238,280 @@ check "the UNRAID update hint pins -O and runs what it wrote" \
   "$(wget_commands "$WORK/unraid_hint.txt" | unpinned_wgets)" ""
 check "the UNRAID update hint still carries a wget command" \
   "$(wget_commands "$WORK/unraid_hint.txt" | wc -l | tr -d ' ')" "1"
+
+# ---------------------------------------------------------------------------
+# Architecture mapping (issue #170). Also ahead of the openssl gate: it needs
+# nothing but sh.
+#
+# The system installers and the UNRAID boot script used to hand every
+# architecture but aarch64 the amd64 build, which verified against SHA256SUMS,
+# installed, and then failed at exec with "Exec format error" on every
+# restart. uname, getconf and detect_libc are the mapping's only inputs, so
+# each case fakes all three in a subshell and reads back the status and the
+# BINARY_NAME.
+# ---------------------------------------------------------------------------
+
+# Prints "<status>:<BINARY_NAME>" for a faked `uname -m` ($1), libc ($2) and
+# `getconf LONG_BIT` ($3, 64 unless given; "none" for a host with no getconf).
+binary_for() {
+  (
+    FAKE_UNAME_M="$1"
+    FAKE_LIBC="$2"
+    FAKE_LONG_BIT="${3-64}"
+    # shellcheck disable=SC2317,SC2329
+    uname() { [ "$1" = "-m" ] && printf '%s\n' "$FAKE_UNAME_M"; }
+    # shellcheck disable=SC2317,SC2329
+    detect_libc() { printf '%s\n' "$FAKE_LIBC"; }
+    # shellcheck disable=SC2317,SC2329
+    getconf() {
+      [ "$FAKE_LONG_BIT" = "none" ] && return 127
+      [ "$1" = "LONG_BIT" ] && printf '%s\n' "$FAKE_LONG_BIT"
+    }
+    select_agent_binary > /dev/null 2>&1
+    printf '%s:%s\n' "$?" "${BINARY_NAME:-}"
+  )
+}
+
+check "x86_64 on glibc gets the linux amd64 build" \
+  "$(binary_for x86_64 glibc)" "0:fivenines-agent-linux-amd64"
+check "aarch64 on glibc gets the linux arm64 build" \
+  "$(binary_for aarch64 glibc)" "0:fivenines-agent-linux-arm64"
+check "x86_64 on musl gets the alpine amd64 build" \
+  "$(binary_for x86_64 musl)" "0:fivenines-agent-alpine-amd64"
+check "aarch64 on musl gets the alpine arm64 build" \
+  "$(binary_for aarch64 musl)" "0:fivenines-agent-alpine-arm64"
+
+# amd64 and arm64 are what FreeBSD and macOS report, never Linux; aarch64_be
+# is big-endian. The empty string (a uname that printed nothing) cannot live
+# in a word list, so every loop over this one adds it as a literal word.
+UNSUPPORTED_ARCHES="armv7l armv6l i686 i386 ppc64le s390x riscv64 aarch64_be amd64 arm64"
+# The list is deliberately word-split into separate architectures.
+# shellcheck disable=SC2086
+for _arch in $UNSUPPORTED_ARCHES ""; do
+  for _libc in glibc musl; do
+    check "'${_arch}' on ${_libc} is refused, with no binary chosen" \
+      "$(binary_for "$_arch" "$_libc")" "1:"
+  done
+done
+
+# uname -m names the kernel. 32-bit Raspberry Pi OS on a Pi 4 or 5 boots a
+# 64-bit kernel by default, so it reports aarch64 over an armhf userland that
+# has no loader for the arm64 build; getconf is what tells the two apart.
+for _arch in aarch64 x86_64; do
+  for _libc in glibc musl; do
+    check "a 32-bit userland on a 64-bit ${_arch} kernel (${_libc}) is refused" \
+      "$(binary_for "$_arch" "$_libc" 32)" "1:"
+  done
+done
+check "a host with no getconf is not guessed at" \
+  "$(binary_for aarch64 glibc none)" "0:fivenines-agent-linux-arm64"
+check "a getconf that prints nothing is not guessed at" \
+  "$(binary_for x86_64 musl "")" "0:fivenines-agent-alpine-amd64"
+check "the 32-bit userland refusal says what it found and what is needed" \
+  "$(
+    # shellcheck disable=SC2317,SC2329
+    uname() { printf 'aarch64\n'; }
+    # shellcheck disable=SC2317,SC2329
+    detect_libc() { printf 'glibc\n'; }
+    # shellcheck disable=SC2317,SC2329
+    getconf() { printf '32\n'; }
+    select_agent_binary 2>&1 | grep -c '32-bit userland on a 64-bit aarch64 kernel\|64-bit x86_64 and aarch64 systems'
+  )" "2"
+
+check "the refusal names the detected and the supported architectures" \
+  "$(
+    # shellcheck disable=SC2317,SC2329
+    uname() { printf 'armv7l\n'; }
+    # shellcheck disable=SC2317,SC2329
+    detect_libc() { printf 'glibc\n'; }
+    select_agent_binary 2>&1 | grep -c 'armv7l\|x86_64 and aarch64'
+  )" "2"
+
+# The exact line, so the success path is seen printing nothing else either.
+check "an accepted host is told its architecture, libc and build" \
+  "$(
+    # shellcheck disable=SC2317,SC2329
+    uname() { printf 'aarch64\n'; }
+    # shellcheck disable=SC2317,SC2329
+    detect_libc() { printf 'musl\n'; }
+    # shellcheck disable=SC2317,SC2329
+    getconf() { printf '64\n'; }
+    select_agent_binary 2>&1
+  )" "[+] Detected architecture: aarch64, libc: musl (fivenines-agent-alpine-arm64)"
+
+# The system installers run without set -e, so a success line that cannot be
+# written (stdout closed, or a full disk behind a redirect) must not turn a
+# supported host into a refusal.
+check "a success line that cannot be written is not a refusal" \
+  "$(
+    # shellcheck disable=SC2317,SC2329
+    uname() { printf 'x86_64\n'; }
+    # shellcheck disable=SC2317,SC2329
+    detect_libc() { printf 'glibc\n'; }
+    # shellcheck disable=SC2317,SC2329
+    getconf() { printf '64\n'; }
+    # shellcheck disable=SC2317,SC2329
+    print_success() { return 1; }
+    select_agent_binary > /dev/null 2>&1
+    printf '%s:%s' "$?" "$BINARY_NAME"
+  )" "0:fivenines-agent-linux-amd64"
+
+# binary_for starts from an unset BINARY_NAME, so on its own it cannot tell a
+# refusal that clears the name from one that merely never set it.
+check "a refusal clears a BINARY_NAME that was set before it ran" \
+  "$(
+    BINARY_NAME=fivenines-agent-linux-amd64
+    # shellcheck disable=SC2317,SC2329
+    uname() { printf 'armv7l\n'; }
+    # shellcheck disable=SC2317,SC2329
+    detect_libc() { printf 'glibc\n'; }
+    select_agent_binary > /dev/null 2>&1
+    printf '%s' "$BINARY_NAME"
+  )" ""
+
+# The call sites. Every installer must choose its binary through the shared
+# mapping and nowhere else (ci/build-scripts.sh keeps the copies identical),
+# exit when it refuses, and do so before the preflight -- which is itself
+# ahead of every download, stop and user or directory creation.
+for _script in fivenines_setup.sh fivenines_update.sh fivenines_setup_user.sh fivenines_update_user.sh; do
+  check "${_script} chooses its binary through select_agent_binary, and exits on a refusal" \
+    "$(grep -c '^select_agent_binary || exit_with_' "$ROOT/${_script}")" "1"
+  # Comments may name it; only a line of code that runs it counts.
+  check "${_script} reads uname -m nowhere but in the shared mapping" \
+    "$(grep -v '^[[:space:]]*#' "$ROOT/${_script}" | grep -c 'uname -m')" "1"
+  # Not reading uname is not enough: a BINARY_NAME hard-coded further down
+  # would bypass the mapping without reading anything at all.
+  check "${_script} sets BINARY_NAME nowhere but in the shared mapping" \
+    "$(awk '/^select_agent_binary\(\)/ {inside = 1}
+            inside && /^}/ {inside = 0; next}
+            !inside && /(^|[^A-Za-z0-9_])BINARY_NAME=/' "$ROOT/${_script}" | wc -l | tr -d ' ')" "0"
+  check "${_script} refuses an unsupported architecture before the preflight" \
+    "$(awk '/^select_agent_binary / {sab = NR}
+            /^verification_preflight / {print (sab && sab < NR) ? "yes" : "no"; exit}' "$ROOT/${_script}")" "yes"
+done
+
+# The UNRAID boot script cannot source the shared function (it is a
+# standalone startup definition), so its own case is run with the same faked
+# uname. Only that block is extracted and run: the script as a whole kills
+# every running agent before it gets there. Every $ in the block below is
+# meant for the extracted script, not for this one.
+# shellcheck disable=SC2016
+{
+  printf '%s\n' 'uname() { [ "$1" = "-m" ] && printf "%s\n" "$FAKE_UNAME_M"; }'
+  sed -n '/^CURRENT_ARCH=\$(uname -m)$/,/^esac$/p' "$ROOT/fivenines_script.sh"
+  printf '%s\n' 'printf "%s\n" "$BINARY_NAME"'
+} > "$WORK/boot_arch.sh"
+check "the UNRAID boot script runs x86_64 on the amd64 build" \
+  "$(FAKE_UNAME_M=x86_64 sh "$WORK/boot_arch.sh" 2>/dev/null)" "fivenines-agent-linux-amd64"
+check "the UNRAID boot script runs aarch64 on the arm64 build" \
+  "$(FAKE_UNAME_M=aarch64 sh "$WORK/boot_arch.sh" 2>/dev/null)" "fivenines-agent-linux-arm64"
+for _arch in armv7l i686; do
+  FAKE_UNAME_M="$_arch" sh "$WORK/boot_arch.sh" > /dev/null 2>&1
+  check "the UNRAID boot script refuses ${_arch}" "$?" "1"
+done
+
+# Its case is a second copy of the mapping that ci/build-scripts.sh cannot
+# compare, so hold it to the shared one on every architecture above. UNRAID is
+# glibc, and the boot script only knows the linux builds.
+# Prints "<status>:<BINARY_NAME>" like binary_for, the name only on success.
+boot_for() {
+  if _name=$(FAKE_UNAME_M="$1" sh "$WORK/boot_arch.sh" 2>/dev/null); then
+    printf '0:%s\n' "$_name"
+  else
+    printf '%s:\n' "$?"
+  fi
+}
+_disagree=""
+# shellcheck disable=SC2086
+for _arch in x86_64 aarch64 $UNSUPPORTED_ARCHES ""; do
+  [ "$(boot_for "$_arch")" = "$(binary_for "$_arch" glibc)" ] || _disagree="${_disagree}'${_arch}' "
+done
+check "the UNRAID boot script maps every architecture as select_agent_binary does" \
+  "$_disagree" ""
+check "the UNRAID boot script's refusal names the detected and the supported architectures" \
+  "$(FAKE_UNAME_M=armv7l sh "$WORK/boot_arch.sh" 2>&1 | grep -c 'armv7l.*x86_64 and aarch64')" "1"
+
+# The installers' call-site guards, held to the boot script too: a second
+# uname read or a BINARY_NAME set after its case would bypass the block the
+# checks above run, and bring the amd64 fallback back without failing them.
+check "the UNRAID boot script reads uname -m once, in its architecture case" \
+  "$(grep -v '^[[:space:]]*#' "$ROOT/fivenines_script.sh" | grep -c 'uname -m')" "1"
+check "the UNRAID boot script sets BINARY_NAME nowhere but in its architecture case" \
+  "$(awk '/^case "\$CURRENT_ARCH" in$/ {inside = 1}
+          inside && /^esac$/ {inside = 0; next}
+          !inside && /(^|[^A-Za-z0-9_])BINARY_NAME=/' "$ROOT/fivenines_script.sh" | wc -l | tr -d ' ')" "0"
+
+# The identity check itself: the harness only ever runs the canonical copy in
+# fivenines_common.sh, so the four inlined copies are held to it by
+# ci/build-scripts.sh -- which checks only the functions it lists.
+check "ci/build-scripts.sh holds all four copies of select_agent_binary to the canonical one" \
+  "$(sh "$ROOT/ci/build-scripts.sh" 2>/dev/null | grep -c '^OK: select_agent_binary() in ')" "4"
+
+# End to end: every installer, run on a faked armv7l, has to stop at the
+# refusal having touched nothing. Each run is a scratch copy, started from a
+# scratch working directory (the installers delete themselves on success,
+# fivenines_update.sh by name from the working directory), and every command
+# that could change the host is on PATH as a stub that records its name and
+# fails -- so a regression that lets a script carry on past the refusal is
+# reported by name instead of acting. `id -u` answers 0, or
+# fivenines_setup.sh would stop at its root check and never reach the
+# refusal; `uname -s` answers Linux, which fivenines_setup_user.sh checks
+# first.
+ARCH_BOX="$WORK/archbox"
+mkdir -p "$ARCH_BOX/bin" "$ARCH_BOX/run" "$ARCH_BOX/install" "$ARCH_BOX/config"
+printf 'test-token-arch-170' > "$ARCH_BOX/config/TOKEN"
+REAL_UNAME=$(command -v uname)
+ARCH_STUBS="mkdir useradd adduser addgroup usermod getent chown chmod tee cp mv rm ln tar
+wget curl systemctl rc-service rc-update pkill pgrep su sudo ping mktemp
+restorecon semodule sleep bash nohup"
+for _stub in $ARCH_STUBS; do
+  printf '#!/bin/sh\necho %s >> "%s"\nexit 1\n' "$_stub" "$ARCH_BOX/touched" > "$ARCH_BOX/bin/$_stub"
+done
+# shellcheck disable=SC2016
+printf '#!/bin/sh\ncase "$1" in\n  -m) echo armv7l ;;\n  -s) echo Linux ;;\n  *) exec "%s" "$@" ;;\nesac\n' \
+  "$REAL_UNAME" > "$ARCH_BOX/bin/uname"
+# shellcheck disable=SC2016
+printf '#!/bin/sh\n[ "$*" = "-u" ] && { echo 0; exit 0; }\necho id >> "%s"\nexit 1\n' \
+  "$ARCH_BOX/touched" > "$ARCH_BOX/bin/id"
+# fivenines_update_user.sh stops the agent through the install's own stop.sh
+# when there is one, and PATH cannot shadow a path: plant a recording one.
+printf '#!/bin/sh\necho stop.sh >> "%s"\nexit 1\n' "$ARCH_BOX/touched" > "$ARCH_BOX/install/stop.sh"
+chmod 755 "$ARCH_BOX/bin/"* "$ARCH_BOX/install/stop.sh"
+
+# Canary: the checks below expect an EMPTY record, which a stub box that
+# shadows nothing or records nothing would produce too. Every name is only
+# looked up through the box's PATH, never run through it, and the one stub
+# that is run is called by its absolute path, so a broken box cannot reach a
+# real command here, and neither can the planted stop.sh. A name that is a
+# shell builtin (kill, echo) cannot be shadowed from PATH at all, which is why
+# none is on the list.
+: > "$ARCH_BOX/touched"
+# The stub list is deliberately word-split into separate arguments, and the
+# $ in the inline script is meant for the child shell.
+# shellcheck disable=SC2016,SC2086
+_unshadowed=$(PATH="$ARCH_BOX/bin:$PATH" sh -c '
+  for _stub in "$@"; do
+    [ "$(command -v "$_stub")" = "$0/$_stub" ] || printf "%s " "$_stub"
+  done' "$ARCH_BOX/bin" $ARCH_STUBS uname id)
+"$ARCH_BOX/bin/useradd"
+_rc=$?
+"$ARCH_BOX/install/stop.sh"
+check "the stub box shadows every host-changing command, and a stub records its name" \
+  "${_unshadowed}|rc=${_rc}|$(tr '\n' ' ' < "$ARCH_BOX/touched")" "|rc=1|useradd stop.sh "
+
+for _script in fivenines_setup.sh fivenines_update.sh fivenines_setup_user.sh fivenines_update_user.sh; do
+  cp "$ROOT/$_script" "$ARCH_BOX/run/$_script"
+  : > "$ARCH_BOX/touched"
+  (
+    cd "$ARCH_BOX/run" || exit 99
+    HOME="$ARCH_BOX" FIVENINES_INSTALL_DIR="$ARCH_BOX/install" FIVENINES_CONFIG_DIR="$ARCH_BOX/config" \
+      PATH="$ARCH_BOX/bin:$PATH" sh "./$_script" test-token-arch-170 > "$ARCH_BOX/out" 2>&1
+  )
+  _rc=$?
+  check "${_script} on armv7l refuses and touches nothing" \
+    "exit=$_rc refused=$(grep -c 'Unsupported architecture: armv7l' "$ARCH_BOX/out") touched=$(tr '\n' ' ' < "$ARCH_BOX/touched")" \
+    "exit=1 refused=1 touched="
+done
 
 if ! command -v openssl > /dev/null 2>&1; then
   echo "openssl not available - skipping the signed cases"
