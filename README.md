@@ -1255,9 +1255,13 @@ something below it -- or when a namespace listing shows a namespace without
 its parent (a `NoAccess` without propagation on that parent): it then reports
 the block and its job lists as partial
 (for an entry below `/remote`, the sync jobs only), so nothing is taken for
-deleted. An entry that leaves the token nothing at all,
-with nothing it audits below, cannot be told from a deleted datastore,
-namespace or remote.
+deleted. Because a hidden namespace shows only in a namespace listing, the
+job lists are also reported as partial whenever a datastore's namespaces
+could not be read in that refresh. An entry that leaves the token nothing at
+all, with no other ACL entry below it, cannot be told from a deleted
+datastore, namespace or remote: a `NoAccess` without propagation on
+`/datastore/store1` hides `store1` whole, although its namespaces still
+inherit the audit.
 
 ### A read-only token, enforced
 
@@ -1325,8 +1329,8 @@ that walk and each request holds one of its proxy threads for good, so one
 broken storage costs one thread however many datastores it carries. Every
 other slow read is retried later, less and less often (at most every 6
 hours). The dashboard shows the namespaces and backups of every datastore as
-unknown meanwhile; a full-scope token still reports each datastore's usage,
-without its estimated full date. Act on it quickly: the stuck walk keeps one
+unknown meanwhile, and the job lists as possibly incomplete; a full-scope
+token still reports each datastore's usage, without its estimated full date. Act on it quickly: the stuck walk keeps one
 PBS core busy and logs an error on every turn until `proxmox-backup-proxy`
 restarts. Once the datastore is repaired, restart
 `proxmox-backup-proxy` on the PBS, then reload the agent
