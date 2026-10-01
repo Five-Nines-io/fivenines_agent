@@ -239,7 +239,8 @@ _ROTATION_MESSAGE = (
 )
 # Why the job lists are flagged 'partial:' once the namespace listings are in
 # (see _build_block): one named a namespace without its parent, or one was not
-# read this build and could have.
+# read this build and could have (a datastore past the datastore cap counts:
+# its namespaces are never read).
 _HIDDEN_NAMESPACE_REASON = (
     "a deeper ACL entry hides a namespace from the API token, so jobs defined "
     "there are not listed"
@@ -341,8 +342,8 @@ _MANIFEST = "index.json.blob"
 _cache = TTLCache()
 
 # Where the next build starts its group reads (the (store, ns) unit to read
-# first) and its datastore reads (the datastore whose namespace walk, own
-# status and gc come first; dragged to the group cursor's datastore when the
+# first) and its datastore reads (the datastore whose own status, gc and
+# namespace walk come first; dragged to the group cursor's datastore when the
 # group reads are cut), see _read_datastores, _read_all_groups and
 # _resume_index. Kept by NAME, not by
 # position: the unit list differs from build to build exactly when the budget
@@ -354,11 +355,15 @@ _store_rotation = None
 # The datastores whose own status and gc pushed their namespace walk past the
 # point where a walk fits: each walks FIRST the next time it is read, unless it
 # is first in that build's order, where its gc fits anyway (_read_datastores).
-_walk_first = set()
+_walk_first: set = set()
 # Set by a reload: the datastore whose walk armed the hold. The next build
 # starts right after it, once, so every other datastore is walked before it
 # can arm the hold again (_read_datastores).
 _resume_after = None
+# Set by a build with no room for any walk: its own status and gc reads moved
+# the datastore cursor while the group reads stood still, so the next build
+# with room starts at the group cursor's datastore instead (_read_datastores).
+_realign = False
 
 # (cache_key, secret digest, retry-after monotonic time, message) after HTTP
 # 401, or None. One configured PBS per agent, so one slot.
@@ -1047,10 +1052,13 @@ _UNSET = object()
 # storage is repaired. One dead NAS under several datastores, or a usage
 # status and a namespace listing that both walk the same broken datastore,
 # then pins one proxy thread, not one per datastore or per read. The other
-# reads that can take long all END (PBS source: /groups reads one level,
-# never walking namespaces; a datastore's status is one statfs), so holding
-# them for good would only blind a PBS that is slow: they retry on the
-# backoff above.
+# reads that can take long -- /groups, /snapshots, a datastore's own status
+# and its gc status -- walk no namespace (PBS source: /groups reads one
+# level; a datastore's status is one statfs), so holding them for good would
+# only blind a PBS that is slow: they retry on the backoff above. The two
+# per-datastore ones still open the datastore, which on a dead hard-mounted
+# NFS may never return: each retry of those may pin one more proxy thread, at
+# the backoff's doubling pace.
 # {(path, params) or _WALK_HOLD: (retry-after monotonic time -- inf for the
 #  hold --, timeouts, the _read_failures key of its failure)}. Keyed on the
 # request alone, not on the PBS's address, token or TLS policy: the stuck walk
@@ -1062,11 +1070,11 @@ _timeout_backoff: dict = {}
 _TIMEOUT_BACKOFF_MAX = 6 * 3600
 # The one key every namespace walk is held under.
 _WALK_HOLD = ("namespace walks", ())
-# One build backs off at most this many reads -- a status per datastore, a
-# /groups and a /snapshots per namespace -- plus the walk hold. Past it the
+# One build backs off at most this many reads -- a status and a gc per
+# datastore, a /groups and a /snapshots per namespace -- plus the walk hold. Past it the
 # oldest retry is dropped, never the hold: that would re-send a walk that
 # never ends.
-_TIMEOUT_BACKOFF_ENTRIES = MAX_DATASTORES + 2 * MAX_NAMESPACES + 1
+_TIMEOUT_BACKOFF_ENTRIES = 2 * MAX_DATASTORES + 2 * MAX_NAMESPACES + 1
 # The read timeout a held or backed-off read always gets (see _get): its
 # timing out then means PBS did not answer, not that the budget ran out.
 _TIMEOUT_BACKOFF_MIN_WAIT = _CONNECT_TIMEOUT
@@ -1435,7 +1443,7 @@ def _build_block(session, target, deadline):
     # "partial": a datastore or namespace absent from this block may exist and
     # simply not be visible to this token (or past the datastore cap, or
     # hidden from it by a deeper ACL entry).
-    whole = full_scope and not hidden and len(kept_stores) == len(stores)
+    whole = full_scope and not hidden and not capped
     scope = "full" if whole else "partial"
     del stores  # past the cap, not kept alive for the whole build
     names = {entry["store"] for entry in kept_stores}
@@ -1658,8 +1666,12 @@ def _read_datastores(
     walk no longer fits -- a cut only when a walk still fitted as the phase
     began and the walk hold keeps none back -- or its gc past the half,
     timed as the gc ends (a gc that merely failed early is not). In a build
-    where no walk fitted at all the cursor stays: it read too little to have
-    started anything. The first build after a reload (`_resume_after`, see
+    where no walk fitted at all, a first datastore cut keeps the cursor (it
+    read too little to have started anything), and the next build with room
+    for a walk starts at the group cursor's datastore instead (`_realign`):
+    such builds move this cursor while the group reads stand still, and walks
+    resumed past the group cursor would skip the namespaces in between for a
+    whole turn. The first build after a reload (`_resume_after`, see
     reset_timeout_holds) starts right after the datastore whose walk armed
     the hold, so that one is walked last. The group reads, when they are
     cut, move the cursor to their own datastore (_read_all_groups): walks
@@ -1677,7 +1689,7 @@ def _read_datastores(
     held, or a scoped token) -- a FILESYSTEM datastore only: any other
     backend's usage is withheld anyway.
     """
-    global _store_rotation, _resume_after
+    global _store_rotation, _resume_after, _realign
     datastores, units = {}, []
     if not stores:
         return datastores, units, False, False, None
@@ -1687,6 +1699,11 @@ def _read_datastores(
     names = [entry["store"] for entry in stores]
     _walk_first.intersection_update(names)
     start = _start_index(names, _store_rotation)
+    if walks_fit and _realign and _rotation is not None:
+        # The builds since the last walk had no room for one: the group reads
+        # resume where they stood, and so do the walks they read.
+        start = _start_index(names, _rotation[0])
+    _realign = not walks_fit
     if _resume_after in names:
         # The first build after a reload: right after the datastore whose
         # walk armed the hold, which comes last.
@@ -1827,10 +1844,10 @@ def _read_all_groups(session, target, errors, deadline, units, datastores, next_
     back). When no unit was cut but a datastore was (`next_store`), both
     start at `next_store`; when nothing was walked, the group cursor stays.
     While the datastores are read in windows, the reads never wrap back into
-    the earlier namespaces of the datastore they resumed in (read last time
-    round: listed unread, with a 'groups' entry naming why), and past the
-    only unit of a window is the next window: either would otherwise pin
-    both cursors to that datastore for good.
+    the earlier namespaces of the datastore they resumed in (listed unread,
+    read on that datastore's next turn, with a 'groups' entry naming why),
+    and past the only unit of a window is the next window: either would
+    otherwise pin both cursors to that datastore for good.
     """
     global _rotation, _store_rotation
 
@@ -2111,7 +2128,9 @@ _GC_COUNTERS = (
 
 
 def _read_gc(session, target, errors, deadline, store):
-    """The datastore's garbage-collection status, or None when unread.
+    """The datastore's garbage-collection status, or None when unread -- a
+    read that timed out is retried on the backoff (_timeout_backoff), so one
+    stuck gc does not take the per-datastore half on every build.
     index_data_bytes / disk_bytes is the deduplication factor.
 
     last_run_starttime and the counters come from the last SUCCESSFUL GC
@@ -2131,6 +2150,7 @@ def _read_gc(session, target, errors, deadline, store):
         _store_path(store, "gc"),
         store=store,
         kind=dict,
+        backoff="retry",
     )
     if status is None:
         return None

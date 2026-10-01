@@ -1259,8 +1259,9 @@ deleted. Because a hidden namespace shows only in a namespace listing, the
 job lists are also reported as partial whenever a datastore's namespaces
 could not be read in that refresh (or the PBS has more than 100 datastores):
 a job deleted on such a PBS, or while a datastore is in offline maintenance or
-a removable datastore is unplugged, stays listed until every datastore is read
-again. An entry that leaves the token nothing at
+a removable datastore is unplugged, stays listed until a refresh reads the
+namespaces of every datastore -- which never happens on a PBS with more than
+100 datastores. An entry that leaves the token nothing at
 all, with no other ACL entry below it, cannot be told from a deleted
 datastore, namespace or remote: a `NoAccess` without propagation on
 `/datastore/store1` hides `store1` whole, although its namespaces still
@@ -1331,7 +1332,9 @@ audits as a whole from that datastore's own status.) With a datastore on a stale
 that walk and each request holds one of its proxy threads for good, so one
 broken storage costs one thread however many datastores it carries. Every
 other slow read is retried later, less and less often (at most every 6
-hours). The dashboard shows the namespaces and backups of every datastore as
+hours) -- a datastore's own status and garbage-collection status included,
+which on a dead mount may never end either: each retry then holds one more
+proxy thread. The dashboard shows the namespaces and backups of every datastore as
 unknown meanwhile, and the job lists as possibly incomplete; a full-scope
 token still reports each datastore's usage, without its estimated full date. Act on it quickly: the stuck walk keeps one
 PBS core busy and logs an error on every turn until `proxmox-backup-proxy`
