@@ -1247,11 +1247,13 @@ inherited role at that path instead of adding to it, so any role there
 without the audit privilege -- `NoAccess`, a `RemoteAudit`, or a
 `DatastoreBackup` the user holds for backups on `/datastore/store1` -- leaves
 the token without it there, and PBS then hides `store1` from it without an
-error. The agent catches such an entry when PBS still reports that path to
-the token -- with another privilege (the `RemoteAudit` case), or because the
-token still audits something below it: it then reports the block and its job
-lists as partial (for an entry below `/remote`, the sync jobs only), so
-nothing is taken for deleted. An entry that leaves the token nothing at all,
+error. Adding `DatastoreAudit` to that user with propagation turned off does
+not fix it: `store1`'s namespaces stay hidden. The agent catches such an entry
+when PBS still reports that path to the token -- with another privilege (the
+`RemoteAudit` case), without propagation, or because the token still audits
+something below it: it then reports the block and its job lists as partial
+(for an entry below `/remote`, the sync jobs only), so nothing is taken for
+deleted. An entry that leaves the token nothing at all,
 with nothing it audits below, cannot be told from a deleted datastore,
 namespace or remote.
 
