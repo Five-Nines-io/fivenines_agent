@@ -1257,7 +1257,10 @@ the block and its job lists as partial
 (for an entry below `/remote`, the sync jobs only), so nothing is taken for
 deleted. Because a hidden namespace shows only in a namespace listing, the
 job lists are also reported as partial whenever a datastore's namespaces
-could not be read in that refresh. An entry that leaves the token nothing at
+could not be read in that refresh (or the PBS has more than 100 datastores):
+a job deleted on such a PBS, or while a datastore is in offline maintenance or
+a removable datastore is unplugged, stays listed until every datastore is read
+again. An entry that leaves the token nothing at
 all, with no other ACL entry below it, cannot be told from a deleted
 datastore, namespace or remote: a `NoAccess` without propagation on
 `/datastore/store1` hides `store1` whole, although its namespaces still
@@ -1337,7 +1340,9 @@ restarts. Once the datastore is repaired, restart
 (`sudo kill -HUP $(pgrep -f fivenines_agent)`; on Windows, restart the
 service). Any reload or restart releases them -- one sent for another reason,
 an agent update, a crash restart -- so repair a broken datastore before
-reloading the agent for anything else; changing the PBS host, fingerprint or
+reloading the agent for anything else (if it is still broken, the first
+refresh after the reload reads it last, so every other datastore is read
+before it blocks the walks again); changing the PBS host, fingerprint or
 token in the dashboard does not. A first backup that is still uploading is never shown as the
 latest backup. Anything that could not be read -- a datastore in offline maintenance,
 a namespace whose group listing failed -- is reported per datastore and
