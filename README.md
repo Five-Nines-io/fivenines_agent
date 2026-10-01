@@ -1251,7 +1251,9 @@ error. Adding `DatastoreAudit` to that user with propagation turned off does
 not fix it: `store1`'s namespaces stay hidden. The agent catches such an entry
 when PBS still reports that path to the token -- with another privilege (the
 `RemoteAudit` case), without propagation, or because the token still audits
-something below it: it then reports the block and its job lists as partial
+something below it -- or when a namespace listing shows a namespace without
+its parent (a `NoAccess` without propagation on that parent): it then reports
+the block and its job lists as partial
 (for an entry below `/remote`, the sync jobs only), so nothing is taken for
 deleted. An entry that leaves the token nothing at all,
 with nothing it audits below, cannot be told from a deleted datastore,

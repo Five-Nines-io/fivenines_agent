@@ -116,11 +116,13 @@ server ingests and prunes nothing. A success carries ``scope``,
 failed or was skipped names its scope (and datastore/namespace). What gates
 pruning lives outside ``errors[]`` (that list is capped), with one exception
 described below: ``scope`` is "partial" when a datastore or namespace absent
-from the block may simply be invisible to the token (and "full" cannot see a
-deeper ACL entry hiding one -- unless that entry shows in the permissions
-map, as a path without the audited privilege or above a path the token still
-audits, which makes the block "partial": see _check_privileges,
-_hidden_below); a datastore's
+from the block may simply be invisible to the token, and then nothing is
+pruned from it, groups included ("full" cannot see a deeper ACL entry hiding
+one -- unless that entry shows in the permissions map, as a path without the
+audited privilege, with it not propagated or above a path the token still
+audits, or in a namespace listing that names a namespace without its parent,
+which makes the block "partial": see _check_privileges, _hidden_below,
+_read_datastores); a datastore's
 ``namespaces`` is null when its set is unknown and ``unread_namespaces`` lists
 every listed namespace whose groups are unknown this build; a group whose
 snapshot details could not be read has ``in_progress: null``. An unparseable
@@ -131,7 +133,8 @@ entry under its own scope -- the ONE pruning signal that lives in ``errors[]``,
 appended before any per-datastore or per-namespace read: only the datastore-cap
 entry, one usage entry per listed datastore, the datastore_config entry and the
 job lists' own entries (a bounded prefix, far under MAX_ERRORS) can come before
-it, so the cap never drops it. See tests/fixtures/pbs_contract_payload.json.
+it, so the cap never drops it -- or, for a flag a namespace listing calls for,
+inserted in a slot reserved there. See tests/fixtures/pbs_contract_payload.json.
 
 The block is rebuilt at most once per PBS_CACHE_TTL and re-emitted with
 ``age_s`` in between (the proxmox backups posture: /snapshots is the costliest
@@ -1201,10 +1204,11 @@ def _check_privileges(permissions, redact=str):
       role there, and when its role lacks the audited privilege (a NoAccess,
       a RemoteAudit on a datastore, a DatastoreBackup the user also holds)
       PBS hides that path from the token. The path then shows in this map
-      without the privilege, or -- where the token holds NO privilege at all
-      -- not at all, visible only through a path below it the token still
-      audits (_hidden_below); otherwise it is invisible here, so the README
-      gives the token's user no other ACL.
+      without the privilege or with it not propagated, or -- where the token
+      holds NO privilege at all -- not at all, visible only through a path
+      below it the token still audits (_hidden_below) or a namespace listed
+      without its parent (_read_datastores); otherwise it is invisible, so
+      the README gives the token's user no other ACL.
     A grant on /datastore/<store>[/ns] is a scoped token whatever its
     propagate flag: it audits at least that path.
     """
@@ -1443,15 +1447,17 @@ def _build_block(session, target, deadline):
             "a deeper ACL entry hides part of /remote from the API token, so "
             "sync jobs using it are not listed"
         )
-    for name, rows, reason in (
+    job_lists = (
         ("sync_jobs", sync_jobs, why_sync),
         ("verify_jobs", verify_jobs, why),
         ("prune_jobs", prune_jobs, why),
-    ):
+    )
+    for name, rows, reason in job_lists:
         if rows is not None and reason is not None:
             _error(errors, name, "partial: " + reason)
+    flags_at = len(errors)
 
-    datastores, units, next_walk = _read_datastores(
+    datastores, units, ns_hidden, next_store = _read_datastores(
         session,
         target,
         errors,
@@ -1461,16 +1467,33 @@ def _build_block(session, target, deadline):
         own_status,
         backends,
     )
+    if ns_hidden:
+        # A listing showed a namespace hidden by a deeper ACL entry: partial,
+        # and the job lists not flagged yet get their flag where it would have
+        # been (ahead of every per-datastore entry, so the cap never drops it).
+        scope = "partial"
+        late = [
+            {
+                "scope": name,
+                "store": None,
+                "ns": None,
+                "message": "partial: a deeper ACL entry hides a namespace from the "
+                "API token, so jobs defined there are not listed",
+            }
+            for name, rows, reason in job_lists
+            if rows is not None and reason is None
+        ]
+        errors[flags_at:flags_at] = late
     # After the job lists and the GC reads: they teach _local_nodes, which
     # decides which verifications the group rows count.
     groups = _read_all_groups(
-        session, target, errors, deadline, units, datastores, next_walk
+        session, target, errors, deadline, units, datastores, next_store
     )
     groups.sort(key=lambda g: (g["store"], g["ns"], g["type"] or "", g["id"] or ""))
     for datastore in datastores.values():
         if datastore["unread_namespaces"] is not None:
             datastore["unread_namespaces"].sort()
-    if errors.dropped:
+    if errors.dropped or len(errors) > MAX_ERRORS:  # the late flags too
         keep = MAX_ERRORS - 1
         dropped = errors.dropped + len(errors) - keep
         del errors[keep:]
@@ -1547,15 +1570,17 @@ def _oversize(block):
     return None
 
 
-def _resume_index(order_length, start, cut):
+def _resume_index(order_length, start, cut, started=True):
     """Where the next build starts: where this one started when nothing was
     cut; else at the first item it cut -- the budget or a cap ran out inside
     it, or before it was even started -- so that item is read FIRST next time,
-    unless it already was the first item of this build (it had the whole
-    budget or cap and did not finish -- or none was left for any item): the
-    next build starts past it, or it would starve the rest on every build. A
-    read that merely FAILED is not a cut and does not move the start."""
-    if cut is None:
+    unless it already was the first item of this build and was STARTED (it
+    had the whole budget or cap and did not finish): the next build starts
+    past it, or it would starve the rest on every build. A first item never
+    started (nothing was left for it) is kept: moving past it would skip it
+    for a whole rotation for nothing. A read that merely FAILED is not a cut
+    and does not move the start."""
+    if cut is None or (cut == 0 and not started):
         return start
     return (start + max(cut, 1)) % order_length
 
@@ -1579,42 +1604,51 @@ def _read_datastores(
     own_status,
     backends,
 ):
-    """(name -> datastore, sorted (store, ns) units, where the next build's
-    namespace walks start when this build's group reads all finish -- or
-    None when every walk fitted).
+    """(name -> datastore, sorted (store, ns) units, whether a listing hides a
+    namespace, where the next build starts when this build's group reads all
+    finish -- None when every datastore was read).
 
-    Two cursors, one loop that makes one read of each per datastore:
-    - the per-datastore reads (a datastore's own status, gc) start at
-      `_store_rotation` and get at most HALF of the budget left, so a wedged
-      datastore (a hung NFS mount) can never leave the per-namespace reads
-      with nothing; the next build resumes at the first datastore whose gc
-      they could not finish (see _resume_index), so one wedged datastore
-      cannot starve the ones after it on every build either;
-    - the namespace listings -- walks, on the tick's deadline, sent only with
-      their whole read timeout left (_walk_deadline) -- start at the datastore
-      where the group reads stopped (`_rotation`), so every build walks the
-      namespaces whose groups are read next. On a big PBS the walks outpace
-      the group reads: a walk window run ahead of them would leave the
-      namespaces in between never read. A walk is cut when the budget ran out
-      inside or before it, or the namespace cap is full (no further listing
-      is sent then: its answer could not be used); a walk held after a
-      timeout is not a cut.
-    `own_status`: the datastores whose own status is read for their usage
-    (see _build_block: the aggregate failed or is held, or a scoped token) --
-    a FILESYSTEM datastore only: any other backend's usage is withheld anyway.
+    One cursor, `_store_rotation`, for a datastore's own reads (own status,
+    gc) and its namespace walk alike. The per-datastore reads get at most
+    HALF of the budget left, so a wedged datastore (a hung NFS mount) can
+    never leave the per-namespace reads with nothing; a namespace listing is
+    a walk and takes the tick's deadline instead, sent only with its whole
+    read timeout left (_walk_deadline). The next build resumes at the first
+    datastore this one could not finish (see _resume_index): its gc past the
+    half, its listing trimmed by the namespace cap, or its walk past the
+    point where a walk no longer fits. That last one is a cut only when a
+    walk still fitted as the phase began (else the cursor would crawl one
+    datastore a build) and the walk hold keeps none back -- nor is the walk
+    that arms the hold: its timeout always pushes the next datastore's gc
+    past the half, and that one is the cut, so after a reload the broken
+    datastore is walked last. The group reads, when they are cut, move the
+    cursor to their own datastore (_read_all_groups): walks outpace group
+    reads on a big PBS, and a cursor run ahead of them would leave the
+    namespaces in between never read. Once the namespace cap is full, no
+    further listing is sent: its answer could not be used.
+
+    A listing that names a namespace whose parent it does not shows a deeper
+    ACL entry that hid the parent (measured: a non-propagated NoAccess on
+    store1/clusterA hides clusterA, while clusterA/sub, no ACL node, stays
+    listed), which the permission map does not show. A scoped token's own
+    grant root reads the same, harmlessly: its block is partial with every
+    job list flagged already. `own_status`: the datastores whose own status
+    is read for their usage (see _build_block: the aggregate failed or is
+    held, or a scoped token) -- a FILESYSTEM datastore only: any other
+    backend's usage is withheld anyway.
     """
     global _store_rotation
-    datastores, listings, units = {}, {}, []
+    datastores, units = {}, []
     if not stores:
-        return datastores, units, None
+        return datastores, units, False, None
     now = time.monotonic()
     phase_deadline = now + max(deadline - now, 0) / 2
+    walks_fit = now < _walk_deadline(deadline)
     names = [entry["store"] for entry in stores]
     start = _start_index(names, _store_rotation)
-    walk_start = start if _rotation is None else _start_index(names, _rotation[0])
-    cut = walk_cut = None
-    for index in range(len(stores)):
-        entry = stores[(start + index) % len(stores)]
+    order = stores[start:] + stores[:start]
+    cut, ns_hidden = None, False
+    for index, entry in enumerate(order):
         name = entry["store"]
         if usage is not None:
             row = usage.get(name, {})
@@ -1625,8 +1659,6 @@ def _read_datastores(
             row = {}
         datastore = _datastore(entry, row, backends.get(name))
         datastore["gc"] = _read_gc(session, target, errors, phase_deadline, name)
-        datastores[name] = datastore
-        walked = names[(walk_start + index) % len(stores)]
         trimmed = len(units) >= MAX_NAMESPACES
         if trimmed:
             # The cap is full: the listing's answer would be dropped whole, so
@@ -1637,46 +1669,46 @@ def _read_datastores(
                 errors,
                 "cap",
                 f"namespaces capped at {MAX_NAMESPACES}: not read",
-                store=walked,
+                store=name,
             )
         else:
-            namespaces = _read_namespaces(session, target, errors, deadline, walked)
+            namespaces = _read_namespaces(session, target, errors, deadline, name)
         if namespaces is not None:
+            listed = set(namespaces)
+            ns_hidden = ns_hidden or any(
+                ns and ns.rpartition("/")[0] not in listed for ns in namespaces
+            )
             kept = _cap(
                 namespaces,
                 MAX_NAMESPACES - len(units),
                 errors,
                 "namespaces",
                 MAX_NAMESPACES,
-                store=walked,
+                store=name,
             )
             trimmed = len(kept) < len(namespaces)
-            # Trimmed, the namespace set itself is incomplete: it stays null
+            if not trimmed:
+                datastore["namespaces"] = [scrub_str(ns) for ns in namespaces]
+                datastore["unread_namespaces"] = []
+            # else: the namespace set itself is incomplete, so it stays null
             # (unknown) while the groups of the namespaces kept still ship.
-            listings[walked] = None if trimmed else namespaces
-            units.extend((walked, ns) for ns in kept)
+            units.extend((name, ns) for ns in kept)
+        datastores[name] = datastore
         # Unfinished for lack of time (a read that merely failed early is
-        # not): a gc past the half; a walk past the point where a walk no
-        # longer fits, unless the walk hold kept it back.
+        # not): its gc past the half, or its walk past the point where a walk
+        # no longer fits.
         at = time.monotonic()
-        if cut is None and datastore["gc"] is None and at >= phase_deadline:
-            cut = index
-        out_of_time = (
-            namespaces is None
+        unfinished = (datastore["gc"] is None and at >= phase_deadline) or (
+            walks_fit
+            and namespaces is None
             and at >= _walk_deadline(deadline)
             and _WALK_HOLD not in _timeout_backoff
         )
-        if walk_cut is None and (trimmed or out_of_time):
-            walk_cut = index
-    for name, namespaces in listings.items():
-        if namespaces is not None:
-            datastores[name]["namespaces"] = [scrub_str(ns) for ns in namespaces]
-            datastores[name]["unread_namespaces"] = []
+        if cut is None and (trimmed or unfinished):
+            cut = index
     _store_rotation = names[_resume_index(len(stores), start, cut)]
-    next_walk = None
-    if walk_cut is not None:
-        next_walk = names[_resume_index(len(stores), walk_start, walk_cut)]
-    return datastores, sorted(units), next_walk
+    next_store = None if cut is None else _store_rotation
+    return datastores, sorted(units), ns_hidden, next_store
 
 
 def _read_store_status(session, target, errors, deadline, store):
@@ -1700,19 +1732,24 @@ def _read_store_status(session, target, errors, deadline, store):
     return {} if status is None else status
 
 
-def _read_all_groups(session, target, errors, deadline, units, datastores, next_walk):
+def _read_all_groups(session, target, errors, deadline, units, datastores, next_store):
     """The groups of every (store, ns) unit, starting at `_rotation`.
 
     A unit whose GROUPS are unknown -- its /groups read failed, a malformed
     row, its /snapshots not read as a list (see _read_groups), trimmed by the
     group cap, or never reached (budget spent, or the group cap full) -- is
     added to its datastore's unread_namespaces. The next build starts at the
-    first unit this one cut (see _resume_index) -- and, when every unit
-    walked was read but some walk did not fit, at `next_walk`, the first
-    datastore whose namespaces were not walked (_read_datastores walks from
-    there too).
+    first unit this one cut (see _resume_index), and its datastore reads at
+    that unit's datastore -- once group reads ran: cut before any did, the
+    datastore cursor keeps its own cut (a wedged datastore must not hold it
+    back). When no unit was cut but not every datastore was read
+    (`next_store`), both start at `next_store`; when nothing was walked, the
+    group cursor stays. While the datastores are read in windows, the reads
+    never wrap back into the earlier namespaces of the datastore they resumed
+    in (read last time round, listed unread): a cut there would pin the
+    cursor to it for good.
     """
-    global _rotation
+    global _rotation, _store_rotation
 
     def unread(store, ns):
         pending = datastores[store]["unread_namespaces"]
@@ -1736,20 +1773,23 @@ def _read_all_groups(session, target, errors, deadline, units, datastores, next_
 
     groups = []
     if not units:
-        if next_walk is not None:
-            _rotation = (next_walk, "")
         return groups
     start = _start_index(units, _rotation)
-    order = units[start:] + units[:start]
-    cut = None
+    order = units[start:]
+    for unit in units[:start]:
+        if next_store is not None and unit[0] == order[0][0]:
+            unread(*unit)
+        else:
+            order.append(unit)
+    cut, started = None, True
     for index, (store, ns) in enumerate(order):
         if time.monotonic() >= deadline:
             skip_rest(order[index:], _DEADLINE_MESSAGE)
-            cut = index
+            cut, started = index, False
             break
         if len(groups) >= MAX_GROUPS:
             skip_rest(order[index:], None)
-            cut = index
+            cut, started = index, False
             break
         result = _read_groups(
             session, target, errors, deadline, store, ns, MAX_GROUPS - len(groups)
@@ -1785,10 +1825,14 @@ def _read_all_groups(session, target, errors, deadline, units, datastores, next_
             skip_rest(order[after:], _DEADLINE_MESSAGE)
             cut = index
             break
-    if cut is None and next_walk is not None:
-        _rotation = (next_walk, "")
+    if cut is not None:
+        _rotation = order[_resume_index(len(order), 0, cut, started)]
+        if cut or started:
+            _store_rotation = _rotation[0]
+    elif next_store is not None:
+        _rotation = (next_store, "")
     else:
-        _rotation = units[_resume_index(len(units), start, cut)]
+        _rotation = order[0]
     return groups
 
 
