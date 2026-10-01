@@ -1244,13 +1244,16 @@ reported as unknown. Keep the ACLs propagating (the default): a grant on
 dedicated to monitoring, and give neither it nor its token any other ACL
 entry below `/datastore` or `/remote`: in PBS a deeper entry REPLACES the
 inherited role at that path instead of adding to it, so any role there
-without the audit privilege -- `NoAccess`, but also a `DatastoreBackup` the
-user holds for backups on `/datastore/store1` -- leaves the token no
-privilege there, and PBS then hides `store1` from it without an error. The
-agent cannot tell a datastore, namespace or remote hidden that way from a
-deleted one -- unless the entry sits below `/datastore` and the token still
-audits something below it: the agent then reports the block (and its job
-lists) as partial, so nothing is taken for deleted.
+without the audit privilege -- `NoAccess`, a `RemoteAudit`, or a
+`DatastoreBackup` the user holds for backups on `/datastore/store1` -- leaves
+the token without it there, and PBS then hides `store1` from it without an
+error. The agent catches such an entry when PBS still reports that path to
+the token -- with another privilege (the `RemoteAudit` case), or because the
+token still audits something below it: it then reports the block and its job
+lists as partial (for an entry below `/remote`, the sync jobs only), so
+nothing is taken for deleted. An entry that leaves the token nothing at all,
+with nothing it audits below, cannot be told from a deleted datastore,
+namespace or remote.
 
 ### A read-only token, enforced
 
@@ -1302,8 +1305,9 @@ works within a 20-second budget, which also shortens each request's timeouts,
 and is cut off at 30 seconds whatever blocks it (a host name that does not
 resolve, or whose addresses do not answer), which is then reported as a timeout
 until that collection returns (no second one starts meanwhile, even after a
-configuration change); the next refresh starts where this one was cut off, so
-a slow tail is not starved, and a datastore or namespace that alone outlasts
+configuration change); the next refresh starts where this one was cut off
+(even when datastores or namespaces were added or removed in between), so a
+slow tail is not starved, and a datastore or namespace that alone outlasts
 the budget is moved to the back instead of blocking the others. A read the
 Proxmox Backup Server may still be working on after it timed out is not
 requested again blindly. The reads that walk namespaces -- every datastore's

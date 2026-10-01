@@ -45,8 +45,11 @@ fixture scenario is SYNTHETIC) -- and each of these shapes the code:
    (PBS >= 3.3 added push); older PBS rejects the parameter, so it is retried
    without it.
 6. /admin/datastore/{store}/status answers total/used/avail = 0 to a token
-   scoped to a namespace; /status/datastore-usage omits the keys instead, so
-   usage is read there (null, never a false 0).
+   scoped to a namespace, and /status/datastore-usage omits the keys instead.
+   A full-scope token reads usage from /status/datastore-usage; a scoped token
+   never reads it (see _build_block) and reads the own status of a datastore
+   it audits at the datastore level only, so a namespace-level grant ships
+   usage null, never a false 0.
 7. A job is listed only to a token that can audit its datastore: a token
    scoped below /datastore sees no job defined outside its scope, so its job
    lists are flagged partial.
@@ -114,9 +117,10 @@ failed or was skipped names its scope (and datastore/namespace). What gates
 pruning lives outside ``errors[]`` (that list is capped), with one exception
 described below: ``scope`` is "partial" when a datastore or namespace absent
 from the block may simply be invisible to the token (and "full" cannot see a
-deeper ACL entry hiding one -- unless the token still audits a path below it,
-which makes the block "partial": see _check_privileges, _hidden_below); a
-datastore's
+deeper ACL entry hiding one -- unless that entry shows in the permissions
+map, as a path without the audited privilege or above a path the token still
+audits, which makes the block "partial": see _check_privileges,
+_hidden_below); a datastore's
 ``namespaces`` is null when its set is unknown and ``unread_namespaces`` lists
 every listed namespace whose groups are unknown this build; a group whose
 snapshot details could not be read has ``in_progress: null``. An unparseable
@@ -135,6 +139,7 @@ call and backup state moves in hours), but /version is read EVERY tick, so a
 PBS that goes down reads unreachable on the next tick, not after the TTL.
 """
 
+import bisect
 import hashlib
 import heapq
 import ipaddress
@@ -312,13 +317,15 @@ _MANIFEST = "index.json.blob"
 
 _cache = TTLCache()
 
-# Where the next build starts its per-namespace reads (an index into the
-# sorted (store, ns) list) and its per-datastore reads (an index into the
-# sorted datastores): see _resume_index. Positional: while those sets
-# are unchanged. A datastore or namespace added or removed in between shifts
-# the start for one build; the next cut re-aims it.
-_rotation = 0
-_store_rotation = 0
+# Where the next build starts its per-namespace reads (the (store, ns) unit to
+# read first) and its per-datastore reads (the datastore to read first): see
+# _resume_index. Kept by NAME, not by position: the unit list differs from
+# build to build exactly when the budget cannot read everything (each build
+# walks a different set of datastores), and a datastore or namespace added or
+# removed in between would shift a position. A name that is gone resumes at
+# the next one in sort order. None: start at the first.
+_rotation = None
+_store_rotation = None
 
 # (cache_key, secret digest, retry-after monotonic time, message) after HTTP
 # 401, or None. One configured PBS per agent, so one slot.
@@ -998,13 +1005,13 @@ _UNSET = object()
 # of a walk that never ends pins ONE MORE proxy thread, for good, and the
 # proxy has one per core: two kill a 2-vCPU PBS. So the reads that can walk
 # namespaces -- every datastore's namespace listing, and the usage status,
-# which walks every datastore the token cannot audit (all of them for a scoped
-# token; for a full-scope one, any a deeper ACL entry hides, which the agent
-# cannot always see) -- share ONE hold (_WALK_HOLD): once any of them times
-# out, NONE is sent again until the agent is reloaded (SIGHUP:
-# reset_timeout_holds) or restarted, the operator's signal that the storage is
-# repaired. One dead NAS under several datastores, or a scoped token whose
-# usage status and namespace listing both walk the same broken datastore,
+# which walks every datastore the token cannot audit (read by a full-scope
+# token only: any datastore a deeper ACL entry hides, which the agent cannot
+# always see; a scoped token never reads it) -- share ONE hold (_WALK_HOLD):
+# once any of them times out, NONE is sent again until the agent is reloaded
+# (SIGHUP: reset_timeout_holds) or restarted, the operator's signal that the
+# storage is repaired. One dead NAS under several datastores, or a usage
+# status and a namespace listing that both walk the same broken datastore,
 # then pins one proxy thread, not one per datastore or per read. The other
 # reads that can take long all END (PBS source: /groups reads one level,
 # never walking namespaces; a datastore's status is one statfs), so holding
@@ -1171,8 +1178,8 @@ def _sub_read(
 
 
 def _check_privileges(permissions, redact=str):
-    """(sync jobs visible, every datastore visible); raises when the token
-    must not be used.
+    """(sync jobs visible, every datastore visible, the map as {str path:
+    privileges}); raises when the token must not be used.
 
     The map is the token's EFFECTIVE privileges ({path: {privilege:
     propagate}}), already intersected with its user's. Both answers exist
@@ -1181,14 +1188,15 @@ def _check_privileges(permissions, redact=str):
     - datastores, and the jobs defined on them, are listed only to a token
       that can audit them, so only a PROPAGATED Datastore.Audit reaching
       /datastore (granted there or on /, which PBS reports at /datastore as
-      inherited) makes an empty listing mean "none". PBS leaves paths where a
-      token has NO privilege out of this map entirely, and an ACL entry below
-      /datastore or /remote on the token or its user makes one when its role
-      lacks the audited privilege: a deeper entry REPLACES the inherited role
-      (a NoAccess, or a DatastoreBackup the user also holds, leaves the token
-      nothing there). That path is then invisible here -- unless, below
-      /datastore, the token can still audit a path below it (_hidden_below)
-      -- so the README gives the token's user no other ACL.
+      inherited) makes an empty listing mean "none". An ACL entry below
+      /datastore or /remote on the token or its user REPLACES the inherited
+      role there, and when its role lacks the audited privilege (a NoAccess,
+      a RemoteAudit on a datastore, a DatastoreBackup the user also holds)
+      PBS hides that path from the token. The path then shows in this map
+      without the privilege, or -- where the token holds NO privilege at all
+      -- not at all, visible only through a path below it the token still
+      audits (_hidden_below); otherwise it is invisible here, so the README
+      gives the token's user no other ACL.
     A grant on /datastore/<store>[/ns] is a scoped token whatever its
     propagate flag: it audits at least that path.
     """
@@ -1248,53 +1256,64 @@ def _check_privileges(permissions, redact=str):
             "an empty list",
             reachable=True,
         )
-    return propagated("Remote.Audit", ("/remote",)), full_scope
+    return propagated("Remote.Audit", ("/remote",)), full_scope, grants
 
 
-def _hidden_below(permissions):
+# The privilege each tree audits: a path under it without this one is hidden.
+_AUDITED_PRIVILEGE = {"datastore": "Datastore.Audit", "remote": "Remote.Audit"}
+
+
+def _hidden_below(grants):
     """(whether some path below /datastore is hidden from the token, the
-    datastores it cannot audit at the datastore level) -- the deeper ACL
-    entries _check_privileges cannot see, in the one case where they show:
-    PBS puts every node of its ACL tree in this map, a node's ancestors are
-    nodes too, and it leaves out only a node where the token holds NO
-    privilege. So a path present under an absent one names a deeper entry
-    that took the token's privilege away there (below /datastore only: an
-    entry hiding a remote shows nothing). Such a datastore is listed only
-    when the token has an ACL entry of its own below it -- then without its
-    root namespace or groups, and its own status answers 0/0/0 -- and is
-    simply absent otherwise; either way the block is partial.
+    datastores it cannot audit at the datastore level, whether some path
+    below /remote is hidden from it) -- the deeper ACL entries
+    _check_privileges cannot see, in the two cases where they show. PBS puts
+    every node of its ACL tree in this map where the token holds a privilege
+    (a node's ancestors are nodes too) and leaves out only a node where it
+    holds NONE. So a deeper entry that took the audited privilege away shows
+    as a path present WITHOUT that privilege (measured: a RemoteAudit entry on
+    /datastore/<s> reads Remote.Audit there, and <s> is no longer listed), or
+    as a present path under an ABSENT one (a NoAccess entry above a path the
+    token still audits). Such a datastore is listed only when the token still
+    audits a path below it -- then without its root namespace or groups, and
+    its own status answers 0/0/0 -- and is simply absent otherwise; either
+    way the block is partial. A hidden remote hides the sync jobs that use it.
 
     Linear in the map (PBS input, up to _SMALL_MAX_BYTES): the shallowest
     present node below an absent ancestor has an absent PARENT, so each path
     checks its parent and its datastore only, never every ancestor."""
-    paths = {
-        str(path)
-        for path, privileges in permissions.items()
-        if isinstance(privileges, dict)
-    }
-    hidden, unaudited = False, set()
-    for path in paths:
-        parts = path.split("/", 3)  # "", "datastore", store, ns path
-        if len(parts) < 4 or parts[1] != "datastore":
+    hidden, unaudited, remote_hidden = False, set(), False
+    for path, privileges in grants.items():
+        parts = path.split("/", 3)  # "", tree, name, the rest
+        if len(parts) < 3 or parts[0] or parts[1] not in _AUDITED_PRIVILEGE:
             continue
-        if "/".join(parts[:3]) not in paths:
+        audited = _AUDITED_PRIVILEGE[parts[1]]
+        # Below the datastore or remote itself (whose parent a scoped token
+        # does not hold), a present path under an absent one is hidden too.
+        lost = audited not in privileges or (
+            len(parts) > 3 and path.rpartition("/")[0] not in grants
+        )
+        if parts[1] == "remote":
+            remote_hidden = remote_hidden or lost
+            continue
+        store = "/".join(parts[:3])
+        if store not in grants or audited not in grants[store]:
             hidden = True
             unaudited.add(parts[2])
-        elif path.rpartition("/")[0] not in paths:
+        elif lost:
             hidden = True
-    return hidden, unaudited
+    return hidden, unaudited, remote_hidden
 
 
-def _audited_stores(permissions):
+def _audited_stores(grants):
     """The datastores the token audits AT the datastore level: a scoped token
     reads their usage from their own status (below that level PBS answers it
     0/0/0, measurement 6)."""
     return {
-        str(path).split("/", 2)[2]
-        for path, privileges in permissions.items()
-        if isinstance(privileges, dict)
-        and str(path).startswith("/datastore/")
-        and str(path).count("/") == 2
+        path.split("/", 2)[2]
+        for path, privileges in grants.items()
+        if path.startswith("/datastore/")
+        and path.count("/") == 2
         and "Datastore.Audit" in privileges
     }
 
@@ -1350,10 +1369,11 @@ def _build_block(session, target, deadline):
     _local_nodes.clear()
     _forget_stale_backoffs()
     permissions = _get(session, target, "/access/permissions", deadline=deadline)
-    remote_audit, full_scope = _check_privileges(permissions, target.redact)
-    hidden, unaudited = _hidden_below(permissions)
-    audited = _audited_stores(permissions)
+    remote_audit, full_scope, grants = _check_privileges(permissions, target.redact)
     del permissions
+    hidden, unaudited, remote_hidden = _hidden_below(grants)
+    audited = _audited_stores(grants)
+    del grants
     stores = _datastore_entries(
         _get(session, target, "/admin/datastore", deadline=deadline)
     )
@@ -1399,23 +1419,33 @@ def _build_block(session, target, deadline):
         session, target, errors, deadline, "prune_jobs", "/admin/prune", _prune_job
     )
     # PBS lists a job only to a token that can audit its datastore (or
-    # namespace): below full scope, or with part of /datastore hidden, a job
+    # namespace), and a sync job only to one that can audit its remote too:
+    # below full scope, or with part of /datastore or /remote hidden, a job
     # list may be short.
-    if not full_scope or hidden:
+    why = None
+    if not full_scope:
         why = (
             "the API token's Datastore.Audit is scoped below /datastore, so jobs "
             "outside that scope are not listed"
-            if not full_scope
-            else "a deeper ACL entry hides part of /datastore from the API token, "
+        )
+    elif hidden:
+        why = (
+            "a deeper ACL entry hides part of /datastore from the API token, "
             "so jobs defined there are not listed"
         )
-        for name, rows in (
-            ("sync_jobs", sync_jobs),
-            ("verify_jobs", verify_jobs),
-            ("prune_jobs", prune_jobs),
-        ):
-            if rows is not None:
-                _error(errors, name, "partial: " + why)
+    why_sync = why
+    if why is None and remote_hidden:
+        why_sync = (
+            "a deeper ACL entry hides part of /remote from the API token, so "
+            "sync jobs using it are not listed"
+        )
+    for name, rows, reason in (
+        ("sync_jobs", sync_jobs, why_sync),
+        ("verify_jobs", verify_jobs, why),
+        ("prune_jobs", prune_jobs, why),
+    ):
+        if rows is not None and reason is not None:
+            _error(errors, name, "partial: " + reason)
 
     datastores, units = _read_datastores(
         session,
@@ -1524,6 +1554,15 @@ def _resume_index(order_length, start, cut):
     return (start + max(cut, 1)) % order_length
 
 
+def _start_index(keys, resume):
+    """Where in the sorted `keys` a build starts: at `resume`, the name the
+    last build kept (see _rotation), or at the next one in sort order when
+    that one is gone; at the first when there is none."""
+    if resume is None:
+        return 0
+    return bisect.bisect_left(keys, resume) % len(keys)
+
+
 def _read_datastores(
     session,
     target,
@@ -1536,15 +1575,19 @@ def _read_datastores(
 ):
     """(name -> datastore, sorted (store, ns) units).
 
-    The per-datastore reads (usage fallback, gc, namespaces) get at most HALF
+    The per-datastore reads (a datastore's own status, gc) get at most HALF
     of the budget left, so a wedged datastore (a hung NFS mount) can never
-    leave the per-namespace reads with nothing; they start at
-    `_store_rotation`, and the next build resumes at the first datastore this
-    one could not finish (see _resume_index), so one wedged datastore cannot
-    starve the ones after it on every build either. `own_status`: the
-    datastores whose own status is read for their usage (see _build_block:
-    the aggregate failed or is held, or a scoped token) -- a FILESYSTEM
-    datastore only: any other backend's usage is withheld anyway.
+    leave the per-namespace reads with nothing; a namespace listing is a walk
+    and takes the tick's deadline instead, sent only with its whole read
+    timeout left (_sub_read). They start at `_store_rotation`, and the next
+    build resumes at the first datastore this one could not finish -- its gc
+    past the half, or its walk past the point where a walk no longer fits
+    (see _resume_index) -- so one wedged datastore cannot starve the ones
+    after it on every build either. Once the namespace cap is full, no
+    further namespace listing is sent: its answer could not be used.
+    `own_status`: the datastores whose own status is read for their usage
+    (see _build_block: the aggregate failed or is held, or a scoped token) --
+    a FILESYSTEM datastore only: any other backend's usage is withheld anyway.
     """
     global _store_rotation
     datastores = {}
@@ -1553,7 +1596,9 @@ def _read_datastores(
         return datastores, units
     now = time.monotonic()
     phase_deadline = now + max(deadline - now, 0) / 2
-    start = _store_rotation % len(stores)
+    walk_cutoff = deadline - _READ_TIMEOUT  # _sub_read's rule for a walk
+    names = [entry["store"] for entry in stores]
+    start = _start_index(names, _store_rotation)
     order = stores[start:] + stores[:start]
     cut = None
     for index, entry in enumerate(order):
@@ -1567,10 +1612,22 @@ def _read_datastores(
             row = {}
         datastore = _datastore(entry, row, backends.get(name))
         datastore["gc"] = _read_gc(session, target, errors, phase_deadline, name)
-        # The tick's deadline, not the phase's: a namespace walk is sent only
-        # with its whole read timeout ahead of it (_sub_read).
-        namespaces = _read_namespaces(session, target, errors, deadline, name)
-        trimmed = False
+        trimmed = len(units) >= MAX_NAMESPACES
+        if trimmed:
+            # The cap is full: the listing's answer would be dropped whole, so
+            # the walk -- one more request on the PBS, and one that may never
+            # end -- is not sent. The set stays null (unknown).
+            namespaces = None
+            _error(
+                errors,
+                "cap",
+                f"namespaces capped at {MAX_NAMESPACES}: not read",
+                store=name,
+            )
+        else:
+            # The tick's deadline, not the phase's: a namespace walk is sent
+            # only with its whole read timeout ahead of it (_sub_read).
+            namespaces = _read_namespaces(session, target, errors, deadline, name)
         if namespaces is not None:
             kept = _cap(
                 namespaces,
@@ -1588,20 +1645,26 @@ def _read_datastores(
             # (unknown) while the groups of the namespaces kept still ship.
             units.extend((name, ns) for ns in kept)
         datastores[name] = datastore
-        incomplete = datastore["gc"] is None or namespaces is None
-        if cut is None and (
-            trimmed or (incomplete and time.monotonic() >= phase_deadline)
-        ):
+        # Unfinished for lack of time: its gc past the half, or its walk past
+        # the point where a walk no longer fits -- which comes BEFORE the half
+        # ends, so a datastore whose walk was skipped is the cut too.
+        at = time.monotonic()
+        unfinished = (datastore["gc"] is None and at >= phase_deadline) or (
+            namespaces is None and at >= walk_cutoff
+        )
+        if cut is None and (trimmed or unfinished):
             cut = index
-    _store_rotation = _resume_index(len(stores), start, cut)
+    _store_rotation = names[_resume_index(len(stores), start, cut)]
     return datastores, sorted(units)
 
 
 def _read_store_status(session, target, errors, deadline, store):
-    """One datastore's own usage, for when /status/datastore-usage failed as a
-    whole. Only read for a full-scope token (to a token scoped below the
-    datastore this endpoint answers 0/0/0, measurement 6) and a filesystem
-    datastore."""
+    """One datastore's own usage: for a full-scope token when
+    /status/datastore-usage failed as a whole or is held, and for a scoped
+    token (which never reads the aggregate) on each datastore it audits at
+    the datastore level. Never read where the token audits only below the
+    datastore (PBS answers 0/0/0 there, measurement 6), and only for a
+    filesystem datastore."""
     status = _sub_read(
         session,
         target,
@@ -1650,7 +1713,7 @@ def _read_all_groups(session, target, errors, deadline, units, datastores):
     groups = []
     if not units:
         return groups
-    start = _rotation % len(units)
+    start = _start_index(units, _rotation)
     order = units[start:] + units[:start]
     cut = None
     for index, (store, ns) in enumerate(order):
@@ -1696,7 +1759,7 @@ def _read_all_groups(session, target, errors, deadline, units, datastores):
             skip_rest(order[after:], _DEADLINE_MESSAGE)
             cut = index
             break
-    _rotation = _resume_index(len(units), start, cut)
+    _rotation = units[_resume_index(len(units), start, cut)]
     return groups
 
 
@@ -1715,15 +1778,14 @@ def _read_usage(session, target, errors, deadline, listed):
     JSON envelope, or a read skipped by the walk hold (_WALK_HOLD, armed by
     ANY namespace walk that timed out) -- rather than being skipped past the
     budget or answering a well-formed non-list, which is when a per-datastore
-    fallback is worth trying). The endpoint omits what a scoped token may not
-    see (measurement 6). A row's own error is recorded once per datastore in
-    `listed` (at most MAX_DATASTORES), however many rows name it: a flood of
-    rows must not crowd the job lists' 'partial:' flags out of the capped
-    errors[]. Read for a full-scope token only (see _build_block). PBS walks
-    the namespaces of every datastore the token cannot audit (any a deeper ACL
-    entry hides), which never ends on an unreadable one: a timeout of any walk
-    holds every walk, this one included (_timeout_backoff), and the token then
-    reads each datastore's own status instead."""
+    fallback is worth trying). A row's own error is recorded once per
+    datastore in `listed` (at most MAX_DATASTORES), however many rows name it:
+    a flood of rows must not crowd the job lists' 'partial:' flags out of the
+    capped errors[]. Read for a full-scope token only (see _build_block). PBS
+    walks the namespaces of every datastore the token cannot audit (any a
+    deeper ACL entry hides), which never ends on an unreadable one: a timeout
+    of any walk holds every walk, this one included (_timeout_backoff), and
+    the token then reads each datastore's own status instead."""
     failures = []
     rows = _sub_read(
         session,
@@ -2324,36 +2386,28 @@ def _job_common(job):
 
 
 def _sync_job(job):
-    row = _job_common(job)
-    row.update(
-        {
-            # No remote is a local sync between two datastores of this PBS.
-            "remote": scrub_str(job.get("remote")),
-            "remote_store": scrub_str(job.get("remote-store")),
-            "remote_ns": scrub_str(job.get("remote-ns")) or "",
-            "direction": scrub_str(job.get("sync-direction")) or "pull",
-        }
-    )
-    return row
+    return {
+        **_job_common(job),
+        # No remote is a local sync between two datastores of this PBS.
+        "remote": scrub_str(job.get("remote")),
+        "remote_store": scrub_str(job.get("remote-store")),
+        "remote_ns": scrub_str(job.get("remote-ns")) or "",
+        "direction": scrub_str(job.get("sync-direction")) or "pull",
+    }
 
 
 def _verify_job(job):
-    row = _job_common(job)
-    row.update(
-        {
-            "outdated_after": _as_int64(job.get("outdated-after")),
-            # Absent means true: PBS's schema default, and what its verify
-            # job does (verify_job.rs: ignore_verified.unwrap_or(true)).
-            "ignore_verified": as_bool(job.get("ignore-verified", True)),
-        }
-    )
-    return row
+    return {
+        **_job_common(job),
+        "outdated_after": _as_int64(job.get("outdated-after")),
+        # Absent means true: PBS's schema default, and what its verify job
+        # does (verify_job.rs: ignore_verified.unwrap_or(true)).
+        "ignore_verified": as_bool(job.get("ignore-verified", True)),
+    }
 
 
 def _prune_job(job):
-    row = _job_common(job)
-    row["disabled"] = as_bool(job.get("disable", False))
-    return row
+    return {**_job_common(job), "disabled": as_bool(job.get("disable", False))}
 
 
 def _job_sort_key(job):
