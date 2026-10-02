@@ -1345,8 +1345,8 @@ service). Any reload or restart releases them -- one sent for another reason,
 an agent update, a crash restart -- so repair a broken datastore before
 reloading the agent for anything else (if it is still broken, the refresh
 after the reload reads every other datastore and leaves its namespaces for
-the next one, so every other datastore is read before it blocks the walks
-again); changing the PBS host, fingerprint or
+the next one -- unless it is the only datastore -- so every other datastore
+is read before it blocks the walks again); changing the PBS host, fingerprint or
 token in the dashboard does not. A first backup that is still uploading is never shown as the
 latest backup. Anything that could not be read -- a datastore in offline maintenance,
 a namespace whose group listing failed -- is reported per datastore and
