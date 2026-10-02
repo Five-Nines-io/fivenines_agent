@@ -374,15 +374,21 @@ _gc_frontier = None
 # that walk is sent (_read_datastores).
 _walk_first: set = set()
 # The datastores whose namespace walk armed the walk hold, gathered by the
-# reloads (reset_timeout_holds) until their walk answers or they are no
-# longer listed; and whether a reload is pending. While one is, every build
-# that can walk reads their own status and gc but defers their walks, until
-# one sends a walk: every other datastore is read before they can arm the
-# hold again (_read_datastores).
+# reloads (reset_timeout_holds). Every build that can walk reads their own
+# status and gc but defers their walks, until the group reads have passed
+# their datastore -- every namespace before it read -- or no other datastore
+# lists a namespace, or their walk returns a listing; or they are no longer
+# listed (_read_datastores, _read_all_groups).
 _deferred_walks: set = set()
-_reload_pending = False
+# The reload count as this build's datastore reads began: the group reads
+# release deferred walks only when no reload came meanwhile.
+_build_reloads = 0
+# Whether the last group reads left namespaces unread (cut, or the datastore
+# reads ran in windows): the head then walks first when they resume inside
+# it, whose listing they need (_read_datastores).
+_groups_pending = True
 # Bumped by every reload: a build that began before one (an abandoned worker
-# finishing late) must not clear the order the reload set.
+# finishing late) must not release the walks the reload deferred.
 _reloads = 0
 # Set by a build that cannot walk, cleared by one that sends a walk: while
 # set, a build that can walk starts at the group cursor's datastore -- the
@@ -427,10 +433,18 @@ class _PbsError(Exception):
     is no evidence about the PBS either way. `pending`: sent, and not answered
     in time (a read timeout that waited its whole read timeout -- never a
     connect one, nor a stalled TLS handshake urllib3 reports as a read one),
-    so PBS may still be running it."""
+    so PBS may still be running it. `sent` is False for a read skipped before
+    it was sent, whatever `reachable` says (see _sub_read's _reads_sent)."""
 
     def __init__(
-        self, error_type, message, reachable, status=None, skipped=None, pending=False
+        self,
+        error_type,
+        message,
+        reachable,
+        status=None,
+        skipped=None,
+        pending=False,
+        sent=True,
     ):
         super().__init__(message)
         self.error_type = error_type
@@ -439,6 +453,7 @@ class _PbsError(Exception):
         self.status = status
         self.skipped = skipped
         self.pending = pending
+        self.sent = sent
 
 
 def _config_error(message):
@@ -666,7 +681,9 @@ def _remaining(deadline):
     phase's half of it); a timeout _PbsError when none."""
     remaining = deadline - time.monotonic()
     if remaining <= 0:
-        raise _PbsError("timeout", _DEADLINE_MESSAGE, True, skipped="deadline")
+        raise _PbsError(
+            "timeout", _DEADLINE_MESSAGE, True, skipped="deadline", sent=False
+        )
     return remaining
 
 
@@ -748,7 +765,9 @@ def _get(
         # namespace unread on a /snapshots error, the 401 backoff) must not
         # depend on timing -- and only its body is skipped (so a 400 past the
         # budget reads as a handler error, not as an old PBS's sync rejection).
-        remaining = deadline - time.monotonic()
+        # A read granted a minimum wait past the deadline (see _sub_read) is
+        # read within it: its answer is what that wait was for.
+        remaining = max(deadline, sent + min_wait) - time.monotonic()
         if remaining <= 0 and status == 200:
             response.close()
             raise _PbsError("timeout", _DEADLINE_MESSAGE, True, skipped="deadline")
@@ -1194,17 +1213,16 @@ def reset_timeout_holds():
     proxmox-backup-proxy), so every held or backed-off read is sent again --
     on the next tick: the cached block, which still reports them held, is
     dropped too. The datastore whose walk armed the hold joins the deferred
-    walks, and every build that can walk defers them until one sends a walk
-    (see _read_datastores): if one is still broken, every other datastore is
-    read before it arms the hold again."""
-    global _cache, _reloads, _reload_pending
+    walks, which every build that can walk defers until the group reads have
+    passed them (see _read_datastores): if one is still broken, every other
+    datastore is read before it arms the hold again."""
+    global _cache, _reloads
     _reloads += 1
     hold = _timeout_backoff.get(_WALK_HOLD)
     failure = hold[2] if isinstance(hold, tuple) and len(hold) == 3 else None
     if isinstance(failure, tuple) and failure[:1] == ("namespaces",):
         if isinstance(failure[1], str) and len(_deferred_walks) < MAX_DATASTORES:
             _deferred_walks.add(failure[1])
-    _reload_pending = _reload_pending or bool(_deferred_walks)
     _timeout_backoff.clear()
     _cache = TTLCache()
 
@@ -1232,10 +1250,11 @@ def _sub_read(
     `missing` when one is given (an endpoint an older PBS does not have);
     `on_error` receives the failure, a backoff skip included, for a caller
     that must know what happened. With `arm_late` False (an own status or
-    gc read past the head datastore of the build), a timeout arms the backoff -- and the
-    read gets its minimum wait -- only when it was sent with that wait still
-    ahead of its deadline, or already backed off before: a read merely late
-    in its phase stays clamped to it and is not taken for stuck."""
+    gc read past the head datastore of the build), a timeout arms the backoff
+    -- and the read gets its minimum wait -- only when it was sent with that
+    wait still ahead of its deadline, or already noted before: a read merely
+    late in its phase stays clamped to it and is not taken for stuck, but its
+    timeout notes it (_suspect_timeout), so its next send gets the wait."""
     global _reads_sent
     if backoff == "hold":
         key = _WALK_HOLD  # one hold for every walk (see _timeout_backoff)
@@ -1274,7 +1293,7 @@ def _sub_read(
     try:
         data = _get(session, target, path, params, deadline=deadline, min_wait=min_wait)
     except _PbsError as e:
-        if e.reachable or e.pending:  # it reached PBS (an answer, or no answer)
+        if e.sent and (e.reachable or e.pending):  # it reached PBS, answered or not
             _reads_sent += 1
         if key is not None and e.pending:
             failure = (scope, store, ns, e.message)
@@ -1737,8 +1756,10 @@ def _read_datastores(
     own reads pushed its walk past the point where a walk fits is flagged
     (`_walk_first`) and walks first, wherever it stands in the order, until
     that walk is sent -- so a slow gc never takes its walk for good -- and so
-    does the head when the group reads stopped inside it, whose listing they
-    need to resume. A namespace listing is a walk: it takes the tick's
+    does the head when the last group reads left namespaces unread and
+    resume inside it, whose listing they need (`_groups_pending`: after a
+    full pass the head is just the first datastore, and its walk first would
+    starve its gc for good on a PBS with one slow datastore). A namespace listing is a walk: it takes the tick's
     deadline, sent only with its whole read timeout left (_walk_deadline).
     The per-datastore reads get at most HALF of the budget left (plus the 5s
     minimum wait of one that may arm its backoff, see _sub_read), so a wedged
@@ -1757,13 +1778,16 @@ def _read_datastores(
     cursor stays with the group reads; every build re-anchors the gc cursor
     at its own gc cut. The next build that can walk then starts at the group
     cursor's datastore (`_realign`, cleared only by a build that sends a
-    walk). After a reload (`_deferred_walks`, `_reload_pending`, see
-    reset_timeout_holds), every build that can walk reads the own status and
-    gc of each datastore whose walk armed the hold but defers its walk
-    (_RELOAD_DEFER_MESSAGE; not a cut; never every listed datastore), until
-    one sends a walk: every other datastore is listed, and its groups read,
-    before those walks can arm the hold again. The build starts where the
-    reads stood -- jumping past the arming datastore skipped every namespace
+    walk). After a reload (`_deferred_walks`, see reset_timeout_holds),
+    every build that can walk reads the own status and gc of each datastore
+    whose walk armed the hold but defers its walk (_RELOAD_DEFER_MESSAGE; not
+    a cut; never every listed datastore), until the group reads have passed
+    its datastore (_read_all_groups), its walk returns a listing, or every
+    other datastore's walk reached PBS in one build and none returned a
+    listing (nothing could ever pass it): every other datastore is listed,
+    and its groups read, before those walks can arm the hold again. A
+    repaired datastore therefore waits up to about two group passes. The
+    build starts where the reads stood -- jumping past the arming datastore skipped every namespace
     between the group cursor and it, after each reload. The group reads,
     when they are cut, move the datastore cursor to their own datastore
     (_read_all_groups): walks outpace group reads on a big PBS, and a cursor
@@ -1781,7 +1805,7 @@ def _read_datastores(
     held, or a scoped token) -- a FILESYSTEM datastore only: any other
     backend's usage is withheld anyway.
     """
-    global _store_rotation, _realign, _gc_frontier, _reload_pending
+    global _store_rotation, _realign, _gc_frontier, _build_reloads
     datastores, units = {}, []
     if not stores:
         return datastores, units, False, False, None
@@ -1790,7 +1814,7 @@ def _read_datastores(
     walks_fit = now < _walk_deadline(deadline)
     # A walk can be sent this build: room for one, and the walk hold off.
     can_walk = walks_fit and _WALK_HOLD not in _timeout_backoff
-    reloads = _reloads
+    _build_reloads = reloads = _reloads
     names = [entry["store"] for entry in stores]
     _walk_first.intersection_update(names)
     _deferred_walks.intersection_update(names)
@@ -1801,10 +1825,10 @@ def _read_datastores(
             # The builds since the last walk sent none: the group reads
             # resume where they stood, and so do the walks they read.
             start = _start_index(names, _rotation[0])
-        if _reload_pending and len(_deferred_walks) < len(names):
-            # After a reload: the walks that armed the hold wait for this
-            # build to read every other datastore (never all of them: a build
-            # that could send no walk would keep the reload pending for good).
+        if _deferred_walks and len(_deferred_walks) < len(names):
+            # After a reload: the walks that armed the hold wait for the
+            # group reads to pass them (never all of them: nothing could be
+            # listed, so nothing would ever pass them).
             deferred = set(_deferred_walks)
     else:
         # Nothing to walk: the per-datastore reads go on from the gc cursor
@@ -1814,6 +1838,7 @@ def _read_datastores(
     order = stores[start:] + stores[:start]
     cut = gc_cut = None
     ns_hidden = unlisted = sent_walk = head_sent = head_gc_sent = False
+    asked = set()  # the datastores whose walk reached PBS this build
     for index, entry in enumerate(order):
         name = entry["store"]
         trimmed = len(units) >= MAX_NAMESPACES
@@ -1822,7 +1847,12 @@ def _read_datastores(
         # to resume, before its own reads can take the walk room.
         walk_first = name not in deferred and (
             name in _walk_first
-            or (index == 0 and _rotation is not None and _rotation[0] == name)
+            or (
+                index == 0
+                and _groups_pending
+                and _rotation is not None
+                and _rotation[0] == name
+            )
         )
         if walk_first:
             sent = _reads_sent
@@ -1830,6 +1860,7 @@ def _read_datastores(
             walked_at = time.monotonic()
             if _reads_sent > sent:
                 sent_walk = True
+                asked.add(name)
                 _walk_first.discard(name)
         sent = _reads_sent
         began = time.monotonic()
@@ -1858,7 +1889,9 @@ def _read_datastores(
             sent = _reads_sent
             namespaces = _walk(session, target, errors, deadline, name, trimmed)
             walked_at = time.monotonic()
-            sent_walk = sent_walk or _reads_sent > sent
+            if _reads_sent > sent:
+                sent_walk = True
+                asked.add(name)
             if (
                 began < _walk_deadline(deadline) <= gc_at
                 and not trimmed
@@ -1870,7 +1903,7 @@ def _read_datastores(
         if namespaces is None:
             unlisted = True
         else:
-            _deferred_walks.discard(name)  # its walk answered: repaired
+            _deferred_walks.discard(name)  # its walk returned a listing: repaired
             listed = set(namespaces)
             ns_hidden = ns_hidden or any(
                 ns and ns.rpartition("/")[0] not in listed for ns in namespaces
@@ -1922,10 +1955,17 @@ def _read_datastores(
         _realign = True
     elif sent_walk:
         _realign = False
-    if sent_walk and _reloads == reloads:
-        # Consumed by a build that walked, and not past a reload that came
-        # while it ran (an abandoned worker finishing late).
-        _reload_pending = False
+    if (
+        deferred
+        and not units
+        and _WALK_HOLD not in _timeout_backoff
+        and asked >= set(names) - deferred
+        and _reloads == reloads
+    ):
+        # Every other datastore was asked and none listed a namespace (an
+        # unplugged or offline one): the group reads will never pass the
+        # deferred walks, which go out again.
+        _deferred_walks.difference_update(deferred)
     return datastores, sorted(units), ns_hidden, unlisted, next_store
 
 
@@ -1995,9 +2035,12 @@ def _read_all_groups(session, target, errors, deadline, units, datastores, next_
     the earlier namespaces of the datastore they resumed in (listed unread,
     read on that datastore's next turn, with a 'groups' entry naming why),
     and past the only unit of a window is the next window: either would
-    otherwise pin both cursors to that datastore for good.
+    otherwise pin both cursors to that datastore for good. A deferred walk
+    (see _read_datastores) goes out again once these reads have passed its
+    datastore -- every namespace before it read since the reload -- or read
+    every namespace in one build.
     """
-    global _rotation, _store_rotation
+    global _rotation, _store_rotation, _groups_pending
 
     def unread(store, ns):
         pending = datastores[store]["unread_namespaces"]
@@ -2021,6 +2064,7 @@ def _read_all_groups(session, target, errors, deadline, units, datastores, next_
 
     groups = []
     if not units:
+        _groups_pending = next_store is not None
         return groups
     start = _start_index(units, _rotation)
     order, earlier = units[start:], []
@@ -2030,7 +2074,7 @@ def _read_all_groups(session, target, errors, deadline, units, datastores, next_
         else:
             order.append(unit)
     skip_rest(earlier, _ROTATION_MESSAGE)
-    cut, started = None, True
+    cut, started, processed = None, True, set()
     for index, (store, ns) in enumerate(order):
         if time.monotonic() >= deadline:
             skip_rest(order[index:], _DEADLINE_MESSAGE)
@@ -2040,6 +2084,7 @@ def _read_all_groups(session, target, errors, deadline, units, datastores, next_
             skip_rest(order[index:], None)
             cut, started = index, False
             break
+        processed.add(store)
         result = _read_groups(
             session, target, errors, deadline, store, ns, MAX_GROUPS - len(groups)
         )
@@ -2086,6 +2131,24 @@ def _read_all_groups(session, target, errors, deadline, units, datastores, next_
         _rotation = (next_store, "")
     else:
         _rotation = order[0]
+    _groups_pending = cut is not None or next_store is not None
+    if _deferred_walks and _reloads == _build_reloads:
+        # Not past a reload that came while this build ran (an abandoned
+        # worker finishing late): its deferred walks are not passed yet.
+        first = order[0][0]
+
+        def cyclic(name):  # the order these reads go round, from `first`
+            return (name < first, name)
+
+        if _groups_pending:
+            passed = {
+                name
+                for name in _deferred_walks
+                if any(cyclic(store) > cyclic(name) for store in processed)
+            }
+        else:
+            passed = set(_deferred_walks)  # every namespace read this build
+        _deferred_walks.difference_update(passed)
     return groups
 
 
@@ -2279,8 +2342,9 @@ def _read_gc(session, target, errors, deadline, store, first=False):
     """The datastore's garbage-collection status, or None when unread -- a
     read that timed out is retried on the backoff (_timeout_backoff), so one
     stuck gc does not take the per-datastore half on every build; one sent
-    late in the half (`first` False) is clamped to it and arms nothing (see
-    _sub_read).
+    late in the half past the head datastore is clamped to it, and its
+    timeout only notes it, so its next send gets the 5s minimum wait (see
+    _sub_read), and an answer within that wait is read.
     index_data_bytes / disk_bytes is the deduplication factor.
 
     last_run_starttime and the counters come from the last SUCCESSFUL GC

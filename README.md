@@ -1343,11 +1343,13 @@ restarts. Once the datastore is repaired, restart
 (`sudo kill -HUP $(pgrep -f fivenines_agent)`; on Windows, restart the
 service). Any reload or restart releases them -- one sent for another reason,
 an agent update, a crash restart -- so repair a broken datastore before
-reloading the agent for anything else (if it is still broken, the refresh
-after the reload reads every other datastore and leaves its namespaces for
-the next one -- unless it is the only datastore -- so every other datastore
-is read before it blocks the walks again); changing the PBS host, fingerprint or
-token in the dashboard does not. A first backup that is still uploading is never shown as the
+reloading the agent for anything else (if it is still broken, the refreshes
+after the reload read the namespaces and backups of every other datastore
+first and leave its namespaces for later -- unless every datastore is
+broken -- so it can block the walks again only after that round; a datastore
+repaired without restarting the proxy is read again once that round is done,
+which on a large PBS takes a few refreshes); changing the PBS host,
+fingerprint or token in the dashboard does not. A first backup that is still uploading is never shown as the
 latest backup. Anything that could not be read -- a datastore in offline maintenance,
 a namespace whose group listing failed -- is reported per datastore and
 namespace, so the dashboard shows those backups as *unknown*, never as
