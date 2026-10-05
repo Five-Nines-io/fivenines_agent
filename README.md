@@ -1334,9 +1334,11 @@ broken storage costs one thread however many datastores it carries. Every
 other slow read is retried later, less and less often (at most every 6
 hours) -- a datastore's own status and garbage-collection status included,
 which on a dead mount may never end either: each retry then holds one more
-proxy thread. The dashboard shows the namespaces and backups of every datastore as
-unknown meanwhile, and the job lists as possibly incomplete; a full-scope
-token still reports each datastore's usage, without its estimated full date. Act on it quickly: the stuck walk keeps one
+proxy thread. Meanwhile the dashboard shows every datastore's namespaces as
+unknown and the job lists as possibly incomplete, but the backups of the
+namespaces the agent listed before keep being refreshed (one deleted meanwhile
+is only removed once the walks resume); a full-scope token still reports each
+datastore's usage, without its estimated full date. Act on it quickly: the stuck walk keeps one
 PBS core busy and logs an error on every turn until `proxmox-backup-proxy`
 restarts. Once the datastore is repaired, restart
 `proxmox-backup-proxy` on the PBS, then reload the agent
