@@ -1348,7 +1348,8 @@ after the reload read the namespaces and backups of every other datastore
 first and leave its namespaces for later -- unless every datastore is
 broken -- so it can block the walks again only after that round; a datastore
 repaired without restarting the proxy is read again once that round is done,
-which on a large PBS takes a few refreshes); changing the PBS host,
+which on a large PBS takes a few refreshes, and reloading the agent for
+another reason meanwhile does not restart that round); changing the PBS host,
 fingerprint or token in the dashboard does not. A first backup that is still uploading is never shown as the
 latest backup. Anything that could not be read -- a datastore in offline maintenance,
 a namespace whose group listing failed -- is reported per datastore and

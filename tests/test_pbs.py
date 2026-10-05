@@ -56,6 +56,7 @@ def _fresh_state(monkeypatch):
     monkeypatch.setattr(pbs, "_deferred_walks", set())
     monkeypatch.setattr(pbs, "_groups_pending", True)
     monkeypatch.setattr(pbs, "_build_reloads", 0)
+    monkeypatch.setattr(pbs, "_lap_origin", None)
     monkeypatch.setattr(pbs, "_realign", False)
     monkeypatch.setattr(pbs, "_gc_frontier", None)
     monkeypatch.setattr(pbs, "_reloads", 0)
@@ -8071,14 +8072,14 @@ def test_a_reload_keeps_the_cursor_when_the_hold_names_no_listed_datastore(
     assert pbs._deferred_walks == set()
 
 
-# Value: protects=a second reload before the next build keeps the reload
-#   order (the broken walk still deferred); fails_when=a reload with
+# Value: protects=a second reload before the next build keeps the walk the
+#   first one deferred; fails_when=a reload with
 #   nothing held forgets the datastore the first one remembered, so it is
 #   walked first and re-arms the hold before any other walk; why_new=coverage
 #   audit: every reload test sent one SIGHUP (two land on two
 #   ticks when proxmox-backup-proxy is still restarting in between, so the
 #   first tick's build never reaches the datastores); seam=none
-def test_a_second_reload_before_the_next_build_keeps_the_reload_order(monkeypatch):
+def test_a_second_reload_before_the_next_build_keeps_the_deferred_walk(monkeypatch):
     failure = ("namespaces", "b", None, "t")
     pbs._timeout_backoff[pbs._WALK_HOLD] = (math.inf, 1, failure)
     pbs.reset_timeout_holds()
@@ -8086,14 +8087,14 @@ def test_a_second_reload_before_the_next_build_keeps_the_reload_order(monkeypatc
     monkeypatch.setattr(pbs, "_store_rotation", "b")
     _, session = collect(monkeypatch, _datastores_with(["a", "b", "c"]))
     walks = [route(u) for u in session.calls if route(u).endswith("/namespace")]
-    # b's walk deferred: the order the first reload set survived the second.
+    # b's walk deferred: the first reload's deferral survived the second.
     assert walks == [f"/admin/datastore/{s}/namespace" for s in ("c", "a")]
 
 
 # Value: protects=after a reload the walk of the datastore that armed the
 #   hold is still deferred when builds with no room for any walk come in between,
 #   after or before the reload; fails_when=the realignment that follows a
-#   no-room build overrides the reload order (the walks restart at the group
+#   no-room build overrides the deferral (the walks restart at the group
 #   cursor's datastore: b is walked before c, re-arms the hold, and c is never
 #   walked until the next reload), or a build with no room starts its gc
 #   reads after b too (on a PBS that stays that slow, the gc of the
@@ -8109,7 +8110,7 @@ def test_a_second_reload_before_the_next_build_keeps_the_reload_order(monkeypatc
     ],
     ids=["no_room_after_the_reload", "two_no_room_after", "no_room_before"],
 )
-def test_a_build_with_no_room_for_a_walk_keeps_the_reload_order(monkeypatch, steps):
+def test_a_build_with_no_room_for_a_walk_keeps_the_deferred_walk(monkeypatch, steps):
     clock = use_clock(monkeypatch, Clock())
     real = pbs._read_backends
     slow = []
@@ -8139,7 +8140,7 @@ def test_a_build_with_no_room_for_a_walk_keeps_the_reload_order(monkeypatch, ste
         clock.now += pbs.PBS_CACHE_TTL
         _, session = collect(monkeypatch, responses)
         assert not [u for u in session.calls if route(u).endswith("/namespace")]
-        # Its gc reads go on from the gc cursor, the reload order pending.
+        # Its gc reads go on from the gc cursor, b's walk still deferred.
         gcs = [
             route(u).split("/")[3] for u in session.calls if route(u).endswith("/gc")
         ]
@@ -8147,7 +8148,7 @@ def test_a_build_with_no_room_for_a_walk_keeps_the_reload_order(monkeypatch, ste
     clock.now += pbs.PBS_CACHE_TTL
     _, session = collect(monkeypatch, responses)
     walks = [route(u) for u in session.calls if route(u).endswith("/namespace")]
-    # From the group cursor (a), b's walk deferred: the order outlived the
+    # From the group cursor (a), b's walk deferred: the deferral outlived the
     # no-room builds.
     assert walks == [f"/admin/datastore/{s}/namespace" for s in ("a", "c")]
 
@@ -8345,6 +8346,26 @@ def test_a_reload_never_defers_every_datastore(monkeypatch):
     assert pbs._deferred_walks == set()  # both walks returned a listing
 
 
+# Value: protects=a datastore since removed from PBS no longer counts among
+#   the deferred walks, so a broken one still listed stays deferred;
+#   fails_when=the deferred set keeps names PBS no longer lists (they count
+#   toward 'every listed datastore deferred': the broken walk is sent at once
+#   and re-arms the hold); why_new=coverage audit, ship 11: dropping the
+#   intersection with the listing survived (a gone name was only ever
+#   alone); seam=none
+def test_a_removed_datastore_never_releases_the_other_deferred_walk(monkeypatch):
+    use_clock(monkeypatch, Clock())
+    # Two reloads deferred b and zz; zz has since been removed from PBS.
+    monkeypatch.setattr(pbs, "_deferred_walks", {"b", "zz"})
+    timeout = {"error": "timeout", "message": "t"}
+    responses = _datastores_with(
+        ["a", "b"], **{"/admin/datastore/b/namespace": timeout}
+    )
+    out, session = collect(monkeypatch, responses)
+    assert _walked([route(u) for u in session.calls]) == ["a"]
+    assert out["walks_held"] is False
+
+
 # Value: protects=a deferred walk is released when every other datastore's
 #   walk reached PBS and none returned a listing (an offline or unplugged
 #   datastore answers 400), but not when one never reached PBS (refused, or
@@ -8355,26 +8376,42 @@ def test_a_reload_never_defers_every_datastore(monkeypatch):
 #   walk before any other datastore was read); why_new=red team, ship 10
 #   pass 3; seam=none
 @pytest.mark.parametrize(
-    "answer, released",
+    "answer, other, released",
     [
-        (fail(400, "datastore is in maintenance mode"), True),
-        ({"error": "connection_refused", "message": "refused"}, False),
-        ({"error": "timeout", "message": "t"}, False),
+        (fail(400, "datastore is in maintenance mode"), None, True),
+        ({"error": "connection_refused", "message": "refused"}, None, False),
+        ({"error": "timeout", "message": "t"}, None, False),
+        (
+            {"error": "connection_refused", "message": "refused"},
+            fail(400, "datastore is in maintenance mode"),
+            False,
+        ),
     ],
-    ids=["answered_400", "never_reached", "timed_out"],
+    ids=["answered_400", "never_reached", "timed_out", "one_of_two_never_reached"],
 )
 def test_a_deferred_walk_is_released_when_no_other_datastore_lists(
-    monkeypatch, answer, released
+    monkeypatch, answer, other, released
 ):
     # Value (row): protects=a walk of another datastore that timed out (the
     #   hold armed again) releases nothing; fails_when=the hold is ignored
     #   (the deferred walk goes out after the next reload, alongside the
     #   datastore that just armed the hold); why_new=red team; seam=none
+    # Value (row): protects=the deferred walk stays deferred while ANY other
+    #   datastore's walk never reached PBS, even when another one's was
+    #   answered (one_of_two_never_reached); fails_when=one walk that reached
+    #   PBS is enough (the release tests `asked` or `sent_walk` alone: the
+    #   broken walk goes out before every other datastore was read);
+    #   why_new=coverage audit, ship 11: both of those mutants survived (every
+    #   row had one other datastore); seam=none
     use_clock(monkeypatch, Clock())
     monkeypatch.setattr(pbs, "_deferred_walks", {"b"})
-    responses = _datastores_with(["a", "b"], **{"/admin/datastore/a/namespace": answer})
+    names = ["a", "b"] if other is None else ["a", "b", "c"]
+    overrides = {"/admin/datastore/a/namespace": answer}
+    if other is not None:
+        overrides["/admin/datastore/c/namespace"] = other
+    responses = _datastores_with(names, **overrides)
     _, session = collect(monkeypatch, responses)
-    assert _walked([route(u) for u in session.calls]) == ["a"]
+    assert _walked([route(u) for u in session.calls]) == [n for n in names if n != "b"]
     assert pbs._deferred_walks == (set() if released else {"b"})
 
 
@@ -8404,6 +8441,38 @@ def test_a_build_that_lists_nothing_ends_the_head_walk_first(monkeypatch):
             "/admin/datastore/a/gc"
         )
         assert order is walk_first
+
+
+# Value: protects=after a build that listed no namespace but was CUT (its
+#   walks past the cutoff), the head holding the group cursor still walks
+#   first, so the group reads resume inside it; fails_when=a build with no
+#   unit ends the head's walk-first whatever was cut (the head's gc takes
+#   the walk room again: its namespaces skipped for another build);
+#   why_new=coverage audit, ship 11: only the uncut no-unit build was pinned,
+#   the early return set to False survived; seam=none
+def test_a_build_that_lists_nothing_but_was_cut_keeps_the_head_walk_first(
+    monkeypatch,
+):
+    clock = use_clock(monkeypatch, Clock())
+    real = pbs._read_datastores
+
+    def late(session, target, errors, deadline, *args):
+        clock.now = deadline - 10.05  # one walk fits, only before the head's gc
+        return real(session, target, errors, deadline, *args)
+
+    monkeypatch.setattr(pbs, "_read_datastores", late)
+    responses = _datastores_with(["a", "b"])
+    responses["/admin/datastore/b/namespace"] = ok([{"ns": ""}, {"ns": "x"}])
+    responses["/admin/datastore/b/groups?ns=x"] = ok([])
+    responses["/admin/datastore/b/snapshots?ns=x"] = ok([])
+    monkeypatch.setattr(pbs, "_rotation", ("b", "x"))  # cut inside b before
+    monkeypatch.setattr(pbs, "_store_rotation", "a")
+    session = _install_timed(monkeypatch, responses, clock, lambda path: 0.2)
+    _, sent = _timed_build(monkeypatch, clock, session)
+    assert _walked(sent) == []  # a's gc took the only walk's room: a cut
+    _, sent = _timed_build(monkeypatch, clock, session)
+    assert _walked(sent) == ["b"]
+    assert "/admin/datastore/b/groups?ns=x" in sent
 
 
 # Value: protects=a walk sent from the walk-first branch counts as asked:
@@ -8523,12 +8592,14 @@ def test_a_usage_armed_hold_keeps_the_deferred_walk(monkeypatch):
 
 
 # Value: protects=after a reload, a build whose head datastore's gc takes the
-#   walk room sends no walk and keeps the reload order; the next walks every
-#   other datastore, then the broken one comes last; fails_when=the order is
-#   consumed by a build that sent no walk (reproduced live on PBS 4.2: the
-#   broken datastore walked second, re-arming the hold, another never
-#   walked); why_new=testing review and QA; seam=none
-def test_a_reload_whose_head_gc_takes_the_walk_room_keeps_its_order(monkeypatch):
+#   walk room sends no walk and keeps the walk it deferred; the next walks
+#   every other datastore, then the broken one comes last; fails_when=the
+#   deferral is released by a build that sent no walk (reproduced live on PBS
+#   4.2: the broken datastore walked second, re-arming the hold, another
+#   never walked); why_new=testing review and QA; seam=none
+def test_a_reload_whose_head_gc_takes_the_walk_room_keeps_the_deferred_walk(
+    monkeypatch,
+):
     clock = use_clock(monkeypatch, Clock())
     timeout = {"error": "timeout", "message": "t"}
     responses = _datastores_with(
@@ -8651,21 +8722,22 @@ def test_a_reload_landing_during_a_build_keeps_its_deferral(monkeypatch, others)
     assert pbs._deferred_walks == {"b"}
 
 
-# Value: protects=a deferred walk stays deferred while the group reads have
-#   not passed its datastore, and goes out once they have (cut inside a later
-#   datastore, round the order from where they began); fails_when=any build
-#   that sends a walk releases it (a big PBS whose group reads lag the walks:
-#   the broken walk re-arms the hold before the namespaces between the group
-#   cursor and it were ever read, 5559 never read over 96 red-team runs), or
-#   the order is not read round from the first datastore read (a deferred
-#   datastore before it in name order reads as passed at once); why_new=red
-#   team, ship 10 pass 3; seam=none
+# Value: protects=a deferred walk stays deferred until the group reads have
+#   gone a full lap from where they stood at the reload (every other
+#   namespace read since), wherever the deferred datastore sits in that
+#   lap, and goes out right after; fails_when=it goes out as soon as the
+#   reads pass its datastore (a still-broken walk re-arms the hold with only
+#   the namespaces between the cursor and it read: 187 of 1356 re-arming runs
+#   under 100%, performance review, ship 11), or any build that sends a walk
+#   releases it (5559 never read over 96 red-team runs, ship 10), or it is
+#   never released; why_new=red team, ship 10 pass 3, rewritten for the lap
+#   rule (ship 11); seam=none
 @pytest.mark.parametrize(
     "deferred, rotation",
     [("c", ("a", "")), ("a", ("c", ""))],
     ids=["after_the_cursor", "before_the_cursor"],
 )
-def test_a_deferred_walk_waits_until_the_group_reads_pass_it(
+def test_a_deferred_walk_waits_for_a_full_lap_of_the_group_reads(
     monkeypatch, deferred, rotation
 ):
     clock = use_clock(monkeypatch, Clock())
@@ -8675,19 +8747,31 @@ def test_a_deferred_walk_waits_until_the_group_reads_pass_it(
         responses[f"/admin/datastore/{store}/namespace"] = ok([{"ns": ""}, {"ns": "x"}])
         responses[f"/admin/datastore/{store}/groups?ns=x"] = ok([])
         responses[f"/admin/datastore/{store}/snapshots?ns=x"] = ok([])
-    monkeypatch.setattr(pbs, "_deferred_walks", {deferred})
+    failure = ("namespaces", deferred, None, "t")
+    pbs._timeout_backoff[pbs._WALK_HOLD] = (math.inf, 1, failure)
     monkeypatch.setattr(pbs, "_rotation", rotation)
     monkeypatch.setattr(pbs, "_store_rotation", rotation[0])
+    pbs.reset_timeout_holds()  # the lap starts where the group reads stand
+    assert (pbs._deferred_walks, pbs._lap_origin) == ({deferred}, rotation)
 
     def latency(path):
         return 6.0 if "/groups" in path else 0.1  # three units a build
 
     session = _install_timed(monkeypatch, responses, clock, latency)
-    _, sent = _timed_build(monkeypatch, clock, session)
-    assert deferred not in _walked(sent)
-    assert pbs._deferred_walks == {deferred}  # the reads stopped short of it
-    _timed_build(monkeypatch, clock, session)
-    assert pbs._deferred_walks == set()  # passed: read round past it
+    others = {(s, ns) for s in names if s != deferred for ns in ("", "x")}
+    read = set()
+    for build in range(1, 7):
+        _, sent = _timed_build(monkeypatch, clock, session)
+        assert deferred not in _walked(sent)
+        read |= {
+            (p.split("/")[3], "x" if p.endswith("?ns=x") else "")
+            for p in sent
+            if "/groups" in p
+        }
+        if not pbs._deferred_walks:
+            break
+    assert read >= others, sorted(others - read)  # a full lap first
+    assert build <= 4, build
     _, sent = _timed_build(monkeypatch, clock, session)
     assert deferred in _walked(sent)
 
@@ -8809,6 +8893,207 @@ def test_a_read_skipped_before_it_was_sent_is_not_counted(monkeypatch):
     assert read is None and session.calls == []
     assert pbs._reads_sent == 0
     assert [e["message"] for e in errors] == [pbs._DEADLINE_MESSAGE]
+
+
+# Value: protects=a read held back by its timeout backoff reports itself as
+#   never sent to a caller that asks (on_error); fails_when=the backoff skip
+#   keeps the default sent=True (a caller counting reads that reached PBS
+#   from on_error would count a backed-off read); why_new=maintainability
+#   review, ship 11; seam=none
+def test_a_backoff_skip_reports_not_sent(monkeypatch):
+    clock = use_clock(monkeypatch, Clock())
+    path = "/admin/datastore/ds/gc"
+    key = pbs._timeout_backoff_key(path, None)
+    pbs._timeout_backoff[key] = (clock.now + 100, 1, ("gc", "ds", None, "t"))
+    seen = []
+    target = _target()
+    read = pbs._sub_read(
+        FakeSession(responses_handler(minimal_responses())),
+        target,
+        pbs._Errors(target.redact),
+        clock.now + 20,
+        "gc",
+        path,
+        kind=dict,
+        backoff="retry",
+        on_error=seen.append,
+    )
+    assert read is None
+    assert [(e.skipped, e.sent) for e in seen] == [("backoff", False)]
+    assert pbs._reads_sent == 0
+
+
+# Value: protects=an HTTP error answered past the budget but within the
+#   minimum wait the read was granted keeps its body in the errors[] message;
+#   fails_when=the error body is still clamped to the budget (the detail is
+#   dropped: 'HTTP 500: ' instead of 'HTTP 500: EIO'); why_new=testing review,
+#   ship 11: that mutant survived every test; seam=none
+def test_an_error_answered_within_the_granted_wait_keeps_its_detail(monkeypatch):
+    clock = use_clock(monkeypatch, Clock())
+    path = "/admin/datastore/ds/snapshots"
+    handler = responses_handler(minimal_responses(**{path: fail(500, "EIO")}))
+
+    def answers_in_two_seconds(url):
+        clock.now += 2  # past the 1s budget, inside the 5s wait it was granted
+        return handler(url)
+
+    session = FakeSession(answers_in_two_seconds)
+    target = _target()
+    errors = pbs._Errors(target.redact)
+    read = pbs._sub_read(
+        session, target, errors, clock.now + 1, "snapshots", path, backoff="retry"
+    )
+    assert read is None
+    assert [e["message"] for e in errors] == ["HTTP 500: EIO"]
+
+
+# Value: protects=a build that could not walk (no room for one, or every
+#   walk held) leaves the head walk-first state as the last group reads left
+#   it, so the next build with room walks the group cursor's datastore first;
+#   fails_when=such a build, which reads no group, resets the state (the
+#   realigned build reads that datastore's gc first, sends no walk and reads
+#   no group: half the group reads lost when such builds alternate,
+#   reproduced live, ship 11 QA ISSUE-001); why_new=testing and
+#   maintainability review, ship 11; seam=none
+@pytest.mark.parametrize("before", ["no_room", "held"])
+def test_a_build_that_could_not_walk_keeps_the_head_walk_first(monkeypatch, before):
+    clock = use_clock(monkeypatch, Clock())
+    real = pbs._read_datastores
+    left = {"value": 10.05}  # one walk fits, only before the head's gc
+
+    def late(session, target, errors, deadline, *args):
+        clock.now = deadline - left["value"]
+        return real(session, target, errors, deadline, *args)
+
+    monkeypatch.setattr(pbs, "_read_datastores", late)
+    responses = _datastores_with(["a", "b"])
+    for store in ("a", "b"):
+        responses[f"/admin/datastore/{store}/status"] = ok(
+            {"total": 9, "used": 4, "avail": 5}
+        )
+    responses["/admin/datastore/a/namespace"] = ok([{"ns": ""}, {"ns": "x"}])
+    responses["/admin/datastore/a/groups?ns=x"] = ok([])
+    responses["/admin/datastore/a/snapshots?ns=x"] = ok([])
+    monkeypatch.setattr(pbs, "_rotation", ("a", "x"))  # group reads cut inside a
+    monkeypatch.setattr(pbs, "_store_rotation", "a")
+    session = _install_timed(monkeypatch, responses, clock, lambda path: 0.2)
+    if before == "no_room":
+        left["value"] = 9.9  # no room for any walk: no group read runs
+        _, sent = _timed_build(monkeypatch, clock, session)
+        left["value"] = 10.05
+    else:
+        failure = ("usage", None, None, "t")
+        pbs._timeout_backoff[pbs._WALK_HOLD] = (math.inf, 1, failure)
+        _, sent = _timed_build(monkeypatch, clock, session)
+        pbs.reset_timeout_holds()  # names no datastore: nothing deferred
+    assert _walked(sent) == []
+    _, sent = _timed_build(monkeypatch, clock, session)
+    assert _walked(sent) == ["a"]  # the group reads still resume inside a
+    assert "/admin/datastore/a/groups?ns=x" in sent
+
+
+# Value: protects=one build whose group reads are cut never locks a lone
+#   datastore whose walk takes the per-datastore half into walk-first for
+#   good: its gc is read again; fails_when=a datastore cut only by its own
+#   gc keeps the group reads pending although every namespace was read (the
+#   walk-first walk pushes the gc past the half every build: 0 gc reads in
+#   10 builds, reproduced live, ship 11 QA ISSUE-002); why_new=red team,
+#   ship 11; seam=none
+def test_one_cut_group_read_does_not_starve_a_lone_datastores_gc(monkeypatch):
+    clock = use_clock(monkeypatch, Clock())
+    slow = {"on": False}
+
+    def latency(path):
+        if path == "/admin/datastore/ds/namespace":
+            return 9.9
+        if "/groups" in path or "/snapshots" in path:
+            return 9.0 if slow["on"] else 0.05
+        return 0.1
+
+    session = _install_timed(monkeypatch, _datastores_with(["ds"]), clock, latency)
+    out, _ = _timed_build(monkeypatch, clock, session)
+    assert out["datastores"][0]["gc"] is not None
+    slow["on"] = True
+    _timed_build(monkeypatch, clock, session)  # the group reads are cut once
+    slow["on"] = False
+    gcs = []
+    for _ in range(10):
+        out, _ = _timed_build(monkeypatch, clock, session)
+        gcs.append(out["datastores"][0]["gc"] is not None)
+    assert any(gcs), gcs
+
+
+# Value: protects=a datastore repaired before the reload is walked again
+#   when the datastores are read in windows and a window ends right before
+#   it; fails_when=the deferral is released only by group reads going past
+#   its datastore in one build (it has no unit, so the next window starts
+#   past it every time: never walked again until a restart, reproduced live
+#   on PBS 4.2, ship 11 QA ISSUE-003); why_new=performance review, ship 11;
+#   seam=none
+def test_a_repaired_deferred_datastore_on_a_window_edge_is_walked_again(
+    monkeypatch,
+):
+    clock = use_clock(monkeypatch, Clock())
+    names = [f"s{i:02d}" for i in range(7)]
+    broken = {"s01"}
+
+    def latency(path):
+        if path == "/admin/datastore/s01/namespace" and broken:
+            return math.inf
+        if path.endswith("/namespace"):
+            return 1.5
+        if path.endswith(("/groups", "/snapshots")):
+            return 0.05
+        return 0.6
+
+    session = _install_timed(monkeypatch, _datastores_with(names), clock, latency)
+    for _ in range(50):
+        _timed_build(monkeypatch, clock, session)
+        if pbs._WALK_HOLD in pbs._timeout_backoff:
+            break
+    assert pbs._timeout_backoff[pbs._WALK_HOLD][2][1] == "s01"
+    broken.clear()  # repaired, proxy restarted
+    pbs.reset_timeout_holds()  # SIGHUP
+    walked = []
+    for _ in range(20):  # a healthy group pass takes 2 builds here
+        _, sent = _timed_build(monkeypatch, clock, session)
+        walked += _walked(sent)
+    assert "s01" in walked
+
+
+# Value: protects=reloads that defer nothing new (SIGHUP is the agent's
+#   general capability refresh, sent by tooling) never restart the lap a
+#   repaired datastore waits for; fails_when=every reload resets the lap
+#   origin (with a SIGHUP every 3 builds the repaired datastore stays
+#   deferred for good: 258 of 360 red-team runs); why_new=red team, ship 11;
+#   seam=none
+@pytest.mark.parametrize("every", [3, 1000])
+def test_unrelated_reloads_do_not_keep_a_repaired_walk_deferred(monkeypatch, every):
+    clock = use_clock(monkeypatch, Clock())
+    names = [f"s{i:02d}" for i in range(31)]
+    broken = {"on": True}
+
+    def latency(path):
+        if path == "/admin/datastore/s15/namespace" and broken["on"]:
+            return math.inf
+        return 1.5 if path.endswith("/namespace") else 0.3
+
+    session = _install_timed(monkeypatch, _datastores_with(names), clock, latency)
+    for _ in range(100):
+        _timed_build(monkeypatch, clock, session)
+        if pbs._WALK_HOLD in pbs._timeout_backoff:
+            break
+    assert pbs._timeout_backoff[pbs._WALK_HOLD][2][1] == "s15"
+    broken["on"] = False
+    walked = []
+    for i in range(60):
+        if i % every == 0:
+            pbs.reset_timeout_holds()
+        _, sent = _timed_build(monkeypatch, clock, session)
+        walked += _walked(sent)
+        if "s15" in walked:
+            break
+    assert "s15" in walked
 
 
 # Value: protects=a datastore whose walk armed the hold is deferred after a
@@ -8944,7 +9229,7 @@ def test_the_carried_local_nodes_are_the_last_learned_only(monkeypatch):
 #   seam=none
 def test_a_reload_naming_no_datastore_still_defers_the_gathered_walks(monkeypatch):
     use_clock(monkeypatch, Clock())
-    monkeypatch.setattr(pbs, "_deferred_walks", {"b"})  # its walk never answered
+    monkeypatch.setattr(pbs, "_deferred_walks", {"b"})  # no listing returned since
     failure = ("usage", None, None, "armed by the usage status")
     pbs._timeout_backoff[pbs._WALK_HOLD] = (math.inf, 1, failure)
     pbs.reset_timeout_holds()
@@ -8989,6 +9274,15 @@ def test_the_group_cursor_datastore_walks_first_only_at_the_head(monkeypatch):
     paths = [route(u) for u in session.calls]
     assert paths.index("/admin/datastore/b/gc") < paths.index(
         "/admin/datastore/b/namespace"
+    )
+    # Value (row): protects=the head reads its own gc before its walk when the
+    #   group reads, though pending, do not resume inside it; fails_when=the
+    #   head walks first whenever group reads are pending, wherever they
+    #   resume (its walk takes the room of its gc on a slow PBS);
+    #   why_new=coverage audit, ship 11: dropping the group-cursor check from
+    #   the head rule survived (only b's order was asserted); seam=none
+    assert paths.index("/admin/datastore/a/gc") < paths.index(
+        "/admin/datastore/a/namespace"
     )
 
 
