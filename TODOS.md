@@ -22,14 +22,17 @@ filed yet in fivenines_server. Agent-side follow-ups, not blockers:
   Fix direction: ship the PBS host's names (hostname, FQDN) in the loopback
   block -- an additive optional key -- and extend the join rule
   (pve_join_contract) to match them when there is no fingerprint.
-- The per-datastore phase reads GC status one datastore at a time (N+1):
-  PBS >= 3.2 serves every datastore's in ONE `GET /admin/gc`. Measured with a
-  50ms RTT and 100 datastores, the per-store reads use the phase's half of the
-  budget and 98/100 datastores get their namespaces; one aggregate read gets
-  100/100 in 15.4s. Fix direction: read `/admin/gc` first, fall back to the
-  per-store read on a 404 (PBS < 3.2) AND for every listed datastore missing
-  from it (PBS drops a datastore whose status fails, and a scoped token's
-  403s, from that 200). Needs a real capture for the contract fixture first.
+- The gc step reads GC status one datastore at a time (N+1): PBS >= 3.2
+  serves every datastore's in ONE `GET /admin/gc`. The per-store reads get
+  half of what the namespace walks leave, so on a distant PBS with many
+  datastores (100 at a 50ms RTT: ~5s of round trips alone) they go round the
+  datastores over several refreshes, and while the walks are held a
+  datastore's remembered groups are read only in a refresh where its gc
+  answered. Fix direction: read `/admin/gc` first, fall back to the per-store
+  read on a 404 (PBS < 3.2) AND for every listed datastore missing from it
+  (PBS drops a datastore whose status fails, and a scoped token's 403s, from
+  that 200) -- keeping the per-datastore gc answer as the proof that its
+  storage still answers. Needs a real capture for the contract fixture first.
 
 ## P2: `read_capped_body` does not bound a slow-drip body that has a Content-Length
 

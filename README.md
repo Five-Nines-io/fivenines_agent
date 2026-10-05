@@ -1330,14 +1330,17 @@ token scoped to some datastores never reads the usage summary, which would
 walk every other datastore on the PBS: it reports the usage of a datastore it
 audits as a whole from that datastore's own status.) With a datastore on a stale or broken mount, PBS never finishes
 that walk and each request holds one of its proxy threads for good, so one
-broken storage costs one thread however many datastores it carries. Every
+broken storage costs one thread for those walks however many datastores it
+carries. Every
 other slow read is retried later, less and less often (at most every 6
 hours) -- a datastore's own status and garbage-collection status included,
 which on a dead mount may never end either: each retry then holds one more
 proxy thread. Meanwhile the dashboard shows every datastore's namespaces as
 unknown and the job lists as possibly incomplete, but the backups of the
-namespaces the agent listed before keep being refreshed (one deleted meanwhile
-is only removed once the walks resume); a full-scope token still reports each
+namespaces the agent listed before keep being refreshed on every datastore
+whose garbage-collection status still answers (one deleted meanwhile is only
+removed once the walks resume; a datastore whose storage stopped answering is
+left alone); a full-scope token still reports each
 datastore's usage, without its estimated full date. Act on it quickly: the stuck walk keeps one
 PBS core busy and logs an error on every turn until `proxmox-backup-proxy`
 restarts. Once the datastore is repaired, restart

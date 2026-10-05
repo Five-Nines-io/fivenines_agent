@@ -41,23 +41,35 @@ LOOPBACK = {"host": "localhost", "verify_ssl": False, **TOKEN}
 GC_UPID = "UPID:n:00000025:000023D8:0000000A:0000000B:garbage_collection:ds:root@pam:"
 
 
+def _reset_state(monkeypatch):
+    """Every piece of the module's state, fresh (the containers mutated in
+    place too: a test ending with a deferred walk would defer it in the
+    next one)."""
+    for name, value in (
+        ("_cache", TTLCache()),
+        ("_rotation", None),
+        ("_local_nodes", set()),
+        ("_stalled_worker", None),
+        ("_stalled_progress", {}),
+        ("_timeout_backoff", {}),
+        ("_auth_backoff", None),
+        ("_last_logged_failure", None),
+        ("_store_rotation", None),
+        ("_listings", {}),
+        ("_listings_key", None),
+        ("_timed_out", set()),
+        ("_deferred_walks", set()),
+        ("_reloads", 0),
+        ("_known_nodes", (None, frozenset())),
+        ("_read_failures", {"previous": set(), "current": set()}),
+        ("_read_failure_lines", {"error": 0, "quieted": 0}),
+    ):
+        monkeypatch.setattr(pbs, name, value)
+
+
 @pytest.fixture(autouse=True)
 def _fresh_state(monkeypatch):
-    monkeypatch.setattr(pbs, "_cache", TTLCache())
-    monkeypatch.setattr(pbs, "_rotation", None)
-    monkeypatch.setattr(pbs, "_local_nodes", set())
-    monkeypatch.setattr(pbs, "_stalled_worker", None)
-    monkeypatch.setattr(pbs, "_stalled_progress", {})
-    monkeypatch.setattr(pbs, "_timeout_backoff", {})
-    monkeypatch.setattr(pbs, "_auth_backoff", None)
-    monkeypatch.setattr(pbs, "_last_logged_failure", None)
-    monkeypatch.setattr(pbs, "_store_rotation", None)
-    monkeypatch.setattr(pbs, "_listings", {})
-    monkeypatch.setattr(pbs, "_listings_key", None)
-    monkeypatch.setattr(pbs, "_reloads", 0)
-    monkeypatch.setattr(pbs, "_known_nodes", (None, frozenset()))
-    monkeypatch.setattr(pbs, "_read_failures", {"previous": set(), "current": set()})
-    monkeypatch.setattr(pbs, "_read_failure_lines", {"error": 0, "quieted": 0})
+    _reset_state(monkeypatch)
 
 
 # --- test doubles ----------------------------------------------------------
@@ -532,7 +544,8 @@ def test_every_skip_message_the_contract_quotes_is_the_one_the_agent_ships():
         pbs._TIMEOUT_HOLD_MESSAGE,
         pbs._ROTATION_MESSAGE,
         pbs._RELOAD_DEFER_MESSAGE,
-        pbs._FORGOTTEN_MESSAGE,
+        pbs._TIMED_OUT_MESSAGE,
+        pbs._NO_ANSWER_MESSAGE,
     }
     matched = set()
     for quote in quoted:
@@ -1404,13 +1417,19 @@ def test_a_scoped_token_reaching_no_datastore_is_no_access(monkeypatch):
     assert out["error_type"] == "no_datastore_access"
 
 
+# Value (extension): protects=an empty listing stays a trusted, error-free
+#   block after earlier builds left their resume points on a datastore since
+#   removed (its last one); fails_when=a resume point is looked up in the
+#   empty datastore list (modulo by zero: every tick fails until a restart);
+#   why_new=the row ran with no resume point set; seam=none
 def test_a_full_scope_token_trusts_an_empty_pbs(monkeypatch):
-    out, _ = collect(
-        monkeypatch,
-        minimal_responses(
-            **{"/admin/datastore": ok([]), "/status/datastore-usage": ok([])}
-        ),
+    empty = minimal_responses(
+        **{"/admin/datastore": ok([]), "/status/datastore-usage": ok([])}
     )
+    out, _ = collect(monkeypatch, empty)
+    assert out["datastores"] == [] and out["groups"] == [] and out["errors"] == []
+    collect(monkeypatch, minimal_responses())  # ds, then removed from PBS
+    out, _ = collect(monkeypatch, empty)
     assert out["datastores"] == [] and out["groups"] == [] and out["errors"] == []
 
 
@@ -2595,9 +2614,30 @@ def _two_datastores(namespaces=("", "x"), **overrides):
     return responses
 
 
-def test_the_namespace_cap_is_shared_across_datastores(monkeypatch):
+# Value (rows): protects=a listing the namespace cap drops whole was still
+#   read and scanned: a parentless namespace in it makes the block partial,
+#   a clean one flags no job list; fails_when=it is scanned only
+#   when kept (scope full, jobs pruned) or counted as unread; why_new=both
+#   mutants survived, the cap rows asserted no flag; seam=none
+@pytest.mark.parametrize(
+    "b_listing, scope, flag",
+    [
+        (["", "x"], "full", None),
+        (["", "x/y"], "partial", pbs._HIDDEN_NAMESPACE_REASON),
+    ],
+    ids=["clean", "hides_a_namespace"],
+)
+def test_the_namespace_cap_is_shared_across_datastores(
+    monkeypatch, b_listing, scope, flag
+):
     monkeypatch.setattr(pbs, "MAX_NAMESPACES", 3)
-    out, _ = collect(monkeypatch, _two_datastores())
+    listing = ok([{"ns": ns} for ns in b_listing])
+    out, _ = collect(
+        monkeypatch, _two_datastores(**{"/admin/datastore/b/namespace": listing})
+    )
+    assert out["scope"] == scope
+    flags = [e["message"] for e in out["errors"] if e["message"].startswith("partial")]
+    assert flags == ([] if flag is None else ["partial: " + flag] * 3)
     a, b = out["datastores"]
     assert (a["namespaces"], a["unread_namespaces"]) == (["", "x"], [])
     # b's listing does not fit what a left: none of it is kept (its set is
@@ -7757,11 +7797,13 @@ class _TimedSession:
         self.clock = clock
         self.latency = latency
         self.calls = []
+        self.timeouts = []
 
     def get(self, url, params=None, timeout=None, stream=None, allow_redirects=None):
         if params:
             url += "?" + urlencode(params)
         self.calls.append(url)
+        self.timeouts.append(timeout)
         wait = self.latency(route(url))
         if wait > timeout[1]:
             self.clock.now += timeout[1]
@@ -8512,6 +8554,13 @@ def test_a_suspect_note_is_due_at_once_uncounted_and_capped(monkeypatch):
     pbs._arm_timeout_backoff(keys[2], late, hold=False)
     pbs._suspect_timeout(keys[3], late)
     assert list(pbs._timeout_backoff) == [keys[0], keys[2], keys[3]]
+    # The hold alone at the cap (the table cleared by a SIGHUP meanwhile, or
+    # a cap of one) is never the entry dropped.
+    pbs._timeout_backoff.clear()
+    monkeypatch.setattr(pbs, "_TIMEOUT_BACKOFF_ENTRIES", 1)
+    pbs._arm_timeout_backoff(keys[0], held, hold=True)
+    pbs._suspect_timeout(keys[1], late)
+    assert list(pbs._timeout_backoff) == [keys[0], keys[1]]
 
 
 # Value: protects=on a PBS where no walk fits, a head datastore whose own
@@ -8912,7 +8961,7 @@ def test_a_timed_out_namespace_read_stops_its_datastore_a_gc_timeout_does_not(
     monkeypatch,
 ):
     clock = use_clock(monkeypatch, Clock())
-    responses = _two_datastores(namespaces=("", "x", "y"))
+    responses = _two_datastores(namespaces=("", "x", "y", "z"))
     session = _install_timed(
         monkeypatch,
         responses,
@@ -8921,20 +8970,23 @@ def test_a_timed_out_namespace_read_stops_its_datastore_a_gc_timeout_does_not(
     )
     out, sent = _timed_build(monkeypatch, clock, session)
     a, b = out["datastores"]
-    assert (a["unread_namespaces"], b["unread_namespaces"]) == (["x", "y"], [])
+    assert (a["unread_namespaces"], b["unread_namespaces"]) == (["x", "y", "z"], [])
     assert "/admin/datastore/a/groups?ns=y" not in sent
-    assert {
-        "scope": "groups",
-        "store": "a",
-        "ns": None,
-        "message": f"{pbs._FORGOTTEN_MESSAGE} (1 namespace(s) not read)",
-    } in out["errors"]
-    assert "a" not in pbs._listings
+    # One entry counting the namespaces left, not one per namespace.
+    assert [e for e in out["errors"] if e["ns"] is None and e["store"] == "a"] == [
+        {
+            "scope": "groups",
+            "store": "a",
+            "ns": None,
+            "message": f"{pbs._TIMED_OUT_MESSAGE} (2 namespace(s) not read)",
+        }
+    ]
+    assert "a" not in pbs._listings  # it waited its whole read timeout
     session.latency = lambda path: math.inf if path == "/admin/datastore/b/gc" else 0.1
     out, _ = _timed_build(monkeypatch, clock, session)
     a, b = out["datastores"]
     assert b["gc"] is None and b["unread_namespaces"] == []
-    assert a["unread_namespaces"] == ["x"]  # backed off; walked again, y read
+    assert a["unread_namespaces"] == ["x"]  # backed off; walked again, y z read
 
 
 # Value: protects=on a PBS with more namespaces than the cap, the listings go
@@ -9066,6 +9118,9 @@ def test_a_reload_during_a_build_keeps_where_it_put_the_reads(monkeypatch):
 #   does a datastore no longer listed; fails_when=they grow with every
 #   datastore ever walked, or one PBS's listings are read on another;
 #   why_new=ship 11 redesign; seam=none
+# Value (extension): protects=a datastore listed again moves to newest, so the
+#   bound holds; fails_when=it keeps its old slot (eviction stops at it: every
+#   datastore's listing kept); why_new=no row re-remembered a store; seam=none
 def test_the_remembered_listings_are_bounded_and_per_pbs(monkeypatch):
     monkeypatch.setattr(pbs, "MAX_NAMESPACES", 3)
     pbs._remember("a", ["", "x"])
@@ -9073,6 +9128,12 @@ def test_the_remembered_listings_are_bounded_and_per_pbs(monkeypatch):
     assert pbs._listings == {"b": ["", "x"]}
     pbs._remember("c", ["", "x", "y"])
     assert pbs._listings == {"c": ["", "x", "y"]}
+    # Extension: a datastore listed again becomes the newest, so the ones
+    # remembered since it was first listed are the oldest -- forgotten first.
+    pbs._remember("a", [""])
+    pbs._remember("b", [""])
+    pbs._remember("a", ["", "x", "y"])  # walked again, grown
+    assert pbs._listings == {"a": ["", "x", "y"]}
     monkeypatch.setattr(pbs, "MAX_NAMESPACES", 1000)
     collect(monkeypatch, _datastores_with(["a", "b"]))
     assert set(pbs._listings) == {"a", "b"}
@@ -9081,6 +9142,44 @@ def test_the_remembered_listings_are_bounded_and_per_pbs(monkeypatch):
     assert set(pbs._listings) == {"a"} and pbs._listings_key == key
     collect(monkeypatch, _datastores_with(["b"]), token_id="other@pbs!t")
     assert set(pbs._listings) == {"b"} and pbs._listings_key != key
+
+
+# Value: protects=when the datastore the reads stand in cannot be walked
+#   (offline: PBS refuses its listing), the next one's namespaces are read in
+#   that build; fails_when=the resume split applies to the first datastore
+#   walked (all its namespaces skipped as 'before the resume point', a lap
+#   late); why_new=mutant survived: the split tests walk the cursor's own
+#   datastore; seam=none
+def test_an_offline_datastore_at_the_cursor_never_skips_the_next_ones_groups(
+    monkeypatch,
+):
+    clock = use_clock(monkeypatch, Clock())
+    real_backends, real_walk = pbs._read_backends, pbs._read_namespaces
+
+    def slow_preamble(*args):
+        left = pbs._READ_TIMEOUT + pbs._AFTER_WALKS + 0.5
+        clock.now += pbs.PBS_COLLECT_DEADLINE - left
+        return real_backends(*args)
+
+    def slow_a(session, target, errors, deadline, store):
+        listing = real_walk(session, target, errors, deadline, store)
+        if store == "a":
+            clock.now += 1  # no further walk fits: the walks stop at b
+        return listing
+
+    monkeypatch.setattr(pbs, "_read_backends", slow_preamble)
+    monkeypatch.setattr(pbs, "_read_namespaces", slow_a)
+    offline = "datastore 'c' is unavailable: offline maintenance mode: disk swap"
+    responses = _datastores_with(
+        ["a", "b", "c"], **{"/admin/datastore/c/namespace": fail(400, offline)}
+    )
+    monkeypatch.setattr(pbs, "_rotation", ("c", ""))  # the reads stand in c
+    read = _spy_groups(monkeypatch)
+    out, session = collect(monkeypatch, responses)
+    assert _walked([route(u) for u in session.calls]) == ["c", "a"]
+    assert read == [("a", "")]
+    a = out["datastores"][0]
+    assert (a["namespaces"], a["unread_namespaces"]) == ([""], [])
 
 
 # Value: protects=on random slow and broken PBSes, a namespace is never
@@ -9095,16 +9194,7 @@ def test_the_remembered_listings_are_bounded_and_per_pbs(monkeypatch):
 def test_no_namespace_ships_as_read_without_both_reads_answering(monkeypatch):
     for seed in range(25):
         rnd = random.Random(seed)
-        monkeypatch.setattr(pbs, "_cache", TTLCache())
-        for name, value in (
-            ("_rotation", None),
-            ("_store_rotation", None),
-            ("_listings", {}),
-            ("_listings_key", None),
-            ("_timeout_backoff", {}),
-            ("_deferred_walks", set()),
-        ):
-            monkeypatch.setattr(pbs, name, value)
+        _reset_state(monkeypatch)
         clock = use_clock(monkeypatch, Clock())
         names = [f"s{i}" for i in range(rnd.randint(1, 4))]
         spaces = {s: [""] + [f"n{j}" for j in range(rnd.randint(0, 3))] for s in names}
@@ -9167,3 +9257,306 @@ def test_no_namespace_ships_as_read_without_both_reads_answering(monkeypatch):
         }
         if all(latency[f"/admin/datastore/{s}/namespace"] < 9 for s in names):
             assert readable <= seen, (seed, sorted(readable - seen))
+
+
+# Value: protects=a build with no time left for any walk leaves the group
+#   reads where they stand, so builds alternating with such a build still
+#   read every namespace; fails_when=the walks' stop at the datastore the
+#   reads stand in is taken as the end of a round (the reads restart at its
+#   root: 8 of 32 namespaces never read with a slow build every second one);
+#   why_new=ship 12 review (testing + performance, CRITICAL); seam=none
+def test_a_build_with_no_room_for_a_walk_keeps_the_group_reads_where_they_stand(
+    monkeypatch,
+):
+    clock = use_clock(monkeypatch, Clock())
+    spaces = [""] + [f"n{i:02d}" for i in range(30)]
+    responses = _datastores_with(["x", "y"])
+    responses["/admin/datastore/x/namespace"] = ok([{"ns": ns} for ns in spaces])
+    for ns in spaces[1:]:
+        responses[f"/admin/datastore/x/groups?ns={ns}"] = ok([])
+        responses[f"/admin/datastore/x/snapshots?ns={ns}"] = ok([])
+    slow = {"on": False}
+    real = pbs._read_backends
+
+    def maybe_slow(*args):
+        if slow["on"]:  # less than a read timeout left: no walk is sent
+            clock.now += pbs.PBS_COLLECT_DEADLINE - pbs._READ_TIMEOUT + 0.5
+        return real(*args)
+
+    monkeypatch.setattr(pbs, "_read_backends", maybe_slow)
+    session = _install_timed(
+        monkeypatch,
+        responses,
+        clock,
+        lambda path: 0.4 if "/groups" in path or "/snapshots" in path else 0.05,
+    )
+    slow["on"] = True
+    monkeypatch.setattr(pbs, "_rotation", ("x", "n07"))
+    _, sent = _timed_build(monkeypatch, clock, session)
+    assert _walked(sent) == [] and pbs._rotation == ("x", "n07")
+    read = set()
+    for build in range(20):
+        slow["on"] = build % 2 == 1
+        out, _ = _timed_build(monkeypatch, clock, session)
+        for d in out["datastores"]:
+            if d["namespaces"] is not None:
+                done = set(d["namespaces"]) - set(d["unread_namespaces"])
+                read |= {(d["store"], ns) for ns in done}
+    assert read == {("x", ns) for ns in spaces} | {("y", "")}
+
+
+# Value: protects=slow walks that leave a slow head gc less than its 5s wait
+#   plus the group reads' reserve never take the group reads' time: the gc
+#   is clamped, so every build reads groups; fails_when=the wait is granted
+#   whatever is left (the gc runs past the budget, no group read starts, the
+#   next build is the same: no snapshot read in 8 builds); why_new=ship 12
+#   review (performance, CRITICAL); seam=none
+def test_slow_walks_and_a_slow_head_gc_never_starve_the_group_reads(monkeypatch):
+    clock = use_clock(monkeypatch, Clock())
+    walk = {"a": 0.1, "b": 5.4, "c": 9.9, "d": 0.1}
+
+    def latency(path):
+        if path.endswith("/namespace"):
+            return walk[path.split("/")[3]]
+        return 4.5 if path.endswith("/gc") else 0.05
+
+    session = _install_timed(monkeypatch, _datastores_with(list(walk)), clock, latency)
+    for _ in range(8):
+        _, sent = _timed_build(monkeypatch, clock, session)
+        assert any(p.split("?")[0].endswith("/snapshots") for p in sent)
+
+
+# Value (rows): protects=an own status or gc read gets its 5s minimum wait
+#   only with the group reads' reserve left after it -- else it is clamped
+#   and its timeout only notes it -- and one that timed out before is not
+#   sent at all without that room; fails_when=the wait ignores the reserve
+#   (the group reads get nothing), or a noted read is re-sent clamped on
+#   every build (one proxy thread each time on a dead mount); why_new=ship
+#   12 review, user decision D2; seam=none
+@pytest.mark.parametrize(
+    "left, noted, read_timeout, retry_later",
+    [
+        (8.0, False, 5, True),  # room: the wait, and a timeout arms the backoff
+        (7.9, False, 3.9, False),  # no room: clamped to its half, only noted
+        (8.0, True, 5, True),  # noted, room: sent with the wait, arms it
+        (7.9, True, None, False),  # noted, no room: not sent
+    ],
+)
+def test_a_gc_gets_its_minimum_wait_only_with_the_group_reads_reserve_left(
+    monkeypatch, left, noted, read_timeout, retry_later
+):
+    clock = use_clock(monkeypatch, Clock())
+    session = _install_timed(
+        monkeypatch, _datastores_with(["a"]), clock, lambda path: math.inf
+    )
+    key = pbs._timeout_backoff_key("/admin/datastore/a/gc", None)
+    if noted:
+        pbs._timeout_backoff[key] = (clock.now, 0, ("gc", "a", None, "t"))
+    errors = pbs._Errors(str)
+    tick = clock.now + left
+    gc = pbs._read_gc(
+        session,
+        _target(),
+        errors,
+        clock.now + 3.9,  # its half
+        "a",
+        first=True,
+        wait_by=tick - pbs._GROUP_READS_RESERVE,
+    )
+    assert gc is None
+    if read_timeout is None:
+        assert session.calls == []
+        assert [e["message"] for e in errors] == [pbs._TIMEOUT_BACKOFF_MESSAGE]
+    else:
+        assert [t[1] for t in session.timeouts] == [pytest.approx(read_timeout)]
+        assert (pbs._timeout_backoff[key][0] > clock.now) is retry_later
+
+
+# Value: protects=the gc is read before the own status, so a slow own status
+#   (the usage aggregate failing) never takes the gc's time at the head;
+#   fails_when=the own status goes first (it takes its 5s wait past the
+#   half, the head gc is never sent and the head is moved past: no gc read
+#   in 8 builds); why_new=ship 12 review (performance, CRITICAL); seam=none
+def test_a_slow_own_status_never_starves_the_gc_reads(monkeypatch):
+    clock = use_clock(monkeypatch, Clock())
+    responses = _datastores_with(
+        ["a", "b"], **{"/status/datastore-usage": fail(500, "EIO")}
+    )
+    for store in ("a", "b"):
+        responses[f"/admin/datastore/{store}/status"] = ok(
+            {"total": 9, "used": 4, "avail": 5}
+        )
+    walk = {"a": 5.4, "b": 9.9}
+
+    def latency(path):
+        if path.endswith("/namespace"):
+            return walk[path.split("/")[3]]
+        if path.startswith("/admin/datastore/") and path.endswith("/status"):
+            return 2.5
+        return 0.05
+
+    session = _install_timed(monkeypatch, responses, clock, latency)
+    for _ in range(8):
+        out, sent = _timed_build(monkeypatch, clock, session)
+        assert any(d["gc"] is not None for d in out["datastores"])
+        for store in ("a", "b"):
+            gc, status = (
+                f"/admin/datastore/{store}/{leaf}" for leaf in ("gc", "status")
+            )
+            if status in sent:
+                assert sent.index(gc) < sent.index(status)
+
+
+def _held_two_datastores(namespaces=("", "x")):
+    """_two_datastores, with the own status each datastore's usage is read
+    from while the walk hold also holds the usage aggregate."""
+    responses = _two_datastores(namespaces)
+    for store in ("a", "b"):
+        responses[f"/admin/datastore/{store}/status"] = ok(
+            {"total": 9, "used": 1, "avail": 8}
+        )
+    return responses
+
+
+# Value: protects=a namespace read the budget cut short (clamped under its
+#   read timeout) keeps its datastore's remembered listing, so under the
+#   walk hold a merely slow read late in the tick does not blind the
+#   datastore until a reload; fails_when=any timeout forgets the listing
+#   (measured: 157 -> 33 remembered listings over 96 held builds);
+#   why_new=ship 12 red team; seam=none
+def test_a_read_the_budget_cut_short_keeps_its_datastores_listing(monkeypatch):
+    clock = use_clock(monkeypatch, Clock())
+    latency = {}
+    session = _install_timed(
+        monkeypatch, _held_two_datastores(), clock, lambda path: latency.get(path, 0.05)
+    )
+    _timed_build(monkeypatch, clock, session)  # both listings remembered
+    pbs._timeout_backoff[pbs._WALK_HOLD] = (math.inf, 1, ("usage", None, None, "t"))
+    latency["/admin/datastore/a/snapshots?ns=x"] = 6.0
+    real = pbs._read_all_groups
+
+    def late(session, target, errors, deadline, *args):
+        clock.now = max(clock.now, deadline - 5.5)  # the read is clamped to 5.5s
+        return real(session, target, errors, deadline, *args)
+
+    monkeypatch.setattr(pbs, "_read_all_groups", late)
+    out, sent = _timed_build(monkeypatch, clock, session)
+    assert out["walks_held"] and "/admin/datastore/a/snapshots?ns=x" in sent
+    assert pbs._timed_out == {"a"} and set(pbs._listings) == {"a", "b"}
+
+
+# Value: protects=while every walk is held, a datastore whose gc read got no
+#   answer in the build gets no group read, so a dead storage under several
+#   datastores pins no extra proxy thread through their remembered listings,
+#   while a live one is still read; fails_when=only a gc that timed out
+#   before counts (a datastore whose gc the half never reached still gets a
+#   /groups read: one more pinned thread per datastore on the dead storage);
+#   why_new=ship 12 security review, user decision D3; seam=none
+def test_a_dead_storage_gets_no_group_read_while_the_walks_are_held(monkeypatch):
+    clock = use_clock(monkeypatch, Clock())
+    names = ["a", "b", "c", "d"]
+    responses = _datastores_with(names)
+    for store in names:
+        responses[f"/admin/datastore/{store}/status"] = ok(
+            {"total": 9, "used": 1, "avail": 8}
+        )
+    session = _install_timed(monkeypatch, responses, clock, lambda path: 0.1)
+    _timed_build(monkeypatch, clock, session)  # every listing remembered
+    dead = tuple(f"/admin/datastore/{store}/" for store in "abc")
+    session.latency = lambda path: math.inf if path.startswith(dead) else 0.1
+    live, skipped = 0, 0
+    for _ in range(6):
+        out, sent = _timed_build(monkeypatch, clock, session)
+        assert out["walks_held"]
+        assert not [
+            p
+            for p in sent
+            if p.startswith(dead)
+            and p.split("?")[0].endswith(("/groups", "/snapshots"))
+        ]
+        live += "/admin/datastore/d/groups" in sent
+        skipped += any(
+            e["message"].startswith(pbs._NO_ANSWER_MESSAGE) for e in out["errors"]
+        )
+    assert live and skipped
+
+
+# Value: protects=while every walk is held, a gc read that PBS answered with
+#   an HTTP error (a namespace-scoped token's 403) still shows the datastore
+#   answering, so its remembered listing is read; fails_when=only a gc that
+#   succeeded counts (such a token gets no group read at all for as long as
+#   the hold lasts); why_new=ship 12 Fix-First, the mutant that survived;
+#   seam=none
+def test_a_gc_refused_with_an_http_error_still_counts_as_an_answer(monkeypatch):
+    clock = use_clock(monkeypatch, Clock())
+    responses = _held_two_datastores()
+    responses["/admin/datastore/a/gc"] = fail(403, "permission check failed")
+    session = _install_timed(monkeypatch, responses, clock, lambda path: 0.05)
+    _timed_build(monkeypatch, clock, session)  # both listings remembered
+    pbs._timeout_backoff[pbs._WALK_HOLD] = (math.inf, 1, ("usage", None, None, "t"))
+    out, sent = _timed_build(monkeypatch, clock, session)
+    assert out["walks_held"] and out["datastores"][0]["gc"] is None
+    assert "/admin/datastore/a/groups?ns=x" in sent
+
+
+# Value (rows): protects=a build whose walks stopped before every datastore
+#   (the budget, or a walk deferred after a reload) flags every job list
+#   'partial:' with the unlisted reason; fails_when=only a failed or trimmed
+#   listing counts as not read (a namespace a deeper ACL entry hides in a
+#   datastore not walked this build would hide its jobs from lists read as
+#   complete); why_new=ship 12 review (testing); seam=none
+@pytest.mark.parametrize("why", ["budget", "reload"])
+def test_a_datastore_not_walked_flags_every_job_list(monkeypatch, why):
+    clock = use_clock(monkeypatch, Clock())
+    walk = 0.05
+    if why == "budget":
+        walk = 9.0  # the second walk would need 14s left
+    else:
+        monkeypatch.setattr(pbs, "_deferred_walks", {"b"})
+    session = _install_timed(
+        monkeypatch,
+        _datastores_with(["a", "b"]),
+        clock,
+        lambda path: walk if path.endswith("/namespace") else 0.05,
+    )
+    out, sent = _timed_build(monkeypatch, clock, session)
+    assert _walked(sent) == ["a"]
+    flags = {
+        e["scope"]: e["message"]
+        for e in out["errors"]
+        if e["message"].startswith("partial:")
+    }
+    assert flags == {
+        scope: "partial: " + pbs._UNLISTED_REASON
+        for scope in ("sync_jobs", "verify_jobs", "prune_jobs")
+    }
+
+
+# Value: protects=while every walk is held, group reads the budget cut inside
+#   a namespace resume at that exact (store, ns) in the next build, through
+#   the remembered listings; fails_when=the remembered reads restart at a
+#   datastore's root or at the first listing (the namespaces past the cut
+#   never read while the hold lasts); why_new=ship 12 review (testing);
+#   seam=none
+def test_the_group_reads_under_the_hold_resume_where_they_were_cut(monkeypatch):
+    clock = use_clock(monkeypatch, Clock())
+    session = _install_timed(
+        monkeypatch, _held_two_datastores(("", "x", "y")), clock, lambda path: 0.05
+    )
+    _timed_build(monkeypatch, clock, session)  # both listings remembered
+    pbs._timeout_backoff[pbs._WALK_HOLD] = (math.inf, 1, ("usage", None, None, "t"))
+    real = pbs._read_groups
+    read = []
+
+    def spy(session, target, errors, deadline, store, ns, room):
+        read.append((store, ns))
+        if (store, ns) == ("b", "x") and len(read) < 10:
+            clock.now = deadline  # the budget runs out inside it
+        return real(session, target, errors, deadline, store, ns, room)
+
+    monkeypatch.setattr(pbs, "_read_groups", spy)
+    _timed_build(monkeypatch, clock, session)
+    assert read[-1] == ("b", "x") and pbs._rotation == ("b", "x")
+    del read[:]
+    _timed_build(monkeypatch, clock, session)
+    assert read[0] == ("b", "x")
