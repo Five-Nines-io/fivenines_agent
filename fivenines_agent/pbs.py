@@ -95,7 +95,9 @@ reading backup metadata):
   (SIGHUP) or restarted -- one broken storage pins one proxy thread, however
   many datastores it carries -- and every other read that can take long
   (groups, snapshots, a datastore's own status and gc) is retried on a backoff
-  (_timeout_backoff).
+  (_timeout_backoff), except that while every walk is held the first group
+  or snapshot read that times out stops every group read until the reload too
+  (_GROUPS_HOLD).
 - Every request's timeouts are clamped to what is left of the tick's
   wall-clock budget, or of the per-datastore reads' half of it (so the
   collector stays NEAR it: one request can still overrun by its own clamped
@@ -244,9 +246,10 @@ _DEADLINE_MESSAGE = "skipped: pbs collection deadline exceeded"
 _AFTER_WALKS = 4
 # What an own status or gc read leaves the group reads when it takes its
 # minimum wait (see _sub_read): without this much of the tick left after that
-# wait, it is clamped to its half instead -- a slow gc at the head would
-# otherwise run past the budget and leave the group reads nothing, build
-# after build.
+# wait, it is clamped instead -- to its half, or, for the head datastore's
+# own status, to what is left before this reserve -- since a slow gc at the
+# head would otherwise run past the budget and leave the group reads
+# nothing, build after build.
 _GROUP_READS_RESERVE = 3
 # A namespace of the datastore the group reads resumed in, before the point
 # they resumed at, when the walks did not go round every datastore: never
@@ -403,9 +406,6 @@ _store_rotation = None
 # storage died is not sent one group read per namespace, each a proxy thread
 # it may pin.
 _listings: dict = {}
-# The datastores where a namespace walk, /groups or /snapshots read timed out
-# in the build in progress: the group reads leave them for the rest of it.
-_timed_out: set = set()
 # The PBS and token the listings came from (target.cache_key): another one
 # starts afresh.
 _listings_key = None
@@ -451,7 +451,8 @@ class _PbsError(Exception):
     is no evidence about the PBS either way. `pending`: sent, and not answered
     in time (a read timeout that waited its whole read timeout -- never a
     connect one, nor a stalled TLS handshake urllib3 reports as a read one),
-    so PBS may still be running it."""
+    so PBS may still be running it. `unsent`: skipped past the budget at
+    the very moment of sending (see _UNSENT)."""
 
     def __init__(
         self,
@@ -461,6 +462,7 @@ class _PbsError(Exception):
         status=None,
         skipped=None,
         pending=False,
+        unsent=False,
     ):
         super().__init__(message)
         self.error_type = error_type
@@ -469,6 +471,7 @@ class _PbsError(Exception):
         self.status = status
         self.skipped = skipped
         self.pending = pending
+        self.unsent = unsent
 
 
 def _config_error(message):
@@ -1096,6 +1099,11 @@ def _log_read_failure(scope, message, store=None, ns=None):
 
 
 _UNSET = object()
+# What a namespace walk or a /groups read returns when it was never sent: its
+# send check found the budget spent although the caller's own check, a moment
+# before, did not. The caller then handles it exactly as if its check had
+# stopped it (no walk counted, no listing forgotten, no namespace passed).
+_UNSENT = object()
 
 # After a read TIMED OUT, PBS may still be running it. A slow read ends, so it
 # waits: one rebuild at first, twice as long after each further timeout, at
@@ -1125,8 +1133,8 @@ _UNSET = object()
 # per-datastore ones still open the datastore, which on a dead hard-mounted
 # NFS may never return: each retry of those may pin one more proxy thread, at
 # the backoff's doubling pace.
-# {(path, params) or _WALK_HOLD: (retry-after monotonic time -- inf for the
-#  hold --, timeouts, the _read_failures key of its failure)}. Keyed on the
+# {(path, params), _WALK_HOLD or _GROUPS_HOLD: (retry-after monotonic time --
+#  inf for a hold --, timeouts, the _read_failures key of its failure)}. Keyed on the
 # request alone, not on the PBS's address, token or TLS policy: the stuck walk
 # pins that PBS's proxy whoever asks and however its host is spelled
 # (localhost, 127.0.0.2, ::1, its FQDN), so no configuration change may
@@ -1205,7 +1213,6 @@ def _arm_timeout_backoff(key, failure, hold):
     # backoff: a gc that merely answers slowly must not cost its namespaces
     # a turn.)
     if failure[0] in ("namespaces", "groups", "snapshots"):
-        _timed_out.add(failure[1])
         _listings.pop(failure[1], None)
         held = _WALK_HOLD in _timeout_backoff
         if failure[0] != "namespaces" and held and _GROUPS_HOLD not in _timeout_backoff:
@@ -1260,14 +1267,29 @@ def reset_timeout_holds():
     only once the group reads reach it, after every other datastore -- if
     it is still broken, every other one is walked and its groups read before
     it arms the hold again, and the group reads then go on over the listings
-    remembered."""
+    remembered. So does the datastore whose group read armed _GROUPS_HOLD, a
+    known suspect too. A hold the usage status armed (a full-scope token)
+    names no datastore and defers nothing: after the reload that status is
+    sent again first, and on a storage still dead it re-arms the hold before
+    any walk."""
     global _cache, _reloads, _rotation
     _reloads += 1
-    hold = _timeout_backoff.get(_WALK_HOLD)
-    failure = hold[2] if isinstance(hold, tuple) and len(hold) == 3 else None
-    if isinstance(failure, tuple) and failure[:1] == ("namespaces",):
-        if isinstance(failure[1], str) and len(_deferred_walks) < MAX_DATASTORES:
+    for key, scopes in (
+        (_GROUPS_HOLD, ("groups", "snapshots")),
+        (_WALK_HOLD, ("namespaces",)),  # last: its placement wins
+    ):
+        hold = _timeout_backoff.get(key)
+        failure = hold[2] if isinstance(hold, tuple) and len(hold) == 3 else None
+        if not (
+            isinstance(failure, tuple)
+            and len(failure) > 1
+            and failure[0] in scopes
+            and isinstance(failure[1], str)
+        ):
+            continue  # nothing armed it, or the usage status (no datastore)
+        if len(_deferred_walks) < MAX_DATASTORES:
             _deferred_walks.add(failure[1])
+        if key == _WALK_HOLD:
             # Sorts just after that datastore (no name holds a NUL: _SAFE_ID),
             # and marks a reload's placement for _read_walks.
             _rotation = (failure[1] + "\x00", "")
@@ -1335,6 +1357,12 @@ def _sub_read(
         store=store,
         ns=ns,
     ):
+        if on_error is not None:
+            on_error(
+                _PbsError(
+                    "timeout", _DEADLINE_MESSAGE, True, skipped="deadline", unsent=True
+                )
+            )
         return None
     now = time.monotonic()
     room = wait_by is None or wait_by - now >= _TIMEOUT_BACKOFF_MIN_WAIT
@@ -1569,7 +1597,6 @@ def _build_block(session, target, deadline):
     _read_failures["current"] = set()
     _read_failure_lines.update(error=0, quieted=0)
     _local_nodes.clear()
-    _timed_out.clear()
     _forget_stale_backoffs()
     permissions = _get(session, target, "/access/permissions", deadline=deadline)
     remote_audit, full_scope, grants = _check_privileges(permissions, target.redact)
@@ -1893,9 +1920,14 @@ def _read_walks(session, target, errors, deadline, names):
         if why is not None:
             _error(errors, why[0], why[1], store=name)
             continue
+        namespaces = _read_namespaces(session, target, errors, deadline, name)
+        if namespaces is _UNSENT:
+            # The budget ran out between the check above and the send: as if
+            # the check had stopped it (its skip entry is already written).
+            why, stop = ("namespaces", _DEADLINE_MESSAGE), name
+            continue
         first = False
         _deferred_walks.discard(name)
-        namespaces = _read_namespaces(session, target, errors, deadline, name)
         if namespaces is None:
             _listings.pop(name, None)
             continue
@@ -1932,8 +1964,9 @@ def _read_stores(
     wedged datastore (a hung NFS mount) never leaves the group reads with
     nothing. They go round the datastores from `_store_rotation`, and the
     next build resumes at the first datastore whose gc the half cut, timed
-    as the gc ends (a gc that merely failed early is no cut) -- or past it
-    when it was the first of the build: it had the whole half. The gc is
+    as the gc ends (a gc that merely failed early is no cut), or whose own
+    status the half cut short before it had its wait -- or past it when it
+    was the first of the build: it had the whole half. The gc is
     read first: an own status sent first could take the half at the head
     datastore, build after build, and no gc would ever be read -- and the
     head's own status still gets its own minimum wait after a gc that took
@@ -1983,6 +2016,15 @@ def _read_stores(
                 first=index == 0,
                 wait_by=wait_by,
             )
+            # Cut short by the half and only noted (never had its wait): a
+            # cut too, so the next build starts here and it gets the head's
+            # wait -- else the gc cut alone never moves past it and the same
+            # datastore stays last, its usage unread on every build.
+            note = _timeout_backoff.get(
+                _timeout_backoff_key(_store_path(name, "status"), None)
+            )
+            if cut is None and not row and note is not None and note[1] == 0:
+                cut, started = index, began < phase_deadline
         else:
             row = {}
         datastore = _datastore(entry, row, backends.get(name))
@@ -2041,8 +2083,10 @@ def _read_all_groups(session, target, errors, deadline, window, stop, reloads):
     (`stop`): past the last namespace of the datastores walked, its next
     read is the first walk of the next build; when the walks stopped at the
     datastore the reads stand in (no walk had time), they stay where they
-    stand. Once a read in a datastore timed out (_timed_out), the rest of
-    its namespaces wait for a later build (a 'groups' entry). While every
+    stand. Once a read in a datastore timed out (its listing forgotten, see
+    _arm_timeout_backoff), the rest of its namespaces wait for the next
+    build (a 'groups' entry), which resumes at the first of them: passed
+    over for a round, they would meet the same slow read on every round. While every
     walk is held, the first group read that times out stops every group
     read until the reload (_GROUPS_HOLD): a dead NAS under
     several datastores would otherwise get one more read, a proxy thread it
@@ -2068,7 +2112,6 @@ def _read_all_groups(session, target, errors, deadline, window, stop, reloads):
                 store=name,
             )
 
-    held = not window and _WALK_HOLD in _timeout_backoff
     if window:
         order = [(store, ns) for store in window for ns in _listings.get(store, [])]
         if _rotation is not None and _rotation[0] == window[0]:
@@ -2081,13 +2124,13 @@ def _read_all_groups(session, target, errors, deadline, window, stop, reloads):
                 order += earlier
             else:
                 skip(earlier, _ROTATION_MESSAGE)
-    elif held:
+    elif _WALK_HOLD in _timeout_backoff:
         units = sorted((store, ns) for store in _listings for ns in _listings[store])
         start = _start_index(units, _rotation)
         order = units[start:] + units[:start]
     else:
         order = []
-    cut, started = None, True
+    cut, started, passed = None, True, None
     for index, (store, ns) in enumerate(order):
         if time.monotonic() >= deadline:
             skip(order[index:], _DEADLINE_MESSAGE)
@@ -2100,12 +2143,20 @@ def _read_all_groups(session, target, errors, deadline, window, stop, reloads):
         if _GROUPS_HOLD in _timeout_backoff:
             skipped.setdefault(_GROUPS_HOLD_MESSAGE, []).append((store, ns))
             continue
-        if store in _timed_out:
+        if store not in _listings:  # a read in it timed out in this build
             skipped.setdefault(_TIMED_OUT_MESSAGE, []).append((store, ns))
+            passed = index if passed is None else passed
             continue
         result = _read_groups(
             session, target, errors, deadline, store, ns, MAX_GROUPS - len(groups)
         )
+        if result is _UNSENT:
+            # The budget ran out between the check above and the send: as if
+            # the check had stopped it.
+            after = index + 1
+            skip(order[after:], _DEADLINE_MESSAGE)
+            cut, started = index, False
+            break
         finished = False
         if result is not None:
             rows, complete, detailed, over = result
@@ -2136,6 +2187,8 @@ def _read_all_groups(session, target, errors, deadline, window, stop, reloads):
             break
     for message, units in skipped.items():
         skip(units, message)
+    if passed is not None and (cut is None or passed < cut):
+        cut, started = passed, False
     # Where the walks stopped is the last item of this round: the next build
     # goes there once every namespace before it was reached -- or, when they
     # stopped where the reads stand (nothing walked), stays where they stand.
@@ -2389,7 +2442,9 @@ def _read_namespaces(session, target, errors, deadline, store):
     """The namespaces the token can see, sorted, or None when unread. A PBS
     older than namespaces (2.2) answers 404 on the endpoint: root only. ONE
     unparseable row makes the whole set unknown: a namespace silently dropped
-    would read as deleted, with all its groups."""
+    would read as deleted, with all its groups. _UNSENT when it was never
+    sent."""
+    failures = []
     rows = _sub_read(
         session,
         target,
@@ -2399,10 +2454,11 @@ def _read_namespaces(session, target, errors, deadline, store):
         _store_path(store, "namespace"),
         store=store,
         missing=[{"ns": ""}],
+        on_error=failures.append,
         backoff="hold",
     )
     if rows is None:
-        return None
+        return _UNSENT if any(e.unsent for e in failures) else None
     if not all(
         isinstance(row, dict) and _is_name(row.get("ns"), namespace=True)
         for row in rows
@@ -2419,7 +2475,8 @@ def _read_namespaces(session, target, errors, deadline, store):
 
 def _read_groups(session, target, errors, deadline, store, ns, room):
     """(rows, complete, detailed, over) for one namespace, or None when
-    /groups itself could not be read (the namespace is then unknown). At most
+    /groups itself could not be read (the namespace is then unknown) --
+    _UNSENT when it was never sent. At most
     `room` rows are built (what the group cap has left); ``over`` counts the
     valid groups past it, which a hostile listing would otherwise make cost a
     row each.
@@ -2436,6 +2493,7 @@ def _read_groups(session, target, errors, deadline, store, ns, room):
     "snapshots" error naming the namespace.
     """
     params = _ns_params(ns)
+    failures = []
     listing = _sub_read(
         session,
         target,
@@ -2446,10 +2504,11 @@ def _read_groups(session, target, errors, deadline, store, ns, room):
         params,
         store=store,
         ns=ns,
+        on_error=failures.append,
         backoff="retry",
     )
     if listing is None:
-        return None
+        return _UNSENT if any(e.unsent for e in failures) else None
     wanted = []
     malformed = 0
     over = 0

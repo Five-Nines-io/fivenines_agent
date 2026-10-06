@@ -1351,7 +1351,9 @@ an agent update, a crash restart -- so repair a broken datastore before
 reloading the agent for anything else (if it is still broken, the refreshes
 after the reload read the namespaces and backups of every other datastore
 first and leave its namespaces for later -- unless every datastore is
-broken -- so it can block the walks again only after that round; a datastore
+broken, or the hold came from the usage summary, which names no datastore
+and is read first again -- so it can block the walks again only after that
+round; a datastore
 repaired without restarting the proxy is read again once that round is done,
 which on a large PBS takes a few refreshes, and reloading the agent for
 another reason meanwhile does not restart that round); changing the PBS host,
