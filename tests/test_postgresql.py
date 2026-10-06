@@ -5,8 +5,11 @@ tests mock at two seams:
   - pg8000.dbapi.connect    -> for _connect routing (TCP vs unix socket)
   - fivenines_agent.postgresql._connect / the helpers -> for orchestration
 
+and run the real driver at one more: scram_only_server, a loopback socket that
+speaks just enough of the wire protocol to demand SCRAM-SHA-256.
+
 No real PostgreSQL is needed. The opt-in integration test that exercises a real
-socket lives in test_postgresql_integration.py.
+server lives in test_postgresql_integration.py.
 """
 
 import os
@@ -140,26 +143,105 @@ def test_connect_forwards_ssl_context(monkeypatch):
         assert isinstance(conn.call_args.kwargs["ssl_context"], ssl.SSLContext)
 
 
-def test_connect_scram_without_password_is_an_auth_interface_error():
+def scram_decode_crash():
+    """The AttributeError pg8000 raises on SCRAM with no password: None.decode()."""
+    return AttributeError(
+        "'NoneType' object has no attribute 'decode'", name="decode", obj=None
+    )
+
+
+@pytest.mark.parametrize(
+    "host, route",
+    [("localhost", "host"), ("/var/run/postgresql", "unix_sock")],
+    ids=["tcp", "unix-socket"],
+)
+def test_connect_scram_without_password_is_an_auth_interface_error(host, route):
     """pg8000 has no missing-password guard on the SCRAM path and raises
     AttributeError from None.decode(); with no password resolved anywhere,
     _connect turns it into the InterfaceError pg8000 raises for cleartext/MD5,
-    so it classifies as auth_failed rather than the generic error."""
-    crash = AttributeError("'NoneType' object has no attribute 'decode'")
-    with patch(f"{PG}.pg8000.dbapi.connect", side_effect=crash):
+    so it classifies as auth_failed rather than the generic error. A
+    `local ... scram-sha-256` pg_hba line reaches the same path over the unix
+    socket, where password=None (peer auth) is the norm."""
+    crash = scram_decode_crash()
+    with patch(f"{PG}.pg8000.dbapi.connect", side_effect=crash) as conn:
         with pytest.raises(InterfaceError) as raised:
-            _connect("localhost", 5432, "postgres", None, "postgres")
+            _connect(host, 5432, "postgres", None, "postgres")
+    assert route in conn.call_args.kwargs
     assert raised.value.__cause__ is crash
     assert _error_category(raised.value) == "auth_failed"
 
 
-def test_connect_attribute_error_with_a_password_is_not_reclassified():
-    """With a password supplied the SCRAM path cannot hit None.decode(), so an
-    AttributeError there is something else and must surface unchanged."""
-    crash = AttributeError("something else")
-    with patch(f"{PG}.pg8000.dbapi.connect", side_effect=crash):
+@pytest.mark.parametrize(
+    "config_password, pgpassword, pgpass_content",
+    [
+        ("secret", None, None),
+        (None, "env-secret", None),
+        (None, None, "*:*:*:*:pgpass-secret\n"),
+        (None, None, "*:*:*:*:\n"),
+    ],
+    ids=["config", "pgpassword", "pgpass", "pgpass-empty-password"],
+)
+def test_connect_decode_crash_with_a_password_is_not_reclassified(
+    monkeypatch, tmp_path, config_password, pgpassword, pgpass_content
+):
+    """The guard keys on the RESOLVED password, not the config argument: with
+    one from config, PGPASSWORD or .pgpass (even an empty one, which pg8000
+    encodes and sends), SCRAM cannot hit None.decode(), so even an
+    AttributeError shaped like it is something else and must surface
+    unchanged."""
+    if pgpassword is not None:
+        monkeypatch.setenv("PGPASSWORD", pgpassword)
+    if pgpass_content is not None:
+        monkeypatch.setenv("PGPASSFILE", _write_pgpass(tmp_path, pgpass_content))
+    with patch(f"{PG}.pg8000.dbapi.connect", side_effect=scram_decode_crash()) as conn:
         with pytest.raises(AttributeError):
-            _connect("localhost", 5432, "postgres", "secret", "postgres")
+            _connect("localhost", 5432, "postgres", config_password, "postgres")
+    assert conn.call_args.kwargs["password"] is not None
+
+
+@pytest.mark.parametrize(
+    "crash",
+    [
+        AttributeError(
+            "'Connection' object has no attribute 'auth'", name="auth", obj=object()
+        ),
+        AttributeError("'str' object has no attribute 'decode'", name="decode", obj=""),
+        AttributeError("something else"),
+    ],
+    ids=["other-attribute", "decode-on-a-str", "no-attribute-context"],
+)
+def test_metrics_other_attribute_error_without_password_stays_a_generic_error(
+    crash,
+):
+    """Only the None.decode() crash is the missing SCRAM password. Any other
+    AttributeError with no password (a server sending SASLContinue before SASL
+    leaves pg8000 without self.auth) is a different bug: it keeps the generic
+    error and its detail instead of reading as "check credentials"."""
+    with patch(f"{PG}.pg8000.dbapi.connect", side_effect=crash):
+        result = postgresql_metrics(host="127.0.0.1", password=None)
+    assert result == {"reachable": False, "error": "error", "error_detail": str(crash)}
+
+
+@pytest.mark.parametrize(
+    "message, expected",
+    [
+        (
+            "something else",
+            {"reachable": False, "error": "error", "error_detail": "something else"},
+        ),
+        ("", {"reachable": False, "error": "error"}),
+    ],
+    ids=["with-detail", "blank-detail"],
+)
+def test_metrics_attribute_error_with_a_password_stays_a_generic_error(
+    message, expected
+):
+    """Regression guard on the payload: with a password configured, an
+    AttributeError out of pg8000 still ships the generic error (with its
+    detail when it has one), exactly as before the SCRAM reclassification."""
+    with patch(f"{PG}.pg8000.dbapi.connect", side_effect=AttributeError(message)):
+        result = postgresql_metrics(host="127.0.0.1", password="secret")
+    assert result == expected
 
 
 @contextmanager
@@ -167,8 +249,9 @@ def scram_only_server():
     """A loopback socket that speaks just enough of the PostgreSQL protocol to
     demand SCRAM-SHA-256, as a stock PostgreSQL 14+ does on a TCP host line.
 
-    Every other test mocks pg8000.dbapi.connect, which is how pg8000's missing
-    SCRAM guard went unnoticed: this one runs the real driver handshake.
+    Every other connect-path test mocks pg8000.dbapi.connect, which is how
+    pg8000's missing SCRAM guard went unnoticed: this one runs the real driver
+    handshake, as far as the server's mechanism offer.
     """
     import struct
     import threading
@@ -180,25 +263,16 @@ def scram_only_server():
     listener.listen(1)
     listener.settimeout(5)
 
-    def read_exact(conn, size):
-        data = b""
-        while len(data) < size:
-            chunk = conn.recv(size - len(data))
-            if not chunk:
-                raise EOFError
-            data += chunk
-        return data
-
     def serve():
         try:
             conn, _ = listener.accept()
         except OSError:
             return
-        with conn:
+        with conn, conn.makefile("rb") as stream:
             try:
                 while True:
-                    (length,) = struct.unpack("!i", read_exact(conn, 4))
-                    (code,) = struct.unpack("!i", read_exact(conn, length - 4)[:4])
+                    (length,) = struct.unpack("!i", stream.read(4))
+                    (code,) = struct.unpack("!i", stream.read(length - 4)[:4])
                     if code != ssl_request_code:  # the StartupMessage
                         break
                     conn.sendall(b"N")
@@ -206,7 +280,7 @@ def scram_only_server():
                 body = struct.pack("!i", auth_sasl) + b"SCRAM-SHA-256" + bytes(2)
                 conn.sendall(b"R" + struct.pack("!i", len(body) + 4) + body)
                 conn.recv(1)  # wait for the client to give up
-            except (EOFError, OSError):
+            except (struct.error, OSError):
                 pass
 
     thread = threading.Thread(target=serve, daemon=True)
@@ -218,14 +292,43 @@ def scram_only_server():
         thread.join(timeout=5)
 
 
-def test_metrics_scram_server_without_password_reports_auth_failed():
+@pytest.mark.parametrize(
+    "password", [None, ""], ids=["no-password", "blank-config-password"]
+)
+def test_metrics_scram_server_without_password_reports_auth_failed(password):
     """End to end through real pg8000: a SCRAM-only server and no password in
     config, PGPASSWORD or .pgpass reports auth_failed, not the
     "'NoneType' object has no attribute 'decode'" generic error that agents up
-    to 1.20.4 sent (rendered server-side as a red PostgreSQL outage)."""
+    to 1.20.4 sent (rendered server-side as a red PostgreSQL outage). A blank
+    dashboard password field arrives as "", which _resolve_password treats as
+    unset, so it takes the same path."""
     with scram_only_server() as port:
-        result = postgresql_metrics(host="127.0.0.1", port=port, password=None)
+        result = postgresql_metrics(host="127.0.0.1", port=port, password=password)
     assert result == {"reachable": False, "error": "auth_failed"}
+
+
+@pytest.mark.parametrize(
+    "exc, expected",
+    [
+        (
+            with_cause(InterfaceError("x"), ConnectionRefusedError()),
+            "connection_refused",
+        ),
+        (with_cause(InterfaceError("x"), socket.timeout()), "timeout"),
+        (DatabaseError({"C": "3D000", "M": 'database "x" does not exist'}), "error"),
+    ],
+    ids=["refused", "timeout", "no-such-database"],
+)
+def test_metrics_other_connect_errors_without_password_keep_their_category(
+    exc, expected
+):
+    """Only AttributeError is reclassified: with no password anywhere, a
+    refused port, a timeout or a mistyped database out of pg8000 must keep its
+    own category, never read as auth_failed."""
+    with patch(f"{PG}.pg8000.dbapi.connect", side_effect=exc):
+        result = postgresql_metrics(host="127.0.0.1", password=None)
+    assert result["reachable"] is False
+    assert result["error"] == expected
 
 
 # ---------------------------------------------------------------------------
