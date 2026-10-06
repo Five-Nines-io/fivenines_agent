@@ -270,12 +270,13 @@ _TIMED_OUT_MESSAGE = (
     "skipped: a read on this datastore timed out in this build, so the rest "
     "of its namespaces wait for a later one"
 )
-# While every walk is held, the namespaces of a datastore whose gc read did
-# not answer in this build: nothing shows its storage readable (see
-# _read_all_groups).
-_NO_ANSWER_MESSAGE = (
-    "skipped: the namespace walks are held and the gc read of this datastore "
-    "did not answer in this build, so its groups wait for one that does"
+# While every walk is held, every namespace once a group read timed out
+# (_GROUPS_HOLD): no read shows which storage is alive
+# (PBS answers a datastore's gc from memory), so none is sent until the
+# reload (see _read_all_groups).
+_GROUPS_HOLD_MESSAGE = (
+    "skipped: a group read timed out while the namespace walks are held, so "
+    "no group is read until the agent is reloaded (SIGHUP)"
 )
 # Why the job lists are flagged 'partial:' once the namespace listings are in
 # (see _build_block): one named a namespace without its parent, or one was not
@@ -398,9 +399,9 @@ _store_rotation = None
 # through those of the datastores it walked, and while every walk is held,
 # when no listing can be read, through all of them (_read_all_groups). A
 # listing is kept only while its datastore's last walk succeeded and no read
-# in it has waited its whole read timeout since (see _arm_timeout_backoff): a
-# datastore whose storage died is not sent one group read per namespace, each
-# a proxy thread it may pin.
+# in it has timed out since (see _arm_timeout_backoff): a datastore whose
+# storage died is not sent one group read per namespace, each a proxy thread
+# it may pin.
 _listings: dict = {}
 # The datastores where a namespace walk, /groups or /snapshots read timed out
 # in the build in progress: the group reads leave them for the rest of it.
@@ -450,8 +451,7 @@ class _PbsError(Exception):
     is no evidence about the PBS either way. `pending`: sent, and not answered
     in time (a read timeout that waited its whole read timeout -- never a
     connect one, nor a stalled TLS handshake urllib3 reports as a read one),
-    so PBS may still be running it; `unclamped`: that wait was the whole
-    _READ_TIMEOUT, not what the budget had left."""
+    so PBS may still be running it."""
 
     def __init__(
         self,
@@ -461,7 +461,6 @@ class _PbsError(Exception):
         status=None,
         skipped=None,
         pending=False,
-        unclamped=False,
     ):
         super().__init__(message)
         self.error_type = error_type
@@ -470,7 +469,6 @@ class _PbsError(Exception):
         self.status = status
         self.skipped = skipped
         self.pending = pending
-        self.unclamped = unclamped
 
 
 def _config_error(message):
@@ -763,13 +761,7 @@ def _get(
         # PBS. Only one that waited the whole read timeout was sent.
         message = _transport_message(target, e)
         pending = time.monotonic() - sent >= read
-        raise _PbsError(
-            "timeout",
-            message,
-            reachable=False,
-            pending=pending,
-            unclamped=pending and read >= _READ_TIMEOUT,
-        )
+        raise _PbsError("timeout", message, reachable=False, pending=pending)
     except requests.exceptions.Timeout as e:  # connecting: never reached PBS
         raise _PbsError("timeout", _transport_message(target, e), reachable=False)
     except requests.exceptions.ConnectionError as e:
@@ -1144,6 +1136,17 @@ _timeout_backoff: dict = {}
 _TIMEOUT_BACKOFF_MAX = 6 * 3600
 # The one key every namespace walk is held under.
 _WALK_HOLD = ("namespace walks", ())
+# Armed, while every walk is held, by the first /groups or /snapshots read
+# that times out (it waited at least its 5s minimum wait: _sub_read): the
+# group reads through the remembered listings then stop until the reload
+# too. Nothing the agent can read tells a datastore on the dead storage from
+# a live one -- PBS answers a cached datastore's gc from memory, and a 403
+# comes from the permission check -- so this bounds what a dead NAS under
+# several datastores costs the group reads: one pinned proxy thread for the
+# whole hold. Not only a read that waited its whole read timeout: while the
+# dead storage's own status reads eat the budget, every group read is cut
+# short, and that rule never armed (one more pinned thread per build).
+_GROUPS_HOLD = ("held group reads", ())
 # One build backs off at most this many reads -- a status and a gc per
 # datastore, a /groups and a /snapshots per namespace -- plus the walk hold. Past it the
 # oldest retry is dropped, never the hold: that would re-send a walk that
@@ -1191,21 +1194,24 @@ def _make_room(key):
                 break
 
 
-def _arm_timeout_backoff(key, failure, hold, unclamped=True):
+def _arm_timeout_backoff(key, failure, hold):
     timeouts = _timeout_backoff.get(key, (0, 0, None))[1] + 1
     _make_room(key)
     # A read in a datastore's namespaces timed out: its storage may be dead,
     # so the group reads leave the datastore for the rest of the build (each
     # read a proxy thread it may pin), and its remembered listing is not used
-    # again until a walk lists it -- when the read waited its WHOLE read
-    # timeout: one the budget cut short may be merely slow, and its own
-    # retry backoff still keeps it from being re-sent at once. (Its own
-    # status and gc have their own backoff: a gc that merely answers slowly
-    # must not cost its namespaces a turn.)
+    # again until a walk lists it. While every walk is held, the group reads
+    # stop altogether (_GROUPS_HOLD). (Its own status and gc have their own
+    # backoff: a gc that merely answers slowly must not cost its namespaces
+    # a turn.)
     if failure[0] in ("namespaces", "groups", "snapshots"):
         _timed_out.add(failure[1])
-        if unclamped:
-            _listings.pop(failure[1], None)
+        _listings.pop(failure[1], None)
+        held = _WALK_HOLD in _timeout_backoff
+        if failure[0] != "namespaces" and held and _GROUPS_HOLD not in _timeout_backoff:
+            _make_room(_GROUPS_HOLD)
+            _timeout_backoff[_GROUPS_HOLD] = (math.inf, 1, failure)
+            log(f"PBS group reads held: {_GROUPS_HOLD_MESSAGE}", "error")
     if hold:
         _timeout_backoff[key] = (math.inf, timeouts, failure)
         # Only the namespace listings (their datastore) and the usage status
@@ -1220,12 +1226,17 @@ def _arm_timeout_backoff(key, failure, hold, unclamped=True):
 
 def _suspect_timeout(key, failure):
     """A read that timed out without its minimum wait (sent late in its
-    phase) is no proof it is stuck, but it is not taken for healthy either:
-    it is noted as due at once, so its next send gets the wait and arms the
-    backoff. A stuck read that is always reached late in its phase would
-    otherwise be sent again on every build, each send a proxy thread it may
-    pin on a dead mount. (Only a read not in the table gets here: one in it
-    is sent with its wait, or not at all, see _sub_read.)"""
+    phase, or with no room for the wait, see _sub_read) is no proof it is
+    stuck, but it is not taken for healthy either: it is noted as due at
+    once, so its next send gets the wait and arms the backoff -- and one
+    already noted or backed off before backs off now (doubling), as if it
+    had its wait. A stuck read that is always reached late would otherwise
+    be sent again on every build, each send a proxy thread it may pin on a
+    dead mount; a read never sent without its wait would stay due, unread,
+    until purged hours later on a PBS whose builds never have that room."""
+    if key in _timeout_backoff:
+        _arm_timeout_backoff(key, failure, hold=False)
+        return
     _make_room(key)
     _timeout_backoff[key] = (time.monotonic(), 0, failure)
 
@@ -1295,17 +1306,14 @@ def _sub_read(
     timeout notes it (_suspect_timeout), so its next send gets the wait.
     `wait_by`: the latest that minimum wait may end (an own status or gc
     read: what the group reads after it need, _GROUP_READS_RESERVE). Without
-    room for it, a read is clamped like a late one -- and one that timed out
-    before is not sent at all: re-sent without its wait on every build, a
-    stuck read would pin a proxy thread each time."""
+    room for it, a read is clamped like a late one, even one that timed out
+    before -- whose clamped timeout then backs it off (_suspect_timeout)."""
     if backoff == "hold":
         key = _WALK_HOLD  # one hold for every walk (see _timeout_backoff)
     else:
         key = _timeout_backoff_key(path, params) if backoff else None
     waiting = _timeout_backoff.get(key)
-    now = time.monotonic()
-    room = wait_by is None or wait_by - now >= _TIMEOUT_BACKOFF_MIN_WAIT
-    if waiting is not None and (now < waiting[0] or not room):
+    if waiting is not None and time.monotonic() < waiting[0]:
         _read_failures["current"].add(waiting[2])  # stays quiet on retry
         message = (
             _TIMEOUT_HOLD_MESSAGE
@@ -1328,13 +1336,15 @@ def _sub_read(
         ns=ns,
     ):
         return None
+    now = time.monotonic()
+    room = wait_by is None or wait_by - now >= _TIMEOUT_BACKOFF_MIN_WAIT
     arm = (
         bool(backoff)
         and room
         and (
             arm_late
             or key in _timeout_backoff
-            or deadline - time.monotonic() >= _TIMEOUT_BACKOFF_MIN_WAIT
+            or deadline - now >= _TIMEOUT_BACKOFF_MIN_WAIT
         )
     )
     min_wait = _TIMEOUT_BACKOFF_MIN_WAIT if arm else 0
@@ -1344,9 +1354,7 @@ def _sub_read(
         if key is not None and e.pending:
             failure = (scope, store, ns, e.message)
             if arm:
-                _arm_timeout_backoff(
-                    key, failure, hold=backoff == "hold", unclamped=e.unclamped
-                )
+                _arm_timeout_backoff(key, failure, hold=backoff == "hold")
             else:
                 _suspect_timeout(key, failure)
         if missing is not _UNSET and e.status == 404:
@@ -1644,7 +1652,7 @@ def _build_block(session, target, deadline):
     listed, window, stop, ns_hidden, unlisted = _read_walks(
         session, target, errors, deadline, sorted(names)
     )
-    datastores, answered = _read_stores(
+    datastores = _read_stores(
         session, target, errors, deadline, kept_stores, usage, own_status, backends
     )
     why_listing = None
@@ -1673,7 +1681,7 @@ def _build_block(session, target, deadline):
     elif _known_nodes[0] == target.cache_key:
         _local_nodes.update(_known_nodes[1])
     groups, read = _read_all_groups(
-        session, target, errors, deadline, window, stop, reloads, answered
+        session, target, errors, deadline, window, stop, reloads
     )
     groups.sort(key=lambda g: (g["store"], g["ns"], g["type"] or "", g["id"] or ""))
     # Listed WHOLE this build: its namespaces ship, and every one whose groups
@@ -1703,8 +1711,8 @@ def _build_block(session, target, deadline):
         "built_at": _epoch(),
         # Every namespace walk is held (_WALK_HOLD) until a reload: from the
         # next build on, every datastore's namespaces are null and the groups
-        # come from the listings remembered (of the datastores whose gc
-        # answered), none authoritative (this one may
+        # come from the listings remembered until a group read times out,
+        # none authoritative (this one may
         # still carry what it read before the timeout), so what the server
         # stored and no longer receives for this PBS is of UNKNOWN freshness
         # -- the one signal it needs for that, outside the capped errors[].
@@ -1916,8 +1924,7 @@ def _read_walks(session, target, errors, deadline, names):
 def _read_stores(
     session, target, errors, deadline, stores, usage, own_status, backends
 ):
-    """(name -> datastore row, with its gc and own status; the datastores
-    whose gc read got an answer from PBS -- its status, or an HTTP error).
+    """name -> datastore row, with its gc and own status.
 
     These reads get at most HALF of the budget left as they begin (plus the
     5s minimum wait of one that may arm its backoff, granted only with
@@ -1928,15 +1935,17 @@ def _read_stores(
     as the gc ends (a gc that merely failed early is no cut) -- or past it
     when it was the first of the build: it had the whole half. The gc is
     read first: an own status sent first could take the half at the head
-    datastore, build after build, and no gc would ever be read.
+    datastore, build after build, and no gc would ever be read -- and the
+    head's own status still gets its own minimum wait after a gc that took
+    the half, bounded by `wait_by` like the gc's.
     `own_status`: the datastores whose own status is read for their usage
     (see _build_block: the aggregate failed or is held, or a scoped token)
     -- a FILESYSTEM datastore only: any other backend's usage is withheld
     anyway."""
     global _store_rotation
-    datastores, answered = {}, set()
+    datastores = {}
     if not stores:
-        return datastores, answered
+        return datastores
     now = time.monotonic()
     phase_deadline = now + max(deadline - now, 0) / 2
     wait_by = deadline - _GROUP_READS_RESERVE
@@ -1946,7 +1955,6 @@ def _read_stores(
     for index, entry in enumerate(stores[start:] + stores[:start]):
         name = entry["store"]
         began = time.monotonic()
-        failures = []
         gc = _read_gc(
             session,
             target,
@@ -1955,21 +1963,22 @@ def _read_stores(
             name,
             first=index == 0,
             wait_by=wait_by,
-            on_error=failures.append,
         )
-        if gc is not None or any(e.status is not None for e in failures):
-            answered.add(name)
         if cut is None and gc is None and time.monotonic() >= phase_deadline:
             cut, started = index, began < phase_deadline
         if usage is not None:
             row = usage.get(name, {})
         elif name in own_status and backends.get(name) == "filesystem":
             # Only where it can ship: any other backend's usage is withheld.
+            status_deadline = phase_deadline
+            if index == 0:
+                end = min(wait_by, time.monotonic() + _TIMEOUT_BACKOFF_MIN_WAIT)
+                status_deadline = max(phase_deadline, end)
             row = _read_store_status(
                 session,
                 target,
                 errors,
-                phase_deadline,
+                status_deadline,
                 name,
                 first=index == 0,
                 wait_by=wait_by,
@@ -1980,7 +1989,7 @@ def _read_stores(
         datastore["gc"] = gc
         datastores[name] = datastore
     _store_rotation = names[_resume_index(len(names), start, cut, started)]
-    return datastores, answered
+    return datastores
 
 
 def _read_store_status(
@@ -2020,9 +2029,7 @@ def _read_store_status(
     return status
 
 
-def _read_all_groups(
-    session, target, errors, deadline, window, stop, reloads, answered
-):
+def _read_all_groups(session, target, errors, deadline, window, stop, reloads):
     """(the groups read, the (store, ns) units whose groups were read whole).
 
     The group reads go through the namespaces of the datastores this build
@@ -2036,16 +2043,15 @@ def _read_all_groups(
     datastore the reads stand in (no walk had time), they stay where they
     stand. Once a read in a datastore timed out (_timed_out), the rest of
     its namespaces wait for a later build (a 'groups' entry). While every
-    walk is held, so do the namespaces of a datastore whose gc read got no
-    answer in this build (not in `answered`: it timed out, is backed off, or
-    was not reached): nothing shows its storage readable, and a dead NAS
-    under several datastores would otherwise get one more read, a proxy
-    thread it may pin, through each of them. When the walks stopped before going round every datastore, the
-    namespaces of the first datastore before the point the reads resumed at
-    are left for its next turn (a 'groups' entry): wrapping back to them
-    would keep both reads on that datastore for good. A reload during the
-    build (`reloads` is the count as it began) leaves `_rotation` where the
-    reload put it."""
+    walk is held, the first group read that times out stops every group
+    read until the reload (_GROUPS_HOLD): a dead NAS under
+    several datastores would otherwise get one more read, a proxy thread it
+    may pin, through each of them. When the walks stopped before
+    going round every datastore, the namespaces of the first datastore
+    before the point the reads resumed at are left for its next turn (a
+    'groups' entry): wrapping back to them would keep both reads on that
+    datastore for good. A reload during the build (`reloads` is the count as
+    it began) leaves `_rotation` where the reload put it."""
     global _rotation
     groups, read, skipped = [], set(), {}
 
@@ -2091,11 +2097,11 @@ def _read_all_groups(
             skip(order[index:], None)
             cut, started = index, False
             break
+        if _GROUPS_HOLD in _timeout_backoff:
+            skipped.setdefault(_GROUPS_HOLD_MESSAGE, []).append((store, ns))
+            continue
         if store in _timed_out:
             skipped.setdefault(_TIMED_OUT_MESSAGE, []).append((store, ns))
-            continue
-        if held and store not in answered:
-            skipped.setdefault(_NO_ANSWER_MESSAGE, []).append((store, ns))
             continue
         result = _read_groups(
             session, target, errors, deadline, store, ns, MAX_GROUPS - len(groups)
@@ -2329,9 +2335,7 @@ _GC_COUNTERS = (
 )
 
 
-def _read_gc(
-    session, target, errors, deadline, store, first=False, wait_by=None, on_error=None
-):
+def _read_gc(session, target, errors, deadline, store, first=False, wait_by=None):
     """The datastore's garbage-collection status, or None when unread -- a
     read that timed out is retried on the backoff (_timeout_backoff), so one
     stuck gc does not take the per-datastore half on every build; one sent
@@ -2360,7 +2364,6 @@ def _read_gc(
         backoff="retry",
         arm_late=first,
         wait_by=wait_by,
-        on_error=on_error,
     )
     if status is None:
         return None

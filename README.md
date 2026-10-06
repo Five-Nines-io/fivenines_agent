@@ -1337,10 +1337,10 @@ hours) -- a datastore's own status and garbage-collection status included,
 which on a dead mount may never end either: each retry then holds one more
 proxy thread. Meanwhile the dashboard shows every datastore's namespaces as
 unknown and the job lists as possibly incomplete, but the backups of the
-namespaces the agent listed before keep being refreshed on every datastore
-whose garbage-collection status still answers (one deleted meanwhile is only
-removed once the walks resume; a datastore whose storage stopped answering is
-left alone); a full-scope token still reports each
+namespaces the agent listed before keep being refreshed (one deleted meanwhile
+is only removed once the walks resume) -- until one of those reads times out
+too: then no backup is refreshed until the agent is reloaded, so a dead
+storage costs at most one more proxy thread; a full-scope token still reports each
 datastore's usage, without its estimated full date. Act on it quickly: the stuck walk keeps one
 PBS core busy and logs an error on every turn until `proxmox-backup-proxy`
 restarts. Once the datastore is repaired, restart
