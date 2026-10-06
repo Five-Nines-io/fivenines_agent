@@ -987,8 +987,8 @@ def test_budget_constants_are_pinned():
     assert pbs._TIMEOUT_BACKOFF_MIN_WAIT == 5
     assert pbs._MAX_READ_FAILURE_LINES == 20
     # Every read one build can back off -- a status and a gc per datastore, a
-    # /groups and a /snapshots per namespace -- plus the one walk hold.
-    assert pbs._TIMEOUT_BACKOFF_ENTRIES == 2 * 100 + 2 * 1000 + 1
+    # /groups and a /snapshots per namespace -- plus the two holds.
+    assert pbs._TIMEOUT_BACKOFF_ENTRIES == 2 * 100 + 2 * 1000 + 2
 
 
 # --- pbs_metrics -----------------------------------------------------------
@@ -5877,12 +5877,12 @@ def test_a_hold_survives_any_configuration_change(monkeypatch, change, url):
 #   as Remote.Audit and no longer lists <s>) reads hidden, and so does a
 #   remote; fails_when=the check goes back to path presence alone, so the
 #   block claims scope full and the server prunes a datastore that still
-#   exists (QA capture 005); why_new=every row hid a path by its ABSENCE;
+#   exists (reproduced live); why_new=every row hid a path by its ABSENCE;
 #   seam=none
 # Value (rows): protects=an audited privilege held but NOT
 #   propagated reads its subtree hidden (measured: the user's non-propagated
 #   DatastoreAudit beside a propagated DatastoreBackup hides every namespace
-#   of the datastore, QA capture 028) while the datastore itself stays
+#   of the datastore, measured live) while the datastore itself stays
 #   audited; fails_when=the check reads the privilege's presence only (scope
 #   full: the server prunes namespaces that still exist); why_new=every row
 #   had a propagated privilege or none; seam=none
@@ -6105,7 +6105,7 @@ def test_a_deep_permissions_chain_is_checked_in_linear_time():
             "/datastore/ds": {"Datastore.Audit": True},
             "/datastore/ds/a/b": {"Datastore.Audit": True},
         },
-        # Audited but not propagated (QA capture 028): its namespaces hidden.
+        # Audited but not propagated (measured live): its namespaces hidden.
         {"/datastore/ds": {"Datastore.Audit": False}},
     ],
     ids=["datastore_hidden", "namespace_hidden", "not_propagated"],
@@ -6976,8 +6976,8 @@ def test_no_namespace_walk_is_sent_once_the_namespace_cap_is_full(monkeypatch):
 #   token's role with one lacking Datastore.Audit (PBS then no longer lists
 #   it) makes the block partial with every job list flagged; fails_when=the
 #   hidden check reads path presence alone (scope full: the server prunes a
-#   datastore that still exists); why_new=QA capture 005, reproduced live on
-#   PBS 4.2; seam=none
+#   datastore that still exists); why_new=reproduced live on PBS 4.2;
+#   seam=none
 def test_a_datastore_whose_role_lost_datastore_audit_reads_partial(monkeypatch):
     perms = {**PERMS_FULL, "/datastore/gone": {"Remote.Audit": True}}
     out, _ = collect(
@@ -7075,7 +7075,7 @@ def test_the_rotation_resumes_by_name_when_the_lists_change(monkeypatch):
 #   itself is audited) while the block reads partial; fails_when=the
 #   non-propagated privilege is read as not audited (real usage dropped) or
 #   as fully audited (scope full: its hidden namespaces pruned);
-#   why_new=QA capture 028 found the case live; seam=none
+#   why_new=found live on PBS 4.2; seam=none
 def test_a_non_propagated_datastore_audit_keeps_its_own_status(monkeypatch):
     perms = {**PERMS_FULL, "/datastore/ds": {"Datastore.Audit": False}}
     out, session = collect(
@@ -7454,7 +7454,7 @@ def test_a_build_with_no_room_for_any_walk_keeps_the_cursor(monkeypatch):
 #   resume datastore's last namespace that is cut inside on every build never
 #   pins the reads: past it is where the walks stopped; fails_when=moving
 #   past the only namespace of a build wraps back to it (the reads stay there
-#   and every other datastore stays unknown for good: QA captures 005/006);
+#   and every other datastore stays unknown for good: reproduced live);
 #   why_new=every started-first-item test had more than one unit in its order
 #   (review run 9, red team); seam=none
 def test_a_lone_unit_cut_inside_moves_on_to_where_the_walks_stopped(monkeypatch):
@@ -9373,7 +9373,10 @@ def test_a_gc_gets_its_minimum_wait_only_with_the_group_reads_reserve_left(
     )
     assert gc is None
     assert [t[1] for t in session.timeouts] == [pytest.approx(read_timeout)]
-    assert (pbs._timeout_backoff[key][0] > clock.now) is retry_later
+    # A backoff is its first finite rung (one rebuild), never a hold; a note
+    # is due at once and uncounted.
+    entry = (clock.now + 2 * pbs.PBS_CACHE_TTL, 1) if retry_later else (clock.now, 0)
+    assert pbs._timeout_backoff[key][:2] == entry
 
 
 # Value: protects=the gc is read before the own status, so a slow own status
@@ -9828,3 +9831,77 @@ def test_a_gc_slow_once_is_read_again_when_the_walks_leave_no_room(monkeypatch):
         out, _ = _timed_build(monkeypatch, clock, session)
         read.append(out["datastores"][0]["gc"] is not None)
     assert read[0] is False and any(read[1:4])
+
+
+# Value (rows): protects=the head datastore's own status keeps the whole
+#   half when that is longer than its 5s wait, and is still sent, clamped,
+#   when no wait fits; fails_when=its deadline is only the 5s wait (a head
+#   status answering in 5-9s times out, is backed off and its usage ships
+#   null) or it is skipped when the tick has under 8s left; why_new=coverage
+#   audit: dropping the max() with the half survived every test; seam=none
+@pytest.mark.parametrize(
+    "preamble, status_latency",
+    [(0.0, 6.5), (pbs.PBS_COLLECT_DEADLINE - 2.8, 0.05)],
+    ids=["half_longer_than_the_wait", "no_room_for_the_wait"],
+)
+def test_the_head_own_status_keeps_the_whole_half_when_it_outlasts_its_wait(
+    monkeypatch, preamble, status_latency
+):
+    clock = use_clock(monkeypatch, Clock())
+    real = pbs._read_backends
+
+    def slow_preamble(*args):
+        clock.now += preamble
+        return real(*args)
+
+    monkeypatch.setattr(pbs, "_read_backends", slow_preamble)
+    responses = _datastores_with(["a"], **{"/status/datastore-usage": fail(500, "EIO")})
+    responses["/admin/datastore/a/status"] = ok({"total": 9, "used": 4, "avail": 5})
+    session = _install_timed(
+        monkeypatch,
+        responses,
+        clock,
+        lambda p: status_latency if p == "/admin/datastore/a/status" else 0.05,
+    )
+    out, sent = _timed_build(monkeypatch, clock, session)
+    assert "/admin/datastore/a/status" in sent
+    assert out["datastores"][0]["total"] == 9 and pbs._timeout_backoff == {}
+
+
+# Value: protects=the group-reads hold lasts until the reload, like the walk
+#   hold: never purged as stale, never dropped at the table cap, and it logs
+#   one error line when it arms; fails_when=it is a finite entry (purged
+#   after 6h: the group reads hit the dead NAS again with no signal), the
+#   cap drops it, or nothing is logged when every group read stops;
+#   why_new=coverage audit: those mutants survived every test; seam=none
+def test_the_group_reads_hold_outlives_the_stale_purge_and_the_cap(monkeypatch):
+    clock = use_clock(monkeypatch, Clock())
+    logged = capture_logs(monkeypatch)
+    latency = {}
+    session = _install_timed(
+        monkeypatch,
+        _held_two_datastores(("", "x", "y")),
+        clock,
+        lambda path: latency.get(path, 0.05),
+    )
+    _timed_build(monkeypatch, clock, session)  # both listings remembered
+    pbs._timeout_backoff[pbs._WALK_HOLD] = (math.inf, 1, ("usage", None, None, "t"))
+    latency["/admin/datastore/a/groups?ns=x"] = math.inf
+    _timed_build(monkeypatch, clock, session)
+    assert pbs._GROUPS_HOLD in pbs._timeout_backoff
+    del latency["/admin/datastore/a/groups?ns=x"]  # it would answer now
+    for later in (pbs.PBS_CACHE_TTL, pbs._TIMEOUT_BACKOFF_MAX + 2 * pbs.PBS_CACHE_TTL):
+        clock.now += later
+        out, sent = _timed_build(monkeypatch, clock, session)
+        assert out["walks_held"]
+        assert not [
+            p for p in sent if p.split("?")[0].endswith(("/groups", "/snapshots"))
+        ]
+    assert pbs._GROUPS_HOLD in pbs._timeout_backoff
+    held = [(lvl, m) for lvl, m in logged if m.startswith("PBS group reads held")]
+    assert held == [("error", f"PBS group reads held: {pbs._GROUPS_HOLD_MESSAGE}")]
+    # At the cap, a retry goes -- never either hold.
+    monkeypatch.setattr(pbs, "_TIMEOUT_BACKOFF_ENTRIES", len(pbs._timeout_backoff))
+    for i in range(3):
+        pbs._arm_timeout_backoff((f"/p{i}", ()), ("gc", "a", None, "t"), hold=False)
+    assert {pbs._WALK_HOLD, pbs._GROUPS_HOLD} <= set(pbs._timeout_backoff)

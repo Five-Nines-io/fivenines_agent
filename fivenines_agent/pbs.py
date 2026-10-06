@@ -1148,10 +1148,10 @@ _WALK_HOLD = ("namespace walks", ())
 # short, and that rule never armed (one more pinned thread per build).
 _GROUPS_HOLD = ("held group reads", ())
 # One build backs off at most this many reads -- a status and a gc per
-# datastore, a /groups and a /snapshots per namespace -- plus the walk hold. Past it the
-# oldest retry is dropped, never the hold: that would re-send a walk that
-# never ends.
-_TIMEOUT_BACKOFF_ENTRIES = 2 * MAX_DATASTORES + 2 * MAX_NAMESPACES + 1
+# datastore, a /groups and a /snapshots per namespace -- plus the two holds
+# (_WALK_HOLD, _GROUPS_HOLD). Past it the oldest retry is dropped, never a
+# hold: that would re-send a read that may never end.
+_TIMEOUT_BACKOFF_ENTRIES = 2 * MAX_DATASTORES + 2 * MAX_NAMESPACES + 2
 # The read timeout a held read, or one that may arm its retry backoff, gets
 # (see _sub_read and _get): its timing out then means PBS did not answer, not
 # that the budget ran out.
@@ -1181,8 +1181,8 @@ def _timeout_backoff_key(path, params):
 
 
 def _make_room(key):
-    """Room for `key` in the capped table: the oldest retry goes, never the
-    one hold (the cap leaves room for it). Iterated over a copy: a SIGHUP
+    """Room for `key` in the capped table: the oldest retry goes, never a
+    hold (the cap leaves room for both). Iterated over a copy: a SIGHUP
     (reset_timeout_holds) may clear the table from another thread."""
     if (
         key not in _timeout_backoff
@@ -1243,8 +1243,8 @@ def _suspect_timeout(key, failure):
 
 def _forget_stale_backoffs():
     """Retries expired this long ago (never sent again: the namespace or
-    datastore is gone) are dropped. The one hold never expires (a SIGHUP or
-    a restart clears it)."""
+    datastore is gone) are dropped. The holds never expire (a SIGHUP or a
+    restart clears them)."""
     now = time.monotonic()
     for key, (retry_at, _, _) in list(_timeout_backoff.items()):  # see _make_room
         if now - retry_at > _TIMEOUT_BACKOFF_MAX:
