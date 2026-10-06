@@ -140,6 +140,94 @@ def test_connect_forwards_ssl_context(monkeypatch):
         assert isinstance(conn.call_args.kwargs["ssl_context"], ssl.SSLContext)
 
 
+def test_connect_scram_without_password_is_an_auth_interface_error():
+    """pg8000 has no missing-password guard on the SCRAM path and raises
+    AttributeError from None.decode(); with no password resolved anywhere,
+    _connect turns it into the InterfaceError pg8000 raises for cleartext/MD5,
+    so it classifies as auth_failed rather than the generic error."""
+    crash = AttributeError("'NoneType' object has no attribute 'decode'")
+    with patch(f"{PG}.pg8000.dbapi.connect", side_effect=crash):
+        with pytest.raises(InterfaceError) as raised:
+            _connect("localhost", 5432, "postgres", None, "postgres")
+    assert raised.value.__cause__ is crash
+    assert _error_category(raised.value) == "auth_failed"
+
+
+def test_connect_attribute_error_with_a_password_is_not_reclassified():
+    """With a password supplied the SCRAM path cannot hit None.decode(), so an
+    AttributeError there is something else and must surface unchanged."""
+    crash = AttributeError("something else")
+    with patch(f"{PG}.pg8000.dbapi.connect", side_effect=crash):
+        with pytest.raises(AttributeError):
+            _connect("localhost", 5432, "postgres", "secret", "postgres")
+
+
+@contextmanager
+def scram_only_server():
+    """A loopback socket that speaks just enough of the PostgreSQL protocol to
+    demand SCRAM-SHA-256, as a stock PostgreSQL 14+ does on a TCP host line.
+
+    Every other test mocks pg8000.dbapi.connect, which is how pg8000's missing
+    SCRAM guard went unnoticed: this one runs the real driver handshake.
+    """
+    import struct
+    import threading
+
+    ssl_request_code = 80877103
+    auth_sasl = 10
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    listener.settimeout(5)
+
+    def read_exact(conn, size):
+        data = b""
+        while len(data) < size:
+            chunk = conn.recv(size - len(data))
+            if not chunk:
+                raise EOFError
+            data += chunk
+        return data
+
+    def serve():
+        try:
+            conn, _ = listener.accept()
+        except OSError:
+            return
+        with conn:
+            try:
+                while True:
+                    (length,) = struct.unpack("!i", read_exact(conn, 4))
+                    (code,) = struct.unpack("!i", read_exact(conn, length - 4)[:4])
+                    if code != ssl_request_code:  # the StartupMessage
+                        break
+                    conn.sendall(b"N")
+                # AuthenticationSASL: mechanism list, each NUL-terminated, then NUL.
+                body = struct.pack("!i", auth_sasl) + b"SCRAM-SHA-256" + bytes(2)
+                conn.sendall(b"R" + struct.pack("!i", len(body) + 4) + body)
+                conn.recv(1)  # wait for the client to give up
+            except (EOFError, OSError):
+                pass
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        yield listener.getsockname()[1]
+    finally:
+        listener.close()
+        thread.join(timeout=5)
+
+
+def test_metrics_scram_server_without_password_reports_auth_failed():
+    """End to end through real pg8000: a SCRAM-only server and no password in
+    config, PGPASSWORD or .pgpass reports auth_failed, not the
+    "'NoneType' object has no attribute 'decode'" generic error that agents up
+    to 1.20.4 sent (rendered server-side as a red PostgreSQL outage)."""
+    with scram_only_server() as port:
+        result = postgresql_metrics(host="127.0.0.1", port=port, password=None)
+    assert result == {"reachable": False, "error": "auth_failed"}
+
+
 # ---------------------------------------------------------------------------
 # _ssl_context: PGSSLMODE / PGSSLROOTCERT parity (#2)
 # ---------------------------------------------------------------------------

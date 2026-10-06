@@ -209,7 +209,21 @@ def _connect(host, port, user, password, database):
     else:
         params["host"] = host
         params["port"] = port_num
-    return pg8000.dbapi.connect(**params)
+    try:
+        return pg8000.dbapi.connect(**params)
+    except AttributeError as e:
+        # pg8000 refuses a missing password with an InterfaceError for cleartext
+        # and MD5, but on SCRAM-SHA-256 (the TCP default since PostgreSQL 14) it
+        # calls None.decode() and leaks "'NoneType' object has no attribute
+        # 'decode'". Re-raise it in the shape pg8000 uses for the other two, so
+        # it classifies as auth_failed (amber "check credentials") instead of
+        # the generic error the backend paints as a red outage.
+        if params["password"] is None:
+            raise InterfaceError(
+                "server requesting SCRAM-SHA-256 password authentication, but no "
+                "password was provided"
+            ) from e
+        raise
 
 
 def _error_category(exc):
