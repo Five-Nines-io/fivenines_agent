@@ -1328,7 +1328,10 @@ timeout left in the refresh, and are held together: as soon as one of them
 times out, none is sent again until the agent is reloaded or restarted. (A
 token scoped to some datastores never reads the usage summary, which would
 walk every other datastore on the PBS: it reports the usage of a datastore it
-audits as a whole from that datastore's own status.) With a datastore on a stale or broken mount, PBS never finishes
+audits as a whole from that datastore's own status. A usage summary so slow
+that it leaves no time to walk any namespace is skipped for a while, retried
+less and less often, and each datastore's usage is then read from its own
+status, without its estimated full date.) With a datastore on a stale or broken mount, PBS never finishes
 that walk and each request holds one of its proxy threads for good, so one
 broken storage costs one thread for those walks however many datastores it
 carries. Every
@@ -1340,7 +1343,9 @@ unknown and the job lists as possibly incomplete, but the backups of the
 namespaces the agent listed before keep being refreshed (one deleted meanwhile
 is only removed once the walks resume) -- until one of those reads times out
 too: then no backup is refreshed until the agent is reloaded, so a dead
-storage costs at most one more proxy thread; a full-scope token still reports each
+storage costs at most one more proxy thread (on a PBS older than 2.2 with a
+token scoped to some datastores, nothing lets the agent hold those reads, so
+each retry there may hold one more thread); a full-scope token still reports each
 datastore's usage, without its estimated full date. Act on it quickly: the stuck walk keeps one
 PBS core busy and logs an error on every turn until `proxmox-backup-proxy`
 restarts. Once the datastore is repaired, restart
@@ -1351,9 +1356,11 @@ an agent update, a crash restart -- so repair a broken datastore before
 reloading the agent for anything else (if it is still broken, the refreshes
 after the reload read the namespaces and backups of every other datastore
 first and leave its namespaces for later -- unless every datastore is
-broken, or the hold came from the usage summary, which names no datastore
-and is read first again -- so it can block the walks again only after that
-round; a datastore
+broken -- so it can block the walks again only after that round (when two
+datastores were flagged, those after the second one in that round wait for
+it, and, on a storage still broken, for the next reload; when the hold came
+from the usage summary, the summary is skipped for a while after the reload
+and each datastore's usage read from its own status); a datastore
 repaired without restarting the proxy is read again once that round is done,
 which on a large PBS takes a few refreshes, and reloading the agent for
 another reason meanwhile does not restart that round); changing the PBS host,
