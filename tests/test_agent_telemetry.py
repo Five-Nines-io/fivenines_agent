@@ -605,7 +605,9 @@ def test_only_sighup_releases_a_held_pbs_read(
         assert pbs._cache is cached
         refresh_permissions_event.set()
         agent._handle_sighup_refresh()
-        assert pbs._timeout_backoff == {}
+        # The hold is released; only the usage status stays backed off for
+        # the build the reload triggers.
+        assert set(pbs._timeout_backoff) == {pbs._USAGE_BACKOFF}
         assert pbs._cache is not cached  # the block reporting the hold, dropped
     finally:
         refresh_permissions_event.clear()

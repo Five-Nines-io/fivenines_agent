@@ -1343,9 +1343,10 @@ unknown and the job lists as possibly incomplete, but the backups of the
 namespaces the agent listed before keep being refreshed (one deleted meanwhile
 is only removed once the walks resume) -- until one of those reads times out
 too: then no backup is refreshed until the agent is reloaded, so a dead
-storage costs at most one more proxy thread (on a PBS older than 2.2 with a
-token scoped to some datastores, nothing lets the agent hold those reads, so
-each retry there may hold one more thread); a full-scope token still reports each
+storage costs at most one more proxy thread (on a PBS older than 2.2, with a
+token scoped to some datastores or while the usage summary is skipped,
+nothing lets the agent hold those reads, so each retry there may hold one
+more thread); a full-scope token still reports each
 datastore's usage, without its estimated full date. Act on it quickly: the stuck walk keeps one
 PBS core busy and logs an error on every turn until `proxmox-backup-proxy`
 restarts. Once the datastore is repaired, restart
@@ -1358,9 +1359,9 @@ after the reload read the namespaces and backups of every other datastore
 first and leave its namespaces for later -- unless every datastore is
 broken -- so it can block the walks again only after that round (when two
 datastores were flagged, those after the second one in that round wait for
-it, and, on a storage still broken, for the next reload; when the hold came
-from the usage summary, the summary is skipped for a while after the reload
-and each datastore's usage read from its own status); a datastore
+it, and, on a storage still broken, for the next reload; the first refresh
+after the reload skips the usage summary and reads each datastore's usage
+from its own status); a datastore
 repaired without restarting the proxy is read again once that round is done,
 which on a large PBS takes a few refreshes, and reloading the agent for
 another reason meanwhile does not restart that round); changing the PBS host,
