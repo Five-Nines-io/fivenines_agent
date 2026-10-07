@@ -2246,7 +2246,18 @@ Collects metrics via a direct connection (pure-Python `pg8000` driver, no `psql`
 - Replication lag (for replicas)
 - Lock counts
 
-Requires appropriate database credentials.
+Requires appropriate database credentials. The password is the configured one,
+else `PGPASSWORD`, else the first matching line of the pgpass file
+(`PGPASSFILE`, or libpq's default for the user the agent runs as: `~/.pgpass`,
+`%APPDATA%\postgresql\pgpass.conf` on Windows). The agent skips a pgpass file
+it cannot read and, as libpq does outside Windows, one that group or others can
+access: keep it owned by the agent's user, mode `0600`.
+
+A failed connection is reported with its cause (connection refused, timeout,
+unreachable, authentication failure), so the dashboard can tell an outage apart
+from a credentials problem. A server that asks for a password the agent did not
+find is an authentication failure, including over SCRAM-SHA-256, the default
+since PostgreSQL 14 (agent **1.20.5+**).
 
 ### MySQL / MariaDB
 

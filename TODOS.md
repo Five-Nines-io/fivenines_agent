@@ -772,6 +772,36 @@ bake's `poetry install` re-syncs poetry's own dependencies to the lock.)
 - **Effort:** XS (human) / XS (CC)
 - **Files:** `ci/requirements/`, `.github/workflows/`
 
+## P2: Tell "no password found" from "wrong password" on a PostgreSQL auth_failed -- agent + server
+
+Since 1.20.5 a host with no PostgreSQL password resolved (config, PGPASSWORD,
+pgpass file) reports a bare `auth_failed` on SCRAM, MD5 and cleartext alike,
+the same payload as a wrong password (SQLSTATE 28P01). A common cause is on
+the agent side and invisible: `_pgpass_lookup` silently skips a pgpass file
+with group/other permissions (libpq rejects a 0644 file too, but prints a
+WARNING) or one in a home the `fivenines` user cannot stat, so the operator
+re-checks a correct password the agent never read.
+
+An English `error_detail` was tried and reverted on
+fix/postgresql-scram-no-password: the server's `Host#postgresql_error_label`
+shows the translated `auth_failed` copy whatever the detail (the key exists in
+every locale, so its `default: detail` is never reached), the prose would
+bypass i18n, and it was matched on text a server-written DatabaseError can
+also carry.
+
+Do it as a pair. Agent: ship a machine token (e.g. `"error_reason":
+"no_password"`), set only from a client-side refusal -- pg8000's own
+InterfaceError or `_connect`'s SCRAM re-raise, never server text -- and log
+once per (path, mode) when a pgpass file is ignored, and why. Server: a
+localized `hosts.postgresql.errors.no_password` label picked by
+`postgresql_error_label`, and gate the legacy SCRAM translation
+(`legacy_scram_no_password?` in `lib/ingesters/postgresql.rb`) on
+`client_version <= 1.20.4`, since 1.20.5+ classify the crash themselves and
+deliberately keep a None.decode() crash WITH a password as the generic error.
+
+- **Effort:** M (human) / S (CC)
+- **Files:** `fivenines_agent/postgresql.py`, `tests/test_postgresql.py`; server `app/models/host.rb`, `lib/ingesters/postgresql.rb`, `config/locales/*.yml`
+
 ## Completed
 
 ### P3: Bound the QEMU collector's libvirt connection with a timeout (#171)
