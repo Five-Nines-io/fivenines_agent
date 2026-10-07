@@ -27,7 +27,7 @@ pg8000 = "^1.31.5"
 # handling. paho pulls no runtime dependencies of its own.
 paho-mqtt = "^2.1.0"
 # Security floor: GHSA-pq67-6m6q-mj2v (decompression bomb), GHSA-48p4-8xcf-vxj5 (header leak across origins). Brought in transitively by requests/docker; pinned here so future lock regenerations cannot drop below the patched line.
-urllib3 = "^2.7.0"
+urllib3 = "^2.8.0"
 
 [tool.poetry.group.virtualization]
 optional = true
