@@ -464,9 +464,12 @@ class _PbsError(Exception):
     or answered too late; "backoff": held back by _timeout_backoff -- which
     is no evidence about the PBS either way. `pending`: sent, and not answered
     in time (a read timeout that waited its whole read timeout -- never a
-    connect one, nor a stalled TLS handshake urllib3 reports as a read one),
-    so PBS may still be running it. `unsent`: skipped past the budget at
-    the very moment of sending (see _UNSENT)."""
+    connect one, nor a stalled TLS handshake urllib3 reports as a read one
+    while the connect timeout is under the read timeout, as _get makes it
+    for a read with a minimum wait; with none, a stall can last the whole
+    read timeout and read as pending: the safe side for the PBS), so PBS may
+    still be running it. `unsent`: skipped past the budget at the very
+    moment of sending (see _UNSENT)."""
 
     def __init__(
         self,
@@ -1336,9 +1339,10 @@ def reset_timeout_holds():
         # Skipped by every build that would read it until the walks have
         # gone round every datastore not deferred, and due from then on
         # (_build_block; its doubling count kept): sent first, on a storage
-        # still dead it would re-arm the hold before any walk -- after a hold any read armed, since it walks the
-        # hidden datastores and statfs-es every audited one, or when it was
-        # backed off already (a second SIGHUP).
+        # still dead it would re-arm the hold before any walk -- after a hold
+        # any read armed, since it walks the hidden datastores and statfs-es
+        # every audited one, or when it was backed off already (a second
+        # SIGHUP).
         timeouts = usage[1] if isinstance(usage, tuple) else 0
         failure = ("usage", None, None, _USAGE_DEFERRED_MESSAGE)
         _timeout_backoff[_USAGE_BACKOFF] = (math.inf, timeouts, failure)
@@ -1440,7 +1444,10 @@ def _sub_read(
     except _PbsError as e:
         if budget_cut and e.error_type == "timeout":
             if key is not None and e.pending:
-                _suspect_timeout(key, (scope, store, ns, e.message), False)
+                # Noted under the budget skip it ships (_read_failures: its
+                # backoff skips must not mark a real failure as reported).
+                failure = (scope, store, ns, _DEADLINE_MESSAGE)
+                _suspect_timeout(key, failure, False)
             e = _PbsError("timeout", _DEADLINE_MESSAGE, True, skipped="deadline")
         if key is not None and e.pending:
             failure = (scope, store, ns, e.message)

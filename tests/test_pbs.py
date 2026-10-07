@@ -10450,22 +10450,41 @@ def test_a_stuck_snapshots_read_on_the_groups_wait_backs_off(monkeypatch):
     assert "s0" in pbs._listings
 
 
+class _StallingSession(_TimedSession):
+    """A _TimedSession whose stalled TLS handshakes last their connect
+    timeout, as on the wire."""
+
+    def get(self, url, params=None, timeout=None, stream=None, allow_redirects=None):
+        try:
+            return super().get(url, params, timeout, stream, allow_redirects)
+        except HandshakeStall:
+            self.clock.now += timeout[0]
+            raise
+
+
 # Value: protects=a connect timeout or a stalled TLS handshake of a
 #   /snapshots read on its /groups read's wait reads as the budget, like a
-#   read timeout there, and leaves no backoff (it never reached PBS);
-#   fails_when=only a read timeout that waited its whole clamp is taken
+#   read timeout there; a connect timeout (never reached PBS) leaves no
+#   backoff, while a handshake stalled for its whole connect timeout -- the
+#   whole clamp, with no minimum wait -- is noted, the safe side for the
+#   PBS; fails_when=only a read timeout that waited its whole clamp is taken
 #   for the budget (the raw transport message ships and an error line is
-#   logged for each namespace, every build) or a request PBS never saw is
-#   backed off; why_new=pre-landing review (testing): only a read timeout
-#   was pinned; seam=none
-@pytest.mark.parametrize("error", ["connect_timeout", "handshake_timeout"])
-def test_a_connect_timeout_on_the_groups_wait_is_a_budget_skip(monkeypatch, error):
+#   logged for each namespace, every build), or a request that never
+#   reached PBS is noted; why_new=pre-landing review (testing, coverage
+#   audit): only a read timeout was pinned, and the stall lasted no time;
+#   seam=none
+@pytest.mark.parametrize(
+    "error, noted", [("connect_timeout", False), ("handshake_timeout", True)]
+)
+def test_a_connect_timeout_on_the_groups_wait_is_a_budget_skip(
+    monkeypatch, error, noted
+):
     clock = use_clock(monkeypatch, Clock())
     responses = _held_two_datastores()
     latency = {}
-    session = _install_timed(
-        monkeypatch, responses, clock, lambda p: latency.get(p, 0.05)
-    )
+    session = _StallingSession(responses, clock, lambda p: latency.get(p, 0.05))
+    monkeypatch.setattr(pbs, "_new_session", lambda target: session)
+    monkeypatch.setattr(pbs, "_peer_fingerprint", lambda response: None)
     _timed_build(monkeypatch, clock, session)
     logged = []
     monkeypatch.setattr(
@@ -10487,7 +10506,55 @@ def test_a_connect_timeout_on_the_groups_wait_is_a_budget_skip(monkeypatch, erro
     cut = [e["message"] for e in out["errors"] if e["scope"] == "snapshots"]
     assert cut and set(cut) == {pbs._DEADLINE_MESSAGE}
     assert not [m for level, m in logged if level == "error" and "snapshots" in m]
-    assert not [k for k in pbs._timeout_backoff if k[0].endswith("/snapshots")]
+    assert (
+        bool([k for k in pbs._timeout_backoff if k[0].endswith("/snapshots")]) is noted
+    )
+
+
+# Value: protects=a stuck /snapshots first reached only on its /groups
+#   read's wait (noted, backed off, never logged) still logs its first real
+#   failure -- sent early, after its whole minimum wait -- at error;
+#   fails_when=the note records the raw transport message (its backoff
+#   skips mark that failure as already reported, so the operator never
+#   sees an error line for a stuck datastore); why_new=pre-landing review
+#   (coverage audit), reproduced; seam=none
+def test_a_budget_cut_snapshots_history_does_not_silence_its_first_real_failure(
+    monkeypatch,
+):
+    clock = use_clock(monkeypatch, Clock())
+    responses = _datastores_with(["s0"])
+    responses["/admin/datastore/s0/namespace"] = ok([{"ns": ""}, {"ns": "n0"}])
+    responses["/admin/datastore/s0/snapshots"] = ok([])
+    responses["/admin/datastore/s0/groups?ns=n0"] = ok([])
+    responses["/admin/datastore/s0/snapshots?ns=n0"] = ok([])
+    latency = {}
+    session = _install_timed(
+        monkeypatch, responses, clock, lambda p: latency.get(p, 0.05)
+    )
+    _timed_build(monkeypatch, clock, session)
+    logged = []
+    monkeypatch.setattr(
+        pbs, "log", lambda message, level="info": logged.append((level, message))
+    )
+    latency["/admin/datastore/s0/snapshots?ns=n0"] = math.inf  # stuck from now on
+    latency["/admin/datastore/s0/groups?ns=n0"] = 3.5
+    real = pbs._read_all_groups
+
+    def late(session, target, errors, deadline, *args):
+        clock.now = max(clock.now, deadline - 3.0)
+        return real(session, target, errors, deadline, *args)
+
+    monkeypatch.setattr(pbs, "_read_all_groups", late)
+    for _ in range(3):  # noted, backed off, skipped
+        _timed_build(monkeypatch, clock, session)
+    monkeypatch.setattr(pbs, "_read_all_groups", real)
+    del latency["/admin/datastore/s0/groups?ns=n0"]
+    early = 0
+    for _ in range(6):
+        _, sent = _timed_build(monkeypatch, clock, session)
+        early += sent.count("/admin/datastore/s0/snapshots?ns=n0")
+    assert early  # sent early, with its minimum wait
+    assert [m for level, m in logged if level == "error" and "snapshots read" in m]
 
 
 # Value: protects=a /snapshots read on its /groups read's wait that PBS
@@ -10707,8 +10774,8 @@ def test_reloads_after_a_restart_walk_every_healthy_datastore(monkeypatch):
 # Value: protects=a scoped token, which never reads the usage status, never
 #   uses up the reload's keep-back either: once the token reaches full scope,
 #   its first build still reads each datastore's own status and walks first;
-#   fails_when=a scoped build with time for a walk uses it up (the first
-#   full-scope build sends the usage status before any walk); why_new=
+#   fails_when=a scoped build whose walks went round uses it up (the
+#   first full-scope build sends the usage status before any walk); why_new=
 #   pre-landing review: the keep-back is consumed in _build_block now, which
 #   scoped builds run too; seam=none
 def test_a_scoped_token_never_uses_up_the_reload_keep_back(monkeypatch):
