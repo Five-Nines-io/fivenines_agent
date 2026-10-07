@@ -1325,8 +1325,7 @@ def reset_timeout_holds():
     capability refresh, sent by tooling -- keeps the round going: restarted
     by every one, a round longer than their period never ended). Those builds
     read each datastore's own status instead, and their walks start at the
-    first datastore not walked yet (_read_walks, `ahead`; a deferred one is
-    reached last, the reads being placed just past it):
+    first datastore not walked yet and not deferred (_read_walks, `ahead`):
     started where the group reads stand, which move only as fast as they
     read, a round took hours on a large PBS (40 datastores of 20 namespaces:
     39 builds). The build after the round sends it again (_build_block).
@@ -1416,19 +1415,29 @@ def _sub_read(
     of a dead storage; left unnoted, one that never answers, reached only on
     that wait, was sent again on every build; under the read's own key, a
     hopeless send on that wait backed off the next build's send with its
-    whole wait, and a slow namespace was never read whole. Any retry read
-    sent without its minimum wait (a gc or own status late in its half, or
-    with no room for the wait) times out the same way: shipped as the budget
-    skip, unlogged -- a healthy PBS whose gc reads do not all fit the half
-    logged a false error every build -- and noted, so its next send gets the
-    wait and logs a read that is truly stuck."""
+    whole wait, and a slow namespace was never read whole; a send on that
+    wait still respects the read's own backoff (one that timed out after its
+    whole wait). Any retry read sent without its minimum wait (a gc or own
+    status late in its half, or with no room for the wait) times out the
+    same way the first time: shipped as the budget skip, unlogged -- a
+    healthy PBS whose gc reads do not all fit the half logged a false error
+    every build -- and noted, so its next send gets the wait; noted, a read
+    that times out again without it is a failure, logged once a streak."""
     if backoff == "hold":
         key = _WALK_HOLD  # one hold for every walk (see _timeout_backoff)
     else:
         key = _timeout_backoff_key(path, params) if backoff else None
-        if key is not None and budget_cut:
-            key = _grace_key(key)
+    own = None
+    if key is not None and budget_cut:
+        own = _timeout_backoff.get(key)
+        key = _grace_key(key)
     waiting = _timeout_backoff.get(key)
+    if own is not None and (waiting is None or own[0] > waiting[0]):
+        # The read's own backoff -- it timed out after its whole minimum
+        # wait -- holds a hopeless send on the grace back too (a note is due
+        # at once: it never does), and grace history never holds a timely
+        # send back.
+        waiting = own
     if waiting is not None and time.monotonic() < waiting[0]:
         _read_failures["current"].add(waiting[2])  # stays quiet on retry
         message = (
@@ -1471,7 +1480,10 @@ def _sub_read(
         )
     )
     min_wait = _TIMEOUT_BACKOFF_MIN_WAIT if arm else 0
-    cut = budget_cut or (backoff == "retry" and not arm)
+    # Cut short by the budget, unless a note says it was before: then it is
+    # a failure (backed off, logged once a streak), or a gc that never
+    # answers on a PBS whose builds never leave room for the wait is silent.
+    cut = budget_cut or (backoff == "retry" and not arm and key not in _timeout_backoff)
     try:
         data = _get(session, target, path, params, deadline=deadline, min_wait=min_wait)
     except _PbsError as e:
@@ -1482,7 +1494,7 @@ def _sub_read(
                 failure = (scope, store, ns, _DEADLINE_MESSAGE)
                 _suspect_timeout(key, failure, blame_datastore=False)
             e = _PbsError("timeout", _DEADLINE_MESSAGE, True, skipped="deadline")
-        if key is not None and e.pending:  # it had its minimum wait (`arm`)
+        if key is not None and e.pending:  # it had its wait, or was noted
             failure = (scope, store, ns, e.message)
             _arm_timeout_backoff(key, failure, hold=backoff == "hold")
         if missing is not _UNSET and e.status == 404:
@@ -2042,8 +2054,11 @@ def _read_walks(session, target, errors, deadline, names, ahead=False):
                 break
             start = (start + 1) % len(names)
     if ahead:
+        # Never at a deferred one: after a reload that lifted no hold the
+        # round may be complete, and it would be walked first.
+        done = _walked_since_reload | _deferred_walks
         for _ in names:
-            if names[start] not in _walked_since_reload:
+            if names[start] not in done:
                 break
             start = (start + 1) % len(names)
     room, first, why = MAX_NAMESPACES, True, None

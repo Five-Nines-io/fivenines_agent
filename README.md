@@ -1374,8 +1374,9 @@ fingerprint or token in the dashboard does not. Known limit: a storage that
 still lists its directories but blocks reading its files (for example CephFS
 with inactive data placement groups) lets every namespace listing answer, so
 nothing holds the reads: each refresh then sends one backup listing that
-never ends (about one more stuck proxy thread an hour) until each namespace's
-retry has backed off -- watch for it after a storage incident, and restart
+never ends -- about one more stuck proxy thread per refresh at first (a dozen
+an hour), fewer as each namespace's retry backs off, down to one try every 6
+hours -- watch for it after a storage incident, and restart
 `proxmox-backup-proxy` once the storage is repaired. A first backup that is still uploading is never shown as the
 latest backup. Anything that could not be read -- a datastore in offline maintenance,
 a namespace whose group listing failed -- is reported per datastore and
