@@ -1359,9 +1359,9 @@ after the reload read the namespaces and backups of every other datastore
 first and leave its namespaces for later -- unless every datastore is
 broken -- so it can block the walks again only after that round (when two
 datastores were flagged, those after the second one in that round wait for
-it, and, on a storage still broken, for the next reload; the first refresh
-after the reload skips the usage summary and reads each datastore's usage
-from its own status); a datastore
+it, and, on a storage still broken, for the next reload; the refreshes
+after the reload skip the usage summary until one has time to read a
+namespace listing, and read each datastore's usage from its own status); a datastore
 repaired without restarting the proxy is read again once that round is done,
 which on a large PBS takes a few refreshes, and reloading the agent for
 another reason meanwhile does not restart that round); changing the PBS host,

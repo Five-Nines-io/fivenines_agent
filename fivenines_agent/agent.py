@@ -634,8 +634,8 @@ class Agent:
             journal_policy.reset_cache()
             # And the PBS namespace walks held since one timed out (and the
             # backed-off reads): the storage is repaired, send them again --
-            # all but the PBS usage status, kept back one build so the walks
-            # go first (pbs.reset_timeout_holds).
+            # all but the PBS usage status, kept back until a build has time
+            # for a walk, so the walks go first (pbs.reset_timeout_holds).
             reset_pbs_timeout_holds()
 
     def _apply_config_driven_refresh(self, config):
