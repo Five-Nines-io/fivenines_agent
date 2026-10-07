@@ -1149,13 +1149,13 @@ _UNSENT = object()
 # NFS may never return: each retry of those may pin one more proxy thread, at
 # the backoff's doubling pace.
 # {(path, params), _WALK_HOLD or _GROUPS_HOLD: (retry-after monotonic time --
-#  inf for a hold, and for the usage status a reload keeps back for one
-#  build --, timeouts, the _read_failures key of its failure)}. Keyed on the
-# request alone, not on the PBS's address, token or TLS policy: the stuck walk
-# pins that PBS's proxy whoever asks and however its host is spelled
-# (localhost, 127.0.0.2, ::1, its FQDN), so no configuration change may
-# re-send it -- only a reload or a restart. After a move to another PBS, the
-# hold waits for that reload too.
+#  inf for a hold, and for the usage status a reload keeps back until a build
+#  has time for a walk --, timeouts, the _read_failures key of its failure)}.
+# Keyed on the request alone, not on the PBS's address, token or TLS policy:
+# the stuck walk pins that PBS's proxy whoever asks and however its host is
+# spelled (localhost, 127.0.0.2, ::1, its FQDN), so no configuration change
+# may re-send it -- only a reload or a restart. After a move to another PBS,
+# the hold waits for that reload too.
 _timeout_backoff: dict = {}
 _TIMEOUT_BACKOFF_MAX = 6 * 3600
 # The one key every namespace walk is held under.
@@ -1274,7 +1274,7 @@ def _forget_stale_backoffs():
     """Retries expired this long ago (never sent again: the namespace or
     datastore is gone) are dropped. The holds never expire (a SIGHUP or a
     restart clears them), nor does the usage status a reload keeps back
-    until a build reads it."""
+    until a build has time for a walk."""
     now = time.monotonic()
     for key, (retry_at, _, _) in list(_timeout_backoff.items()):  # see _make_room
         if now - retry_at > _TIMEOUT_BACKOFF_MAX:
