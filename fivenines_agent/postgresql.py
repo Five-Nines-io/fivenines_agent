@@ -247,7 +247,8 @@ def _error_category(exc):
     if isinstance(exc, InterfaceError):
         # pg8000 raises InterfaceError (not DatabaseError) when the server
         # requires a password none was provided, or for an unsupported auth
-        # method -- every such message contains "authentication".
+        # method -- every such message contains "authentication", and so does
+        # the one _connect re-raises for pg8000's SCRAM None.decode() crash.
         if "authentication" in str(exc).lower():
             return "auth_failed"
         return "unreachable"

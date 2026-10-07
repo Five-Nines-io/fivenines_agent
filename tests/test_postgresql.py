@@ -146,6 +146,11 @@ def test_connect_forwards_ssl_context(monkeypatch):
         assert isinstance(conn.call_args.kwargs["ssl_context"], ssl.SSLContext)
 
 
+# ---------------------------------------------------------------------------
+# No password: pg8000's SCRAM None.decode() crash reads as auth_failed
+# ---------------------------------------------------------------------------
+
+
 def scram_decode_crash():
     """The AttributeError pg8000 raises on SCRAM with no password: None.decode()."""
     return AttributeError(
@@ -318,6 +323,18 @@ def test_metrics_password_server_without_password_reports_auth_failed(
     with password_demanding_server(auth_request) as port:
         result = postgresql_metrics(host="127.0.0.1", port=port, password=password)
     assert result == {"reachable": False, "error": "auth_failed"}
+
+
+def test_installed_pg8000_still_crashes_on_scram_without_password():
+    """Tripwire for the workaround in _connect: through the installed pg8000,
+    a SCRAM refusal with no password must still be the reclassified
+    None.decode() crash. Once a pg8000 upgrade adds its own SCRAM guard this
+    fails: drop the except branch in _connect (and its "1.31.5 and earlier"
+    comment) instead of leaving it dead."""
+    with password_demanding_server(AUTH_SCRAM) as port:
+        with pytest.raises(InterfaceError) as raised:
+            _connect("127.0.0.1", port, "postgres", None, "postgres")
+    assert isinstance(raised.value.__cause__, AttributeError)
 
 
 def test_metrics_scram_decode_crash_without_password_reports_auth_failed():

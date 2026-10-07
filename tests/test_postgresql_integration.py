@@ -64,10 +64,16 @@ def test_real_postgres_scram_without_password_is_auth_failed(monkeypatch, tmp_pa
     kwargs["password"] = None
     # The payload alone would also pass against an MD5 or cleartext server,
     # which pg8000 refuses on its own: only a SCRAM refusal is the reclassified
-    # None.decode() crash.
-    with pytest.raises(InterfaceError) as raised:
-        _connect(**kwargs)
-    assert isinstance(raised.value.__cause__, AttributeError), raised.value
+    # None.decode() crash. A server that asks for anything else (password
+    # encryption md5, the default before PostgreSQL 14) or nothing at all
+    # (trust) is not what this test is about, so it skips rather than fails.
+    try:
+        _connect(**kwargs).close()
+    except InterfaceError as e:
+        if not isinstance(e.__cause__, AttributeError):
+            pytest.skip(f"server did not request SCRAM-SHA-256: {e}")
+    else:
+        pytest.skip("server accepted a connection without a password")
     assert postgresql_metrics(**kwargs) == {"reachable": False, "error": "auth_failed"}
 
 
