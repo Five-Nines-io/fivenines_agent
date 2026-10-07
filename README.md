@@ -1353,15 +1353,18 @@ restarts. Once the datastore is repaired, restart
 `proxmox-backup-proxy` on the PBS, then reload the agent
 (`sudo kill -HUP $(pgrep -f fivenines_agent)`; on Windows, restart the
 service). Any reload or restart releases them -- one sent for another reason,
-an agent update, a crash restart -- so repair a broken datastore before
+an agent update, a crash restart (an agent restarting in a loop sends the
+read that hangs again at each start, one more pinned proxy thread each
+time: stop the loop first) -- so repair a broken datastore before
 reloading the agent for anything else (if it is still broken, the refreshes
 after the reload read the namespaces and backups of every other datastore
 first and leave its namespaces for later -- unless every datastore is
 broken -- so it can block the walks again only after that round (when two
 datastores were flagged, those after the second one in that round wait for
 it, and, on a storage still broken, for the next reload; the refreshes
-after the reload skip the usage summary until one has time to read a
-namespace listing, and read each datastore's usage from its own status); a datastore
+after the reload skip the usage summary until the namespaces of every
+datastore not flagged have been listed since the reload, and read each
+datastore's usage from its own status); a datastore
 repaired without restarting the proxy is read again once that round is done,
 which on a large PBS takes a few refreshes, and reloading the agent for
 another reason meanwhile does not restart that round); changing the PBS host,

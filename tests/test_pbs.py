@@ -58,6 +58,7 @@ def _reset_state(monkeypatch):
         ("_listings", {}),
         ("_listings_key", None),
         ("_deferred_walks", set()),
+        ("_walked_since_reload", set()),
         ("_reloads", 0),
         ("_known_nodes", (None, frozenset())),
         ("_read_failures", {"previous": set(), "current": set()}),
@@ -10358,11 +10359,11 @@ def test_a_snapshots_read_sent_before_the_budget_keeps_its_own_wait(monkeypatch)
 
 
 # Value: protects=a live /snapshots read reached on what is left of its
-#   /groups read's wait, past the budget, is cut by the budget and nothing
-#   else: no note, no backoff, and under the walk hold no group-reads hold;
-#   fails_when=its clamped timeout is taken for a stuck read (a live, slow
-#   datastore backs off, or stops every group read until a reload);
-#   why_new=pre-landing review (red team); seam=none
+#   /groups read's wait, past the budget, never arms the group-reads hold
+#   under the walk hold, nor costs its datastore the listing remembered;
+#   fails_when=its clamped timeout is taken for a stuck datastore (every
+#   group read stops until a reload, or the datastore's groups stop
+#   shipping); why_new=pre-landing review (red team); seam=none
 @pytest.mark.parametrize("held", [True, False], ids=["walks_held", "not_held"])
 def test_a_snapshots_read_on_its_groups_wait_is_only_cut_by_the_budget(
     monkeypatch, held
@@ -10398,7 +10399,7 @@ def test_a_snapshots_read_on_its_groups_wait_is_only_cut_by_the_budget(
         cut += [e["message"] for e in out["errors"] if e["scope"] == "snapshots"]
     assert sent  # the /snapshots reads were sent on the /groups wait
     assert pbs._GROUPS_HOLD not in pbs._timeout_backoff
-    assert not [k for k in pbs._timeout_backoff if k[0].endswith("/snapshots")]
+    assert set(pbs._listings) == {"a", "b"}
     # Value (extension): protects=such a cut reads like the same read refused
     #   at its send: errors[] names the budget, and no error line is logged;
     #   fails_when=its raw timeout message ships and an error line is logged
@@ -10407,6 +10408,86 @@ def test_a_snapshots_read_on_its_groups_wait_is_only_cut_by_the_budget(
     #   seam=none
     assert cut and set(cut) == {pbs._DEADLINE_MESSAGE}
     assert not [m for level, m in logged if level == "error" and "snapshots" in m]
+
+
+# Value: protects=a /snapshots read on its /groups read's wait that never
+#   answers is noted, then backed off like a late read, so it is not sent
+#   again on every build, and its datastore keeps its listing and its group
+#   reads; fails_when=a budget-cut timeout leaves no trace (a stuck
+#   /snapshots reached only on that wait is sent on every build, 60 in 60,
+#   each a PBS proxy thread it may pin) or takes the namespace side effects
+#   of a stuck read; why_new=pre-landing review (performance), reproduced;
+#   seam=none
+def test_a_stuck_snapshots_read_on_the_groups_wait_backs_off(monkeypatch):
+    clock = use_clock(monkeypatch, Clock())
+    responses = _datastores_with(["s0"])
+    responses["/admin/datastore/s0/namespace"] = ok([{"ns": ""}, {"ns": "n0"}])
+    responses["/admin/datastore/s0/groups?ns=n0"] = ok([])
+    responses["/admin/datastore/s0/snapshots?ns=n0"] = ok([])
+    latency = {
+        path: 1.5
+        for path in (
+            "/access/permissions",
+            "/admin/datastore",
+            "/status/datastore-usage",
+            "/admin/sync?sync-direction=all",
+            "/admin/verify",
+            "/admin/prune",
+        )
+    }
+    latency["/admin/datastore/s0/namespace"] = 9.5
+    latency["/admin/datastore/s0/groups?ns=n0"] = 3  # answers past the budget
+    latency["/admin/datastore/s0/snapshots?ns=n0"] = math.inf  # never answers
+    session = _install_timed(
+        monkeypatch, responses, clock, lambda p: latency.get(p, 0.05)
+    )
+    sends = 0
+    for _ in range(60):
+        _, sent = _timed_build(monkeypatch, clock, session)
+        sends += sent.count("/admin/datastore/s0/snapshots?ns=n0")
+    assert 2 <= sends <= 8, sends  # one rebuild, then twice as long each time
+    assert pbs._GROUPS_HOLD not in pbs._timeout_backoff
+    assert "s0" in pbs._listings
+
+
+# Value: protects=a connect timeout or a stalled TLS handshake of a
+#   /snapshots read on its /groups read's wait reads as the budget, like a
+#   read timeout there, and leaves no backoff (it never reached PBS);
+#   fails_when=only a read timeout that waited its whole clamp is taken
+#   for the budget (the raw transport message ships and an error line is
+#   logged for each namespace, every build) or a request PBS never saw is
+#   backed off; why_new=pre-landing review (testing): only a read timeout
+#   was pinned; seam=none
+@pytest.mark.parametrize("error", ["connect_timeout", "handshake_timeout"])
+def test_a_connect_timeout_on_the_groups_wait_is_a_budget_skip(monkeypatch, error):
+    clock = use_clock(monkeypatch, Clock())
+    responses = _held_two_datastores()
+    latency = {}
+    session = _install_timed(
+        monkeypatch, responses, clock, lambda p: latency.get(p, 0.05)
+    )
+    _timed_build(monkeypatch, clock, session)
+    logged = []
+    monkeypatch.setattr(
+        pbs, "log", lambda message, level="info": logged.append((level, message))
+    )
+    for store in ("a", "b"):
+        for query in ("", "?ns=x"):
+            latency[f"/admin/datastore/{store}/groups{query}"] = 3.5
+            responses[f"/admin/datastore/{store}/snapshots{query}"] = {"error": error}
+    real = pbs._read_all_groups
+
+    def late(session, target, errors, deadline, *args):
+        clock.now = max(clock.now, deadline - 3.0)
+        return real(session, target, errors, deadline, *args)
+
+    monkeypatch.setattr(pbs, "_read_all_groups", late)
+    out, sent = _timed_build(monkeypatch, clock, session)
+    assert [p for p in sent if p.split("?")[0].endswith("/snapshots")]
+    cut = [e["message"] for e in out["errors"] if e["scope"] == "snapshots"]
+    assert cut and set(cut) == {pbs._DEADLINE_MESSAGE}
+    assert not [m for level, m in logged if level == "error" and "snapshots" in m]
+    assert not [k for k in pbs._timeout_backoff if k[0].endswith("/snapshots")]
 
 
 # Value: protects=a /snapshots read on its /groups read's wait that PBS
@@ -10450,19 +10531,19 @@ def test_an_http_error_on_the_groups_wait_is_no_budget_cut(monkeypatch):
 
 
 # Value: protects=after any reload that lifts a hold, or while the usage
-#   status is backed off, the first build after it with time for a walk
-#   reads each datastore's own status instead and the next one sends the
-#   usage status again; fails_when=the reload clears the backoff (a usage status on a
-#   storage still dead re-arms the hold before any walk) or keeps it longer
-#   than one build; why_new=pre-landing review (security, simplification,
-#   coverage audit): a second SIGHUP, or a walk-armed hold, cleared it;
-#   seam=none
+#   status is backed off, the builds until the walks went round read each
+#   datastore's own status instead and the next one sends the usage status
+#   again; fails_when=the reload clears the backoff (a usage status on a
+#   storage still dead re-arms the hold before any walk) or keeps it past
+#   the build whose walks went round; why_new=pre-landing review (security,
+#   simplification, coverage audit): a second SIGHUP, or a walk-armed hold,
+#   cleared it; seam=none
 @pytest.mark.parametrize("gap", [30, pbs.PBS_CACHE_TTL + 20], ids=["tick", "late"])
 @pytest.mark.parametrize(
     "before",
     ["usage_hold", "walk_hold", "group_hold", "backed_off", "double_reload"],
 )
-def test_a_reload_keeps_the_usage_status_backed_off_for_one_build(
+def test_a_reload_keeps_the_usage_status_backed_off_until_the_walks_went_round(
     monkeypatch, before, gap
 ):
     clock = use_clock(monkeypatch, Clock())
@@ -10509,7 +10590,7 @@ def test_a_reload_keeps_the_usage_status_backed_off_for_one_build(
 
 
 # Value: protects=the reload's keep-back of the usage status is used up only
-#   by a build with time for a walk: after one with none -- an abandoned
+#   once the walks went round: after a build with no walk -- an abandoned
 #   worker finishing past its deadline, or job lists that took the budget --
 #   the next build still walks the other datastores before the usage status
 #   is sent; fails_when=the first build after the reload uses it up whatever
@@ -10517,7 +10598,7 @@ def test_a_reload_keeps_the_usage_status_backed_off_for_one_build(
 #   dead, re-arms the hold with nothing walked: the reload was for nothing);
 #   why_new=pre-landing review (red team), reproduced; seam=none
 @pytest.mark.parametrize("late", ["abandoned", "no_walk_time"])
-def test_the_reload_keep_back_waits_for_a_build_with_time_for_a_walk(monkeypatch, late):
+def test_the_reload_keep_back_outlasts_a_build_with_no_walk(monkeypatch, late):
     clock = use_clock(monkeypatch, Clock())
     latency = {  # b's storage is dead: its walk and the usage status hang
         "/status/datastore-usage": math.inf,
@@ -10554,6 +10635,73 @@ def test_the_reload_keep_back_waits_for_a_build_with_time_for_a_walk(monkeypatch
     _, sent = _timed_build(monkeypatch, clock, session, gap=30)
     assert "/status/datastore-usage" in sent  # b still dead: the hold again
     assert pbs._WALK_HOLD in pbs._timeout_backoff
+
+
+# Value: protects=the reload's keep-back of the usage status lasts until
+#   every datastore not deferred has been walked since the reload, over as
+#   many builds as that takes; fails_when=a build with one walk uses it up
+#   (the next sends the usage status before the other datastores are
+#   walked); why_new=pre-landing review (red team); seam=none
+def test_the_reload_keep_back_lasts_until_the_walks_went_round(monkeypatch):
+    clock = use_clock(monkeypatch, Clock())
+    names = ["a", "b", "c", "d"]
+    latency = {f"/admin/datastore/{n}/namespace": 8 for n in names}  # one a build
+    session = _install_timed(
+        monkeypatch, _datastores_with(names), clock, lambda p: latency.get(p, 0.05)
+    )
+    failure = ("usage", None, None, "t")
+    pbs._timeout_backoff[pbs._WALK_HOLD] = (math.inf, 1, failure)
+    pbs.reset_timeout_holds()
+    walked, usage_sent = [], []
+    for _ in range(5):
+        _, sent = _timed_build(monkeypatch, clock, session, gap=30)
+        walked.append(_walked(sent))
+        usage_sent.append("/status/datastore-usage" in sent)
+    assert walked[:4] == [["a"], ["b"], ["c"], ["d"]]
+    assert usage_sent == [False, False, False, False, True]
+    # Value (extension): protects=each reload starts a new round: the walks
+    #   counted for an earlier reload do not release the next one's keep-back;
+    #   fails_when=the walks are not forgotten by a reload (the usage status
+    #   goes first right after the second reload); why_new=pre-landing review
+    #   (mutation testing); seam=none
+    pbs._timeout_backoff[pbs._WALK_HOLD] = (math.inf, 1, failure)
+    pbs.reset_timeout_holds()
+    usage_sent = []
+    for _ in range(4):
+        _, sent = _timed_build(monkeypatch, clock, session, gap=30)
+        usage_sent.append("/status/datastore-usage" in sent)
+    assert usage_sent == [False, False, False, False]
+
+
+# Value: protects=after an agent restart, with a full-scope token and one
+#   storage still dead, the operator's reloads walk every healthy datastore;
+#   fails_when=the keep-back is used up before the walks went round (the
+#   usage status re-arms a hold naming no datastore, the held group reads
+#   move the rotation back to the few datastores remembered, and every
+#   reload walks the same two: 7 of 9 healthy ones never walked); why_new=
+#   pre-landing review (red team), reproduced; seam=none
+def test_reloads_after_a_restart_walk_every_healthy_datastore(monkeypatch):
+    clock = use_clock(monkeypatch, Clock())
+    names = [f"s{i:02d}" for i in range(10)]
+
+    def latency(path):
+        if "/datastore/s05/" in path or path == "/status/datastore-usage":
+            return math.inf  # dead hard-mounted NFS: statfs and readdir hang
+        return 3.0 if path.endswith("/namespace") else 0.05
+
+    session = _install_timed(monkeypatch, _datastores_with(names), clock, latency)
+    _timed_build(monkeypatch, clock, session)  # restarted: usage first, held
+    assert pbs._WALK_HOLD in pbs._timeout_backoff
+    walked = set()
+    for _ in range(5):
+        pbs.reset_timeout_holds()
+        for build in range(10):
+            gap = 30 if build == 0 else None
+            _, sent = _timed_build(monkeypatch, clock, session, gap=gap)
+            walked |= set(_walked(sent))
+            if pbs._WALK_HOLD in pbs._timeout_backoff:
+                break
+    assert set(names) - {"s05"} <= walked, sorted(walked)
 
 
 # Value: protects=a scoped token, which never reads the usage status, never

@@ -282,7 +282,7 @@ _GROUPS_HOLD_MESSAGE = (
     "skipped: a group read timed out while the namespace walks are held, so "
     "no group is read until the agent is reloaded (SIGHUP)"
 )
-# A full-scope token's usage status, while it is backed off (see _read_usage):
+# A full-scope token's usage status, while it is backed off (_build_block):
 # an earlier one left no time for a namespace walk, or the agent was reloaded
 # after a hold (reset_timeout_holds).
 _USAGE_DEFERRED_MESSAGE = (
@@ -423,6 +423,10 @@ _listings_key = None
 # each is walked only once the group reads reach it, after every other
 # datastore (_read_walks).
 _deferred_walks: set = set()
+# The datastores whose namespace walk was sent since the last reload: a reload
+# keeps the usage status back until it holds every datastore not deferred
+# (_build_block, reset_timeout_holds).
+_walked_since_reload: set = set()
 # Bumped by every reload: a build that began before one (an abandoned worker
 # finishing late) leaves `_rotation` where the reload put it.
 _reloads = 0
@@ -1149,8 +1153,8 @@ _UNSENT = object()
 # NFS may never return: each retry of those may pin one more proxy thread, at
 # the backoff's doubling pace.
 # {(path, params), _WALK_HOLD or _GROUPS_HOLD: (retry-after monotonic time --
-#  inf for a hold, and for the usage status a reload keeps back until a build
-#  has time for a walk --, timeouts, the _read_failures key of its failure)}.
+#  inf for a hold, and for the usage status a reload keeps back until the
+#  walks went round --, timeouts, the _read_failures key of its failure)}.
 # Keyed on the request alone, not on the PBS's address, token or TLS policy:
 # the stuck walk pins that PBS's proxy whoever asks and however its host is
 # spelled (localhost, 127.0.0.2, ::1, its FQDN), so no configuration change
@@ -1171,10 +1175,11 @@ _WALK_HOLD = ("namespace walks", ())
 # dead storage's own status reads eat the budget, every group read is cut
 # short, and that rule never armed (one more pinned thread per build).
 _GROUPS_HOLD = ("held group reads", ())
-# The usage status backed off after it left the walks no time (see
-# _read_usage): a retry keyed on the request, like the others -- or kept back
-# by a reload until a build that would read it has time for a walk (no retry
-# time until then: reset_timeout_holds, _build_block).
+# The usage status backed off after it left the walks no time (armed and
+# cleared in _build_block, honoured by _read_usage): a retry keyed on the
+# request, like the others -- or kept back by a reload until the walks have
+# gone round every datastore not deferred (no retry time until then:
+# reset_timeout_holds, _build_block).
 _USAGE_PATH = "/status/datastore-usage"
 _USAGE_BACKOFF = (_USAGE_PATH, ())
 # One build backs off at most this many reads -- a status and a gc per
@@ -1224,7 +1229,7 @@ def _make_room(key):
                 break
 
 
-def _arm_timeout_backoff(key, failure, hold):
+def _arm_timeout_backoff(key, failure, hold, namespaces=True):
     timeouts = _timeout_backoff.get(key, (0, 0, None))[1] + 1
     _make_room(key)
     # A read in a datastore's namespaces timed out: its storage may be dead,
@@ -1233,8 +1238,8 @@ def _arm_timeout_backoff(key, failure, hold):
     # again until a walk lists it. While every walk is held, the group reads
     # stop altogether (_GROUPS_HOLD). (Its own status and gc have their own
     # backoff: a gc that merely answers slowly must not cost its namespaces
-    # a turn.)
-    if failure[0] in ("namespaces", "groups", "snapshots"):
+    # a turn; nor does a read the budget cut short, `namespaces` False.)
+    if namespaces and failure[0] in ("namespaces", "groups", "snapshots"):
         _listings.pop(failure[1], None)
         held = _WALK_HOLD in _timeout_backoff
         if failure[0] != "namespaces" and held and _GROUPS_HOLD not in _timeout_backoff:
@@ -1253,7 +1258,7 @@ def _arm_timeout_backoff(key, failure, hold):
     _timeout_backoff[key] = (time.monotonic() + delay, timeouts, failure)
 
 
-def _suspect_timeout(key, failure):
+def _suspect_timeout(key, failure, namespaces=True):
     """A read that timed out without its minimum wait (sent late in its
     phase, or with no room for the wait, see _sub_read) is no proof it is
     stuck, but it is not taken for healthy either: it is noted as due at
@@ -1262,9 +1267,11 @@ def _suspect_timeout(key, failure):
     had its wait. A stuck read that is always reached late would otherwise
     be sent again on every build, each send a proxy thread it may pin on a
     dead mount; a read never sent without its wait would stay due, unread,
-    until purged hours later on a PBS whose builds never have that room."""
+    until purged hours later on a PBS whose builds never have that room.
+    `namespaces` False (a read the budget cut short): its backoff forgets no
+    listing and arms no hold (_arm_timeout_backoff)."""
     if key in _timeout_backoff:
-        _arm_timeout_backoff(key, failure, hold=False)
+        _arm_timeout_backoff(key, failure, hold=False, namespaces=namespaces)
         return
     _make_room(key)
     _timeout_backoff[key] = (time.monotonic(), 0, failure)
@@ -1274,7 +1281,7 @@ def _forget_stale_backoffs():
     """Retries expired this long ago (never sent again: the namespace or
     datastore is gone) are dropped. The holds never expire (a SIGHUP or a
     restart clears them), nor does the usage status a reload keeps back
-    until a build has time for a walk."""
+    until the walks went round."""
     now = time.monotonic()
     for key, (retry_at, _, _) in list(_timeout_backoff.items()):  # see _make_room
         if now - retry_at > _TIMEOUT_BACKOFF_MAX:
@@ -1296,12 +1303,13 @@ def reset_timeout_holds():
     names no datastore (the walk hold's placement wins): a hold the usage
     status armed names none. After any reload that lifts a hold, or while
     the usage status is backed off, that status stays backed off
-    (_USAGE_BACKOFF) until a build has time for a walk: that build reads
-    each datastore's own status and walks first, and the next one sends it
-    again -- sent first, on a storage still dead it would re-arm the hold
-    before any walk."""
+    (_USAGE_BACKOFF) until every datastore not deferred has been walked
+    since: those builds read each datastore's own status and walk first, and
+    the next one sends it again -- sent first, on a storage still dead it
+    would re-arm the hold before any walk."""
     global _cache, _reloads, _rotation
     _reloads += 1
+    _walked_since_reload.clear()
     walk_hold = _timeout_backoff.get(_WALK_HOLD)
     usage = _timeout_backoff.get(_USAGE_BACKOFF)
     held = walk_hold is not None or _GROUPS_HOLD in _timeout_backoff
@@ -1325,10 +1333,10 @@ def reset_timeout_holds():
         _rotation = (failure[1] + "\x00", "")
     _timeout_backoff.clear()
     if held or usage is not None:
-        # Skipped by every build that would read it until one has time for
-        # a walk, and due from then on (_build_block; its doubling count
-        # kept): sent first, on a storage still dead it would re-arm the hold
-        # before any walk -- after a hold any read armed, since it walks the
+        # Skipped by every build that would read it until the walks have
+        # gone round every datastore not deferred, and due from then on
+        # (_build_block; its doubling count kept): sent first, on a storage
+        # still dead it would re-arm the hold before any walk -- after a hold any read armed, since it walks the
         # hidden datastores and statfs-es every audited one, or when it was
         # backed off already (a second SIGHUP).
         timeouts = usage[1] if isinstance(usage, tuple) else 0
@@ -1371,12 +1379,15 @@ def _sub_read(
     read: what the group reads after it need, _GROUP_READS_RESERVE).
     Without room for it, a read is clamped like a late one, even one that
     timed out before -- whose clamped timeout then backs it off
-    (_suspect_timeout). `budget_cut`: no minimum wait, and a timeout is only
-    the budget running out -- a skip like _deadline_hit's (_DEADLINE_MESSAGE,
-    not logged), with no note, no backoff and no hold (a /snapshots read
-    sent past the budget on what is left of its /groups read's wait: the
-    datastore just answered, so a timeout there is no sign of a dead
-    storage)."""
+    (_suspect_timeout). `budget_cut`: no minimum wait, and a timeout reads
+    as the budget running out -- a skip like _deadline_hit's
+    (_DEADLINE_MESSAGE, not logged) -- yet one PBS may still be running is
+    noted, then backed off, like a late read (_suspect_timeout), never
+    forgetting its listing nor arming a hold (a /snapshots read sent past
+    the budget on what is left of its /groups read's wait: the datastore
+    just answered, so a timeout there is no sign of a dead storage -- but
+    left unnoted, one that never answers, reached only on that wait, was
+    sent again on every build)."""
     if backoff == "hold":
         key = _WALK_HOLD  # one hold for every walk (see _timeout_backoff)
     else:
@@ -1428,6 +1439,8 @@ def _sub_read(
         data = _get(session, target, path, params, deadline=deadline, min_wait=min_wait)
     except _PbsError as e:
         if budget_cut and e.error_type == "timeout":
+            if key is not None and e.pending:
+                _suspect_timeout(key, (scope, store, ns, e.message), False)
             e = _PbsError("timeout", _DEADLINE_MESSAGE, True, skipped="deadline")
         if key is not None and e.pending:
             failure = (scope, store, ns, e.message)
@@ -1729,8 +1742,6 @@ def _build_block(session, target, deadline):
     # ACL's (`why`) before the listings' (`why_listing`).
     flags_at = len(errors)
     reloads = _reloads
-    now, cutoff = time.monotonic(), _walk_cutoff(deadline, True)
-    kept = _timeout_backoff.get(_USAGE_BACKOFF)
     if usage is not None:
         # The usage status answered (never under the walk hold, which holds
         # it too). When the reads before the walks left no time for even the
@@ -1738,24 +1749,32 @@ def _build_block(session, target, deadline):
         # with a fallback, each datastore's own status -- is backed off
         # (doubling, see _arm_timeout_backoff): else no namespace would ever
         # be walked on a PBS whose usage status takes most of the budget.
+        now, cutoff = time.monotonic(), _walk_cutoff(deadline, True)
         if now < cutoff:
             _timeout_backoff.pop(_USAGE_BACKOFF, None)
         elif now - usage_took < cutoff:
             failure = ("usage", None, None, _USAGE_DEFERRED_MESSAGE)
             _arm_timeout_backoff(_USAGE_BACKOFF, failure, hold=False)
-    elif full_scope and kept is not None and kept[0] == math.inf and now < cutoff:
-        # Kept back by a reload (reset_timeout_holds), and this build has time
-        # for its first walk: the walks go first, and the usage status is due
-        # from the next build on (its doubling count kept). A build with no
-        # time for one -- an abandoned worker finishing late, or one whose job
-        # lists took the budget -- leaves it kept back, else the next build
-        # would send it before any walk and, on a storage still dead, re-arm
-        # the hold with nothing walked. (Under the walk hold it stays held
-        # whatever this says, until the reload that keeps it back again.)
-        _timeout_backoff[_USAGE_BACKOFF] = (now, *kept[1:])
     listed, window, stop, ns_hidden, unlisted = _read_walks(
         session, target, errors, deadline, sorted(names)
     )
+    kept = _timeout_backoff.get(_USAGE_BACKOFF)
+    if (
+        full_scope
+        and kept is not None
+        and kept[0] == math.inf
+        and names - _deferred_walks <= _walked_since_reload
+    ):
+        # Kept back by a reload (reset_timeout_holds) until every datastore
+        # not deferred has been walked since -- over as many builds as it
+        # takes: due from the next build on (its doubling count kept). Sent
+        # sooner, on a storage still dead it would re-arm the hold with a
+        # hold that names no datastore, which no reload places past, while
+        # the held group reads move the rotation back to the datastores
+        # remembered: every reload then walked the same few datastores. An
+        # abandoned worker finishing late, or a build whose job lists took
+        # the budget, walks none.
+        _timeout_backoff[_USAGE_BACKOFF] = (time.monotonic(), *kept[1:])
     datastores = _read_stores(
         session, target, errors, deadline, kept_stores, usage, own_status, backends
     )
@@ -1970,6 +1989,7 @@ def _read_walks(session, target, errors, deadline, names):
     list flagged by its scope reason."""
     _sync_listings(target, names)
     _deferred_walks.intersection_update(names)
+    _walked_since_reload.intersection_update(names)
     listed, window, stop, ns_hidden, read = {}, [], None, False, 0
     start = _start_index(names, None if _rotation is None else _rotation[0])
     if _rotation is not None and _rotation[0].endswith("\x00"):
@@ -2005,6 +2025,7 @@ def _read_walks(session, target, errors, deadline, names):
             continue
         first = False
         _deferred_walks.discard(name)
+        _walked_since_reload.add(name)
         if namespaces is None:
             _listings.pop(name, None)
             continue
@@ -2313,7 +2334,7 @@ def _read_usage(session, target, errors, deadline, listed):
     if not held and waiting is not None and time.monotonic() < waiting[0]:
         # Backed off (_build_block, reset_timeout_holds): the own status of
         # each datastore is read instead, the walks get the time. Kept back
-        # by a reload (no retry time): until a build has time for a walk
+        # by a reload (no retry time): until the walks went round
         # (_build_block).
         _error(errors, "usage", _USAGE_DEFERRED_MESSAGE)
         return None, True
