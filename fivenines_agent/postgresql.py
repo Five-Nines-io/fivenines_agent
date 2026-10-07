@@ -245,6 +245,12 @@ def _error_category(exc):
     if isinstance(cause, socket.gaierror):
         return "unreachable"
     if isinstance(exc, InterfaceError):
+        # A network failure pg8000 wraps is raised from an OSError and is never
+        # an auth refusal, whatever its message says: pg8000 quotes the
+        # configured host in it, so a host named "authentication-db" that goes
+        # down would otherwise read as auth_failed.
+        if isinstance(cause, OSError):
+            return "unreachable"
         # pg8000 raises InterfaceError (not DatabaseError) when the server
         # requires a password none was provided, or for an unsupported auth
         # method -- every such message contains "authentication", and so does

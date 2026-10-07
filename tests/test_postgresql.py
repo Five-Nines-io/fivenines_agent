@@ -13,6 +13,7 @@ No real PostgreSQL is needed. The opt-in integration test that exercises a real
 server lives in test_postgresql_integration.py.
 """
 
+import errno
 import os
 import socket
 import ssl
@@ -470,6 +471,21 @@ def test_error_category_dns_unreachable():
 def test_error_category_interface_error_unknown_cause():
     """An InterfaceError with no recognized cause maps to unreachable."""
     assert _error_category(InterfaceError("x")) == "unreachable"
+
+
+@pytest.mark.parametrize(
+    "err",
+    [errno.EHOSTUNREACH, errno.ENETUNREACH, errno.EACCES],
+    ids=["host-unreachable", "network-unreachable", "connect-denied"],
+)
+def test_metrics_network_failure_on_a_host_named_authentication_is_unreachable(err):
+    """pg8000 quotes the configured host in its connect error: a down host
+    whose name contains "authentication" must still read as unreachable, never
+    as auth_failed (the amber "check credentials" state)."""
+    down = OSError(err, "down")
+    with patch("pg8000.core.socket.create_connection", side_effect=down):
+        result = postgresql_metrics(host="authentication-db.internal", password="x")
+    assert result == {"reachable": False, "error": "unreachable"}
 
 
 def test_error_category_interface_error_auth_message_is_auth_failed():
