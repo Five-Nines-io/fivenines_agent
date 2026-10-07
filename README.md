@@ -353,7 +353,7 @@ For Synology NAS devices running DSM 7 and higher, the agent is distributed as a
 3. Upload the `.spk` file and follow the wizard.
 4. When prompted by the UI, paste your Fivenines API token. the agent will automatically configure itself and start.
 
-> **Note:** To comply with Synology DSM 7's strict security policies, the agent runs as a dedicated low-privilege system user (`sc-fivenines-agent`), not as `root`. Because it cannot use `sudo`, deep system hardware telemetry (like SMART disk health, RAID mapping, and raw `sysfs` temperature sensors) may be gracefully disabled depending on your NAS model permissions. QEMU and Proxmox metrics are also excluded from the Synology build.
+> **Note:** To comply with Synology DSM 7's strict security policies, the agent runs as a dedicated low-privilege system user (`sc-fivenines-agent`), not as `root`. Because it cannot use `sudo`, deep system hardware telemetry (like SMART disk health, RAID mapping, and raw `sysfs` temperature sensors) may be gracefully disabled depending on your NAS model permissions. QEMU, Proxmox and NVIDIA GPU metrics are also excluded from the Synology build.
 
 ### Cloning VMs or building golden images
 
