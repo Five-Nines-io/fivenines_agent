@@ -209,7 +209,24 @@ def _connect(host, port, user, password, database):
     else:
         params["host"] = host
         params["port"] = port_num
-    return pg8000.dbapi.connect(**params)
+    try:
+        return pg8000.dbapi.connect(**params)
+    except AttributeError as e:
+        # pg8000 (1.31.5 and earlier) refuses a missing password with an
+        # InterfaceError for cleartext and MD5, but on SCRAM-SHA-256 (the TCP
+        # default since PostgreSQL 14) it calls None.decode() and leaks
+        # "'NoneType' object has no attribute 'decode'". Re-raise exactly that
+        # crash in the shape pg8000 uses for the other two -- the message must
+        # keep the word "authentication", which is what _error_category reads
+        # as auth_failed (amber "check credentials") instead of the generic
+        # error the backend paints as a red outage. Any other AttributeError is
+        # a different bug and surfaces unchanged, with its detail.
+        if params["password"] is None and e.name == "decode" and e.obj is None:
+            raise InterfaceError(
+                "server requesting SCRAM-SHA-256 password authentication, but no "
+                "password was provided"
+            ) from e
+        raise
 
 
 def _error_category(exc):
@@ -228,9 +245,16 @@ def _error_category(exc):
     if isinstance(cause, socket.gaierror):
         return "unreachable"
     if isinstance(exc, InterfaceError):
+        # A network failure pg8000 wraps is raised from an OSError and is never
+        # an auth refusal, whatever its message says: pg8000 quotes the
+        # configured host in it, so a host named "authentication-db" that goes
+        # down would otherwise read as auth_failed.
+        if isinstance(cause, OSError):
+            return "unreachable"
         # pg8000 raises InterfaceError (not DatabaseError) when the server
         # requires a password none was provided, or for an unsupported auth
-        # method -- every such message contains "authentication".
+        # method -- every such message contains "authentication", and so does
+        # the one _connect re-raises for pg8000's SCRAM None.decode() crash.
         if "authentication" in str(exc).lower():
             return "auth_failed"
         return "unreachable"
