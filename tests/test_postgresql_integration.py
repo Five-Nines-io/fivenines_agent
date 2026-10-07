@@ -17,8 +17,9 @@ Run against a local or containerized PostgreSQL, e.g.:
 import os
 
 import pytest
+from pg8000.exceptions import InterfaceError
 
-from fivenines_agent.postgresql import postgresql_metrics
+from fivenines_agent.postgresql import NO_PASSWORD_DETAIL, _connect, postgresql_metrics
 
 
 pytestmark = pytest.mark.skipif(
@@ -55,13 +56,24 @@ def test_real_postgres_is_reachable_with_metrics():
 def test_real_postgres_scram_without_password_is_auth_failed(monkeypatch, tmp_path):
     """A stock PostgreSQL 14+ demands SCRAM-SHA-256 on a TCP host line, as the
     docker recipe above does. With no password in config, PGPASSWORD or
-    .pgpass the collector reports auth_failed; agents up to 1.20.4 sent the
-    generic "'NoneType' object has no attribute 'decode'" error instead."""
+    .pgpass the collector reports auth_failed with the no-password detail;
+    agents up to 1.20.4 sent the generic "'NoneType' object has no attribute
+    'decode'" error instead."""
     monkeypatch.delenv("PGPASSWORD", raising=False)
     monkeypatch.setenv("PGPASSFILE", str(tmp_path / "does-not-exist.pgpass"))
     kwargs = _conn_kwargs()
     kwargs["password"] = None
-    assert postgresql_metrics(**kwargs) == {"reachable": False, "error": "auth_failed"}
+    # The payload alone would also pass against an MD5 or cleartext server,
+    # which pg8000 refuses on its own: only a SCRAM refusal is the reclassified
+    # None.decode() crash.
+    with pytest.raises(InterfaceError) as raised:
+        _connect(**kwargs)
+    assert isinstance(raised.value.__cause__, AttributeError), raised.value
+    assert postgresql_metrics(**kwargs) == {
+        "reachable": False,
+        "error": "auth_failed",
+        "error_detail": NO_PASSWORD_DETAIL,
+    }
 
 
 def test_real_postgres_unreachable_on_closed_port():

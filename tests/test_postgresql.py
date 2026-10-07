@@ -5,8 +5,9 @@ tests mock at two seams:
   - pg8000.dbapi.connect    -> for _connect routing (TCP vs unix socket)
   - fivenines_agent.postgresql._connect / the helpers -> for orchestration
 
-and run the real driver at one more: scram_only_server, a loopback socket that
-speaks just enough of the wire protocol to demand SCRAM-SHA-256.
+and run the real driver at one more: password_demanding_server, a loopback
+socket that speaks just enough of the wire protocol to demand a password
+(SCRAM-SHA-256, MD5 or cleartext).
 
 No real PostgreSQL is needed. The opt-in integration test that exercises a real
 server lives in test_postgresql_integration.py.
@@ -15,6 +16,8 @@ server lives in test_postgresql_integration.py.
 import os
 import socket
 import ssl
+import struct
+import threading
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
@@ -22,6 +25,7 @@ import pytest
 from pg8000.exceptions import DatabaseError, InterfaceError
 
 from fivenines_agent.postgresql import (
+    NO_PASSWORD_DETAIL,
     _connect,
     _default_pgpass_path,
     _error_category,
@@ -244,23 +248,26 @@ def test_metrics_attribute_error_with_a_password_stays_a_generic_error(
     assert result == expected
 
 
+# AuthenticationRequest bodies (auth code + payload) a password-demanding
+# server sends after the StartupMessage.
+AUTH_CLEARTEXT = struct.pack("!i", 3)
+AUTH_MD5 = struct.pack("!i", 5) + b"salt"
+# AuthenticationSASL: mechanism list, each NUL-terminated, then NUL.
+AUTH_SCRAM = struct.pack("!i", 10) + b"SCRAM-SHA-256" + bytes(2)
+
+
 @contextmanager
-def scram_only_server():
+def password_demanding_server(auth_request):
     """A loopback socket that speaks just enough of the PostgreSQL protocol to
-    demand SCRAM-SHA-256, as a stock PostgreSQL 14+ does on a TCP host line.
+    demand a password with auth_request (SCRAM-SHA-256 is what a stock
+    PostgreSQL 14+ asks for on a TCP host line).
 
     Every other connect-path test mocks pg8000.dbapi.connect, which is how
     pg8000's missing SCRAM guard went unnoticed: this one runs the real driver
-    handshake, as far as the server's mechanism offer.
+    handshake, as far as the server's password request.
     """
-    import struct
-    import threading
-
     ssl_request_code = 80877103
-    auth_sasl = 10
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    listener.bind(("127.0.0.1", 0))
-    listener.listen(1)
+    listener = socket.create_server(("127.0.0.1", 0))
     listener.settimeout(5)
 
     def serve():
@@ -276,9 +283,9 @@ def scram_only_server():
                     if code != ssl_request_code:  # the StartupMessage
                         break
                     conn.sendall(b"N")
-                # AuthenticationSASL: mechanism list, each NUL-terminated, then NUL.
-                body = struct.pack("!i", auth_sasl) + b"SCRAM-SHA-256" + bytes(2)
-                conn.sendall(b"R" + struct.pack("!i", len(body) + 4) + body)
+                conn.sendall(
+                    b"R" + struct.pack("!i", len(auth_request) + 4) + auth_request
+                )
                 conn.recv(1)  # wait for the client to give up
             except (struct.error, OSError):
                 pass
@@ -295,16 +302,61 @@ def scram_only_server():
 @pytest.mark.parametrize(
     "password", [None, ""], ids=["no-password", "blank-config-password"]
 )
-def test_metrics_scram_server_without_password_reports_auth_failed(password):
-    """End to end through real pg8000: a SCRAM-only server and no password in
-    config, PGPASSWORD or .pgpass reports auth_failed, not the
-    "'NoneType' object has no attribute 'decode'" generic error that agents up
-    to 1.20.4 sent (rendered server-side as a red PostgreSQL outage). A blank
-    dashboard password field arrives as "", which _resolve_password treats as
-    unset, so it takes the same path."""
-    with scram_only_server() as port:
+@pytest.mark.parametrize(
+    "auth_request",
+    [AUTH_SCRAM, AUTH_MD5, AUTH_CLEARTEXT],
+    ids=["scram", "md5", "cleartext"],
+)
+def test_metrics_password_server_without_password_reports_auth_failed(
+    auth_request, password
+):
+    """End to end through real pg8000: a server demanding a password and none
+    in config, PGPASSWORD or .pgpass reports auth_failed with the fixed
+    no-password detail. On SCRAM, agents up to 1.20.4 sent the
+    "'NoneType' object has no attribute 'decode'" generic error instead
+    (rendered server-side as a red PostgreSQL outage). A blank dashboard
+    password field arrives as "", which _resolve_password treats as unset, so
+    it takes the same path."""
+    with password_demanding_server(auth_request) as port:
         result = postgresql_metrics(host="127.0.0.1", port=port, password=password)
-    assert result == {"reachable": False, "error": "auth_failed"}
+    assert result == {
+        "reachable": False,
+        "error": "auth_failed",
+        "error_detail": NO_PASSWORD_DETAIL,
+    }
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        DatabaseError({"C": "28P01", "M": 'password authentication failed for "x"'}),
+        InterfaceError("Authentication method 7 not supported by pg8000."),
+    ],
+    ids=["wrong-password", "unsupported-method"],
+)
+def test_metrics_other_auth_failures_carry_no_detail(exc):
+    """Only a refusal for want of a password gets NO_PASSWORD_DETAIL: a wrong
+    password (SQLSTATE 28P01) or an auth method pg8000 cannot speak stays a
+    bare auth_failed, so the detail never claims a password was missing."""
+    with patch(f"{PG}._connect", side_effect=exc):
+        assert postgresql_metrics(password="secret") == {
+            "reachable": False,
+            "error": "auth_failed",
+        }
+
+
+def test_metrics_no_password_detail_rides_only_on_auth_failed():
+    """A no-password refusal whose cause classifies it first (here a timeout)
+    keeps that category and gets no detail: NO_PASSWORD_DETAIL is only ever
+    shipped with auth_failed."""
+    exc = with_cause(
+        InterfaceError(
+            "server requesting password authentication, but no password was provided"
+        ),
+        socket.timeout(),
+    )
+    with patch(f"{PG}._connect", side_effect=exc):
+        assert postgresql_metrics() == {"reachable": False, "error": "timeout"}
 
 
 @pytest.mark.parametrize(

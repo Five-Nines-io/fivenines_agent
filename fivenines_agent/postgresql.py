@@ -33,6 +33,8 @@ from fivenines_agent.debug import debug, log
 #
 # Failure contract:
 #   connect / auth / timeout fails --> {"reachable": False, "error": <category>}
+#     (+ "error_detail": the exception text for the generic "error", or
+#      NO_PASSWORD_DETAIL for an auth_failed with no password to send)
 #   connected + version probe OK   --> {"reachable": True, <metrics...>}
 #   The no-privilege `SHOW server_version` probe is the liveness gate: if it
 #   fails after connect (session dropped or unusable), report reachable: False
@@ -59,6 +61,19 @@ STATEMENT_TIMEOUT_MS = 5000
 # unreachable). It also bounds connection establishment so a dead host cannot
 # stall the loop.
 SOCKET_TIMEOUT = 10
+
+# pg8000 refuses cleartext and MD5 with an InterfaceError carrying these words
+# when it has no password to send, and _connect words the SCRAM refusal the
+# same way.
+_NO_PASSWORD_MARKER = "no password was provided"
+
+# Shipped as error_detail with that auth_failed, so the operator can tell "the
+# agent found no password to send" from a wrong one (a bare auth_failed). Fixed
+# text, never the exception's.
+NO_PASSWORD_DETAIL = (
+    "no password found in the config, PGPASSWORD or the pgpass file (outside "
+    "Windows, a pgpass file with group or other permissions is ignored)"
+)
 
 
 def _is_socket_host(host):
@@ -219,8 +234,10 @@ def _connect(host, port, user, password, database):
         # crash in the shape pg8000 uses for the other two -- the message must
         # keep the word "authentication", which is what _error_category reads
         # as auth_failed (amber "check credentials") instead of the generic
-        # error the backend paints as a red outage. Any other AttributeError is
-        # a different bug and surfaces unchanged, with its detail.
+        # error the backend paints as a red outage, and _NO_PASSWORD_MARKER,
+        # which is what _failure reads to say no password was found. Any other
+        # AttributeError is a different bug and surfaces unchanged, with its
+        # detail.
         if params["password"] is None and e.name == "decode" and e.obj is None:
             raise InterfaceError(
                 "server requesting SCRAM-SHA-256 password authentication, but no "
@@ -422,7 +439,9 @@ def _failure(exc):
 
     The category comes from _error_category; for the generic "error" catch-all
     a short human-readable error_detail is attached (the contract's optional
-    field) since the category alone is not descriptive there.
+    field) since the category alone is not descriptive there. An auth_failed
+    raised because the agent had no password to send gets the fixed
+    NO_PASSWORD_DETAIL, which tells it apart from a wrong password.
     """
     category = _error_category(exc)
     result = {"reachable": False, "error": category}
@@ -430,6 +449,8 @@ def _failure(exc):
         detail = str(exc).strip()
         if detail:
             result["error_detail"] = detail[:200]
+    elif category == "auth_failed" and _NO_PASSWORD_MARKER in str(exc):
+        result["error_detail"] = NO_PASSWORD_DETAIL
     return result
 
 
