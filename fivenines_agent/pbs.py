@@ -1488,9 +1488,13 @@ def _sub_read(
         data = _get(session, target, path, params, deadline=deadline, min_wait=min_wait)
     except _PbsError as e:
         if cut and e.error_type == "timeout":
-            if key is not None and e.pending:
-                # Noted under the budget skip it ships (_read_failures: its
-                # backoff skips must not mark a real failure as reported).
+            # Noted under the budget skip it ships (_read_failures: its
+            # backoff skips must not mark a real failure as reported) when
+            # PBS may still be running it -- and, off the grace, when it never
+            # connected: a note is due at once and backs nothing off, but a
+            # repeat is then a failure, else a proxy too busy to accept left
+            # a gc silent for good.
+            if key is not None and (e.pending or not budget_cut):
                 failure = (scope, store, ns, _DEADLINE_MESSAGE)
                 _suspect_timeout(key, failure, blame_datastore=False)
             e = _PbsError("timeout", _DEADLINE_MESSAGE, True, skipped="deadline")

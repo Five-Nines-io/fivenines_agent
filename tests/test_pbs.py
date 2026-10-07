@@ -10725,13 +10725,16 @@ def test_a_gc_read_its_half_cuts_short_is_no_error_line(monkeypatch):
     }
 
 
-# Value: protects=a gc that never answers, on a PBS whose builds never leave
-#   room for its minimum wait, still logs one error line: noted the first
-#   time, it is a failure the next; fails_when=every timeout of a read sent
-#   without its wait ships as the budget skip (the stuck gc is silent for
-#   good); why_new=scoped review of the budget-cut rule, reproduced;
-#   seam=none
-def test_a_stuck_gc_without_room_for_its_wait_is_still_logged(monkeypatch):
+# Value: protects=a gc that never answers -- its read or its connection
+#   timing out -- on a PBS whose builds never leave room for its minimum
+#   wait, still logs one error line: noted the first time, it is a failure
+#   the next; fails_when=every timeout of a read sent without its wait ships
+#   as the budget skip, or a connect timeout is never noted (the stuck gc,
+#   or a proxy too busy to accept, is silent for good); why_new=scoped
+#   review of the budget-cut rule (and the outside review's connect-timeout
+#   case), reproduced; seam=none
+@pytest.mark.parametrize("stuck", ["read", "connect"])
+def test_a_stuck_gc_without_room_for_its_wait_is_still_logged(monkeypatch, stuck):
     clock = use_clock(monkeypatch, Clock())
     logged = []
     monkeypatch.setattr(
@@ -10750,12 +10753,13 @@ def test_a_stuck_gc_without_room_for_its_wait_is_still_logged(monkeypatch):
     }
     latency["/admin/datastore/s0/namespace"] = 9.0
     latency["/admin/datastore/s1/namespace"] = 9.0
-    latency["/admin/datastore/s1/gc"] = math.inf  # never answers
+    responses = _datastores_with(["s0", "s1"])
+    if stuck == "read":
+        latency["/admin/datastore/s1/gc"] = math.inf  # never answers
+    else:
+        responses["/admin/datastore/s1/gc"] = {"error": "connect_timeout"}
     session = _install_timed(
-        monkeypatch,
-        _datastores_with(["s0", "s1"]),
-        clock,
-        lambda p: latency.get(p, 0.05),
+        monkeypatch, responses, clock, lambda p: latency.get(p, 0.05)
     )
     for _ in range(40):
         _timed_build(monkeypatch, clock, session)
