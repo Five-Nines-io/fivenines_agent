@@ -4,8 +4,8 @@
 
 Agent side is DONE: `data["pbs"]` (`pbs.py`) behind a new TOP-LEVEL `pbs` config
 key that nothing sends yet, so the collector is inert until it is sent, plus
-the `pbs` join key on PVE storage rows of type `pbs`. The companion work is not
-filed yet in fivenines_server. Agent-side follow-ups, not blockers:
+the `pbs` join key on PVE storage rows of type `pbs`. The companion server work
+is tracked in fivenines_server#1316. Agent-side follow-ups, not blockers:
 
 - `proxmox.py` accepts `verify_ssl: false` for ANY host, so a remote PVE token
   can travel over unverified TLS. `pbs.py` refuses that (loopback only, or a
