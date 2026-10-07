@@ -540,3 +540,74 @@ def test_resync_systemd_runtime_noop_on_non_systemd_host(mock_refresh):
     agent._resync_systemd_runtime()  # must not raise
 
     mock_refresh.assert_not_called()
+
+
+@patch("fivenines_agent.agent.print_capabilities_banner")
+@patch("fivenines_agent.agent.refresh_runtime_caches")
+@patch("fivenines_agent.agent.force_inventory_resend")
+@patch("fivenines_agent.agent.journal_policy")
+@patch("fivenines_agent.agent.reset_pbs_timeout_holds")
+def test_handle_sighup_refresh_releases_held_pbs_reads(
+    mock_reset, mock_policy, mock_force, mock_refresh, mock_banner
+):
+    """The PBS namespace walks held since one timed out (a walk PBS may still
+    be running) are sent again only on SIGHUP -- the operator's 'storage
+    repaired' signal -- or a restart."""
+    from fivenines_agent.agent import refresh_permissions_event
+
+    agent = make_agent()
+    agent._systemd_force_resend = False
+    agent.permissions = MagicMock()
+    agent.static_data = {}
+    refresh_permissions_event.set()
+
+    try:
+        agent._handle_sighup_refresh()
+    finally:
+        refresh_permissions_event.clear()
+
+    mock_reset.assert_called_once_with()
+
+
+# Value: protects=only SIGHUP releases the held PBS reads in the agent loop;
+#   fails_when=_handle_sighup_refresh resets the PBS holds on every tick;
+#   why_new=the mock test only checked that SIGHUP makes the call; seam=none
+@patch("fivenines_agent.agent.print_capabilities_banner")
+@patch("fivenines_agent.agent.refresh_runtime_caches")
+@patch("fivenines_agent.agent.force_inventory_resend")
+@patch("fivenines_agent.agent.journal_policy")
+def test_only_sighup_releases_a_held_pbs_read(
+    mock_policy, mock_force, mock_refresh, mock_banner, monkeypatch
+):
+    """_handle_sighup_refresh runs at the top of EVERY tick: a held PBS read (a
+    namespace walk PBS may still be running) must survive the ticks without
+    the signal -- released each tick, every rebuild would pin one more PBS
+    proxy thread -- and only SIGHUP clears it, through the real pbs state."""
+    import math
+
+    from fivenines_agent import pbs
+    from fivenines_agent.agent import refresh_permissions_event
+
+    held = pbs._WALK_HOLD
+    monkeypatch.setattr(pbs, "_timeout_backoff", {held: (math.inf, 1, None)})
+    # Patched too: SIGHUP replaces the module's block cache, which must not
+    # leak into the tests that run after this one.
+    cached = pbs.TTLCache()
+    monkeypatch.setattr(pbs, "_cache", cached)
+    agent = make_agent()
+    agent._systemd_force_resend = False
+    agent.permissions = MagicMock()
+    agent.static_data = {}
+    try:
+        refresh_permissions_event.clear()
+        agent._handle_sighup_refresh()
+        assert pbs._timeout_backoff == {held: (math.inf, 1, None)}
+        assert pbs._cache is cached
+        refresh_permissions_event.set()
+        agent._handle_sighup_refresh()
+        # The hold is released; only the usage status stays backed off for
+        # the builds until the walks went round.
+        assert set(pbs._timeout_backoff) == {pbs._USAGE_BACKOFF}
+        assert pbs._cache is not cached  # the block reporting the hold, dropped
+    finally:
+        refresh_permissions_event.clear()

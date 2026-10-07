@@ -1,5 +1,66 @@
 # TODOS
 
+## Proxmox Backup Server (v1.21.0) -- follow-ups
+
+Agent side is DONE: `data["pbs"]` (`pbs.py`) behind a new TOP-LEVEL `pbs` config
+key that nothing sends yet, so the collector is inert until it is sent, plus
+the `pbs` join key on PVE storage rows of type `pbs`. The companion server work
+is tracked in fivenines_server#1316. Agent-side follow-ups, not blockers:
+
+- `proxmox.py` accepts `verify_ssl: false` for ANY host, so a remote PVE token
+  can travel over unverified TLS. `pbs.py` refuses that (loopback only, or a
+  pinned fingerprint); applying the same policy to proxmoxer means a pinned
+  adapter on its session and a config key under `proxmox` -- the splat hazard,
+  so it needs `**_kwargs` on `proxmox_metrics` first, in its own release.
+- Not collected yet: tape backup jobs (`/tape/backup`, `Tape.Audit`, which the
+  privilege allowlist would then have to admit) and the PBS task log (a failed
+  backup ATTEMPT needs Sys.Audit, now refused, and its `worker_id` omits the
+  namespace, so it cannot be tied to a group unambiguously).
+- The PVE join cannot reach a PBS whose certificate PVE trusts through a CA:
+  storage.cfg then carries no fingerprint, and a loopback PBS report (the
+  recommended setup) ships no host identity to match PVE's `server` against.
+  Fix direction: ship the PBS host's names (hostname, FQDN) in the loopback
+  block -- an additive optional key -- and extend the join rule
+  (pve_join_contract) to match them when there is no fingerprint.
+- The gc step reads GC status one datastore at a time (N+1): PBS >= 3.2
+  serves every datastore's in ONE `GET /admin/gc`. The per-store reads get
+  half of what the namespace walks leave, so on a distant PBS with many
+  datastores (100 at a 50ms RTT: ~5s of round trips alone) they go round the
+  datastores over several refreshes. Fix direction: read `/admin/gc` first,
+  fall back to the per-store read on a 404 (PBS < 3.2) AND for every listed
+  datastore missing from it (PBS drops a datastore whose status fails, and a
+  scoped token's 403s, from that 200). Needs a real capture for the contract
+  fixture first.
+- A storage whose namespace walk still answers while its /groups or
+  /snapshots reads hang for good (CephFS with inactive data PGs: readdir is
+  served, file data blocks) arms neither hold: the walk hold needs a walk
+  timeout, and the group-reads hold arms only under it. Each build then sends
+  one more read that never ends -- measured: 12 hung /snapshots in 12 builds
+  on a datastore of 11 namespaces -- until every namespace's per-request
+  retry has backed off. Fix direction: a per-datastore group-read backoff
+  (doubling, like gc/own status) that a pending /groups or /snapshots
+  timeout arms, survives the next walk's `_remember()`, skips that
+  datastore's group reads until it expires, and is cleared by a success or
+  SIGHUP.
+
+## P2: `read_capped_body` does not bound a slow-drip body that has a Content-Length
+
+Found by the performance review of the PBS collector; pre-existing, and shared by
+every user of `http_body.read_capped_body` (tsdb, php_fpm, rabbitmq, pbs). With
+a `Content-Length`, requests' `iter_content(64KB)` ends in `BufferedReader.read(n)`,
+which keeps calling `recv` until n bytes (clipped to the length) or EOF arrive, so
+the wall-clock deadline is only checked once per 64KB chunk: a server sending one
+byte every few seconds never trips the read timeout or the deadline (measured: a
+50-byte body at 0.2s/byte with a 1s deadline returned after 10s; chunked
+encoding stops at 1s). The header phase is not deadline-bound at all. Fix
+direction: read with `response.raw.read1(...)` (one `recv` per call, urllib3 2.x)
+so the deadline is checked after every `recv`; bounding the header phase needs the
+per-collector `bounded.call_bounded` bound (the P3 entry below). `pbs` already runs
+under such a bound (`PBS_HARD_DEADLINE`), which cuts its TICK at 30s -- but not
+the abandoned worker, which a drip can keep alive for hours while every tick
+reports the stall, so the `read1` fix still matters there. Only a misbehaving
+endpoint can trigger it (the URLs are operator-configured), which is why it is not P1.
+
 ## Block device topology (#155) -- server half tracked in fivenines_server#1227
 
 Agent side is DONE (v1.20.0): `data["io_topology"]`, behind a new TOP-LEVEL
@@ -30,10 +91,12 @@ The agent reads sysfs on every tick from several collectors (`network`, psutil's
 hwmon globs behind `temperatures` and `fans`), all on the collection thread, so one such
 stall can outlast `WatchdogSec=90` and restart the agent. `io_topology` (#155)
 is the first to bound its own read (a single-flight worker abandoned after
-`TOPOLOGY_READ_TIMEOUT`); the others are not. The uniform fix is a per-collector
+`TOPOLOGY_READ_TIMEOUT`), and `pbs` bounds its whole collection the same way
+(`PBS_HARD_DEADLINE`, which also covers DNS and connecting to every address of
+a host name); the others are not. The uniform fix is a per-collector
 wall-clock bound in `collectors.collect_metrics` built on `bounded.call_bounded`
 (already shared by `run_privileged`, the libvirt probe, `io_topology` and the
-`qemu` collector), which changes every collector's failure mode -- hence its own
+`qemu` and `pbs` collectors), which changes every collector's failure mode -- hence its own
 change. Two things it must handle, both found reviewing #155: `run_privileged`
 has no single-flight, so a wedged sudoers backend leaks one thread and one
 blocked root `sudo` per call site per tick, and its per-call bounds (30s + 2s for
@@ -59,11 +122,11 @@ reading the content listing, which filters backups per-volume; the prune preview
 returns the same evidence under `Datastore.Audit`). Everything server-side is in
 **fivenines_server#1164**: the ingest, the per-guest-age model, the
 `proxmox_guest_backup_stale` trigger, and the byte-identical
-`spec/fixtures/proxmox_contract_payload.json` copy. The only remaining
-`Datastore.Allocate`/PBS-native question is the OPTIONAL later enrichment
-(verification state, size) the prune preview does not carry -- not a blocker,
-not a rollout decision for the core feature. Design: fivenines_server
-`docs/designs/proxmox-backup-monitoring.md`.
+`spec/fixtures/proxmox_contract_payload.json` copy. The enrichment the prune
+preview does not carry (verification, size, encryption, completion) is the PBS
+collector above (v1.21.0), joined through the storage row's `pbs` key; the
+`Datastore.Allocate` route is rejected for good, since that privilege also
+deletes backups. Design: fivenines_server `docs/designs/proxmox-backup-monitoring.md`.
 
 ## P1: Reconcile the server's copy of ubuntu_pro_contract_payload.json
 

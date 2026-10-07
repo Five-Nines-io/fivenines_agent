@@ -17,7 +17,12 @@ import time
 
 from fivenines_agent.cache import TTLCache
 from fivenines_agent.debug import debug, log
-from fivenines_agent.logs import redact
+from fivenines_agent.scrub import ERROR_MAX_LEN, ERROR_PRE_REDACT_MAX_LEN, FIELD_MAX_LEN
+from fivenines_agent.scrub import as_bool as _as_bool
+from fivenines_agent.scrub import as_int as _as_int
+from fivenines_agent.scrub import log_safe as _log_safe
+from fivenines_agent.scrub import scrub_message
+from fivenines_agent.scrub import scrub_str as _scrub_str
 
 try:
     from proxmoxer import ProxmoxAPI
@@ -25,23 +30,9 @@ except ImportError:  # pragma: no cover
     ProxmoxAPI = None  # type: ignore[assignment, misc]
 
 
-# Defensive cap on the collection.error hint. The messages the collector emits
-# are short and structured; this only bounds a pathological value.
-_ERROR_MAX_LEN = 500
-
-# Prefix bound applied to a raw error message BEFORE redact() runs over it, so a
-# pathological (customer-controlled) blob cannot turn the redaction regexes into
-# a CPU sink on the watchdog-bounded loop; the final _ERROR_MAX_LEN cap trims the
-# redacted result. Same posture as the ceph stderr envelope.
-_ERROR_PRE_REDACT_MAX_LEN = 2000
-
-# C0 + C1 control characters (incl. newlines) mapped to a space, so a
-# customer-controlled value (a PVE error body, a volid, a storage id) written to
-# a journal log line cannot forge extra log lines. The wire path already scrubs
-# and redacts (see _backup_error); _log_safe gives the log path the same guard.
-_LOG_CONTROL_TO_SPACE = {
-    c: ord(" ") for c in list(range(0x20)) + [0x7F] + list(range(0x80, 0xA0))
-}
+# The wire and log sanitation of customer-controlled values (_scrub_str,
+# _log_safe, scrub_message) and its caps live in scrub.py, shared with the PBS
+# collector.
 
 # --- backups block (#156) ---------------------------------------------------
 #
@@ -81,8 +72,10 @@ _DEADLINE_MESSAGE = 'skipped: backups collection deadline exceeded'
 # check_volume_access filter and no write privilege; keep-all=1 only overrides
 # the preview's retention calc, it changes nothing. So the whole feature works
 # under the PVEAuditor role the setup guide already provisions. It carries fewer
-# fields than the content listing (no size / verification / encrypted); those
-# are a later PBS-native or allocate-gated enrichment.
+# fields than the content listing (no size / verification / encrypted); for a
+# PBS storage those come from the PBS collector (pbs.py), joined through the
+# storage row's `pbs` key. The allocate-gated content listing stays rejected:
+# Datastore.Allocate also authorizes DELETING the backup volumes.
 _PRUNE_BACKUPS_PARAMS = {'prune-backups': 'keep-all=1'}
 
 # Hard caps on every array in the block. A trim is never silent: it lands in
@@ -98,10 +91,6 @@ MAX_NOT_BACKED_UP = 2000
 # bounded without hiding that the read was massively incomplete.
 MAX_ERRORS = 500
 
-# Every string in the block is customer-controlled (volid, task status, job
-# comment...). Bound each one so a pathological value cannot bloat the tick.
-_BACKUP_FIELD_MAX_LEN = 500
-
 # Keyed on the connection identity (host, port, token id) the way ceph keys on
 # its conf/keyring: proxmox_metrics builds a fresh ProxmoxCollector every tick,
 # so the cache has to live at module level, and a re-pointed config must not be
@@ -109,59 +98,17 @@ _BACKUP_FIELD_MAX_LEN = 500
 _backups_cache = TTLCache()
 
 
-def _scrub_str(value, max_len=_BACKUP_FIELD_MAX_LEN):
-    """Make a customer-controlled value safe for the wire: UTF-8 with invalid
-    sequences replaced, NUL deleted (Postgres refuses to store it), capped.
-
-    None stays None so "the daemon reported no value" survives as null.
-    """
-    if value is None:
-        return None
-    if not isinstance(value, str):
-        value = str(value)
-    # Bound the work BEFORE the encode/decode/replace pass: a pathological
-    # multi-MB field from a hostile PVE response must not be fully re-encoded on
-    # the watchdog loop to return max_len chars. Slicing a str is by code point,
-    # so a generous pre-slice yields the same result for any real (short) value;
-    # NUL removal only shrinks, so the final [:max_len] still holds.
-    cleaned = value[:max_len].encode("utf-8", errors="replace").decode(
-        "utf-8", errors="replace"
-    )
-    return cleaned.replace("\x00", "")[:max_len]
-
-
-def _scrub_csv(value, max_len=_BACKUP_FIELD_MAX_LEN):
+def _scrub_csv(value, max_len=FIELD_MAX_LEN):
     """Scrub a comma-separated ID list (a job's `vmid`/`exclude`) WITHOUT
     splitting an ID. A plain char cap can turn ",224" into ",22" and name a
     guest that was never configured; truncate at the last comma instead, so the
     result is always a prefix of WHOLE ids.
     """
-    cleaned = _scrub_str(value, max_len=_ERROR_PRE_REDACT_MAX_LEN)
+    cleaned = _scrub_str(value, max_len=ERROR_PRE_REDACT_MAX_LEN)
     if cleaned is None or len(cleaned) <= max_len:
         return cleaned
     cut = cleaned.rfind(',', 0, max_len)
     return cleaned[:cut] if cut != -1 else cleaned[:max_len]
-
-
-def _as_int(value):
-    """int() that answers None instead of raising on anything non-numeric.
-
-    Bools are refused: True would otherwise read as vmid 1.
-    """
-    if value is None or isinstance(value, bool):
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
-
-
-def _as_bool(value):
-    """PVE spells booleans as 0/1 ints or "0"/"1" strings (active, enabled,
-    all, shared)."""
-    if isinstance(value, str):
-        return value.strip() not in ("", "0")
-    return bool(value)
 
 
 def _backup_error(errors, scope, message, node=None, storage=None):
@@ -181,24 +128,8 @@ def _backup_error(errors, scope, message, node=None, storage=None):
         # oversized/NUL-laden node name); bound them like every other field.
         "node": _scrub_str(node),
         "storage": _scrub_str(storage),
-        "message": _scrub_str(
-            redact(str(message)[:_ERROR_PRE_REDACT_MAX_LEN]), _ERROR_MAX_LEN
-        ),
+        "message": scrub_message(message),
     })
-
-
-def _log_safe(value):
-    """Make a customer-controlled value safe to interpolate into a log line:
-    redact secrets (a PVE error body can echo a credential, the reason this
-    module imports redact) and collapse control characters so a newline in a
-    volid, storage id, or error body cannot forge journal lines. The wire path
-    guards `errors[].message` the same way -- the log path must match it,
-    including the pre-redact prefix bound: a proxmoxer exception's str() carries
-    the full HTTP error body, so redact() must never see an unbounded blob on
-    the watchdog-bounded loop.
-    """
-    bounded = str(value)[:_ERROR_PRE_REDACT_MAX_LEN]
-    return redact(bounded).translate(_LOG_CONTROL_TO_SPACE)[:_ERROR_MAX_LEN]
 
 
 def _cap_list(rows, limit, errors, noun, node=None):
@@ -259,6 +190,38 @@ def _holds_backups(storage):
     return True
 
 
+def _pbs_storage_ref(config):
+    """Where a 'pbs' storage points: the key that lines a PVE guest's backups up
+    with the PBS collector's own report of the same datastore.
+
+    The PBS collector keys a backup group on (datastore, namespace, type, id),
+    and a vmid alone is ambiguous there: two clusters backing up to one PBS
+    both have a vm/100, told apart only by namespace. The PBS identity is the
+    certificate fingerprint plus the datastore (pbs_contract_payload.json's
+    pve_join_contract; proxmox_contract_payload.json's pbs_join_contract):
+    `fingerprint` is the SHA-256 of the PBS certificate PVE pinned
+    (lowercased, the spelling the PBS collector reports its own
+    certificate in), null when PVE trusts a CA-signed certificate; a
+    fingerprint alone is not unique (PBS VMs cloned from one template share
+    their certificate), and `server` + `port` break that tie only against a
+    reporter whose configured host (config["pbs"]["host"]:port) is remote.
+    `namespace` is "" for the root namespace, which is how the PBS API itself
+    spells it. None when the config does not name both a
+    server and a datastore (a restricted token that could not read /storage).
+    """
+    server = config.get('server')
+    datastore = config.get('datastore')
+    if not server or not datastore:
+        return None
+    return {
+        'server': _scrub_str(server),
+        'port': _as_int(config.get('port')),
+        'datastore': _scrub_str(datastore),
+        'namespace': _scrub_str(config.get('namespace')) or '',
+        'fingerprint': (_scrub_str(config.get('fingerprint')) or '').strip().lower() or None,
+    }
+
+
 def _record_failure(collection, flag, message):
     """Flip a section completeness flag off and record the first failure.
 
@@ -273,7 +236,7 @@ def _record_failure(collection, flag, message):
         return
     collection[flag] = False
     if collection["error"] is None:
-        collection["error"] = message[:_ERROR_MAX_LEN]
+        collection["error"] = message[:ERROR_MAX_LEN]
 
 
 class ProxmoxCollector:
@@ -732,6 +695,14 @@ class ProxmoxCollector:
                         if pool is not None:
                             storage_data['pool'] = pool
 
+                        # Same additive posture for the PBS join key: present
+                        # only on a 'pbs' storage whose config names a server
+                        # and a datastore.
+                        if storage_data['type'] == 'pbs':
+                            pbs_ref = _pbs_storage_ref(config_map.get(storage_name, {}))
+                            if pbs_ref is not None:
+                                storage_data['pbs'] = pbs_ref
+
                         storage_pools.append(storage_data)
 
                 except Exception as e:
@@ -1140,9 +1111,10 @@ def _set_latest_volume(entry, volume, ctime):
     running PBS backup could momentarily promote it as the latest -- a false
     "backed up" if that upload then fails. The prune preview carries no
     completion field, so distinguishing complete from in-progress needs a
-    PBS-native read; it is deferred to the same enrichment as `verification`
-    (server issue #1164). Local/NFS/dir storages are unaffected: vzdump writes to
-    a temp name and the archive is only listed once renamed on completion."""
+    PBS-native read: the PBS collector (pbs.py) reports each group's last
+    FINISHED backup, which the server can prefer where the two are joined.
+    Local/NFS/dir storages are unaffected: vzdump writes to a temp name and the
+    archive is only listed once renamed on completion."""
     entry['latest_ctime'] = ctime
     entry['latest_volid'] = _scrub_str(volume.get('volid'))
     entry['protected'] = volume.get('mark') == 'protected'

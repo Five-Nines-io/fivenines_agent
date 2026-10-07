@@ -22,6 +22,7 @@ from fivenines_agent.network import network
 from fivenines_agent.nginx import nginx_metrics
 from fivenines_agent.openvpn import openvpn_metrics
 from fivenines_agent.partitions import partitions_metadata, partitions_usage
+from fivenines_agent.pbs import pbs_metrics
 from fivenines_agent.php_fpm import php_fpm_metrics
 from fivenines_agent.ports import listening_ports
 from fivenines_agent.postgresql import postgresql_metrics
@@ -162,6 +163,15 @@ COLLECTORS = [
     # (a dead broker / partial listing) so the server never prunes queue rows.
     ("rabbitmq", [("rabbitmq", rabbitmq_metrics, True)]),
     ("proxmox", [("proxmox", proxmox_metrics, True)]),
+    # Proxmox Backup Server: config-driven REST API poll (rabbitmq/tsdb posture,
+    # no capability gate -- the PBS can be this host or a remote one).
+    # config["pbs"] == {host, port, token_id, token_secret, verify_ssl,
+    # fingerprint} is unpacked (pass_kwargs) into pbs_metrics(...), which takes
+    # **_kwargs so a key the server adds later is ignored rather than a
+    # TypeError. A TOP-LEVEL key, never nested under "proxmox" (whose dict is
+    # splatted into proxmox_metrics). Emits a never-None envelope: an error
+    # envelope with no "datastores" key, or the block with scoped errors[].
+    ("pbs", [("pbs", pbs_metrics, True)]),
     # WireGuard peer health (#508). config["wireguard"] is a TOP-LEVEL plain
     # boolean and the collector takes no parameters, so pass_kwargs is False --
     # a future dict value is then ignored rather than splatted into a
@@ -302,8 +312,14 @@ def _log_capability_skip_once(config_key):
     log(f"Skipping '{config_key}' collection: capability unavailable", "info")
 
 
-def _collect_with_telemetry(name, fn, telemetry, *args, **kwargs):
+def _collect_with_telemetry(name, fn, telemetry, /, *args, **kwargs):
     """Wrap a collector call with timing and log capture for telemetry.
+
+    The wrapper's own parameters are positional-only: a server-pushed config
+    dict splatted as **kwargs may carry a key named `name`, `fn` or
+    `telemetry` (a PBS display name, say), which must reach the collector, not
+    raise a TypeError here -- outside the collector's error handling, where it
+    would stop the agent itself.
 
     When *telemetry* is None, runs the collector without capture/timing.
     """

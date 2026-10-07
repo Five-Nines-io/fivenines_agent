@@ -74,10 +74,12 @@ def adopt_log_capture(buffer):
     deadline keeps the list it was given: a line it logs later lands in that
     tick's telemetry if the list was already non-empty (stop_log_capture
     returns it as is) and the tick's payload has not been built yet, and is
-    lost otherwise (the journal still gets it). The qemu collector logs from
-    its worker and logs its own timeout on the caller's thread, so its list is
-    never empty when it abandons one; a per-collector bound (TODOS.md) would
-    have to settle this for every collector.
+    lost otherwise (the journal still gets it). The qemu and pbs collectors
+    log from their workers and log their own timeout on the caller's thread,
+    so the list is not empty when one is abandoned (pbs logs a stall at error
+    level for the first stall of a streak only: a later one's late lines may
+    reach the journal alone); a per-collector bound (TODOS.md) would have to
+    settle this for every collector.
     """
     _thread_local.log_buffer = buffer
 
