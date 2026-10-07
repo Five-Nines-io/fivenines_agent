@@ -25,7 +25,6 @@ import pytest
 from pg8000.exceptions import DatabaseError, InterfaceError
 
 from fivenines_agent.postgresql import (
-    NO_PASSWORD_DETAIL,
     _connect,
     _default_pgpass_path,
     _error_category,
@@ -311,52 +310,23 @@ def test_metrics_password_server_without_password_reports_auth_failed(
     auth_request, password
 ):
     """End to end through real pg8000: a server demanding a password and none
-    in config, PGPASSWORD or .pgpass reports auth_failed with the fixed
-    no-password detail. On SCRAM, agents up to 1.20.4 sent the
-    "'NoneType' object has no attribute 'decode'" generic error instead
-    (rendered server-side as a red PostgreSQL outage). A blank dashboard
-    password field arrives as "", which _resolve_password treats as unset, so
-    it takes the same path."""
+    in config, PGPASSWORD or .pgpass reports auth_failed. pg8000 refuses
+    cleartext and MD5 on its own; on SCRAM it crashes on None.decode(), which
+    agents up to 1.20.4 sent as the generic error (rendered server-side as a
+    red PostgreSQL outage). A blank dashboard password field arrives as "",
+    which _resolve_password treats as unset, so it takes the same path."""
     with password_demanding_server(auth_request) as port:
         result = postgresql_metrics(host="127.0.0.1", port=port, password=password)
-    assert result == {
-        "reachable": False,
-        "error": "auth_failed",
-        "error_detail": NO_PASSWORD_DETAIL,
-    }
+    assert result == {"reachable": False, "error": "auth_failed"}
 
 
-@pytest.mark.parametrize(
-    "exc",
-    [
-        DatabaseError({"C": "28P01", "M": 'password authentication failed for "x"'}),
-        InterfaceError("Authentication method 7 not supported by pg8000."),
-    ],
-    ids=["wrong-password", "unsupported-method"],
-)
-def test_metrics_other_auth_failures_carry_no_detail(exc):
-    """Only a refusal for want of a password gets NO_PASSWORD_DETAIL: a wrong
-    password (SQLSTATE 28P01) or an auth method pg8000 cannot speak stays a
-    bare auth_failed, so the detail never claims a password was missing."""
-    with patch(f"{PG}._connect", side_effect=exc):
-        assert postgresql_metrics(password="secret") == {
-            "reachable": False,
-            "error": "auth_failed",
-        }
-
-
-def test_metrics_no_password_detail_rides_only_on_auth_failed():
-    """A no-password refusal whose cause classifies it first (here a timeout)
-    keeps that category and gets no detail: NO_PASSWORD_DETAIL is only ever
-    shipped with auth_failed."""
-    exc = with_cause(
-        InterfaceError(
-            "server requesting password authentication, but no password was provided"
-        ),
-        socket.timeout(),
-    )
-    with patch(f"{PG}._connect", side_effect=exc):
-        assert postgresql_metrics() == {"reachable": False, "error": "timeout"}
+def test_metrics_scram_decode_crash_without_password_reports_auth_failed():
+    """The payload pinned without the installed pg8000: should an upgrade add
+    its own SCRAM guard, the fake-server test stops reaching _connect's except
+    branch, and this one still holds what the reclassified crash ships."""
+    with patch(f"{PG}.pg8000.dbapi.connect", side_effect=scram_decode_crash()):
+        result = postgresql_metrics(host="127.0.0.1", password=None)
+    assert result == {"reachable": False, "error": "auth_failed"}
 
 
 @pytest.mark.parametrize(
