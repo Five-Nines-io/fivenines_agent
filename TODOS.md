@@ -31,6 +31,17 @@ filed yet in fivenines_server. Agent-side follow-ups, not blockers:
   datastore missing from it (PBS drops a datastore whose status fails, and a
   scoped token's 403s, from that 200). Needs a real capture for the contract
   fixture first.
+- A storage whose namespace walk still answers while its /groups or
+  /snapshots reads hang for good (CephFS with inactive data PGs: readdir is
+  served, file data blocks) arms neither hold: the walk hold needs a walk
+  timeout, and the group-reads hold arms only under it. Each build then sends
+  one more read that never ends -- measured: 12 hung /snapshots in 12 builds
+  on a datastore of 11 namespaces -- until every namespace's per-request
+  retry has backed off. Fix direction: a per-datastore group-read backoff
+  (doubling, like gc/own status) that a pending /groups or /snapshots
+  timeout arms, survives the next walk's `_remember()`, skips that
+  datastore's group reads until it expires, and is cleared by a success or
+  SIGHUP.
 
 ## P2: `read_capped_body` does not bound a slow-drip body that has a Content-Length
 

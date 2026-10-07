@@ -1363,12 +1363,20 @@ broken -- so it can block the walks again only after that round (when two
 datastores were flagged, those after the second one in that round wait for
 it, and, on a storage still broken, for the next reload; the refreshes
 after the reload skip the usage summary until the namespaces of every
-datastore not flagged have been listed since the reload, and read each
-datastore's usage from its own status); a datastore
+datastore not flagged have been requested since the reload -- those
+refreshes request the datastores not requested yet first, so this takes a
+few refreshes even on a large PBS -- and read each datastore's usage from its
+own status); a datastore
 repaired without restarting the proxy is read again once that round is done,
 which on a large PBS takes a few refreshes, and reloading the agent for
 another reason meanwhile does not restart that round); changing the PBS host,
-fingerprint or token in the dashboard does not. A first backup that is still uploading is never shown as the
+fingerprint or token in the dashboard does not. Known limit: a storage that
+still lists its directories but blocks reading its files (for example CephFS
+with inactive data placement groups) lets every namespace listing answer, so
+nothing holds the reads: each refresh then sends one backup listing that
+never ends (about one more stuck proxy thread an hour) until each namespace's
+retry has backed off -- watch for it after a storage incident, and restart
+`proxmox-backup-proxy` once the storage is repaired. A first backup that is still uploading is never shown as the
 latest backup. Anything that could not be read -- a datastore in offline maintenance,
 a namespace whose group listing failed -- is reported per datastore and
 namespace, so the dashboard shows those backups as *unknown*, never as
