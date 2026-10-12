@@ -190,6 +190,36 @@ def _holds_backups(storage):
     return True
 
 
+def _storage_shared(storage, config):
+    """Whether a storage holds the same content on every node that lists it
+    (PBS/NFS/CIFS/Ceph, or a dir/lvm storage marked shared by hand), or None
+    when unknown.
+
+    `storage` is the per-node /nodes/<n>/storage row, `config` the storage's
+    datacenter /storage entry ({} when absent). The row's flag wins -- PVE's
+    storage_info always sets it, 0 or 1 -- then the config's. None, never
+    False, when neither carries it: "unknown" must not read as "not shared".
+    Only PVE's own spellings are read -- a JSON bool, the integers 0/1, or
+    "0"/"1" (surrounding spaces, tabs and line breaks ignored, nothing more
+    exotic) -- and the value that decides is
+    final: one outside them is unknown too, never True, and does not fall back
+    to the config, since a wrong True tells the server to merge separate
+    node-local disks into one.
+    """
+    for source in (storage, config):
+        value = source.get('shared')
+        if value is None:
+            continue
+        if isinstance(value, str):
+            value = value.strip(' \t\r\n')
+        elif not isinstance(value, int):
+            return None
+        if value in (0, 1, '0', '1'):
+            return _as_bool(value)
+        return None
+    return None
+
+
 def _pbs_storage_ref(config):
     """Where a 'pbs' storage points: the key that lines a PVE guest's backups up
     with the PBS collector's own report of the same datastore.
@@ -633,13 +663,15 @@ class ProxmoxCollector:
     def _storage_config_map(self):
         """Map storage id -> its datacenter /storage config entry.
 
-        The per-node /nodes/<n>/storage endpoint returns runtime status only
-        (total/used/avail/active); the 'pool' property -- a zfspool's ZFS
-        dataset (e.g. 'rpool/data'), an rbd/cephfs's Ceph pool -- lives in the
-        cluster-wide datacenter storage config (/storage). One call per collect,
-        used to enrich each per-node storage row with the ZFS<->Proxmox join key
-        (issue #49). Best-effort: a restricted token that cannot read /storage,
-        or an older PVE, yields {} and no 'pool' enrichment rather than failing
+        The per-node /nodes/<n>/storage endpoint returns runtime status
+        (total/used/avail/active) plus the row's own 'shared' flag; the 'pool'
+        property -- a zfspool's ZFS dataset (e.g. 'rpool/data'), an
+        rbd/cephfs's Ceph pool -- and the 'pbs' target live in the cluster-wide
+        datacenter storage config (/storage), which is also the 'shared'
+        fallback. One call per collect, used to enrich each per-node storage
+        row (the ZFS<->Proxmox join key, issue #49). Best-effort: a restricted
+        token that cannot read /storage, or an older PVE, yields {} and no
+        enrichment rather than failing
         the storage section -- deliberately NOT threaded through the `collection`
         flags block, so it never flips storage_ok.
         """
@@ -661,7 +693,8 @@ class ProxmoxCollector:
 
             # Datacenter storage config (/storage), one cluster-wide call, maps
             # storage id -> its config entry so each per-node storage row can be
-            # enriched with 'pool' (the ZFS<->Proxmox join key, issue #49).
+            # enriched with 'pool' (the ZFS<->Proxmox join key, issue #49), and
+            # 'shared' when the row itself does not carry the flag.
             config_map = self._storage_config_map()
 
             for node_info in node_list:
@@ -687,10 +720,21 @@ class ProxmoxCollector:
                             'active': storage.get('active', 0) == 1
                         }
 
+                        # 'shared' is what tells one shared storage, listed
+                        # once per node, from node-local storages that merely
+                        # share an id ('local-lvm' on every node, different
+                        # disks, possibly of identical size). Omitted (never
+                        # null) when unknown, like 'pool'.
+                        shared = _storage_shared(
+                            storage, config_map.get(storage_name, {})
+                        )
+                        if shared is not None:
+                            storage_data['shared'] = shared
+
                         # Additive 'pool' enrichment: present only for storage
                         # types that carry one (zfspool/rbd/cephfs), omitted
-                        # (never null) otherwise, so a host with only dir/lvmthin
-                        # stays byte-identical to the pre-field payload.
+                        # (never null) otherwise, so 'pool' adds nothing to a
+                        # host with only dir/lvmthin.
                         pool = config_map.get(storage_name, {}).get('pool')
                         if pool is not None:
                             storage_data['pool'] = pool
@@ -799,8 +843,10 @@ class ProxmoxCollector:
         A SHARED storage (PBS/NFS/CIFS) is the same content from every node,
         so it is listed once -- from the first node where it is active -- and
         emitted with node:null; a local storage is listed per node with node
-        set. The `shared` flag comes from the per-node row, falling back to the
-        datacenter /storage config. A storage that is inactive everywhere it is
+        set. The `shared` flag is `_storage_shared`'s: the per-node row's when it
+        carries one, else the datacenter /storage config's; a storage whose flag
+        is unknown (an unusable value is final) is listed per node, like a local
+        one, whatever its type. A storage that is inactive everywhere it is
         seen is not listed (the call would only fail) but IS recorded as an
         error naming it, so the server treats its guests as unknown. Volumes are
         read from the prune-preview endpoint (works under Datastore.Audit); a
@@ -838,9 +884,10 @@ class ProxmoxCollector:
                 if not raw_sid or not _holds_backups(storage):
                     continue
                 storage_name = _scrub_str(raw_sid)
-                shared = _as_bool(
-                    storage.get('shared', config_map.get(raw_sid, {}).get('shared', 0))
-                )
+                # Unknown (None) is listed per node, like a local storage,
+                # whatever its type: listing shared content twice costs a call,
+                # merging two local storages would hide one node's backups.
+                shared = _storage_shared(storage, config_map.get(raw_sid, {}))
                 active = _as_bool(storage.get('active', 0))
 
                 if shared:
