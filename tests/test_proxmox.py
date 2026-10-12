@@ -1560,6 +1560,104 @@ def test_storage_config_map_builds_and_skips_unnamed():
     assert config_map["local-zfs"]["pool"] == "rpool/data"
 
 
+@pytest.mark.parametrize(
+    "row,config,expected",
+    [
+        ({"shared": 1}, {}, True),
+        ({"shared": 0}, {}, False),
+        ({"shared": "1"}, {}, True),
+        ({"shared": "0"}, {}, False),
+        ({"shared": True}, {}, True),
+        # The per-node row wins over the datacenter config.
+        ({"shared": 0}, {"shared": 1}, False),
+        ({"shared": 1}, {"shared": 0}, True),
+        # Row silent (or null): the config decides.
+        ({}, {"shared": 1}, True),
+        ({}, {"shared": 0}, False),
+        ({"shared": None}, {"shared": 1}, True),
+        # Neither source: unknown, never "not shared".
+        ({}, {}, None),
+        ({"shared": None}, {"shared": None}, None),
+        ({"shared": False}, {}, False),
+        # Only a surrounding space, tab, CR or LF is stripped; str.strip()
+        # would also eat \v, \f, \x1c-\x1f, \x85 and \xa0.
+        ({"shared": " 1 "}, {}, True),
+        ({"shared": "\t1\r\n"}, {}, True),
+        ({"shared": "\x0b1"}, {}, None),
+        ({"shared": "1\x0c"}, {}, None),
+        ({"shared": "\x1c1"}, {}, None),
+        ({"shared": "\x851"}, {}, None),
+        ({"shared": "\xa01"}, {}, None),
+        # Not one of PVE's spellings: unknown, never "shared" (a wrong True
+        # merges different disks), and a garbled row does not fall back.
+        ({"shared": "false"}, {}, None),
+        ({"shared": "yes"}, {}, None),
+        ({"shared": ""}, {"shared": 1}, None),
+        ({"shared": "   "}, {}, None),
+        ({"shared": 2}, {"shared": 1}, None),
+        # Value: protects=a non-int row value is final; fails_when=it falls back
+        # to /storage; why_new=only an empty config was paired with it; seam=none;
+        # no_claim=PVE never sends a float or a list here
+        ({"shared": 1.0}, {"shared": 1}, None),
+        ({"shared": [1]}, {"shared": 1}, None),
+        ({}, {"shared": "true"}, None),
+    ],
+)
+def test_storage_shared_source_order(row, config, expected):
+    assert proxmox_module._storage_shared(row, config) is expected
+
+
+def test_collect_storage_shared_flag():
+    """#222: each storage entry carries 'shared' (bool) from the per-node row,
+    falling back to /storage, and omits it when neither source has one."""
+    pmock = make_proxmox_mock(
+        nodes=[{"node": "pve1"}],
+        storage_by_node={
+            "pve1": [
+                {"storage": "ceph", "type": "rbd", "active": 1, "shared": 1},
+                {"storage": "local", "type": "dir", "active": 1, "shared": 0},
+                {"storage": "san", "type": "lvm", "active": 1},
+                {"storage": "mystery", "type": "dir", "active": 1},
+            ]
+        },
+        storage_config=[
+            {"storage": "local", "type": "dir", "shared": 1},
+            {"storage": "san", "type": "lvm", "shared": 1},
+            {"storage": "mystery", "type": "dir"},
+        ],
+    )
+    by_name = {p["name"]: p for p in make_collector(proxmox_mock=pmock)._collect_storage()}
+    assert by_name["ceph"]["shared"] is True
+    assert by_name["local"]["shared"] is False
+    assert by_name["san"]["shared"] is True
+    assert "shared" not in by_name["mystery"]
+
+
+def test_collect_storage_shared_flag_without_storage_config():
+    """A token that cannot read /storage still ships the per-node row's flag
+    (PVE always sets it there) and storage_ok stays True."""
+    pmock = make_proxmox_mock(
+        version={"version": "8"},
+        cluster_status=[],
+        nodes=[{"node": "pve1"}],
+        node_status_by_name={"pve1": {"uptime": 1}},
+        qemu_by_node={"pve1": []},
+        lxc_by_node={"pve1": []},
+        storage_by_node={
+            "pve1": [
+                {"storage": "nfs", "type": "nfs", "active": 1, "shared": 1},
+                {"storage": "local", "type": "dir", "active": 1},
+            ]
+        },
+        storage_config_raises=True,
+    )
+    result = make_collector(proxmox_mock=pmock).collect()
+    by_name = {p["name"]: p for p in result["storage"]}
+    assert by_name["nfs"]["shared"] is True
+    assert "shared" not in by_name["local"]
+    assert result["collection"]["storage_ok"] is True
+
+
 def test_storage_config_map_degrades_on_failure():
     """T83 [#49]: _storage_config_map swallows a /storage failure and returns an
     empty map (best-effort, never raises)."""
@@ -1638,9 +1736,10 @@ _GUEST_KEYS = {
 }
 _STORAGE_KEYS = {"name", "node", "type", "total", "used", "available", "active"}
 # The only keys a storage entry may carry beyond the base 7: 'pool' (#49),
-# present for pool-backed types (zfspool/rbd/cephfs), and 'pbs' (agent 1.21.0+),
-# present for type 'pbs'; each omitted otherwise.
-_STORAGE_OPTIONAL_KEYS = {"pool", "pbs"}
+# present for pool-backed types (zfspool/rbd/cephfs), 'pbs' (agent 1.21.0+),
+# present for type 'pbs', each omitted otherwise; and 'shared' (#222, agent
+# 1.21.1+), omitted only when unknown (no usable value in the deciding source).
+_STORAGE_OPTIONAL_KEYS = {"pool", "pbs", "shared"}
 _PBS_REF_KEYS = {"server", "port", "datastore", "namespace", "fingerprint"}
 # backups block (#156, agent 1.19.0+)
 _BACKUPS_KEYS = {"age_s", "guest_backups", "tasks", "jobs", "not_backed_up", "errors"}
@@ -1709,6 +1808,8 @@ def test_contract_payload_key_sets(scenario_name):
         if "pbs" in keys:
             assert storage["type"] == "pbs"
             assert set(storage["pbs"]) == _PBS_REF_KEYS
+        if "shared" in keys:
+            assert isinstance(storage["shared"], bool)
     backups = payload["backups"]
     if backups is None:  # 'backups_block_failed' -> node listing failed
         return
@@ -1806,6 +1907,53 @@ def test_contract_storage_pool_join_key():
     assert by_name["local-zfs"]["pool"].split("/")[0] == "rpool"
     assert "pool" not in by_name["local"]
     assert "pool" not in by_name["local-lvm"]
+
+
+def test_contract_storage_shared_flag():
+    """#222: 'quorate_cluster' pins the two cases the server could not tell
+    apart without the flag -- one shared storage listed once per node, whose
+    total drifts a little between the nodes' reads, and node-local storages
+    sharing an id, here even with an identical total. A (name, type, total)
+    dedupe would split the first and merge the second."""
+    storage = _CONTRACT_SCENARIOS["quorate_cluster"]["payload"]["storage"]
+    ceph = [s for s in storage if s["name"] == "ceph-pool"]
+    lvm = {s["node"]: s for s in storage if s["name"] == "local-lvm"}
+    assert [s["node"] for s in ceph] == ["pve1", "pve2", "pve3"]
+    assert all(s["shared"] is True for s in ceph)
+    assert len({s["total"] for s in ceph}) == 3
+    assert all(s["shared"] is False for s in lvm.values())
+    same = ("name", "type", "total")
+    assert [lvm["pve1"][k] for k in same] == [lvm["pve2"][k] for k in same]
+
+
+def test_contract_storage_shared_absent_only_in_the_fallback_example():
+    """PVE always sets 'shared' on the per-node row, so every storage entry in
+    the fixture carries it except the one storage built to have no usable flag
+    in either source: the example of the server's type-only fallback, kept so
+    that shape stays in the shared contract."""
+    absent = {
+        (name, storage["node"], storage["name"])
+        for name, scenario in _CONTRACT_SCENARIOS.items()
+        if scenario["payload"] is not None
+        for storage in scenario["payload"]["storage"]
+        if "shared" not in storage
+    }
+    assert absent == {
+        ("shared_storage_down_on_one_node", "pve1", "scratch"),
+        ("shared_storage_down_on_one_node", "pve2", "scratch"),
+    }
+
+
+def test_contract_shared_storage_down_on_one_node():
+    """#222: a shared storage whose mount is down on one node is still one
+    storage. pve2's row stays shared:true with active:false and 0 bytes, so
+    the capacity is the active row's and the inactive row is pve2 losing the
+    mount (storage_shared_contract 'dedupe')."""
+    storage = _CONTRACT_SCENARIOS["shared_storage_down_on_one_node"]["payload"]["storage"]
+    nfs = {s["node"]: s for s in storage if s["name"] == "nfs-iso"}
+    assert nfs["pve1"]["shared"] is True and nfs["pve2"]["shared"] is True
+    assert nfs["pve1"]["active"] is True and nfs["pve1"]["total"] > 0
+    assert nfs["pve2"]["active"] is False and nfs["pve2"]["total"] == 0
 
 
 def test_contract_backups_key_present_in_every_non_null_payload():
@@ -2307,6 +2455,62 @@ def test_guest_backups_shared_flag_falls_back_to_datacenter_config():
     entries = make_collector(proxmox_mock=mock)._collect_guest_backups(["pve1", "pve2"], [])
     assert [(e["storage"], e["node"]) for e in entries] == [("nfs", None)]
     assert len(mock._prunebackups_calls) == 1
+
+
+@pytest.mark.parametrize("storage_type", ["dir", "pbs"])
+def test_guest_backups_unknown_shared_flag_is_listed_per_node(storage_type):
+    """A storage neither the row nor /storage marks is listed per node, like a
+    local one, whatever its type (storage_shared_contract 'dedupe'): listing
+    shared content twice costs a call, merging two local storages would hide
+    one node's backups."""
+    row = {"storage": "store", "type": storage_type, "content": "backup", "active": 1}
+    mock = _one_node_mock(
+        nodes=[{"node": "pve1"}, {"node": "pve2"}],
+        storage_by_node={"pve1": [row], "pve2": [row]},
+        prunebackups_by_node_storage={"pve1": {"store": [_volume(100, 1)]}, "pve2": {"store": [_volume(100, 1)]}},
+    )
+    entries = make_collector(proxmox_mock=mock)._collect_guest_backups(["pve1", "pve2"], [])
+    assert [(e["storage"], e["node"]) for e in entries] == [("store", "pve1"), ("store", "pve2")]
+
+
+# Value: protects=the storage entry's 'shared' and the backups block's node:null
+# for the same storage come from ONE source order (the fixture's
+# storage_shared_contract 'source': "the same order the backups block uses");
+# fails_when=_collect_guest_backups reads /storage before the row (swapped
+# arguments) or reverts to the old inline expression, which reads an explicit
+# row null as "not shared"; why_new=every other backups test leaves the row and
+# /storage agreeing or one of them silent, so either change passes them all;
+# seam=none; no_claim=real PVE rows and /storage do not disagree -- this pins
+# that the two callers agree, not what PVE sends
+@pytest.mark.parametrize(
+    "row_flag,config_flag,shared,backup_nodes",
+    [
+        (0, 1, False, ["pve1", "pve2"]),
+        (1, 0, True, [None]),
+        (None, 1, True, [None]),
+    ],
+)
+def test_storage_entry_and_backups_listing_agree_on_shared(
+    row_flag, config_flag, shared, backup_nodes
+):
+    """#222: when the per-node row and /storage disagree, the storage entries
+    and the backups listing still tell one story: a storage the server dedupes
+    as one is listed once, and one it keeps per node is listed per node."""
+    row = {"storage": "store", "type": "dir", "content": "backup", "active": 1, "shared": row_flag}
+    mock = _one_node_mock(
+        nodes=[{"node": "pve1"}, {"node": "pve2"}],
+        storage_by_node={"pve1": [row], "pve2": [row]},
+        storage_config=[{"storage": "store", "type": "dir", "shared": config_flag}],
+        prunebackups_by_node_storage={
+            "pve1": {"store": [_volume(100, 1)]},
+            "pve2": {"store": [_volume(100, 1)]},
+        },
+    )
+    collector = make_collector(proxmox_mock=mock)
+    storage = collector._collect_storage()
+    entries = collector._collect_guest_backups(["pve1", "pve2"], [])
+    assert [(s["node"], s["shared"]) for s in storage] == [("pve1", shared), ("pve2", shared)]
+    assert [e["node"] for e in entries] == backup_nodes
 
 
 def test_guest_backups_node_storage_listing_failure_is_scoped_and_isolated():

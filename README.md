@@ -1143,6 +1143,17 @@ Agent version **1.11.7+** adds the `pool` property to `zfspool`, `rbd` and
 storage pool up with the [ZFS pool health](#zfs-pool-health) or
 [Ceph](#ceph-cluster-monitoring) data collected from the same host.
 
+Agent version **1.21.1+** marks each storage entry with `shared` (left out only
+when Proxmox reports no usable flag for that storage). Proxmox lists a storage
+once per node, so a shared storage (PBS, NFS, CIFS, Ceph, iSCSI, or one you
+marked shared yourself, such as a directory or LVM storage) appears once on
+each node that sees it, while `local` and `local-lvm` exist on every node and
+are different disks. The flag lets the dashboard show a shared storage once and
+keep each node's local storage separate. For a directory storage you mount
+yourself and mark shared, set Proxmox's `is_mountpoint` option: without it, a
+node whose mount dropped keeps reporting the storage as active, with the size
+of the disk underneath (usually its system disk).
+
 Agent version **1.19.0+** adds a `backups` block so the dashboard can answer
 "has every VM and container had a backup in the last N hours, whatever the
 target?" and "which guests are in no backup job?". It reads four things: the
