@@ -276,6 +276,10 @@ def test_bang_names_are_left_out_when_diskstats_is_unreadable(tmp_path, linux):
     assert out == {"sda": {"slaves": [], "virtual": False}}
 
 
+@pytest.mark.skipif(
+    sys.platform == "darwin",
+    reason="APFS refuses a file name that is not valid UTF-8 (EILSEQ)",
+)
 def test_undecodable_diskstats_byte_is_escaped_like_psutil(tmp_path, linux):
     """psutil reads /proc/diskstats with surrogateescape, so an `io` row whose
     name is not valid UTF-8 still has a key; decoding the same way keeps the
