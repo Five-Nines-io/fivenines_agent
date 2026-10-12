@@ -1579,11 +1579,14 @@ def test_storage_config_map_builds_and_skips_unnamed():
         ({}, {}, None),
         ({"shared": None}, {"shared": None}, None),
         ({"shared": False}, {}, False),
-        # Surrounding spaces, tabs and line breaks are ignored; nothing more
-        # exotic (str.strip() alone would also eat \x1c-\x1f and \xa0).
+        # Only a surrounding space, tab, CR or LF is stripped; str.strip()
+        # would also eat \v, \f, \x1c-\x1f, \x85 and \xa0.
         ({"shared": " 1 "}, {}, True),
         ({"shared": "\t1\r\n"}, {}, True),
+        ({"shared": "\x0b1"}, {}, None),
+        ({"shared": "1\x0c"}, {}, None),
         ({"shared": "\x1c1"}, {}, None),
+        ({"shared": "\x851"}, {}, None),
         ({"shared": "\xa01"}, {}, None),
         # Not one of PVE's spellings: unknown, never "shared" (a wrong True
         # merges different disks), and a garbled row does not fall back.
@@ -1908,14 +1911,16 @@ def test_contract_storage_pool_join_key():
 
 def test_contract_storage_shared_flag():
     """#222: 'quorate_cluster' pins the two cases the server could not tell
-    apart without the flag -- one shared storage listed once per node, and
-    node-local storages sharing an id, here even with an identical total, so
-    a (name, type, total) dedupe would merge two different disks."""
+    apart without the flag -- one shared storage listed once per node, whose
+    total drifts a little between the nodes' reads, and node-local storages
+    sharing an id, here even with an identical total. A (name, type, total)
+    dedupe would split the first and merge the second."""
     storage = _CONTRACT_SCENARIOS["quorate_cluster"]["payload"]["storage"]
     ceph = [s for s in storage if s["name"] == "ceph-pool"]
     lvm = {s["node"]: s for s in storage if s["name"] == "local-lvm"}
     assert [s["node"] for s in ceph] == ["pve1", "pve2", "pve3"]
     assert all(s["shared"] is True for s in ceph)
+    assert len({s["total"] for s in ceph}) == 3
     assert all(s["shared"] is False for s in lvm.values())
     same = ("name", "type", "total")
     assert [lvm["pve1"][k] for k in same] == [lvm["pve2"][k] for k in same]

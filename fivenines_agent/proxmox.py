@@ -192,19 +192,18 @@ def _holds_backups(storage):
 
 def _storage_shared(storage, config):
     """Whether a storage holds the same content on every node that lists it
-    (PBS/NFS/CIFS/Ceph, or a dir/lvm storage marked shared by hand), or None
-    when unknown.
+    (PBS/NFS/CIFS/Ceph, or a storage marked shared by hand, e.g. dir/lvm/btrfs),
+    or None when unknown.
 
     `storage` is the per-node /nodes/<n>/storage row, `config` the storage's
     datacenter /storage entry ({} when absent). The row's flag wins -- PVE's
     storage_info always sets it, 0 or 1 -- then the config's. None, never
     False, when neither carries it: "unknown" must not read as "not shared".
     Only PVE's own spellings are read -- a JSON bool, the integers 0/1, or
-    "0"/"1" (surrounding spaces, tabs and line breaks ignored, nothing more
-    exotic) -- and the value that decides is
-    final: one outside them is unknown too, never True, and does not fall back
-    to the config, since a wrong True tells the server to merge separate
-    node-local disks into one.
+    "0"/"1" (a surrounding space, tab, CR or LF is stripped, nothing else) --
+    and the value that decides is final: one outside them is unknown too,
+    never True, and does not fall back to the config, since a wrong True
+    tells the server to merge separate node-local disks into one.
     """
     for source in (storage, config):
         value = source.get('shared')
