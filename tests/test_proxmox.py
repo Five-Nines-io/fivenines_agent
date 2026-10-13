@@ -1607,6 +1607,31 @@ def test_storage_shared_source_order(row, config, expected):
     assert proxmox_module._storage_shared(row, config) is expected
 
 
+@pytest.mark.parametrize(
+    "row,expected",
+    [
+        ({"enabled": 1}, True),
+        ({"enabled": 0}, False),
+        ({"enabled": "1"}, True),
+        ({"enabled": "0"}, False),
+        ({"enabled": True}, True),
+        ({"enabled": False}, False),
+        ({"enabled": " 0\r\n"}, False),
+        # Missing or not one of PVE's spellings: unknown, never "disabled".
+        ({}, None),
+        ({"enabled": None}, None),
+        ({"enabled": ""}, None),
+        ({"enabled": "false"}, None),
+        ({"enabled": "\x0b0"}, None),
+        ({"enabled": 2}, None),
+        ({"enabled": 0.0}, None),
+        ({"enabled": [0]}, None),
+    ],
+)
+def test_storage_enabled_reads_only_pve_spellings(row, expected):
+    assert proxmox_module._storage_enabled(row) is expected
+
+
 def test_collect_storage_shared_flag():
     """#222: each storage entry carries 'shared' (bool) from the per-node row,
     falling back to /storage, and omits it when neither source has one."""
@@ -1656,6 +1681,35 @@ def test_collect_storage_shared_flag_without_storage_config():
     assert by_name["nfs"]["shared"] is True
     assert "shared" not in by_name["local"]
     assert result["collection"]["storage_ok"] is True
+
+
+def test_collect_storage_enabled_flag():
+    """#225: each storage entry carries 'enabled' (bool) from the per-node row
+    alone -- a storage disabled, or outside its 'nodes' option, is listed by
+    PVE with enabled 0 -- and omits it when the row has no usable value, never
+    falling back to the /storage config's 'disable'."""
+    pmock = make_proxmox_mock(
+        nodes=[{"node": "pve3"}],
+        storage_by_node={
+            "pve3": [
+                {"storage": "local", "type": "dir", "active": 1, "enabled": 1},
+                {"storage": "nfs-vm", "type": "nfs", "active": 0, "enabled": 0},
+                {"storage": "old", "type": "nfs", "active": 0},
+                {"storage": "odd", "type": "nfs", "active": 0, "enabled": "no"},
+            ]
+        },
+        storage_config=[
+            {"storage": "nfs-vm", "type": "nfs", "nodes": "pve1,pve2"},
+            {"storage": "old", "type": "nfs", "disable": 1},
+            {"storage": "odd", "type": "nfs", "disable": 1},
+        ],
+    )
+    by_name = {p["name"]: p for p in make_collector(proxmox_mock=pmock)._collect_storage()}
+    assert by_name["local"]["enabled"] is True
+    assert by_name["nfs-vm"]["enabled"] is False
+    assert by_name["nfs-vm"]["active"] is False
+    assert "enabled" not in by_name["old"]
+    assert "enabled" not in by_name["odd"]
 
 
 def test_storage_config_map_degrades_on_failure():
@@ -1738,8 +1792,9 @@ _STORAGE_KEYS = {"name", "node", "type", "total", "used", "available", "active"}
 # The only keys a storage entry may carry beyond the base 7: 'pool' (#49),
 # present for pool-backed types (zfspool/rbd/cephfs), 'pbs' (agent 1.21.0+),
 # present for type 'pbs', each omitted otherwise; and 'shared' (#222, agent
-# 1.21.1+), omitted only when unknown (no usable value in the deciding source).
-_STORAGE_OPTIONAL_KEYS = {"pool", "pbs", "shared"}
+# 1.21.1+) and 'enabled' (#225, agent 1.21.2+), each omitted only when unknown
+# (no usable value in the deciding source).
+_STORAGE_OPTIONAL_KEYS = {"pool", "pbs", "shared", "enabled"}
 _PBS_REF_KEYS = {"server", "port", "datastore", "namespace", "fingerprint"}
 # backups block (#156, agent 1.19.0+)
 _BACKUPS_KEYS = {"age_s", "guest_backups", "tasks", "jobs", "not_backed_up", "errors"}
@@ -1810,6 +1865,13 @@ def test_contract_payload_key_sets(scenario_name):
             assert set(storage["pbs"]) == _PBS_REF_KEYS
         if "shared" in keys:
             assert isinstance(storage["shared"], bool)
+        # Value: protects=the shared fixture's 'enabled' stays a JSON bool on
+        # every row; fails_when=a payload row copies its api row's 0/1;
+        # why_new=the scenario equality reads 1 == True and the dedicated test
+        # checks one scenario's rows; seam=none; no_claim=the agent's own type,
+        # pinned by test_collect_storage_enabled_flag
+        if "enabled" in keys:
+            assert isinstance(storage["enabled"], bool)
     backups = payload["backups"]
     if backups is None:  # 'backups_block_failed' -> node listing failed
         return
@@ -1954,6 +2016,64 @@ def test_contract_shared_storage_down_on_one_node():
     assert nfs["pve1"]["shared"] is True and nfs["pve2"]["shared"] is True
     assert nfs["pve1"]["active"] is True and nfs["pve1"]["total"] > 0
     assert nfs["pve2"]["active"] is False and nfs["pve2"]["total"] == 0
+
+
+def test_contract_storage_enabled_absent_only_in_the_fallback_example():
+    """#225: PVE always sets 'enabled' on the per-node row, so every storage
+    entry in the fixture carries it except 'scratch', the one storage built to
+    carry no usable flag: the example of a row the server reads as enabled."""
+    absent = {
+        (name, storage["node"], storage["name"])
+        for name, scenario in _CONTRACT_SCENARIOS.items()
+        if scenario["payload"] is not None
+        for storage in scenario["payload"]["storage"]
+        if "enabled" not in storage
+    }
+    assert absent == {
+        ("shared_storage_down_on_one_node", "pve1", "scratch"),
+        ("shared_storage_down_on_one_node", "pve2", "scratch"),
+    }
+
+
+def test_contract_storage_not_enabled_on_a_node():
+    """#225: a shared storage outside its 'nodes' option on pve3 and one that
+    is disabled everywhere read active:false with 0 bytes there, exactly like a
+    storage that is down -- 'enabled' is what tells them apart. The down case
+    ('nfs-iso' on pve2 in the #222 scenario) stays enabled:true. A disabled
+    storage holding backups is neither listed nor reported as an error."""
+    scenario = _CONTRACT_SCENARIOS["storage_not_enabled_on_a_node"]["payload"]
+    by_key = {(s["name"], s["node"]): s for s in scenario["storage"]}
+    for node in ("pve1", "pve2"):
+        nfs_vm = by_key[("nfs-vm", node)]
+        assert nfs_vm["enabled"] is True and nfs_vm["active"] is True
+    excluded = by_key[("nfs-vm", "pve3")]
+    assert excluded["enabled"] is False and excluded["active"] is False
+    assert excluded["shared"] is True and excluded["total"] == 0
+    for node in ("pve1", "pve2", "pve3"):
+        old = by_key[("nfs-old", node)]
+        assert old["enabled"] is False and old["active"] is False
+        assert by_key[("local", node)]["enabled"] is True
+    assert scenario["backups"]["errors"] == []
+    down = _CONTRACT_SCENARIOS["shared_storage_down_on_one_node"]["payload"]
+    nfs_iso = {s["node"]: s for s in down["storage"] if s["name"] == "nfs-iso"}
+    assert nfs_iso["pve2"]["enabled"] is True and nfs_iso["pve2"]["active"] is False
+
+
+def test_contract_storage_not_enabled_named_when_its_node_is_unlisted():
+    """#225: the server's worked example of the 'not read' error. 'nfs-bk' is
+    enabled only on pve1, which could not be listed, so it is named and its
+    guests read unknown; 'nfs-old' is disabled cluster-wide in /storage, so
+    the unlisted node cannot be the one it is enabled on and it is not."""
+    payload = _CONTRACT_SCENARIOS["storage_not_enabled_node_unlisted"]["payload"]
+    assert payload["backups"]["errors"] == [
+        {"scope": "storage", "node": "pve1", "storage": None,
+         "message": "storage listing failed: storage boom"},
+        {"scope": "storage", "node": None, "storage": "nfs-bk",
+         "message": "shared storage not read: not enabled on any node listed"},
+    ]
+    by_name = {s["name"]: s for s in payload["storage"]}
+    assert by_name["nfs-bk"]["enabled"] is False
+    assert by_name["nfs-old"]["enabled"] is False
 
 
 def test_contract_backups_key_present_in_every_non_null_payload():
@@ -2252,13 +2372,440 @@ def test_as_int_and_as_bool_coercions():
     assert as_bool(0) is False and as_bool(1) is True
 
 
-def test_holds_backups_filters_content_and_disabled():
-    holds = proxmox_module._holds_backups
-    assert holds({"content": "images,rootdir"}) is False
-    assert holds({"content": "iso,backup"}) is True
-    assert holds({}) is True  # older PVE without the field: list anyway
-    assert holds({"content": "backup", "enabled": 0}) is False
-    assert holds({"content": "backup", "enabled": 1}) is True
+def test_backup_content_filters_on_the_backup_type():
+    has = proxmox_module._backup_content
+    assert has({"content": "images,rootdir"}) is False
+    assert has({"content": "iso,backup"}) is True
+    assert has({}) is True  # older PVE without the field: list anyway
+    # `enabled` is the walk's own check (test_guest_backups_*), not this one.
+    assert has({"content": "backup", "enabled": 0}) is True
+
+
+def test_guest_backups_list_a_storage_whose_enabled_is_unknown():
+    """#225: the backups walk reads `enabled` like the storage entry does. A
+    value outside PVE's spellings is unknown, and an unknown storage is listed
+    -- skipping it would make its guests read as never backed up, with no error
+    naming the storage (the T89 rule for `content`). A known False is not."""
+    rows = [
+        _dir_storage(name, enabled=value)
+        for name, value in (
+            ("s-null", None), ("s-empty", ""), ("s-list", []), ("s-off", False)
+        )
+    ]
+    mock = _one_node_mock(storage_by_node={"pve1": rows})
+    errors = []
+    make_collector(proxmox_mock=mock)._collect_guest_backups(["pve1"], errors)
+    assert errors == []
+    assert sorted(s for _, s, _ in mock._prunebackups_calls) == [
+        "s-empty", "s-list", "s-null"
+    ]
+
+
+def test_guest_backups_skip_rows_not_enabled_on_the_node():
+    """#225 (storage_enabled_contract.server_use): a row KNOWN not enabled on
+    its node -- outside the storage's 'nodes' option, or disabled -- is not
+    that node's storage. Walked FIRST, the shared one must neither use up the
+    shared listing nor mark it inactive, so it is read from the node where it
+    is enabled; the node-local one is skipped without an error."""
+    excluded = {"storage": "nfs-bk", "type": "nfs", "content": "backup",
+                "shared": 1, "active": 0, "enabled": 0}
+    enabled = dict(excluded, active=1, enabled=1)
+    local_off = _dir_storage("bk-local", active=0, shared=0, enabled=0)
+    mock = _one_node_mock(
+        nodes=[{"node": "pve3"}, {"node": "pve1"}],
+        storage_by_node={"pve3": [excluded, local_off], "pve1": [enabled]},
+        prunebackups_by_node_storage={"pve1": {"nfs-bk": [_volume(100, 10)]}},
+    )
+    errors = []
+    entries = make_collector(proxmox_mock=mock)._collect_guest_backups(
+        ["pve3", "pve1"], errors
+    )
+    assert errors == []
+    assert [(n, s) for n, s, _ in mock._prunebackups_calls] == [("pve1", "nfs-bk")]
+    assert [(e["vmid"], e["storage"], e["node"]) for e in entries] == [
+        (100, "nfs-bk", None)
+    ]
+
+
+def test_guest_backups_enabled_but_inactive_is_still_an_error():
+    """#225: enabled:false skips without an error, but enabled:true with
+    active:false is the storage being DOWN and stays an error naming it --
+    even when the other nodes list the shared storage enabled:0."""
+    shared_down = {"storage": "nfs-bk", "type": "nfs", "content": "backup",
+                   "shared": 1, "active": 0, "enabled": 1}
+    shared_excluded = dict(shared_down, enabled=0)
+    local_down = _dir_storage("usb", active=0, shared=0, enabled=1)
+    mock = _one_node_mock(
+        nodes=[{"node": "pve1"}, {"node": "pve3"}],
+        storage_by_node={"pve1": [shared_down, local_down], "pve3": [shared_excluded]},
+    )
+    errors = []
+    make_collector(proxmox_mock=mock)._collect_guest_backups(["pve1", "pve3"], errors)
+    assert mock._prunebackups_calls == []
+    assert {(e["node"], e["storage"], e["message"]) for e in errors} == {
+        ("pve1", "usb", "storage not active on this node"),
+        (None, "nfs-bk", "shared storage not active on any node"),
+    }
+
+
+# Value: protects=each of the three ways a node goes unread (the block deadline,
+# a listing that raises, a listing that is not a list) names the shared storages
+# seen only enabled:0 -- in sorted order, with the contract's exact message --
+# and never names one that cannot hold backups, is local, or whose shared flag is
+# unknown; fails_when=one of the three unread-node records is dropped, the
+# content check moves behind the enabled one, `if shared:` widens to unknown or
+# to local, or sorted() is dropped (insertion order is pbs-a, archive);
+# why_new=no other test drives the deadline or non-list unread paths, or checks
+# the not-read message whole and in order; seam=none; no_claim=none beyond
+# protects
+@pytest.mark.parametrize(
+    "why_unread,first_error",
+    [
+        ("raises", "storage listing failed: storage boom"),
+        ("non_list", "unexpected response shape (not a list)"),
+        ("deadline", proxmox_module._DEADLINE_MESSAGE),
+    ],
+    ids=["raises", "non_list", "deadline"],
+)
+def test_guest_backups_name_a_shared_storage_whose_enabled_node_was_not_listed(
+    why_unread, first_error
+):
+    """#225: two PBS limited to pve1 by their 'nodes' option are enabled:0 on
+    pve3. When pve1 is not listed -- its listing raises, is not a list, or the
+    block deadline skips it -- they are read nowhere and pve1's error names no
+    storage (backups_contract: storage:null covers LOCAL storages), so each is
+    named, in sorted order -- its guests read unknown, not never backed up. A
+    storage also seen on an enabled row already has its own outcome and gets
+    no second error. A shared rbd whose content excludes backups, and an
+    enabled:0 row whose shared flag is unknown, are never named: neither can be
+    a shared backup storage read elsewhere. With every node listed, enabled:0
+    rows stay error-free
+    (test_guest_backups_not_enabled_anywhere_is_error_free_when_all_listed)."""
+    excluded = {"storage": "pbs-a", "type": "pbs", "content": "backup",
+                "shared": 1, "active": 0, "enabled": 0}
+    seen_down = dict(excluded, storage="nfs-bk", type="nfs", enabled=1)
+    no_backups = {"storage": "ceph-vm", "type": "rbd", "content": "images,rootdir",
+                  "shared": 1, "active": 0, "enabled": 0}
+    flag_unknown = {"storage": "nfs-noflag", "type": "nfs", "content": "backup",
+                    "active": 0, "enabled": 0}
+    pve1_rows = [dict(excluded, active=1, enabled=1)]
+    mock = _one_node_mock(
+        nodes=[{"node": "pve2"}, {"node": "pve3"}, {"node": "pve1"}],
+        storage_by_node={
+            "pve2": [
+                dict(seen_down, enabled=0),
+                no_backups,
+                flag_unknown,
+                _dir_storage("bk-local", active=0, shared=0, enabled=0),
+            ],
+            # 'archive' sorts before 'pbs-a' but is walked after it.
+            "pve3": [excluded, seen_down, dict(excluded, storage="archive")],
+            "pve1": {"data": pve1_rows} if why_unread == "non_list" else pve1_rows,
+        },
+        storage_raises_for={"pve1"} if why_unread == "raises" else set(),
+    )
+    clock = _FakeClock()
+    deadline = None
+    if why_unread == "deadline":
+        # The budget runs out while pve3, the last node before pve1, is listed.
+        deadline = clock.t + 10
+        pve3 = mock.nodes("pve3").storage.get
+        pve3_rows = pve3.return_value
+
+        def list_pve3_then_spend_budget():
+            clock.t = deadline
+            return pve3_rows
+
+        pve3.side_effect = list_pve3_then_spend_budget
+    errors = []
+    with patch.object(proxmox_module, "time", clock):
+        make_collector(proxmox_mock=mock)._collect_guest_backups(
+            ["pve2", "pve3", "pve1"], errors, deadline=deadline
+        )
+    not_read = "shared storage not read: not enabled on any node listed"
+    assert errors == [
+        {"scope": "storage", "node": "pve1", "storage": None, "message": first_error},
+        {"scope": "storage", "node": None, "storage": "nfs-bk",
+         "message": "shared storage not active on any node"},
+        {"scope": "storage", "node": None, "storage": "archive", "message": not_read},
+        {"scope": "storage", "node": None, "storage": "pbs-a", "message": not_read},
+    ]
+    assert mock._prunebackups_calls == []
+
+
+def test_guest_backups_not_read_rule_follows_the_storage_config():
+    """#225: the /storage config can rule the unread node out. A storage
+    disabled cluster-wide, or whose 'nodes' option names none of the unread
+    nodes, is enabled on none of them, so it is not named -- a node that stays
+    unlisted (dead, never removed with pvecm delnode) would otherwise name it
+    on every build, its guests reading unknown instead of 'backups stopped'.
+    It is named when 'nodes' includes ANY of the unread nodes (here the
+    second), or when the config cannot tell: no entry (a token that cannot
+    read /storage), a blank or non-string 'nodes', or a 'disable' outside
+    PVE's spellings."""
+    def row(name):
+        return {"storage": name, "type": "nfs", "content": "backup",
+                "shared": 1, "active": 0, "enabled": 0}
+
+    names = ["off", "elsewhere", "on-pve4", "pve-list", "semi-list", "space-list",
+             "semi-only", "no-config", "blank-nodes", "list-nodes", "odd-disable"]
+    mock = _one_node_mock(
+        nodes=[{"node": "pve2"}, {"node": "pve1"}, {"node": "pve4"}],
+        storage_by_node={"pve2": [row(name) for name in names]},
+        storage_raises_for={"pve1", "pve4"},
+        storage_config=[
+            {"storage": "off", "type": "nfs", "disable": 1, "nodes": "pve1"},
+            {"storage": "elsewhere", "type": "nfs", "nodes": "pve3,pve9"},
+            {"storage": "on-pve4", "type": "nfs", "nodes": "pve3, pve4"},
+            # PVE's own spelling: comma-joined, no spaces.
+            {"storage": "pve-list", "type": "nfs", "nodes": "pve3,pve1"},
+            # PVE::Tools::split_list also splits on ';' and whitespace.
+            {"storage": "semi-list", "type": "nfs", "nodes": "pve3;pve1"},
+            {"storage": "space-list", "type": "nfs", "nodes": "pve3 pve1"},
+            {"storage": "semi-only", "type": "nfs", "nodes": ";"},
+            {"storage": "blank-nodes", "type": "nfs", "nodes": " "},
+            {"storage": "list-nodes", "type": "nfs", "nodes": ["pve3"]},
+            {"storage": "odd-disable", "type": "nfs", "disable": "yes"},
+        ],
+    )
+    errors = []
+    make_collector(proxmox_mock=mock)._collect_guest_backups(
+        ["pve2", "pve1", "pve4"], errors
+    )
+    assert [(e["node"], e["storage"]) for e in errors] == [
+        ("pve1", None),
+        ("pve4", None),
+        (None, "blank-nodes"),
+        (None, "list-nodes"),
+        (None, "no-config"),
+        (None, "odd-disable"),
+        (None, "on-pve4"),
+        (None, "pve-list"),
+        (None, "semi-list"),
+        (None, "semi-only"),
+        (None, "space-list"),
+    ]
+
+
+def test_guest_backups_not_enabled_anywhere_is_error_free_when_all_listed():
+    """#225: with every node listed, a shared storage enabled:0 on every row is
+    enabled nowhere, so it is skipped without an error -- even when the
+    /storage config cannot be read to say so. Naming it would turn its guests
+    unknown on every build (storage_enabled_contract.server_use)."""
+    row = {"storage": "nfs-old", "type": "nfs", "content": "backup",
+           "shared": 1, "active": 0, "enabled": 0}
+    mock = _one_node_mock(
+        nodes=[{"node": "pve1"}, {"node": "pve2"}],
+        storage_by_node={"pve1": [row], "pve2": [dict(row)]},
+        storage_config_raises=True,
+    )
+    errors = []
+    make_collector(proxmox_mock=mock)._collect_guest_backups(["pve1", "pve2"], errors)
+    assert errors == []
+    assert mock._prunebackups_calls == []
+
+
+@pytest.mark.parametrize("read_fails", [False, True], ids=["read", "read_fails"])
+def test_guest_backups_shared_storage_seen_enabled_is_never_not_read(read_fails):
+    """#225: a PBS enabled on pve1 and excluded on pve3, while pve2 cannot be
+    listed, has its own outcome from pve1 -- its volumes, or the failure of
+    that read naming it -- and never also the 'not read' error, which would
+    turn guests whose backups WERE read unknown."""
+    on = {"storage": "pbs-a", "type": "pbs", "content": "backup",
+          "shared": 1, "active": 1, "enabled": 1}
+    mock = _one_node_mock(
+        nodes=[{"node": "pve1"}, {"node": "pve3"}, {"node": "pve2"}],
+        storage_by_node={"pve1": [on], "pve3": [dict(on, active=0, enabled=0)]},
+        storage_raises_for={"pve2"},
+        prunebackups_by_node_storage={"pve1": {"pbs-a": [_volume(100, 10)]}},
+        prunebackups_raises_for={"pve1/pbs-a"} if read_fails else set(),
+    )
+    errors = []
+    entries = make_collector(proxmox_mock=mock)._collect_guest_backups(
+        ["pve1", "pve3", "pve2"], errors
+    )
+    expected = [("pve2", None)]
+    if read_fails:
+        expected.insert(0, ("pve1", "pbs-a"))
+    assert [(e["node"], e["storage"]) for e in errors] == expected
+    assert not any(e["message"].startswith("shared storage not read") for e in errors)
+    assert [e["vmid"] for e in entries] == ([] if read_fails else [100])
+
+
+@pytest.mark.parametrize(
+    "disable,named",
+    [(0, True), ("0", True), (False, True), (" 0\n", True), (1, False), (" 1", False)],
+)
+def test_guest_backups_not_read_rule_reads_disable_like_pve(disable, named):
+    """#225: `pvesm set <id> --disable 0` re-enables a storage and leaves an
+    explicit 'disable: 0' in /storage. Read through PVE's own spellings, a
+    false one is not a disabled storage: one limited to the unread node is
+    still named, and only a true one rules that node out."""
+    row = {"storage": "nfs-bk", "type": "nfs", "content": "backup",
+           "shared": 1, "active": 0, "enabled": 0}
+    mock = _one_node_mock(
+        nodes=[{"node": "pve2"}, {"node": "pve1"}],
+        storage_by_node={"pve2": [row]},
+        storage_raises_for={"pve1"},
+        storage_config=[{"storage": "nfs-bk", "type": "nfs", "disable": disable,
+                         "nodes": "pve1"}],
+    )
+    errors = []
+    make_collector(proxmox_mock=mock)._collect_guest_backups(["pve2", "pve1"], errors)
+    assert ("nfs-bk" in [e["storage"] for e in errors]) is named
+
+
+def test_guest_backups_not_read_rule_uses_the_storage_shared_decision():
+    """#225: whether a row not enabled is a SHARED storage comes from
+    `_storage_shared`, as everywhere else: a row with no flag falls back to
+    the /storage config (shared there: named), and a row spelling its flag
+    "0" is local (never named)."""
+    base = {"type": "nfs", "content": "backup", "active": 0, "enabled": 0}
+    mock = _one_node_mock(
+        nodes=[{"node": "pve2"}, {"node": "pve1"}],
+        storage_by_node={"pve2": [
+            dict(base, storage="cfg-shared"),
+            dict(base, storage="str-local", shared="0"),
+        ]},
+        storage_raises_for={"pve1"},
+        storage_config=[{"storage": "cfg-shared", "type": "nfs", "shared": 1}],
+    )
+    errors = []
+    make_collector(proxmox_mock=mock)._collect_guest_backups(["pve2", "pve1"], errors)
+    assert [(e["node"], e["storage"]) for e in errors] == [
+        ("pve1", None), (None, "cfg-shared")
+    ]
+
+
+def test_guest_backups_shared_storage_cut_by_the_deadline_is_never_not_read():
+    """#225: a PBS enabled on pve1 whose read the block deadline cuts there has
+    that deadline error as its outcome; being enabled:0 on pve3 must not also
+    give it the 'not read' error (a second, wrong, entry for one storage)."""
+    on = {"storage": "pbs-a", "type": "pbs", "content": "backup",
+          "shared": 1, "active": 1, "enabled": 1}
+    mock = _one_node_mock(
+        nodes=[{"node": "pve3"}, {"node": "pve1"}, {"node": "pve2"}],
+        storage_by_node={
+            "pve3": [dict(on, active=0, enabled=0)], "pve1": [on], "pve2": [on]
+        },
+    )
+    clock = _FakeClock()
+    deadline = clock.t + 10
+    pve1 = mock.nodes("pve1").storage.get
+    rows = pve1.return_value
+
+    def list_pve1_then_spend_budget():
+        clock.t = deadline
+        return rows
+
+    pve1.side_effect = list_pve1_then_spend_budget
+    errors = []
+    with patch.object(proxmox_module, "time", clock):
+        make_collector(proxmox_mock=mock)._collect_guest_backups(
+            ["pve3", "pve1", "pve2"], errors, deadline=deadline
+        )
+    assert [(e["node"], e["storage"], e["message"]) for e in errors] == [
+        ("pve1", "pbs-a", proxmox_module._DEADLINE_MESSAGE),
+        ("pve2", None, proxmox_module._DEADLINE_MESSAGE),
+    ]
+
+
+def test_guest_backups_skip_a_storage_id_that_is_not_a_string():
+    """A /nodes/<n>/storage row whose 'storage' id is not a string (a hostile
+    or broken API) cannot be looked up in /storage: it is skipped, enabled or
+    not, instead of raising TypeError and nulling the whole backups block."""
+    bad = [dict(_dir_storage("x", enabled=value), storage=["bad"]) for value in (0, 1)]
+    mock = _one_node_mock(
+        storage_by_node={"pve1": bad + [_dir_storage("local")]},
+        prunebackups_by_node_storage={"pve1": {"local": [_volume(100, 10)]}},
+    )
+    errors = []
+    entries = make_collector(proxmox_mock=mock)._collect_guest_backups(["pve1"], errors)
+    assert errors == []
+    assert [(e["vmid"], e["storage"]) for e in entries] == [(100, "local")]
+
+
+def test_guest_backups_unreadable_row_counts_its_node_as_not_read():
+    """A row without a usable storage id on a node that WAS listed may be the
+    one where a shared storage is enabled: that node counts as not read, so a
+    PBS limited to it and seen enabled:0 elsewhere is named rather than its
+    guests reading never backed up."""
+    excluded = {"storage": "pbs-a", "type": "pbs", "content": "backup",
+                "shared": 1, "active": 0, "enabled": 0}
+    for junk in ("garbage", {"storage": ["pbs-a"], "content": "backup"}):
+        mock = _one_node_mock(
+            nodes=[{"node": "pve2"}, {"node": "pve1"}],
+            storage_by_node={"pve2": [excluded], "pve1": [junk]},
+            storage_config=[{"storage": "pbs-a", "type": "pbs", "nodes": "pve1"}],
+        )
+        errors = []
+        make_collector(proxmox_mock=mock)._collect_guest_backups(
+            ["pve2", "pve1"], errors
+        )
+        assert [(e["node"], e["storage"]) for e in errors] == [(None, "pbs-a")]
+
+
+def test_guest_backups_not_read_rule_does_not_split_an_oversized_nodes():
+    """A 'nodes' option far past any real cluster's (a hostile API) is not
+    split -- that would cost many times its size, after the deadline too --
+    and reads as possibly enabled anywhere, so the storage is named."""
+    row = {"storage": "nfs-bk", "type": "nfs", "content": "backup",
+           "shared": 1, "active": 0, "enabled": 0}
+    huge = "pve3," * (proxmox_module.NODES_OPTION_MAX_CHARS // 5 + 1)
+    mock = _one_node_mock(
+        nodes=[{"node": "pve2"}, {"node": "pve1"}],
+        storage_by_node={"pve2": [row]},
+        storage_raises_for={"pve1"},
+        storage_config=[{"storage": "nfs-bk", "type": "nfs", "nodes": huge}],
+    )
+    errors = []
+    make_collector(proxmox_mock=mock)._collect_guest_backups(["pve2", "pve1"], errors)
+    assert [(e["node"], e["storage"]) for e in errors] == [
+        ("pve1", None), (None, "nfs-bk")
+    ]
+
+
+def test_guest_backups_storage_read_per_node_is_never_not_read():
+    """#225: a storage read on pve1, where its row carries no usable shared
+    flag (so it is listed per node), already has its outcome there: being
+    listed shared:1 and enabled:0 on pve3, with pve2 unread, must not also
+    give it the 'not read' error."""
+    row = {"storage": "nfs-bk", "type": "nfs", "content": "backup",
+           "active": 1, "enabled": 1}
+    mock = _one_node_mock(
+        nodes=[{"node": "pve1"}, {"node": "pve3"}, {"node": "pve2"}],
+        storage_by_node={
+            "pve1": [row], "pve3": [dict(row, shared=1, active=0, enabled=0)]
+        },
+        storage_raises_for={"pve2"},
+        prunebackups_by_node_storage={"pve1": {"nfs-bk": [_volume(100, 10)]}},
+    )
+    errors = []
+    entries = make_collector(proxmox_mock=mock)._collect_guest_backups(
+        ["pve1", "pve3", "pve2"], errors
+    )
+    assert [(e["node"], e["storage"]) for e in errors] == [("pve2", None)]
+    assert [(e["vmid"], e["storage"], e["node"]) for e in entries] == [
+        (100, "nfs-bk", "pve1")
+    ]
+
+
+def test_guest_backups_not_read_rule_skips_a_node_name_that_is_not_a_string():
+    """A /nodes entry whose name is not a string (a hostile or broken API)
+    cannot be listed, but it is never compared against a 'nodes' option: the
+    set test would raise TypeError and null the whole backups block. Only the
+    string names that were not listed count."""
+    row = {"storage": "nfs-bk", "type": "nfs", "content": "backup",
+           "shared": 1, "active": 0, "enabled": 0}
+    mock = _one_node_mock(
+        storage_by_node={"pve2": [row, dict(row, storage="no-config")]},
+        storage_config=[{"storage": "nfs-bk", "type": "nfs", "nodes": "pve1"}],
+    )
+    errors = []
+    make_collector(proxmox_mock=mock)._collect_guest_backups(
+        ["pve2", {"node": "pve1"}], errors
+    )
+    assert [e["storage"] for e in errors] == [None, "no-config"]
 
 
 def test_backup_error_bounds_and_scrubs_message():
@@ -2987,16 +3534,15 @@ def test_collect_backups_partial_block_is_cached_within_ttl():
         assert second["backups"]["age_s"] == 30
 
 
-def test_holds_backups_non_string_content_lists_anyway():
+def test_backup_content_non_string_content_lists_anyway():
     """T89: `content` only EXCLUDES a storage when it is the comma-separated
     string PVE documents. Any other shape falls through to 'list it and find
     out' -- dropping it instead would make the storage's guests read as never
     backed up, with no error naming the storage."""
-    holds = proxmox_module._holds_backups
-    assert holds({"content": ["backup"]}) is True
-    assert holds({"content": None}) is True
-    assert holds({"content": ["images", "rootdir"]}) is True
-    assert holds({"content": "backup,images", "enabled": "0"}) is False
+    has = proxmox_module._backup_content
+    assert has({"content": ["backup"]}) is True
+    assert has({"content": None}) is True
+    assert has({"content": ["images", "rootdir"]}) is True
 
 
 def test_as_int_overflow_returns_none():

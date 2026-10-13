@@ -1154,6 +1154,13 @@ yourself and mark shared, set Proxmox's `is_mountpoint` option: without it, a
 node whose mount dropped keeps reporting the storage as active, with the size
 of the disk underneath (usually its system disk).
 
+Agent version **1.21.2+** also marks each storage entry with `enabled` (left
+out only when Proxmox reports no usable flag). Proxmox lists every storage on
+every node, including storages you disabled and the nodes a storage's `nodes`
+option leaves out; those entries are `enabled: false` and inactive. The flag
+lets the dashboard leave them out instead of reporting a storage that is
+limited to some nodes as inactive on the others.
+
 Agent version **1.19.0+** adds a `backups` block so the dashboard can answer
 "has every VM and container had a backup in the last N hours, whatever the
 target?" and "which guests are in no backup job?". It reads four things: the

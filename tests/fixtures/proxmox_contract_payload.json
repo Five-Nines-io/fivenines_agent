@@ -4,10 +4,11 @@
   "collection_contract": {"reachable": "collection.reachable. Always true inside a non-null payload -- an unreachable API yields a null payload (proxmox_metrics() -> None), never a payload with reachable:false. Stated explicitly so the server reads a flag rather than re-deriving 'reachable == payload is not null'.", "cluster_ok": "collection.cluster_ok. True iff the /cluster/status call succeeded. Resolves the cluster:null ambiguity the inference contract could not: standalone node => cluster:null AND cluster_ok:true (the call succeeded, there was simply no cluster-type entry); clustered reporter whose /cluster/status failed => cluster:null AND cluster_ok:false. See scenarios 'standalone' vs 'cluster_fetch_failed'.", "nodes_ok": "collection.nodes_ok. True iff the /nodes listing AND every per-node /nodes/<n>/status call succeeded. A node dropped from payload.nodes because its status fetch raised mid-loop sets nodes_ok:false (see 'partial_node_timeout', 'quorum_lost'). Unlike the shape heuristic (len(nodes)==cluster.nodes_online) this fires even when the dropped node is genuinely offline and excluded from nodes_online -- it reports call success, not head-count agreement.", "guests_ok": "collection.guests_ok. True iff every qemu AND lxc listing across all reporting nodes succeeded (covers both guest loops). A single node's qemu or lxc call raising sets guests_ok:false; the guests of that node are absent from payload.vms/lxc.", "storage_ok": "collection.storage_ok. True iff every per-node /nodes/<n>/storage call succeeded. Independent of the other flags: a lone storage timeout leaves nodes_ok/guests_ok true and only storage_ok false (see 'storage_query_failed'). This is what the shape heuristic could never express -- 'no storages exist' (empty array, storage_ok:true) vs 'storage query failed' (empty/partial array, storage_ok:false).", "error": "collection.error. First failure message across the sections in collect() order (cluster, nodes, vms, lxc, storage), or null when every flag is true. A short structured hint ('node pve2: storage query failed'), truncated to 500 chars; the full exception goes to the agent log, not the payload. Opaque to the server -- surfaced as a diagnostic, never parsed."},
   "inference_contract": {"_note": "PRE-1.10.0 FALLBACK ONLY. When the explicit 'collection' block is present (agent >= 1.10.0) the server MUST use it (see 'collection_contract'); these shape rules are how the same signals are recovered from older agents that emit no flags.", "reachable": "payload is not null. A null payload (proxmox_metrics() -> None) is the ONLY unreachable/auth-failure signal; there is no partial 'all empty' payload to disambiguate (normalized agent-side in ProxmoxCollector.collect).", "cluster_ok": "payload.cluster is not null. CAVEAT: payload.cluster is also null for a genuine standalone node (see scenario 'standalone'). cluster:null is therefore ambiguous between (a) standalone, no corosync, and (b) a clustered reporter whose /cluster/status call failed -- ProxmoxCollector._collect_cluster returns None for both. The server must disambiguate with its own cross-reporter knowledge (a lone reporter => standalone; one of N cluster reporters returning cluster:null => that reporter's cluster fetch failed).", "nodes_ok": "when payload.cluster is present, len(payload.nodes) == payload.cluster.nodes_online. A node counted online by corosync (cluster.status) but missing from payload.nodes means its per-node detail collection failed mid-loop (see scenario 'partial_node_timeout'). For a standalone node (cluster:null) expect exactly one node entry.", "guests_ok": "guests (vms + lxc) are only reported for nodes present in payload.nodes; a node that dropped out of payload.nodes also drops its guests. There is no expected-guest-count in the payload, so guests_ok is derived transitively from nodes_ok, not independently.", "storage_ok": "same as guests_ok: storage is reported per node present in payload.nodes. SHARED storage (e.g. ceph/nfs) is reported once PER reporting node (not deduplicated). Agent 1.21.1+ marks each entry with a 'shared' flag (see storage_shared_contract); for an older agent, which carries none, shared-ness comes from the storage type alone. Never dedupe by (name, type, total): node-local storages built from the same hardware share all three. See scenario 'quorate_cluster' where 'ceph-pool' appears three times, once per node, and pve1's and pve2's 'local-lvm' have the same total but are different disks."},
   "error_path_audit": {"proxmoxer_missing": "proxmox_metrics() -> None (ProxmoxAPI is None guard). data['proxmox'] = null.", "no_credentials": "_connect() logs and leaves self.proxmox = None; collect() returns None. data['proxmox'] = null.", "constructor_raises": "ProxmoxAPI(...) raising is caught in _connect (self.proxmox = None) OR, if ProxmoxCollector.__init__ itself raises, by proxmox_metrics' outer try. Either way -> None.", "api_unreachable_after_construction": "The realistic auth-failure / host-down case: token-auth ProxmoxAPI constructs lazily (no None), then every request raises. version.get() raises AND the node-listing probe raises => collect() returns None (see scenario 'unreachable'). BEFORE 1.9.0 this returned {\"version\": null, \"cluster\": null, \"nodes\": [], \"vms\": [], \"lxc\": [], \"storage\": []}, indistinguishable-by-value from an idle node; normalized to None in 1.9.0.", "single_node_timeout": "One node's per-node calls raise mid-loop while the cluster-wide /cluster/status still counts it online. Exceptions are swallowed per-node in _collect_nodes/_collect_vms/_collect_lxc/_collect_storage, so that node silently drops from payload.nodes/vms/lxc/storage while payload.cluster.nodes_online still includes it (see scenario 'partial_node_timeout')."},
-  "storage_pool_contract": {"_note": "Agent-side prerequisite for the deferred ZFS<->Proxmox join (issue #49, ZFS pool health shipped in agent 1.11.3). Each storage entry OPTIONALLY carries 'pool', read from the datacenter storage config (/storage -> self.proxmox.storage.get(), one cluster-wide call), which is DISTINCT from the per-node /nodes/<n>/storage runtime status the total/used/available/active fields come from. See scenario 'standalone' for the pinned shape (local-zfs carries pool, local/local-lvm do not).", "field": "pool", "present_for": "Pool-backed storage types only: zfspool (the ZFS dataset, e.g. 'rpool/data'), rbd/cephfs (the Ceph pool). OMITTED (key absent, never null) for dir/lvmthin/nfs/etc, so 'pool' adds nothing to a host with no pool-backed storage -- the contract is purely additive; 'pool', 'pbs' (type 'pbs' only, agent 1.21.0+, see pbs_join_contract) and 'shared' (agent 1.21.1+, see storage_shared_contract) are the only optional keys beyond the base 7.", "server_join": "For a zfspool storage the zpool ROOT is pool.split('/')[0] (e.g. 'rpool/data' -> 'rpool'); the server joins that to host-local ZfsPool.name per (host, pool root). This is the join key proxmox_storages.name could never provide -- that column is the PVE storage ID (e.g. 'local-zfs'), not the zpool name. rbd/cephfs 'pool' is the Ceph pool; the server filters by type when joining. OUT OF SCOPE for the agent: the server adds proxmox_storages.pool and performs the join in a paired lockstep PR.", "best_effort": "Enrichment is best-effort. A restricted token that cannot read /storage, or an older PVE, degrades to no 'pool' on any entry and NEVER fails or flips storage_ok -- _storage_config_map swallows its own error and is deliberately not threaded through the 'collection' flags block. Deploy order is not sensitive: an old server ignores the extra 'pool' key; a new server reads it with .get('pool')."},
+  "storage_pool_contract": {"_note": "Agent-side prerequisite for the deferred ZFS<->Proxmox join (issue #49, ZFS pool health shipped in agent 1.11.3). Each storage entry OPTIONALLY carries 'pool', read from the datacenter storage config (/storage -> self.proxmox.storage.get(), one cluster-wide call), which is DISTINCT from the per-node /nodes/<n>/storage runtime status the total/used/available/active fields come from. See scenario 'standalone' for the pinned shape (local-zfs carries pool, local/local-lvm do not).", "field": "pool", "present_for": "Pool-backed storage types only: zfspool (the ZFS dataset, e.g. 'rpool/data'), rbd/cephfs (the Ceph pool). OMITTED (key absent, never null) for dir/lvmthin/nfs/etc, so 'pool' adds nothing to a host with no pool-backed storage -- the contract is purely additive; 'pool', 'pbs' (type 'pbs' only, agent 1.21.0+, see pbs_join_contract), 'shared' (agent 1.21.1+, see storage_shared_contract) and 'enabled' (agent 1.21.2+, see storage_enabled_contract) are the only optional keys beyond the base 7.", "server_join": "For a zfspool storage the zpool ROOT is pool.split('/')[0] (e.g. 'rpool/data' -> 'rpool'); the server joins that to host-local ZfsPool.name per (host, pool root). This is the join key proxmox_storages.name could never provide -- that column is the PVE storage ID (e.g. 'local-zfs'), not the zpool name. rbd/cephfs 'pool' is the Ceph pool; the server filters by type when joining. OUT OF SCOPE for the agent: the server adds proxmox_storages.pool and performs the join in a paired lockstep PR.", "best_effort": "Enrichment is best-effort. A restricted token that cannot read /storage, or an older PVE, degrades to no 'pool' on any entry and NEVER fails or flips storage_ok -- _storage_config_map swallows its own error and is deliberately not threaded through the 'collection' flags block. Deploy order is not sensitive: an old server ignores the extra 'pool' key; a new server reads it with .get('pool')."},
   "backups_contract": {"_note": "Agent 1.19.0+ (fivenines_agent#156, server companion of fivenines_server#1159 phase 2). payload.backups is the one section OUTSIDE the collection flags block: it carries its own three-level signal and NEVER flips a flag (completeness_score is a stored generated column over the five flags that elects the authoritative reporter; a sixth bit would be a migration + a rollout window). See scenarios backups_ok / backups_storage_partial / backups_block_failed / backups_capped.", "three_level_null": "Key ABSENT = an agent older than 1.19.0: the server reads 'unknown', never 'no backups'. backups: null = the block could not be built at all (the node listing failed; see backups_block_failed) -- also 'unknown', and never cached agent-side so the next tick retries. An OBJECT = a read happened; errors[] says which sub-reads failed.", "partial_read_rule": "errors[] entries are {scope: 'storage'|'tasks'|'jobs'|'not_backed_up'|'cap', node, storage, message}. Per-storage entries are LOAD-BEARING: the server's rule for a partial read is asymmetric -- a guest with a fresh backup on a successfully listed storage is fine (evidence exists), but a guest with NO backup found is 'unknown', never 'never'/'aged', because its backups may live on the storage that failed (see backups_storage_partial: ct 101). A 'storage' entry with storage:null means a whole node's storage listing failed (every local storage on that node is unknown). A backup read that fails -- e.g. a PBS storage whose PBS credentials lack prune rights, so the prune-preview errors -- is a 'storage' scoped error too, so those guests read unknown. A non-list envelope is recorded as 'unexpected response shape (not a list)'; a storage whose backup volumes are missing vmid/ctime is flagged 'N backup volume(s) skipped (missing vmid or ctime)'. scope 'cap' means an array was trimmed to its hard cap (guest_backups 5000, tasks 50 per node, jobs 200, not_backed_up 2000) and is not complete; errors[] itself is bounded (a 'cap'-scope 'errors capped at N' entry once past the limit). A read skipped because the block's 30s wall-clock budget ran out is recorded under its scope with message 'skipped: backups collection deadline exceeded'.", "guest_backups": "One entry per (vmid, storage[, node]): the LATEST volume's ctime/volid, a count, and `protected` (from the prune-preview `mark`: protected backups are retention-exempt). Read from the PRUNE-PREVIEW endpoint (/nodes/{n}/storage/{s}/prunebackups?prune-backups=keep-all=1, a dryrun), NOT the content listing, so a read-only PVEAuditor token (Datastore.Audit) sees the volumes -- the content listing filters backups per-volume and would need an allocate-class privilege. The prune preview carries no size/verification/encrypted; for a PBS storage those come from data['pbs'] (agent 1.21.0+, see pbs_join_contract), and the allocate-gated content listing is rejected (Datastore.Allocate also deletes backups). A SHARED storage (PBS/NFS/CIFS) is listed once from the first node where it is active and emitted with node: null; a local storage once per node with node set. Volumes without vmid or ctime are skipped. Sorted by (vmid, storage, node). This is the per-guest signal; the alert is built from it, never from tasks. KNOWN LIMITATION: the prune preview reports snapshot EXISTENCE by ctime, not COMPLETION -- an in-progress PBS backup can momentarily read as the latest_ctime (a false 'backed up' if it fails); data['pbs'] resolves completion: its last_backup only ever names a FINISHED backup (agent 1.21.0+). Local/NFS/dir storages are unaffected.", "tasks": "Finished vzdump tasks per node (limit 50), JOB-level: status is the free string PVE reports ('OK', 'WARNINGS: <n>', or an error message), passed verbatim and capped -- the server classifies it. id is the vmid only when exactly one guest was backed up (pve-manager VZDump.pm); a scheduled multi-guest job has an empty id, shipped as null. Never attribute a task to a guest.", "jobs": "/cluster/backup definitions trimmed to id/enabled/schedule/storage/vmid/all/exclude/pool/node/mode/comment/next_run (PVE's 'next-run'). Display context and the schedule the server can size a default threshold from.", "not_backed_up": "/cluster/backup-info/not-backed-up verbatim: [{vmid, name, type}] -- guests covered by no job, the signal a job-level webhook can never produce.", "freshness": "The block is computed at most once per 600s and re-emitted with age_s = seconds since it was computed (monotonic). Anchor freshness as received_at - age_s; never trust the agent wall clock. latest_ctime and task starttime/endtime are PVE data timestamps and pass through as-is. In every scenario here age_s is 0 because the block was just computed.", "no_config_key": "The TTL and caps are agent constants. config['proxmox'] is splatted into proxmox_metrics(**config): a key the server started sending would be a TypeError on every older agent and kill the whole Proxmox collector there. Do not add one.", "scrubbing": "Every customer-controlled string (volid, status, comment, upid, name...) is UTF-8-sanitized, NUL-stripped and capped at 500 chars agent-side; the server ingester applies its own scrub regardless."},
   "pbs_join_contract": {"_note": "Agent 1.21.0+. A storage entry of type 'pbs' OPTIONALLY carries 'pbs', read from the same datacenter storage config (/storage) as 'pool' and with the same additive, best-effort posture: omitted (never null) for every other type, and when the config does not name both a server and a datastore (a token that cannot read /storage). See scenarios backups_ok (fingerprint pinned, a namespace: its 'pbs-main' storage points at the SAME datastore, namespace and certificate as pbs_contract_payload.json scenario 'healthy', so vm 100 there joins PBS group store1/clusterA/vm/100, whose last verification FAILED) and backups_storage_partial (no fingerprint, the root namespace).", "fields": "server and datastore verbatim; port (null = the PBS default 8007); namespace ('' = the root namespace, the PBS API's own spelling); fingerprint (the SHA-256 PVE pinned for a self-signed PBS certificate, lowercased; null when PVE trusts a CA-signed certificate instead). username/password/encryption-key are never shipped.", "server_join": "The PBS collector (data['pbs'], agent 1.21.0+, tests/fixtures/pbs_contract_payload.json) reports its certificate fingerprint and keys each backup group on (store, ns, type, id). A PVE guest's backups on this storage are the PBS group (datastore, namespace, vm|ct, vmid) of the matching PBS; the identity rule (fingerprint plus datastore; the host breaks a tie between cloned PBS VMs sharing a certificate only against a reporter whose configured host (config['pbs']['host']:port) is remote) is pbs_contract_payload.json's pve_join_contract. A storage with no fingerprint (a CA-signed PBS) cannot be joined yet. vmid alone is ambiguous: two clusters backing up to one PBS both have a vm/100, told apart only by namespace."},
-  "storage_shared_contract": {"_note": "Agent 1.21.1+ (fivenines_agent#222). Each storage entry carries 'shared' (bool): true when the storage holds the same content on every node that lists it (PBS, NFS, CIFS, Ceph RBD/CephFS, iSCSI, or a storage marked shared by hand, e.g. dir/lvm/btrfs), false for a node-local one. See scenarios 'quorate_cluster' (ceph-pool true on all three nodes, local-lvm false) and 'shared_storage_down_on_one_node' (a shared storage down on one node, and a storage with no flag).", "source": "The per-node /nodes/<n>/storage row's own 'shared' decides when the row carries one (PVE always sets it, 0 or 1); the datacenter /storage config entry only when the row has none or null -- the same order the backups block uses to list a shared storage once. Only PVE's own spellings are read (a JSON bool, the integers 0/1, '0'/'1'): a deciding value outside them is unknown, and does not fall back to the config. OMITTED (key absent, never null) when unknown, so 'unknown' never reads as 'not shared' nor as 'shared'; in practice it is always present. Never flips storage_ok.", "dedupe": "Entries of one cluster with the same name and shared:true are ONE storage seen from N nodes. Entries with the same name and shared:false are N different storages ('local', 'local-lvm' exist on every node), even when type and total are identical too. Take a shared storage's capacity (total/used/available) from one row with active:true. active:false with 0 bytes means the storage is not available on that node, for reasons the payload does not tell apart: the node lost it (an nfs/cifs share it cannot mount, an unreachable Ceph or PBS), the storage is disabled, or its 'nodes' option excludes that node (PVE still lists it there). Keep 'active' per node: active:false on one node of a shared storage is about that node, not the storage shrinking (scenario 'shared_storage_down_on_one_node', 'nfs-iso'). Never compare the active rows' totals: each node reads the size at its own moment (Ceph's total is stored + max_avail, a share on ZFS moves with its pool), so they legitimately differ a little (scenario 'quorate_cluster', 'ceph-pool'). iscsi, iscsidirect and esxi report no capacity at all (0 bytes even when active, and iscsidirect is always reported active): their capacity is unknown, never 0. Known blind spot: a dir storage marked shared by hand on a mount the operator manages (or a btrfs one whose mount point sits on another btrfs filesystem) keeps reporting active when the mount drops, with the size of the filesystem underneath -- unless the storage sets PVE's is_mountpoint option, which makes that node read active:false. When no row is active, the capacity is unknown (null), never 0. The backups block applies the active rule: it lists a shared storage once, from the first node where it is active; a storage whose flag is unknown it lists per node whatever its type, even one the type fallback reads as shared.", "absent": "Key absent = an agent older than 1.21.1 (or a row neither source describes): only the type is left, i.e. the types PVE forces shared (PVE::Storage::Plugin @SHARED_STORAGE: iscsi, nfs, cifs, rbd, cephfs, iscsidirect, zfs (ZFS over iSCSI), drbd, pbs, plus glusterfs up to PVE 8). A storage marked shared by hand (e.g. dir/lvm/btrfs) is only told by the flag. During a rolling update, reporters of the same cluster run both versions: a key absent from one reporter does not erase a flag another reporter of that cluster already sent, and the type is the fallback only when no reporter of the cluster has sent it. Scenario 'shared_storage_down_on_one_node' ('scratch') pins the absent shape. Deploy order is not sensitive: an old server ignores the key."},
+  "storage_shared_contract": {"_note": "Agent 1.21.1+ (fivenines_agent#222). Each storage entry carries 'shared' (bool): true when the storage holds the same content on every node that lists it (PBS, NFS, CIFS, Ceph RBD/CephFS, iSCSI, or a storage marked shared by hand, e.g. dir/lvm/btrfs), false for a node-local one. See scenarios 'quorate_cluster' (ceph-pool true on all three nodes, local-lvm false) and 'shared_storage_down_on_one_node' (a shared storage down on one node, and a storage with no flag).", "source": "The per-node /nodes/<n>/storage row's own 'shared' decides when the row carries one (PVE always sets it, 0 or 1); the datacenter /storage config entry only when the row has none or null -- the same order the backups block uses to list a shared storage once. Only PVE's own spellings are read (a JSON bool, the integers 0/1, '0'/'1'): a deciding value outside them is unknown, and does not fall back to the config. OMITTED (key absent, never null) when unknown, so 'unknown' never reads as 'not shared' nor as 'shared'; in practice it is always present. Never flips storage_ok.", "dedupe": "Entries of one cluster with the same name and shared:true are ONE storage seen from N nodes. Entries with the same name and shared:false are N different storages ('local', 'local-lvm' exist on every node), even when type and total are identical too. Take a shared storage's capacity (total/used/available) from one row with active:true. active:false with 0 bytes means the storage is not available on that node: the node lost it (an nfs/cifs share it cannot mount, an unreachable Ceph or PBS), the storage is disabled, or its 'nodes' option excludes that node (PVE still lists it there). Agent 1.21.2+ tells the last two apart from the first by 'enabled': false (storage_enabled_contract): such a row is not that node's storage at all, so leave it out of the fold -- a shared storage limited to some nodes is one storage, active on the nodes it is enabled on, never inactive because of the others (scenario 'storage_not_enabled_on_a_node', 'nfs-vm'). Keep 'active' per node: active:false on one node of a shared storage is about that node, not the storage shrinking (scenario 'shared_storage_down_on_one_node', 'nfs-iso'). Never compare the active rows' totals: each node reads the size at its own moment (Ceph's total is stored + max_avail, a share on ZFS moves with its pool), so they legitimately differ a little (scenario 'quorate_cluster', 'ceph-pool'). iscsi, iscsidirect and esxi report no capacity at all (0 bytes even when active, and iscsidirect is always reported active): their capacity is unknown, never 0. Known blind spot: a dir storage marked shared by hand on a mount the operator manages (or a btrfs one whose mount point sits on another btrfs filesystem) keeps reporting active when the mount drops, with the size of the filesystem underneath -- unless the storage sets PVE's is_mountpoint option, which makes that node read active:false. When no row is active, the capacity is unknown (null), never 0. The backups block applies the active rule: it lists a shared storage once, from the first node where it is active; a storage whose flag is unknown it lists per node whatever its type, even one the type fallback reads as shared.", "absent": "Key absent = an agent older than 1.21.1 (or a row neither source describes): only the type is left, i.e. the types PVE forces shared (PVE::Storage::Plugin @SHARED_STORAGE: iscsi, nfs, cifs, rbd, cephfs, iscsidirect, zfs (ZFS over iSCSI), drbd, pbs, plus glusterfs up to PVE 8). A storage marked shared by hand (e.g. dir/lvm/btrfs) is only told by the flag. During a rolling update, reporters of the same cluster run both versions: a key absent from one reporter does not erase a flag another reporter of that cluster already sent, and the type is the fallback only when no reporter of the cluster has sent it. Scenario 'shared_storage_down_on_one_node' ('scratch') pins the absent shape. Deploy order is not sensitive: an old server ignores the key."},
+  "storage_enabled_contract": {"_note": "Agent 1.21.2+ (fivenines_agent#225). Each storage entry carries 'enabled' (bool), PVE's own verdict for that node: false when the storage is disabled ('disable' in storage.cfg) or its 'nodes' option excludes that node. PVE lists every storage of storage.cfg on every node and never activates one that is not enabled there, so such a row reads active:false with 0 bytes, the shape of a storage that is down on that node: 'enabled' is the only field that tells them apart. See scenario 'storage_not_enabled_on_a_node'.", "source": "The per-node /nodes/<n>/storage row's 'enabled' alone (PVE's storage_info always sets it, 0 or 1). No fallback to the datacenter /storage config, which carries 'disable' and 'nodes' rather than the per-node verdict. Only PVE's own spellings are read (a JSON bool, the integers 0/1, '0'/'1'). OMITTED (key absent, never null) when the row carries no usable value, so 'unknown' never reads as 'disabled'. Never flips storage_ok.", "server_use": "An enabled:false row is not a storage of that node: leave it out of the shared-storage fold (storage_shared_contract.dedupe), the storage counts and the storage-inactive alert. active:false on an enabled:true row is still the storage being down on that node. The backups block never lists a storage on a node where it is enabled:false and records no error for that row (PVE refuses to read a disabled storage); a shared storage is listed from a node where it is enabled and active. A shared storage seen only on enabled:false rows while some node's storage listing failed or was skipped (a storage:null entry), or carried a row without a usable storage id, is named in a 'storage' error, 'shared storage not read: not enabled on any node listed': the node that was not listed may be the one it is enabled on, so its guests read unknown -- unless the datacenter /storage config rules that out (the storage is disabled cluster-wide, or its 'nodes' option names none of the nodes not listed), in which case it stays error-free (scenario 'storage_not_enabled_node_unlisted': 'nfs-bk' named, 'nfs-old' not). In a build where every node's storage was listed (collection.storage_ok true), a storage that is enabled:false on EVERY row is configured but disabled (or excluded everywhere): keep it and show it as disabled, its capacity unknown; never read it as gone nor prune it (scenario 'storage_not_enabled_on_a_node', 'nfs-old'). With storage_ok false, a storage seen only on enabled:false rows may be enabled on a node that was not listed: its state is unknown, not disabled -- keep the last known one (scenario 'storage_not_enabled_node_unlisted', 'nfs-bk').", "absent": "Key absent = an agent older than 1.21.2 (or a row with no usable value: scenario 'shared_storage_down_on_one_node', 'scratch'): read the row as enabled, i.e. as before the key existed, where active:false cannot be told from a storage that is down. Deploy order is not sensitive: an old server ignores the key."},
   "scenarios": {
     "quorate_cluster": {
       "description": "3-node quorate cluster 'production'. Guests spread across nodes (pve1: vm 100 + ct 200; pve2: vm 101; pve3: stopped ct 201). Shared storage 'ceph-pool' visible on all three nodes (reported 3x, once per node, each with shared:true: ONE storage, whose total differs a little from node to node because each node reads Ceph's stored + max_avail at its own moment) plus a per-node 'local-lvm' (shared:false: three different disks, pve1's and pve2's of identical size, so (name, type, total) cannot tell them apart). cluster.nodes_online (3) == len(nodes) (3) => nodes_ok. This is the fully-healthy reference shape.",
@@ -49,16 +50,16 @@
         },
         "storage_by_node": {
           "pve1": [
-            {"storage": "ceph-pool", "type": "rbd", "total": 10995116277760, "used": 3298534883328, "avail": 7696581394432, "active": 1, "shared": 1},
-            {"storage": "local-lvm", "type": "lvmthin", "total": 137438953472, "used": 34359738368, "avail": 103079215104, "active": 1, "shared": 0}
+            {"storage": "ceph-pool", "type": "rbd", "total": 10995116277760, "used": 3298534883328, "avail": 7696581394432, "active": 1, "shared": 1, "enabled": 1},
+            {"storage": "local-lvm", "type": "lvmthin", "total": 137438953472, "used": 34359738368, "avail": 103079215104, "active": 1, "shared": 0, "enabled": 1}
           ],
           "pve2": [
-            {"storage": "ceph-pool", "type": "rbd", "total": 10995106277760, "used": 3298534883328, "avail": 7696571394432, "active": 1, "shared": 1},
-            {"storage": "local-lvm", "type": "lvmthin", "total": 137438953472, "used": 20000000000, "avail": 117438953472, "active": 1, "shared": 0}
+            {"storage": "ceph-pool", "type": "rbd", "total": 10995106277760, "used": 3298534883328, "avail": 7696571394432, "active": 1, "shared": 1, "enabled": 1},
+            {"storage": "local-lvm", "type": "lvmthin", "total": 137438953472, "used": 20000000000, "avail": 117438953472, "active": 1, "shared": 0, "enabled": 1}
           ],
           "pve3": [
-            {"storage": "ceph-pool", "type": "rbd", "total": 10995096277760, "used": 3298534883328, "avail": 7696561394432, "active": 1, "shared": 1},
-            {"storage": "local-lvm", "type": "lvmthin", "total": 68719476736, "used": 10000000000, "avail": 58719476736, "active": 1, "shared": 0}
+            {"storage": "ceph-pool", "type": "rbd", "total": 10995096277760, "used": 3298534883328, "avail": 7696561394432, "active": 1, "shared": 1, "enabled": 1},
+            {"storage": "local-lvm", "type": "lvmthin", "total": 68719476736, "used": 10000000000, "avail": 58719476736, "active": 1, "shared": 0, "enabled": 1}
           ]
         }
       },
@@ -79,12 +80,12 @@
           {"vmid": 201, "name": "backup-01", "node": "pve3", "status": "stopped", "cpu_usage": 0, "memory_used": 0, "memory_max": 1073741824, "disk_read": 0, "disk_write": 0, "net_in": 0, "net_out": 0, "uptime": 0}
         ],
         "storage": [
-          {"name": "ceph-pool", "node": "pve1", "type": "rbd", "total": 10995116277760, "used": 3298534883328, "available": 7696581394432, "active": true, "shared": true},
-          {"name": "local-lvm", "node": "pve1", "type": "lvmthin", "total": 137438953472, "used": 34359738368, "available": 103079215104, "active": true, "shared": false},
-          {"name": "ceph-pool", "node": "pve2", "type": "rbd", "total": 10995106277760, "used": 3298534883328, "available": 7696571394432, "active": true, "shared": true},
-          {"name": "local-lvm", "node": "pve2", "type": "lvmthin", "total": 137438953472, "used": 20000000000, "available": 117438953472, "active": true, "shared": false},
-          {"name": "ceph-pool", "node": "pve3", "type": "rbd", "total": 10995096277760, "used": 3298534883328, "available": 7696561394432, "active": true, "shared": true},
-          {"name": "local-lvm", "node": "pve3", "type": "lvmthin", "total": 68719476736, "used": 10000000000, "available": 58719476736, "active": true, "shared": false}
+          {"name": "ceph-pool", "node": "pve1", "type": "rbd", "total": 10995116277760, "used": 3298534883328, "available": 7696581394432, "active": true, "shared": true, "enabled": true},
+          {"name": "local-lvm", "node": "pve1", "type": "lvmthin", "total": 137438953472, "used": 34359738368, "available": 103079215104, "active": true, "shared": false, "enabled": true},
+          {"name": "ceph-pool", "node": "pve2", "type": "rbd", "total": 10995106277760, "used": 3298534883328, "available": 7696571394432, "active": true, "shared": true, "enabled": true},
+          {"name": "local-lvm", "node": "pve2", "type": "lvmthin", "total": 137438953472, "used": 20000000000, "available": 117438953472, "active": true, "shared": false, "enabled": true},
+          {"name": "ceph-pool", "node": "pve3", "type": "rbd", "total": 10995096277760, "used": 3298534883328, "available": 7696561394432, "active": true, "shared": true, "enabled": true},
+          {"name": "local-lvm", "node": "pve3", "type": "lvmthin", "total": 68719476736, "used": 10000000000, "available": 58719476736, "active": true, "shared": false, "enabled": true}
         ],
         "backups": {
           "age_s": 0,
@@ -126,7 +127,7 @@
         "lxc_raises_for": ["pve2"],
         "storage_by_node": {
           "pve1": [
-            {"storage": "local", "type": "dir", "total": 100000000000, "used": 40000000000, "avail": 60000000000, "active": 1, "shared": 0}
+            {"storage": "local", "type": "dir", "total": 100000000000, "used": 40000000000, "avail": 60000000000, "active": 1, "shared": 0, "enabled": 1}
           ]
         },
         "storage_raises_for": ["pve2"]
@@ -142,7 +143,7 @@
         ],
         "lxc": [],
         "storage": [
-          {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 40000000000, "available": 60000000000, "active": true, "shared": false}
+          {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 40000000000, "available": 60000000000, "active": true, "shared": false, "enabled": true}
         ],
         "backups": {
           "age_s": 0,
@@ -180,9 +181,9 @@
         },
         "storage_by_node": {
           "standalone-pve": [
-            {"storage": "local", "type": "dir", "total": 100000000000, "used": 30000000000, "avail": 70000000000, "active": 1, "shared": 0},
-            {"storage": "local-lvm", "type": "lvmthin", "total": 200000000000, "used": 50000000000, "avail": 150000000000, "active": 1, "shared": 0},
-            {"storage": "local-zfs", "type": "zfspool", "total": 500000000000, "used": 100000000000, "avail": 400000000000, "active": 1, "shared": 0}
+            {"storage": "local", "type": "dir", "total": 100000000000, "used": 30000000000, "avail": 70000000000, "active": 1, "shared": 0, "enabled": 1},
+            {"storage": "local-lvm", "type": "lvmthin", "total": 200000000000, "used": 50000000000, "avail": 150000000000, "active": 1, "shared": 0, "enabled": 1},
+            {"storage": "local-zfs", "type": "zfspool", "total": 500000000000, "used": 100000000000, "avail": 400000000000, "active": 1, "shared": 0, "enabled": 1}
           ]
         },
         "storage_config": [
@@ -202,9 +203,9 @@
         ],
         "lxc": [],
         "storage": [
-          {"name": "local", "node": "standalone-pve", "type": "dir", "total": 100000000000, "used": 30000000000, "available": 70000000000, "active": true, "shared": false},
-          {"name": "local-lvm", "node": "standalone-pve", "type": "lvmthin", "total": 200000000000, "used": 50000000000, "available": 150000000000, "active": true, "shared": false},
-          {"name": "local-zfs", "node": "standalone-pve", "type": "zfspool", "total": 500000000000, "used": 100000000000, "available": 400000000000, "active": true, "shared": false, "pool": "rpool/data"}
+          {"name": "local", "node": "standalone-pve", "type": "dir", "total": 100000000000, "used": 30000000000, "available": 70000000000, "active": true, "shared": false, "enabled": true},
+          {"name": "local-lvm", "node": "standalone-pve", "type": "lvmthin", "total": 200000000000, "used": 50000000000, "available": 150000000000, "active": true, "shared": false, "enabled": true},
+          {"name": "local-zfs", "node": "standalone-pve", "type": "zfspool", "total": 500000000000, "used": 100000000000, "available": 400000000000, "active": true, "shared": false, "enabled": true, "pool": "rpool/data"}
         ],
         "backups": {
           "age_s": 0,
@@ -260,10 +261,10 @@
         "lxc_raises_for": ["pve2"],
         "storage_by_node": {
           "pve1": [
-            {"storage": "local-lvm", "type": "lvmthin", "total": 137438953472, "used": 34359738368, "avail": 103079215104, "active": 1, "shared": 0}
+            {"storage": "local-lvm", "type": "lvmthin", "total": 137438953472, "used": 34359738368, "avail": 103079215104, "active": 1, "shared": 0, "enabled": 1}
           ],
           "pve3": [
-            {"storage": "local-lvm", "type": "lvmthin", "total": 68719476736, "used": 10000000000, "avail": 58719476736, "active": 1, "shared": 0}
+            {"storage": "local-lvm", "type": "lvmthin", "total": 68719476736, "used": 10000000000, "avail": 58719476736, "active": 1, "shared": 0, "enabled": 1}
           ]
         },
         "storage_raises_for": ["pve2"]
@@ -283,8 +284,8 @@
           {"vmid": 200, "name": "proxy-01", "node": "pve1", "status": "running", "cpu_usage": 0.02, "memory_used": 536870912, "memory_max": 1073741824, "disk_read": 524288, "disk_write": 1048576, "net_in": 2097152, "net_out": 3145728, "uptime": 863800}
         ],
         "storage": [
-          {"name": "local-lvm", "node": "pve1", "type": "lvmthin", "total": 137438953472, "used": 34359738368, "available": 103079215104, "active": true, "shared": false},
-          {"name": "local-lvm", "node": "pve3", "type": "lvmthin", "total": 68719476736, "used": 10000000000, "available": 58719476736, "active": true, "shared": false}
+          {"name": "local-lvm", "node": "pve1", "type": "lvmthin", "total": 137438953472, "used": 34359738368, "available": 103079215104, "active": true, "shared": false, "enabled": true},
+          {"name": "local-lvm", "node": "pve3", "type": "lvmthin", "total": 68719476736, "used": 10000000000, "available": 58719476736, "active": true, "shared": false, "enabled": true}
         ],
         "backups": {
           "age_s": 0,
@@ -318,7 +319,7 @@
         },
         "storage_by_node": {
           "pve1": [
-            {"storage": "local", "type": "dir", "total": 100000000000, "used": 25000000000, "avail": 75000000000, "active": 1, "shared": 0}
+            {"storage": "local", "type": "dir", "total": 100000000000, "used": 25000000000, "avail": 75000000000, "active": 1, "shared": 0, "enabled": 1}
           ]
         }
       },
@@ -331,7 +332,7 @@
         "vms": [],
         "lxc": [],
         "storage": [
-          {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 25000000000, "available": 75000000000, "active": true, "shared": false}
+          {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 25000000000, "available": 75000000000, "active": true, "shared": false, "enabled": true}
         ],
         "backups": {
           "age_s": 0,
@@ -375,7 +376,7 @@
         },
         "storage_by_node": {
           "pve1": [
-            {"storage": "local-lvm", "type": "lvmthin", "total": 137438953472, "used": 34359738368, "avail": 103079215104, "active": 1, "shared": 0}
+            {"storage": "local-lvm", "type": "lvmthin", "total": 137438953472, "used": 34359738368, "avail": 103079215104, "active": 1, "shared": 0, "enabled": 1}
           ]
         },
         "storage_raises_for": ["pve2"]
@@ -394,7 +395,7 @@
           {"vmid": 200, "name": "proxy-01", "node": "pve2", "status": "running", "cpu_usage": 0.02, "memory_used": 536870912, "memory_max": 1073741824, "disk_read": 524288, "disk_write": 1048576, "net_in": 2097152, "net_out": 3145728, "uptime": 699800}
         ],
         "storage": [
-          {"name": "local-lvm", "node": "pve1", "type": "lvmthin", "total": 137438953472, "used": 34359738368, "available": 103079215104, "active": true, "shared": false}
+          {"name": "local-lvm", "node": "pve1", "type": "lvmthin", "total": 137438953472, "used": 34359738368, "available": 103079215104, "active": true, "shared": false, "enabled": true}
         ],
         "backups": {
           "age_s": 0,
@@ -508,11 +509,11 @@
           {"vmid": 101, "name": "db-01", "node": "pve2", "status": "running", "cpu_usage": 0.02, "memory_used": 536870912, "memory_max": 1073741824, "disk_read": 4096, "disk_write": 8192, "net_in": 16384, "net_out": 32768, "uptime": 43000}
         ],
         "storage": [
-          {"name": "pbs-main", "node": "pve1", "type": "pbs", "total": 4398046511104, "used": 1099511627776, "available": 3298534883328, "active": true, "shared": true, "pbs": {"server": "pbs.example", "port": null, "datastore": "store1", "namespace": "clusterA", "fingerprint": "b7:24:5c:7a:78:c1:25:6c:0d:a9:ff:4a:6c:30:2e:10:03:ce:82:2c:00:d7:e9:82:1e:fc:00:93:f4:de:85:4f"}},
-          {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 30000000000, "available": 70000000000, "active": true, "shared": false},
-          {"name": "local-lvm", "node": "pve1", "type": "lvmthin", "total": 200000000000, "used": 50000000000, "available": 150000000000, "active": true, "shared": false},
-          {"name": "pbs-main", "node": "pve2", "type": "pbs", "total": 4398046511104, "used": 1099511627776, "available": 3298534883328, "active": true, "shared": true, "pbs": {"server": "pbs.example", "port": null, "datastore": "store1", "namespace": "clusterA", "fingerprint": "b7:24:5c:7a:78:c1:25:6c:0d:a9:ff:4a:6c:30:2e:10:03:ce:82:2c:00:d7:e9:82:1e:fc:00:93:f4:de:85:4f"}},
-          {"name": "local", "node": "pve2", "type": "dir", "total": 100000000000, "used": 40000000000, "available": 60000000000, "active": true, "shared": false}
+          {"name": "pbs-main", "node": "pve1", "type": "pbs", "total": 4398046511104, "used": 1099511627776, "available": 3298534883328, "active": true, "shared": true, "enabled": true, "pbs": {"server": "pbs.example", "port": null, "datastore": "store1", "namespace": "clusterA", "fingerprint": "b7:24:5c:7a:78:c1:25:6c:0d:a9:ff:4a:6c:30:2e:10:03:ce:82:2c:00:d7:e9:82:1e:fc:00:93:f4:de:85:4f"}},
+          {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 30000000000, "available": 70000000000, "active": true, "shared": false, "enabled": true},
+          {"name": "local-lvm", "node": "pve1", "type": "lvmthin", "total": 200000000000, "used": 50000000000, "available": 150000000000, "active": true, "shared": false, "enabled": true},
+          {"name": "pbs-main", "node": "pve2", "type": "pbs", "total": 4398046511104, "used": 1099511627776, "available": 3298534883328, "active": true, "shared": true, "enabled": true, "pbs": {"server": "pbs.example", "port": null, "datastore": "store1", "namespace": "clusterA", "fingerprint": "b7:24:5c:7a:78:c1:25:6c:0d:a9:ff:4a:6c:30:2e:10:03:ce:82:2c:00:d7:e9:82:1e:fc:00:93:f4:de:85:4f"}},
+          {"name": "local", "node": "pve2", "type": "dir", "total": 100000000000, "used": 40000000000, "available": 60000000000, "active": true, "shared": false, "enabled": true}
         ],
         "backups": {
           "age_s": 0,
@@ -599,8 +600,8 @@
           {"vmid": 101, "name": "db-01", "node": "pve1", "status": "running", "cpu_usage": 0.02, "memory_used": 536870912, "memory_max": 1073741824, "disk_read": 4096, "disk_write": 8192, "net_in": 16384, "net_out": 32768, "uptime": 43000}
         ],
         "storage": [
-          {"name": "pbs-main", "node": "pve1", "type": "pbs", "total": 4398046511104, "used": 1099511627776, "available": 3298534883328, "active": true, "shared": true, "pbs": {"server": "pbs.example", "port": null, "datastore": "main", "namespace": "", "fingerprint": null}},
-          {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 30000000000, "available": 70000000000, "active": true, "shared": false}
+          {"name": "pbs-main", "node": "pve1", "type": "pbs", "total": 4398046511104, "used": 1099511627776, "available": 3298534883328, "active": true, "shared": true, "enabled": true, "pbs": {"server": "pbs.example", "port": null, "datastore": "main", "namespace": "", "fingerprint": null}},
+          {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 30000000000, "available": 70000000000, "active": true, "shared": false, "enabled": true}
         ],
         "backups": {
           "age_s": 0,
@@ -654,7 +655,7 @@
         "vms": [],
         "lxc": [],
         "storage": [
-          {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 30000000000, "available": 70000000000, "active": true, "shared": false}
+          {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 30000000000, "available": 70000000000, "active": true, "shared": false, "enabled": true}
         ],
         "backups": null,
         "collection": {"reachable": true, "cluster_ok": true, "nodes_ok": true, "guests_ok": true, "storage_ok": true, "error": null}
@@ -747,7 +748,7 @@
         "vms": [],
         "lxc": [],
         "storage": [
-          {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 30000000000, "available": 70000000000, "active": true, "shared": false}
+          {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 30000000000, "available": 70000000000, "active": true, "shared": false, "enabled": true}
         ],
         "backups": {
           "age_s": 0,
@@ -814,7 +815,7 @@
       }
     },
     "shared_storage_down_on_one_node": {
-      "description": "2-node cluster 'lab' (agent 1.21.1+, #222). Shared NFS storage 'nfs-iso' is active on pve1 while its mount is down on pve2: PVE still reports pve2's row shared:1, with active:0 and total/used/avail 0. The two shared:true entries are ONE storage: its capacity is pve1's (the active row), and pve2's active:false is pve2 losing the mount, not the storage shrinking (storage_shared_contract.dedupe). 'local' is node-local on both nodes (shared:false). 'scratch' carries no usable flag in either source (synthetic: a real PVE always sets it on the per-node row), so both its entries OMIT 'shared' -- the fixture's example of the type-only fallback (storage_shared_contract.absent). storage_ok stays true: an inactive storage is a successful read.",
+      "description": "2-node cluster 'lab' (agent 1.21.1+, #222). Shared NFS storage 'nfs-iso' is active on pve1 while its mount is down on pve2: PVE still reports pve2's row shared:1, with active:0 and total/used/avail 0, and enabled:1 (agent 1.21.2+: it is enabled on pve2, so this is pve2 losing the mount, not the storage excluded from pve2). The two shared:true entries are ONE storage: its capacity is pve1's (the active row), and pve2's active:false is pve2 losing the mount, not the storage shrinking (storage_shared_contract.dedupe). 'local' is node-local on both nodes (shared:false). 'scratch' carries no usable 'shared' flag in either source and no 'enabled' one (synthetic: a real PVE always sets both on the per-node row), so both its entries OMIT both keys -- the fixture's example of the type-only fallback (storage_shared_contract.absent) and of a row read as enabled (storage_enabled_contract.absent). storage_ok stays true: an inactive storage is a successful read.",
       "api": {
         "version": {"version": "8.2.4"},
         "cluster_status": [
@@ -842,12 +843,12 @@
           "pve1": [
             {"storage": "nfs-iso", "type": "nfs", "content": "iso,vztmpl", "total": 2000000000000, "used": 500000000000, "avail": 1500000000000, "active": 1, "shared": 1, "enabled": 1},
             {"storage": "local", "type": "dir", "content": "iso,vztmpl,backup", "total": 100000000000, "used": 30000000000, "avail": 70000000000, "active": 1, "shared": 0, "enabled": 1},
-            {"storage": "scratch", "type": "dir", "content": "images,rootdir", "total": 50000000000, "used": 1000000000, "avail": 49000000000, "active": 1, "enabled": 1}
+            {"storage": "scratch", "type": "dir", "content": "images,rootdir", "total": 50000000000, "used": 1000000000, "avail": 49000000000, "active": 1}
           ],
           "pve2": [
             {"storage": "nfs-iso", "type": "nfs", "content": "iso,vztmpl", "total": 0, "used": 0, "avail": 0, "active": 0, "shared": 1, "enabled": 1},
             {"storage": "local", "type": "dir", "content": "iso,vztmpl,backup", "total": 100000000000, "used": 45000000000, "avail": 55000000000, "active": 1, "shared": 0, "enabled": 1},
-            {"storage": "scratch", "type": "dir", "content": "images,rootdir", "total": 50000000000, "used": 2000000000, "avail": 48000000000, "active": 1, "enabled": 1}
+            {"storage": "scratch", "type": "dir", "content": "images,rootdir", "total": 50000000000, "used": 2000000000, "avail": 48000000000, "active": 1}
           ]
         },
         "storage_config": [
@@ -866,11 +867,11 @@
         "vms": [],
         "lxc": [],
         "storage": [
-          {"name": "nfs-iso", "node": "pve1", "type": "nfs", "total": 2000000000000, "used": 500000000000, "available": 1500000000000, "active": true, "shared": true},
-          {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 30000000000, "available": 70000000000, "active": true, "shared": false},
+          {"name": "nfs-iso", "node": "pve1", "type": "nfs", "total": 2000000000000, "used": 500000000000, "available": 1500000000000, "active": true, "shared": true, "enabled": true},
+          {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 30000000000, "available": 70000000000, "active": true, "shared": false, "enabled": true},
           {"name": "scratch", "node": "pve1", "type": "dir", "total": 50000000000, "used": 1000000000, "available": 49000000000, "active": true},
-          {"name": "nfs-iso", "node": "pve2", "type": "nfs", "total": 0, "used": 0, "available": 0, "active": false, "shared": true},
-          {"name": "local", "node": "pve2", "type": "dir", "total": 100000000000, "used": 45000000000, "available": 55000000000, "active": true, "shared": false},
+          {"name": "nfs-iso", "node": "pve2", "type": "nfs", "total": 0, "used": 0, "available": 0, "active": false, "shared": true, "enabled": true},
+          {"name": "local", "node": "pve2", "type": "dir", "total": 100000000000, "used": 45000000000, "available": 55000000000, "active": true, "shared": false, "enabled": true},
           {"name": "scratch", "node": "pve2", "type": "dir", "total": 50000000000, "used": 2000000000, "available": 48000000000, "active": true}
         ],
         "backups": {
@@ -882,6 +883,158 @@
           "errors": []
         },
         "collection": {"reachable": true, "cluster_ok": true, "nodes_ok": true, "guests_ok": true, "storage_ok": true, "error": null}
+      }
+    },
+    "storage_not_enabled_on_a_node": {
+      "description": "3-node cluster 'edge' (agent 1.21.2+, #225). Shared NFS storage 'nfs-vm' is limited to pve1 and pve2 by its 'nodes' option and healthy there; PVE still lists it on pve3, with enabled:0, active:0 and 0 bytes -- the shape of a storage down on pve3 but for 'enabled'. It is ONE shared storage, active on both nodes it is enabled on: pve3's enabled:false row is left out of the fold, the counts and the storage-inactive alert (storage_enabled_contract.server_use). 'nfs-old' is disabled ('disable' set in storage.cfg): enabled:false on every node and never activated; the backups block does not list it and records no error for it, although its content includes backup. 'local' is node-local and enabled everywhere. storage_ok stays true.",
+      "api": {
+        "version": {"version": "8.2.4"},
+        "cluster_status": [
+          {"type": "cluster", "name": "edge", "quorate": 1, "nodes": 3},
+          {"type": "node", "name": "pve1", "online": 1},
+          {"type": "node", "name": "pve2", "online": 1},
+          {"type": "node", "name": "pve3", "online": 1}
+        ],
+        "nodes": [
+          {"node": "pve1", "status": "online", "cpu": 0.1, "mem": 8589934592, "maxmem": 34359738368},
+          {"node": "pve2", "status": "online", "cpu": 0.2, "mem": 4294967296, "maxmem": 34359738368},
+          {"node": "pve3", "status": "online", "cpu": 0.05, "mem": 2147483648, "maxmem": 17179869184}
+        ],
+        "node_status_by_name": {
+          "pve1": {"uptime": 700000},
+          "pve2": {"uptime": 600000},
+          "pve3": {"uptime": 500000}
+        },
+        "qemu_by_node": {
+          "pve1": [],
+          "pve2": [],
+          "pve3": []
+        },
+        "lxc_by_node": {
+          "pve1": [],
+          "pve2": [],
+          "pve3": []
+        },
+        "storage_by_node": {
+          "pve1": [
+            {"storage": "nfs-vm", "type": "nfs", "content": "images,rootdir", "total": 4000000000000, "used": 1000000000000, "avail": 3000000000000, "active": 1, "shared": 1, "enabled": 1},
+            {"storage": "nfs-old", "type": "nfs", "content": "backup", "total": 0, "used": 0, "avail": 0, "active": 0, "shared": 1, "enabled": 0},
+            {"storage": "local", "type": "dir", "content": "iso,vztmpl,backup", "total": 100000000000, "used": 30000000000, "avail": 70000000000, "active": 1, "shared": 0, "enabled": 1}
+          ],
+          "pve2": [
+            {"storage": "nfs-vm", "type": "nfs", "content": "images,rootdir", "total": 4000000000000, "used": 1000000000000, "avail": 3000000000000, "active": 1, "shared": 1, "enabled": 1},
+            {"storage": "nfs-old", "type": "nfs", "content": "backup", "total": 0, "used": 0, "avail": 0, "active": 0, "shared": 1, "enabled": 0},
+            {"storage": "local", "type": "dir", "content": "iso,vztmpl,backup", "total": 100000000000, "used": 45000000000, "avail": 55000000000, "active": 1, "shared": 0, "enabled": 1}
+          ],
+          "pve3": [
+            {"storage": "nfs-vm", "type": "nfs", "content": "images,rootdir", "total": 0, "used": 0, "avail": 0, "active": 0, "shared": 1, "enabled": 0},
+            {"storage": "nfs-old", "type": "nfs", "content": "backup", "total": 0, "used": 0, "avail": 0, "active": 0, "shared": 1, "enabled": 0},
+            {"storage": "local", "type": "dir", "content": "iso,vztmpl,backup", "total": 100000000000, "used": 20000000000, "avail": 80000000000, "active": 1, "shared": 0, "enabled": 1}
+          ]
+        },
+        "storage_config": [
+          {"storage": "nfs-vm", "type": "nfs", "shared": 1, "content": "images,rootdir", "nodes": "pve1,pve2", "server": "10.0.0.30", "export": "/srv/vm"},
+          {"storage": "nfs-old", "type": "nfs", "shared": 1, "content": "backup", "disable": 1, "server": "10.0.0.31", "export": "/srv/backup"},
+          {"storage": "local", "type": "dir", "content": "iso,vztmpl,backup"}
+        ]
+      },
+      "payload": {
+        "version": "8.2.4",
+        "cluster": {"name": "edge", "quorate": true, "nodes": 3, "nodes_online": 3},
+        "nodes": [
+          {"name": "pve1", "status": "online", "cpu_usage": 0.1, "memory_used": 8589934592, "memory_total": 34359738368, "uptime": 700000, "vms_running": 0, "lxc_running": 0},
+          {"name": "pve2", "status": "online", "cpu_usage": 0.2, "memory_used": 4294967296, "memory_total": 34359738368, "uptime": 600000, "vms_running": 0, "lxc_running": 0},
+          {"name": "pve3", "status": "online", "cpu_usage": 0.05, "memory_used": 2147483648, "memory_total": 17179869184, "uptime": 500000, "vms_running": 0, "lxc_running": 0}
+        ],
+        "vms": [],
+        "lxc": [],
+        "storage": [
+          {"name": "nfs-vm", "node": "pve1", "type": "nfs", "total": 4000000000000, "used": 1000000000000, "available": 3000000000000, "active": true, "shared": true, "enabled": true},
+          {"name": "nfs-old", "node": "pve1", "type": "nfs", "total": 0, "used": 0, "available": 0, "active": false, "shared": true, "enabled": false},
+          {"name": "local", "node": "pve1", "type": "dir", "total": 100000000000, "used": 30000000000, "available": 70000000000, "active": true, "shared": false, "enabled": true},
+          {"name": "nfs-vm", "node": "pve2", "type": "nfs", "total": 4000000000000, "used": 1000000000000, "available": 3000000000000, "active": true, "shared": true, "enabled": true},
+          {"name": "nfs-old", "node": "pve2", "type": "nfs", "total": 0, "used": 0, "available": 0, "active": false, "shared": true, "enabled": false},
+          {"name": "local", "node": "pve2", "type": "dir", "total": 100000000000, "used": 45000000000, "available": 55000000000, "active": true, "shared": false, "enabled": true},
+          {"name": "nfs-vm", "node": "pve3", "type": "nfs", "total": 0, "used": 0, "available": 0, "active": false, "shared": true, "enabled": false},
+          {"name": "nfs-old", "node": "pve3", "type": "nfs", "total": 0, "used": 0, "available": 0, "active": false, "shared": true, "enabled": false},
+          {"name": "local", "node": "pve3", "type": "dir", "total": 100000000000, "used": 20000000000, "available": 80000000000, "active": true, "shared": false, "enabled": true}
+        ],
+        "backups": {
+          "age_s": 0,
+          "guest_backups": [],
+          "tasks": [],
+          "jobs": [],
+          "not_backed_up": [],
+          "errors": []
+        },
+        "collection": {"reachable": true, "cluster_ok": true, "nodes_ok": true, "guests_ok": true, "storage_ok": true, "error": null}
+      }
+    },
+    "storage_not_enabled_node_unlisted": {
+      "description": "2-node cluster 'branch' (agent 1.21.2+, #225) where pve1's /nodes/pve1/storage call fails. Shared NFS 'nfs-bk' is limited to pve1 by its 'nodes' option, so pve2 lists it enabled:0/active:0, and pve1, the one node it is enabled on, could not be listed: it was read nowhere, and pve1's storage:null error only covers pve1's LOCAL storages, so the backups block names it ('shared storage not read: not enabled on any node listed') and its guests read unknown, not never backed up. 'nfs-old' is disabled cluster-wide ('disable' in storage.cfg): the /storage config rules out pve1, so it is not named. 'local' is pve2's local storage, listed normally. storage_ok is false because of pve1 (as in 'storage_query_failed'), so the storage section's 'nfs-bk' (enabled:false on the only row received) reads as unknown, not disabled (storage_enabled_contract.server_use).",
+      "api": {
+        "version": {"version": "8.2.4"},
+        "cluster_status": [
+          {"type": "cluster", "name": "branch", "quorate": 1, "nodes": 2},
+          {"type": "node", "name": "pve1", "online": 1},
+          {"type": "node", "name": "pve2", "online": 1}
+        ],
+        "nodes": [
+          {"node": "pve1", "status": "online", "cpu": 0.1, "mem": 8589934592, "maxmem": 34359738368},
+          {"node": "pve2", "status": "online", "cpu": 0.2, "mem": 4294967296, "maxmem": 34359738368}
+        ],
+        "node_status_by_name": {
+          "pve1": {"uptime": 700000},
+          "pve2": {"uptime": 600000}
+        },
+        "qemu_by_node": {
+          "pve1": [],
+          "pve2": []
+        },
+        "lxc_by_node": {
+          "pve1": [],
+          "pve2": []
+        },
+        "storage_by_node": {
+          "pve2": [
+            {"storage": "nfs-bk", "type": "nfs", "content": "backup", "total": 0, "used": 0, "avail": 0, "active": 0, "shared": 1, "enabled": 0},
+            {"storage": "nfs-old", "type": "nfs", "content": "backup", "total": 0, "used": 0, "avail": 0, "active": 0, "shared": 1, "enabled": 0},
+            {"storage": "local", "type": "dir", "content": "iso,vztmpl,backup", "total": 100000000000, "used": 45000000000, "avail": 55000000000, "active": 1, "shared": 0, "enabled": 1}
+          ]
+        },
+        "storage_raises_for": ["pve1"],
+        "storage_config": [
+          {"storage": "nfs-bk", "type": "nfs", "shared": 1, "content": "backup", "nodes": "pve1", "server": "10.0.0.40", "export": "/srv/backup"},
+          {"storage": "nfs-old", "type": "nfs", "shared": 1, "content": "backup", "disable": 1, "server": "10.0.0.31", "export": "/srv/backup-old"},
+          {"storage": "local", "type": "dir", "content": "iso,vztmpl,backup"}
+        ]
+      },
+      "payload": {
+        "version": "8.2.4",
+        "cluster": {"name": "branch", "quorate": true, "nodes": 2, "nodes_online": 2},
+        "nodes": [
+          {"name": "pve1", "status": "online", "cpu_usage": 0.1, "memory_used": 8589934592, "memory_total": 34359738368, "uptime": 700000, "vms_running": 0, "lxc_running": 0},
+          {"name": "pve2", "status": "online", "cpu_usage": 0.2, "memory_used": 4294967296, "memory_total": 34359738368, "uptime": 600000, "vms_running": 0, "lxc_running": 0}
+        ],
+        "vms": [],
+        "lxc": [],
+        "storage": [
+          {"name": "nfs-bk", "node": "pve2", "type": "nfs", "total": 0, "used": 0, "available": 0, "active": false, "shared": true, "enabled": false},
+          {"name": "nfs-old", "node": "pve2", "type": "nfs", "total": 0, "used": 0, "available": 0, "active": false, "shared": true, "enabled": false},
+          {"name": "local", "node": "pve2", "type": "dir", "total": 100000000000, "used": 45000000000, "available": 55000000000, "active": true, "shared": false, "enabled": true}
+        ],
+        "backups": {
+          "age_s": 0,
+          "guest_backups": [],
+          "tasks": [],
+          "jobs": [],
+          "not_backed_up": [],
+          "errors": [
+            {"scope": "storage", "node": "pve1", "storage": null, "message": "storage listing failed: storage boom"},
+            {"scope": "storage", "node": null, "storage": "nfs-bk", "message": "shared storage not read: not enabled on any node listed"}
+          ]
+        },
+        "collection": {"reachable": true, "cluster_ok": true, "nodes_ok": true, "guests_ok": true, "storage_ok": false, "error": "node pve1: storage query failed"}
       }
     }
   }
