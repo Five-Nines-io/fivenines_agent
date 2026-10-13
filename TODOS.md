@@ -813,6 +813,26 @@ deliberately keep a None.decode() crash WITH a password as the generic error.
 - **Effort:** M (human) / S (CC)
 - **Files:** `fivenines_agent/postgresql.py`, `tests/test_postgresql.py`; server `app/models/host.rb`, `lib/ingesters/postgresql.rb`, `config/locales/*.yml`
 
+## P2: Bound the Proxmox backups `errors[]` while it is built, not only after
+
+`_build_backups_block` trims `errors` to `MAX_ERRORS` (500) only once the whole
+block is built, so every path that appends one error per storage or per node
+does all its work first: 'shared storage not read' (#225), 'shared storage not
+active on any node' and 'storage not active on this node', each through
+`_backup_error` (redact + scrub). A hostile or broken PVE listing 100k
+storages makes 100k error dicts on the watchdog-bounded loop, after the 30s
+deadline too, before 499 survive (measured by the #225 adversarial review:
+~49 MiB extra for 100k disabled shared rows). Real clusters never come close.
+
+Fix the posture once for the block: stop building entries past the cap while
+still counting them, so the 'cap'-scope entry keeps an exact `dropped` count
+(the server reads that a read was massively incomplete from it). Apply it to
+all three paths above, and keep the per-node storage:null entries, appended
+first during the walk, ahead of the cap as today.
+
+- **Effort:** S (human) / S (CC)
+- **Files:** `fivenines_agent/proxmox.py` (`_collect_guest_backups`, `_build_backups_block`), `tests/test_proxmox.py`
+
 ## Completed
 
 ### P3: Bound the QEMU collector's libvirt connection with a timeout (#171)
