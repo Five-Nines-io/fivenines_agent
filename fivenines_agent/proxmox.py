@@ -90,6 +90,10 @@ MAX_NOT_BACKED_UP = 2000
 # dropped and one 'cap'-scope error records how many, so the payload stays
 # bounded without hiding that the read was massively incomplete.
 MAX_ERRORS = 500
+# A /storage 'nodes' option names cluster members, a few KB at most; one past
+# this is not split (a hostile API could make that cost many times its size)
+# and reads as "possibly enabled anywhere".
+NODES_OPTION_MAX_CHARS = 65536
 
 # Keyed on the connection identity (host, port, token id) the way ceph keys on
 # its conf/keyring: proxmox_metrics builds a fresh ProxmoxCollector every tick,
@@ -174,20 +178,45 @@ def _deadline_hit(deadline, errors, scope, node=None, storage=None):
     return True
 
 
-def _holds_backups(storage):
-    """Whether a per-node storage row is worth a content listing.
-
-    A storage whose `content` set lacks `backup` (lvmthin, zfspool, rbd...)
-    cannot hold one, and a `disable`d storage is one the operator took out of
-    service on purpose -- listing it would fail every TTL and keep the block
-    permanently partial. When `content` is missing (older PVE) we list anyway.
-    """
+def _backup_content(storage):
+    """Whether a storage's `content` set allows backups: one that lacks
+    `backup` (lvmthin, zfspool, rbd...) cannot hold one, on any node. When
+    `content` is missing (older PVE) or not a string, we assume it can."""
     content = storage.get("content")
-    if isinstance(content, str) and "backup" not in content.split(","):
+    return not (isinstance(content, str) and "backup" not in content.split(","))
+
+
+def _may_be_enabled_on(config, node_names):
+    """Whether a storage's datacenter /storage `config` ({} when absent)
+    leaves it possibly enabled on one of `node_names` (a set of str): not when
+    it is disabled cluster-wide (`disable`), nor when its `nodes` option names
+    none of them. Anything this cannot read -- no config entry (a token that
+    cannot read /storage), a `disable` outside PVE's spellings, a `nodes` that
+    is not a string -- is possible: the caller then names the storage as
+    unknown. One set test per storage, so a long /nodes listing and many
+    storages cost their sum, not their product."""
+    if _pve_flag(config.get('disable')):
         return False
-    if "enabled" in storage and not _as_bool(storage["enabled"]):
-        return False
-    return True
+    nodes = config.get('nodes')
+    if not isinstance(nodes, str) or len(nodes) > NODES_OPTION_MAX_CHARS:
+        return True
+    # PVE's own list syntax (PVE::Tools::split_list): ',' ';' or whitespace.
+    allowed = set(nodes.replace(',', ' ').replace(';', ' ').split())
+    return not allowed or not node_names.isdisjoint(allowed)
+
+
+def _pve_flag(value):
+    """A PVE 0/1 flag as a bool, or None when `value` is not one of PVE's own
+    spellings -- a JSON bool, the integers 0/1, or "0"/"1" (a surrounding
+    space, tab, CR or LF is stripped, nothing else). None for a missing value
+    too, so "unknown" never reads as either answer."""
+    if isinstance(value, str):
+        value = value.strip(' \t\r\n')
+    elif not isinstance(value, int):
+        return None
+    if value in (0, 1, '0', '1'):
+        return _as_bool(value)
+    return None
 
 
 def _storage_shared(storage, config):
@@ -199,24 +228,32 @@ def _storage_shared(storage, config):
     datacenter /storage entry ({} when absent). The row's flag wins -- PVE's
     storage_info always sets it, 0 or 1 -- then the config's. None, never
     False, when neither carries it: "unknown" must not read as "not shared".
-    Only PVE's own spellings are read -- a JSON bool, the integers 0/1, or
-    "0"/"1" (a surrounding space, tab, CR or LF is stripped, nothing else) --
-    and the value that decides is final: one outside them is unknown too,
-    never True, and does not fall back to the config, since a wrong True
-    tells the server to merge separate node-local disks into one.
+    Only PVE's own spellings are read (`_pve_flag`), and the value that
+    decides is final: one outside them is unknown too, never True, and does
+    not fall back to the config, since a wrong True tells the server to merge
+    separate node-local disks into one.
     """
     for source in (storage, config):
         value = source.get('shared')
-        if value is None:
-            continue
-        if isinstance(value, str):
-            value = value.strip(' \t\r\n')
-        elif not isinstance(value, int):
-            return None
-        if value in (0, 1, '0', '1'):
-            return _as_bool(value)
-        return None
+        if value is not None:
+            return _pve_flag(value)
     return None
+
+
+def _storage_enabled(storage):
+    """Whether a storage is enabled on the node whose /nodes/<n>/storage row
+    `storage` is, or None when unknown.
+
+    PVE lists every storage of storage.cfg on every node, and storage_info sets
+    the row's `enabled` to 0 (and never activates it) when the storage is
+    disabled or its `nodes` option excludes that node -- so `enabled` is what
+    tells such a row from a storage that is down there (both read active 0).
+    Read from the row alone: the datacenter /storage config carries `disable`
+    and `nodes`, not this per-node verdict. Only PVE's own spellings are read
+    (`_pve_flag`); None, never False, otherwise: "unknown" must not read as
+    "disabled".
+    """
+    return _pve_flag(storage.get('enabled'))
 
 
 def _pbs_storage_ref(config):
@@ -663,16 +700,18 @@ class ProxmoxCollector:
         """Map storage id -> its datacenter /storage config entry.
 
         The per-node /nodes/<n>/storage endpoint returns runtime status
-        (total/used/avail/active) plus the row's own 'shared' flag; the 'pool'
-        property -- a zfspool's ZFS dataset (e.g. 'rpool/data'), an
-        rbd/cephfs's Ceph pool -- and the 'pbs' target live in the cluster-wide
-        datacenter storage config (/storage), which is also the 'shared'
-        fallback. One call per collect, used to enrich each per-node storage
-        row (the ZFS<->Proxmox join key, issue #49). Best-effort: a restricted
-        token that cannot read /storage, or an older PVE, yields {} and no
-        enrichment rather than failing
-        the storage section -- deliberately NOT threaded through the `collection`
-        flags block, so it never flips storage_ok.
+        (total/used/avail/active) plus the row's own 'shared' and 'enabled'
+        flags; the 'pool' property -- a zfspool's ZFS dataset (e.g.
+        'rpool/data'), an rbd/cephfs's Ceph pool -- and the 'pbs' target live
+        in the cluster-wide datacenter storage config (/storage), which is also
+        the 'shared' fallback and, for the backups block, the source of the
+        'disable'/'nodes' that `_may_be_enabled_on` reads. One call per
+        collect, used to enrich each per-node storage row (the ZFS<->Proxmox
+        join key, issue #49).
+        Best-effort: a restricted token that cannot read /storage, or an older
+        PVE, yields {} and no enrichment rather than failing the storage
+        section -- deliberately NOT threaded through the `collection` flags
+        block, so it never flips storage_ok.
         """
         config = {}
         try:
@@ -729,6 +768,15 @@ class ProxmoxCollector:
                         )
                         if shared is not None:
                             storage_data['shared'] = shared
+
+                        # 'enabled' false: the storage is disabled, or its
+                        # 'nodes' option excludes this node, which PVE still
+                        # lists with active 0 -- not a storage that is down
+                        # here. Omitted (never null) when unknown, like
+                        # 'shared'.
+                        enabled = _storage_enabled(storage)
+                        if enabled is not None:
+                            storage_data['enabled'] = enabled
 
                         # Additive 'pool' enrichment: present only for storage
                         # types that carry one (zfspool/rbd/cephfs), omitted
@@ -847,18 +895,31 @@ class ProxmoxCollector:
         is unknown (an unusable value is final) is listed per node, like a local
         one, whatever its type. A storage that is inactive everywhere it is
         seen is not listed (the call would only fail) but IS recorded as an
-        error naming it, so the server treats its guests as unknown. Volumes are
-        read from the prune-preview endpoint (works under Datastore.Audit); a
-        read that fails -- e.g. a PBS storage whose PBS credentials lack prune
-        rights -- is a storage-scoped error, so those guests read unknown.
+        error naming it, so the server treats its guests as unknown -- except
+        on a node where it is KNOWN not enabled (disabled, or outside its
+        `nodes` option): that row is skipped without an error, since PVE never
+        activates it there. A shared storage seen ONLY on such rows is named
+        when some node could not be listed this build, since that node may be
+        the one it is enabled on -- unless its /storage config rules that out
+        (`_may_be_enabled_on`). Volumes are read from the prune-preview
+        endpoint (works under Datastore.Audit); a read that fails -- e.g. a PBS
+        storage whose PBS credentials lack prune rights -- is a storage-scoped
+        error, so those guests read unknown.
         """
         config_map = self._storage_config_map()
         latest = {}
         shared_done = set()
         shared_inactive = set()
+        # Storages seen on a row where they are not known disabled, whatever
+        # their shared flag (each such sighting ends in a listing or an error),
+        # and shared ones seen on a row where they are.
+        enabled_seen = set()
+        shared_not_enabled = {}
+        unread_nodes = []
 
         for node_name in node_names:
             if _deadline_hit(deadline, errors, 'storage', node=node_name):
+                unread_nodes.append(node_name)
                 continue
             try:
                 storage_list = self.proxmox.nodes(node_name).storage.get()
@@ -871,22 +932,40 @@ class ProxmoxCollector:
                 _backup_error(
                     errors, 'storage', f'storage listing failed: {e}', node=node_name
                 )
+                unread_nodes.append(node_name)
                 continue
             storage_list = _as_list_or_error(storage_list, errors, 'storage', node=node_name)
             if storage_list is None:
+                unread_nodes.append(node_name)
                 continue
 
+            unreadable_row = False
             for storage in storage_list:
-                if not isinstance(storage, dict):
+                raw_sid = storage.get('storage') if isinstance(storage, dict) else None
+                # A storage id is a string: a row without one (a hostile or
+                # broken API) cannot be looked up, and would null the whole
+                # block. It may have been where a shared storage is enabled, so
+                # its node then counts as not read for the 'not read' rule.
+                if not isinstance(raw_sid, str) or not raw_sid:
+                    unreadable_row = True
                     continue
-                raw_sid = storage.get('storage')
-                if not raw_sid or not _holds_backups(storage):
+                if not _backup_content(storage):
                     continue
                 storage_name = _scrub_str(raw_sid)
                 # Unknown (None) is listed per node, like a local storage,
                 # whatever its type: listing shared content twice costs a call,
                 # merging two local storages would hide one node's backups.
                 shared = _storage_shared(storage, config_map.get(raw_sid, {}))
+                # Not enabled on this node (disabled, or outside its `nodes`
+                # option): the operator took it out of service there and PVE
+                # never activates it -- listing it would fail every TTL and
+                # keep the block partial. An `enabled` outside PVE's spellings
+                # is unknown and listed anyway.
+                if _storage_enabled(storage) is False:
+                    if shared:
+                        shared_not_enabled.setdefault(storage_name, raw_sid)
+                    continue
+                enabled_seen.add(storage_name)
                 active = _as_bool(storage.get('active', 0))
 
                 if shared:
@@ -925,6 +1004,8 @@ class ProxmoxCollector:
                     self._merge_backup_volumes(
                         node_name, storage_name, node_name, latest, errors
                     )
+            if unreadable_row:
+                unread_nodes.append(node_name)
 
         # Every name left here was never active on a node that was scanned
         # (an active sighting discards it), so the set itself is the guard.
@@ -933,6 +1014,23 @@ class ProxmoxCollector:
                 errors, 'storage', 'shared storage not active on any node',
                 storage=storage_name,
             )
+        # Seen only where it is not enabled, so read nowhere. A node that could
+        # not be listed may be the one it is enabled on, and that node's own
+        # error names no storage: name it, or its guests read never backed up
+        # -- unless its /storage config rules those nodes out. With every node
+        # listed it is enabled nowhere and stays error-free.
+        if unread_nodes:
+            unread = {name for name in unread_nodes if isinstance(name, str)}
+            for storage_name, raw_sid in sorted(shared_not_enabled.items()):
+                if storage_name in enabled_seen or not _may_be_enabled_on(
+                    config_map.get(raw_sid, {}), unread
+                ):
+                    continue
+                _backup_error(
+                    errors, 'storage',
+                    'shared storage not read: not enabled on any node listed',
+                    storage=storage_name,
+                )
 
         entries = sorted(
             latest.values(), key=lambda e: (e['vmid'], e['storage'], e['node'] or '')
