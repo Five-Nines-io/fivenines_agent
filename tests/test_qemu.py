@@ -13,8 +13,10 @@ spent (COLLECT_BUDGET) -- None in both cases, never a partial VM list.
 """
 
 import contextlib
+import importlib.util
 import os
 import re
+import sys
 import threading
 import time
 from pathlib import Path
@@ -1821,3 +1823,436 @@ def test_cmdline_is_read_bounded_straight_from_procfs(tmp_path):
         assert sum(counted) == 17
         with pytest.raises(OSError):
             qemu._read_cmdline(3)
+
+
+# --- the libvirt import ---
+
+
+def _load_private_copy(monkeypatch, libvirt_module):
+    """Execute qemu.py as a NEW module object with *libvirt_module* standing
+    in for `import libvirt` (None blocks the import, as a host without
+    libvirt-python does). Nothing is registered in sys.modules, so the
+    module every other test uses is untouched; LIBVIRT_AUTOSTART is pinned
+    so the copy's import-time setdefault cannot leak into the environment."""
+    monkeypatch.setitem(sys.modules, "libvirt", libvirt_module)
+    monkeypatch.setenv("LIBVIRT_AUTOSTART", "1")
+    spec = importlib.util.spec_from_file_location(
+        "_fivenines_qemu_private_copy", qemu.__file__
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    assert sys.modules["fivenines_agent.qemu"] is qemu
+    return module
+
+
+def test_libvirt_errors_are_caught_by_libvirts_own_class(monkeypatch):
+    """With libvirt-python installed the per-metric handlers catch its
+    libvirtError, so an unexpected Python error is told apart from a libvirt
+    one; without it the module still imports, reports None, and every
+    handler falls back to Exception."""
+
+    class LibvirtError(Exception):
+        pass
+
+    installed = SimpleNamespace(libvirtError=LibvirtError)
+    copy = _load_private_copy(monkeypatch, installed)
+    assert copy.libvirt is installed
+    assert copy._LibvirtError is LibvirtError
+
+    copy = _load_private_copy(monkeypatch, None)
+    assert copy.libvirt is None
+    assert copy._LibvirtError is Exception
+    with patch.object(copy, "log"):
+        assert copy.qemu_metrics() is None
+    assert os.environ["LIBVIRT_AUTOSTART"] == "1"
+
+
+# --- connection setup ---
+
+
+def test_the_error_handler_drops_cgroup_v2_noise_and_logs_the_rest(fake_libvirt):
+    """libvirt reports the per-CPU accounting it cannot read on a cgroup v2
+    host through the error handler on every call; those two messages are
+    dropped, anything else is logged at debug (libvirt would otherwise print
+    it to stderr)."""
+    QEMUCollector()
+    (handler, ctx), _ = fake_libvirt.registerErrorHandler.call_args
+    assert ctx is None
+
+    with patch("fivenines_agent.qemu.log") as mock_log:
+        handler(None, (1, "Unable to get getCpuacctPercpuUsage"))
+        handler(None, (1, "operation not supported: cgroup V2 has no cpuacct"))
+        assert mock_log.call_args_list == []
+
+        handler(None, (1, "internal error: monitor closed"))
+        handler(None, (1, None))
+        handler(None, None)
+    assert [c.args for c in mock_log.call_args_list] == [
+        ("libvirt error: (1, 'internal error: monitor closed')", "debug"),
+        ("libvirt error: (1, None)", "debug"),
+        ("libvirt error: None", "debug"),
+    ]
+
+
+def test_an_error_handler_libvirt_refuses_is_not_fatal(fake_libvirt):
+    """The handler is optional: a libvirt that refuses it still collects."""
+    fake_libvirt.registerErrorHandler.side_effect = RuntimeError("not supported")
+    collector = QEMUCollector()
+    assert collector.conn is fake_libvirt.openReadOnly.return_value
+    assert collector.collect() == []
+
+
+def test_a_libvirt_without_getlibversion_still_connects(fake_libvirt):
+    """getLibVersion() is missing from older bindings; it is only logged."""
+    del fake_libvirt.getLibVersion
+    with patch("fivenines_agent.qemu.log") as mock_log:
+        collector = QEMUCollector()
+    assert collector.conn is fake_libvirt.openReadOnly.return_value
+    assert (
+        "libvirt.getLibVersion() not available in this version",
+        "debug",
+    ) in [c.args for c in mock_log.call_args_list]
+    assert _errors(mock_log) == []
+
+
+def test_unreadable_connection_info_does_not_fail_the_open(fake_libvirt):
+    """The version/type read after the open is diagnostics only: a failure
+    there keeps the connection and the collection."""
+    conn = fake_libvirt.openReadOnly.return_value
+    conn.getVersion.side_effect = RuntimeError("rpc failed")
+    with patch("fivenines_agent.qemu.log") as mock_log:
+        collector = QEMUCollector()
+        assert collector.collect() == []
+    assert collector.conn is conn
+    assert ("Error getting connection info: rpc failed", "debug") in [
+        c.args for c in mock_log.call_args_list
+    ]
+    assert _errors(mock_log) == []
+
+
+def test_a_failing_close_is_swallowed_and_drops_the_connection(fake_libvirt):
+    """close() is best effort: a connection that cannot be closed is dropped
+    anyway, and the collection it ends still ships."""
+    conn = fake_libvirt.openReadOnly.return_value
+    conn.close.side_effect = RuntimeError("already closed")
+    conn.listAllDomains.return_value = [_running_domain("web")]
+    with patch("fivenines_agent.qemu.log"):
+        result = qemu_metrics()
+    assert {m["labels"]["vm_name"] for m in result} == {"web"}
+    conn.close.assert_called_once()
+
+    collector = QEMUCollector()
+    collector.close()
+    assert collector.conn is None
+    assert collector.position == ("close", None)
+    collector.close()  # nothing left to close
+    assert conn.close.call_count == 2
+
+
+# --- per-VM detail metrics: each failure costs that reading only ---
+
+
+def _collect_one_vm(fake_libvirt, dom):
+    """Run *dom* through qemu_metrics under a mocked log; return its metrics
+    as {(name, device or vcpu label): value} and the log mock."""
+    fake_libvirt.openReadOnly.return_value.listAllDomains.return_value = [dom]
+    with patch("fivenines_agent.qemu.log") as mock_log:
+        result = qemu_metrics()
+    assert result is not None
+    metrics = {
+        (m["name"], m["labels"].get("device", m["labels"].get("vcpu"))): m["value"]
+        for m in result
+        if m["labels"].get("vm_name") == dom.name.return_value
+    }
+    return metrics, mock_log
+
+
+def _debug_lines(mock_log):
+    return [c.args[0] for c in mock_log.call_args_list if c.args[1:] == ("debug",)]
+
+
+def _cpu_stats(per_vcpu, total):
+    """dom.getCPUStats(total_flag): *per_vcpu* for False, *total* for True;
+    an exception is raised."""
+
+    def get_cpu_stats(total_flag):
+        value = total if total_flag else per_vcpu
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    return MagicMock(side_effect=get_cpu_stats)
+
+
+@pytest.fixture
+def libvirt_error_class(monkeypatch):
+    """_LibvirtError as libvirt-python defines it: a class of its own, so
+    the handlers that tell a libvirt error from any other one can both run
+    (with libvirt absent it is Exception, which catches everything)."""
+    monkeypatch.setattr(qemu, "_LibvirtError", _FakeLibvirtError)
+    return _FakeLibvirtError
+
+
+@pytest.mark.parametrize(
+    "per_vcpu, logged",
+    [
+        # cgroup v2: libvirt cannot read per-vCPU accounting -- expected.
+        (_FakeLibvirtError(1, "Operation not supported: no per-CPU stats"), None),
+        (_FakeLibvirtError(1, "cgroup CPUACCT controller is not mounted"), None),
+        (
+            _FakeLibvirtError(1, "internal error: monitor closed"),
+            "Unexpected error in getCPUStats(False): internal error: monitor closed",
+        ),
+        (
+            [{"cpu_time": "n/a"}],
+            "Error getting per-vCPU stats: invalid literal for int() with base 10: 'n/a'",
+        ),
+    ],
+)
+def test_per_vcpu_stats_failure_falls_back_and_logs_only_the_unexpected(
+    fake_libvirt, libvirt_error_class, per_vcpu, logged
+):
+    dom = _running_domain("web")
+    dom.getCPUStats = _cpu_stats(per_vcpu, [{"cpu_time": 900}])
+    dom.vcpus.return_value = ([], [])
+
+    metrics, mock_log = _collect_one_vm(fake_libvirt, dom)
+
+    assert metrics[("vm_cpu_time_nanoseconds_total", None)] == 900
+    assert not any(name == "vm_vcpu_time_nanoseconds_total" for name, _ in metrics)
+    cpu_lines = [
+        line
+        for line in _debug_lines(mock_log)
+        if "getCPUStats(False)" in line or "per-vCPU" in line
+    ]
+    assert cpu_lines == ([logged] if logged else [])
+    assert _errors(mock_log) == []
+
+
+def test_vcpus_fallback_reports_each_vcpu_that_has_cpu_time(fake_libvirt):
+    """With no per-vCPU stats, dom.vcpus() rows (number, state, cpu_time,
+    cpu) are the per-vCPU source: a row with no CPU time yet or too short
+    is skipped, the rest sum to the VM's CPU time, and the aggregate
+    fallbacks are then never called."""
+    dom = _running_domain("web")
+    dom.getCPUStats = _cpu_stats([], AssertionError("aggregate not needed"))
+    dom.vcpus.return_value = ([(0, 1, 1500, 3), (1, 1, 0, 2), (2, 1)], [(True,)])
+
+    metrics, mock_log = _collect_one_vm(fake_libvirt, dom)
+
+    assert metrics[("vm_vcpu_time_nanoseconds_total", "0")] == 1500
+    assert ("vm_vcpu_time_nanoseconds_total", "1") not in metrics
+    assert ("vm_vcpu_time_nanoseconds_total", "2") not in metrics
+    assert metrics[("vm_cpu_time_nanoseconds_total", None)] == 1500
+    assert metrics[("vm_vcpu_count", None)] == 2
+    assert [c.args for c in dom.getCPUStats.call_args_list] == [(False,)]
+    dom.info.assert_not_called()
+    assert _errors(mock_log) == []
+
+
+@pytest.mark.parametrize(
+    "vcpus, logged",
+    [
+        (_FakeLibvirtError(1, "this function is not implemented"), None),
+        (
+            _FakeLibvirtError(1, "Requested operation is not valid"),
+            "vcpus() error: Requested operation is not valid",
+        ),
+        (
+            ([5], []),
+            "Error parsing vcpus() output: object of type 'int' has no len()",
+        ),
+    ],
+)
+def test_vcpus_failure_falls_back_to_the_aggregate_cpu_time(
+    fake_libvirt, libvirt_error_class, vcpus, logged
+):
+    dom = _running_domain("web")
+    dom.getCPUStats = _cpu_stats([], [{"cpu_time": 900}])
+    if isinstance(vcpus, BaseException):
+        dom.vcpus.side_effect = vcpus
+    else:
+        dom.vcpus.return_value = vcpus
+
+    metrics, mock_log = _collect_one_vm(fake_libvirt, dom)
+
+    assert metrics[("vm_cpu_time_nanoseconds_total", None)] == 900
+    dom.info.assert_not_called()
+    vcpus_lines = [line for line in _debug_lines(mock_log) if "vcpus()" in line]
+    assert vcpus_lines == ([logged] if logged else [])
+
+
+@pytest.mark.parametrize(
+    "info, cpu_time, logged",
+    [
+        # libvirt's real shape: [state, maxMem, memory, nrVirtCpu, cpuTime]
+        ([1, 2048, 2048, 2, 4242], 4242, None),
+        (
+            RuntimeError("domain gone"),
+            0,
+            "Error getting CPU time from info(): domain gone",
+        ),
+    ],
+)
+def test_info_is_the_last_cpu_time_fallback(fake_libvirt, info, cpu_time, logged):
+    """When neither per-vCPU nor aggregate stats can be read, the CPU time
+    comes from dom.info(); a VM where that fails too reports 0."""
+    dom = _running_domain("web")
+    dom.getCPUStats = _cpu_stats([], RuntimeError("no aggregate stats"))
+    dom.vcpus.return_value = ([], [])
+    if isinstance(info, BaseException):
+        dom.info.side_effect = info
+    else:
+        dom.info.return_value = info
+
+    metrics, mock_log = _collect_one_vm(fake_libvirt, dom)
+
+    assert metrics[("vm_cpu_time_nanoseconds_total", None)] == cpu_time
+    lines = _debug_lines(mock_log)
+    assert "Error getting total CPU stats: no aggregate stats" in lines
+    assert [line for line in lines if "info()" in line] == ([logged] if logged else [])
+    assert _errors(mock_log) == []
+
+
+def test_optional_memory_stats_are_reported_in_bytes(fake_libvirt):
+    """memoryStats() reports KiB; each optional reading the guest balloon
+    driver provides ships in bytes, and a zero/absent one is left out."""
+    dom = _running_domain("web")
+    dom.memoryStats.return_value = {
+        "actual": 1024,
+        "usable": 0,
+        "rss": 512,
+        "available": 2048,
+        "swap_in": 3,
+        "swap_out": 4,
+    }
+
+    metrics, _ = _collect_one_vm(fake_libvirt, dom)
+
+    assert metrics[("vm_memory_assigned_bytes", None)] == 1024 * 1024
+    assert metrics[("vm_memory_rss_bytes", None)] == 512 * 1024
+    assert metrics[("vm_memory_available_bytes", None)] == 2048 * 1024
+    assert metrics[("vm_memory_swap_in_bytes", None)] == 3 * 1024
+    assert metrics[("vm_memory_swap_out_bytes", None)] == 4 * 1024
+    assert ("vm_memory_balloon_bytes", None) not in metrics
+
+
+def test_a_memory_stats_failure_costs_only_the_memory_metrics(fake_libvirt):
+    dom = _running_domain("web")
+    dom.memoryStats.side_effect = RuntimeError("balloon driver missing")
+
+    metrics, mock_log = _collect_one_vm(fake_libvirt, dom)
+
+    assert not any(name.startswith("vm_memory_") for name, _ in metrics)
+    assert metrics[("vm_cpu_time_nanoseconds_total", None)] == 5
+    assert metrics[("vm_disk_read_bytes_total", "vda")] == 1
+    assert "Error collecting memory metrics: balloon driver missing" in _debug_lines(
+        mock_log
+    )
+    assert _errors(mock_log) == []
+
+
+def test_disk_timing_and_flush_counters_are_reported_when_nonzero(fake_libvirt):
+    dom = _running_domain("web")
+    dom.blockStatsFlags.return_value = {
+        "rd_bytes": 10,
+        "wr_bytes": 20,
+        "rd_operations": 1,
+        "wr_operations": 2,
+        "rd_total_time_ns": 300,
+        "wr_total_time_ns": 400,
+        "flush_operations": 5,
+        "flush_total_time_ns": 600,
+    }
+
+    metrics, _ = _collect_one_vm(fake_libvirt, dom)
+
+    assert {
+        name: value for (name, device), value in metrics.items() if device == "vda"
+    } == {
+        "vm_disk_read_bytes_total": 10,
+        "vm_disk_write_bytes_total": 20,
+        "vm_disk_read_operations_total": 1,
+        "vm_disk_write_operations_total": 2,
+        "vm_disk_read_time_nanoseconds_total": 300,
+        "vm_disk_write_time_nanoseconds_total": 400,
+        "vm_disk_flush_operations_total": 5,
+        "vm_disk_flush_time_nanoseconds_total": 600,
+    }
+
+
+def test_a_disk_whose_stats_fail_is_skipped_alone(fake_libvirt):
+    """One unreadable disk (detached mid-walk, an unsupported backend) costs
+    that disk's counters; the VM's other disks are still read."""
+    dom = _running_domain("web")
+    dom.XMLDesc.return_value = (
+        "<domain><devices>"
+        "<disk><target dev='vda'/></disk>"
+        "<disk><target dev='vdb'/></disk>"
+        "<disk><target/></disk>"
+        "</devices></domain>"
+    )
+
+    def block_stats(dev, flags):
+        if dev == "vda":
+            raise RuntimeError("invalid path vda")
+        return {"rd_bytes": 7}
+
+    dom.blockStatsFlags.side_effect = block_stats
+
+    metrics, mock_log = _collect_one_vm(fake_libvirt, dom)
+
+    assert not any(device == "vda" for _, device in metrics)
+    assert metrics[("vm_disk_read_bytes_total", "vdb")] == 7
+    assert [c.args[0] for c in dom.blockStatsFlags.call_args_list] == ["vda", "vdb"]
+    assert (
+        "Error collecting disk metrics for device vda: invalid path vda"
+        in _debug_lines(mock_log)
+    )
+
+
+def test_unparseable_domain_xml_costs_only_disk_and_network_metrics(fake_libvirt):
+    dom = _running_domain("web")
+    dom.XMLDesc.return_value = "<domain><devices>"
+
+    metrics, mock_log = _collect_one_vm(fake_libvirt, dom)
+
+    assert not any(name.startswith(("vm_disk_", "vm_network_")) for name, _ in metrics)
+    assert metrics[("vm_cpu_time_nanoseconds_total", None)] == 5
+    assert metrics[("vm_memory_rss_bytes", None)] == 512 * 1024
+    dom.blockStatsFlags.assert_not_called()
+    dom.interfaceStats.assert_not_called()
+    (error,) = _errors(mock_log)
+    assert error.startswith("Error parsing XML for domain: ")
+
+
+def test_a_metric_that_cannot_be_appended_is_logged_not_raised(fake_libvirt):
+    class Rejecting(list):
+        def append(self, item):
+            raise MemoryError("no room")
+
+    collector = QEMUCollector()
+    with patch("fivenines_agent.qemu.log") as mock_log:
+        collector._safe_append(Rejecting(), "vm_vcpu_count", 2, {})
+    assert mock_log.call_args_list[0].args == (
+        "Error appending metric vm_vcpu_count: no room",
+        "error",
+    )
+
+
+def test_a_hypervisor_totals_failure_keeps_the_vm_metrics(fake_libvirt):
+    """The host totals are a side read: a failing getInfo() leaves them out
+    and the VM list still ships."""
+    conn = fake_libvirt.openReadOnly.return_value
+    conn.getInfo.side_effect = RuntimeError("node info unavailable")
+    conn.listAllDomains.return_value = [_running_domain("web")]
+
+    with patch("fivenines_agent.qemu.log") as mock_log:
+        result = qemu_metrics()
+
+    assert {m["labels"].get("vm_name") for m in result} == {"web"}
+    assert not any(m["name"].startswith("hypervisor_") for m in result)
+    assert "Error collecting hypervisor metrics: node info unavailable" in _debug_lines(
+        mock_log
+    )
+    assert _errors(mock_log) == []

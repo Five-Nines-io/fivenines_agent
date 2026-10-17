@@ -2,6 +2,7 @@
 
 import json
 import os
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import docker as docker_lib
@@ -1020,6 +1021,44 @@ class TestCollectionDeadline:
             "fivenines_agent.docker.COLLECT_DEADLINE", -1
         ):
             assert docker_containers() is None
+
+    def test_deadline_spent_by_a_reload_stops_before_the_secondary_calls(self):
+        """The budget is re-checked between a container's reload and its
+        image inspect + stats calls: a reload that used the rest of it ends
+        the pass as None right there, without the (CLIENT_TIMEOUT-bounded)
+        calls that would overshoot it, and without touching the next
+        container."""
+        clock = [1000.0]
+        slow = _make_container("slow", _attrs(status="running"))
+        inspect = slow.reload.side_effect
+
+        def slow_reload():
+            clock[0] += docker_mod.COLLECT_DEADLINE + 1
+            inspect()
+
+        slow.reload.side_effect = slow_reload
+        later = _make_container("later", _attrs(status="exited"))
+        client = _make_client([slow, later], {"sha256:img": _make_image()})
+        fake_time = SimpleNamespace(monotonic=lambda: clock[0])
+        with patch(
+            "fivenines_agent.docker.get_docker_client", return_value=client
+        ), patch("fivenines_agent.docker.previous_stats", {}), patch.object(
+            docker_mod, "time", fake_time
+        ), patch(
+            "fivenines_agent.docker.log"
+        ) as mock_log:
+            assert docker_containers() is None
+        slow.reload.assert_called_once()
+        slow.stats.assert_not_called()
+        client.images.get.assert_not_called()
+        later.reload.assert_not_called()
+        (error,) = [
+            c.args[0] for c in mock_log.call_args_list if c.args[1:] == ("error",)
+        ]
+        assert error == (
+            f"Docker collection exceeded {docker_mod.COLLECT_DEADLINE}s budget "
+            "after 0 of 2 containers; reporting collection failure"
+        )
 
 
 class TestClientCache:

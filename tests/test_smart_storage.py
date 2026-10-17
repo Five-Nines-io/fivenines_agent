@@ -621,3 +621,401 @@ def test_sudo_probe_passes_timeout(monkeypatch):
 
     assert seen, "no probe calls were made"
     assert all(t is not None for t in seen), f"a probe call had no timeout: {seen}"
+
+
+# --- realistic smartctl / nvme-cli output ---------------------------------
+
+SMARTCTL_BANNER = (
+    "smartctl 7.3 2022-02-28 r5338 [x86_64-linux-6.1.0-18-amd64] (local build)\n"
+    "Copyright (C) 2002-22, Bruce Allen, Christian Franke, www.smartmontools.org\n"
+    "\n"
+)
+
+# `smartctl -A -H /dev/sda` on a Samsung SATA SSD.
+SMARTCTL_AH_SAMSUNG_SSD = SMARTCTL_BANNER + (
+    "=== START OF READ SMART DATA SECTION ===\n"
+    "SMART overall-health self-assessment test result: PASSED\n"
+    "\n"
+    "SMART Attributes Data Structure revision number: 1\n"
+    "Vendor Specific SMART Attributes with Thresholds:\n"
+    "ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED"
+    "  WHEN_FAILED RAW_VALUE\n"
+    "  5 Reallocated_Sector_Ct   0x0033   100   100   010    Pre-fail  Always"
+    "       -       0\n"
+    "  9 Power_On_Hours          0x0032   095   095   000    Old_age   Always"
+    "       -       21567\n"
+    " 12 Power_Cycle_Count       0x0032   099   099   000    Old_age   Always"
+    "       -       512\n"
+    "177 Wear_Leveling_Count     0x0013   097   097   000    Pre-fail  Always"
+    "       -       42\n"
+    "179 Used_Rsvd_Blk_Cnt_Tot   0x0013   100   100   010    Pre-fail  Always"
+    "       -       0\n"
+    "194 Temperature_Celsius     0x0022   067   052   000    Old_age   Always"
+    "       -       33 (Min/Max 18/48)\n"
+    "241 Total_LBAs_Written      0x0032   099   099   000    Old_age   Always"
+    "       -       28745830212\n"
+    "\n"
+)
+
+# `smartctl -A -H /dev/nvme0`.
+SMARTCTL_AH_NVME = SMARTCTL_BANNER + (
+    "=== START OF SMART DATA SECTION ===\n"
+    "SMART overall-health self-assessment test result: PASSED\n"
+    "\n"
+    "SMART/Health Information (NVMe Log 0x02)\n"
+    "Critical Warning:                   0x00\n"
+    "Temperature:                        36 Celsius\n"
+    "Available Spare:                    100%\n"
+    "Percentage Used:                    3%\n"
+    "Power On Hours:                     7,890\n"
+)
+
+# `nvme smart-log /dev/nvme0 -o json` (nvme-cli 1.x key names).
+NVME_SMART_LOG_JSON = """{
+  "critical_warning" : 0,
+  "temperature" : 310,
+  "avail_spare" : 100,
+  "spare_thresh" : 10,
+  "percent_used" : 3,
+  "endurance_grp_critical_warning_summary" : 0,
+  "data_units_read" : 12345678,
+  "data_units_written" : 23456789,
+  "host_read_commands" : 345678901,
+  "host_write_commands" : 456789012,
+  "controller_busy_time" : 1234,
+  "power_cycles" : 56,
+  "power_on_hours" : 7890,
+  "unsafe_shutdowns" : 12,
+  "media_errors" : 0,
+  "num_err_log_entries" : 34,
+  "warning_temp_time" : 0,
+  "critical_comp_time" : 0,
+  "temperature_sensor_1" : 310,
+  "thm_temp1_trans_count" : 0
+}
+"""
+
+NVME_ENHANCED_EXPECTED = {
+    "temperature_celsius": 36.9,  # 310 K
+    "avail_spare": 100,
+    "spare_thresh": 10,
+    "percent_used": 3,
+    "data_units_read": 12345678,
+    "data_units_written": 23456789,
+    "host_read_commands": 345678901,
+    "host_write_commands": 456789012,
+    "controller_busy_time": 1234,
+    "power_cycles": 56,
+    "power_on_hours": 7890,
+    "unsafe_shutdowns": 12,
+    "media_errors": 0,
+    "num_err_log_entries": 34,
+    "warning_temp_time": 0,
+    "critical_comp_time": 0,
+}
+
+# `smartctl -i /dev/sda`.
+SMARTCTL_I_SAMSUNG_SSD = SMARTCTL_BANNER + (
+    "=== START OF INFORMATION SECTION ===\n"
+    "Model Family:     Samsung based SSDs\n"
+    "Device Model:     Samsung SSD 860 EVO 500GB\n"
+    "Serial Number:    S3Z2NB0K123456A\n"
+    "LU WWN Device Id: 5 002538 e40a1b2c3\n"
+    "Firmware Version: RVT03B6Q\n"
+    "User Capacity:    500,107,862,016 bytes [500 GB]\n"
+    "Sector Size:      512 bytes logical/physical\n"
+    "Rotation Rate:    Solid State Device\n"
+    "Form Factor:      2.5 inches\n"
+    "Local Time is:    Tue Feb 13 08:15:30 2024 UTC\n"
+    "SMART support is: Enabled\n"
+    "\n"
+)
+
+
+# --- get_life_attribute_for_drive / calculate_percentage_used -------------
+
+
+def test_life_attribute_matches_vendor_in_family_or_model_case_insensitively():
+    life = smart_storage.get_life_attribute_for_drive
+    assert life("Samsung based SSDs", None) == "177"
+    assert life(None, "INTEL SSDSC2KB480G8") == "233"
+    assert life("Crucial/Micron Client SSDs", "CT500MX500SSD1") == "202"
+    assert life(None, "WDC WDS500G2B0A-00SM50") == "231"
+    assert life("Unknown family", "ACME SSD 1TB") is None
+    assert life(None, None) is None
+
+
+def test_percentage_used_nvme_reads_percent_used_verbatim():
+    calc = smart_storage.calculate_percentage_used
+    assert calc({"device_type": "nvme", "percent_used": 3}) == 3
+    assert calc({"device_type": "nvme"}) is None
+
+
+def test_percentage_used_none_for_rotational_drive():
+    """A spinning disk has no wear figure, whatever life-like attribute it
+    happens to expose."""
+    results = {
+        "device_type": "ata",
+        "rotation_rate": "7200 rpm",
+        "data_address_mark_errors_pct": 100,
+    }
+    assert smart_storage.calculate_percentage_used(results) is None
+
+
+def test_percentage_used_vendor_attribute_wins_over_fallback_order():
+    """An Intel SSD exposes 232 (Available_Reservd_Space) AND 233
+    (Media_Wearout_Indicator); its vendor entry picks 233 although 232
+    comes first in the fallback order."""
+    results = {
+        "device_type": "ata",
+        "rotation_rate": "Solid State Device",
+        "endurance_remaining_pct": 100,
+        "media_wearout_indicator_pct": 20,
+    }
+    assert (
+        smart_storage.calculate_percentage_used(
+            results, model_family="Intel 730 and DC S35x0/3610/3700 Series SSDs"
+        )
+        == 80
+    )
+
+
+def test_percentage_used_falls_back_when_vendor_attribute_unread():
+    """Samsung maps to 177; when that value is missing the fallback order
+    still finds 231."""
+    results = {"wear_leveling_count_pct": None, "life_left_pct": 90}
+    assert (
+        smart_storage.calculate_percentage_used(
+            results, model_family="Samsung based SSDs"
+        )
+        == 10
+    )
+
+
+def test_percentage_used_fallback_clamps_and_none_without_attributes():
+    calc = smart_storage.calculate_percentage_used
+    # Unknown vendor: first fallback attribute present is used.
+    assert calc({"endurance_remaining_pct": 0}, device_model="ACME SSD") == 100
+    # A normalized VALUE above 100 clamps to 0, never a negative percentage.
+    assert calc({"endurance_remaining_pct": 120}) == 0
+    assert calc({"device_type": "ata"}) is None
+
+
+# --- is_partition / list_storage_devices ----------------------------------
+
+
+@pytest.mark.parametrize(
+    "device, expected",
+    [
+        ("/dev/nvme0n1p1", True),
+        ("/dev/sda1", True),
+        ("/dev/sda", False),
+        ("/dev/nvme0", False),
+        ("/dev/nvme0n1", False),
+        ("/dev/bus/0", False),
+    ],
+)
+def test_is_partition(device, expected):
+    assert smart_storage.is_partition(device) is expected
+
+
+def test_list_storage_devices_parses_scan_and_drops_partitions(monkeypatch):
+    scan = (
+        b"/dev/sda -d sat # /dev/sda [SAT], ATA device\n"
+        b"/dev/sda1 -d sat # /dev/sda1 [SAT], ATA device\n"
+        b"/dev/sdb -d scsi # /dev/sdb, SCSI device\n"
+        b"/dev/nvme0 -d nvme # /dev/nvme0, NVMe device\n"
+    )
+    run = mock.Mock(return_value=_proc(0, scan))
+    monkeypatch.setattr(smart_storage, "run_privileged", run)
+
+    assert smart_storage.list_storage_devices() == [
+        "/dev/sda",
+        "/dev/sdb",
+        "/dev/nvme0",
+    ]
+    cmd = run.call_args.args[0]
+    assert cmd[0] == "sudo"
+    assert cmd[-2:] == ["smartctl", "--scan"]
+
+
+# --- get_nvme_enhanced_info -----------------------------------------------
+
+
+def test_nvme_enhanced_info_maps_smart_log_json(monkeypatch):
+    """Whitelisted keys only, temperature converted from Kelvin."""
+    run = mock.Mock(return_value=_proc(0, NVME_SMART_LOG_JSON))
+    monkeypatch.setattr(smart_storage, "run_privileged", run)
+
+    assert smart_storage.get_nvme_enhanced_info("/dev/nvme0") == NVME_ENHANCED_EXPECTED
+    cmd = run.call_args.args[0]
+    assert cmd[0] == "sudo"
+    assert cmd[-5:] == ["nvme", "smart-log", "/dev/nvme0", "-o", "json"]
+
+
+def test_nvme_enhanced_info_empty_and_logged_on_bad_json(monkeypatch):
+    monkeypatch.setattr(
+        smart_storage, "run_privileged", mock.Mock(return_value=_proc(0, "{trunc"))
+    )
+    log = mock.Mock()
+    monkeypatch.setattr(smart_storage, "log", log)
+
+    assert smart_storage.get_nvme_enhanced_info("/dev/nvme0") == {}
+    message, level = log.call_args.args
+    assert level == "error"
+    assert "/dev/nvme0" in message
+
+
+# --- get_storage_info on real output ---------------------------------------
+
+
+def test_get_storage_info_parses_ata_attribute_table(monkeypatch):
+    """The banner before the section is skipped, the table header and blank
+    lines are not rows, every row maps by ID (unknown IDs as smart_attr_N),
+    life attributes also keep their normalized VALUE, and percentage_used is
+    derived from it."""
+    run = mock.Mock(return_value=_proc(0, SMARTCTL_AH_SAMSUNG_SSD))
+    monkeypatch.setattr(smart_storage, "run_privileged", run)
+
+    info = smart_storage.get_storage_info("/dev/sda")
+
+    cmd = run.call_args.args[0]
+    assert cmd[0] == "sudo"
+    assert cmd[-4:] == ["smartctl", "-A", "-H", "/dev/sda"]
+    # Row names come from SMART_ATTRIBUTE_NAMES: this pins the parser (row ->
+    # name table -> RAW_VALUE), not the table's content.
+    names = smart_storage.SMART_ATTRIBUTE_NAMES
+    assert info == {
+        "device": "sda",
+        "device_type": "ata",
+        "smart_overall_health": "PASSED",
+        names["5"]: 0,
+        names["9"]: 21567,
+        names["12"]: 512,
+        names["177"]: 42,
+        "wear_leveling_count_pct": 97,
+        "smart_attr_179": 0,
+        names["194"]: 33,
+        names["241"]: 28745830212,
+        "percentage_used": 3,
+    }
+
+
+def test_get_storage_info_bad_attribute_row_is_skipped_and_logged(monkeypatch):
+    """One attribute row that fails to parse is logged and skipped; the
+    rest of the table and the device itself still ship."""
+    monkeypatch.setattr(
+        smart_storage,
+        "run_privileged",
+        mock.Mock(return_value=_proc(0, SMARTCTL_AH_SAMSUNG_SSD)),
+    )
+    real_convert = smart_storage.safe_int_conversion
+
+    def convert(value, base=10):
+        if value == "512":  # Power_Cycle_Count's raw value
+            raise RuntimeError("unparseable row")
+        return real_convert(value, base)
+
+    monkeypatch.setattr(smart_storage, "safe_int_conversion", convert)
+    log = mock.Mock()
+    monkeypatch.setattr(smart_storage, "log", log)
+
+    info = smart_storage.get_storage_info("/dev/sda")
+
+    assert "power_cycle_count" not in info
+    assert info["reallocated_sector_ct"] == 0
+    assert info["total_lbas_written"] == 28745830212
+    assert info["wear_leveling_count_pct"] == 97
+    log.assert_called_once()
+    message, level = log.call_args.args
+    assert level == "error"
+    assert "unparseable row" in message
+
+
+def test_get_storage_info_nvme_end_to_end_with_nvme_cli(monkeypatch):
+    """smartctl's NVMe section plus nvme-cli's smart-log, both through the
+    sudo boundary; percentage_used is nvme-cli's percent_used."""
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        if "smart-log" in cmd:
+            return _proc(0, NVME_SMART_LOG_JSON)
+        return _proc(0, SMARTCTL_AH_NVME)
+
+    monkeypatch.setattr(smart_storage, "run_privileged", fake_run)
+
+    info = smart_storage.get_storage_info("/dev/nvme0", nvme_available=lambda: True)
+
+    assert info == {
+        "device": "nvme0",
+        "device_type": "nvme",
+        "smart_overall_health": "PASSED",
+        "critical_warning": 0,
+        **NVME_ENHANCED_EXPECTED,
+        "percentage_used": 3,
+    }
+    assert len(calls) == 2
+
+
+def test_get_storage_info_maps_identification_keys_in_section(monkeypatch):
+    """Identification keys are mapped wherever they appear after the section
+    header, and a rotational Rotation Rate keeps a life attribute from being
+    read as SSD wear."""
+    out = (
+        "=== START OF READ SMART DATA SECTION ===\n"
+        "Device Model:     ST2000DM008-2FR102\n"
+        "Rotation Rate:    7200 rpm\n"
+        "177 Wear_Leveling_Count     0x0013   097   097   000    Pre-fail  Always"
+        "       -       42\n"
+    )
+    monkeypatch.setattr(
+        smart_storage, "run_privileged", mock.Mock(return_value=_proc(0, out))
+    )
+
+    info = smart_storage.get_storage_info("/dev/sdb")
+
+    assert info["device_model"] == "ST2000DM008-2FR102"
+    assert info["rotation_rate"] == "7200 rpm"
+    assert info["wear_leveling_count_pct"] == 97
+    assert "percentage_used" not in info
+
+
+# --- get_storage_identification on real output -----------------------------
+
+
+def test_get_storage_identification_parses_information_section(monkeypatch):
+    """Mapped keys only; the banner, the section header and blank lines carry
+    no colon-separated pair and are skipped."""
+    run = mock.Mock(return_value=_proc(0, SMARTCTL_I_SAMSUNG_SSD))
+    monkeypatch.setattr(smart_storage, "run_privileged", run)
+
+    info = smart_storage.get_storage_identification("/dev/sda")
+
+    cmd = run.call_args.args[0]
+    assert cmd[0] == "sudo"
+    assert cmd[-3:] == ["smartctl", "-i", "/dev/sda"]
+    assert info == {
+        "device": "sda",
+        "model_family": "Samsung based SSDs",
+        "device_model": "Samsung SSD 860 EVO 500GB",
+        "serial_number": "S3Z2NB0K123456A",
+        "firmware_version": "RVT03B6Q",
+        "total_capacity": "500,107,862,016 bytes [500 GB]",
+        "sector_size": "512 bytes logical/physical",
+        "rotation_rate": "Solid State Device",
+    }
+
+
+# --- safe_temperature_conversion --------------------------------------------
+
+
+def test_safe_temperature_conversion():
+    convert = smart_storage.safe_temperature_conversion
+    assert convert("36 Celsius") == 36
+    assert convert("36") == 36
+    assert convert("") is None
+    assert convert(None) is None
+    assert convert("n/a") is None
+    # Undecoded output (bytes) is not text: None, never a TypeError.
+    assert convert(b"36 Celsius") is None

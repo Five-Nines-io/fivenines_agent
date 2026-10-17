@@ -83,3 +83,31 @@ def test_ignored_fs_includes_optical_media():
     """Regression guard: the IGNORED_FS list still has the optical entries."""
     for fstype in ("cdfs", "udf", "iso9660"):
         assert fstype in IGNORED_FS
+
+
+def test_partitions_usage_skips_a_mountpoint_it_may_not_read():
+    """A PermissionError on one mountpoint (an autofs/FUSE mount owned by
+    another user, a Windows drive the service account may not open) is logged
+    and skipped; the other partitions are still reported."""
+    fake = [
+        Partition(device="/dev/sda1", mountpoint="/", fstype="ext4", opts="rw"),
+        Partition(device="sshfs", mountpoint="/mnt/private", fstype="fuse", opts="rw"),
+        Partition(device="/dev/sdb1", mountpoint="/data", fstype="xfs", opts="rw"),
+    ]
+
+    def disk_usage(mountpoint):
+        if mountpoint == "/mnt/private":
+            raise PermissionError(13, "Permission denied", mountpoint)
+        return Usage(total=100, used=40, free=60, percent=40.0)
+
+    with patch("fivenines_agent.partitions.log") as mock_log, patch(
+        "fivenines_agent.partitions.psutil.disk_partitions", return_value=fake
+    ), patch("fivenines_agent.partitions.psutil.disk_usage", side_effect=disk_usage):
+        result = partitions_usage()
+
+    expected = {"total": 100, "used": 40, "free": 60, "percent": 40.0}
+    assert result == {"/": expected, "/data": expected}
+    mock_log.assert_called_once_with(
+        "Error getting disk usage for /mnt/private: "
+        "[Errno 13] Permission denied: '/mnt/private'"
+    )
