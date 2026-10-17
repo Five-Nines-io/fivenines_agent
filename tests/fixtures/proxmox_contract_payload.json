@@ -9,6 +9,7 @@
   "pbs_join_contract": {"_note": "Agent 1.21.0+. A storage entry of type 'pbs' OPTIONALLY carries 'pbs', read from the same datacenter storage config (/storage) as 'pool' and with the same additive, best-effort posture: omitted (never null) for every other type, and when the config does not name both a server and a datastore (a token that cannot read /storage). See scenarios backups_ok (fingerprint pinned, a namespace: its 'pbs-main' storage points at the SAME datastore, namespace and certificate as pbs_contract_payload.json scenario 'healthy', so vm 100 there joins PBS group store1/clusterA/vm/100, whose last verification FAILED) and backups_storage_partial (no fingerprint, the root namespace).", "fields": "server and datastore verbatim; port (null = the PBS default 8007); namespace ('' = the root namespace, the PBS API's own spelling); fingerprint (the SHA-256 PVE pinned for a self-signed PBS certificate, lowercased; null when PVE trusts a CA-signed certificate instead). username/password/encryption-key are never shipped.", "server_join": "The PBS collector (data['pbs'], agent 1.21.0+, tests/fixtures/pbs_contract_payload.json) reports its certificate fingerprint and keys each backup group on (store, ns, type, id). A PVE guest's backups on this storage are the PBS group (datastore, namespace, vm|ct, vmid) of the matching PBS; the identity rule (fingerprint plus datastore; the host breaks a tie between cloned PBS VMs sharing a certificate only against a reporter whose configured host (config['pbs']['host']:port) is remote) is pbs_contract_payload.json's pve_join_contract. A storage with no fingerprint (a CA-signed PBS) cannot be joined yet. vmid alone is ambiguous: two clusters backing up to one PBS both have a vm/100, told apart only by namespace."},
   "storage_shared_contract": {"_note": "Agent 1.21.1+ (fivenines_agent#222). Each storage entry carries 'shared' (bool): true when the storage holds the same content on every node that lists it (PBS, NFS, CIFS, Ceph RBD/CephFS, iSCSI, or a storage marked shared by hand, e.g. dir/lvm/btrfs), false for a node-local one. See scenarios 'quorate_cluster' (ceph-pool true on all three nodes, local-lvm false) and 'shared_storage_down_on_one_node' (a shared storage down on one node, and a storage with no flag).", "source": "The per-node /nodes/<n>/storage row's own 'shared' decides when the row carries one (PVE always sets it, 0 or 1); the datacenter /storage config entry only when the row has none or null -- the same order the backups block uses to list a shared storage once. Only PVE's own spellings are read (a JSON bool, the integers 0/1, '0'/'1'): a deciding value outside them is unknown, and does not fall back to the config. OMITTED (key absent, never null) when unknown, so 'unknown' never reads as 'not shared' nor as 'shared'; in practice it is always present. Never flips storage_ok.", "dedupe": "Entries of one cluster with the same name and shared:true are ONE storage seen from N nodes. Entries with the same name and shared:false are N different storages ('local', 'local-lvm' exist on every node), even when type and total are identical too. Take a shared storage's capacity (total/used/available) from one row with active:true. active:false with 0 bytes means the storage is not available on that node: the node lost it (an nfs/cifs share it cannot mount, an unreachable Ceph or PBS), the storage is disabled, or its 'nodes' option excludes that node (PVE still lists it there). Agent 1.21.2+ tells the last two apart from the first by 'enabled': false (storage_enabled_contract): such a row is not that node's storage at all, so leave it out of the fold -- a shared storage limited to some nodes is one storage, active on the nodes it is enabled on, never inactive because of the others (scenario 'storage_not_enabled_on_a_node', 'nfs-vm'). Keep 'active' per node: active:false on one node of a shared storage is about that node, not the storage shrinking (scenario 'shared_storage_down_on_one_node', 'nfs-iso'). Never compare the active rows' totals: each node reads the size at its own moment (Ceph's total is stored + max_avail, a share on ZFS moves with its pool), so they legitimately differ a little (scenario 'quorate_cluster', 'ceph-pool'). iscsi, iscsidirect and esxi report no capacity at all (0 bytes even when active, and iscsidirect is always reported active): their capacity is unknown, never 0. Known blind spot: a dir storage marked shared by hand on a mount the operator manages (or a btrfs one whose mount point sits on another btrfs filesystem) keeps reporting active when the mount drops, with the size of the filesystem underneath -- unless the storage sets PVE's is_mountpoint option, which makes that node read active:false. When no row is active, the capacity is unknown (null), never 0. The backups block applies the active rule: it lists a shared storage once, from the first node where it is active; a storage whose flag is unknown it lists per node whatever its type, even one the type fallback reads as shared.", "absent": "Key absent = an agent older than 1.21.1 (or a row neither source describes): only the type is left, i.e. the types PVE forces shared (PVE::Storage::Plugin @SHARED_STORAGE: iscsi, nfs, cifs, rbd, cephfs, iscsidirect, zfs (ZFS over iSCSI), drbd, pbs, plus glusterfs up to PVE 8). A storage marked shared by hand (e.g. dir/lvm/btrfs) is only told by the flag. During a rolling update, reporters of the same cluster run both versions: a key absent from one reporter does not erase a flag another reporter of that cluster already sent, and the type is the fallback only when no reporter of the cluster has sent it. Scenario 'shared_storage_down_on_one_node' ('scratch') pins the absent shape. Deploy order is not sensitive: an old server ignores the key."},
   "storage_enabled_contract": {"_note": "Agent 1.21.2+ (fivenines_agent#225). Each storage entry carries 'enabled' (bool), PVE's own verdict for that node: false when the storage is disabled ('disable' in storage.cfg) or its 'nodes' option excludes that node. PVE lists every storage of storage.cfg on every node and never activates one that is not enabled there, so such a row reads active:false with 0 bytes, the shape of a storage that is down on that node: 'enabled' is the only field that tells them apart. See scenario 'storage_not_enabled_on_a_node'.", "source": "The per-node /nodes/<n>/storage row's 'enabled' alone (PVE's storage_info always sets it, 0 or 1). No fallback to the datacenter /storage config, which carries 'disable' and 'nodes' rather than the per-node verdict. Only PVE's own spellings are read (a JSON bool, the integers 0/1, '0'/'1'). OMITTED (key absent, never null) when the row carries no usable value, so 'unknown' never reads as 'disabled'. Never flips storage_ok.", "server_use": "An enabled:false row is not a storage of that node: leave it out of the shared-storage fold (storage_shared_contract.dedupe), the storage counts and the storage-inactive alert. active:false on an enabled:true row is still the storage being down on that node. The backups block never lists a storage on a node where it is enabled:false and records no error for that row (PVE refuses to read a disabled storage); a shared storage is listed from a node where it is enabled and active. A shared storage seen only on enabled:false rows while some node's storage listing failed or was skipped (a storage:null entry), or carried a row without a usable storage id, is named in a 'storage' error, 'shared storage not read: not enabled on any node listed': the node that was not listed may be the one it is enabled on, so its guests read unknown -- unless the datacenter /storage config rules that out (the storage is disabled cluster-wide, or its 'nodes' option names none of the nodes not listed), in which case it stays error-free (scenario 'storage_not_enabled_node_unlisted': 'nfs-bk' named, 'nfs-old' not). In a build where every node's storage was listed (collection.storage_ok true), a storage that is enabled:false on EVERY row is configured but disabled (or excluded everywhere): keep it and show it as disabled, its capacity unknown; never read it as gone nor prune it (scenario 'storage_not_enabled_on_a_node', 'nfs-old'). With storage_ok false, a storage seen only on enabled:false rows may be enabled on a node that was not listed: its state is unknown, not disabled -- keep the last known one (scenario 'storage_not_enabled_node_unlisted', 'nfs-bk').", "absent": "Key absent = an agent older than 1.21.2 (or a row with no usable value: scenario 'shared_storage_down_on_one_node', 'scratch'): read the row as enabled, i.e. as before the key existed, where active:false cannot be told from a storage that is down. Deploy order is not sensitive: an old server ignores the key."},
+  "cluster_members_contract": {"_note": "Agent 1.21.3+ (fivenines_server#1366). payload.cluster carries 'members': one {name, online} entry per node entry /cluster/status lists, sorted by name.", "source": "/cluster/status node entries: 'name', and 'online' read the way nodes_online counts it (1 = online in corosync, anything else offline), once for both, so the count and the list never disagree about a node.", "why": "A DOWN node drops out of payload.nodes/vms/lxc/storage, every per-node call to it raising (scenarios 'quorum_lost', 'node_down'). The counts say a node is missing, never which one: members names it.", "server_use": "Each reporter's list is its own view; the server writes offline the nodes the reporters' DECIDED view lists offline (while a reporter is quorate, the newest quorate reporter's view, except that two quorate views naming each other's node, a two_node or expected-1 split, keep only the nodes both list; without quorum, the nodes every reporter that read /cluster/status lists offline, and none while one of them has no verdict), which is the proxmox_node status the API, MCP and the cluster page show and the proxmox_node_status trigger fires on. It trusts a list only when it agrees with nodes and nodes_online from the same read. members is corosync's view, not the per-node read: a member online yet absent from payload.nodes is a node whose own API calls failed ('partial_node_timeout'), not a down one.", "nameless": "A node entry without a string name still counts in nodes / nodes_online but is not listed, so len(members) can be below nodes.", "absent": "No 'members' key (agent < 1.21.3): the server infers the down node from the counts and the node rows it already has, only when that is unambiguous, and otherwise names none.", "standalone": "cluster is null on a standalone node, so there is no members list: it has no corosync membership."},
   "scenarios": {
     "quorate_cluster": {
       "description": "3-node quorate cluster 'production'. Guests spread across nodes (pve1: vm 100 + ct 200; pve2: vm 101; pve3: stopped ct 201). Shared storage 'ceph-pool' visible on all three nodes (reported 3x, once per node, each with shared:true: ONE storage, whose total differs a little from node to node because each node reads Ceph's stored + max_avail at its own moment) plus a per-node 'local-lvm' (shared:false: three different disks, pve1's and pve2's of identical size, so (name, type, total) cannot tell them apart). cluster.nodes_online (3) == len(nodes) (3) => nodes_ok. This is the fully-healthy reference shape.",
@@ -65,7 +66,7 @@
       },
       "payload": {
         "version": "8.2.4",
-        "cluster": {"name": "production", "quorate": true, "nodes": 3, "nodes_online": 3},
+        "cluster": {"name": "production", "quorate": true, "nodes": 3, "nodes_online": 3, "members": [{"name": "pve1", "online": true}, {"name": "pve2", "online": true}, {"name": "pve3", "online": true}]},
         "nodes": [
           {"name": "pve1", "status": "online", "cpu_usage": 0.12, "memory_used": 8589934592, "memory_total": 34359738368, "uptime": 864000, "vms_running": 1, "lxc_running": 1},
           {"name": "pve2", "status": "online", "cpu_usage": 0.34, "memory_used": 4294967296, "memory_total": 34359738368, "uptime": 432000, "vms_running": 1, "lxc_running": 0},
@@ -134,7 +135,7 @@
       },
       "payload": {
         "version": "8.2.4",
-        "cluster": {"name": "homelab", "quorate": false, "nodes": 2, "nodes_online": 1},
+        "cluster": {"name": "homelab", "quorate": false, "nodes": 2, "nodes_online": 1, "members": [{"name": "pve1", "online": true}, {"name": "pve2", "online": false}]},
         "nodes": [
           {"name": "pve1", "status": "online", "cpu_usage": 0.1, "memory_used": 4294967296, "memory_total": 17179869184, "uptime": 604800, "vms_running": 1, "lxc_running": 0}
         ],
@@ -156,6 +157,76 @@
           ]
         },
         "collection": {"reachable": true, "cluster_ok": true, "nodes_ok": false, "guests_ok": false, "storage_ok": false, "error": "node pve2: status query failed"}
+      }
+    },
+    "node_down": {
+      "description": "3-node cluster 'production' that keeps quorum while pve3 is DOWN (powered off): corosync counts it offline (nodes_online 2 of 3, quorate:true) and every pve3 per-node call raises, so pve3 drops from nodes/vms/lxc/storage. The counts say ONE node is down; only cluster.members names it (pve3, online:false). The commonest real outage, and the shape the server's proxmox_node_status trigger must fire on (#1366). Unlike 'quorum_lost' the surviving side keeps quorum, so its view of which node is down is the cluster's.",
+      "api": {
+        "version": {"version": "8.2.4"},
+        "cluster_status": [
+          {"type": "cluster", "name": "production", "quorate": 1, "nodes": 3},
+          {"type": "node", "name": "pve1", "online": 1},
+          {"type": "node", "name": "pve2", "online": 1},
+          {"type": "node", "name": "pve3", "online": 0}
+        ],
+        "nodes": [
+          {"node": "pve1", "status": "online", "cpu": 0.12, "mem": 8589934592, "maxmem": 34359738368},
+          {"node": "pve2", "status": "online", "cpu": 0.34, "mem": 4294967296, "maxmem": 34359738368},
+          {"node": "pve3", "status": "offline", "cpu": 0, "mem": 0, "maxmem": 17179869184}
+        ],
+        "node_status_by_name": {
+          "pve1": {"uptime": 864000},
+          "pve2": {"uptime": 432000}
+        },
+        "node_status_raises_for": ["pve3"],
+        "qemu_by_node": {
+          "pve1": [
+            {"vmid": 100, "name": "web-01", "status": "running", "cpu": 0.08, "mem": 2147483648, "maxmem": 4294967296, "diskread": 1048576, "diskwrite": 2097152, "netin": 3145728, "netout": 4194304, "uptime": 863900}
+          ],
+          "pve2": []
+        },
+        "qemu_raises_for": ["pve3"],
+        "lxc_by_node": {
+          "pve1": [],
+          "pve2": []
+        },
+        "lxc_raises_for": ["pve3"],
+        "storage_by_node": {
+          "pve1": [
+            {"storage": "local-lvm", "type": "lvmthin", "total": 137438953472, "used": 34359738368, "avail": 103079215104, "active": 1, "shared": 0, "enabled": 1}
+          ],
+          "pve2": [
+            {"storage": "local-lvm", "type": "lvmthin", "total": 137438953472, "used": 20000000000, "avail": 117438953472, "active": 1, "shared": 0, "enabled": 1}
+          ]
+        },
+        "storage_raises_for": ["pve3"]
+      },
+      "payload": {
+        "version": "8.2.4",
+        "cluster": {"name": "production", "quorate": true, "nodes": 3, "nodes_online": 2, "members": [{"name": "pve1", "online": true}, {"name": "pve2", "online": true}, {"name": "pve3", "online": false}]},
+        "nodes": [
+          {"name": "pve1", "status": "online", "cpu_usage": 0.12, "memory_used": 8589934592, "memory_total": 34359738368, "uptime": 864000, "vms_running": 1, "lxc_running": 0},
+          {"name": "pve2", "status": "online", "cpu_usage": 0.34, "memory_used": 4294967296, "memory_total": 34359738368, "uptime": 432000, "vms_running": 0, "lxc_running": 0}
+        ],
+        "vms": [
+          {"vmid": 100, "name": "web-01", "node": "pve1", "status": "running", "cpu_usage": 0.08, "memory_used": 2147483648, "memory_max": 4294967296, "disk_read": 1048576, "disk_write": 2097152, "net_in": 3145728, "net_out": 4194304, "uptime": 863900}
+        ],
+        "lxc": [],
+        "storage": [
+          {"name": "local-lvm", "node": "pve1", "type": "lvmthin", "total": 137438953472, "used": 34359738368, "available": 103079215104, "active": true, "shared": false, "enabled": true},
+          {"name": "local-lvm", "node": "pve2", "type": "lvmthin", "total": 137438953472, "used": 20000000000, "available": 117438953472, "active": true, "shared": false, "enabled": true}
+        ],
+        "backups": {
+          "age_s": 0,
+          "guest_backups": [],
+          "tasks": [],
+          "jobs": [],
+          "not_backed_up": [],
+          "errors": [
+            {"scope": "storage", "node": "pve3", "storage": null, "message": "storage listing failed: storage boom"}
+          ]
+        },
+        "collection": {"reachable": true, "cluster_ok": true, "nodes_ok": false, "guests_ok": false, "storage_ok": false, "error": "node pve3: status query failed"}
       }
     },
     "standalone": {
@@ -271,7 +342,7 @@
       },
       "payload": {
         "version": "8.2.4",
-        "cluster": {"name": "production", "quorate": true, "nodes": 3, "nodes_online": 3},
+        "cluster": {"name": "production", "quorate": true, "nodes": 3, "nodes_online": 3, "members": [{"name": "pve1", "online": true}, {"name": "pve2", "online": true}, {"name": "pve3", "online": true}]},
         "nodes": [
           {"name": "pve1", "status": "online", "cpu_usage": 0.12, "memory_used": 8589934592, "memory_total": 34359738368, "uptime": 864000, "vms_running": 1, "lxc_running": 1},
           {"name": "pve3", "status": "online", "cpu_usage": 0.05, "memory_used": 2147483648, "memory_total": 17179869184, "uptime": 216000, "vms_running": 1, "lxc_running": 0}
@@ -383,7 +454,7 @@
       },
       "payload": {
         "version": "8.2.4",
-        "cluster": {"name": "production", "quorate": true, "nodes": 2, "nodes_online": 2},
+        "cluster": {"name": "production", "quorate": true, "nodes": 2, "nodes_online": 2, "members": [{"name": "pve1", "online": true}, {"name": "pve2", "online": true}]},
         "nodes": [
           {"name": "pve1", "status": "online", "cpu_usage": 0.1, "memory_used": 4294967296, "memory_total": 17179869184, "uptime": 700000, "vms_running": 1, "lxc_running": 0},
           {"name": "pve2", "status": "online", "cpu_usage": 0.2, "memory_used": 2147483648, "memory_total": 17179869184, "uptime": 700001, "vms_running": 0, "lxc_running": 1}
@@ -496,7 +567,7 @@
       },
       "payload": {
         "version": "8.2.4",
-        "cluster": {"name": "production", "quorate": true, "nodes": 2, "nodes_online": 2},
+        "cluster": {"name": "production", "quorate": true, "nodes": 2, "nodes_online": 2, "members": [{"name": "pve1", "online": true}, {"name": "pve2", "online": true}]},
         "nodes": [
           {"name": "pve1", "status": "online", "cpu_usage": 0.12, "memory_used": 8589934592, "memory_total": 34359738368, "uptime": 864000, "vms_running": 1, "lxc_running": 0},
           {"name": "pve2", "status": "online", "cpu_usage": 0.34, "memory_used": 4294967296, "memory_total": 34359738368, "uptime": 432000, "vms_running": 0, "lxc_running": 1}
@@ -859,7 +930,7 @@
       },
       "payload": {
         "version": "8.2.4",
-        "cluster": {"name": "lab", "quorate": true, "nodes": 2, "nodes_online": 2},
+        "cluster": {"name": "lab", "quorate": true, "nodes": 2, "nodes_online": 2, "members": [{"name": "pve1", "online": true}, {"name": "pve2", "online": true}]},
         "nodes": [
           {"name": "pve1", "status": "online", "cpu_usage": 0.1, "memory_used": 8589934592, "memory_total": 34359738368, "uptime": 700000, "vms_running": 0, "lxc_running": 0},
           {"name": "pve2", "status": "online", "cpu_usage": 0.2, "memory_used": 4294967296, "memory_total": 34359738368, "uptime": 600000, "vms_running": 0, "lxc_running": 0}
@@ -940,7 +1011,7 @@
       },
       "payload": {
         "version": "8.2.4",
-        "cluster": {"name": "edge", "quorate": true, "nodes": 3, "nodes_online": 3},
+        "cluster": {"name": "edge", "quorate": true, "nodes": 3, "nodes_online": 3, "members": [{"name": "pve1", "online": true}, {"name": "pve2", "online": true}, {"name": "pve3", "online": true}]},
         "nodes": [
           {"name": "pve1", "status": "online", "cpu_usage": 0.1, "memory_used": 8589934592, "memory_total": 34359738368, "uptime": 700000, "vms_running": 0, "lxc_running": 0},
           {"name": "pve2", "status": "online", "cpu_usage": 0.2, "memory_used": 4294967296, "memory_total": 34359738368, "uptime": 600000, "vms_running": 0, "lxc_running": 0},
@@ -1011,7 +1082,7 @@
       },
       "payload": {
         "version": "8.2.4",
-        "cluster": {"name": "branch", "quorate": true, "nodes": 2, "nodes_online": 2},
+        "cluster": {"name": "branch", "quorate": true, "nodes": 2, "nodes_online": 2, "members": [{"name": "pve1", "online": true}, {"name": "pve2", "online": true}]},
         "nodes": [
           {"name": "pve1", "status": "online", "cpu_usage": 0.1, "memory_used": 8589934592, "memory_total": 34359738368, "uptime": 700000, "vms_running": 0, "lxc_running": 0},
           {"name": "pve2", "status": "online", "cpu_usage": 0.2, "memory_used": 4294967296, "memory_total": 34359738368, "uptime": 600000, "vms_running": 0, "lxc_running": 0}

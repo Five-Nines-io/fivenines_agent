@@ -485,6 +485,71 @@ def test_collect_cluster_counts_online_nodes():
     assert result["nodes_online"] == 2
 
 
+def test_collect_cluster_members_name_each_node_sorted():
+    """#1366: members names every node /cluster/status lists, sorted by name,
+    with the same online reading nodes_online counts, so a DOWN node, which
+    drops out of every per-node section, is still named."""
+    c = make_collector(
+        proxmox_mock=make_proxmox_mock(
+            cluster_status=[
+                {"type": "cluster", "name": "c1", "quorate": 1, "nodes": 3},
+                {"type": "node", "name": "pve3", "online": 1},
+                {"type": "node", "name": "pve1", "online": 1},
+                {"type": "node", "name": "pve2", "online": 0},
+            ]
+        )
+    )
+    result = c._collect_cluster()
+    assert result["members"] == [
+        {"name": "pve1", "online": True},
+        {"name": "pve2", "online": False},
+        {"name": "pve3", "online": True},
+    ]
+    assert result["nodes_online"] == sum(m["online"] for m in result["members"])
+
+
+def test_collect_cluster_members_skip_a_nameless_node_but_count_it():
+    """A node entry without a string name still counts in nodes /
+    nodes_online (as before) but cannot be listed: nothing could key it."""
+    c = make_collector(
+        proxmox_mock=make_proxmox_mock(
+            cluster_status=[
+                {"type": "cluster", "name": "c1", "quorate": 1, "nodes": 4},
+                {"type": "node", "name": "pve1", "online": 1},
+                {"type": "node", "online": 0},
+                {"type": "node", "name": "", "online": 1},
+                {"type": "node", "name": 7, "online": 0},
+            ]
+        )
+    )
+    result = c._collect_cluster()
+    assert result["nodes"] == 4
+    assert result["nodes_online"] == 2
+    assert result["members"] == [{"name": "pve1", "online": True}]
+
+
+def test_collect_cluster_members_read_online_like_the_count():
+    """A missing or unexpected online value reads offline in the list exactly
+    as the count reads it, so the two never disagree about a node."""
+    c = make_collector(
+        proxmox_mock=make_proxmox_mock(
+            cluster_status=[
+                {"type": "cluster", "name": "c1", "quorate": 1, "nodes": 3},
+                {"type": "node", "name": "pve1", "online": True},
+                {"type": "node", "name": "pve2"},
+                {"type": "node", "name": "pve3", "online": "1"},
+            ]
+        )
+    )
+    result = c._collect_cluster()
+    assert result["members"] == [
+        {"name": "pve1", "online": True},
+        {"name": "pve2", "online": False},
+        {"name": "pve3", "online": False},
+    ]
+    assert result["nodes_online"] == 1
+
+
 def test_collect_cluster_no_cluster_entry_returns_none():
     """T25: response with no 'cluster' type entry returns None (single-node)."""
     c = make_collector(
@@ -1763,7 +1828,8 @@ _COLLECTION_KEYS = {
     "storage_ok",
     "error",
 }
-_CLUSTER_KEYS = {"name", "quorate", "nodes", "nodes_online"}
+_CLUSTER_KEYS = {"name", "quorate", "nodes", "nodes_online", "members"}
+_MEMBER_KEYS = {"name", "online"}
 _NODE_KEYS = {
     "name",
     "status",
@@ -1852,6 +1918,9 @@ def test_contract_payload_key_sets(scenario_name):
     assert set(payload["collection"]) == _COLLECTION_KEYS
     if payload["cluster"] is not None:
         assert set(payload["cluster"]) == _CLUSTER_KEYS
+        for member in payload["cluster"]["members"]:
+            assert set(member) == _MEMBER_KEYS
+            assert isinstance(member["online"], bool)
     for node in payload["nodes"]:
         assert set(node) == _NODE_KEYS
     for guest in payload["vms"] + payload["lxc"]:
