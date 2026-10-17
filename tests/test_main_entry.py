@@ -18,14 +18,6 @@ import fivenines_agent.__main__ as main_module
 from fivenines_agent import cli
 
 
-@pytest.fixture(autouse=True)
-def _restore_parsed_args(monkeypatch):
-    """parse_args() stores its result in a module global that env.dry_run()
-    reads; a leaked --dry-run would switch every later test to debug logging.
-    Setting it through monkeypatch restores the original value afterwards."""
-    monkeypatch.setattr(cli, "_args", None)
-
-
 def _argv(monkeypatch, *args):
     monkeypatch.setattr(sys, "argv", ["fivenines_agent", *args])
 

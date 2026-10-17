@@ -188,7 +188,11 @@ def test_metrics_cached_within_ttl():
 
 def test_jail_status_unparseable_counters_keep_zero_and_parse_the_rest():
     """A counter that is not an integer keeps its 0 default instead of
-    failing the jail: the other counters and the banned IPs still ship."""
+    failing the jail: the other counters and the banned IPs still ship.
+
+    The 0 pins TODAY's behaviour, not the contract: an unparseable counter is
+    unknown, and 0 reads as "nothing banned" (TODOS.md). A fix that ships
+    None for it must change this test."""
     garbled = (
         "Status for the jail: sshd\n"
         "|- Filter\n"

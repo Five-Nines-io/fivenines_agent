@@ -1,5 +1,6 @@
 import datetime
 import subprocess
+import time
 from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
@@ -273,14 +274,28 @@ def test_parse_size_with_units_takes_the_leading_number():
     assert parse("unknown") is None
 
 
-def test_parse_timestamp_reads_mdadm_format_as_local_time():
-    """mdadm prints asctime-style local time (day padded with a space);
-    the epoch is computed in the host's timezone, like mdadm wrote it."""
+def test_parse_timestamp_reads_mdadm_format():
+    """mdadm prints asctime-style time (day padded with a space); anything
+    else is unparseable."""
     expected = int(datetime.datetime(2024, 1, 8, 9, 15, 42).timestamp())
     assert raid_storage._parse_timestamp("Mon Jan  8 09:15:42 2024") == expected
     assert raid_storage._parse_timestamp("") is None
     assert raid_storage._parse_timestamp(None) is None
     assert raid_storage._parse_timestamp("2024-01-08T09:15:42") is None
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="needs time.tzset (POSIX)")
+def test_parse_timestamp_reads_the_host_zone_not_utc(monkeypatch):
+    """mdadm writes LOCAL time. CI hosts run in UTC, where local and UTC
+    agree, so the zone is pinned to one that differs: 09:15:42 EST is
+    14:15:42 UTC."""
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset()
+    try:
+        assert raid_storage._parse_timestamp("Mon Jan  8 09:15:42 2024") == 1704723342
+    finally:
+        monkeypatch.undo()
+        time.tzset()
 
 
 # --- get_raid_info ----------------------------------------------------------

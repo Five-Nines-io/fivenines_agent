@@ -229,15 +229,6 @@ def test_restrict_to_owner_is_a_noop_without_fchmod(tmp_path, monkeypatch):
 # --- api_url / dry_run / log_level -----------------------------------------
 
 
-@pytest.fixture
-def no_run_mode(monkeypatch):
-    """Neither DRY_RUN nor a parsed --dry-run; cli._args goes through
-    monkeypatch so whatever another test parsed is put back afterwards."""
-    monkeypatch.delenv("DRY_RUN", raising=False)
-    monkeypatch.delenv("LOG_LEVEL", raising=False)
-    monkeypatch.setattr(cli, "_args", None)
-
-
 def test_api_url_default(monkeypatch):
     monkeypatch.delenv("API_URL", raising=False)
     assert api_url() == "api.fivenines.io"
@@ -248,46 +239,44 @@ def test_api_url_env_override(monkeypatch):
     assert api_url() == "staging.example.test"
 
 
-def test_dry_run_false_by_default(no_run_mode):
+def test_dry_run_false_by_default():
     assert dry_run() is False
 
 
-def test_dry_run_env_true(no_run_mode, monkeypatch):
+def test_dry_run_env_true(monkeypatch):
     monkeypatch.setenv("DRY_RUN", "true")
     assert dry_run() is True
 
 
 @pytest.mark.parametrize("value", ["1", "yes", "True", "TRUE", ""])
-def test_dry_run_env_only_accepts_lowercase_true(no_run_mode, monkeypatch, value):
+def test_dry_run_env_only_accepts_lowercase_true(monkeypatch, value):
     monkeypatch.setenv("DRY_RUN", value)
     assert dry_run() is False
 
 
-def test_dry_run_from_parsed_args(no_run_mode, monkeypatch):
+def test_dry_run_from_parsed_args(monkeypatch):
     monkeypatch.setattr(cli, "_args", Namespace(dry_run=True))
     assert dry_run() is True
     monkeypatch.setattr(cli, "_args", Namespace(dry_run=False))
     assert dry_run() is False
 
 
-def test_log_level_defaults_to_info(no_run_mode):
+def test_log_level_defaults_to_info():
     assert log_level() == "info"
 
 
-def test_log_level_from_env(no_run_mode, monkeypatch):
+def test_log_level_from_env(monkeypatch):
     monkeypatch.setenv("LOG_LEVEL", "error")
     assert log_level() == "error"
 
 
-def test_log_level_is_debug_under_dry_run_whatever_log_level_says(
-    no_run_mode, monkeypatch
-):
+def test_log_level_is_debug_under_dry_run_whatever_log_level_says(monkeypatch):
     monkeypatch.setenv("LOG_LEVEL", "error")
     monkeypatch.setenv("DRY_RUN", "true")
     assert log_level() == "debug"
 
 
-def test_log_level_is_debug_under_the_dry_run_flag(no_run_mode, monkeypatch):
+def test_log_level_is_debug_under_the_dry_run_flag(monkeypatch):
     monkeypatch.setenv("LOG_LEVEL", "error")
     monkeypatch.setattr(cli, "_args", Namespace(dry_run=True))
     assert log_level() == "debug"

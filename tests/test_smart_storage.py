@@ -882,21 +882,21 @@ def test_get_storage_info_parses_ata_attribute_table(monkeypatch):
     cmd = run.call_args.args[0]
     assert cmd[0] == "sudo"
     assert cmd[-4:] == ["smartctl", "-A", "-H", "/dev/sda"]
-    # Row names come from SMART_ATTRIBUTE_NAMES: this pins the parser (row ->
-    # name table -> RAW_VALUE), not the table's content.
-    names = smart_storage.SMART_ATTRIBUTE_NAMES
+    # Wire names are spelled out. Row 9 pins TODAY's bug: SMART_ATTRIBUTE_NAMES
+    # is shifted for ids 6-11 against smartmontools (9 is Power_On_Hours), so
+    # power-on hours ship as spin_retry_count. A fix must change this line.
     assert info == {
         "device": "sda",
         "device_type": "ata",
         "smart_overall_health": "PASSED",
-        names["5"]: 0,
-        names["9"]: 21567,
-        names["12"]: 512,
-        names["177"]: 42,
+        "reallocated_sector_ct": 0,
+        "spin_retry_count": 21567,
+        "power_cycle_count": 512,
+        "wear_leveling_count": 42,
         "wear_leveling_count_pct": 97,
         "smart_attr_179": 0,
-        names["194"]: 33,
-        names["241"]: 28745830212,
+        "temperature_celsius": 33,
+        "total_lbas_written": 28745830212,
         "percentage_used": 3,
     }
 

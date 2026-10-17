@@ -6,6 +6,8 @@ outage cannot grow the agent's memory, and clear() empties the backlog at
 shutdown without leaving join() waiting on tasks nobody will finish.
 """
 
+import threading
+import time
 from unittest.mock import patch
 
 from fivenines_agent.synchronization_queue import SynchronizationQueue
@@ -46,12 +48,25 @@ def test_put_past_the_bound_drops_the_oldest_payload():
     assert mock_log.call_args.args == ("Queue size too big: 3. Dropping oldest data",)
 
 
-def test_put_wakes_a_waiting_consumer():
+def test_put_wakes_a_consumer_already_blocked_in_get():
+    """The Synchronizer sits in get() on an empty queue: put() must notify
+    it. Without the notify the consumer only rechecks when its own timeout
+    ends, so it is parked first and must be back well before that."""
     queue = SynchronizationQueue()
+    got = []
+    consumer = threading.Thread(
+        target=lambda: got.append(queue.get(timeout=30)), daemon=True
+    )
+    consumer.start()
+    deadline = time.monotonic() + 5
+    while not queue.not_empty._waiters and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert queue.not_empty._waiters, "the consumer never blocked in get()"
+
     queue.put(b"payload")
-    # get() with a timeout goes through not_empty: the put must have notified
-    # it, and the item must be there.
-    assert queue.get(timeout=1) == b"payload"
+    consumer.join(timeout=5)
+
+    assert got == [b"payload"]
 
 
 def test_clear_empties_the_backlog_and_releases_join():

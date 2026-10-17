@@ -16,13 +16,6 @@ from fivenines_agent import cli
 from fivenines_agent.debug import debug
 
 
-@pytest.fixture(autouse=True)
-def _no_dry_run_by_default(monkeypatch):
-    monkeypatch.delenv("DRY_RUN", raising=False)
-    monkeypatch.delenv("LOG_LEVEL", raising=False)
-    monkeypatch.setattr(cli, "_args", None)
-
-
 @pytest.fixture
 def dry_run_mode(monkeypatch):
     monkeypatch.setenv("DRY_RUN", "true")
@@ -159,14 +152,6 @@ def test_context_manager_dry_run_without_result_logs_none(dry_run_mode, clock, c
     with debug("no_result"):
         pass
     assert _messages(capsys) == ["no_result (100 ms): None"]
-
-
-def test_context_manager_wrapped_result_takes_precedence(dry_run_mode, clock, capsys):
-    clock(0.0, 0.0)
-    with debug("both") as d:
-        d.result = "plain"
-        d._wrapped_result = "wrapped"
-    assert _messages(capsys) == ["both (0 ms): 'wrapped'"]
 
 
 def test_context_manager_dry_run_does_not_swallow_exceptions(

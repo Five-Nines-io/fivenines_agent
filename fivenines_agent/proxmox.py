@@ -505,11 +505,12 @@ class ProxmoxCollector:
         but only the latter flips cluster_ok, so the server can tell the two
         apart. A standalone node leaves cluster_ok True.
 
-        `members` (#1366) names each node corosync lists, with its `online`
-        flag, sorted by name. A DOWN node drops out of every per-node section
-        (each call to it raises), so this is the only place the payload names
-        it: the counts alone say a node is missing, never which one. A node
-        entry without a string name still counts but is not listed.
+        `members` (server #1366) names each node corosync lists, with its
+        `online` flag, sorted by name. A DOWN node drops out of every
+        per-node section (each call to it raises), so this is the only place
+        the payload names it: the counts alone say a node is missing, never
+        which one. A node entry without a string name still counts but is not
+        listed.
         """
         try:
             cluster_status = self.proxmox.cluster.status.get()

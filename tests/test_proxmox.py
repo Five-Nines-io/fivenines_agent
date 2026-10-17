@@ -486,9 +486,9 @@ def test_collect_cluster_counts_online_nodes():
 
 
 def test_collect_cluster_members_name_each_node_sorted():
-    """#1366: members names every node /cluster/status lists, sorted by name,
-    with the same online reading nodes_online counts, so a DOWN node, which
-    drops out of every per-node section, is still named."""
+    """server #1366: members names every node /cluster/status lists, sorted
+    by name, with the same online reading nodes_online counts, so a DOWN node,
+    which drops out of every per-node section, is still named."""
     c = make_collector(
         proxmox_mock=make_proxmox_mock(
             cluster_status=[
@@ -506,6 +506,12 @@ def test_collect_cluster_members_name_each_node_sorted():
         {"name": "pve3", "online": True},
     ]
     assert result["nodes_online"] == sum(m["online"] for m in result["members"])
+    # Value: protects=members[].online ships as a JSON bool, the type
+    # cluster_members_contract and the fixture declare; fails_when=online is
+    # emitted as the API's 0/1 int; why_new=every other check compares with
+    # ==, where 1 == True, and the key-set test reads the fixture, not the
+    # agent; seam=none; no_claim=the wire type of nodes or nodes_online
+    assert all(isinstance(m["online"], bool) for m in result["members"])
 
 
 def test_collect_cluster_members_skip_a_nameless_node_but_count_it():
@@ -1978,6 +1984,28 @@ def test_contract_nodes_ok_signal():
     partial = _CONTRACT_SCENARIOS["partial_node_timeout"]["payload"]
     assert partial["cluster"]["nodes_online"] == 3
     assert len(partial["nodes"]) == 2  # pve2 dropped mid-loop -> nodes_ok=false
+
+
+def test_contract_members_name_the_node_the_counts_only_count():
+    """cluster_members_contract: in node_down and quorum_lost the offline
+    member is the node missing from payload.nodes (the one the counts cannot
+    name), and in every clustered scenario the list agrees with nodes /
+    nodes_online and is sorted -- the cross-check the server runs before it
+    trusts a list."""
+    for name in ("node_down", "quorum_lost"):
+        payload = _CONTRACT_SCENARIOS[name]["payload"]
+        offline = [m["name"] for m in payload["cluster"]["members"] if not m["online"]]
+        assert offline
+        assert not set(offline) & {n["name"] for n in payload["nodes"]}
+    for scenario in _CONTRACT_SCENARIOS.values():
+        payload = scenario["payload"]
+        if payload is None or payload["cluster"] is None:
+            continue
+        cluster = payload["cluster"]
+        names = [m["name"] for m in cluster["members"]]
+        assert names == sorted(names)
+        assert len(names) == cluster["nodes"]
+        assert sum(m["online"] for m in cluster["members"]) == cluster["nodes_online"]
 
 
 def test_contract_standalone_cluster_is_null():
