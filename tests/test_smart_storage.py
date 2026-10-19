@@ -883,8 +883,9 @@ def test_get_storage_info_parses_ata_attribute_table(monkeypatch):
     assert cmd[0] == "sudo"
     assert cmd[-4:] == ["smartctl", "-A", "-H", "/dev/sda"]
     # Wire names are spelled out. Row 9 pins TODAY's bug: SMART_ATTRIBUTE_NAMES
-    # is shifted for ids 6-11 against smartmontools (9 is Power_On_Hours), so
-    # power-on hours ship as spin_retry_count. A fix must change this line.
+    # is shifted by one for ids 6-10 against smartmontools (9 is
+    # Power_On_Hours, 10 Spin_Retry_Count), so power-on hours ship as
+    # spin_retry_count (#229). A fix must change this line.
     assert info == {
         "device": "sda",
         "device_type": "ata",

@@ -7,6 +7,7 @@ touching the config dir, the API or the collection loop. The Agent is always
 mocked here: no test may start the real agent.
 """
 
+import importlib.util
 import runpy
 import sys
 from argparse import Namespace
@@ -26,7 +27,13 @@ def _argv(monkeypatch, *args):
 
 
 def test_get_args_is_none_before_parse_args():
-    assert cli.get_args() is None
+    """The module default, read from a fresh copy of cli.py: the conftest
+    fixture sets cli._args to None before every test, so the shared module
+    would only echo that."""
+    spec = importlib.util.spec_from_file_location("_fresh_cli", cli.__file__)
+    fresh = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fresh)
+    assert fresh.get_args() is None
 
 
 def test_parse_args_without_flags(monkeypatch):
@@ -96,7 +103,6 @@ def test_start_dry_run_flag_is_visible_to_the_agent(monkeypatch):
     from fivenines_agent.env import dry_run
 
     _argv(monkeypatch, "--dry-run")
-    monkeypatch.delenv("DRY_RUN", raising=False)
     seen = []
     agent_cls = MagicMock(side_effect=lambda: seen.append(dry_run()) or MagicMock())
     monkeypatch.setattr(main_module, "Agent", agent_cls)

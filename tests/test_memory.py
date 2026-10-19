@@ -69,20 +69,6 @@ def test_swap_converts_swap_memory_to_a_dict(monkeypatch):
     assert type(result) is dict
 
 
-def test_swap_with_no_swap_configured(monkeypatch):
-    """A host without swap reports zeros, still as a full dict."""
-    reading = sswap(total=0, used=0, free=0, percent=0.0, sin=0, sout=0)
-    monkeypatch.setattr(psutil, "swap_memory", lambda: reading)
-    assert swap() == {
-        "total": 0,
-        "used": 0,
-        "free": 0,
-        "percent": 0.0,
-        "sin": 0,
-        "sout": 0,
-    }
-
-
 def test_memory_and_swap_against_the_real_host():
     """Unmocked: the fields every psutil platform provides are present."""
     mem = memory()

@@ -455,6 +455,9 @@ def test_collect_cluster_quorate_true():
     result = c._collect_cluster()
     assert result["quorate"] is True
     assert result["name"] == "c1"
+    # No node entry carries a name: the key stays, as an empty list. An
+    # absent key reads server-side as an agent older than 1.21.3.
+    assert result["members"] == []
 
 
 def test_collect_cluster_quorate_false():
@@ -466,6 +469,7 @@ def test_collect_cluster_quorate_false():
     )
     result = c._collect_cluster()
     assert result["quorate"] is False
+    assert result["members"] == []
 
 
 def test_collect_cluster_counts_online_nodes():

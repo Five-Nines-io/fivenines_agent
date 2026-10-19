@@ -84,7 +84,8 @@ def test_truncated_page_returns_none_and_logs_error():
 
 def test_missing_server_header_returns_none():
     """The version comes from the Server header, read with [] -- a response
-    without one (stripped by a proxy) fails the collection."""
+    without one (stripped by a proxy) fails the collection. This pins TODAY's
+    behaviour, not the contract (#233)."""
     with patch(
         "fivenines_agent.nginx.requests.get",
         return_value=_response(STUB_STATUS, server=None),

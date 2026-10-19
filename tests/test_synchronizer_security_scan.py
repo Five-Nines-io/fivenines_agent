@@ -1,4 +1,5 @@
-"""Tests for synchronizer _post() and send_packages() methods."""
+"""Tests for the Synchronizer: _post, the /collect token swap, send_metrics,
+the run() queue drain, the send_* endpoints, get_config and get_conn."""
 
 import gzip
 import http.client

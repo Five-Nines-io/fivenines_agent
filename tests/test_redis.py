@@ -290,7 +290,8 @@ def test_resp_command_uses_byte_length_for_multibyte_arguments():
 def test_trickling_reply_is_cut_at_the_read_deadline():
     """A listener that keeps trickling bytes never trips the per-recv socket
     timeout, so the read stops at the wall-clock deadline and parses what
-    arrived so far -- it never waits for the rest."""
+    arrived so far -- it never waits for the rest. Parsing a prefix pins
+    TODAY's behaviour: a cut mid-line ships a truncated value (#240)."""
     clock = MagicMock()
     clock.monotonic.side_effect = [100.0, 100.0, 100.0 + redis._READ_DEADLINE_S + 1]
     sock = MagicMock()
@@ -312,7 +313,8 @@ def test_trickling_reply_is_cut_at_the_read_deadline():
 
 def test_oversized_reply_is_cut_at_the_size_cap(monkeypatch):
     """A listener that streams without end is cut once the reply passes the
-    byte cap; the prefix read so far is still parsed."""
+    byte cap; the prefix read so far is still parsed (today's behaviour,
+    #240)."""
     monkeypatch.setattr(redis, "_MAX_REPLY_BYTES", 32)
     first = b"# Server\r\nrole:master\r\nconnected_clients:7\r\n"
     assert len(first) > 32

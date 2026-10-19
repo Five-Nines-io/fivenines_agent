@@ -288,13 +288,15 @@ def test_parse_timestamp_reads_mdadm_format():
 def test_parse_timestamp_reads_the_host_zone_not_utc(monkeypatch):
     """mdadm writes LOCAL time. CI hosts run in UTC, where local and UTC
     agree, so the zone is pinned to one that differs: 09:15:42 EST is
-    14:15:42 UTC."""
-    monkeypatch.setenv("TZ", "America/New_York")
-    time.tzset()
+    14:15:42 UTC. EST5 is a POSIX zone string, so no tzdata is needed (an
+    unknown zone name silently falls back to UTC)."""
     try:
-        assert raid_storage._parse_timestamp("Mon Jan  8 09:15:42 2024") == 1704723342
+        with monkeypatch.context() as m:
+            m.setenv("TZ", "EST5")
+            time.tzset()
+            ts = raid_storage._parse_timestamp("Mon Jan  8 09:15:42 2024")
+            assert ts == 1704723342
     finally:
-        monkeypatch.undo()
         time.tzset()
 
 

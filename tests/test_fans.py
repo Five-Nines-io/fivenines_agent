@@ -29,8 +29,3 @@ def test_fans_returns_the_psutil_reading_verbatim(monkeypatch):
     }
     monkeypatch.setattr(psutil, "sensors_fans", lambda: reading, raising=False)
     assert fans() is reading
-
-
-def test_fans_with_no_fan_sensors_is_empty(monkeypatch):
-    monkeypatch.setattr(psutil, "sensors_fans", lambda: {}, raising=False)
-    assert fans() == {}

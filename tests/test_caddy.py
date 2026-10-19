@@ -188,7 +188,7 @@ def test_upstreams_and_pki_failures_do_not_fail_the_collection():
 
     This pins TODAY's behaviour, not the contract: a transport error is
     unknown, and shipping 0 upstreams_unhealthy for it reads as a false
-    all-clear (TODOS.md). A fix that ships None there must change this test."""
+    all-clear (#234). A fix that ships None there must change this test."""
     fake_get = _route(
         config=_response({"apps": {}}),
         upstreams=requests.exceptions.ConnectionError("reset"),

@@ -162,8 +162,8 @@ def test_can_run_sudo_unexpected_exception_is_false_with_reason():
 # --- _can_access_hwmon (temperatures, fans) ---
 
 
-def _fake_hwmon(tree, readable, errors=()):
-    """Patches for a fake /sys/class/hwmon.
+def _run_hwmon(tree, readable, errors=()):
+    """Run the probe against a fake /sys/class/hwmon.
 
     *tree* maps a directory path to its listing, *readable* is the set of
     paths os.access reports readable, *errors* maps a directory to the
@@ -183,21 +183,14 @@ def _fake_hwmon(tree, readable, errors=()):
         accessed.append((path, mode))
         return path in readable
 
-    exists = patch.object(
-        permissions.os.path, "exists", side_effect=lambda path: path == HWMON
-    )
-    return (
-        exists,
-        patch.object(permissions.os, "listdir", side_effect=listdir),
-        patch.object(permissions.os, "access", side_effect=access),
-        accessed,
-    )
-
-
-def _run_hwmon(tree, readable, errors=()):
-    exists, listdir, access, accessed = _fake_hwmon(tree, readable, errors)
     p = _probe()
-    with exists, listdir, access, patch("fivenines_agent.permissions.log") as mock_log:
+    with patch.object(
+        permissions.os.path, "exists", side_effect=lambda path: path == HWMON
+    ), patch.object(permissions.os, "listdir", side_effect=listdir), patch.object(
+        permissions.os, "access", side_effect=access
+    ), patch(
+        "fivenines_agent.permissions.log"
+    ) as mock_log:
         result = p._can_access_hwmon()
     return p, result, accessed, mock_log
 

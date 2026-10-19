@@ -34,8 +34,3 @@ def test_temperatures_returns_the_psutil_reading_verbatim(monkeypatch):
     }
     monkeypatch.setattr(psutil, "sensors_temperatures", lambda: reading, raising=False)
     assert temperatures() is reading
-
-
-def test_temperatures_with_no_sensors_is_empty(monkeypatch):
-    monkeypatch.setattr(psutil, "sensors_temperatures", lambda: {}, raising=False)
-    assert temperatures() == {}

@@ -38,7 +38,8 @@ def test_put_past_the_bound_drops_the_oldest_payload():
 
     # The check runs before each insert and drops only once the queue holds
     # MORE than maxsize, so the backlog settles at maxsize + 1 entries: the
-    # newest ones, oldest first.
+    # newest ones, oldest first. One more than the bound: today's behaviour
+    # (#238), which a fix must change here.
     assert queue.qsize() == 3
     # Every drop also retires the dropped payload's task, so join() still
     # waits only for what is actually queued.
