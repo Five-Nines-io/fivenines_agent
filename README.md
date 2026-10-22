@@ -1161,6 +1161,12 @@ option leaves out; those entries are `enabled: false` and inactive. The flag
 lets the dashboard leave them out instead of reporting a storage that is
 limited to some nodes as inactive on the others.
 
+Agent version **1.21.3+** names each cluster node with its corosync state
+(`members`, read from the same cluster status call as the node counts). A node
+that is down answers none of the per-node calls, so it drops out of the node,
+guest and storage lists: before this version the dashboard could see that a
+node was missing but not which one, and could not alert on it by name.
+
 Agent version **1.19.0+** adds a `backups` block so the dashboard can answer
 "has every VM and container had a backup in the last N hours, whatever the
 target?" and "which guests are in no backup job?". It reads four things: the

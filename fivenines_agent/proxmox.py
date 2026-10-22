@@ -504,6 +504,13 @@ class ProxmoxCollector:
         in /cluster/status) and when the /cluster/status call itself fails --
         but only the latter flips cluster_ok, so the server can tell the two
         apart. A standalone node leaves cluster_ok True.
+
+        `members` (server #1366) names each node corosync lists, with its
+        `online` flag, sorted by name. A DOWN node drops out of every
+        per-node section (each call to it raises), so this is the only place
+        the payload names it: the counts alone say a node is missing, never
+        which one. A node entry without a string name still counts but is not
+        listed.
         """
         try:
             cluster_status = self.proxmox.cluster.status.get()
@@ -511,6 +518,7 @@ class ProxmoxCollector:
             cluster_info = None
             nodes_total = 0
             nodes_online = 0
+            members = []
 
             for item in cluster_status:
                 if item.get('type') == 'cluster':
@@ -522,12 +530,19 @@ class ProxmoxCollector:
                     }
                 elif item.get('type') == 'node':
                     nodes_total += 1
-                    if item.get('online', 0) == 1:
+                    # One reading for the count and the member, so the two
+                    # can never disagree about a node.
+                    online = item.get('online', 0) == 1
+                    if online:
                         nodes_online += 1
+                    name = item.get('name')
+                    if isinstance(name, str) and name:
+                        members.append({'name': name, 'online': online})
 
             if cluster_info:
                 cluster_info['nodes'] = nodes_total
                 cluster_info['nodes_online'] = nodes_online
+                cluster_info['members'] = sorted(members, key=lambda m: m['name'])
                 return cluster_info
 
             # Single node (not in cluster)

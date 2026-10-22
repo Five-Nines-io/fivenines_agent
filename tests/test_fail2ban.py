@@ -181,3 +181,72 @@ def test_metrics_cached_within_ttl():
         fail2ban_metrics()
         fail2ban_metrics()
     jail_list.assert_called_once()  # second call inside the 60s TTL
+
+
+# --- get_jail_status: malformed counters and a failed call -----------------
+
+
+def test_jail_status_unparseable_counters_keep_zero_and_parse_the_rest():
+    """A counter that is not an integer keeps its 0 default instead of
+    failing the jail: the other counters and the banned IPs still ship.
+
+    The 0 pins TODAY's behaviour, not the contract: an unparseable counter is
+    unknown, and 0 reads as "nothing banned" (#235). A fix that ships
+    None for it must change this test."""
+    garbled = (
+        "Status for the jail: sshd\n"
+        "|- Filter\n"
+        "|  |- Currently failed: n/a\n"
+        "|  |- Total failed:     lots\n"
+        "|  `- File list:        /var/log/auth.log\n"
+        "`- Actions\n"
+        "   |- Currently banned: ?\n"
+        "   |- Total banned:     12x\n"
+        "   `- Banned IP list:   203.0.113.7\n"
+    )
+    with patch.object(
+        fail2ban_module, "run_privileged", return_value=_proc(0, garbled)
+    ) as run:
+        status = get_jail_status("sshd")
+    assert status == {
+        "name": "sshd",
+        "currently_failed": 0,
+        "total_failed": 0,
+        "currently_banned": 0,
+        "total_banned": 0,
+        "banned_ips": ["203.0.113.7"],
+    }
+    # Non-interactive sudo, the jail name as its own argv element.
+    assert run.call_args.args[0] == [
+        "sudo",
+        "-n",
+        "fail2ban-client",
+        "status",
+        "sshd",
+    ]
+
+
+def test_jail_status_empty_banned_list_stays_empty():
+    """`Banned IP list:` with nothing after it is zero bans, not a [""] entry."""
+    out = JAIL_OUT.replace("1.2.3.4 5.6.7.8", "")
+    with patch.object(fail2ban_module, "run_privileged", return_value=_proc(0, out)):
+        status = get_jail_status("sshd")
+    assert status["banned_ips"] == []
+    assert status["total_banned"] == 45
+
+
+def test_jail_status_none_and_logged_when_call_raises():
+    """A sudo call that raises (here: run_privileged's TimeoutExpired for a
+    wedged sudoers backend) is a per-jail None with an error line, never an
+    exception out of the collector."""
+    timeout = fail2ban_module.subprocess.TimeoutExpired(
+        cmd=["sudo", "-n", "fail2ban-client", "status", "sshd"], timeout=12
+    )
+    with patch.object(
+        fail2ban_module, "run_privileged", side_effect=timeout
+    ), patch.object(fail2ban_module, "log") as log:
+        assert get_jail_status("sshd") is None
+    log.assert_called_once()
+    message, level = log.call_args.args
+    assert level == "error"
+    assert "sshd" in message

@@ -1472,6 +1472,31 @@ def test_snapshot_inventory_list_units_error():
     assert any(e["step"] == "list_units" for e in errors)
 
 
+def test_snapshot_inventory_unit_files_error_skips_the_snapshot():
+    """Without collect()'s stash the snapshot enumerates on its own; when
+    `list-unit-files` fails there, the installed-but-unloaded units are
+    unknown, so the tick ships no hash (an inventory of the loaded units
+    alone would delete every disabled unit server-side) and never reaches
+    the bulk show."""
+    coll = _make_collector()
+    failure = {"type": "timeout", "message": "systemctl timed out after 10s"}
+    calls = []
+
+    def fake_run(args, timeout=None):
+        calls.append(args[0])
+        return None, failure
+
+    show = MagicMock(side_effect=AssertionError("show must not run"))
+    with patch("fivenines_agent.systemd._run_systemctl", side_effect=fake_run):
+        with patch.object(coll, "_list_units", return_value=(["nginx.service"], None)):
+            with patch.object(coll, "_show_bulk", show):
+                units, h, errors = coll.snapshot_inventory()
+    assert (units, h) == ({}, None)
+    assert errors == [{"step": "list_unit_files", **failure}]
+    assert calls == ["list-unit-files"]
+    show.assert_not_called()
+
+
 def test_snapshot_inventory_no_units():
     coll = _make_collector()
     _stub_unit_files(coll)

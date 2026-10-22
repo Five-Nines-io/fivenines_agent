@@ -6,10 +6,11 @@ session, the synchronizer TLS context). Tests patch the underlying functions
 per test, so any cached value leaking across tests makes them order-dependent;
 the first autouse fixture resets every such cache before each test.
 
-The other two keep the suite off host state it would otherwise read: the
+The next two keep the suite off host state it would otherwise read: the
 operator's journal allowlist under CONFIG_DIR, and the host's own IPv6
 configuration (get_ip(ipv6=True) short-circuits when there is no routable
-IPv6 address, which is most CI runners).
+IPv6 address, which is most CI runners). The last starts every test in the
+default run mode, whatever the shell running pytest exported.
 """
 
 import os
@@ -28,6 +29,7 @@ import fivenines_agent.packages as packages_module
 import fivenines_agent.qemu as qemu_module
 import fivenines_agent.raid_storage as raid_module
 import fivenines_agent.synchronizer as synchronizer_module
+from fivenines_agent import cli
 from fivenines_agent.cache import TTLCache
 
 
@@ -83,6 +85,22 @@ def _assume_ipv6_configured():
     """
     with patch.object(ip_module, "_ipv6_configured", return_value=True):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _default_run_mode(monkeypatch):
+    """No DRY_RUN, no LOG_LEVEL and no parsed command line.
+
+    env.dry_run() reads DRY_RUN and the namespace cli.parse_args() stores in a
+    module global, env.log_level() reads LOG_LEVEL unless dry_run() is on, and
+    between them they decide whether @debug times and prints every call and
+    which log lines print. An exported `LOG_LEVEL=debug` or `DRY_RUN=true`, or
+    a --dry-run a test parsed, would otherwise switch tests to debug output.
+    Going through monkeypatch puts back whatever was there afterwards.
+    """
+    monkeypatch.delenv("DRY_RUN", raising=False)
+    monkeypatch.delenv("LOG_LEVEL", raising=False)
+    monkeypatch.setattr(cli, "_args", None)
 
 
 @pytest.fixture

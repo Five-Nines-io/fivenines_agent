@@ -455,6 +455,9 @@ def test_collect_cluster_quorate_true():
     result = c._collect_cluster()
     assert result["quorate"] is True
     assert result["name"] == "c1"
+    # No node entry carries a name: the key stays, as an empty list. An
+    # absent key reads server-side as an agent older than 1.21.3.
+    assert result["members"] == []
 
 
 def test_collect_cluster_quorate_false():
@@ -466,6 +469,7 @@ def test_collect_cluster_quorate_false():
     )
     result = c._collect_cluster()
     assert result["quorate"] is False
+    assert result["members"] == []
 
 
 def test_collect_cluster_counts_online_nodes():
@@ -483,6 +487,77 @@ def test_collect_cluster_counts_online_nodes():
     result = c._collect_cluster()
     assert result["nodes"] == 3
     assert result["nodes_online"] == 2
+
+
+def test_collect_cluster_members_name_each_node_sorted():
+    """server #1366: members names every node /cluster/status lists, sorted
+    by name, with the same online reading nodes_online counts, so a DOWN node,
+    which drops out of every per-node section, is still named."""
+    c = make_collector(
+        proxmox_mock=make_proxmox_mock(
+            cluster_status=[
+                {"type": "cluster", "name": "c1", "quorate": 1, "nodes": 3},
+                {"type": "node", "name": "pve3", "online": 1},
+                {"type": "node", "name": "pve1", "online": 1},
+                {"type": "node", "name": "pve2", "online": 0},
+            ]
+        )
+    )
+    result = c._collect_cluster()
+    assert result["members"] == [
+        {"name": "pve1", "online": True},
+        {"name": "pve2", "online": False},
+        {"name": "pve3", "online": True},
+    ]
+    assert result["nodes_online"] == sum(m["online"] for m in result["members"])
+    # Value: protects=members[].online ships as a JSON bool, the type
+    # cluster_members_contract and the fixture declare; fails_when=online is
+    # emitted as the API's 0/1 int; why_new=every other check compares with
+    # ==, where 1 == True, and the key-set test reads the fixture, not the
+    # agent; seam=none; no_claim=the wire type of nodes or nodes_online
+    assert all(isinstance(m["online"], bool) for m in result["members"])
+
+
+def test_collect_cluster_members_skip_a_nameless_node_but_count_it():
+    """A node entry without a string name still counts in nodes /
+    nodes_online (as before) but cannot be listed: nothing could key it."""
+    c = make_collector(
+        proxmox_mock=make_proxmox_mock(
+            cluster_status=[
+                {"type": "cluster", "name": "c1", "quorate": 1, "nodes": 4},
+                {"type": "node", "name": "pve1", "online": 1},
+                {"type": "node", "online": 0},
+                {"type": "node", "name": "", "online": 1},
+                {"type": "node", "name": 7, "online": 0},
+            ]
+        )
+    )
+    result = c._collect_cluster()
+    assert result["nodes"] == 4
+    assert result["nodes_online"] == 2
+    assert result["members"] == [{"name": "pve1", "online": True}]
+
+
+def test_collect_cluster_members_read_online_like_the_count():
+    """A missing or unexpected online value reads offline in the list exactly
+    as the count reads it, so the two never disagree about a node."""
+    c = make_collector(
+        proxmox_mock=make_proxmox_mock(
+            cluster_status=[
+                {"type": "cluster", "name": "c1", "quorate": 1, "nodes": 3},
+                {"type": "node", "name": "pve1", "online": True},
+                {"type": "node", "name": "pve2"},
+                {"type": "node", "name": "pve3", "online": "1"},
+            ]
+        )
+    )
+    result = c._collect_cluster()
+    assert result["members"] == [
+        {"name": "pve1", "online": True},
+        {"name": "pve2", "online": False},
+        {"name": "pve3", "online": False},
+    ]
+    assert result["nodes_online"] == 1
 
 
 def test_collect_cluster_no_cluster_entry_returns_none():
@@ -1763,7 +1838,8 @@ _COLLECTION_KEYS = {
     "storage_ok",
     "error",
 }
-_CLUSTER_KEYS = {"name", "quorate", "nodes", "nodes_online"}
+_CLUSTER_KEYS = {"name", "quorate", "nodes", "nodes_online", "members"}
+_MEMBER_KEYS = {"name", "online"}
 _NODE_KEYS = {
     "name",
     "status",
@@ -1852,6 +1928,9 @@ def test_contract_payload_key_sets(scenario_name):
     assert set(payload["collection"]) == _COLLECTION_KEYS
     if payload["cluster"] is not None:
         assert set(payload["cluster"]) == _CLUSTER_KEYS
+        for member in payload["cluster"]["members"]:
+            assert set(member) == _MEMBER_KEYS
+            assert isinstance(member["online"], bool)
     for node in payload["nodes"]:
         assert set(node) == _NODE_KEYS
     for guest in payload["vms"] + payload["lxc"]:
@@ -1909,6 +1988,28 @@ def test_contract_nodes_ok_signal():
     partial = _CONTRACT_SCENARIOS["partial_node_timeout"]["payload"]
     assert partial["cluster"]["nodes_online"] == 3
     assert len(partial["nodes"]) == 2  # pve2 dropped mid-loop -> nodes_ok=false
+
+
+def test_contract_members_name_the_node_the_counts_only_count():
+    """cluster_members_contract: in node_down and quorum_lost the offline
+    member is the node missing from payload.nodes (the one the counts cannot
+    name), and in every clustered scenario the list agrees with nodes /
+    nodes_online and is sorted -- the cross-check the server runs before it
+    trusts a list."""
+    for name in ("node_down", "quorum_lost"):
+        payload = _CONTRACT_SCENARIOS[name]["payload"]
+        offline = [m["name"] for m in payload["cluster"]["members"] if not m["online"]]
+        assert offline
+        assert not set(offline) & {n["name"] for n in payload["nodes"]}
+    for scenario in _CONTRACT_SCENARIOS.values():
+        payload = scenario["payload"]
+        if payload is None or payload["cluster"] is None:
+            continue
+        cluster = payload["cluster"]
+        names = [m["name"] for m in cluster["members"]]
+        assert names == sorted(names)
+        assert len(names) == cluster["nodes"]
+        assert sum(m["online"] for m in cluster["members"]) == cluster["nodes_online"]
 
 
 def test_contract_standalone_cluster_is_null():

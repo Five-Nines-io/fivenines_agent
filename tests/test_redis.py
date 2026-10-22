@@ -282,3 +282,52 @@ def test_resp_command_uses_byte_length_for_multibyte_arguments():
     # repo ASCII-only).
     frame = redis._resp_command("AUTH", "p\u00e9w")
     assert frame == b"*2\r\n$4\r\nAUTH\r\n$4\r\np\xc3\xa9w\r\n"
+
+
+# --- read bounds (server-pushed port: the listener may not be Redis) -------
+
+
+def test_trickling_reply_is_cut_at_the_read_deadline():
+    """A listener that keeps trickling bytes never trips the per-recv socket
+    timeout, so the read stops at the wall-clock deadline and parses what
+    arrived so far -- it never waits for the rest. Parsing a prefix pins
+    TODAY's behaviour: a cut mid-line ships a truncated value (#240)."""
+    clock = MagicMock()
+    clock.monotonic.side_effect = [100.0, 100.0, 100.0 + redis._READ_DEADLINE_S + 1]
+    sock = MagicMock()
+    sock.recv.side_effect = [b"# Server\r\nrole:master\r\n", b"never read"]
+    with patch(
+        "fivenines_agent.redis.socket.create_connection", return_value=sock
+    ), patch("fivenines_agent.redis.time", clock), patch(
+        "fivenines_agent.redis.log"
+    ) as mock_log:
+        out = redis.redis_metrics(port=6379)
+
+    assert out == {"role": "master"}
+    assert sock.recv.call_count == 1
+    sock.close.assert_called_once()
+    mock_log.assert_called_once_with(
+        "Redis INFO read exceeded deadline; truncating", "error"
+    )
+
+
+def test_oversized_reply_is_cut_at_the_size_cap(monkeypatch):
+    """A listener that streams without end is cut once the reply passes the
+    byte cap; the prefix read so far is still parsed (today's behaviour,
+    #240)."""
+    monkeypatch.setattr(redis, "_MAX_REPLY_BYTES", 32)
+    first = b"# Server\r\nrole:master\r\nconnected_clients:7\r\n"
+    assert len(first) > 32
+    sock = MagicMock()
+    sock.recv.side_effect = [first, b"maxclients:10000\r\n", b""]
+    with patch(
+        "fivenines_agent.redis.socket.create_connection", return_value=sock
+    ), patch("fivenines_agent.redis.log") as mock_log:
+        out = redis.redis_metrics(port=6379)
+
+    assert out == {"role": "master", "connected_clients": 7.0}
+    assert sock.recv.call_count == 1
+    sock.close.assert_called_once()
+    mock_log.assert_called_once_with(
+        "Redis INFO reply exceeded size cap; truncating", "error"
+    )

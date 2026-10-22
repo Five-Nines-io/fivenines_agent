@@ -391,8 +391,6 @@ def get_storage_info(device, nvme_available=lambda: False):
                 continue
 
             parts = stats.split(':', 1)
-            if len(parts) != 2:
-                continue
 
             key = parts[0].strip()
             value = parts[1].strip()

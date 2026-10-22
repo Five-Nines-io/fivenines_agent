@@ -1915,6 +1915,23 @@ class TestParseTable:
         )
         assert len(interfaces) == 0
 
+    def test_column_without_an_index_is_skipped(self):
+        """A row under the table prefix whose suffix has no interface index
+        (column only) is skipped; the rows around it still parse."""
+        output = (
+            ".1.3.6.1.2.1.2.2.1.10 = Counter32: 5\n"
+            ".1.3.6.1.2.1.2.2.1.10.1 = Counter32: 1000\n"
+        )
+        collector = SNMPCollector([_make_target()])
+        interfaces = {}
+        counters = {}
+        hc_supported = collector._parse_table(
+            output, IF_TABLE_PREFIX, IFTABLE_COLUMNS, interfaces, counters, None
+        )
+        assert hc_supported is True
+        assert list(counters) == [1]
+        assert counters[1]["bytes_in"] == 1000
+
     def test_unknown_column_skipped(self):
         output = ".1.3.6.1.2.1.2.2.1.99.1 = INTEGER: 42\n"
         collector = SNMPCollector([_make_target()])
@@ -2230,6 +2247,25 @@ class TestEdgeCases:
         assert len(metrics) == 1
         assert metrics[0]["name"] == "present"
         assert metrics[0]["value"] == 99
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_custom_oids_answer_for_an_oid_not_requested_is_dropped(self, mock_cmd):
+        """Only the OIDs the target asked for become custom metrics: a line
+        for any other OID in the snmpget output is ignored."""
+        custom_output = "\n".join(
+            [
+                ".1.3.6.1.4.1.9.9.9.0 = Gauge32: 5",
+                ".1.3.6.1.4.1.9.1.0 = Gauge32: 77",
+            ]
+        )
+        mock_cmd.return_value = (custom_output, None)
+        collector = SNMPCollector([_make_target()])
+        metrics, error = collector._poll_custom_oids(
+            [],
+            [{"name": "val", "oid": "1.3.6.1.4.1.9.1.0", "type": "gauge"}],
+        )
+        assert error is None
+        assert metrics == [{"name": "val", "oid": "1.3.6.1.4.1.9.1.0", "value": 77}]
 
     @patch("fivenines_agent.snmp._run_snmp_cmd")
     def test_custom_oids_float_value(self, mock_cmd):
