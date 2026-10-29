@@ -2979,6 +2979,222 @@ def test_guest_backups_protected_is_rederived_from_the_winning_volume():
     assert entries[0]["protected"] is False
 
 
+def _pbs_volume(vmid, ctime, mark, kind="qemu"):
+    # A PBS snapshot as PVE relays it under keep-last=1 (#246).
+    prefix = "vm" if kind == "qemu" else "ct"
+    return _volume(
+        vmid, ctime, volid=f"pbs:backup/{prefix}/{vmid}/{ctime}", mark=mark, type=kind
+    )
+
+
+def _pbs_guest_backups(volumes):
+    pbs = {
+        "storage": "pbs",
+        "type": "pbs",
+        "content": "backup",
+        "active": 1,
+        "shared": 1,
+        "enabled": 1,
+    }
+    mock = _one_node_mock(
+        storage_by_node={"pve1": [pbs]},
+        prunebackups_by_node_storage={"pve1": {"pbs": volumes}},
+    )
+    errors = []
+    entries = make_collector(proxmox_mock=mock)._collect_guest_backups(["pve1"], errors)
+    assert errors == []
+    assert mock._prunebackups_calls == [
+        ("pve1", "pbs", {"prune-backups": "keep-last=1"})
+    ]
+    return {
+        e["vmid"]: (e["latest_ctime"], e["latest_volid"], e["count"]) for e in entries
+    }
+
+
+def test_guest_backups_leave_out_a_snapshot_pbs_marks_unfinished():
+    """#246: under keep-last=1 PBS marks a snapshot with no manifest that is
+    newer than every finished one 'keep' (KeepPartial) beside the newest
+    finished one. The newer of the two 'keep' is left out of latest_* and of
+    count: the entry names the FINISHED snapshot, whether the other is still
+    uploading or was left behind when PBS died mid-backup."""
+    assert _pbs_guest_backups(
+        [
+            _pbs_volume(100, 300, "keep"),  # no manifest
+            _pbs_volume(100, 200, "keep"),  # newest finished
+            _pbs_volume(100, 100, "remove"),
+        ]
+    ) == {100: (200, "pbs:backup/vm/100/200", 2)}
+
+
+def test_guest_backups_leave_out_crash_orphans_newer_than_the_finished_one():
+    """PBS marks KeepPartial only on the NEWEST unfinished snapshot; an orphan
+    an earlier PBS crash left behind is marked remove. Every remove newer than
+    the finished keep is such an orphan (a finished one there would have been
+    the keep), so it is left out too: else a PBS dying during every run would
+    report last night's dead snapshot as backed up, every day."""
+    assert _pbs_guest_backups(
+        [
+            _pbs_volume(100, 300, "keep"),  # running now
+            _pbs_volume(100, 250, "remove"),  # orphan of a crashed run
+            _pbs_volume(100, 200, "keep"),  # newest finished
+            _pbs_volume(100, 100, "remove"),  # older finished
+            _pbs_volume(101, 400, "keep", kind="lxc"),  # dead tonight
+            _pbs_volume(101, 350, "remove", kind="lxc"),  # dead last night
+            _pbs_volume(101, 300, "remove", kind="lxc"),  # dead the night before
+            _pbs_volume(101, 200, "keep", kind="lxc"),  # last finished
+        ]
+    ) == {
+        100: (200, "pbs:backup/vm/100/200", 2),
+        101: (200, "pbs:backup/ct/101/200", 1),
+    }
+
+
+def test_guest_backups_name_a_protected_snapshot_past_the_unfinished_ones():
+    """keep-last=1 keeps the newest finished snapshot that is NOT protected, so
+    a protected one can sit between it and the unfinished snapshots: with
+    those left out, the protected one is the latest. With one keep, a remove
+    newer than it can only sit behind such a protected snapshot, and is an
+    orphan too."""
+    assert _pbs_guest_backups(
+        [
+            _pbs_volume(100, 300, "keep"),  # no manifest
+            _pbs_volume(100, 200, "protected"),
+            _pbs_volume(100, 100, "keep"),  # newest finished, not protected
+            _pbs_volume(101, 400, "keep"),  # no manifest
+            _pbs_volume(101, 350, "remove"),  # orphan
+            _pbs_volume(101, 300, "protected"),
+            _pbs_volume(101, 200, "keep"),  # newest finished, not protected
+            _pbs_volume(102, 400, "protected"),
+            _pbs_volume(102, 350, "remove"),  # orphan behind the protected one
+            _pbs_volume(102, 300, "keep"),  # newest finished, not protected
+        ]
+    ) == {
+        100: (200, "pbs:backup/vm/100/200", 2),
+        101: (300, "pbs:backup/vm/101/300", 2),
+        102: (400, "pbs:backup/vm/102/400", 2),
+    }
+
+
+def test_guest_backups_keep_a_lone_keep_pbs_cannot_tell_apart():
+    """One 'keep' alone is a finished newest (the steady state: keep-last=1
+    marks the older finished snapshots remove) or the unfinished newest of a
+    group whose finished snapshots, if any, are all protected (a first backup,
+    or a run of a job that always protects its backups; running or dead): the
+    marks cannot tell, so the group is shipped as read (the documented
+    limit)."""
+    assert _pbs_guest_backups(
+        [
+            _pbs_volume(100, 300, "keep"),
+            _pbs_volume(100, 200, "remove"),
+            _pbs_volume(100, 100, "remove"),
+            _pbs_volume(101, 500, "keep", kind="lxc"),
+        ]
+    ) == {
+        100: (300, "pbs:backup/vm/100/300", 3),
+        101: (500, "pbs:backup/ct/101/500", 1),
+    }
+
+
+def test_guest_backups_read_each_backup_group_on_its_own():
+    """PBS marks per group (type, vmid): a vm/102 and a ct/102 (a reused vmid)
+    each keep their own finished newest, and read as one group the newer would
+    pass for a snapshot in progress. A type that is not a string (a malformed
+    answer) reads as no type, without failing the listing."""
+    assert _pbs_guest_backups(
+        [
+            _pbs_volume(102, 100, "keep"),
+            _pbs_volume(102, 200, "keep", kind="lxc"),
+            _volume(103, 300, mark="keep", type=["qemu"]),
+            _volume(103, 200, mark="keep"),
+        ]
+    ) == {
+        102: (200, "pbs:backup/ct/102/200", 2),
+        103: (200, "s:backup/vm/103/200", 1),
+    }
+
+
+@pytest.mark.parametrize(
+    "row, node",
+    [
+        (_dir_storage("bk"), "pve1"),  # a local storage
+        (_dir_storage("bk", type="nfs", shared=1), None),  # shared, listed once
+    ],
+)
+def test_guest_backups_read_other_storage_types_marks_as_is(row, node):
+    """The unfinished-snapshot rule is PBS's marking: on any other storage
+    type the marks are read as is, so a plugin that marks every volume 'keep'
+    never loses a guest's newest finished backup to it -- on the local and
+    the shared listing alike."""
+    mock = _one_node_mock(
+        storage_by_node={"pve1": [row]},
+        prunebackups_by_node_storage={
+            "pve1": {
+                "bk": [
+                    _volume(100, 300, type="qemu"),
+                    _volume(100, 200, type="qemu"),
+                    _volume(100, 100, mark="remove", type="qemu"),
+                ]
+            }
+        },
+    )
+    entries = make_collector(proxmox_mock=mock)._collect_guest_backups(["pve1"], [])
+    assert [(e["latest_ctime"], e["count"], e["node"]) for e in entries] == [
+        (300, 3, node)
+    ]
+
+
+def test_guest_backups_decode_a_pbs_storage_listed_per_node():
+    """A PBS row whose shared flag is unknown is listed per node, like a
+    local storage: the unfinished snapshot is still left out there."""
+    mock = _one_node_mock(
+        storage_by_node={
+            "pve1": [
+                {"storage": "pbs", "type": "pbs", "content": "backup", "active": 1}
+            ]
+        },
+        prunebackups_by_node_storage={
+            "pve1": {
+                "pbs": [
+                    _pbs_volume(100, 300, "keep"),  # no manifest
+                    _pbs_volume(100, 200, "keep"),  # newest finished
+                ]
+            }
+        },
+    )
+    entries = make_collector(proxmox_mock=mock)._collect_guest_backups(["pve1"], [])
+    assert [(e["latest_ctime"], e["count"], e["node"]) for e in entries] == [
+        (200, 1, "pve1")
+    ]
+
+
+def test_drop_unfinished_needs_the_shape_pbs_produces():
+    """Two 'keep' whose newer is the group's newest volume are PBS's
+    KeepPartial + Keep, and one 'keep' is its Keep: only then are the newer
+    keep and every remove newer than the Keep left out. Anything else -- no
+    keep, a keep-all answer, a tie, a volume newer than both keeps -- proves
+    nothing and leaves the group whole, whatever the listing order."""
+
+    def kept(*pairs):
+        group = [(ctime, {"mark": mark}) for ctime, mark in pairs]
+        return [ctime for ctime, _ in proxmox_module._drop_unfinished(group)]
+
+    assert kept((200, "keep"), (100, "remove"), (300, "keep")) == [200, 100]
+    assert kept((250, "remove"), (300, "keep"), (200, "keep")) == [200]
+    assert kept((300, "keep"), (200, "remove")) == [300, 200]
+    assert kept((400, "protected"), (350, "remove"), (300, "keep")) == [400, 300]
+    assert kept((300, "keep"), (200, "keep"), (100, "keep")) == [300, 200, 100]
+    assert kept((300, "keep"), (300, "keep")) == [300, 300]
+    assert kept((400, "protected"), (300, "keep"), (200, "keep")) == [400, 300, 200]
+    assert kept((400, "remove"), (300, "keep"), (200, "keep")) == [400, 300, 200]
+    assert kept((300, "protected"), (200, "remove")) == [300, 200]
+    # A run of a job that always protects its backups: the documented limit.
+    assert kept((500, "keep"), (400, "protected"), (300, "protected")) == [
+        500,
+        400,
+        300,
+    ]
+
+
 def test_guest_backups_content_query_and_skips():
     """The content listing asks for content=backup; non-dict volumes, non-dict
     storage rows, rows without a name and storages that cannot hold backups are
@@ -3017,7 +3233,9 @@ def test_guest_backups_content_query_and_skips():
         }
     ]
     assert [(e["vmid"], e["count"]) for e in entries] == [(100, 1)]
-    assert mock._prunebackups_calls == [("pve1", "local", {"prune-backups": "keep-all=1"})]
+    assert mock._prunebackups_calls == [
+        ("pve1", "local", {"prune-backups": "keep-last=1"})
+    ]
 
 
 def test_guest_backups_shared_listed_once_from_first_active_node():

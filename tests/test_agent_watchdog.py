@@ -1,6 +1,7 @@
 """Tests for optional systemd-watchdog support in agent.run()."""
 
 import sys
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -10,6 +11,7 @@ sys.modules.setdefault("libvirt", MagicMock())
 
 import fivenines_agent.agent as agent_module  # noqa: E402
 from fivenines_agent.agent import Agent  # noqa: E402
+from fivenines_agent.synchronizer import QueuedPayload  # noqa: E402
 
 
 def make_agent():
@@ -83,8 +85,12 @@ def test_run_with_watchdog_present(mock_ps, mock_cm, mock_dr):
 @patch("fivenines_agent.agent.packages_sync")
 def test_run_enqueues_precompressed_payload(mock_ps, mock_cm, mock_dr, mock_sis):
     """The metric payload is gzip-compressed at enqueue time (small blobs in
-    the outage buffer, not full object graphs) and round-trips to JSON."""
+    the outage buffer, not full object graphs) and round-trips to JSON. It is
+    queued with its tick's start, taken BEFORE any collector reads the clock:
+    every age in the payload is taken after it, so the wait reported from it
+    makes an age read older than it is, not fresher (#246)."""
     import gzip
+    import itertools
     import json
 
     agent = make_agent()
@@ -98,20 +104,36 @@ def test_run_enqueues_precompressed_payload(mock_ps, mock_cm, mock_dr, mock_sis)
         agent_module.exit_event.set()
 
     agent._wait_interval = stop_loop
+    # A clock that moves on every read: each stamp is strictly ordered.
+    ticks = itertools.count(1000.0)
+    # Value: protects=the stamp is the tick's start, before any collector
+    # reads the clock, as the contract fixtures name it; fails_when=the payload
+    # is queued with a stamp taken during or after the collection (its end, or
+    # the enqueue), which makes an age read fresher than it is;
+    # why_new=synchronizer tests feed literal waiting_since values, no other
+    # agent test checks where the stamp is taken; seam=none; no_claim=reads of
+    # the clock before the tick's start (none in the loop today).
+    collected_at = []
+    mock_cm.side_effect = lambda *args, **kwargs: collected_at.append(time.monotonic())
 
     original = agent_module.systemd_watchdog
     try:
         agent_module.systemd_watchdog = None
         agent_module.exit_event.clear()
-        with pytest.raises(SystemExit):
-            agent.run()
+        with patch.object(agent_module.time, "monotonic", lambda: next(ticks)):
+            with pytest.raises(SystemExit):
+                agent.run()
     finally:
         agent_module.systemd_watchdog = original
 
     # One enqueue from the loop, then the shutdown sentinel from _cleanup.
     payload_calls = [c for c in agent.queue.put.call_args_list if c.args[0] is not None]
     assert len(payload_calls) == 1
-    blob = payload_calls[0].args[0]
+    queued = payload_calls[0].args[0]
+    assert isinstance(queued, QueuedPayload)
+    assert len(collected_at) == 1
+    assert queued.waiting_since < collected_at[0]
+    blob = queued.body
     assert isinstance(blob, bytes)
     decoded = json.loads(gzip.decompress(blob).decode("utf-8"))
     assert decoded["version"] == "test"
