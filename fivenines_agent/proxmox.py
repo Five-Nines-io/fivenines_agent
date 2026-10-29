@@ -840,8 +840,10 @@ class ProxmoxCollector:
         the TTL re-emits the same block with a fresh `age_s` = seconds since it
         was computed, the subscribed_age_s / handshake-age pattern: the server
         anchors freshness as received_at - age_s and never trusts the agent's
-        wall clock. `latest_ctime` and the task times are PVE's own data
-        timestamps and pass through untouched.
+        wall clock. `age_s` is taken when the tick collects; the time from
+        the tick's start to the payload's delivery travels beside it, as the
+        synchronizer's QUEUED_MS_HEADER (#246). `latest_ctime` and the task
+        times are PVE's own data timestamps and pass through untouched.
 
         store_if rejects None so a failed build (node listing down) is retried
         next tick and a recovered API is reported promptly instead of serving

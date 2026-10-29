@@ -1223,6 +1223,15 @@ Backup Server report only ever names a finished backup and covers that case
 where the two are lined up. Other storage types are unchanged: Proxmox VE lists
 their backups only once they are written.
 
+Agent version **1.21.4+** also tells the server how long each collection
+waited before it was sent (the `X-Fivenines-Queued-Ms` request header, from the
+start of the collection to each send attempt), so the dashboard can date the
+backups block and the
+[Proxmox Backup Server report](#proxmox-backup-server-monitoring) by when they
+were read. Before, a collection held back by an outage of the fivenines API was
+dated by when it finally arrived, and a backup listing read before a backup
+failed could pass for a newer one.
+
 ## Proxmox Backup Server Monitoring
 
 Enabled per host from the fivenines dashboard (agent **1.21.0+**). The agent
