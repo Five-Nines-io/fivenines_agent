@@ -4,6 +4,8 @@ the run() queue drain, the send_* endpoints, get_config and get_conn."""
 import gzip
 import http.client
 import json
+import os
+import re
 import ssl
 import sys
 from threading import Event
@@ -606,6 +608,133 @@ def test_post_sends_precompressed_bytes_verbatim(mock_get_conn):
     assert json.loads(gzip.decompress(body).decode("utf-8")) == payload
     headers = conn.request.call_args[0][3]
     assert headers["Content-Length"] == str(len(blob))
+    # Not a queued tick: no wait to report.
+    assert synchronizer_module.QUEUED_MS_HEADER not in headers
+
+
+@patch.object(Synchronizer, "get_conn")
+def test_post_sends_the_queued_time_of_each_attempt(mock_get_conn):
+    """#246: a queued payload carries the time since its tick started, in
+    whole ms on the monotonic clock, taken again right before every attempt --
+    so the retry backoff and a stalled attempt count as waiting too."""
+    sync = make_synchronizer()
+    clock = [1000.0]
+    sent = []
+    failed = MagicMock()
+    failed.status = 500
+    failed.read.return_value = b"busy"
+    ok = MagicMock()
+    ok.status = 200
+    ok.read.return_value = b'{"ok": true}'
+    conn = MagicMock()
+    conn.getresponse.side_effect = [failed, ok]
+
+    def request(method, endpoint, body, headers):
+        # The headers dict is reused across attempts: keep this attempt's value.
+        sent.append(headers[synchronizer_module.QUEUED_MS_HEADER])
+        clock[0] += 30.0
+
+    conn.request.side_effect = request
+    mock_get_conn.return_value = conn
+
+    with patch.object(synchronizer_module.time, "monotonic", lambda: clock[0]):
+        result = sync._post("/collect", serialize_payload({}), waiting_since=987.6543)
+
+    assert result == {"ok": True}
+    assert sent == ["12345", "42345"]
+
+
+@patch.object(Synchronizer, "get_conn")
+def test_post_never_sends_a_negative_queued_time(mock_get_conn):
+    sync = make_synchronizer()
+    conn = _ok_conn()
+    mock_get_conn.return_value = conn
+    with patch.object(synchronizer_module.time, "monotonic", lambda: 5.0):
+        sync._post("/collect", serialize_payload({}), waiting_since=6.0)
+    assert conn.request.call_args[0][3][synchronizer_module.QUEUED_MS_HEADER] == "0"
+
+
+@patch.object(Synchronizer, "_post")
+def test_send_metrics_sends_a_queued_payload_with_its_tick_start(mock_post):
+    """A QueuedPayload is posted as its bytes, with its tick's start;
+    a dict (a config fetch) or bare bytes carry none."""
+    mock_post.return_value = None
+    sync = make_synchronizer()
+    blob = serialize_payload({"tick": 1})
+
+    sync.send_metrics(synchronizer_module.QueuedPayload(blob, 12.5))
+    sync.send_metrics({"get_config": True})
+    sync.send_metrics(blob)
+
+    assert mock_post.call_args_list == [
+        call("/collect", blob, waiting_since=12.5),
+        call("/collect", {"get_config": True}, waiting_since=None),
+        call("/collect", blob, waiting_since=None),
+    ]
+
+
+@patch.object(Synchronizer, "get_conn")
+def test_post_counts_a_stale_attempt_and_the_reconnect_as_queued_time(
+    mock_get_conn,
+):
+    """The wait is read after the connect, right before the request: a
+    kept-alive socket the server had closed (rebuilt for free) and the
+    rebuild's own DNS + TCP + TLS count as waiting too."""
+    # Value: protects=queued-ms includes a stale kept-alive attempt and the reconnect (the connect counts); fails_when=the wait is read before _acquire_conn or from start_time; why_new=no test advances the clock inside get_conn or on the stale-rebuild path; seam=none; no_claim=real DNS, TCP or TLS timing
+    sync = make_synchronizer()
+    header = synchronizer_module.QUEUED_MS_HEADER
+    clock = [100.0]
+    sent = []
+
+    def stale_request(method, endpoint, body, headers):
+        sent.append(headers[header])
+        clock[0] += 2.0
+        raise BrokenPipeError("stale socket")
+
+    stale = MagicMock()
+    stale.request.side_effect = stale_request
+    sync._conn_local.conn = stale  # kept alive from a past POST
+    fresh = _ok_conn()
+    fresh.request.side_effect = lambda method, endpoint, body, headers: sent.append(
+        headers[header]
+    )
+
+    def reconnect():
+        clock[0] += 3.0  # the rebuild's DNS + TCP + TLS
+        return fresh
+
+    mock_get_conn.side_effect = reconnect
+
+    with patch.object(synchronizer_module.time, "monotonic", lambda: clock[0]):
+        result = sync._post("/collect", serialize_payload({}), waiting_since=90.0)
+
+    assert result == {"ok": True}
+    # Queued 10s before the stale attempt, which took 2s; the reconnect, 3s.
+    assert sent == ["10000", "15000"]
+    stale.close.assert_called_once()
+
+
+def test_queued_time_travels_under_the_header_the_contracts_name():
+    """The server learns the header's name from the shared contract fixtures
+    (copied byte for byte to fivenines-server): the one header a queued tick
+    adds is the one both freshness rules tell the server to read."""
+    # Value: protects=the queued-wait header name the server reads, as both shared contract fixtures publish it; fails_when=QUEUED_MS_HEADER is renamed without the cross-repo contract; why_new=every test reads the name through the constant, so a rename passes; seam=none; no_claim=server-side parsing
+    fixtures = os.path.join(os.path.dirname(__file__), "fixtures")
+    with open(os.path.join(fixtures, "proxmox_contract_payload.json")) as f:
+        proxmox_rule = json.load(f)["backups_contract"]["freshness"]
+    with open(os.path.join(fixtures, "pbs_contract_payload.json")) as f:
+        pbs_rule = json.load(f)["freshness"]
+    sync = make_synchronizer()
+    conn = _ok_conn()
+    with patch.object(Synchronizer, "get_conn", return_value=conn):
+        sync._post("/collect", serialize_payload({}), waiting_since=0.0)
+        sync._post("/collect", serialize_payload({}))
+
+    queued, plain = (c.args[3] for c in conn.request.call_args_list)
+    (name,) = set(queued) - set(plain)
+    whole_name = re.compile(rf"(?<![\w-]){re.escape(name)}(?![\w-])")
+    assert whole_name.search(proxmox_rule)
+    assert whole_name.search(pbs_rule)
 
 
 def test_discard_conn_swallows_close_errors():

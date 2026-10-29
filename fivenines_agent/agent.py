@@ -52,7 +52,7 @@ from fivenines_agent.pbs import reset_timeout_holds as reset_pbs_timeout_holds
 from fivenines_agent.permissions import get_permissions, print_capabilities_banner
 from fivenines_agent.ping import tcp_ping
 from fivenines_agent.synchronization_queue import SynchronizationQueue
-from fivenines_agent.synchronizer import Synchronizer, serialize_payload
+from fivenines_agent.synchronizer import QueuedPayload, Synchronizer, serialize_payload
 from fivenines_agent.systemd import (
     force_inventory_resend,
     refresh_runtime_caches,
@@ -415,7 +415,13 @@ class Agent:
                         )
                         blob = None
                     if blob is not None:
-                        self.queue.put(blob)
+                        # Queued with the tick's start, taken before any
+                        # collector ran: every age in the payload was taken
+                        # after it, so the wait the synchronizer reports from
+                        # it (#246) makes an age read older than it is,
+                        # not fresher (QUEUED_MS_HEADER names what it
+                        # cannot measure).
+                        self.queue.put(QueuedPayload(blob, start))
                     self._wait_interval(running_time)
 
         except Exception as e:

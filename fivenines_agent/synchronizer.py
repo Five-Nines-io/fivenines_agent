@@ -7,6 +7,7 @@ import ssl
 import threading
 import time
 from threading import Event, Lock, Thread
+from typing import NamedTuple
 
 import certifi
 
@@ -18,6 +19,27 @@ from fivenines_agent.env import api_url, config_dir, restrict_to_owner
 # setting for a ~2-5% size win on JSON; level 6 is the standard speed/ratio
 # trade and this code runs on every payload of every tick.
 GZIP_LEVEL = 6
+
+# Milliseconds from the start of a /collect payload's tick, before any
+# collector ran, to this attempt to send it (#246): the collection, the
+# synchronous /packages and /systemd_inventory POSTs after it, then the send
+# queue (100 deep). Every age a payload carries (the Proxmox backups block's
+# age_s, the PBS block's, handshake ages) was taken during the collection, and
+# the server anchors an age as received_at - age; without this, a payload held
+# through a /collect outage would be dated as late as it waited. The server
+# adds it to an age (anchors received_at - age - wait). Every age was taken
+# after the tick started, so the anchor errs older, never fresher, except by
+# what the agent cannot measure: this request's own transit after the header
+# is set (upload, proxies, the server's queueing before it stamps
+# received_at), a host suspend (the monotonic clock stops), and the whole
+# second an age_s truncates. A block's age counts from the END of its build,
+# whose reads ran up to its budget earlier. The Proxmox and PBS contract
+# fixtures tell the server to add it for their age_s, reading a missing
+# header (an older agent) as 0, and to stamp received_at on arrival. The payload is gzipped before it is
+# queued, so the wait travels as a header rather than a JSON field. Measured
+# on time.monotonic(), never the wall clock, and taken again on every attempt,
+# so a retry's backoff counts too.
+QUEUED_MS_HEADER = "X-Fivenines-Queued-Ms"
 
 # Process-wide TLS context. Building one re-parses the whole CA bundle
 # (~200KB of PEM), which is pure per-request waste before this was cached. The
@@ -53,6 +75,14 @@ def serialize_payload(data):
     input as-is instead of re-serializing.
     """
     return gzip.compress(json.dumps(data).encode("utf-8"), compresslevel=GZIP_LEVEL)
+
+
+class QueuedPayload(NamedTuple):
+    """A serialize_payload blob and the time.monotonic() at which its tick
+    started, from which QUEUED_MS_HEADER counts."""
+
+    body: bytes
+    waiting_since: float
 
 
 class _HTTPStatusError(Exception):
@@ -118,12 +148,14 @@ class Synchronizer(Thread):
             except Exception:
                 pass  # nosec B110  # best-effort close of a connection that is being dropped
 
-    def _post(self, endpoint, data):
+    def _post(self, endpoint, data, waiting_since=None):
         """Generic POST with gzip, auth, and retries. Returns parsed JSON or None.
 
         *data* is either a dict (serialized + compressed here) or bytes already
         produced by serialize_payload (metric payloads are compressed at
-        enqueue time so the buffering queue stays small).
+        enqueue time so the buffering queue stays small). *waiting_since*,
+        the time.monotonic() from which QUEUED_MS_HEADER counts, adds that
+        header to each attempt.
         """
         if isinstance(data, (bytes, bytearray)):
             compressed_data = bytes(data)
@@ -167,6 +199,12 @@ class Synchronizer(Thread):
                         "Failed to establish connection (DNS resolution or connection setup failed)"
                     )
 
+                if waiting_since is not None:
+                    # Taken after the connect, right before the request, so
+                    # the connect and every earlier attempt count as waiting.
+                    headers[QUEUED_MS_HEADER] = str(
+                        max(0, int((time.monotonic() - waiting_since) * 1000))
+                    )
                 conn.request("POST", endpoint, compressed_data, headers)
                 res = conn.getresponse()
                 body = res.read().decode("utf-8")
@@ -214,8 +252,16 @@ class Synchronizer(Thread):
         return None
 
     def send_metrics(self, data):
-        """Send metrics to /collect and update config from response."""
-        response = self._post("/collect", data)
+        """Send metrics to /collect and update config from response.
+
+        *data* is a dict (a config fetch), serialize_payload bytes, or a
+        QueuedPayload: a tick the agent loop queued, sent with the time
+        since that tick started (QUEUED_MS_HEADER).
+        """
+        waiting_since = None
+        if isinstance(data, QueuedPayload):
+            data, waiting_since = data.body, data.waiting_since
+        response = self._post("/collect", data, waiting_since=waiting_since)
         if response is not None:
             if "token" in response:
                 self._swap_token(response["token"])
