@@ -63,20 +63,26 @@ BACKUPS_COLLECT_DEADLINE = 30
 _DEADLINE_MESSAGE = 'skipped: backups collection deadline exceeded'
 
 # Backup volumes are read from the prune-PREVIEW endpoint
-# (/nodes/{n}/storage/{s}/prunebackups?prune-backups=keep-all=1, dryrun), NOT
-# the content listing. The content listing filters backup volumes per-volume
-# via check_volume_access -- an audit-only PVEAuditor token gets HTTP 200 with
-# the backups REMOVED (confirmed on a real PVE, agent #156) and would need an
+# (GET /nodes/{n}/storage/{s}/prunebackups, always a dry run: the real prune is
+# the DELETE method, which the agent never calls), NOT the content listing.
+# The content listing filters backup volumes per-volume via
+# check_volume_access -- an audit-only PVEAuditor token gets HTTP 200 with the
+# backups REMOVED (confirmed on a real PVE, agent #156) and would need an
 # allocate-class privilege. The prune preview returns the SAME present-volume
 # evidence (volid, ctime, vmid, mark) under plain Datastore.Audit, with no
-# check_volume_access filter and no write privilege; keep-all=1 only overrides
-# the preview's retention calc, it changes nothing. So the whole feature works
+# check_volume_access filter and no write privilege. So the whole feature works
 # under the PVEAuditor role the setup guide already provisions. It carries fewer
 # fields than the content listing (no size / verification / encrypted); for a
 # PBS storage those come from the PBS collector (pbs.py), joined through the
 # storage row's `pbs` key. The allocate-gated content listing stays rejected:
 # Datastore.Allocate also authorizes DELETING the backup volumes.
-_PRUNE_BACKUPS_PARAMS = {'prune-backups': 'keep-all=1'}
+#
+# The retention passed only decides each volume's `mark`, never which volumes
+# are listed, and keep-last=1 (rather than keep-all=1, #246) is what makes the
+# marks tell an unfinished PBS snapshot apart: see _drop_unfinished, which
+# reads them on PBS storages only. Every storage gets the same params: the
+# `protected` mark the block reads on the others is the same under both.
+_PRUNE_BACKUPS_PARAMS = {'prune-backups': 'keep-last=1'}
 
 # Hard caps on every array in the block. A trim is never silent: it lands in
 # `errors` with scope "cap", because a trimmed guest_backups reads as "never
@@ -1001,7 +1007,8 @@ class ProxmoxCollector:
                     # failure on this node lets the next ACTIVE node retry the
                     # same shared storage rather than freezing its guests unknown.
                     if self._merge_backup_volumes(
-                        node_name, storage_name, None, latest, errors
+                        node_name, storage_name, None, latest, errors,
+                        pbs=storage.get('type') == 'pbs',
                     ):
                         shared_done.add(storage_name)
                         shared_inactive.discard(storage_name)
@@ -1017,7 +1024,8 @@ class ProxmoxCollector:
                     deadline, errors, 'storage', node=node_name, storage=storage_name
                 ):
                     self._merge_backup_volumes(
-                        node_name, storage_name, node_name, latest, errors
+                        node_name, storage_name, node_name, latest, errors,
+                        pbs=storage.get('type') == 'pbs',
                     )
             if unreadable_row:
                 unread_nodes.append(node_name)
@@ -1052,7 +1060,9 @@ class ProxmoxCollector:
         )
         return _cap_list(entries, MAX_GUEST_BACKUPS, errors, 'guest_backups')
 
-    def _merge_backup_volumes(self, node_name, storage_name, entry_node, latest, errors):
+    def _merge_backup_volumes(
+        self, node_name, storage_name, entry_node, latest, errors, pbs=False
+    ):
         """List one storage's backup volumes and fold them into `latest`.
 
         Aggregated into a local dict and merged only on success, so a listing
@@ -1066,6 +1076,9 @@ class ProxmoxCollector:
 
         Reads the prune PREVIEW (dryrun), not the content listing, so a
         read-only PVEAuditor token sees the volumes -- see _PRUNE_BACKUPS_PARAMS.
+        On a 'pbs' storage (`pbs`), a snapshot the preview's marks prove
+        unfinished (_drop_unfinished) is left out of the entry, its latest_*
+        and its count alike; the marks of other storage types are read as is.
         """
         try:
             volumes = (
@@ -1079,7 +1092,10 @@ class ProxmoxCollector:
                     node=node_name, storage=storage_name,
                 )
                 return False
-            per_guest = {}
+            # PBS marks per backup group, which is (type, vmid): a vm/100 and
+            # a ct/100 (a vmid reused) are two groups with a finished snapshot
+            # each, read together they would look like one in progress.
+            groups = {}
             undated = 0
             for volume in volumes:
                 if not isinstance(volume, dict):
@@ -1093,21 +1109,30 @@ class ProxmoxCollector:
                     # unknown, never a false "never backed up".
                     undated += 1
                     continue
-                entry = per_guest.get(vmid)
-                if entry is None:
-                    entry = {
-                        'vmid': vmid,
-                        'storage': storage_name,
-                        'node': _scrub_str(entry_node),
-                        'latest_ctime': None,
-                        'latest_volid': None,
-                        'count': 0,
-                        'protected': False,
-                    }
-                    per_guest[vmid] = entry
-                entry['count'] += 1
-                if entry['latest_ctime'] is None or ctime > entry['latest_ctime']:
-                    _set_latest_volume(entry, volume, ctime)
+                kind = volume.get('type')
+                group = (vmid, kind if isinstance(kind, str) else None)
+                groups.setdefault(group, []).append((ctime, volume))
+
+            per_guest = {}
+            for (vmid, _kind), group_volumes in groups.items():
+                if pbs:
+                    group_volumes = _drop_unfinished(group_volumes)
+                for ctime, volume in group_volumes:
+                    entry = per_guest.get(vmid)
+                    if entry is None:
+                        entry = {
+                            'vmid': vmid,
+                            'storage': storage_name,
+                            'node': _scrub_str(entry_node),
+                            'latest_ctime': None,
+                            'latest_volid': None,
+                            'count': 0,
+                            'protected': False,
+                        }
+                        per_guest[vmid] = entry
+                    entry['count'] += 1
+                    if entry['latest_ctime'] is None or ctime > entry['latest_ctime']:
+                        _set_latest_volume(entry, volume, ctime)
         except Exception as e:
             log(
                 f"Error listing backups on {_log_safe(node_name)}/"
@@ -1258,22 +1283,82 @@ class ProxmoxCollector:
         ]
 
 
+def _drop_unfinished(group):
+    """`group` without the snapshots PBS's marks prove unfinished.
+
+    `group` is [(ctime, volume)] for one (vmid, type) of a keep-last=1 prune
+    preview. PBS (pbs-datastore prune.rs, the same since PBS 1.0) treats a
+    snapshot with no manifest -- one still uploading, or one left behind when
+    PBS died mid-backup, which it keeps listing -- as unfinished: the newest
+    one, when it is newer than every finished snapshot, is marked KeepPartial,
+    and every other one Remove. keep-last=1 then marks Keep the newest
+    finished snapshot that is not protected; the remaining finished ones are
+    Remove, protected ones Protected. PVE relays KeepPartial and Keep both as
+    'keep'. So, with F the finished 'keep':
+
+    - two 'keep', the newer being the group's newest volume: the newer is the
+      unfinished one, and the older is F;
+    - one 'keep': it is F, or the unfinished newest of a group whose finished
+      snapshots, if any, are all protected -- a guest's first backup to this
+      PBS, or a run of a backup job with `protected` set while the group holds
+      no unprotected finished backup (every run of a job that always set it:
+      vzdump protects a backup only once it is written), running or dead. The
+      marks cannot tell those apart, so it stays;
+    - either way, every 'remove' newer than F is unfinished too: a finished
+      snapshot there would have been F. That is a crash orphan between F and a
+      run now going on, or every orphan of a PBS that dies during each run.
+
+    Those are left out (#246), so the block names F, never a snapshot that may
+    still fail. Any other shape leaves the group as read: no 'keep' at all (a
+    group whose finished snapshots are all protected; its newest volume is
+    then a protected one) is named as it reads, and more than two 'keep', a
+    tie or a volume newer than both is not a shape PBS produces. It runs on
+    PBS storages only: the rule is PBS's marking, and nothing obliges another
+    storage plugin to mark the same way (PVE's own mark 'keep' on each
+    guest's newest volume, and a plugin that marked every volume 'keep' would
+    lose a two-backup group's newest).
+    """
+    keeps = sorted(
+        (ctime for ctime, volume in group if volume.get('mark') == 'keep'),
+        reverse=True,
+    )
+    if len(keeps) == 1:
+        unfinished, finished = None, keeps[0]
+    elif (
+        len(keeps) == 2
+        and keeps[0] > keeps[1]
+        and keeps[0] == max(ctime for ctime, _ in group)
+    ):
+        unfinished, finished = keeps
+    else:
+        return group
+    return [
+        (ctime, volume)
+        for ctime, volume in group
+        if not (volume.get('mark') == 'keep' and ctime == unfinished)
+        and not (volume.get('mark') == 'remove' and ctime > finished)
+    ]
+
+
 def _set_latest_volume(entry, volume, ctime):
     """Overwrite the entry's latest-* fields from a newer prune-preview volume.
     `mark` == 'protected' is a retention-exempt (protected) backup; the prune
     preview does not carry size / verification / encrypted.
 
-    KNOWN LIMITATION (#156, Codex review): the prune preview reports a snapshot's
-    EXISTENCE by ctime, not its COMPLETION. On a PBS storage an in-progress
-    backup can be listed while it is still uploading (PBS enumerates incomplete
-    snapshots, and keep-all=1 marks them `keep`), so a collection that overlaps a
-    running PBS backup could momentarily promote it as the latest -- a false
-    "backed up" if that upload then fails. The prune preview carries no
-    completion field, so distinguishing complete from in-progress needs a
-    PBS-native read: the PBS collector (pbs.py) reports each group's last
+    The prune preview reports a snapshot's EXISTENCE by ctime, not its
+    COMPLETION: PBS lists a snapshot from the start of its upload, and forever
+    when PBS dies before the manifest is written. _drop_unfinished leaves such
+    snapshots out whenever the group holds a finished one that is not
+    protected (#246). KNOWN LIMITATION: in a group whose finished snapshots,
+    if any, are all protected -- a guest's first backup to that PBS, or a run
+    of a backup job with `protected` set while the group holds no unprotected
+    finished backup (every run of a job that always set it, since vzdump
+    protects a backup only once it is written) -- the newest unfinished one is
+    still named, running or dead, since the marks cannot tell it from a
+    finished one; the PBS collector (pbs.py) reports each group's last
     FINISHED backup, which the server can prefer where the two are joined.
-    Local/NFS/dir storages are unaffected: vzdump writes to a temp name and the
-    archive is only listed once renamed on completion."""
+    Local/NFS/dir storages are unaffected: vzdump writes to a temp name and
+    the archive is only listed once renamed on completion."""
     entry['latest_ctime'] = ctime
     entry['latest_volid'] = _scrub_str(volume.get('volid'))
     entry['protected'] = volume.get('mark') == 'protected'

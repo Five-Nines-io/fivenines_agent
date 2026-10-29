@@ -1184,9 +1184,10 @@ listing would hide them behind a write-class privilege. If a storage's backups
 genuinely cannot be read (for example a PBS datastore whose credentials lack
 prune rights), that storage is reported as *unknown*, never as "no backups", so
 a read failure can never turn into a false "not backed up" alert.
-The block is refreshed every 10 minutes rather than every tick, since the
-content listing is the most expensive call the collector makes and backup age
-moves in hours; its `age_s` tells the server how old the snapshot is. One
+The block is refreshed every 10 minutes rather than every tick, since
+listing the backup volumes is the most expensive call the collector makes and
+backup age moves in hours; its `age_s` tells the server how old the snapshot
+is. One
 refresh is bounded by a 30-second budget, so a wedged PVE or PBS can never
 stall the agent: reads left over when the budget runs out are reported as
 errors rather than silently dropped. A
@@ -1205,6 +1206,22 @@ namespace and the certificate fingerprint PVE pinned), so the dashboard can
 line a guest's backups up with that PBS report even when several clusters back
 up to the same PBS. A PBS whose certificate Proxmox VE trusts through a CA (no
 pinned fingerprint) cannot be lined up yet.
+
+Agent version **1.21.4+** no longer reports a PBS backup that has not finished
+as a guest's latest backup. Proxmox VE lists a backup on a PBS storage from the
+moment its upload starts, and keeps listing one PBS left behind when it died
+mid-backup, so a backup still running, or one that never completed, could make
+a guest read as backed up. The agent now reads the prune preview with
+`keep-last=1` (still a dry run that deletes nothing, under the same read-only
+role) and uses the mark PBS gives each backup to leave out the ones it proves
+unfinished, from both the latest backup and the count. Known limit: a guest's
+first backup to a PBS, and a backup of a guest whose earlier backups there are
+all protected (every run of a backup job that has always set `protected`), can
+still be named while it runs (or, if PBS died during it, until the next backup
+finishes), because the marks cannot tell it from a finished one; the Proxmox
+Backup Server report only ever names a finished backup and covers that case
+where the two are lined up. Other storage types are unchanged: Proxmox VE lists
+their backups only once they are written.
 
 ## Proxmox Backup Server Monitoring
 
