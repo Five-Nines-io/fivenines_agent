@@ -109,7 +109,13 @@ libvirt calls and reports `None`, never a partial VM list. The same exposure
 exists outside sysfs: `processes` and `openvpn` read every QEMU process's
 `/proc/<pid>/cmdline` on the collection thread, through psutil's `name()` (it
 falls back to `cmdline()` for a 15-character comm such as `qemu-system-x86`),
-and that read waits on the process's mmap lock.
+and that read waits on the process's mmap lock. `smart_storage_health` reads its
+devices one after another with no collection deadline, and since #230 (v1.21.5)
+each device is ONE `sudo smartctl -i -A -H -l ssd` call (30s + 2s): a drive or
+bridge that advertises ATA Device Statistics but hangs reading page 7 costs that
+device's whole health read (the old `-A -H` alone would have answered), and three
+such devices outlast `WatchdogSec=90`. Accepted when #230 shipped rather than
+splitting the call, since only the bound here ends the restart loop.
 
 ## Proxmox backups phase 2 -- server half tracked in fivenines_server#1164
 
