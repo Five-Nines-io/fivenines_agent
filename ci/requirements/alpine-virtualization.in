@@ -1,0 +1,10 @@
+# The virtualization group's pure-Python packages for the Alpine builds.
+# `poetry install` there skips that optional group, and `--with virtualization`
+# would rebuild libvirt-python from its sdist at poetry.lock's version, while
+# Alpine needs the one matching its own libvirt (libvirt-python-alpine.in);
+# systemd-watchdog is excluded there (no systemd). Without these, the Alpine
+# binary shipped with neither proxmoxer nor pynvml. The versions must equal
+# poetry.lock's: py2exe_alpine.sh checks that and fails if they drift.
+proxmoxer==2.2.0
+pynvml==12.0.0
+nvidia-ml-py==12.575.51
