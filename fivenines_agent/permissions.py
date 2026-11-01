@@ -1142,6 +1142,14 @@ class PermissionProbe:
         except ImportError as e:
             self._set_reason(f"wmi package not installed: {e}")
             return False
+        except Exception as e:
+            # wmi connects to WMI when it is imported (GetObject("winmgmts:")
+            # at module level), so a disabled service or a broken repository
+            # raises pywintypes.com_error here, not ImportError. Nothing above
+            # this probe catches it: escaping, it crashed Agent.__init__ on
+            # every start of the service.
+            self._set_reason(f"WMI unavailable: {type(e).__name__}: {e}")
+            return False
         return True
 
     def _can_read_uninstall_registry(self):

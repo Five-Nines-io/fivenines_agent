@@ -502,6 +502,32 @@ def test_can_query_wmi_storage_absent():
     )
 
 
+def test_can_query_wmi_storage_wmi_service_unavailable():
+    """wmi calls GetObject("winmgmts:") at import, so a disabled WMI service
+    or a broken repository raises pywintypes.com_error, not ImportError: the
+    probe must report disk_health unavailable instead of letting it escape
+    and crash Agent.__init__."""
+
+    class com_error(Exception):  # stands in for pywintypes.com_error
+        pass
+
+    probe = _new_probe_with({})
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name == "wmi":
+            raise com_error(-2147217394, "OLE error 0x8004100e", None, None)
+        return real_import(name, *args, **kwargs)
+
+    with patch.object(builtins, "__import__", fake_import):
+        assert probe._probe("disk_health", probe._can_query_wmi_storage) is False
+    reason = probe._capability_reasons["disk_health"]
+    assert reason.startswith("WMI unavailable: com_error: ")
+    assert "0x8004100e" in reason
+
+
 def test_can_read_uninstall_registry_success():
     probe = _new_probe_with({})
     fake_winreg = MagicMock()
