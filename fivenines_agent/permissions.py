@@ -16,6 +16,7 @@ from fivenines_agent.debug import log
 from fivenines_agent.env import is_windows
 from fivenines_agent.openvpn import probe_management_access
 from fivenines_agent.qemu import DEFAULT_LIBVIRT_URI
+from fivenines_agent.scrub import log_safe
 from fivenines_agent.subprocess_utils import get_clean_env, run_privileged
 from fivenines_agent.wireguard import (
     WG_DUMP_ARGV,
@@ -409,7 +410,12 @@ class PermissionProbe:
             msg += f": {hint}"
         reason = self._capability_reasons.get(cap)
         if reason:
-            msg += f" ({reason})"
+            # A reason can quote OS text (a com_error's localized message, a
+            # "DLL load failed" ImportError), and this line is print()ed at
+            # startup: on a Windows service's ANSI-code-page stdout a character
+            # it cannot encode raised UnicodeEncodeError out of Agent.__init__.
+            # log_safe() escapes non-ASCII and collapses control characters.
+            msg += f" ({log_safe(reason)})"
         return msg
 
     def _log_capability_flip(self, name, available):

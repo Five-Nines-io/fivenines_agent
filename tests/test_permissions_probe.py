@@ -419,6 +419,35 @@ def test_unavailable_log_without_reason_omits_parens():
     assert docker_msg.endswith("docker group")
 
 
+def test_unavailable_log_line_survives_a_cp1252_service_stdout():
+    """A reason can carry OS text in the system language (a com_error's
+    message, a "DLL load failed" ImportError). The startup log prints it, and
+    a Windows service's stdout encodes in the ANSI code page with
+    errors='strict': the line must encode in cp1252 and stay on one line,
+    while the reason itself (shipped in capability_reasons) is unchanged."""
+    reason = "WMI unavailable: com_error: (-2147217394, '\u30b5\u30fc\u30d3\u30b9\nstopped', None, None)"
+
+    def gpu_unavailable_with_reason(self):
+        self._set_reason(reason)
+        return False
+
+    returns = {"default": True}
+    with _patched_probe(returns, exclude=["_can_access_gpu"]), patch.object(
+        PermissionProbe,
+        "_can_access_gpu",
+        autospec=True,
+        side_effect=gpu_unavailable_with_reason,
+    ), patch("fivenines_agent.permissions.log") as mock_log:
+        probe = PermissionProbe()
+
+    info_msgs = [c.args[0] for c in mock_log.call_args_list if c.args[1] == "info"]
+    gpu_msg = next(m for m in info_msgs if "nvidia_gpu" in m and "unavailable" in m)
+    gpu_msg.encode("cp1252")  # print() on the service's stdout must not raise
+    assert "\n" not in gpu_msg
+    assert "\\u30b5" in gpu_msg
+    assert probe._capability_reasons["nvidia_gpu"] == reason
+
+
 # ----- T2: Windows-tailored capability set, banner, and probe methods -----
 
 
