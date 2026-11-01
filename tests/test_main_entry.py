@@ -10,6 +10,7 @@ agent.
 """
 
 import importlib.util
+import re
 import runpy
 import subprocess
 import sys
@@ -192,6 +193,24 @@ def test_start_check_imports_fails_when_the_agent_cannot_be_imported(monkeypatch
 
     with pytest.raises(ImportError):
         main_module.start()
+
+
+# Value: protects=each build/distro smoke check invokes the binary with --check-imports; fails_when=the invocation is dropped or switched back to --version while a quoted PASS/FAIL message (test-distro.sh record_result, py2exe_windows.ps1 Write-Error) still names the flag; why_new=the comment-only filter accepted any mention, so in two of the four scripts a message string alone passed; seam=none; no_claim=that a failing check aborts the build (exit 1 / FAIL_COUNT) or that the frozen binary passes it
+@pytest.mark.parametrize(
+    "script",
+    ["py2exe.sh", "py2exe_alpine.sh", "py2exe_windows.ps1", "ci/test-distro.sh"],
+)
+def test_every_binary_smoke_check_runs_check_imports(script):
+    """--version no longer imports the agent, so a build or distro smoke check
+    that ran only --version would stop catching a missing hidden import or an
+    extension module that does not load on the target libc. Each one must run
+    --check-imports: as a bare argument, on a line that is not a comment and
+    outside any quoted string, since test-distro.sh and py2exe_windows.ps1 also
+    name the flag in their PASS/FAIL messages."""
+    lines = (REPO_ROOT / script).read_text(encoding="utf-8").splitlines()
+    code = [line.split("#", 1)[0] for line in lines]
+    bare = [re.sub(r"\"[^\"]*\"|'[^']*'", "", line) for line in code]
+    assert any("--check-imports" in line for line in bare)
 
 
 def test_start_dry_run_flag_is_visible_to_the_agent(monkeypatch):

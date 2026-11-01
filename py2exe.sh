@@ -345,12 +345,18 @@ echo "Total directory size: $(du -sh ./build/$BINARY_NAME | awk '{print $1}')"
 echo "Binary dependencies:"
 ldd ./build/$BINARY_NAME/$BINARY_NAME | head -10 || echo "ldd check failed (might be expected)"
 
-# Quick test of the binary. --version must succeed: it imports the full
-# collector graph (incl. pg8000, which reads its package metadata at import),
-# so this catches missing hidden imports or un-copied metadata before shipping.
+# Quick test of the binary. --check-imports must succeed: it imports the agent
+# and every collector it loads at startup (incl. pg8000, which reads its package
+# metadata at import), so this catches missing hidden imports or un-copied
+# metadata before shipping.
+# --version no longer does: it exits before the agent is imported, to stay fast.
 echo "=== Testing Built Binary ==="
+if ! ./build/$BINARY_NAME/$BINARY_NAME --check-imports; then
+    echo "Smoke check FAILED: built binary cannot import the agent (missing hidden import or bundled metadata). Aborting."
+    exit 1
+fi
 if ! VERSION_OUTPUT="$(./build/$BINARY_NAME/$BINARY_NAME --version)"; then
-    echo "Smoke check FAILED: built binary cannot run --version (missing hidden import or bundled metadata). Aborting."
+    echo "Smoke check FAILED: built binary cannot run --version. Aborting."
     exit 1
 fi
 echo "$VERSION_OUTPUT"

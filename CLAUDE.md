@@ -45,9 +45,14 @@ poetry run fivenines_agent
 # Run with dry-run mode (collects metrics once and exits, prints JSON to stdout)
 poetry run fivenines_agent --dry-run
 
-# Check version
+# Check version (exits before the agent module is imported, so it stays fast)
 poetry run fivenines_agent --version
+
+# Import the agent and every module it loads at startup, then exit (the binary smoke check)
+poetry run fivenines_agent --check-imports
 ```
+
+`__main__.start()` (also the PyInstaller entry, `py2exe_entrypoint.py`) parses the command line BEFORE importing `fivenines_agent.agent`: that import pulls in the whole collector graph and was ~70% of the frozen binary's `--version` time (~210ms -> ~60ms). Keep `cli.py` light for the same reason; `tests/test_main_entry.py` checks in a fresh interpreter that `--version` loads none of it. Since `--version` no longer exercises the bundled modules, the build smoke checks (`py2exe.sh`, `py2exe_alpine.sh`, `py2exe_windows.ps1`) and `ci/test-distro.sh` run `--check-imports` to catch a missing hidden import or an extension module that does not load on a distro's libc. It proves only what the agent imports at load time, like the old `--version` check did: modules imported lazily (`snmp`) or under `try/except ImportError` (libvirt, pynvml, proxmoxer, systemd_watchdog; wmi and win32pdh on Windows) fail soft at runtime and are not covered, and neither is the agent's own metadata (`cli.py` falls back to `0.0.0+unknown`; only `py2exe.sh` checks the version string). The import also loads `<config_dir>/.env` (module level in `agent.py`), so an unreadable `.env` fails the check.
 
 ## Architecture
 

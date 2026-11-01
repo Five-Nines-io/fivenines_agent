@@ -151,6 +151,18 @@ if timeout 60 "$AGENT_EXECUTABLE" --version > "${OUTPUT_DIR}/version_output" 2>&
 else
   record_result "--version" "FAIL" "exit code $?"
 fi
+# --version exits before the agent is imported, so it no longer proves the
+# bundled extension modules (psutil, _ssl over the bundled OpenSSL, _lzma, ...)
+# load on this distro's libc. --check-imports does, and unlike the dry-run below
+# it needs no python3 in the image. stderr stays out of the PASS row: the
+# results table goes through printf '%b', where a stray warning line would
+# break the table and a literal \c would cut the rest of the report.
+if timeout 60 "$AGENT_EXECUTABLE" --check-imports > "${OUTPUT_DIR}/check_imports_output" 2> "${OUTPUT_DIR}/check_imports_stderr"; then
+  record_result "--check-imports" "PASS" "$(head -n 1 "${OUTPUT_DIR}/check_imports_output")"
+else
+  record_result "--check-imports" "FAIL" "exit code $?"
+  cat "${OUTPUT_DIR}/check_imports_output" "${OUTPUT_DIR}/check_imports_stderr"
+fi
 
 # ---------------------------------------------------------------
 # Test 2: Shared libraries resolve (ldd)
