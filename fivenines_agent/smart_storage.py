@@ -36,9 +36,8 @@ VENDOR_LIFE_ATTRIBUTE_MAP = [
     ('device_model', 'Crucial', '202'),
     ('model_family', 'Micron', '202'),
     ('device_model', 'Micron', '202'),
-    # SanDisk SSDs - use attribute 230 or 232
-    ('model_family', 'SanDisk', '232'),
-    ('device_model', 'SanDisk', '232'),
+    # No SanDisk entry: its 232 is spare blocks (Perc_Avail_Resrvd_Space /
+    # Available_Reservd_Space, see NOT_WEAR_ATTRIBUTE_NAMES), never wear
     # Western Digital SSDs - use attribute 231
     ('model_family', 'Western Digital', '231'),
     ('device_model', 'WD', '231'),
@@ -90,6 +89,43 @@ VENDOR_LIFE_ATTRIBUTE_MAP = [
 # Fallback priority order for unknown SSDs
 # Check these attributes in order, use first one with valid value
 LIFE_ATTRIBUTE_FALLBACK_ORDER = ['231', '232', '233', '177', '202']
+
+# What smartctl prints on one health read (#230). -i adds the INFORMATION
+# section (Model Family / Device Model / Rotation Rate): without it the vendor
+# wear attribute above and the spinning-disk check had nothing to read, so the
+# fallback order always decided. -l ssd adds ATA Device Statistics page 7, the
+# drive's own "Percentage Used Endurance Indicator". Both ride the same spawn;
+# -l ssd exists since smartmontools 5.42 (2011), is ignored for NVMe, and a
+# drive without the page prints no value row.
+HEALTH_SMARTCTL_ARGS = ['-i', '-A', '-H', '-l', 'ssd']
+
+# Names smartctl's drive database gives the life ids above (177/202/231/232/
+# 233) on drives where that id measures something else (#230): an attribute
+# smartctl names one of these is never read as wear. 232 is a wear figure on
+# no drive in the database, and its generic name is Available_Reservd_Space
+# (spare blocks, still ~100 on a worn-out SSD), yet it came second in the
+# fallback order: an Intel or Toshiba SSD at 1% or 72% life read 99-100%.
+# A name outside this set still counts, so a drive smartctl does not know
+# (generic names, e.g. 231 Temperature_Celsius on an older smartctl) reads as
+# before. Source: smartmontools drivedb.h.
+NOT_WEAR_ATTRIBUTE_NAMES = frozenset({
+    # 177
+    'Endurance_Limit_Met', 'Read_Retry_Cnt', 'Wear_Range_Delta',
+    # 202
+    'Error_Bits_Flash_Tot_Ct', 'Exception_Mode_Status',
+    'Total_Read_Bits_Corr_Ct',
+    # 231
+    'Controller_Temperature',
+    # 232
+    'Available_Reservd_Space', 'Firmware_Version_Info', 'Lifetime_Writes',
+    'Perc_Avail_Resrvd_Space', 'Read_Fail_Count', 'Read_Failure_Blk_Ct',
+    'Spares_Remaining_Perc', 'Total_Number_of_Reads', 'Total_Read_Cnt',
+    # 233
+    'ECC_Fail_Record', 'Flash_Writes_32MiB', 'Flash_Writes_GiB',
+    'Lifetime_Nand_Writes', 'Lifetime_Wts_To_Flsh_GB', 'NAND_GB_Written_TLC',
+    'NAND_GiB_Written', 'NAND_Writes_1GiB', 'Number_Of_Write_Ct',
+    'SandForce_Internal', 'Total_LBAs_Written', 'Total_NAND_Writes_GiB',
+})
 
 # Standard SMART attribute names by ID
 SMART_ATTRIBUTE_NAMES = {
@@ -171,15 +207,24 @@ def get_life_attribute_for_drive(model_family, device_model):
     return None
 
 
-def calculate_percentage_used(results, model_family=None, device_model=None):
+def calculate_percentage_used(
+    results, model_family=None, device_model=None, endurance_used=None,
+    attribute_names=None,
+):
     """
     Calculate unified percentage_used for a drive.
 
-    For NVMe: uses 100 - percent_used
-    For SATA SSD: uses vendor-specific attribute or fallback heuristic
+    For NVMe: uses percent_used verbatim
+    For SATA SSD: the drive's Device Statistics endurance indicator
+    (endurance_used) when it reports one, else 100 - the normalized VALUE of
+    the vendor-specific attribute or of the fallback order, skipping any
+    attribute smartctl names as something other than wear (attribute_names:
+    id -> smartctl's ATTRIBUTE_NAME)
     For HDD: returns None (not applicable)
 
-    Returns the percentage used (0-100) or None if not available.
+    Returns the percentage used or None if not available. Like NVMe's, the
+    endurance indicator is shipped as read and passes 100 on a drive past its
+    rated endurance; an attribute-derived value stays within 0-100.
     """
     device_type = results.get('device_type')
 
@@ -190,27 +235,30 @@ def calculate_percentage_used(results, model_family=None, device_model=None):
             return percent_used
         return None
 
-    # HDD detection: has rotation rate that's not "Solid State Device"
-    rotation_rate = results.get('rotation_rate', '')
-    if rotation_rate and 'Solid State' not in rotation_rate:
+    # HDD detection: smartctl prints "<N> rpm" for a spinning disk ("Solid
+    # State Device" for an SSD, "Unknown (0x....)" for a reserved value, which
+    # some SSDs and USB bridges report: not proof of a spinning disk)
+    if 'rpm' in results.get('rotation_rate', ''):
         return None
 
-    # SATA SSD: try vendor-specific attribute first
+    # ATA Device Statistics page 7: the drive's own wear figure, standardized
+    # (ACS-3) with the meaning and scale of NVMe Percentage Used, so it needs
+    # no vendor table and wins over every attribute heuristic.
+    if endurance_used is not None:
+        return endurance_used
+
+    # SATA SSD: try vendor-specific attribute first, then the fallback order
+    attribute_names = attribute_names or {}
+    candidates = list(LIFE_ATTRIBUTE_FALLBACK_ORDER)
     life_attr_id = get_life_attribute_for_drive(model_family, device_model)
-
     if life_attr_id:
-        attr_name = SMART_ATTRIBUTE_NAMES.get(life_attr_id, f"smart_attr_{life_attr_id}")
-        pct_key = f"{attr_name}_pct"
-        if pct_key in results and results[pct_key] is not None:
-            value = results[pct_key]
-            return max(0, min(100, 100 - value))
-
-    # Fallback: try common life attributes in priority order
-    for attr_id in LIFE_ATTRIBUTE_FALLBACK_ORDER:
+        candidates.insert(0, life_attr_id)
+    for attr_id in candidates:
+        if attribute_names.get(attr_id) in NOT_WEAR_ATTRIBUTE_NAMES:
+            continue
         attr_name = SMART_ATTRIBUTE_NAMES.get(attr_id, f"smart_attr_{attr_id}")
-        pct_key = f"{attr_name}_pct"
-        if pct_key in results and results[pct_key] is not None:
-            value = results[pct_key]
+        value = results.get(f"{attr_name}_pct")
+        if value is not None:
             return max(0, min(100, 100 - value))
 
     return None
@@ -343,24 +391,36 @@ def get_storage_info(device, nvme_available=lambda: False):
     the caller. It is consulted only for devices whose parsed SMART output is
     NVMe, so a host with no NVMe device never shells out to `nvme version` and a
     multi-NVMe host probes exactly once per tick.
+
+    One smartctl call (HEALTH_SMARTCTL_ARGS) reads the identity, the attribute
+    table, the verdict and the Device Statistics endurance indicator. The
+    identity and the endurance indicator only feed percentage_used: the entry
+    ships the same keys as before #230 (smart_storage_identification carries
+    the identity).
     """
     try:
         results = {
             "device": device.split('/')[-1]
         }
         proc_result = run_privileged(
-            ['sudo', 'smartctl', '-A', '-H', device],
+            ['sudo', 'smartctl', *HEALTH_SMARTCTL_ARGS, device],
             capture_output=True, text=True,
             timeout=_DATA_SUBPROCESS_TIMEOUT,
             env=get_clean_env()
         )
         storage_stats = proc_result.stdout.splitlines()
 
+        identity = {}
+        attribute_names = {}
+        endurance_used = None
         # Skip header lines until we find the SMART data section
         found_section = False
         current_section = None
         for stats in storage_stats:
-            if "=== START OF SMART DATA SECTION ===" in stats:
+            if "=== START OF INFORMATION SECTION ===" in stats:
+                current_section = "info"
+                continue
+            elif "=== START OF SMART DATA SECTION ===" in stats:
                 found_section = True
                 current_section = "nvme"
                 results["device_type"] = "nvme"
@@ -370,22 +430,42 @@ def get_storage_info(device, nvme_available=lambda: False):
                 current_section = "ata"
                 results["device_type"] = "ata"
                 continue
+            if current_section == "info":
+                key, sep, value = stats.partition(":")
+                key = key.strip()
+                if sep and key in STORAGE_IDENTIFICATION_ATTRIBUTES:
+                    identity[STORAGE_IDENTIFICATION_ATTRIBUTES[key]] = value.strip()
+                continue
             if not found_section:
                 continue
 
             if stats.rfind(":") == -1:
-                # Handle ATA SMART attributes table
-                if current_section == "ata" and "ID#" not in stats and stats.strip():
+                if current_section == "ata" and stats.strip():
                     try:
                         parts = stats.split()
-                        if len(parts) >= 10:
+                        if parts[0] in ("0x07", "7") and parts[1:2] == ["0x008"] and len(parts) > 3:
+                            # Device Statistics page 7 (-l ssd): `0x07  0x008
+                            # 1  104  ---  Percentage Used Endurance Indicator`,
+                            # '-' in the value column when the drive flags it
+                            # invalid. smartctl < 6.4 prints the page in
+                            # decimal and marks a normalized value with a '~'
+                            # suffix (`  7  0x008  1  28~ Percentage ...`).
+                            endurance_used = safe_int_conversion(parts[3])
+                        elif parts[0].isdigit() and len(parts) >= 10 and parts[2].startswith("0x"):
+                            # ATA SMART attributes table row: a decimal id,
+                            # then the name and the hex FLAG column. Neither
+                            # the table header (ID#) nor a Device Statistics
+                            # row is one, including smartctl < 6.4's decimal
+                            # page title (`  7  =====  =  ...  (rev 1) ==`).
                             attr_id = parts[0]
                             # Use standardized attribute name if available
                             attr_name = SMART_ATTRIBUTE_NAMES.get(attr_id, f"smart_attr_{attr_id}")
                             results[attr_name] = safe_int_conversion(parts[9])
                             # For wear/life attributes, also capture the normalized VALUE (0-100%)
+                            # and the name smartctl gives the attribute on this drive
                             if attr_id in SMART_LIFE_ATTRIBUTES:
                                 results[f"{attr_name}_pct"] = safe_int_conversion(parts[3])
+                                attribute_names[attr_id] = parts[1]
                     except Exception as e:
                         log(f"Error parsing ATA attribute: {e}", 'error')
                 continue
@@ -410,10 +490,13 @@ def get_storage_info(device, nvme_available=lambda: False):
             results.update(nvme_info)
 
         # Calculate unified percentage_used
+        facts = {**identity, **results}
         percentage_used = calculate_percentage_used(
-            results,
-            model_family=results.get('model_family'),
-            device_model=results.get('device_model')
+            facts,
+            model_family=facts.get('model_family'),
+            device_model=facts.get('device_model'),
+            endurance_used=endurance_used,
+            attribute_names=attribute_names,
         )
         if percentage_used is not None:
             results['percentage_used'] = percentage_used
