@@ -45,9 +45,15 @@ poetry run fivenines_agent
 # Run with dry-run mode (collects metrics once and exits, prints JSON to stdout)
 poetry run fivenines_agent --dry-run
 
-# Check version
+# Check version (exits before the agent module is imported, so it stays fast)
 poetry run fivenines_agent --version
+
+# Import the agent, its lazily imported modules and each optional MODULE named,
+# then exit (the binary smoke check)
+poetry run fivenines_agent --check-imports [MODULE ...]
 ```
+
+`__main__.start()` (also the PyInstaller entry, `py2exe_entrypoint.py`) parses the command line BEFORE importing `fivenines_agent.agent`: that import pulls in the whole collector graph and was ~70% of the frozen binary's `--version` time (~210ms -> ~60ms). Keep `cli.py` light for the same reason; `tests/test_main_entry.py` checks in a fresh interpreter that `--version` loads none of it. Since `--version` no longer exercises the bundled modules, the build smoke checks (`py2exe.sh`, `py2exe_alpine.sh`, `py2exe_windows.ps1`) and `ci/test-distro.sh` run `--check-imports` to catch a missing hidden import or an extension module that does not load on a distro's libc. Besides the agent's load-time imports it loads the modules the agent imports only inside a function (`snmp`; a fresh-interpreter test fails if any package module is left out) and each optional MODULE named on the command line: the ones the agent imports under `try/except ImportError` and would otherwise silently go without. Each build names what it bundles, kept beside its hidden imports: `py2exe.sh` libvirt, pynvml, proxmoxer.backends.https, systemd_watchdog (none for Synology); `py2exe_alpine.sh` the same minus systemd_watchdog; `py2exe_windows.ps1` wmi, win32pdh, win32timezone; `ci/test-distro.sh` repeats the Linux and Alpine lists per variant (a test keeps them equal). The Alpine build installs proxmoxer, pynvml and nvidia-ml-py from `ci/requirements/alpine-virtualization.txt` (pinned to poetry.lock's versions and hashes: `py2exe_alpine.sh` checks the versions at build time, and `tests/test_build_requirements.py` checks versions and hashes in the test job, since a pull request -- a Dependabot poetry.lock bump included -- does not run the Alpine build), since its `poetry install` skips the optional virtualization group and `--with virtualization` would rebuild libvirt-python: before 1.21.6 the Alpine binary shipped without proxmoxer and pynvml. Still not proven: the agent's own metadata (`cli.py` falls back to `0.0.0+unknown`; only `py2exe.sh` checks the version string). The import also loads `<config_dir>/.env` (module level in `agent.py`), so an unreadable `.env` fails the check.
 
 ## Architecture
 
@@ -122,7 +128,7 @@ poetry run fivenines_agent --version
 - Any new collector reading a server-pushed HTTP URL must fetch through this posture (streamed, redirects refused, capped) instead of `response.text` / `response.json()`
 
 **Wire/Log Sanitation (`scrub.py`)**
-- `scrub_str` / `scrub_message` / `log_safe` / `as_int` / `as_bool`: the one implementation of how an API collector ships or logs a customer-controlled string (UTF-8 repaired, NUL removed, capped; messages prefix-bounded BEFORE `redact()` so a hostile blob cannot make the redaction regexes a CPU sink; control characters collapsed and non-ASCII backslash-escaped on the log path, so print() cannot raise on any stdout encoding -- a Windows service's is the ANSI code page). Shared by `proxmox.py` (which keeps its old private names as aliases) and `pbs.py`; a new API collector uses it rather than a copy
+- `scrub_str` / `scrub_message` / `log_safe` / `as_int` / `as_bool`: the one implementation of how an API collector ships or logs a customer-controlled string (UTF-8 repaired, NUL removed, capped; messages prefix-bounded BEFORE `redact()` so a hostile blob cannot make the redaction regexes a CPU sink; control characters collapsed and non-ASCII backslash-escaped on the log path, so print() cannot raise on any stdout encoding -- a Windows service's is the ANSI code page). Shared by `proxmox.py` (which keeps its old private names as aliases), `pbs.py` and `permissions.py` (`log_safe` on the capability reasons printed at startup, which can quote localized OS text such as a WMI `com_error` message); a new API collector uses it rather than a copy
 
 **Environment (`env.py`)**
 - Central source for runtime configuration: `api_url()`, `config_dir()`, `dry_run()`, `log_level()`

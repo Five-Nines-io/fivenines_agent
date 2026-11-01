@@ -326,8 +326,14 @@ if [ -n "${SYNOLOGY:-}" ]; then
     # they must be excluded explicitly or PyInstaller would bundle them --
     # pynvml included, which the standard build --hidden-imports.
     PYI_EXTRA=(--exclude-module libvirt --exclude-module libvirtmod --exclude-module systemd_watchdog --exclude-module proxmoxer --exclude-module pynvml)
+    CHECK_IMPORTS=()
 else
     PYI_EXTRA=(--hidden-import=libvirt --hidden-import=libvirtmod --hidden-import=proxmoxer.backends --hidden-import=proxmoxer.backends.https --hidden-import=pynvml --add-binary "/usr/lib64/libtirpc.so.3:.")
+    # The optional modules this build bundles, which the agent imports under
+    # try/except ImportError: the smoke check below must prove they load, or a
+    # missing one would ship and the agent silently go without it. Keep in
+    # step with PYI_EXTRA and with the linux-* list in ci/test-distro.sh.
+    CHECK_IMPORTS=(libvirt pynvml proxmoxer.backends.https systemd_watchdog)
 fi
 
 LD_LIBRARY_PATH="/opt/python/cp310-cp310/lib:$LD_LIBRARY_PATH" pyinstaller \
@@ -345,12 +351,18 @@ echo "Total directory size: $(du -sh ./build/$BINARY_NAME | awk '{print $1}')"
 echo "Binary dependencies:"
 ldd ./build/$BINARY_NAME/$BINARY_NAME | head -10 || echo "ldd check failed (might be expected)"
 
-# Quick test of the binary. --version must succeed: it imports the full
-# collector graph (incl. pg8000, which reads its package metadata at import),
-# so this catches missing hidden imports or un-copied metadata before shipping.
+# Quick test of the binary. --check-imports must succeed: it imports the agent
+# and every collector (incl. pg8000, which reads its package metadata at
+# import), plus each optional module in CHECK_IMPORTS, so this catches missing
+# hidden imports or un-copied metadata before shipping.
+# --version no longer does: it exits before the agent is imported, to stay fast.
 echo "=== Testing Built Binary ==="
+if ! ./build/$BINARY_NAME/$BINARY_NAME --check-imports "${CHECK_IMPORTS[@]}"; then
+    echo "Smoke check FAILED: built binary cannot import the agent or an optional module in CHECK_IMPORTS (missing hidden import, dependency or bundled metadata; the traceback above names it). Aborting."
+    exit 1
+fi
 if ! VERSION_OUTPUT="$(./build/$BINARY_NAME/$BINARY_NAME --version)"; then
-    echo "Smoke check FAILED: built binary cannot run --version (missing hidden import or bundled metadata). Aborting."
+    echo "Smoke check FAILED: built binary cannot run --version. Aborting."
     exit 1
 fi
 echo "$VERSION_OUTPUT"

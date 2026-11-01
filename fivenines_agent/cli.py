@@ -19,11 +19,22 @@ _args = None
 
 
 def parse_args():
-    """Parse command-line arguments. Handles --version and --dry-run."""
+    """Parse command-line arguments. Handles --version, --dry-run and --check-imports.
+
+    Keep this module light: __main__.start() runs it before importing the
+    agent, so whatever it imports is paid by every --version.
+    """
     global _args
     parser = argparse.ArgumentParser(description='Fivenines monitoring agent')
     parser.add_argument('--version', action='version', version=f'fivenines-agent {VERSION}')
     parser.add_argument('--dry-run', action='store_true', help='Run once and print output without sending data')
+    parser.add_argument(
+        '--check-imports',
+        nargs='*',
+        metavar='MODULE',
+        help='Import the agent, the modules it loads lazily and each optional MODULE given '
+        '(e.g. libvirt), then exit without running (binary smoke check)',
+    )
     _args = parser.parse_args()
     return _args
 

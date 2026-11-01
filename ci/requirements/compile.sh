@@ -23,3 +23,6 @@ compile libvirt-build
 # building it against libvirt; --no-deps pins the sdist without building it.
 compile libvirt-python --no-deps
 compile libvirt-python-alpine --no-deps
+# proxmoxer, pynvml and nvidia-ml-py have no other dependencies, and --no-deps
+# keeps uv from re-pinning anything poetry.lock already installs on Alpine.
+compile alpine-virtualization --no-deps

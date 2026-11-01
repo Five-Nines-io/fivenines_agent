@@ -61,6 +61,23 @@ poetry config installer.max-workers 1
 # build fetches its build backend unpinned, so that fails instead.
 POETRY_INSTALLER_ONLY_BINARY=":all:" poetry install --no-interaction
 
+# That install skips the optional virtualization group, so the Alpine binary
+# shipped with neither proxmoxer nor pynvml (--hidden-import only warns about a
+# module that is not installed). `poetry install --with virtualization` would
+# rebuild libvirt-python from its sdist at poetry.lock's version, so install the
+# group's pure-Python packages from their hash-pinned file, wheels only, after
+# checking that each pin is the version poetry.lock locks.
+echo "=== Installing proxmoxer and pynvml ==="
+for pkg in proxmoxer pynvml nvidia-ml-py; do
+    LOCKED=$(awk -v name="$pkg" '$0 == "name = \"" name "\"" {getline; gsub(/"/, "", $3); print $3}' poetry.lock)
+    if [ -z "$LOCKED" ] || ! grep -q "^${pkg}==${LOCKED} " ci/requirements/alpine-virtualization.txt; then
+        echo "poetry.lock locks ${pkg} ${LOCKED:-(not found)}, but ci/requirements/alpine-virtualization.txt pins another version."
+        echo "Update ci/requirements/alpine-virtualization.in and run ci/requirements/compile.sh."
+        exit 1
+    fi
+done
+python -m pip install --require-hashes --no-deps --only-binary :all: -r ci/requirements/alpine-virtualization.txt
+
 # Remove systemd-watchdog (not needed on Alpine, may fail to import)
 pip uninstall -y systemd-watchdog 2>/dev/null || true
 
@@ -114,6 +131,7 @@ PYINSTALLER_ARGS="--strip \
     --hidden-import=libvirtmod \
     --hidden-import=proxmoxer.backends \
     --hidden-import=proxmoxer.backends.https \
+    --hidden-import=pynvml \
     --hidden-import=scramp \
     --hidden-import=dateutil.parser \
     --hidden-import=paho.mqtt.client \
@@ -142,10 +160,21 @@ echo "Total directory size: $(du -sh ./build/$BINARY_NAME | awk '{print $1}')"
 echo "Binary dependencies:"
 ldd ./build/$BINARY_NAME/$BINARY_NAME | head -10 || echo "ldd check failed"
 
-# Quick test. --version imports the full collector graph (incl. pg8000, which
-# reads its package metadata at import), so a failure here means a missing
-# hidden import or un-copied metadata -- fail the build rather than ship it.
+# Quick test. --check-imports imports the agent and every collector (incl.
+# pg8000, which reads its package metadata at import), plus each optional module
+# named below -- the ones the agent imports under try/except ImportError and
+# would otherwise silently go without -- so a failure here means a missing
+# hidden import, dependency or metadata: fail the build rather than ship it.
+# Keep the list in step with the hidden imports above and with the alpine-*
+# list in ci/test-distro.sh (systemd_watchdog is excluded on Alpine).
+# --version no longer does: it exits before the agent is imported, to stay fast.
+CHECK_IMPORTS="libvirt pynvml proxmoxer.backends.https"
 echo "=== Testing Built Binary ==="
+# shellcheck disable=SC2086 # CHECK_IMPORTS is a word list
+if ! ./build/$BINARY_NAME/$BINARY_NAME --check-imports $CHECK_IMPORTS; then
+    echo "Smoke check FAILED: built binary cannot import the agent or an optional module in CHECK_IMPORTS (the traceback above names it). Aborting."
+    exit 1
+fi
 if ! ./build/$BINARY_NAME/$BINARY_NAME --version; then
     echo "Smoke check FAILED: built binary cannot run --version. Aborting."
     exit 1

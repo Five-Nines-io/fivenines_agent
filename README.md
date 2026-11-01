@@ -315,6 +315,12 @@ dump is read through a `sudo` rule rather than a process capability, so install
 an ambient capability that OpenRC cannot grant to a non-root user, and was
 unavailable here unless the agent ran as root.
 
+The Alpine build bundles pynvml and proxmoxer, the libraries the NVIDIA GPU
+and Proxmox VE collectors load (agent **1.21.6+**). Earlier Alpine builds
+shipped without both, so NVIDIA GPU always read unavailable here (`pynvml not
+installed`), and Proxmox VE reported `null` even on a host the agent detected
+as a Proxmox VE node (`/etc/pve` or `pvesh`).
+
 ### UNRAID
 
 Use the [standard installer](#standard-installation-linux) -- it detects UNRAID
