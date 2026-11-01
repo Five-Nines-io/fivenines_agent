@@ -881,7 +881,7 @@ def test_get_storage_info_parses_ata_attribute_table(monkeypatch):
 
     cmd = run.call_args.args[0]
     assert cmd[0] == "sudo"
-    assert cmd[-4:] == ["smartctl", "-A", "-H", "/dev/sda"]
+    assert cmd[-7:] == ["smartctl", "-i", "-A", "-H", "-l", "ssd", "/dev/sda"]
     # Wire names are spelled out. Row 9 pins TODAY's bug: SMART_ATTRIBUTE_NAMES
     # is shifted by one for ids 6-10 against smartmontools (9 is
     # Power_On_Hours, 10 Spin_Retry_Count), so power-on hours ship as
@@ -1020,3 +1020,406 @@ def test_safe_temperature_conversion():
     assert convert("n/a") is None
     # Undecoded output (bytes) is not text: None, never a TypeError.
     assert convert(b"36 Celsius") is None
+
+
+# --- real worn SSDs: the wear figure the dashboard shows (#230) -----------
+#
+# `smartctl -i -A -H -l ssd` on two SATA SSDs from a field report, rebuilt
+# from their `smartctl -x` (serial numbers and WWNs replaced). Before #230 the
+# agent read neither identity nor Device Statistics, the fallback order picked
+# 232 Available_Reservd_Space, and the dashboard showed 99% and 100% life for
+# drives at 1% and 72% by their Media_Wearout_Indicator.
+
+SMARTCTL_74_BANNER = (
+    "smartctl 7.4 2023-08-01 r5530 [x86_64-linux-6.8.0-147-generic] (local build)\n"
+    "Copyright (C) 2002-23, Bruce Allen, Christian Franke, www.smartmontools.org\n"
+    "\n"
+)
+
+# In smartctl's drive database: Model Family names the vendor.
+INTEL_S4510_INFO = (
+    "=== START OF INFORMATION SECTION ===\n"
+    "Model Family:     Intel S4510/S4610/S4500/S4600 Series SSDs\n"
+    "Device Model:     INTEL SSDSC2KB480G8\n"
+    "Serial Number:    TESTSERIAL0000001\n"
+    "LU WWN Device Id: 5 5cd2e4 000000001\n"
+    "Firmware Version: XCV10100\n"
+    "User Capacity:    480,103,981,056 bytes [480 GB]\n"
+    "Sector Sizes:     512 bytes logical, 4096 bytes physical\n"
+    "Rotation Rate:    Solid State Device\n"
+    "Form Factor:      2.5 inches\n"
+    "TRIM Command:     Available, deterministic, zeroed\n"
+    "Device is:        In smartctl database 7.3/5528\n"
+    "ATA Version is:   ACS-3 T13/2161-D revision 5\n"
+    "SATA Version is:  SATA 3.2, 6.0 Gb/s (current: 6.0 Gb/s)\n"
+    "Local Time is:    Sat Oct 31 21:26:22 2026 UTC\n"
+    "SMART support is: Available - device has SMART capability.\n"
+    "SMART support is: Enabled\n"
+    "\n"
+)
+
+# Rated endurance used up: 233 is at its floor (001) while 232, spare blocks,
+# still reads 099.
+INTEL_S4510_ATTRIBUTES = (
+    "=== START OF READ SMART DATA SECTION ===\n"
+    "SMART overall-health self-assessment test result: PASSED\n"
+    "\n"
+    "SMART Attributes Data Structure revision number: 1\n"
+    "Vendor Specific SMART Attributes with Thresholds:\n"
+    "ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_FAILED RAW_VALUE\n"
+    "  5 Reallocated_Sector_Ct   0x0032   099   099   000    Old_age   Always       -       2\n"
+    "  9 Power_On_Hours          0x0032   100   100   000    Old_age   Always       -       67155\n"
+    " 12 Power_Cycle_Count       0x0032   100   100   000    Old_age   Always       -       31\n"
+    "170 Available_Reservd_Space 0x0033   099   099   010    Pre-fail  Always       -       0\n"
+    "171 Program_Fail_Count      0x0032   100   100   000    Old_age   Always       -       1\n"
+    "172 Erase_Fail_Count        0x0032   100   100   000    Old_age   Always       -       0\n"
+    "174 Unsafe_Shutdown_Count   0x0032   100   100   000    Old_age   Always       -       29\n"
+    "175 Power_Loss_Cap_Test     0x0033   100   100   010    Pre-fail  Always       -       2693 (31 65535)\n"
+    "183 SATA_Downshift_Count    0x0032   100   100   000    Old_age   Always       -       0\n"
+    "184 End-to-End_Error_Count  0x0033   100   100   090    Pre-fail  Always       -       0\n"
+    "187 Uncorrectable_Error_Cnt 0x0032   100   100   000    Old_age   Always       -       0\n"
+    "190 Drive_Temperature       0x0022   060   056   000    Old_age   Always       -       40 (Min/Max 31/44)\n"
+    "192 Unsafe_Shutdown_Count   0x0032   100   100   000    Old_age   Always       -       29\n"
+    "194 Temperature_Celsius     0x0022   100   100   000    Old_age   Always       -       40\n"
+    "197 Pending_Sector_Count    0x0012   100   100   000    Old_age   Always       -       0\n"
+    "199 CRC_Error_Count         0x003e   100   100   000    Old_age   Always       -       0\n"
+    "225 Host_Writes_32MiB       0x0032   100   100   000    Old_age   Always       -       135420975\n"
+    "226 Workld_Media_Wear_Indic 0x0032   100   100   000    Old_age   Always       -       102390\n"
+    "227 Workld_Host_Reads_Perc  0x0032   100   100   000    Old_age   Always       -       1\n"
+    "228 Workload_Minutes        0x0032   100   100   000    Old_age   Always       -       4029179\n"
+    "232 Available_Reservd_Space 0x0033   099   099   010    Pre-fail  Always       -       0\n"
+    "233 Media_Wearout_Indicator 0x0032   001   001   000    Old_age   Always       -       0\n"
+    "234 Thermal_Throttle_Status 0x0032   100   100   000    Old_age   Always       -       0/0\n"
+    "235 Power_Loss_Cap_Test     0x0033   100   100   010    Pre-fail  Always       -       2693 (31 65535)\n"
+    "241 Host_Writes_32MiB       0x0032   100   100   000    Old_age   Always       -       135420975\n"
+    "242 Host_Reads_32MiB        0x0032   100   100   000    Old_age   Always       -       2326984\n"
+    "243 NAND_Writes_32MiB       0x0032   100   100   000    Old_age   Always       -       184610382\n"
+    "\n"
+)
+
+# The drive's own figure: 104% of its rated endurance used.
+INTEL_S4510_DEVSTAT = (
+    "Device Statistics (GP Log 0x04)\n"
+    "Page  Offset Size        Value Flags Description\n"
+    "0x07  =====  =               =  ===  == Solid State Device Statistics (rev 1) ==\n"
+    "0x07  0x008  1             104  ---  Percentage Used Endurance Indicator\n"
+    "                                |||_ C monitored condition met\n"
+    "                                ||__ D supports DSN\n"
+    "                                |___ N normalized value\n"
+    "\n"
+)
+
+# NOT in smartctl's drive database: no Model Family line, every attribute
+# under its generic name; only the Device Model names the vendor.
+TOSHIBA_HK6_INFO = (
+    "=== START OF INFORMATION SECTION ===\n"
+    "Device Model:     TOSHIBA KHK61RSE960G\n"
+    "Serial Number:    TESTSERIAL0000002\n"
+    "LU WWN Device Id: 5 8ce38e 000000002\n"
+    "Firmware Version: 1DET6102\n"
+    "User Capacity:    960,197,124,096 bytes [960 GB]\n"
+    "Sector Sizes:     512 bytes logical, 4096 bytes physical\n"
+    "Rotation Rate:    Solid State Device\n"
+    "Form Factor:      2.5 inches\n"
+    "TRIM Command:     Available, deterministic, zeroed\n"
+    "Device is:        Not in smartctl database 7.3/5528\n"
+    "ATA Version is:   ACS-3 (minor revision not indicated)\n"
+    "SATA Version is:  SATA 3.2, 6.0 Gb/s (current: 6.0 Gb/s)\n"
+    "Local Time is:    Sat Oct 31 22:32:20 2026 CET\n"
+    "SMART support is: Available - device has SMART capability.\n"
+    "SMART support is: Enabled\n"
+    "\n"
+)
+
+TOSHIBA_HK6_ATTRIBUTES = (
+    "=== START OF READ SMART DATA SECTION ===\n"
+    "SMART overall-health self-assessment test result: PASSED\n"
+    "\n"
+    "SMART Attributes Data Structure revision number: 4258\n"
+    "Vendor Specific SMART Attributes with Thresholds:\n"
+    "ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_FAILED RAW_VALUE\n"
+    "  5 Reallocated_Sector_Ct   0x0013   100   100   010    Pre-fail  Always       -       0\n"
+    "  9 Power_On_Hours          0x0012   100   100   000    Old_age   Always       -       56260\n"
+    " 12 Power_Cycle_Count       0x0032   100   100   000    Old_age   Always       -       3\n"
+    "173 Unknown_Attribute       0x0012   172   172   000    Old_age   Always       -       28\n"
+    "175 Program_Fail_Count_Chip 0x0033   100   100   099    Pre-fail  Always       -       10084583211008\n"
+    "179 Used_Rsvd_Blk_Cnt_Tot   0x0013   100   100   010    Pre-fail  Always       -       0\n"
+    "181 Program_Fail_Cnt_Total  0x0032   100   100   000    Old_age   Always       -       0\n"
+    "182 Erase_Fail_Count_Total  0x0032   100   100   000    Old_age   Always       -       0\n"
+    "183 Runtime_Bad_Block       0x0032   100   100   000    Old_age   Always       -       0\n"
+    "184 End-to-End_Error        0x0033   100   100   090    Pre-fail  Always       -       0\n"
+    "187 Reported_Uncorrect      0x0032   100   100   000    Old_age   Always       -       0\n"
+    "190 Airflow_Temperature_Cel 0x0022   076   071   000    Old_age   Always       -       24 (Min/Max 18/29)\n"
+    "192 Power-Off_Retract_Count 0x0032   100   100   000    Old_age   Always       -       0\n"
+    "194 Temperature_Celsius     0x0022   073   068   000    Old_age   Always       -       27 (Min/Max 21/32)\n"
+    "197 Current_Pending_Sector  0x0012   100   100   000    Old_age   Always       -       0\n"
+    "199 UDMA_CRC_Error_Count    0x000a   100   100   000    Old_age   Always       -       0\n"
+    "232 Available_Reservd_Space 0x0013   100   100   010    Pre-fail  Always       -       0\n"
+    "233 Media_Wearout_Indicator 0x0012   072   072   000    Old_age   Always       -       28\n"
+    "234 Unknown_Attribute       0x0032   100   100   000    Old_age   Always       -       0\n"
+    "241 Total_LBAs_Written      0x0032   100   100   000    Old_age   Always       -       111407976\n"
+    "242 Total_LBAs_Read         0x0032   100   100   000    Old_age   Always       -       6581295\n"
+    "243 Unknown_Attribute       0x0012   100   100   000    Old_age   Always       -       0\n"
+    "249 Unknown_Attribute       0x0032   100   100   000    Old_age   Always       -       3885064\n"
+    "\n"
+)
+
+TOSHIBA_HK6_DEVSTAT = (
+    "Device Statistics (GP Log 0x04)\n"
+    "Page  Offset Size        Value Flags Description\n"
+    "0x07  =====  =               =  ===  == Solid State Device Statistics (rev 1) ==\n"
+    "0x07  0x008  1              28  N--  Percentage Used Endurance Indicator\n"
+    "                                |||_ C monitored condition met\n"
+    "                                ||__ D supports DSN\n"
+    "                                |___ N normalized value\n"
+    "\n"
+)
+
+
+def _run_health(monkeypatch, *parts):
+    run = mock.Mock(return_value=_proc(0, SMARTCTL_74_BANNER + "".join(parts)))
+    monkeypatch.setattr(smart_storage, "run_privileged", run)
+    return smart_storage.get_storage_info("/dev/sdb"), run.call_args.args[0]
+
+
+@pytest.mark.parametrize(
+    "parts, expected",
+    [
+        # Today's read: Device Statistics win, passing 100 like NVMe's figure.
+        ((INTEL_S4510_INFO, INTEL_S4510_ATTRIBUTES, INTEL_S4510_DEVSTAT), 104),
+        ((TOSHIBA_HK6_INFO, TOSHIBA_HK6_ATTRIBUTES, TOSHIBA_HK6_DEVSTAT), 28),
+        # No Device Statistics page: the identity picks the vendor attribute
+        # (Intel and Toshiba: 233), found by Model Family or by Device Model.
+        ((INTEL_S4510_INFO, INTEL_S4510_ATTRIBUTES), 99),
+        ((TOSHIBA_HK6_INFO, TOSHIBA_HK6_ATTRIBUTES), 28),
+        # Neither (the pre-#230 read): 232 is named Available_Reservd_Space,
+        # so the fallback order skips it for 233. It used to ship 1 and 0.
+        ((INTEL_S4510_ATTRIBUTES,), 99),
+        ((TOSHIBA_HK6_ATTRIBUTES,), 28),
+    ],
+    ids=[
+        "intel-devstat",
+        "toshiba-devstat",
+        "intel-vendor-family",
+        "toshiba-vendor-model",
+        "intel-names-only",
+        "toshiba-names-only",
+    ],
+)
+def test_worn_ssd_reports_its_real_wear(monkeypatch, parts, expected):
+    info, cmd = _run_health(monkeypatch, *parts)
+
+    assert cmd == ["sudo", "smartctl", "-i", "-A", "-H", "-l", "ssd", "/dev/sdb"]
+    assert info["percentage_used"] == expected
+
+
+def test_worn_ssd_entry_keeps_its_wire_shape(monkeypatch):
+    """The identity and the Device Statistics rows only feed percentage_used:
+    no identity key ships in the health entry, no Device Statistics row is
+    read as an attribute (they have ten tokens or more too), and the life
+    attributes still ship their normalized VALUE."""
+    info, _ = _run_health(
+        monkeypatch, INTEL_S4510_INFO, INTEL_S4510_ATTRIBUTES, INTEL_S4510_DEVSTAT
+    )
+
+    assert info["device"] == "sdb"
+    assert info["device_type"] == "ata"
+    assert info["smart_overall_health"] == "PASSED"
+    assert info["media_wearout_indicator"] == 0
+    assert info["media_wearout_indicator_pct"] == 1
+    assert info["endurance_remaining_pct"] == 99
+    assert info["smart_attr_243"] == 184610382
+    assert not set(smart_storage.STORAGE_IDENTIFICATION_ATTRIBUTES.values()) & set(info)
+    assert not [key for key in info if key.startswith("smart_attr_0x")]
+
+
+def test_endurance_indicator_flagged_invalid_falls_back_to_attributes(monkeypatch):
+    """smartctl prints '-' in the value column when the drive flags the
+    indicator invalid: the attribute heuristics decide instead."""
+    invalid = TOSHIBA_HK6_DEVSTAT.replace(
+        "  28  N--  Percentage", "   -  N--  Percentage"
+    )
+    assert invalid != TOSHIBA_HK6_DEVSTAT
+
+    info, _ = _run_health(
+        monkeypatch, TOSHIBA_HK6_INFO, TOSHIBA_HK6_ATTRIBUTES, invalid
+    )
+
+    assert info["percentage_used"] == 28  # 233 by Device Model, not 104 or 0
+
+
+def test_spinning_disk_identity_from_info_section_drops_wear(monkeypatch):
+    """-i's Rotation Rate reaches the spinning-disk check, so a life-like
+    attribute on an HDD ships no percentage_used (and no rotation_rate)."""
+    info, _ = _run_health(
+        monkeypatch,
+        "=== START OF INFORMATION SECTION ===\n"
+        "Device Model:     ST2000DM008-2FR102\n"
+        "Rotation Rate:    7200 rpm\n"
+        "\n",
+        "=== START OF READ SMART DATA SECTION ===\n"
+        "177 Wear_Leveling_Count     0x0013   097   097   000    Pre-fail  Always"
+        "       -       42\n",
+    )
+
+    assert info["wear_leveling_count_pct"] == 97
+    assert "percentage_used" not in info
+    assert "rotation_rate" not in info
+
+
+def test_percentage_used_endurance_indicator_wins_verbatim():
+    calc = smart_storage.calculate_percentage_used
+    results = {"device_type": "ata", "media_wearout_indicator_pct": 1}
+    # Wins over the vendor attribute (which would say 99), and passes 100.
+    assert calc(results, device_model="INTEL SSDSC2KB480G8", endurance_used=104) == 104
+    assert calc(results, endurance_used=0) == 0
+    # A spinning disk still reports no wear, whatever it claims.
+    hdd = {"device_type": "ata", "rotation_rate": "7200 rpm"}
+    assert calc(hdd, endurance_used=5) is None
+
+
+def test_percentage_used_skips_attributes_named_as_something_else():
+    calc = smart_storage.calculate_percentage_used
+    # OCZ SandForce: the OCZ vendor entry says 233, which smartctl names
+    # SandForce_Internal (VALUE 000) there; 231 SSD_Life_Left is the wear.
+    sandforce = {
+        "device_type": "ata",
+        "media_wearout_indicator_pct": 0,
+        "life_left_pct": 90,
+    }
+    names = {"233": "SandForce_Internal", "231": "SSD_Life_Left"}
+    assert calc(sandforce, device_model="OCZ-VERTEX3", attribute_names=names) == 10
+    # Every candidate named as something else: unknown, not 0% used.
+    dell = {
+        "device_type": "ata",
+        "endurance_remaining_pct": 100,
+        "media_wearout_indicator_pct": 100,
+    }
+    dell_names = {"232": "Available_Reservd_Space", "233": "Total_LBAs_Written"}
+    assert (
+        calc(
+            dell,
+            model_family="Dell Certified Intel S4x00/D3-S4x10 Series SSDs",
+            attribute_names=dell_names,
+        )
+        is None
+    )
+
+
+def test_not_wear_names_leave_wear_and_generic_names_alone():
+    """The deny list never holds a wear name, nor the generic names an older
+    smartctl gives 231/202 on a drive it does not know (they keep counting)."""
+    keep = {
+        "Media_Wearout_Indicator",
+        "Wear_Leveling_Count",
+        "SSD_Life_Left",
+        "Percent_Lifetime_Remain",
+        "Remaining_Lifetime_Perc",
+        "Temperature_Celsius",
+        "Data_Address_Mark_Errs",
+    }
+    assert not keep & smart_storage.NOT_WEAR_ATTRIBUTE_NAMES
+
+
+def test_nvme_identity_from_info_section_ships_unchanged_entry(monkeypatch):
+    # Value: protects=NVMe health entry with -i output keeps pre-#230 keys and nvme-cli percentage_used; fails_when=info parse leaks identity keys or swallows the NVMe section; why_new=NVMe e2e test has no INFORMATION section; seam=none; no_claim=Device Statistics on NVMe
+    def fake_run(cmd, **kwargs):
+        if "smart-log" in cmd:
+            return _proc(0, NVME_SMART_LOG_JSON)
+        return _proc(
+            0,
+            SMARTCTL_BANNER + "=== START OF INFORMATION SECTION ===\n"
+            "Model Number:                       Samsung SSD 980 PRO 1TB\n"
+            "Serial Number:                      TESTSERIAL0000003\n"
+            "Firmware Version:                   5B2QGXA7\n"
+            "\n" + SMARTCTL_AH_NVME.removeprefix(SMARTCTL_BANNER),
+        )
+
+    monkeypatch.setattr(smart_storage, "run_privileged", fake_run)
+
+    info = smart_storage.get_storage_info("/dev/nvme0", nvme_available=lambda: True)
+
+    assert info == {
+        "device": "nvme0",
+        "device_type": "nvme",
+        "smart_overall_health": "PASSED",
+        "critical_warning": 0,
+        **NVME_ENHANCED_EXPECTED,
+        "percentage_used": 3,
+    }
+
+
+# A Plextor M6S as smartctl's drive database names it: 177 Wear_Leveling_Count
+# (the vendor wear attribute), 232 Available_Reservd_Space, 233
+# Media_Wearout_Indicator. The vendor id and the fallback order disagree here.
+PLEXTOR_M6S_INFO = (
+    "=== START OF INFORMATION SECTION ===\n"
+    "Model Family:     Plextor M3/M5/M6/M7 Series SSDs\n"
+    "Device Model:     PLEXTOR PX-256M6S\n"
+    "Rotation Rate:    Solid State Device\n"
+    "\n"
+)
+
+PLEXTOR_M6S_ATTRIBUTES = (
+    "=== START OF READ SMART DATA SECTION ===\n"
+    "SMART overall-health self-assessment test result: PASSED\n"
+    "\n"
+    "ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_FAILED RAW_VALUE\n"
+    "177 Wear_Leveling_Count     0x0003   091   091   000    Pre-fail  Always       -       256\n"
+    "232 Available_Reservd_Space 0x0003   100   100   010    Pre-fail  Always       -       0\n"
+    "233 Media_Wearout_Indicator 0x0003   096   096   000    Pre-fail  Always       -       0\n"
+    "\n"
+)
+
+
+def test_identity_picks_the_vendor_attribute_over_the_fallback_order(monkeypatch):
+    """The -i identity decides which attribute is the wear figure: Plextor's
+    177 (VALUE 091 -> 9 used) wins over the fallback order's 233 (VALUE 096
+    -> 4 used), which is what the same attributes read without an identity."""
+    with_identity, _ = _run_health(
+        monkeypatch, PLEXTOR_M6S_INFO, PLEXTOR_M6S_ATTRIBUTES
+    )
+    without_identity, _ = _run_health(monkeypatch, PLEXTOR_M6S_ATTRIBUTES)
+
+    assert with_identity["percentage_used"] == 9
+    assert without_identity["percentage_used"] == 4
+
+
+# smartctl 6.2 and 6.3 (CentOS 7.0-7.4, Debian 8, Ubuntu 14.04) print Device
+# Statistics with a DECIMAL page number and mark a normalized value with a '~'
+# suffix; the rows below use smartmontools RELEASE_6_2 ataprint.cpp's own
+# format strings.
+OLD_SMARTCTL_DEVSTAT = (
+    "Device Statistics (GP Log 0x04)\n"
+    "Page Offset Size         Value  Description\n"
+    + "%3d%s%s (rev %d) ==\n"
+    % (7, "  =====  =                =  == ", "Solid State Device Statistics", 1)
+    + "%3d  0x%03x  %d%c %15s%c %s\n"
+    % (7, 8, 1, " ", "104", "~", "Percentage Used Endurance Indicator")
+    + "%30s|_ ~ normalized value\n" % ""
+    + "\n"
+)
+
+
+def test_old_smartctl_decimal_device_statistics_are_read_not_parsed_as_attributes(
+    monkeypatch,
+):
+    """The decimal page title has ten tokens and starts with "7": it must not
+    become SMART attribute 7 (a new seek_time_performance key, or an
+    overwritten real one), and the decimal value row still feeds the
+    endurance indicator (104, where the attributes would say 99)."""
+    info, _ = _run_health(
+        monkeypatch, INTEL_S4510_INFO, INTEL_S4510_ATTRIBUTES, OLD_SMARTCTL_DEVSTAT
+    )
+
+    assert info["percentage_used"] == 104
+    assert "seek_time_performance" not in info
+
+
+def test_unknown_rotation_rate_is_not_a_spinning_disk():
+    """smartctl prints "Unknown (0x....)" for a reserved rotation value, which
+    some SSDs and USB bridges report: only "<N> rpm" means a spinning disk."""
+    calc = smart_storage.calculate_percentage_used
+    ssd = {"device_type": "ata", "rotation_rate": "Unknown (0x0005)"}
+    assert calc(ssd, endurance_used=12) == 12
+    assert calc({**ssd, "media_wearout_indicator_pct": 90}) == 10
