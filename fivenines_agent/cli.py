@@ -30,8 +30,10 @@ def parse_args():
     parser.add_argument('--dry-run', action='store_true', help='Run once and print output without sending data')
     parser.add_argument(
         '--check-imports',
-        action='store_true',
-        help='Import the agent and the modules it loads at startup, then exit without running (binary smoke check)',
+        nargs='*',
+        metavar='MODULE',
+        help='Import the agent, the modules it loads lazily and each optional MODULE given '
+        '(e.g. libvirt), then exit without running (binary smoke check)',
     )
     _args = parser.parse_args()
     return _args

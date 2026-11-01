@@ -154,10 +154,20 @@ fi
 # --version exits before the agent is imported, so it no longer proves the
 # bundled extension modules (psutil, _ssl over the bundled OpenSSL, _lzma, ...)
 # load on this distro's libc. --check-imports does, and unlike the dry-run below
-# it needs no python3 in the image. stderr stays out of the PASS row: the
-# results table goes through printf '%b', where a stray warning line would
-# break the table and a literal \c would cut the rest of the report.
-if timeout 60 "$AGENT_EXECUTABLE" --check-imports > "${OUTPUT_DIR}/check_imports_output" 2> "${OUTPUT_DIR}/check_imports_stderr"; then
+# it needs no python3 in the image. It also imports the optional modules the
+# variant's build bundles (the agent imports them under try/except ImportError,
+# so a libvirt that does not load on this libc would otherwise just disable the
+# QEMU collector): keep each list in step with CHECK_IMPORTS in py2exe.sh and
+# py2exe_alpine.sh. stderr stays out of the PASS row: the results table goes
+# through printf '%b', where a stray warning line would break the table and a
+# literal \c would cut the rest of the report.
+case "$BINARY_VARIANT" in
+  linux-*) CHECK_IMPORTS="libvirt pynvml proxmoxer.backends.https systemd_watchdog" ;;
+  alpine-*) CHECK_IMPORTS="libvirt pynvml proxmoxer.backends.https" ;;
+  *) CHECK_IMPORTS="" ;;
+esac
+# shellcheck disable=SC2086 # CHECK_IMPORTS is a word list
+if timeout 60 "$AGENT_EXECUTABLE" --check-imports $CHECK_IMPORTS > "${OUTPUT_DIR}/check_imports_output" 2> "${OUTPUT_DIR}/check_imports_stderr"; then
   record_result "--check-imports" "PASS" "$(head -n 1 "${OUTPUT_DIR}/check_imports_output")"
 else
   record_result "--check-imports" "FAIL" "exit code $?"

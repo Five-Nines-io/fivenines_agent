@@ -160,13 +160,18 @@ echo "Total directory size: $(du -sh ./build/$BINARY_NAME | awk '{print $1}')"
 echo "Binary dependencies:"
 ldd ./build/$BINARY_NAME/$BINARY_NAME | head -10 || echo "ldd check failed"
 
-# Quick test. --check-imports imports the agent and every collector it loads at
-# startup (incl. pg8000, which reads its package metadata at import), so a
-# failure here means a missing hidden import or un-copied metadata -- fail the
-# build rather than ship it.
+# Quick test. --check-imports imports the agent and every collector (incl.
+# pg8000, which reads its package metadata at import), plus each optional module
+# named below -- the ones the agent imports under try/except ImportError and
+# would otherwise silently go without -- so a failure here means a missing
+# hidden import, dependency or metadata: fail the build rather than ship it.
+# Keep the list in step with the hidden imports above and with the alpine-*
+# list in ci/test-distro.sh (systemd_watchdog is excluded on Alpine).
 # --version no longer does: it exits before the agent is imported, to stay fast.
+CHECK_IMPORTS="libvirt pynvml proxmoxer.backends.https"
 echo "=== Testing Built Binary ==="
-if ! ./build/$BINARY_NAME/$BINARY_NAME --check-imports; then
+# shellcheck disable=SC2086 # CHECK_IMPORTS is a word list
+if ! ./build/$BINARY_NAME/$BINARY_NAME --check-imports $CHECK_IMPORTS; then
     echo "Smoke check FAILED: built binary cannot import the agent. Aborting."
     exit 1
 fi

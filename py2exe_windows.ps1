@@ -124,13 +124,14 @@ if (-not (Test-Path $exePath)) {
 $size = (Get-Item $exePath).Length
 Write-Host "Executable size: $size bytes"
 
-# --check-imports must succeed: it imports the agent and every module it loads
-# at startup, so a missing hidden import fails the build here rather than at
-# install time. It does NOT prove the Windows modules imported lazily under
-# try/except (wmi, win32pdh) nor win32timezone, which pywin32 imports at
-# runtime. --version proves even less: it exits before the agent is imported,
-# to stay fast.
-& $exePath --check-imports
+# --check-imports must succeed: it imports the agent and every collector, plus
+# each Windows module named here -- the agent imports wmi and win32pdh inside
+# functions that catch ImportError, and pywin32 imports win32timezone only at
+# runtime (the classic pywin32-PyInstaller gotcha) -- so a missing hidden
+# import fails the build here rather than silently at install time. Keep the
+# list in step with the --hidden-import arguments above. --version proves
+# less: it exits before the agent is imported, to stay fast.
+& $exePath --check-imports wmi win32pdh win32timezone
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Smoke check failed: $exePath --check-imports returned $LASTEXITCODE"
     exit 1

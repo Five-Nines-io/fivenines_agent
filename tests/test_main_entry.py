@@ -47,7 +47,7 @@ def test_get_args_is_none_before_parse_args():
 def test_parse_args_without_flags(monkeypatch):
     _argv(monkeypatch)
     args = cli.parse_args()
-    assert args == Namespace(dry_run=False, check_imports=False)
+    assert args == Namespace(dry_run=False, check_imports=None)
     assert cli.get_args() is args
 
 
@@ -58,11 +58,17 @@ def test_parse_args_dry_run(monkeypatch):
     assert cli.get_args() is args
 
 
-def test_parse_args_check_imports(monkeypatch):
+def test_parse_args_check_imports_alone_names_no_optional_module(monkeypatch):
     _argv(monkeypatch, "--check-imports")
     args = cli.parse_args()
-    assert args.check_imports is True
+    assert args.check_imports == []
     assert args.dry_run is False
+
+
+def test_parse_args_check_imports_collects_the_optional_modules(monkeypatch):
+    _argv(monkeypatch, "--check-imports", "libvirt", "proxmoxer.backends.https")
+    args = cli.parse_args()
+    assert args.check_imports == ["libvirt", "proxmoxer.backends.https"]
 
 
 def test_parse_args_version_prints_and_exits_zero(monkeypatch, capsys):
@@ -90,7 +96,7 @@ def test_parse_args_unknown_flag_exits_with_usage_error(monkeypatch, capsys):
 
 def test_start_parses_args_before_building_and_running_the_agent(monkeypatch):
     calls = MagicMock()
-    calls.parse_args.return_value = Namespace(dry_run=False, check_imports=False)
+    calls.parse_args.return_value = Namespace(dry_run=False, check_imports=None)
     monkeypatch.setattr(main_module, "parse_args", calls.parse_args)
     monkeypatch.setattr("fivenines_agent.agent.Agent", calls.Agent)
 
@@ -173,7 +179,7 @@ def test_start_check_imports_imports_the_agent_then_exits_without_building_it(
     monkeypatch, capsys
 ):
     """The real parser: --check-imports goes through the agent import (the
-    frozen binary's smoke check; the test below shows a failing import fails
+    frozen binary's smoke check; the tests below show a failing import fails
     it) and returns before Agent() reads any config."""
     _argv(monkeypatch, "--check-imports")
     agent_cls = MagicMock()
@@ -181,8 +187,78 @@ def test_start_check_imports_imports_the_agent_then_exits_without_building_it(
 
     main_module.start()
 
-    assert capsys.readouterr().out == f"fivenines-agent {cli.VERSION}: agent imported\n"
+    assert capsys.readouterr().out == f"fivenines-agent {cli.VERSION}: imported agent\n"
     agent_cls.assert_not_called()
+
+
+def test_start_check_imports_imports_each_optional_module_named(monkeypatch, capsys):
+    """The build names the optional modules it bundles; each is imported and
+    listed in the confirmation line."""
+    _argv(monkeypatch, "--check-imports", "json", "colorsys")
+    monkeypatch.delitem(sys.modules, "colorsys", raising=False)
+    monkeypatch.setattr("fivenines_agent.agent.Agent", MagicMock())
+
+    main_module.start()
+
+    assert "colorsys" in sys.modules
+    assert (
+        capsys.readouterr().out
+        == f"fivenines-agent {cli.VERSION}: imported agent, json, colorsys\n"
+    )
+
+
+def test_start_check_imports_fails_on_a_missing_optional_module(monkeypatch, capsys):
+    """An optional module the build says it bundles but the binary lacks (a
+    dropped hidden import, an uninstalled dependency) fails the check instead
+    of the agent silently going without it at runtime."""
+    _argv(monkeypatch, "--check-imports", "fivenines_no_such_module")
+    monkeypatch.setattr("fivenines_agent.agent.Agent", MagicMock())
+
+    with pytest.raises(ModuleNotFoundError, match="fivenines_no_such_module"):
+        main_module.start()
+
+    assert capsys.readouterr().out == ""
+
+
+def test_start_check_imports_fails_when_a_lazy_module_cannot_be_imported(
+    monkeypatch,
+):
+    """The agent imports snmp inside a function, so importing the agent does
+    not prove it: --check-imports loads it explicitly, even with no optional
+    module named."""
+    _argv(monkeypatch, "--check-imports")
+    monkeypatch.setitem(sys.modules, "fivenines_agent.snmp", None)
+    monkeypatch.setattr("fivenines_agent.agent.Agent", MagicMock())
+
+    with pytest.raises(ImportError):
+        main_module.start()
+
+
+def test_check_imports_in_a_fresh_interpreter_leaves_no_package_module_out():
+    """check_imports() must load every module the agent imports only inside a
+    function: after --check-imports, no fivenines_agent module may be left
+    unloaded, or a missing hidden import there would pass the smoke check."""
+    probe = (
+        "import sys, pkgutil\n"
+        "sys.argv = ['fivenines_agent', '--check-imports']\n"
+        "from fivenines_agent.__main__ import start\n"
+        "start()\n"
+        "import fivenines_agent\n"
+        "names = ['fivenines_agent.' + m.name for m in pkgutil.iter_modules(fivenines_agent.__path__)]\n"
+        "print(sorted(n for n in names if n not in sys.modules))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=REPO_ROOT,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.splitlines() == [
+        f"fivenines-agent {cli.VERSION}: imported agent",
+        "[]",
+    ]
 
 
 def test_start_check_imports_fails_when_the_agent_cannot_be_imported(monkeypatch):
@@ -213,6 +289,37 @@ def test_every_binary_smoke_check_runs_check_imports(script):
     assert any("--check-imports" in line for line in bare)
 
 
+def _check_imports_list(script, pattern):
+    text = (REPO_ROOT / script).read_text(encoding="utf-8")
+    found = re.findall(pattern, text, re.MULTILINE)
+    assert len(found) == 1, (script, pattern, found)
+    return found[0].split()
+
+
+def test_distro_test_checks_the_optional_modules_each_build_checks():
+    """The distro matrix re-runs each build's --check-imports on other libcs,
+    so its per-variant module list must stay the list that build proves: a
+    module added to one and not the other is either unproven on the distros
+    or fails a binary that never bundled it."""
+    linux = _check_imports_list("py2exe.sh", r"^\s*CHECK_IMPORTS=\(([^)]+)\)$")
+    alpine = _check_imports_list("py2exe_alpine.sh", r'^CHECK_IMPORTS="([^"]+)"$')
+    distro = "ci/test-distro.sh"
+    assert linux == _check_imports_list(
+        distro, r'^\s*linux-\*\) CHECK_IMPORTS="([^"]+)"'
+    )
+    assert alpine == _check_imports_list(
+        distro, r'^\s*alpine-\*\) CHECK_IMPORTS="([^"]+)"'
+    )
+    assert "libvirt" in linux and "libvirt" in alpine
+    assert "proxmoxer.backends.https" in alpine  # bundled on Alpine since 1.21.6
+    # Each script passes its list to the binary.
+    assert (
+        '--check-imports "${CHECK_IMPORTS[@]}"' in (REPO_ROOT / "py2exe.sh").read_text()
+    )
+    for script in ("py2exe_alpine.sh", distro):
+        assert "--check-imports $CHECK_IMPORTS" in (REPO_ROOT / script).read_text()
+
+
 def test_start_dry_run_flag_is_visible_to_the_agent(monkeypatch):
     """Agent() reads --dry-run through env.dry_run() -> cli.get_args(), so the
     flag must already be parsed when the Agent is constructed."""
@@ -236,7 +343,7 @@ def _run_main_module(monkeypatch, run_name):
     # (this file imports it above); monkeypatch puts the entry back afterwards.
     monkeypatch.delitem(sys.modules, "fivenines_agent.__main__", raising=False)
     calls = MagicMock()
-    calls.parse_args.return_value = Namespace(dry_run=False, check_imports=False)
+    calls.parse_args.return_value = Namespace(dry_run=False, check_imports=None)
     with patch("fivenines_agent.cli.parse_args", calls.parse_args), patch(
         "fivenines_agent.agent.Agent", calls.Agent
     ):
