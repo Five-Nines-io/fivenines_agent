@@ -358,7 +358,7 @@ ldd ./build/$BINARY_NAME/$BINARY_NAME | head -10 || echo "ldd check failed (migh
 # --version no longer does: it exits before the agent is imported, to stay fast.
 echo "=== Testing Built Binary ==="
 if ! ./build/$BINARY_NAME/$BINARY_NAME --check-imports "${CHECK_IMPORTS[@]}"; then
-    echo "Smoke check FAILED: built binary cannot import the agent (missing hidden import or bundled metadata). Aborting."
+    echo "Smoke check FAILED: built binary cannot import the agent or an optional module in CHECK_IMPORTS (missing hidden import, dependency or bundled metadata; the traceback above names it). Aborting."
     exit 1
 fi
 if ! VERSION_OUTPUT="$(./build/$BINARY_NAME/$BINARY_NAME --version)"; then

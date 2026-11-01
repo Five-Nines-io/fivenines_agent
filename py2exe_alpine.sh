@@ -172,7 +172,7 @@ CHECK_IMPORTS="libvirt pynvml proxmoxer.backends.https"
 echo "=== Testing Built Binary ==="
 # shellcheck disable=SC2086 # CHECK_IMPORTS is a word list
 if ! ./build/$BINARY_NAME/$BINARY_NAME --check-imports $CHECK_IMPORTS; then
-    echo "Smoke check FAILED: built binary cannot import the agent. Aborting."
+    echo "Smoke check FAILED: built binary cannot import the agent or an optional module in CHECK_IMPORTS (the traceback above names it). Aborting."
     exit 1
 fi
 if ! ./build/$BINARY_NAME/$BINARY_NAME --version; then
