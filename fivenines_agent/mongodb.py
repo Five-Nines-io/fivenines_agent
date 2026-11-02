@@ -37,10 +37,11 @@ Bounded twice, because the collection loop shares one systemd watchdog
 window: every command runs under pymongo.timeout() with what is left of
 COMMAND_BUDGET (so a slow mongod costs its sections, not the tick), and the
 whole collection runs on a bounded.call_bounded worker abandoned after
-COLLECT_DEADLINE, single-flight, for what no driver timeout covers: resolving
-the host name, which the worker therefore does itself before the driver's
-monitor thread does (a resolver that never answers then stalls one worker,
-never one more monitor thread per tick).
+COLLECT_DEADLINE, single-flight. Neither bounds the driver's own monitor
+thread, which resolves and dials the host and which client.close() does not
+join: a resolver that never answers keeps it blocked after the tick returns.
+So no client is built while a pymongo thread from an earlier tick is still
+alive (_driver_thread_alive): at most one blocked monitor, never one per tick.
 
 pymongo is imported lazily, on the first tick that carries a mongodb config:
 it costs ~110 ms and ~11 MB of RSS, which hosts without MongoDB never pay.
@@ -48,9 +49,12 @@ it costs ~110 ms and ~11 MB of RSS, which hosts without MongoDB never pay.
 
 import ipaddress
 import math
+import os
 import re
 import socket
 import ssl
+import stat
+import threading
 import time
 from collections.abc import Mapping
 from datetime import datetime, timezone
@@ -134,6 +138,22 @@ ERROR = "error"
 
 _EPOCH = datetime(1970, 1, 1)
 
+_REDACT_MIN_LEN = 6
+
+# Every pymongo thread is named pymongo_*: the monitor, the kill-cursors
+# executor (the agent has no other pymongo user).
+_DRIVER_THREAD_PREFIX = "pymongo_"
+
+_DRIVER_BUSY_MESSAGE = (
+    "a previous MongoDB connection attempt is still blocked (the driver's "
+    "monitor thread, resolving or dialing the host); no new one starts until "
+    "it ends"
+)
+
+# What the driver reports when the peer is not speaking the MongoDB wire
+# protocol (its own text carries random request ids, a new message per tick).
+_PROTOCOL_MESSAGE = "the peer does not speak the MongoDB wire protocol"
+
 # How a TLS failure still shows once pymongo has flattened it into an
 # AutoReconnect (see _connection_error_type): the prefix pymongo puts on a
 # handshake failure, or the "[SSL: REASON]" CPython's ssl module puts in front
@@ -167,6 +187,11 @@ class ConfigError(ValueError):
 class _BudgetSpent(Exception):
     """COMMAND_BUDGET ran out before a command could be sent."""
 
+    def __init__(self):
+        super().__init__(
+            f"skipped: the {COMMAND_BUDGET}s command budget was spent before it"
+        )
+
 
 class _Config:
     """The validated config: every value MongoClient receives comes from here."""
@@ -187,9 +212,6 @@ class _Config:
         host = DEFAULT_HOST if host in (None, "") else host
         if not isinstance(host, str):
             raise ConfigError("host must be a string")
-        # The name the worker resolves before the driver does (see the module
-        # docstring); None for a socket path or an IP literal.
-        self.resolve = None
         if host.startswith("/"):
             if not hasattr(socket, "AF_UNIX"):
                 # pymongo's own check (Windows): refused before any I/O.
@@ -199,8 +221,6 @@ class _Config:
         else:
             self.host = _tcp_host(host)
             self.port = _port(port)
-            if not self.host.startswith("[") and not _is_ip(self.host):
-                self.resolve = self.host
         self.username = _optional_str(username, "username")
         self.password = _optional_str(password, "password")
         self.auth_source = (
@@ -241,9 +261,9 @@ class _Config:
             # adds an RTT monitor), each a pair of mongod log lines a tick.
             "serverMonitoringMode": "poll",
             "event_listeners": [listener],
-            # No monitor thread until the first command: building the client
-            # then only checks the config, and the worker resolves the host
-            # before the driver does (see _collect).
+            # No thread until the first command: building the client only
+            # checks the config (a bad option or TLS file is config_error,
+            # never masked by a host that does not answer).
             "connect": False,
         }
         if self.port is not None:
@@ -308,19 +328,11 @@ def _port(value):
         raise ConfigError("port must be an integer")
     try:
         port = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # OverflowError: 1e400
         raise ConfigError("port must be an integer") from None
     if not 0 < port < 65536:
         raise ConfigError("port must be between 1 and 65535")
     return port
-
-
-def _is_ip(host):
-    try:
-        ipaddress.ip_address(host)
-    except ValueError:
-        return False
-    return True
 
 
 def _tcp_host(host):
@@ -347,8 +359,12 @@ def _tcp_host(host):
 
 
 def _socket_path(path):
+    try:
+        encoded = path.encode("utf-8")
+    except UnicodeEncodeError:  # a lone surrogate from a JSON escape
+        raise ConfigError("a unix socket path must be valid UTF-8") from None
     if (
-        len(path.encode("utf-8", "surrogatepass")) > _SOCKET_PATH_MAX_LEN
+        len(encoded) > _SOCKET_PATH_MAX_LEN
         or not path.endswith(".sock")
         or any(ord(c) < 0x20 or ord(c) == 0x7F for c in path)
     ):
@@ -812,6 +828,16 @@ def _member(status_member, config_member, now, reference):
     return entry
 
 
+def _status_for(by_id, config_member):
+    """The status entry of a config member: same _id AND same host. A
+    reconfig between the two reads can give a replaced member's _id to a new
+    host; its health must not be lent to the newcomer (left unknown)."""
+    status_member = by_id.get(_int(config_member.get("_id")))
+    if status_member is None or status_member.get("name") != config_member.get("host"):
+        return None
+    return status_member
+
+
 def _members(status, config):
     """One entry per member of the config (of the status when the config was
     not read), sorted by name, at most MAX_MEMBERS. None when neither was
@@ -836,7 +862,7 @@ def _members(status, config):
     for m in status_members or []:
         by_id.setdefault(_int(m.get("_id")), m)
     if config_members is not None:
-        pairs = [(by_id.get(_int(c.get("_id"))), c) for c in config_members]
+        pairs = [(_status_for(by_id, c), c) for c in config_members]
     else:
         pairs = [(s, None) for s in status_members or []]
     entries = [_member(s, c, now, reference) for s, c in pairs]
@@ -977,6 +1003,8 @@ def _classify(exc, client, pymongo):
         return "timeout", exc
     if isinstance(exc, errors.OperationFailure):
         return "unknown", exc
+    if isinstance(exc, errors.ProtocolError):
+        return "unknown", _PROTOCOL_MESSAGE
     error_type = _connection_error_type(exc, pymongo)
     if error_type is not None:
         return error_type, exc
@@ -993,7 +1021,10 @@ def _message(exc, config):
         text = details["errmsg"]
     if not text:
         text = str(exc) or type(exc).__name__
-    if config is not None and config.password:
+    # pymongo never echoes a password passed as a keyword argument: this is a
+    # backstop, and a short password would only garble a message (and show
+    # where it occurs).
+    if config is not None and len(config.password or "") >= _REDACT_MIN_LEN:
         text = text.replace(config.password, "[REDACTED]")
     return scrub_message(text)
 
@@ -1153,12 +1184,42 @@ def _repl_config(mongo):
     return _checked(_get(mongo.command("replSetGetConfig"), "config"))
 
 
+def _unusable_tls_file(config):
+    """Why a configured TLS file cannot be used, or None. Checked on the
+    worker before the driver opens it: open() on a FIFO (or a device) never
+    returns, and the abandoned worker would then hold the single flight for
+    good, whatever the config says later."""
+    if not config.tls:
+        return None
+    for key in ("tls_ca_file", "tls_certificate_key_file"):
+        path = getattr(config, key)
+        if path is None:
+            continue
+        try:
+            mode = os.stat(path).st_mode
+        except OSError as e:
+            return scrub_message(f"{key}: {e}")
+        if not stat.S_ISREG(mode):
+            return scrub_message(f"{key} is not a regular file: {path}")
+    return None
+
+
+def _driver_thread_alive():
+    return any(
+        t.name.startswith(_DRIVER_THREAD_PREFIX) and t.is_alive()
+        for t in threading.enumerate()
+    )
+
+
 def _collect(config):
     """One collection, on the worker mongodb_metrics bounds."""
     try:
         pymongo = _import_pymongo()
     except ImportError as e:
         return _failure("unknown", scrub_message(f"pymongo is not available: {e}"))
+    unusable = _unusable_tls_file(config)
+    if unusable is not None:
+        return _failure("config_error", unusable)
     recorder = _hello_recorder(pymongo)
     try:
         client = _new_client(pymongo, config.client_options(recorder))
@@ -1166,18 +1227,8 @@ def _collect(config):
         # MongoClient does no I/O while it is built (connect=False): whatever
         # it raises is the config (an option, a TLS file that does not load).
         return _failure("config_error", _message(e, config))
-    mongo = _Mongo(pymongo, client)  # the command budget starts here
+    mongo = _Mongo(pymongo, client)
     try:
-        if config.resolve is not None:
-            # Before the driver's monitor thread does (see the module
-            # docstring), and inside the budget.
-            try:
-                socket.getaddrinfo(config.resolve, config.port, type=socket.SOCK_STREAM)
-            except OSError as e:
-                # The driver would fail the same way, after its whole 5s
-                # server selection: nothing answered (the error_types table).
-                message = f"{config.resolve}:{config.port}: {e}"
-                return _failure("connection_refused", _message(message, config))
         return _read(mongo, recorder, config)
     finally:
         mongo.close()
@@ -1249,7 +1300,7 @@ def mongodb_metrics(
             tls_certificate_key_file,
             tls_allow_invalid_certificates,
         )
-    except ConfigError as e:
+    except Exception as e:  # ConfigError, or a value no rule anticipated
         result = _failure("config_error", scrub_message(e))
         _log_outcome(result)
         return result
@@ -1260,6 +1311,10 @@ def mongodb_metrics(
             log(f"MongoDB collection skipped: {message}", "debug")
             return _failure("timeout", message)
         _stalled_worker = None
+    if _driver_thread_alive():
+        result = _failure("timeout", _DRIVER_BUSY_MESSAGE)
+        _log_outcome(result)
+        return result
     try:
         result = call_bounded(
             lambda: _collect(config), COLLECT_DEADLINE, name="mongodb"
