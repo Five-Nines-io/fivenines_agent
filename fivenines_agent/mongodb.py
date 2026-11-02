@@ -155,7 +155,9 @@ _DRIVER_BUSY_MESSAGE = (
 # close() does not join them, and they notice it within their 0.5s sleep
 # (measured: both gone ~0.6s after close()), so a collection started right
 # after another one would otherwise read a thread that is merely exiting as
-# blocked.
+# blocked. A check still connecting at close() outlives it by the rest of its
+# connect (up to CONNECT_TIMEOUT_MS; a refused loopback connect takes ~1-2s
+# on Windows): that one reads as busy, which it is.
 _DRIVER_EXIT_GRACE = 1.0
 
 # What the driver reports when the peer is not speaking the MongoDB wire
@@ -1299,7 +1301,8 @@ def mongodb_metrics(
     Args mirror config["mongodb"] (the fixture's config_contract); **_kwargs
     ignores a key the server adds later instead of raising a TypeError.
 
-    Never returns None, and never takes longer than COLLECT_DEADLINE.
+    Never returns None, and never takes longer than _DRIVER_EXIT_GRACE plus
+    COLLECT_DEADLINE.
     """
     global _stalled_worker
     try:
@@ -1327,11 +1330,15 @@ def mongodb_metrics(
             return _failure("timeout", message)
         _stalled_worker = None
     if _driver_thread_alive():
-        # Logged like the stalled worker: the tick that left the thread
-        # blocked logged its own failure, and a streak key of this skip's own
-        # would alternate with that failure's and log at error every tick.
-        log(f"MongoDB collection skipped: {_DRIVER_BUSY_MESSAGE}", "debug")
-        return _failure("timeout", _DRIVER_BUSY_MESSAGE)
+        result = _failure("timeout", _DRIVER_BUSY_MESSAGE)
+        if "envelope" in _last_logged:
+            # A failure is logged already (usually the one that left the
+            # thread blocked): a streak key of this skip's own would
+            # alternate with that failure's and log at error every tick.
+            log(f"MongoDB collection skipped: {_DRIVER_BUSY_MESSAGE}", "debug")
+        else:
+            _log_outcome(result)
+        return result
     try:
         result = call_bounded(
             lambda: _collect(config), COLLECT_DEADLINE, name="mongodb"

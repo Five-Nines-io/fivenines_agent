@@ -627,6 +627,31 @@ def test_the_driver_busy_skip_does_not_restart_the_error_streak(monkeypatch, cap
     assert lines == ["[ERROR", "[DEBUG", "[DEBUG"]
 
 
+def test_a_driver_busy_skip_after_a_success_logs_at_error_once(monkeypatch, capsys):
+    """No failure is logged to stand for it (the tick that left the thread
+    blocked was reachable): the skip itself logs at error, once."""
+    monkeypatch.setenv("LOG_LEVEL", "debug")
+    monkeypatch.setattr(mongodb, "_DRIVER_EXIT_GRACE", 0.05)
+    collect(monkeypatch, {"hello": {"arbiterOnly": True}})
+    release = threading.Event()
+    stuck = threading.Thread(
+        target=release.wait, name="pymongo_server_monitor_thread", daemon=True
+    )
+    stuck.start()
+    try:
+        collect(monkeypatch, {})
+        collect(monkeypatch, {})
+    finally:
+        release.set()
+        stuck.join(5)
+    lines = [
+        line.split("]")[0]
+        for line in capsys.readouterr().out.splitlines()
+        if "MongoDB collection" in line
+    ]
+    assert lines == ["[ERROR", "[DEBUG"]
+
+
 # Value: protects=a resolver that never answers leaves at most ONE blocked pymongo monitor thread however many ticks run (close() does not join it); fails_when=the driver-thread single flight is dropped: each tick adds a thread; why_new=the fake client starts no thread, only the real driver shows it; seam=none; no_claim=how a real NSS backend hangs (getaddrinfo is stubbed to block)
 def test_a_wedged_resolver_leaves_one_monitor_thread_with_the_real_driver(
     monkeypatch,
@@ -1532,6 +1557,7 @@ def test_the_shipped_bounds_nest():
     assert (
         mongodb.COMMAND_BUDGET + mongodb.CLOSE_TIMEOUT
         < mongodb.COLLECT_DEADLINE
+        < mongodb.COLLECT_DEADLINE + mongodb._DRIVER_EXIT_GRACE
         < int(watchdog.group(1))
     )
 
@@ -1706,8 +1732,11 @@ def test_a_refused_port_end_to_end_with_the_real_driver(monkeypatch):
     assert result["error_message"].startswith(f"127.0.0.1:{port}: ")
     # At once, as after a tick that overran its interval: the first client's
     # threads are still exiting (close() does not join them), not blocked.
-    again = mongodb.mongodb_metrics(**{**CONFIG, "port": port})
-    assert again["error_type"] == "connection_refused"
+    # Not on Windows, where a refused loopback connect takes ~1-2s: a check
+    # still connecting at close() can outlive the grace (reported busy).
+    if sys.platform != "win32":
+        again = mongodb.mongodb_metrics(**{**CONFIG, "port": port})
+        assert again["error_type"] == "connection_refused"
 
 
 def test_ssl_errors_keep_their_type():
