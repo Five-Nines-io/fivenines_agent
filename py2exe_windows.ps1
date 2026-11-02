@@ -97,6 +97,10 @@ $pyInstallerArgs = @(
     "--hidden-import", "scramp",
     "--hidden-import", "dateutil.parser",
     "--hidden-import", "paho.mqtt.client",
+    # pymongo (the mongodb collector, imported lazily) imports some of its own
+    # modules only when a feature needs them (auth mechanisms, compression).
+    "--collect-submodules", "pymongo",
+    "--collect-submodules", "bson",
     "--copy-metadata", "pg8000",
     "--copy-metadata", "scramp",
     "--noconfirm",
@@ -125,13 +129,14 @@ $size = (Get-Item $exePath).Length
 Write-Host "Executable size: $size bytes"
 
 # --check-imports must succeed: it imports the agent and every collector, plus
-# each Windows module named here -- the agent imports wmi and win32pdh inside
-# functions that catch ImportError, and pywin32 imports win32timezone only at
-# runtime (the classic pywin32-PyInstaller gotcha) -- so a missing hidden
-# import fails the build here rather than silently at install time. Keep the
-# list in step with the --hidden-import arguments above. --version proves
+# each module named here -- the agent imports wmi and win32pdh inside
+# functions that catch ImportError, pywin32 imports win32timezone only at
+# runtime (the classic pywin32-PyInstaller gotcha), and the mongodb collector
+# imports pymongo only when it runs -- so a missing hidden import fails the
+# build here rather than silently at install time. Keep the list in step with
+# the --hidden-import / --collect-submodules arguments above. --version proves
 # less: it exits before the agent is imported, to stay fast.
-& $exePath --check-imports wmi win32pdh win32timezone
+& $exePath --check-imports wmi win32pdh win32timezone pymongo
 if ($LASTEXITCODE -ne 0) {
     Write-Error "Smoke check failed: $exePath --check-imports returned $LASTEXITCODE"
     exit 1

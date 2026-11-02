@@ -1,0 +1,7 @@
+# pymongo for the Alpine builds, built from its sdist (no musllinux wheel)
+# without build isolation, against pymongo-build.txt, BEFORE `poetry install`,
+# which then finds the locked version installed and skips it (its wheels-only
+# install would fail on the sdist). The C extensions build with the image's
+# gcc; pymongo falls back to pure Python if they do not. The version must equal
+# poetry.lock's: py2exe_alpine.sh checks that and fails if they drift.
+pymongo==4.18.3
