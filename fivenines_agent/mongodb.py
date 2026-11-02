@@ -1209,10 +1209,12 @@ def _unusable_tls_file(config):
             continue
         try:
             mode = os.stat(path).st_mode
-        except OSError as e:
-            return scrub_message(f"{key}: {e}")
+        except (OSError, ValueError) as e:
+            # ValueError: a NUL in the path, or a lone surrogate
+            # (UnicodeEncodeError).
+            return _message(f"{key}: {e}", config)
         if not stat.S_ISREG(mode):
-            return scrub_message(f"{key} is not a regular file: {path}")
+            return _message(f"{key} is not a regular file: {path}", config)
     return None
 
 

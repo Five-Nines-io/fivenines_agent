@@ -499,6 +499,30 @@ def test_a_tls_file_that_cannot_be_read_is_a_config_error_naming_it(monkeypatch,
     assert missing in result["error_message"]
 
 
+@pytest.mark.parametrize("key", ["tls_ca_file", "tls_certificate_key_file"])
+# \ud800, not \udc80: surrogateescape encodes the latter (an OSError then).
+@pytest.mark.parametrize("path", ["/tmp/ca\x00.pem", "/tmp/ca\ud800.pem"])
+def test_a_tls_path_python_cannot_convert_is_a_config_error(monkeypatch, key, path):
+    result, clients = collect(monkeypatch, {}, tls=True, **{key: path})
+    assert clients == []
+    assert result["error_type"] == "config_error"
+    assert result["error_message"].startswith(f"{key}")
+
+
+def test_the_password_is_redacted_from_tls_file_messages(monkeypatch, tmp_path):
+    """A password pasted into a path field: both preflight messages quote
+    the path."""
+    password = CONFIG["password"]
+    missing = f"/nonexistent-fivenines/{password}.pem"
+    directory = tmp_path / password
+    directory.mkdir()
+    for path in (missing, str(directory)):
+        result, _ = collect(monkeypatch, {}, tls=True, tls_ca_file=path)
+        assert result["error_type"] == "config_error"
+        assert password not in result["error_message"]
+        assert "[REDACTED]" in result["error_message"]
+
+
 # Value: protects=each config shape the validator accepts builds a real MongoClient dialing that address over one direct, poll-monitored connection; fails_when=a host spelling (bracketed IPv6, percent-encoded socket URI) or TLS option mix stops being what pymongo reads that way; why_new=only the default TCP shape reaches a real MongoClient (the refused-port test), the rest are checked against our own dict; seam=none; no_claim=that a TLS handshake or an X.509 login succeeds
 @pytest.mark.parametrize(
     "config, seed",
