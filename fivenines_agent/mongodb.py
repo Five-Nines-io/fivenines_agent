@@ -1023,6 +1023,15 @@ def _classify(exc, client, pymongo):
     return "unknown", exc
 
 
+def _error_text(exc):
+    """str(exc), but an OSError naming a file is rebuilt from the raw name:
+    str() quotes it with repr(), which escapes a password in it (a
+    backslash, a quote) out of the redaction's reach."""
+    if isinstance(exc, OSError) and exc.strerror and exc.filename is not None:
+        return f"{exc.strerror}: {exc.filename}"
+    return str(exc)
+
+
 def _message(exc, config):
     """A short, stable, redacted error message: an OperationFailure's errmsg
     without the reply dump (which carries $clusterTime), and never the
@@ -1032,7 +1041,7 @@ def _message(exc, config):
     if isinstance(details, Mapping) and isinstance(details.get("errmsg"), str):
         text = details["errmsg"]
     if not text:
-        text = str(exc) or type(exc).__name__
+        text = _error_text(exc) or type(exc).__name__
     # pymongo never echoes a password passed as a keyword argument: this is a
     # backstop, and a short password would only garble a message (and show
     # where it occurs).
@@ -1211,11 +1220,8 @@ def _unusable_tls_file(config):
             mode = os.stat(path).st_mode
         except (OSError, ValueError) as e:
             # ValueError: a NUL in the path, or a lone surrogate
-            # (UnicodeEncodeError). The raw path, never str(OSError): it
-            # quotes the path with repr(), which escapes a password in it
-            # out of the redaction's reach.
-            reason = getattr(e, "strerror", None) or str(e)
-            return _message(f"{key}: {reason}: {path}", config)
+            # (UnicodeEncodeError).
+            return _message(f"{key}: {_error_text(e)}", config)
         if not stat.S_ISREG(mode):
             return _message(f"{key} is not a regular file: {path}", config)
     return None
@@ -1273,6 +1279,7 @@ def _log_outcome(result):
         )
         return
     _last_logged.pop("envelope", None)
+    _last_logged.pop("busy", None)
     errors = (result.get("collection") or {}).get("errors") or {}
     if errors:
         _log_streak(
@@ -1335,15 +1342,11 @@ def mongodb_metrics(
             return _failure("timeout", message)
         _stalled_worker = None
     if _driver_thread_alive():
-        result = _failure("timeout", _DRIVER_BUSY_MESSAGE)
-        if "envelope" in _last_logged:
-            # A failure is logged already (usually the one that left the
-            # thread blocked): a streak key of this skip's own would
-            # alternate with that failure's and log at error every tick.
-            log(f"MongoDB collection skipped: {_DRIVER_BUSY_MESSAGE}", "debug")
-        else:
-            _log_outcome(result)
-        return result
+        # A streak of its own, reset by a reachable tick: at error once per
+        # outage, and never resetting the failure's (sharing its key, the
+        # two would alternate and log at error every tick).
+        _log_streak("busy", True, f"MongoDB collection skipped: {_DRIVER_BUSY_MESSAGE}")
+        return _failure("timeout", _DRIVER_BUSY_MESSAGE)
     try:
         result = call_bounded(
             lambda: _collect(config), COLLECT_DEADLINE, name="mongodb"

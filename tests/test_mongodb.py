@@ -8,6 +8,7 @@ and age rules, the section accounting and the two time bounds.
 """
 
 import json
+import math
 import os
 import re
 import socket
@@ -523,6 +524,24 @@ def test_the_password_is_redacted_from_tls_file_messages(monkeypatch, tmp_path):
         assert "[REDACTED]" in result["error_message"]
 
 
+def test_a_tls_file_the_driver_cannot_read_has_its_password_redacted(monkeypatch):
+    """A file os.stat passes but open() refuses (EACCES: root-owned 0600):
+    the driver's PermissionError is rebuilt from the raw path too."""
+    password = "back\\slash'quote\""
+    path = f"/etc/{password}/ca.pem"
+
+    def unreadable(_pymongo, _options):
+        raise PermissionError(13, "Permission denied", path)
+
+    monkeypatch.setattr(mongodb, "_new_client", unreadable)
+    monkeypatch.setattr(mongodb, "_unusable_tls_file", lambda _config: None)
+    result = mongodb.mongodb_metrics(
+        **{**CONFIG, "password": password, "tls": True, "tls_ca_file": path}
+    )
+    assert result["error_type"] == "config_error"
+    assert result["error_message"] == "Permission denied: /etc/[REDACTED]/ca.pem"
+
+
 def test_a_password_repr_would_escape_is_redacted_from_tls_file_messages(
     monkeypatch,
 ):
@@ -639,31 +658,40 @@ def test_a_driver_thread_that_ends_within_the_grace_is_not_blocked(monkeypatch):
     assert not exiting.is_alive()
 
 
-def test_the_driver_busy_skip_does_not_restart_the_error_streak(monkeypatch, capsys):
-    """A resolver slower than one interval alternates a no-answer tick and a
-    busy one: the failure logs at error once, not on every tick."""
-    monkeypatch.setenv("LOG_LEVEL", "debug")
-    monkeypatch.setattr(mongodb, "_DRIVER_EXIT_GRACE", 0.05)
-    no_answer = {"hello": {"raises": SELECTION}}
+def busy_tick(monkeypatch, mongo):
+    """One collection while a pymongo thread from an earlier tick is stuck."""
     release = threading.Event()
     stuck = threading.Thread(
         target=release.wait, name="pymongo_server_monitor_thread", daemon=True
     )
-    collect(monkeypatch, no_answer)
     stuck.start()
     try:
-        busy, _ = collect(monkeypatch, no_answer)
+        return collect(monkeypatch, mongo)
     finally:
         release.set()
         stuck.join(5)
-    collect(monkeypatch, no_answer)
-    lines = [
+
+
+def log_levels(capsys):
+    return [
         line.split("]")[0]
         for line in capsys.readouterr().out.splitlines()
         if "MongoDB collection" in line
     ]
+
+
+def test_the_driver_busy_skip_does_not_restart_the_error_streak(monkeypatch, capsys):
+    """A resolver slower than one interval alternates a no-answer tick and a
+    busy one: each logs at error once, not on every tick."""
+    monkeypatch.setenv("LOG_LEVEL", "debug")
+    monkeypatch.setattr(mongodb, "_DRIVER_EXIT_GRACE", 0.05)
+    no_answer = {"hello": {"raises": SELECTION}}
+    collect(monkeypatch, no_answer)
+    busy, _ = busy_tick(monkeypatch, no_answer)
+    collect(monkeypatch, no_answer)
+    busy_tick(monkeypatch, no_answer)
     assert busy["error_message"] == mongodb._DRIVER_BUSY_MESSAGE
-    assert lines == ["[ERROR", "[DEBUG", "[DEBUG"]
+    assert log_levels(capsys) == ["[ERROR", "[ERROR", "[DEBUG", "[DEBUG"]
 
 
 def test_a_driver_busy_skip_after_a_success_logs_at_error_once(monkeypatch, capsys):
@@ -672,23 +700,51 @@ def test_a_driver_busy_skip_after_a_success_logs_at_error_once(monkeypatch, caps
     monkeypatch.setenv("LOG_LEVEL", "debug")
     monkeypatch.setattr(mongodb, "_DRIVER_EXIT_GRACE", 0.05)
     collect(monkeypatch, {"hello": {"arbiterOnly": True}})
-    release = threading.Event()
-    stuck = threading.Thread(
-        target=release.wait, name="pymongo_server_monitor_thread", daemon=True
+    busy_tick(monkeypatch, {})
+    busy_tick(monkeypatch, {})
+    collect(monkeypatch, {"hello": {"arbiterOnly": True}})
+    busy_tick(monkeypatch, {})  # a new outage after the recovery
+    assert log_levels(capsys) == ["[ERROR", "[DEBUG", "[ERROR"]
+
+
+def test_a_driver_busy_skip_after_an_older_failure_logs_at_error_once(
+    monkeypatch, capsys
+):
+    """A steady failure logged long before (auth_failed) does not stand for
+    a monitor blocked since: the busy state reaches an error line once."""
+    monkeypatch.setenv("LOG_LEVEL", "debug")
+    monkeypatch.setattr(mongodb, "_DRIVER_EXIT_GRACE", 0.05)
+    refused = {"hello": {"raises": op_failure(18, "Authentication failed.")}}
+    collect(monkeypatch, refused)
+    collect(monkeypatch, refused)
+    busy_tick(monkeypatch, refused)
+    busy_tick(monkeypatch, refused)
+    assert log_levels(capsys) == ["[ERROR", "[DEBUG", "[ERROR", "[DEBUG"]
+
+
+def test_the_driver_exit_grace_is_shared_by_every_thread(monkeypatch):
+    """One deadline for all of them: the documented bound (the grace plus
+    COLLECT_DEADLINE) holds however many threads are exiting."""
+    now = [0.0]
+    monkeypatch.setattr(mongodb, "time", SimpleNamespace(monotonic=lambda: now[0]))
+
+    class Exiting:
+        def __init__(self, name, ends):
+            self.name, self.ends = name, ends
+
+        def join(self, timeout):
+            now[0] += min(timeout, max(0.0, self.ends - now[0]))
+
+        def is_alive(self):
+            return now[0] < self.ends
+
+    grace = mongodb._DRIVER_EXIT_GRACE
+    threads = [Exiting("pymongo_a", 0.9 * grace), Exiting("pymongo_b", math.inf)]
+    monkeypatch.setattr(
+        mongodb, "threading", SimpleNamespace(enumerate=lambda: threads)
     )
-    stuck.start()
-    try:
-        collect(monkeypatch, {})
-        collect(monkeypatch, {})
-    finally:
-        release.set()
-        stuck.join(5)
-    lines = [
-        line.split("]")[0]
-        for line in capsys.readouterr().out.splitlines()
-        if "MongoDB collection" in line
-    ]
-    assert lines == ["[ERROR", "[DEBUG"]
+    assert mongodb._driver_thread_alive() is True
+    assert now[0] == grace
 
 
 # Value: protects=a resolver that never answers leaves at most ONE blocked pymongo monitor thread however many ticks run (close() does not join it); fails_when=the driver-thread single flight is dropped: each tick adds a thread; why_new=the fake client starts no thread, only the real driver shows it; seam=none; no_claim=how a real NSS backend hangs (getaddrinfo is stubbed to block)
