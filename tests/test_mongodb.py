@@ -447,12 +447,24 @@ def test_flags_need_an_explicit_true(value, expected):
 
 
 @pytest.mark.parametrize("config", [{"port": 1e400}, {"host": "/tmp/\udc80.sock"}])
-def test_config_values_no_rule_anticipated_are_still_an_envelope(config):
+def test_values_python_cannot_convert_are_a_config_error(config):
     from fivenines_agent.collectors import collect_metrics
 
     data = {}
     collect_metrics({"mongodb": {**CONFIG, **config}}, data)
     assert data["mongodb"]["error_type"] == "config_error"
+
+
+def test_a_config_failure_no_rule_anticipated_is_still_an_envelope(monkeypatch):
+    def unexpected(_host):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(mongodb, "_tcp_host", unexpected)
+    result = mongodb.mongodb_metrics(**CONFIG)
+    assert (result["error_type"], result["error_message"]) == (
+        "config_error",
+        "unexpected",
+    )
 
 
 def test_a_config_error_is_an_envelope_and_sends_nothing(monkeypatch, capsys):
@@ -476,12 +488,14 @@ def test_a_client_that_cannot_be_built_is_a_config_error(monkeypatch):
     )
 
 
-# Value: protects=a TLS CA or client certificate file that does not load is a config_error envelope, raised before any connection; fails_when=the client-build except is narrowed to ConfigurationError (pymongo raises a bare FileNotFoundError): it reads unknown; why_new=the test above fakes a ConfigurationError, the one type a narrowed except still catches; seam=none; no_claim=how a present but malformed PEM file is reported
+# Value: protects=a missing TLS CA or client certificate path is a config_error naming its key and path, before any client is built; fails_when=the os.stat failure branch of _unusable_tls_file is dropped (the path then reaches the driver, whose message names no key); why_new=the FIFO test below covers only a path that exists; seam=none; no_claim=how a present but malformed PEM file is reported (test_a_regular_tls_file_reaches_the_driver)
 @pytest.mark.parametrize("key", ["tls_ca_file", "tls_certificate_key_file"])
-def test_a_tls_file_that_does_not_load_is_a_config_error_with_the_real_driver(key):
+def test_a_tls_file_that_cannot_be_read_is_a_config_error_naming_it(monkeypatch, key):
     missing = "/nonexistent-fivenines/agent.pem"
-    result = mongodb.mongodb_metrics(**{**CONFIG, "tls": True, key: missing})
+    result, clients = collect(monkeypatch, {}, tls=True, **{key: missing})
+    assert clients == []
     assert (result["reachable"], result["error_type"]) == (False, "config_error")
+    assert result["error_message"].startswith(f"{key}: ")
     assert missing in result["error_message"]
 
 
@@ -551,6 +565,7 @@ def test_the_config_is_checked_before_anything_is_dialed(monkeypatch):
 
 
 def test_no_client_is_built_while_a_driver_thread_is_alive(monkeypatch):
+    monkeypatch.setattr(mongodb, "_DRIVER_EXIT_GRACE", 0.05)
     release = threading.Event()
     stuck = threading.Thread(
         target=release.wait, name="pymongo_server_monitor_thread", daemon=True
@@ -570,6 +585,48 @@ def test_no_client_is_built_while_a_driver_thread_is_alive(monkeypatch):
     assert result["role"] == "arbiter" and clients
 
 
+def test_a_driver_thread_that_ends_within_the_grace_is_not_blocked(monkeypatch):
+    """close() does not join the driver's threads: one that is merely
+    exiting when the next collection starts is waited for, not reported."""
+    exiting = threading.Thread(
+        target=threading.Event().wait,
+        args=(0.2,),
+        name="pymongo_server_monitor_thread",
+        daemon=True,
+    )
+    exiting.start()
+    result, clients = collect(monkeypatch, {"hello": {"arbiterOnly": True}})
+    assert result["role"] == "arbiter" and clients
+    assert not exiting.is_alive()
+
+
+def test_the_driver_busy_skip_does_not_restart_the_error_streak(monkeypatch, capsys):
+    """A resolver slower than one interval alternates a no-answer tick and a
+    busy one: the failure logs at error once, not on every tick."""
+    monkeypatch.setenv("LOG_LEVEL", "debug")
+    monkeypatch.setattr(mongodb, "_DRIVER_EXIT_GRACE", 0.05)
+    no_answer = {"hello": {"raises": SELECTION}}
+    release = threading.Event()
+    stuck = threading.Thread(
+        target=release.wait, name="pymongo_server_monitor_thread", daemon=True
+    )
+    collect(monkeypatch, no_answer)
+    stuck.start()
+    try:
+        busy, _ = collect(monkeypatch, no_answer)
+    finally:
+        release.set()
+        stuck.join(5)
+    collect(monkeypatch, no_answer)
+    lines = [
+        line.split("]")[0]
+        for line in capsys.readouterr().out.splitlines()
+        if "MongoDB collection" in line
+    ]
+    assert busy["error_message"] == mongodb._DRIVER_BUSY_MESSAGE
+    assert lines == ["[ERROR", "[DEBUG", "[DEBUG"]
+
+
 # Value: protects=a resolver that never answers leaves at most ONE blocked pymongo monitor thread however many ticks run (close() does not join it); fails_when=the driver-thread single flight is dropped: each tick adds a thread; why_new=the fake client starts no thread, only the real driver shows it; seam=none; no_claim=how a real NSS backend hangs (getaddrinfo is stubbed to block)
 def test_a_wedged_resolver_leaves_one_monitor_thread_with_the_real_driver(
     monkeypatch,
@@ -584,6 +641,7 @@ def test_a_wedged_resolver_leaves_one_monitor_thread_with_the_real_driver(
         return real(host, *args, **kwargs)
 
     monkeypatch.setattr(socket, "getaddrinfo", wedged)
+    monkeypatch.setattr(mongodb, "_DRIVER_EXIT_GRACE", 0.05)
     monkeypatch.setattr(mongodb, "SERVER_SELECTION_TIMEOUT_MS", 300)
     monkeypatch.setattr(mongodb, "HELLO_TIMEOUT_S", 0.3)
 
@@ -841,6 +899,16 @@ def test_a_short_password_is_not_redacted_into_messages(monkeypatch):
     hello = {"type": "AutoReconnect", "message": "127.0.0.1:1: connection closed"}
     _, message = gate_failure(monkeypatch, hello, password="1")
     assert message == "127.0.0.1:1: connection closed"
+
+
+@pytest.mark.parametrize(
+    "password, shipped",
+    [("abcdef", "bad value [REDACTED]"), ("abcde", "bad value abcde")],
+)
+def test_redaction_starts_at_six_characters(monkeypatch, password, shipped):
+    hello = op_failure(2, f"bad value {password}")
+    _, message = gate_failure(monkeypatch, hello, password=password)
+    assert message == shipped
 
 
 def test_a_peer_that_is_not_mongodb_gets_a_stable_message(monkeypatch):
@@ -1434,6 +1502,7 @@ def test_sharding_needs_a_set_name():
 
 
 def test_sections_the_budget_no_longer_covers_read_timeout(monkeypatch):
+    monkeypatch.setattr(mongodb, "_driver_thread_alive", lambda: False)
     clock = iter([0.0, 1.0] + [99.0] * 50)  # __init__, the hello, then late
     monkeypatch.setattr(mongodb, "time", SimpleNamespace(monotonic=lambda: next(clock)))
     result = member(monkeypatch)
@@ -1451,7 +1520,7 @@ def test_a_gate_the_budget_no_longer_covers_is_a_timeout(monkeypatch):
     result, _ = collect(monkeypatch, {"hello": MEMBER_HELLO})
     assert (result["error_type"], result["error_message"]) == (
         "timeout",
-        "skipped: the 0s command budget was spent before it",
+        "not sent: the 0s command budget was already spent",
     )
 
 
@@ -1635,6 +1704,10 @@ def test_a_refused_port_end_to_end_with_the_real_driver(monkeypatch):
     assert result["reachable"] is False
     assert result["error_type"] == "connection_refused"
     assert result["error_message"].startswith(f"127.0.0.1:{port}: ")
+    # At once, as after a tick that overran its interval: the first client's
+    # threads are still exiting (close() does not join them), not blocked.
+    again = mongodb.mongodb_metrics(**{**CONFIG, "port": port})
+    assert again["error_type"] == "connection_refused"
 
 
 def test_ssl_errors_keep_their_type():

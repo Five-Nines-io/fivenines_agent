@@ -41,7 +41,8 @@ COLLECT_DEADLINE, single-flight. Neither bounds the driver's own monitor
 thread, which resolves and dials the host and which client.close() does not
 join: a resolver that never answers keeps it blocked after the tick returns.
 So no client is built while a pymongo thread from an earlier tick is still
-alive (_driver_thread_alive): at most one blocked monitor, never one per tick.
+alive once given _DRIVER_EXIT_GRACE to end (_driver_thread_alive): at most one
+blocked monitor, never one per tick.
 
 pymongo is imported lazily, on the first tick that carries a mongodb config:
 it costs ~110 ms and ~11 MB of RSS, which hosts without MongoDB never pay.
@@ -150,6 +151,13 @@ _DRIVER_BUSY_MESSAGE = (
     "it ends"
 )
 
+# How long a pymongo thread may take to end before it counts as blocked:
+# close() does not join them, and they notice it within their 0.5s sleep
+# (measured: both gone ~0.6s after close()), so a collection started right
+# after another one would otherwise read a thread that is merely exiting as
+# blocked.
+_DRIVER_EXIT_GRACE = 1.0
+
 # What the driver reports when the peer is not speaking the MongoDB wire
 # protocol (its own text carries random request ids, a new message per tick).
 _PROTOCOL_MESSAGE = "the peer does not speak the MongoDB wire protocol"
@@ -189,7 +197,7 @@ class _BudgetSpent(Exception):
 
     def __init__(self):
         super().__init__(
-            f"skipped: the {COMMAND_BUDGET}s command budget was spent before it"
+            f"not sent: the {COMMAND_BUDGET}s command budget was already spent"
         )
 
 
@@ -979,8 +987,8 @@ def _connection_error_type(error, pymongo):
 
 
 def _classify(exc, client, pymongo):
-    """(error_type, the exception whose message ships) for a failure of the
-    hello gate."""
+    """(error_type, the exception or fixed message that ships) for a failure
+    of the hello gate."""
     errors = pymongo.errors
     if isinstance(exc, errors.ServerSelectionTimeoutError):
         # The selection only says it gave up; the monitor's error says why.
@@ -997,6 +1005,8 @@ def _classify(exc, client, pymongo):
         if _wire_version_too_old(client, pymongo):
             return "server_too_old", exc
         return "config_error", exc
+    # _BudgetSpent is a backstop here: the gate is the first command, capped
+    # at HELLO_TIMEOUT_S of COMMAND_BUDGET.
     if isinstance(exc, _BudgetSpent) or (
         isinstance(exc, errors.PyMongoError) and exc.timeout
     ):
@@ -1205,10 +1215,15 @@ def _unusable_tls_file(config):
 
 
 def _driver_thread_alive():
-    return any(
-        t.name.startswith(_DRIVER_THREAD_PREFIX) and t.is_alive()
-        for t in threading.enumerate()
-    )
+    """Whether a pymongo thread from an earlier tick is still running after
+    _DRIVER_EXIT_GRACE (shared by every such thread) to end."""
+    deadline = time.monotonic() + _DRIVER_EXIT_GRACE
+    for thread in threading.enumerate():
+        if thread.name.startswith(_DRIVER_THREAD_PREFIX):
+            thread.join(max(0.0, deadline - time.monotonic()))
+            if thread.is_alive():
+                return True
+    return False
 
 
 def _collect(config):
@@ -1312,9 +1327,11 @@ def mongodb_metrics(
             return _failure("timeout", message)
         _stalled_worker = None
     if _driver_thread_alive():
-        result = _failure("timeout", _DRIVER_BUSY_MESSAGE)
-        _log_outcome(result)
-        return result
+        # Logged like the stalled worker: the tick that left the thread
+        # blocked logged its own failure, and a streak key of this skip's own
+        # would alternate with that failure's and log at error every tick.
+        log(f"MongoDB collection skipped: {_DRIVER_BUSY_MESSAGE}", "debug")
+        return _failure("timeout", _DRIVER_BUSY_MESSAGE)
     try:
         result = call_bounded(
             lambda: _collect(config), COLLECT_DEADLINE, name="mongodb"
