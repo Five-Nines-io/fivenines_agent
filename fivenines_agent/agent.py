@@ -173,6 +173,12 @@ _DRY_RUN_CONFIG = {
     # default poll interval. Gated on the "zfs" capability like smart/raid.
     "zfs": True,
     "redis": {"port": 6379},
+    # The local mongod on its default port, without credentials (#258): enough
+    # for --dry-run to prove pymongo loads and connects in a built binary (the
+    # sections a mongod with access control refuses read not_authorized). A
+    # dict, not {}, which the `if not config_value` gate would skip. Costs the
+    # 5s server selection timeout on a host where nothing listens on 27017.
+    "mongodb": {"host": "127.0.0.1", "port": 27017},
     "fail2ban": True,
     "disk_health": True,
     # True (not a dict) -> docker_metrics() runs with default socket resolution.

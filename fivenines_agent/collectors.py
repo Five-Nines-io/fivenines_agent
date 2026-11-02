@@ -17,6 +17,7 @@ from fivenines_agent.io import io, io_topology
 from fivenines_agent.logs import collect_log_signals
 from fivenines_agent.memcached import memcached_metrics
 from fivenines_agent.memory import memory, swap
+from fivenines_agent.mongodb import mongodb_metrics
 from fivenines_agent.mysql import mysql_metrics
 from fivenines_agent.network import network
 from fivenines_agent.nginx import nginx_metrics
@@ -155,6 +156,14 @@ COLLECTORS = [
     ("sglang", [("sglang", sglang_metrics, True)]),
     ("postgresql", [("postgresql", postgresql_metrics, True)]),
     ("mysql", [("mysql", mysql_metrics, True)]),
+    # MongoDB (#258 / server #493): the local mongod's (or mongos') health and,
+    # on a replica set member, the member's whole view of its set -- the
+    # server dedups the views of every member by replicaSetId (the Proxmox
+    # multi-reporter model). Config-driven, cross-OS, no capability gate (the
+    # tsdb/pbs posture). config["mongodb"] is a TOP-LEVEL key splatted into
+    # mongodb_metrics(...), which takes **_kwargs so a key the server adds
+    # later is ignored rather than a TypeError. Emits a never-None envelope.
+    ("mongodb", [("mongodb", mongodb_metrics, True)]),
     # RabbitMQ: config-driven management-API poll (nginx/apache/postgresql
     # posture, no capability gate). config["rabbitmq"] == {url, username,
     # password, vhost, include_queues} is unpacked (pass_kwargs) into
