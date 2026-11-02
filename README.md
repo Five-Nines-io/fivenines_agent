@@ -2349,9 +2349,8 @@ credentials.
 ### MongoDB
 
 Monitors the `mongod` (or `mongos`) running on the agent's own machine, over
-one direct, read-only connection per collection (agent **1.22.0+**; MongoDB
-4.4 to 8.x). No client binary is needed: the driver (pymongo) ships inside the
-agent.
+a direct, read-only connection (agent **1.22.0+**; MongoDB 4.4 to 8.x). No
+client binary is needed: the driver (pymongo) ships inside the agent.
 
 - Every process: uptime, connections, operation and document counters,
   network traffic, memory, WiredTiger cache and read/write tickets, global
