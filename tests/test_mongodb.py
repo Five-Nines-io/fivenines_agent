@@ -523,6 +523,21 @@ def test_the_password_is_redacted_from_tls_file_messages(monkeypatch, tmp_path):
         assert "[REDACTED]" in result["error_message"]
 
 
+def test_a_password_repr_would_escape_is_redacted_from_tls_file_messages(
+    monkeypatch,
+):
+    """str(OSError) quotes the path with repr(), which doubles a backslash:
+    the message is built from the raw path instead."""
+    password = "back\\slash'quote\""
+    missing = f"/nonexistent-fivenines/{password}.pem"
+    result, _ = collect(
+        monkeypatch, {}, password=password, tls=True, tls_ca_file=missing
+    )
+    assert result["error_type"] == "config_error"
+    assert "slash" not in result["error_message"]
+    assert "[REDACTED]" in result["error_message"]
+
+
 # Value: protects=each config shape the validator accepts builds a real MongoClient dialing that address over one direct, poll-monitored connection; fails_when=a host spelling (bracketed IPv6, percent-encoded socket URI) or TLS option mix stops being what pymongo reads that way; why_new=only the default TCP shape reaches a real MongoClient (the refused-port test), the rest are checked against our own dict; seam=none; no_claim=that a TLS handshake or an X.509 login succeeds
 @pytest.mark.parametrize(
     "config, seed",

@@ -1211,8 +1211,11 @@ def _unusable_tls_file(config):
             mode = os.stat(path).st_mode
         except (OSError, ValueError) as e:
             # ValueError: a NUL in the path, or a lone surrogate
-            # (UnicodeEncodeError).
-            return _message(f"{key}: {e}", config)
+            # (UnicodeEncodeError). The raw path, never str(OSError): it
+            # quotes the path with repr(), which escapes a password in it
+            # out of the redaction's reach.
+            reason = getattr(e, "strerror", None) or str(e)
+            return _message(f"{key}: {reason}: {path}", config)
         if not stat.S_ISREG(mode):
             return _message(f"{key} is not a regular file: {path}", config)
     return None
