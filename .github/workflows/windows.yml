@@ -211,6 +211,54 @@ jobs:
 
           if ($script:failed -gt 0) { throw "$($script:failed) service-account rule case(s) failed" }
 
+      # The WMI Storage namespace delegation, for real on this runner: two
+      # grants leave one ACE, the uninstall's removal takes it, and a grant
+      # must work while the namespace still carries the ACE of a deleted
+      # account (the object-form GetSecurityDescriptor failed on one, which
+      # failed a reinstall with 1603 on a domain controller).
+      - name: Verify the WMI namespace delegation and its removal
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $namespace = "root\Microsoft\Windows\Storage"
+          $uninstall = Get-Content fivenines_uninstall.ps1 -Raw
+          foreach ($fn in 'Get-WmiNamespaceSD', 'Set-WmiNamespaceSD', 'Remove-WmiStorageGrant') {
+            $m = [regex]::Match($uninstall, "(?ms)^function $fn \{.*?^\}")
+            if (-not $m.Success) { throw "$fn not found in fivenines_uninstall.ps1" }
+            Invoke-Expression $m.Value
+          }
+          function Get-GrantCount($Sid) {
+            return @((Get-WmiNamespaceSD $namespace).DiscretionaryAcl | Where-Object {
+              $_ -is [System.Security.AccessControl.KnownAce] -and $_.SecurityIdentifier.Value -eq $Sid }).Count
+          }
+          function New-TestUser($Name) {
+            $pw = ConvertTo-SecureString ("Aa1-" + [guid]::NewGuid()) -AsPlainText -Force
+            New-LocalUser -Name $Name -Password $pw | Out-Null
+            return (Get-LocalUser -Name $Name).SID.Value
+          }
+
+          try {
+            $first = New-TestUser "fn-wmi-a"
+            & windows/installer/DelegateWmiStorageNamespace.ps1 -ServiceAccount "$env:COMPUTERNAME\fn-wmi-a"
+            & windows/installer/DelegateWmiStorageNamespace.ps1 -ServiceAccount ".\fn-wmi-a"
+            if ((Get-GrantCount $first) -ne 1) { throw "two grants left $(Get-GrantCount $first) ACEs, expected 1" }
+            Write-Host "Granted twice: one ACE."
+
+            Remove-LocalUser -Name "fn-wmi-a"
+            $second = New-TestUser "fn-wmi-b"
+            & windows/installer/DelegateWmiStorageNamespace.ps1 -ServiceAccount "fn-wmi-b"
+            if ((Get-GrantCount $second) -ne 1) { throw "the grant over an orphaned ACE did not land" }
+            Write-Host "Granted while the namespace carries a deleted account's ACE."
+
+            Remove-WmiStorageGrant $second
+            Remove-WmiStorageGrant $first
+            if ((Get-GrantCount $second) -ne 0 -or (Get-GrantCount $first) -ne 0) { throw "Remove-WmiStorageGrant left an ACE" }
+            Write-Host "Remove-WmiStorageGrant removed both, the orphaned one included."
+          } finally {
+            Remove-LocalUser -Name "fn-wmi-a" -ErrorAction SilentlyContinue
+            Remove-LocalUser -Name "fn-wmi-b" -ErrorAction SilentlyContinue
+          }
+
       # Helpers duplicated across scripts that cannot share a file: the
       # custom actions are separate MSI files, the bootstraps are downloaded
       # one by one.

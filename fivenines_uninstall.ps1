@@ -149,13 +149,12 @@ function Remove-WmiStorageGrant {
     $namespace = "root\Microsoft\Windows\Storage"
     $sd = Get-WmiNamespaceSD $namespace
     $sidObject = [System.Security.Principal.SecurityIdentifier]$Sid
-    $inherited = [System.Security.AccessControl.AceFlags]::Inherited
     $removed = 0
     for ($i = $sd.DiscretionaryAcl.Count - 1; $i -ge 0; $i--) {
         $ace = $sd.DiscretionaryAcl[$i]
         if ($ace -is [System.Security.AccessControl.KnownAce] -and
             $ace.SecurityIdentifier -eq $sidObject -and
-            ($ace.AceFlags -band $inherited) -eq 0) {
+            -not $ace.IsInherited) {
             $sd.DiscretionaryAcl.RemoveAce($i)
             $removed++
         }

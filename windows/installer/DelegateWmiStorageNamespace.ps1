@@ -90,7 +90,6 @@ $WBEM_REMOTE_ENABLE  = 0x20
 $mask = $WBEM_ENABLE -bor $WBEM_METHOD_EXECUTE -bor $WBEM_REMOTE_ENABLE
 $sidObject = [System.Security.Principal.SecurityIdentifier]$sid
 $allowed = [System.Security.AccessControl.AceQualifier]::AccessAllowed
-$inherited = [System.Security.AccessControl.AceFlags]::Inherited
 
 $alreadyGranted = $false
 foreach ($existingAce in $sd.DiscretionaryAcl) {
@@ -107,10 +106,12 @@ if ($alreadyGranted) {
     exit 0
 }
 
-# Explicit ACEs go before inherited ones (the canonical order).
+# Explicit ACEs go before inherited ones (the canonical order). IsInherited,
+# not "AceFlags -band Inherited": AceFlags is a byte enum, and Windows
+# PowerShell 5.1's -band on one raises "Specified cast is not valid".
 $position = $sd.DiscretionaryAcl.Count
 for ($i = 0; $i -lt $sd.DiscretionaryAcl.Count; $i++) {
-    if (($sd.DiscretionaryAcl[$i].AceFlags -band $inherited) -ne 0) {
+    if ($sd.DiscretionaryAcl[$i].IsInherited) {
         $position = $i
         break
     }
