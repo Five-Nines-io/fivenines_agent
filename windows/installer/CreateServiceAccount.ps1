@@ -260,19 +260,23 @@ function Test-HResult {
 # Kept identical in fivenines_uninstall.ps1 (windows.yml checks it).
 # The WinNT entry of this machine's user NAME, or $null when there is none.
 # [ADSI]::Exists() does not answer that for WinNT: it raises NERR_UserNotFound
-# instead of returning false. [ADSI] binds lazily, so reading a property is
-# what finds out. Properties go through psbase: PowerShell's ADSI adapter
-# hides the DirectoryEntry's own .NET members.
+# instead of returning false. [ADSI] binds lazily and reading a property does
+# not bind it either (a missing user reads as one with no SID), so
+# RefreshCache() -- IADs::GetInfo -- is what finds out. .NET members go
+# through psbase: PowerShell's ADSI adapter hides them.
 function Get-WinNTUser {
     param([string]$Name)
 
     $entry = [ADSI]("WinNT://{0}/{1},user" -f $env:COMPUTERNAME, $Name)
     try {
-        $null = $entry.psbase.Properties["objectSid"].Value
+        $entry.psbase.RefreshCache()
     } catch {
         # NERR_UserNotFound (2221, 0x800708AD), ERROR_NO_SUCH_USER (1317, 0x80070525).
         if ((Test-HResult $_.Exception -2147022675) -or (Test-HResult $_.Exception -2147023579)) { return $null }
         throw
+    }
+    if ($null -eq $entry.psbase.Properties["objectSid"].Value) {
+        throw ("WinNT user '{0}' was read but carries no objectSid" -f $Name)
     }
     return $entry
 }
