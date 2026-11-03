@@ -90,11 +90,11 @@ while kill -0 "$qemu" 2>/dev/null; do
     fi
     if [ $(( $(date +%s) / 180 )) -ne "$shot" ]; then
         shot=$(( $(date +%s) / 180 ))
-        echo "screendump $out/screens/$(date +%H%M%S).png -f png" | socat - UNIX-CONNECT:"$work/monitor.sock" > /dev/null 2>&1 || true
+        ( echo "screendump $out/screens/$(date +%H%M%S).png -f png" | socat - UNIX-CONNECT:"$work/monitor.sock" ) > /dev/null 2>&1 || true
     fi
     if [ "$(date +%s)" -gt "$deadline" ]; then
         echo "timed out waiting for the VM; killing it" >&2
-        echo "screendump $out/screens/timeout.png -f png" | socat - UNIX-CONNECT:"$work/monitor.sock" > /dev/null 2>&1 || true
+        ( echo "screendump $out/screens/timeout.png -f png" | socat - UNIX-CONNECT:"$work/monitor.sock" ) > /dev/null 2>&1 || true
         sleep 2
         kill "$qemu" 2>/dev/null || true
         timed_out=1

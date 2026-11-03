@@ -41,9 +41,16 @@ function Check {
 function Invoke-Msi {
     param([string]$Name, [string[]]$Arguments)
 
+    # 1601 (the Windows Installer service could not be reached) and 1618
+    # (another installation is running) are the service settling after the
+    # previous run, not a result: retry them.
     $log = "C:\fn\logs\$Name.log"
-    $p = Start-Process msiexec.exe -ArgumentList ($Arguments + @("/qn", "/l*v", "`"$log`"")) -Wait -PassThru
-    Log ("msiexec {0}: exit {1}" -f $Name, $p.ExitCode)
+    for ($attempt = 1; $attempt -le 4; $attempt++) {
+        $p = Start-Process msiexec.exe -ArgumentList ($Arguments + @("/qn", "/l*v", "`"$log`"")) -Wait -PassThru
+        Log ("msiexec {0}: exit {1}" -f $Name, $p.ExitCode)
+        if ($p.ExitCode -ne 1601 -and $p.ExitCode -ne 1618) { break }
+        Start-Sleep -Seconds 20
+    }
     return @{ ExitCode = $p.ExitCode; Log = $log; Token = $null }
 }
 
@@ -331,6 +338,7 @@ try {
     Log "== S8b: an account deleted by hand leaves its WMI grant behind; the next install must cope"
     $r = Install-Agent "s8b-install"
     Check ($r.ExitCode -eq 0) "S8b install exits 0"
+    Check (Wait-AgentRunning) "S8b service reaches Running"
     Check ((Uninstall-Agent "s8b-uninstall").ExitCode -eq 0) "S8b uninstall exits 0"
     ([ADSI]("WinNT://{0},computer" -f $env:COMPUTERNAME)).Delete("user", $Account)
     Check ($null -eq (Get-AdAccount)) "S8b the account is deleted by hand"
