@@ -72,3 +72,45 @@ def test_alpine_build_checks_and_installs_the_same_packages():
         "pip install --require-hashes --no-deps --only-binary :all: "
         "-r ci/requirements/alpine-virtualization.txt" in script
     )
+
+
+def test_alpine_pymongo_pin_is_poetry_lock_version_and_hashes():
+    """pymongo has no musllinux wheel: py2exe_alpine.sh builds the sdist this
+    file pins before `poetry install`, which skips it only at poetry.lock's
+    version (#258). Its build backend is pinned beside it, every file
+    hash-checked."""
+    locked = _locked_packages()
+    pins = _pinned_packages("ci/requirements/pymongo-alpine.txt")
+    assert set(pins) == {"pymongo"}
+    version, hashes = pins["pymongo"]
+    locked_version, locked_hashes = locked["pymongo"]
+    assert version == locked_version, (
+        f"pymongo-alpine.txt pins {version}, poetry.lock locks {locked_version}; "
+        "update ci/requirements/pymongo-alpine.in and run ci/requirements/compile.sh"
+    )
+    assert hashes and hashes <= locked_hashes
+    backend = _pinned_packages("ci/requirements/pymongo-build.txt")
+    assert {"hatchling", "hatch-requirements-txt"} <= set(backend)
+    assert all(digests for _version, digests in backend.values())
+    # A package both files pin keeps build-tools.txt's version (poetry runs
+    # with it after this install).
+    tools = _pinned_packages("ci/requirements/build-tools.txt")
+    for name in set(backend) & set(tools):
+        assert backend[name][0] == tools[name][0], name
+
+
+def test_alpine_build_builds_pymongo_before_the_wheels_only_install():
+    script = (REPO_ROOT / "py2exe_alpine.sh").read_text(encoding="utf-8")
+    backend = script.index(
+        "pip install --require-hashes --no-deps --only-binary :all: "
+        "-r ci/requirements/pymongo-build.txt"
+    )
+    sdist = script.index(
+        "pip install --require-hashes --no-deps --no-build-isolation "
+        "--no-binary pymongo -r ci/requirements/pymongo-alpine.txt"
+    )
+    check = script.index(
+        'grep -q "^pymongo==${LOCKED} " ci/requirements/pymongo-alpine.txt'
+    )
+    poetry = script.index('POETRY_INSTALLER_ONLY_BINARY=":all:" poetry install')
+    assert check < backend < sdist < poetry

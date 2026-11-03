@@ -315,6 +315,9 @@ PYI_BASE=(
     --workpath ./build/tmp --distpath ./build --clean
     --hidden-import=scramp --hidden-import=dateutil.parser
     --hidden-import=paho.mqtt.client
+    # pymongo (the mongodb collector, imported lazily) imports some of its own
+    # modules only when a feature needs them (auth mechanisms, compression).
+    --collect-submodules pymongo --collect-submodules bson
     --copy-metadata fivenines_agent --copy-metadata pg8000 --copy-metadata scramp
     --add-binary "$PYTHON_LIB:."
     --add-binary "/usr/local/lib/libcrypt.so.2:." --add-binary "/usr/local/lib/libcrypt.so.1:."
@@ -326,14 +329,17 @@ if [ -n "${SYNOLOGY:-}" ]; then
     # they must be excluded explicitly or PyInstaller would bundle them --
     # pynvml included, which the standard build --hidden-imports.
     PYI_EXTRA=(--exclude-module libvirt --exclude-module libvirtmod --exclude-module systemd_watchdog --exclude-module proxmoxer --exclude-module pynvml)
-    CHECK_IMPORTS=()
+    # pymongo is a main dependency the agent imports only inside the mongodb
+    # collector: every variant bundles it, so every variant proves it loads.
+    CHECK_IMPORTS=(pymongo)
 else
     PYI_EXTRA=(--hidden-import=libvirt --hidden-import=libvirtmod --hidden-import=proxmoxer.backends --hidden-import=proxmoxer.backends.https --hidden-import=pynvml --add-binary "/usr/lib64/libtirpc.so.3:.")
     # The optional modules this build bundles, which the agent imports under
-    # try/except ImportError: the smoke check below must prove they load, or a
-    # missing one would ship and the agent silently go without it. Keep in
-    # step with PYI_EXTRA and with the linux-* list in ci/test-distro.sh.
-    CHECK_IMPORTS=(libvirt pynvml proxmoxer.backends.https systemd_watchdog)
+    # try/except ImportError or only inside a collector (pymongo): the smoke
+    # check below must prove they load, or a missing one would ship and the
+    # agent silently go without it. Keep in step with PYI_BASE/PYI_EXTRA and
+    # with the linux-* list in ci/test-distro.sh.
+    CHECK_IMPORTS=(pymongo libvirt pynvml proxmoxer.backends.https systemd_watchdog)
 fi
 
 LD_LIBRARY_PATH="/opt/python/cp310-cp310/lib:$LD_LIBRARY_PATH" pyinstaller \

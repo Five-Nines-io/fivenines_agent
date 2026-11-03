@@ -289,11 +289,15 @@ def test_every_binary_smoke_check_runs_check_imports(script):
     assert any("--check-imports" in line for line in bare)
 
 
-def _check_imports_list(script, pattern):
+def _check_imports_lists(script, pattern):
     text = (REPO_ROOT / script).read_text(encoding="utf-8")
-    found = re.findall(pattern, text, re.MULTILINE)
+    return [found.split() for found in re.findall(pattern, text, re.MULTILINE)]
+
+
+def _check_imports_list(script, pattern):
+    found = _check_imports_lists(script, pattern)
     assert len(found) == 1, (script, pattern, found)
-    return found[0].split()
+    return found[0]
 
 
 def test_distro_test_checks_the_optional_modules_each_build_checks():
@@ -301,7 +305,10 @@ def test_distro_test_checks_the_optional_modules_each_build_checks():
     so its per-variant module list must stay the list that build proves: a
     module added to one and not the other is either unproven on the distros
     or fails a binary that never bundled it."""
-    linux = _check_imports_list("py2exe.sh", r"^\s*CHECK_IMPORTS=\(([^)]+)\)$")
+    # py2exe.sh sets the Synology variant's list first, then the standard one.
+    synology, linux = _check_imports_lists(
+        "py2exe.sh", r"^\s*CHECK_IMPORTS=\(([^)]+)\)$"
+    )
     alpine = _check_imports_list("py2exe_alpine.sh", r'^CHECK_IMPORTS="([^"]+)"$')
     distro = "ci/test-distro.sh"
     assert linux == _check_imports_list(
@@ -312,12 +319,56 @@ def test_distro_test_checks_the_optional_modules_each_build_checks():
     )
     assert "libvirt" in linux and "libvirt" in alpine
     assert "proxmoxer.backends.https" in alpine  # bundled on Alpine since 1.21.6
+    # pymongo is a main dependency the agent imports only inside the mongodb
+    # collector (#258): every artifact bundles it, so every build proves it,
+    # the Windows build included.
+    assert synology == ["pymongo"]
+    assert "pymongo" in linux and "pymongo" in alpine
+    windows = (REPO_ROOT / "py2exe_windows.ps1").read_text(encoding="utf-8")
+    assert re.search(
+        r"^& \$exePath --check-imports .*\bpymongo\b", windows, re.MULTILINE
+    )
     # Each script passes its list to the binary.
     assert (
         '--check-imports "${CHECK_IMPORTS[@]}"' in (REPO_ROOT / "py2exe.sh").read_text()
     )
     for script in ("py2exe_alpine.sh", distro):
         assert "--check-imports $CHECK_IMPORTS" in (REPO_ROOT / script).read_text()
+
+
+# Value: protects=every PyInstaller build (Synology too) bundles all pymongo/bson submodules, incl. pymongo.synchronous.auth, imported only at login; fails_when=a --collect-submodules is dropped from one build or moved out of py2exe.sh's shared PYI_BASE: --check-imports pymongo loads only the top package and passes; why_new=the build tests pin only the CHECK_IMPORTS lists, nothing reads the PyInstaller arguments; seam=none; no_claim=that PyInstaller's static analysis would miss a module without them
+@pytest.mark.parametrize(
+    "script, block, uses",
+    [
+        ("py2exe.sh", r"^PYI_BASE=\((.*?)^\)$", '"${PYI_BASE[@]}"'),
+        (
+            "py2exe_alpine.sh",
+            r'^PYINSTALLER_ARGS="(.*?)"$',
+            "pyinstaller $PYINSTALLER_ARGS",
+        ),
+        (
+            "py2exe_windows.ps1",
+            r"^\$pyInstallerArgs = @\((.*?)^\)$",
+            "PyInstaller @pyInstallerArgs",
+        ),
+    ],
+)
+def test_every_build_collects_the_pymongo_submodules(script, block, uses):
+    """The agent imports pymongo only inside the mongodb collector, and pymongo
+    imports its authentication code only at login: the binary smoke check
+    (--check-imports pymongo) imports the top-level package alone, so each
+    build must collect every submodule in the argument block it hands
+    PyInstaller (py2exe.sh's PYI_BASE is shared with the Synology variant)."""
+    text = (REPO_ROOT / script).read_text(encoding="utf-8")
+    found = re.findall(block, text, re.MULTILINE | re.DOTALL)
+    assert len(found) == 1, (script, found)
+    code = " ".join(line.split("#", 1)[0] for line in found[0].splitlines())
+    # One token per argument, whatever the quoting: sh words, PowerShell items.
+    tokens = [t for t in (w.strip('",\\') for w in code.split()) if t]
+    pairs = set(zip(tokens, tokens[1:]))
+    for package in ("pymongo", "bson"):
+        assert ("--collect-submodules", package) in pairs, (script, package)
+    assert uses in text
 
 
 def test_start_dry_run_flag_is_visible_to_the_agent(monkeypatch):

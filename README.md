@@ -48,7 +48,7 @@ hardware such as 32-bit Raspberry Pi OS on a Pi 4 or 5), **Windows** (Server
   - [Application Integrations](#application-integrations): [Apache](#apache),
     [Caddy](#caddy), [Nginx](#nginx), [HAProxy](#haproxy), [PHP-FPM](#php-fpm),
     [PostgreSQL](#postgresql), [MySQL / MariaDB](#mysql--mariadb),
-    [Redis / Valkey](#redis--valkey), [Memcached](#memcached),
+    [MongoDB](#mongodb), [Redis / Valkey](#redis--valkey), [Memcached](#memcached),
     [RabbitMQ](#rabbitmq), [Prometheus / VictoriaMetrics](#prometheus--victoriametrics)
 - [Contribute](#contribute) / [Contact](#contact)
 
@@ -2345,6 +2345,70 @@ from a credentials problem. Available in agent version **1.11.4+**:
 
 Requires a `mysql` (or `mariadb`) client on the host and appropriate database
 credentials.
+
+### MongoDB
+
+Monitors the `mongod` (or `mongos`) running on the agent's own machine, over
+a direct, read-only connection (agent **1.22.0+**; MongoDB 4.4 to 8.x). No
+client binary is needed: the driver (pymongo) ships inside the agent.
+
+- Every process: uptime, connections, operation and document counters,
+  network traffic, memory, WiredTiger cache and read/write tickets, global
+  lock queues, asserts, cursors and cumulative operation latencies (raw
+  counters; the dashboard derives rates)
+- On a replica set member: the member's whole view of its set -- set name and
+  `replicaSetId`, term, and for every member its state, health, replication
+  lag, heartbeat ages, sync source and configuration (priority, votes,
+  hidden, arbiter, delay) -- plus the oplog window
+- Arbiters, uninitiated and removed nodes, config servers, shard members and
+  `mongos` routers are recognised; a shard member, config server or `mongos`
+  reports which config server set (which sharded cluster) it belongs to
+
+**Install the agent on each member.** Each agent reads only its own `mongod`
+and never connects to another member, yet each member's view describes the
+whole set: the dashboard merges the views of every member (by the set's
+`replicaSetId`), so the set stays monitored when any one member, its machine or
+its agent goes down. Replication lag and heartbeat ages are computed from the
+`mongod`'s own reply, never from the host clock.
+
+**Create a dedicated user.** `clusterMonitor` covers every command the agent
+sends but the oplog read; `read` on `local` adds the oplog window. That second
+role is optional and broad: it lets the account read the oplog's contents
+(every recent write to every database), although the agent only asks for the
+first and last entries' timestamps. Without it, only the oplog window reads as
+not authorized. Everything the agent sends is read-only:
+
+```javascript
+db.getSiblingDB("admin").createUser({
+  user: "fivenines",
+  pwd: passwordPrompt(),
+  roles: [{ role: "clusterMonitor", db: "admin" }, { role: "read", db: "local" }]
+})
+```
+
+Run it on the primary of a replica set (the user replicates to every member).
+On a sharded cluster, create it through a `mongos` for the routers, and on the
+primary of each shard and of the config server set for their members. A user
+that lacks a privilege does not break the collection: the agent stays
+connected and reports the missing sections as not authorized.
+
+**Connection.** The agent connects to `127.0.0.1:27017` by default. Set `host`
+to a name the server certificate carries when TLS is on (a certificate issued
+for `db1.internal` does not match `127.0.0.1`). With TLS, the certificate is
+verified against the agent's bundled public CA set, not the OS trust store:
+a certificate from an internal CA needs `tls_ca_file`. `MONGODB-X509`
+authenticates with `tls_certificate_key_file`, whose key must not be encrypted.
+A unix socket path ending in `.sock` works too (not on Windows), but `mongod`
+creates its socket mode 0700, so the agent's `fivenines` user usually cannot
+use it. An arbiter stores no users: the agent
+on an arbiter reports it as such even when credentials are configured.
+
+Each collection is bounded: 5s to connect and authenticate, 15s for the
+commands, and a hard 20s limit, so an unresponsive `mongod` never stalls the
+agent. Each collection opens two short connections (the driver's monitor and
+one for the commands), which `mongod` logs at its default verbosity.
+`--dry-run` tries the local `mongod` on port 27017 without credentials (5s more
+when nothing listens there).
 
 ### Redis / Valkey
 

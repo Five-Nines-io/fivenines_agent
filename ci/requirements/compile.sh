@@ -26,3 +26,9 @@ compile libvirt-python-alpine --no-deps
 # proxmoxer, pynvml and nvidia-ml-py have no other dependencies, and --no-deps
 # keeps uv from re-pinning anything poetry.lock already installs on Alpine.
 compile alpine-virtualization --no-deps
+# pymongo has no musllinux wheel: Alpine builds its sdist against this backend,
+# constrained to build-tools.txt so a shared package (packaging, setuptools)
+# keeps the version poetry runs with.
+compile pymongo-build --constraint build-tools.txt
+# --no-deps: dnspython, its one dependency, comes from poetry.lock.
+compile pymongo-alpine --no-deps

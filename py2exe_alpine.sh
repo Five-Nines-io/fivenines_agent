@@ -57,6 +57,26 @@ poetry config virtualenvs.create false
 poetry cache clear --all . || true
 poetry config installer.max-workers 1
 
+# pymongo (the mongodb collector) publishes no musllinux and no pure-Python
+# wheel, so the wheels-only `poetry install` below cannot install it. Build it
+# here from its sdist, hash-pinned in ci/requirements/pymongo-alpine.txt,
+# without build isolation, against the hash-pinned backend in
+# ci/requirements/pymongo-build.txt (nothing unpinned is fetched); `poetry
+# install` then finds the locked version installed and skips it, as the
+# manylinux builders do for libvirt-python. The C extensions build with the
+# image's gcc; pymongo falls back to pure Python if they do not (slower BSON,
+# fine at one tick a minute).
+echo "=== Building pymongo from its sdist ==="
+LOCKED=$(awk -v name="pymongo" '$0 == "name = \"" name "\"" {getline; gsub(/"/, "", $3); print $3}' poetry.lock)
+if [ -z "$LOCKED" ] || ! grep -q "^pymongo==${LOCKED} " ci/requirements/pymongo-alpine.txt; then
+    echo "poetry.lock locks pymongo ${LOCKED:-(not found)}, but ci/requirements/pymongo-alpine.txt pins another version."
+    echo "Update ci/requirements/pymongo-alpine.in and run ci/requirements/compile.sh."
+    exit 1
+fi
+python -m pip install --require-hashes --no-deps --only-binary :all: -r ci/requirements/pymongo-build.txt
+python -m pip install --require-hashes --no-deps --no-build-isolation --no-binary pymongo -r ci/requirements/pymongo-alpine.txt
+python -c "import pymongo, bson; print('pymongo', pymongo.version, '- C extensions:', pymongo.has_c() and bson.has_c())"
+
 # Wheels only (hash-checked against poetry.lock): an sdist poetry would have to
 # build fetches its build backend unpinned, so that fails instead.
 POETRY_INSTALLER_ONLY_BINARY=":all:" poetry install --no-interaction
@@ -135,6 +155,8 @@ PYINSTALLER_ARGS="--strip \
     --hidden-import=scramp \
     --hidden-import=dateutil.parser \
     --hidden-import=paho.mqtt.client \
+    --collect-submodules pymongo \
+    --collect-submodules bson \
     --copy-metadata pg8000 \
     --copy-metadata scramp"
 
@@ -162,13 +184,14 @@ ldd ./build/$BINARY_NAME/$BINARY_NAME | head -10 || echo "ldd check failed"
 
 # Quick test. --check-imports imports the agent and every collector (incl.
 # pg8000, which reads its package metadata at import), plus each optional module
-# named below -- the ones the agent imports under try/except ImportError and
-# would otherwise silently go without -- so a failure here means a missing
+# named below -- the ones the agent imports under try/except ImportError or only
+# inside a collector (pymongo), and would otherwise silently go without -- so a
+# failure here means a missing
 # hidden import, dependency or metadata: fail the build rather than ship it.
 # Keep the list in step with the hidden imports above and with the alpine-*
 # list in ci/test-distro.sh (systemd_watchdog is excluded on Alpine).
 # --version no longer does: it exits before the agent is imported, to stay fast.
-CHECK_IMPORTS="libvirt pynvml proxmoxer.backends.https"
+CHECK_IMPORTS="pymongo libvirt pynvml proxmoxer.backends.https"
 echo "=== Testing Built Binary ==="
 # shellcheck disable=SC2086 # CHECK_IMPORTS is a word list
 if ! ./build/$BINARY_NAME/$BINARY_NAME --check-imports $CHECK_IMPORTS; then

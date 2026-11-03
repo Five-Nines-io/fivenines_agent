@@ -47,6 +47,7 @@ def test_registry_has_expected_config_keys():
         "sglang",
         "postgresql",
         "mysql",
+        "mongodb",
         "rabbitmq",
         "proxmox",
         "pbs",

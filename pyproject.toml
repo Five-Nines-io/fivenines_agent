@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "fivenines_agent"
-version = "1.21.6"
+version = "1.22.0"
 description = ""
 authors = ["Sebastien Puyet <sebastien@fivenines.io>"]
 license = "WTFPL"
@@ -26,6 +26,14 @@ pg8000 = "^1.31.5"
 # extension, so it bundles into the PyInstaller binary with no shared-library
 # handling. paho pulls no runtime dependencies of its own.
 paho-mqtt = "^2.1.0"
+# MongoDB driver for the mongodb collector (#258). Held below 4.19, which
+# requires Python 3.11 (the agent supports 3.10); 4.18 is also the line whose
+# floor is MongoDB 4.4, the collector's minimum. Imported lazily, only when a
+# mongodb config arrives, so hosts without MongoDB never load it. No musllinux
+# and no pure-Python wheel: the Alpine builds compile it from its sdist (see
+# ci/requirements/pymongo-alpine.in). Pulls dnspython, already listed above;
+# the collector never uses SRV.
+pymongo = ">=4.18,<4.19"
 # Security floor: GHSA-pq67-6m6q-mj2v (decompression bomb), GHSA-48p4-8xcf-vxj5 (header leak across origins). Brought in transitively by requests/docker; pinned here so future lock regenerations cannot drop below the patched line.
 urllib3 = "^2.8.0"
 

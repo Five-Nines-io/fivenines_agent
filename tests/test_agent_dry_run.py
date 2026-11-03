@@ -86,6 +86,14 @@ def test_dry_run_config_includes_vpn_collectors():
     assert _DRY_RUN_CONFIG.get("tailscale")  # present and truthy
 
 
+def test_dry_run_config_includes_mongodb():
+    """--dry-run is how a built binary is shown to collect from a real mongod
+    (#258): the key must be a non-empty dict (the collector is splatted, and {}
+    would be skipped by collect_metrics' `if not config_value` gate), aimed at
+    the local default port with no credentials."""
+    assert _DRY_RUN_CONFIG.get("mongodb") == {"host": "127.0.0.1", "port": 27017}
+
+
 def test_dry_run_config_includes_io_topology():
     """Block device topology (#155) is a host-local sysfs read with no external
     config, so --dry-run must exercise it. Same regression class as systemd/zfs:
