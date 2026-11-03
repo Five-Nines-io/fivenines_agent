@@ -73,6 +73,16 @@ function Get-CustomActionLines {
     return @(Get-Content $LogPath | Where-Object { $_ -match "WixQuietExec" -and $_ -notmatch "powershell\.exe" })
 }
 
+# The errors an MSI log recorded (a bootstrap script's msiexec /qb run shows
+# them in a modal box nobody here can see).
+function Show-MsiErrors {
+    param([string]$LogPath)
+
+    if (-not (Test-Path $LogPath)) { Log "  (no MSI log at $LogPath)"; return }
+    Get-Content $LogPath | Where-Object { $_ -match "Error \d{4}|Fehler \d{4}|Return value 3|WixQuietExec:.*(Exception|Error)" } |
+        Select-Object -Last 15 | ForEach-Object { Log ("  | " + $_.Trim()) }
+}
+
 function Show-CustomActionOutput {
     param([string]$LogPath)
 
@@ -275,7 +285,7 @@ try {
         "EXIT:$LASTEXITCODE"
     }
     Check ($null -eq $setupFailed) "S5 fivenines_setup.ps1 succeeds ($setupFailed)"
-    if ($setupFailed) { Show-CustomActionOutput "C:\fn\logs\s5-setup.log" }
+    if ($setupFailed) { Show-CustomActionOutput "C:\fn\logs\s5-setup.log"; Show-MsiErrors "C:\fn\logs\s5-setup.log" }
     Test-Installed "S5" $Operator
 
     Log "== S6: an operator-managed account needs its password"
@@ -296,6 +306,7 @@ try {
         "EXIT:$LASTEXITCODE"
     }
     Check ($null -eq $failed) "S7 fivenines_uninstall.ps1 succeeds ($failed)"
+    if ($failed) { Show-MsiErrors "C:\fn\logs\s7-uninstall.log" }
     Check ($null -eq (Get-Service -Name "fivenines-agent" -ErrorAction SilentlyContinue)) "S7 the service is gone"
     Check ((Get-AdAccount).Description -eq $Operator) "S7 the shared account is kept"
 
@@ -303,6 +314,10 @@ try {
     Set-AccountDescription $Own
     $r = Install-Agent "s8-install"
     Check ($r.ExitCode -eq 0) "S8 install exits 0"
+    # An uninstall a second after the install finds the service still
+    # starting, and msiexec /qb's "could not stop the service" box would
+    # wait for a click: let it come up, as on a real host.
+    Check (Wait-AgentRunning) "S8 service reaches Running"
     $deletedSid = (Get-AdAccount).SID.Value
     $failed = Invoke-Bootstrap -Arguments @("C:\fn\logs\s8-uninstall.log") -Script {
         param($LogFile)
@@ -311,6 +326,7 @@ try {
         "EXIT:$LASTEXITCODE"
     }
     Check ($null -eq $failed) "S8 fivenines_uninstall.ps1 succeeds ($failed)"
+    if ($failed) { Show-MsiErrors "C:\fn\logs\s8-uninstall.log" }
     Check ($null -eq (Get-AdAccount)) "S8 the account is deleted"
     Check (@(Get-WmiStorageAces | Where-Object { $_.SecurityIdentifier.Value -eq $deletedSid }).Count -eq 0) "S8 no WMI grant left for the deleted account"
 
