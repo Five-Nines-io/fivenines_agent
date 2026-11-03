@@ -125,6 +125,121 @@ jobs:
 
           Write-Host "2000 passwords: length 32, all four character classes, no duplicates, shuffled."
 
+      # The service-account rules, under Windows PowerShell 5.1 (the custom
+      # actions' runtime). The domain-controller cases cannot run for real
+      # here -- promoting a runner to a DC needs a reboot -- so the decision
+      # lives in a pure function, Get-AccountPlan, exercised case by case.
+      - name: Verify service-account rules (domain-controller cases included)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = Get-Content windows/installer/CreateServiceAccount.ps1 -Raw
+          foreach ($name in 'MSI_MANAGED_DESCRIPTION', 'DC_MANAGED_PREFIX', 'DC_OPERATOR_DESCRIPTION') {
+            $m = [regex]::Match($src, ('(?m)^\${0} = ".*"' -f $name))
+            if (-not $m.Success) { throw "`$$name not found in CreateServiceAccount.ps1" }
+            Invoke-Expression $m.Value
+          }
+          $m = [regex]::Match($src, "(?ms)^function Get-AccountPlan \{.*?^\}")
+          if (-not $m.Success) { throw "Get-AccountPlan not found in CreateServiceAccount.ps1" }
+          Invoke-Expression $m.Value
+
+          # New-LocalUser refuses a Description over 48 characters; a
+          # NetBIOS computer name is at most 15.
+          foreach ($d in @($MSI_MANAGED_DESCRIPTION, $DC_OPERATOR_DESCRIPTION, ($DC_MANAGED_PREFIX + ('X' * 15)))) {
+            if ($d.Length -gt 48) { throw "Description over 48 characters: '$d'" }
+          }
+
+          # The uninstall script deletes a DC's account only when it carries
+          # this DC's tag, so it must spell the prefix the same way.
+          $uninstall = Get-Content fivenines_uninstall.ps1 -Raw
+          $line = [regex]::Match($src, '(?m)^\$DC_MANAGED_PREFIX = ".*"').Value
+          if (-not $uninstall.Contains($line)) { throw "fivenines_uninstall.ps1 does not carry: $line" }
+
+          $own = $DC_MANAGED_PREFIX + "DC1"
+          $other = $DC_MANAGED_PREFIX + "DC2"
+          $script:failed = 0
+          function Check($IsDc, $Exists, $Description, $HasPassword, $Action, $Tag, $Mentions) {
+            $plan = Get-AccountPlan -IsDomainController $IsDc -Exists $Exists -Description $Description `
+              -HasPassword $HasPassword -AccountName "fivenines-agent" -ComputerName "DC1"
+            $label = "dc=$IsDc exists=$Exists description='$Description' password=$HasPassword"
+            if ($plan.Action -ne $Action -or $plan.Description -ne $Tag) {
+              Write-Host "FAIL $label -> $($plan.Action) '$($plan.Description)', expected $Action '$Tag'"
+              $script:failed++
+            } elseif ($Action -eq "Refuse" -and -not ($plan.Message -like "*$Mentions*")) {
+              Write-Host "FAIL $label -> message does not mention '$Mentions': $($plan.Message)"
+              $script:failed++
+            } else {
+              Write-Host "ok   $label -> $Action"
+            }
+          }
+
+          # Member server / workgroup: the behavior every release had.
+          Check $false $false ""                       $false "Create"      $MSI_MANAGED_DESCRIPTION $null
+          Check $false $false ""                       $true  "Create"      $MSI_MANAGED_DESCRIPTION $null
+          Check $false $true  $MSI_MANAGED_DESCRIPTION $false "Rotate"      $null $null
+          Check $false $true  $MSI_MANAGED_DESCRIPTION $true  "UseProvided" $null $null
+          Check $false $true  "Ansible-managed"        $false "Refuse"      $null "SERVICEACCOUNTPASSWORD"
+          Check $false $true  "Ansible-managed"        $true  "UseProvided" $null $null
+          Check $false $true  ""                       $false "Refuse"      $null "SERVICEACCOUNTPASSWORD"
+
+          # Domain controller, fresh account: random password -> this DC's
+          # tag; operator password -> shared, never rotated.
+          Check $true $false ""                        $false "Create"      $own $null
+          Check $true $false ""                        $true  "Create"      $DC_OPERATOR_DESCRIPTION $null
+
+          # Domain controller, existing account, no password.
+          Check $true $true  $own                      $false "Rotate"      $null $null
+          Check $true $true  ($DC_MANAGED_PREFIX + "dc1") $false "Rotate"   $null $null
+          Check $true $true  $MSI_MANAGED_DESCRIPTION  $false "Rotate"      $own $null
+          Check $true $true  $other                    $false "Refuse"      $null "DC2"
+          Check $true $true  $DC_OPERATOR_DESCRIPTION  $false "Refuse"      $null "SERVICEACCOUNTPASSWORD"
+          Check $true $true  "Ansible-managed"         $false "Refuse"      $null "SERVICEACCOUNTPASSWORD"
+          Check $true $true  ""                        $false "Refuse"      $null "SERVICEACCOUNTPASSWORD"
+
+          # Domain controller, existing account, operator password: an
+          # installer-managed account becomes shared so nothing rotates it.
+          Check $true $true  $own                      $true  "UseProvided" $DC_OPERATOR_DESCRIPTION $null
+          Check $true $true  $other                    $true  "UseProvided" $DC_OPERATOR_DESCRIPTION $null
+          Check $true $true  $MSI_MANAGED_DESCRIPTION  $true  "UseProvided" $DC_OPERATOR_DESCRIPTION $null
+          Check $true $true  $DC_OPERATOR_DESCRIPTION  $true  "UseProvided" $null $null
+          Check $true $true  "Ansible-managed"         $true  "UseProvided" $null $null
+
+          if ($script:failed -gt 0) { throw "$($script:failed) service-account rule case(s) failed" }
+
+      # Helpers duplicated across scripts that cannot share a file: the
+      # custom actions are separate MSI files, the bootstraps are downloaded
+      # one by one.
+      - name: Verify duplicated installer helpers stay identical
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          function Get-Fn($path, $fn) {
+            $m = [regex]::Match((Get-Content $path -Raw), "(?ms)^function $fn \{.*?^\}")
+            if (-not $m.Success) { throw "$fn not found in $path" }
+            return $m.Value
+          }
+          $pairs = @(
+            @('Resolve-ServiceAccountSid', 'windows/installer/SetTokenFileAcl.ps1', 'windows/installer/DelegateWmiStorageNamespace.ps1'),
+            @('ConvertTo-MsiPasswordArgument', 'fivenines_setup.ps1', 'fivenines_update.ps1')
+          )
+          foreach ($p in $pairs) {
+            if ((Get-Fn $p[1] $p[0]) -ne (Get-Fn $p[2] $p[0])) { throw "$($p[0]) differs between $($p[1]) and $($p[2])" }
+            Write-Host "$($p[0]): identical in $($p[1]) and $($p[2])"
+          }
+
+          # A password the MSI's quoted custom-action command line would split.
+          Invoke-Expression (Get-Fn 'fivenines_setup.ps1' 'ConvertTo-MsiPasswordArgument')
+          $empty = New-Object System.Security.SecureString
+          $bad = @($empty, (ConvertTo-SecureString 'pa"ss' -AsPlainText -Force), (ConvertTo-SecureString 'pass\' -AsPlainText -Force))
+          foreach ($b in $bad) {
+            $refused = $false
+            try { ConvertTo-MsiPasswordArgument $b | Out-Null } catch { $refused = $true }
+            if (-not $refused) { throw "a password that splits the custom action's command line was not refused" }
+          }
+          $arg = ConvertTo-MsiPasswordArgument (ConvertTo-SecureString 'p a$s\w;rd' -AsPlainText -Force)
+          if ($arg -ne 'SERVICEACCOUNTPASSWORD="p a$s\w;rd"') { throw "unexpected msiexec argument: $arg" }
+          Write-Host "ConvertTo-MsiPasswordArgument refuses '', a quote and a trailing backslash."
+
       - name: Upload Windows coverage
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -246,6 +361,29 @@ jobs:
           name: fivenines-agent-msi
           path: .
 
+      # A non-English Windows, simulated: its built-in group names are
+      # translated (German here), which is what failed the install with 1603
+      # for a customer -- the custom actions looked groups up by their English
+      # name. Renaming the groups on this English runner reproduces exactly
+      # that, so every step below must find them by SID. SYSTEM cannot be
+      # renamed; the real German domain-controller run covers it.
+      - name: Rename the built-in groups as a German Windows names them
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $names = @{
+            "S-1-5-32-558" = "Leistungsueberwachungsbenutzer"
+            "S-1-5-32-545" = "Benutzer"
+            "S-1-5-32-544" = "Administratoren"
+          }
+          foreach ($sid in $names.Keys) {
+            Rename-LocalGroup -SID $sid -NewName $names[$sid]
+            Write-Host "$sid -> $((Get-LocalGroup -SID $sid).Name)"
+          }
+          if (Get-LocalGroup -Name "Performance Monitor Users" -ErrorAction SilentlyContinue) {
+            throw "the English group name still resolves"
+          }
+
       - name: Install MSI silently (fresh-install path - MSI provisions the account)
         shell: pwsh
         timeout-minutes: 5
@@ -273,12 +411,14 @@ jobs:
           }
           Write-Host "Account created: $($u.Name) (Enabled=$($u.Enabled))"
 
-          $groups = @("Performance Monitor Users", "Users")
-          foreach ($g in $groups) {
-            $member = Get-LocalGroupMember -Group $g -ErrorAction SilentlyContinue |
-                      Where-Object { $_.Name -match "fivenines-agent" }
+          # By SID, like the installer: the names are translated on a
+          # non-English Windows. S-1-5-32-558 = Performance Monitor Users,
+          # S-1-5-32-545 = Users.
+          foreach ($g in @("S-1-5-32-558", "S-1-5-32-545")) {
+            $member = Get-LocalGroupMember -SID $g -ErrorAction SilentlyContinue |
+                      Where-Object { $_.SID -eq $u.SID }
             if (-not $member) {
-              Write-Error "fivenines-agent is not a member of '$g'"
+              Write-Error "fivenines-agent is not a member of $g"
               exit 1
             }
             Write-Host "Group membership OK: $g"
@@ -291,6 +431,33 @@ jobs:
           if ($svcAccount -notmatch "fivenines-agent") {
             Write-Error "Service is not running under the dedicated account"
             exit 1
+          }
+
+      # Under Windows PowerShell 5.1, the custom actions' runtime: an upgrade
+      # re-adds the account to its groups, and the "already a member" error
+      # must be caught by its type (its message is translated); the TOKEN ACL
+      # and WMI scripts must resolve every spelling of the MSI's account.
+      - name: Verify re-adding the account to its groups and resolving its name
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $u = Get-LocalUser -Name "fivenines-agent"
+          $group = Get-LocalGroup -SID "S-1-5-32-545"
+          $caught = $false
+          try {
+            Add-LocalGroupMember -Group $group -Member $u -ErrorAction Stop
+          } catch [Microsoft.PowerShell.Commands.MemberExistsException] {
+            $caught = $true
+          }
+          if (-not $caught) { throw "re-adding fivenines-agent to $($group.Name) raised no MemberExistsException" }
+          Write-Host "Re-adding to '$($group.Name)': MemberExistsException, caught by type."
+
+          $m = [regex]::Match((Get-Content windows/installer/SetTokenFileAcl.ps1 -Raw), "(?ms)^function Resolve-ServiceAccountSid \{.*?^\}")
+          Invoke-Expression $m.Value
+          foreach ($spelling in @("$env:COMPUTERNAME\fivenines-agent", ".\fivenines-agent", "fivenines-agent")) {
+            $sid = Resolve-ServiceAccountSid $spelling
+            if ($sid -ne $u.SID) { throw "'$spelling' resolved to $sid, expected $($u.SID)" }
+            Write-Host "'$spelling' -> $sid"
           }
 
       - name: Sanity check - install dir has the PyInstaller payload
@@ -354,9 +521,23 @@ jobs:
           $principals = $acl.Access | ForEach-Object { $_.IdentityReference.Value }
           Write-Host "TOKEN ACL principals: $($principals -join ', ')"
           # The Users group must NOT have access.
-          if ($principals -match "BUILTIN\\Users" -or $principals -match "Authenticated Users") {
+          # By SID: the Users group is renamed above, as on a German Windows.
+          $granted = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) |
+                       ForEach-Object { $_.IdentityReference.Value })
+          if ($granted -contains "S-1-5-32-545" -or $granted -contains "S-1-5-11") {
             Write-Error "TOKEN ACL too permissive - includes Users/Authenticated Users"
             exit 1
+          }
+          # And it must grant the three principals the installer names, matched
+          # by SID: by name, Administrators and SYSTEM failed to resolve on a
+          # non-English Windows and were silently left out.
+          $sids = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) |
+                    ForEach-Object { $_.IdentityReference.Value })
+          foreach ($want in @((Get-LocalUser -Name "fivenines-agent").SID.Value, "S-1-5-32-544", "S-1-5-18")) {
+            if ($sids -notcontains $want) {
+              Write-Error "TOKEN ACL does not grant $want (SIDs: $($sids -join ', '))"
+              exit 1
+            }
           }
 
       - name: Uninstall MSI silently

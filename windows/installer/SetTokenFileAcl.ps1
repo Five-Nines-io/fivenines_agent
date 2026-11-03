@@ -36,25 +36,41 @@ $acl.SetAccessRuleProtection($true, $false)  # protect=true, preserve=false
 $fullControl = [System.Security.AccessControl.FileSystemRights]::FullControl
 $allow = [System.Security.AccessControl.AccessControlType]::Allow
 
-function Resolve-LocalAccount {
-    param([string]$Name)
-    # ".\name" is the MSI convention but System.Security.Principal.NTAccount
-    # rejects the dot-prefix on some Windows configurations - normalize to the
-    # bare username so NTAccount falls back to the local machine.
-    if ($Name.StartsWith('.\')) { return $Name.Substring(2) }
-    return $Name
+# Resolve the MSI's SERVICEACCOUNT to its SID. A "." or <ComputerName> prefix
+# is dropped and the bare name looked up instead: on a domain controller the
+# account the MSI created is a DOMAIN account (a DC has no local ones), and
+# the MSI's default "<DCNAME>\name" is not how the domain names it, while a
+# bare name is looked up in the machine's own account database on every
+# role (the local SAM on a member server, the domain on a DC).
+# Kept identical in SetTokenFileAcl.ps1 and DelegateWmiStorageNamespace.ps1
+# (windows.yml checks it).
+function Resolve-ServiceAccountSid {
+    param([Parameter(Mandatory=$true)][string]$Account)
+
+    $name = $Account
+    if ($name.Contains('\')) {
+        $parts = $name.Split('\', 2)
+        if ($parts[0] -eq '.' -or $parts[0] -eq $env:COMPUTERNAME) {
+            $name = $parts[1]
+        }
+    }
+    $ntAccount = New-Object System.Security.Principal.NTAccount($name)
+    return $ntAccount.Translate([System.Security.Principal.SecurityIdentifier])
 }
 
-$principals = @($ServiceAccount, "BUILTIN\Administrators", "NT AUTHORITY\SYSTEM")
-foreach ($id in $principals) {
-    $normalized = Resolve-LocalAccount $id
-    try {
-        $sid = New-Object System.Security.Principal.NTAccount($normalized)
-        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, $fullControl, $allow)
-        $acl.AddAccessRule($rule)
-    } catch {
-        Write-Warning ("Could not grant FullControl to {0} (resolved as {1}): {2}" -f $id, $normalized, $_)
-    }
+# Every principal by SID, never by name: "BUILTIN\Administrators" and
+# "NT AUTHORITY\SYSTEM" are translated with the OS install language, and on a
+# non-English Windows they failed to resolve, so the file was left without
+# them. The service account must resolve: an ACL it is missing from is a
+# TOKEN the agent cannot read, so that failure stops the install.
+$principals = @(
+    (Resolve-ServiceAccountSid $ServiceAccount),
+    [System.Security.Principal.SecurityIdentifier]"S-1-5-32-544",  # BUILTIN\Administrators
+    [System.Security.Principal.SecurityIdentifier]"S-1-5-18"       # NT AUTHORITY\SYSTEM
+)
+foreach ($sid in $principals) {
+    $rule = New-Object System.Security.AccessControl.FileSystemAccessRule($sid, $fullControl, $allow)
+    $acl.AddAccessRule($rule)
 }
 
 Set-Acl -Path $tokenPath -AclObject $acl

@@ -18,6 +18,11 @@
 # If the agent is NOT already installed, this script refuses and tells the
 # operator to use fivenines_setup.ps1 instead - update has no way to obtain
 # a TOKEN from thin air.
+#
+# Domain controllers: an account the installer created on THIS DC with a
+# random password is rotated like on any server. One whose password the
+# operator set (shared by several DCs) is never rotated, so pass it:
+#   .\fivenines_update.ps1 -ServiceAccountPassword (Read-Host -AsSecureString "fivenines-agent password")
 
 #Requires -RunAsAdministrator
 
@@ -27,7 +32,11 @@ param(
 
     [string]$MsiPath = (Join-Path $env:TEMP "fivenines-agent-windows-amd64.msi"),
 
-    [string]$LogFile = (Join-Path $env:TEMP "fivenines-update.log")
+    [string]$LogFile = (Join-Path $env:TEMP "fivenines-update.log"),
+
+    # The service account's password, when it is not one the MSI may rotate
+    # (see the domain controller note above).
+    [System.Security.SecureString]$ServiceAccountPassword
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,6 +50,33 @@ function Test-IsAdmin {
 if (-not (Test-IsAdmin)) {
     Write-Error "This script must be run from an elevated PowerShell session (Run as administrator)."
     exit 1
+}
+
+# SERVICEACCOUNTPASSWORD as msiexec takes it. The MSI embeds the value in
+# the custom action's command line between double quotes, so a '"' in it, or
+# a trailing '\' (which escapes the closing quote), would split the command
+# line: refused here rather than failing the install with 1603.
+function ConvertTo-MsiPasswordArgument {
+    param([Parameter(Mandatory=$true)][System.Security.SecureString]$Password)
+
+    $plain = (New-Object System.Management.Automation.PSCredential("x", $Password)).GetNetworkCredential().Password
+    if ([string]::IsNullOrEmpty($plain)) {
+        throw "-ServiceAccountPassword is empty."
+    }
+    if ($plain.Contains('"') -or $plain.EndsWith('\')) {
+        throw "-ServiceAccountPassword cannot contain a double quote or end with a backslash (the MSI passes it on a quoted command line). Set a password without them on the account first."
+    }
+    return "SERVICEACCOUNTPASSWORD=`"$plain`""
+}
+
+$passwordArgument = $null
+if ($ServiceAccountPassword) {
+    try {
+        $passwordArgument = ConvertTo-MsiPasswordArgument $ServiceAccountPassword
+    } catch {
+        Write-Error $_
+        exit 1
+    }
 }
 
 # Detect the currently-installed Fivenines product via the ARP registry.
@@ -91,6 +127,9 @@ $msiArgs = @(
     "/qb",
     "/l*v", "`"$LogFile`""
 )
+if ($passwordArgument) {
+    $msiArgs += $passwordArgument
+}
 $proc = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
 if ($proc.ExitCode -ne 0) {
     Write-Error "msiexec failed with exit code $($proc.ExitCode). See $LogFile."

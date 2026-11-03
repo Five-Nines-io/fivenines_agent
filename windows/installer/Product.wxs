@@ -11,7 +11,9 @@
       (F1) and runs the WMI Storage-namespace delegation (D19).
     - Service runs as a dedicated low-privilege account, added to the
       Performance Monitor Users group by the MSI (D12). Account name and
-      password are SERVICEACCOUNT / SERVICEACCOUNTPASSWORD properties.
+      password are SERVICEACCOUNT / SERVICEACCOUNTPASSWORD properties. On a
+      domain controller the account is a domain account (see
+      CreateServiceAccount.ps1).
     - Major upgrades are clean (UpgradeCode kept stable); uninstall removes
       the service, config dir, and logs.
 
@@ -201,12 +203,17 @@
          CreateServiceAccount.ps1 via icacls. util:PermissionEx replaces the
          inherited ProgramData ACL (which would otherwise give BUILTIN\Users
          read access), so even if our CA were to fail we don't degrade to a
-         world-listable config dir. -->
+         world-listable config dir.
+         User="LocalSystem", never "SYSTEM": WiX maps a few well-known names
+         ("Administrators", "LocalSystem", "Users", ...) straight to their
+         SID, and passes any other name to LookupAccountName, which only
+         knows the OS install language's spelling ("Systeme" with an accent
+         on a French Windows), so "SYSTEM" could fail the install there. -->
     <ComponentGroup Id="ConfigDirComponents" Directory="CONFIGDIR">
       <Component Id="ConfigDirComponent">
         <CreateFolder>
           <util:PermissionEx User="Administrators" GenericAll="yes" />
-          <util:PermissionEx User="SYSTEM" GenericAll="yes" />
+          <util:PermissionEx User="LocalSystem" GenericAll="yes" />
         </CreateFolder>
         <RemoveFolder Id="RemoveConfigDir" On="uninstall" />
         <!-- Required: every Component needs a KeyPath -->
@@ -223,7 +230,7 @@
       <Component Id="LogDirComponent">
         <CreateFolder>
           <util:PermissionEx User="Administrators" GenericAll="yes" />
-          <util:PermissionEx User="SYSTEM" GenericAll="yes" />
+          <util:PermissionEx User="LocalSystem" GenericAll="yes" />
         </CreateFolder>
         <RemoveFolder Id="RemoveLogDir" On="uninstall" />
         <RegistryValue Root="HKLM"

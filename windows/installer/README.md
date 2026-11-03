@@ -15,12 +15,35 @@ This directory builds the Windows MSI installer for the fivenines agent.
 ## Files
 
 - `Product.wxs` - WiX 4 source. Components, service registration, ACL
-  components, and the two security custom-action hookups.
+  components, and the security custom-action hookups.
+- `CreateServiceAccount.ps1` - deferred custom action: creates (or rotates)
+  the service account, joins its groups, grants SeServiceLogonRight and the
+  config-dir ACL, and flips the service to it.
 - `SetTokenFileAcl.ps1` - deferred custom action: writes TOKEN with a
   restrictive ACL, inheritance broken.
 - `DelegateWmiStorageNamespace.ps1` - deferred custom action: grants the
   service account read access to `root\Microsoft\Windows\Storage` so the
   disk-health collector can query `MSFT_PhysicalDisk` without admin.
+
+## Rules the custom actions keep
+
+- **No principal by name.** Group and built-in account names are translated
+  with the OS install language, so `Performance Monitor Users`, `Users`,
+  `BUILTIN\Administrators` and `NT AUTHORITY\SYSTEM` are looked up by their
+  well-known SID (S-1-5-32-558, -545, -544, S-1-5-18), errors are matched by
+  exception type rather than message, and WiX's `util:PermissionEx` uses the
+  names it maps to a SID itself (`Administrators`, `LocalSystem`). A name
+  lookup failed every install on a non-English Windows with 1603.
+- **Domain controllers.** A DC has no local accounts: `New-LocalUser` creates
+  a domain account, the BUILTIN groups are the domain's, and the account's
+  qualified name is `<DOMAIN>\name`, not the `[ComputerName]\name` the MSI
+  defaults to, so every script resolves it by SID (`Resolve-ServiceAccountSid`)
+  and `sc.exe` gets the name the SID translates back to. Whether a DC may
+  rotate the password is `Get-AccountPlan` in `CreateServiceAccount.ps1`,
+  tracked by the account's Description (the user-facing rules are in the main
+  README, "Domain controllers"). The DC paths are **not** exercised by CI --
+  promoting a runner to a DC needs a reboot -- so `windows.yml` tests
+  `Get-AccountPlan` case by case instead.
 
 ## Build prerequisites
 

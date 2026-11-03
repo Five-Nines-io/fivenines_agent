@@ -20,17 +20,33 @@ $ErrorActionPreference = "Stop"
 
 $Namespace = "root\Microsoft\Windows\Storage"
 
+# Resolve the MSI's SERVICEACCOUNT to its SID. A "." or <ComputerName> prefix
+# is dropped and the bare name looked up instead: on a domain controller the
+# account the MSI created is a DOMAIN account (a DC has no local ones), and
+# the MSI's default "<DCNAME>\name" is not how the domain names it, while a
+# bare name is looked up in the machine's own account database on every
+# role (the local SAM on a member server, the domain on a DC).
+# Kept identical in SetTokenFileAcl.ps1 and DelegateWmiStorageNamespace.ps1
+# (windows.yml checks it).
+function Resolve-ServiceAccountSid {
+    param([Parameter(Mandatory=$true)][string]$Account)
+
+    $name = $Account
+    if ($name.Contains('\')) {
+        $parts = $name.Split('\', 2)
+        if ($parts[0] -eq '.' -or $parts[0] -eq $env:COMPUTERNAME) {
+            $name = $parts[1]
+        }
+    }
+    $ntAccount = New-Object System.Security.Principal.NTAccount($name)
+    return $ntAccount.Translate([System.Security.Principal.SecurityIdentifier])
+}
+
 # Resolve the service account to a SID. Translate raises if the account
 # does not exist - fail loudly here rather than silently writing a broken ACE.
-# Normalize ".\name" -> "name": NTAccount can't always resolve the dot-prefix
-# even though MSI uses it as the local-machine convention.
-$accountName = $ServiceAccount
-if ($accountName.StartsWith('.\')) {
-    $accountName = $accountName.Substring(2)
-}
-$ntAccount = New-Object System.Security.Principal.NTAccount($accountName)
-$sid = $ntAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
-Write-Host ("Service account {0} (resolved as {1}) -> SID {2}" -f $ServiceAccount, $accountName, $sid)
+$sid = (Resolve-ServiceAccountSid $ServiceAccount).Value
+$accountName = $ServiceAccount.Split('\')[-1]
+Write-Host ("Service account {0} -> SID {1}" -f $ServiceAccount, $sid)
 
 # Read the current namespace security descriptor.
 # __SystemSecurity is a singleton; "__SystemSecurity=@" is the canonical

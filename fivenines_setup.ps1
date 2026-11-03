@@ -20,6 +20,13 @@
 #      SeServiceLogonRight grant, WMI Storage namespace delegation, and
 #      writing TOKEN under a restrictive ACL.
 #   5. Starts the service and reports its status.
+#
+# Domain controllers: a DC has no local accounts, so the MSI creates the
+# service account in the DOMAIN, where every DC sees it. The first DC creates
+# it with a random password only that DC knows. To run the agent on several
+# DCs as one account, set its password in Active Directory and pass it on
+# each of them, the first one included (the MSI then never rotates it):
+#   .\fivenines_setup.ps1 -Token <token> -ServiceAccountPassword (Read-Host -AsSecureString "fivenines-agent password")
 
 #Requires -RunAsAdministrator
 
@@ -32,7 +39,11 @@ param(
 
     [string]$MsiPath = (Join-Path $env:TEMP "fivenines-agent-windows-amd64.msi"),
 
-    [string]$LogFile = (Join-Path $env:TEMP "fivenines-setup.log")
+    [string]$LogFile = (Join-Path $env:TEMP "fivenines-setup.log"),
+
+    # The service account's password, when the account already exists and
+    # is not one the MSI may rotate (see the domain controller note above).
+    [System.Security.SecureString]$ServiceAccountPassword
 )
 
 $ErrorActionPreference = "Stop"
@@ -46,6 +57,33 @@ function Test-IsAdmin {
 if (-not (Test-IsAdmin)) {
     Write-Error "This script must be run from an elevated PowerShell session (Run as administrator)."
     exit 1
+}
+
+# SERVICEACCOUNTPASSWORD as msiexec takes it. The MSI embeds the value in
+# the custom action's command line between double quotes, so a '"' in it, or
+# a trailing '\' (which escapes the closing quote), would split the command
+# line: refused here rather than failing the install with 1603.
+function ConvertTo-MsiPasswordArgument {
+    param([Parameter(Mandatory=$true)][System.Security.SecureString]$Password)
+
+    $plain = (New-Object System.Management.Automation.PSCredential("x", $Password)).GetNetworkCredential().Password
+    if ([string]::IsNullOrEmpty($plain)) {
+        throw "-ServiceAccountPassword is empty."
+    }
+    if ($plain.Contains('"') -or $plain.EndsWith('\')) {
+        throw "-ServiceAccountPassword cannot contain a double quote or end with a backslash (the MSI passes it on a quoted command line). Set a password without them on the account first."
+    }
+    return "SERVICEACCOUNTPASSWORD=`"$plain`""
+}
+
+$passwordArgument = $null
+if ($ServiceAccountPassword) {
+    try {
+        $passwordArgument = ConvertTo-MsiPasswordArgument $ServiceAccountPassword
+    } catch {
+        Write-Error $_
+        exit 1
+    }
 }
 
 Write-Host "Downloading $MsiUrl..."
@@ -69,6 +107,9 @@ $msiArgs = @(
     "/qb",
     "/l*v", "`"$LogFile`""
 )
+if ($passwordArgument) {
+    $msiArgs += $passwordArgument
+}
 $proc = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
 if ($proc.ExitCode -ne 0) {
     Write-Error "msiexec failed with exit code $($proc.ExitCode). See $LogFile."

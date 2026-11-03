@@ -18,6 +18,12 @@
 #   4. Unless -KeepAccount, removes the local fivenines-agent user.
 #   5. Removes the SeServiceLogonRight grant for that SID (it lingers in the
 #      LSA after the user is deleted - tidy up so secedit /export is clean).
+#
+# On a domain controller the account is a DOMAIN account (a DC has no local
+# ones), which other DCs may run the agent as. It is deleted only when this
+# DC's installer created it with a random password nobody else knows; an
+# account whose password the operator set is kept, and only this DC's
+# SeServiceLogonRight grant is removed.
 
 #Requires -RunAsAdministrator
 
@@ -66,17 +72,29 @@ if ($KeepAccount) {
     exit 0
 }
 
+# Same tag as CreateServiceAccount.ps1, which writes it on an account the
+# installer created on a domain controller (windows.yml keeps the two equal).
+$DC_MANAGED_PREFIX = "Fivenines agent, managed on "
+
 # Capture the SID before deleting the account so we can clean up the
 # SeServiceLogonRight grant secedit left behind.
 $user = Get-LocalUser -Name "fivenines-agent" -ErrorAction SilentlyContinue
 if ($user) {
     $sid = $user.SID.Value
-    Write-Host "Removing local account fivenines-agent (SID $sid)..."
-    Remove-LocalUser -Name "fivenines-agent" -ErrorAction Stop
+    # DomainRole 4 = backup DC, 5 = primary DC.
+    $isDomainController = (Get-CimInstance -ClassName Win32_ComputerSystem).DomainRole -ge 4
+    if ((-not $isDomainController) -or ($user.Description -eq ($DC_MANAGED_PREFIX + $env:COMPUTERNAME))) {
+        Write-Host "Removing account fivenines-agent (SID $sid)..."
+        Remove-LocalUser -Name "fivenines-agent" -ErrorAction Stop
+    } else {
+        Write-Host ("Keeping domain account fivenines-agent (Description={0}): other domain controllers may run the agent as it. Delete it in Active Directory once none does." -f $user.Description)
+    }
 
-    # Strip the orphaned SeServiceLogonRight entry from local security policy.
-    # secedit /export shows it as a dangling *S-1-5-21-... after the user is
-    # gone, which is cosmetic but ugly.
+    # Strip the account's SeServiceLogonRight entry from this machine's
+    # security policy. secedit /export shows it as a dangling *S-1-5-21-...
+    # after the user is gone, which is cosmetic but ugly; on a domain
+    # controller that keeps the account, the service it was granted for is
+    # gone from this DC.
     $tmpCfg = Join-Path $env:TEMP "fnuninstall_secpolicy.cfg"
     $tmpDb  = Join-Path $env:TEMP "fnuninstall_secpolicy.sdb"
     try {
