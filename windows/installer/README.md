@@ -31,19 +31,31 @@ This directory builds the Windows MSI installer for the fivenines agent.
   with the OS install language, so `Performance Monitor Users`, `Users`,
   `BUILTIN\Administrators` and `NT AUTHORITY\SYSTEM` are looked up by their
   well-known SID (S-1-5-32-558, -545, -544, S-1-5-18), errors are matched by
-  exception type rather than message, and WiX's `util:PermissionEx` uses the
-  names it maps to a SID itself (`Administrators`, `LocalSystem`). A name
-  lookup failed every install on a non-English Windows with 1603.
-- **Domain controllers.** A DC has no local accounts: `New-LocalUser` creates
-  a domain account, the BUILTIN groups are the domain's, and the account's
-  qualified name is `<DOMAIN>\name`, not the `[ComputerName]\name` the MSI
-  defaults to, so every script resolves it by SID (`Resolve-ServiceAccountSid`)
-  and `sc.exe` gets the name the SID translates back to. Whether a DC may
-  rotate the password is `Get-AccountPlan` in `CreateServiceAccount.ps1`,
-  tracked by the account's Description (the user-facing rules are in the main
-  README, "Domain controllers"). The DC paths are **not** exercised by CI --
-  promoting a runner to a DC needs a reboot -- so `windows.yml` tests
-  `Get-AccountPlan` case by case instead.
+  HRESULT rather than message, and WiX's `util:PermissionEx` uses the names it
+  maps to a SID itself (`Administrators`, `LocalSystem`). A lookup by English
+  name fails on a non-English Windows.
+- **No LocalAccounts cmdlets for the account.** `Get-LocalUser`,
+  `Get-LocalGroup`, `Set-LocalUser` and `Add-LocalGroupMember` enumerate SAM one
+  entry at a time and drop any reply carrying more than one, which is what a
+  domain controller's directory-backed SAM sends: on a DC they find nothing
+  (only `New-LocalUser` works, so v1.22.0 created the account, then failed with
+  "Group Performance Monitor Users was not found" on an English DC). The account
+  and its groups go through the ADSI WinNT provider (`WinNT://<ComputerName>`,
+  the NetUser*/NetLocalGroup* APIs), which is the local SAM on a member server
+  and the domain on a DC.
+- **Domain controllers.** On a DC the account is a domain account, the BUILTIN
+  groups are the domain's, and the account's qualified name is `<DOMAIN>\name`,
+  not the `[ComputerName]\name` the MSI defaults to, so every script resolves it
+  by SID (`Resolve-ServiceAccountSid`) and `sc.exe` gets the name the SID
+  translates back to. Whether a DC may rotate the password is `Get-AccountPlan`
+  in `CreateServiceAccount.ps1`, tracked by the account's Description (the
+  user-facing rules are in the main README, "Domain controllers"). No GitHub
+  runner can become a DC (promotion needs a reboot), so `windows.yml` tests
+  `Get-AccountPlan` case by case on every run, and its on-request
+  `smoke-msi-domain-controller` job (`gh workflow run windows.yml --ref <branch>
+  -f domain_controller=true`, about an hour) installs Windows Server 2019 in
+  English and German in QEMU/KVM, promotes it, reproduces v1.22.0's failure
+  and plays every account scenario (`ci/windows-dc/`).
 
 ## Build prerequisites
 

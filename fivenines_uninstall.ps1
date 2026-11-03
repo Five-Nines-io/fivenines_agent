@@ -77,17 +77,22 @@ if ($KeepAccount) {
 $DC_MANAGED_PREFIX = "Fivenines agent, managed on "
 
 # Capture the SID before deleting the account so we can clean up the
-# SeServiceLogonRight grant secedit left behind.
-$user = Get-LocalUser -Name "fivenines-agent" -ErrorAction SilentlyContinue
-if ($user) {
-    $sid = $user.SID.Value
+# SeServiceLogonRight grant secedit left behind. The account goes through the
+# ADSI WinNT provider, as in CreateServiceAccount.ps1: the LocalAccounts
+# cmdlets find no account at all on a domain controller.
+$accountPath = "WinNT://{0}/fivenines-agent,user" -f $env:COMPUTERNAME
+if ([ADSI]::Exists($accountPath)) {
+    $entry = [ADSI]$accountPath
+    $sid = ([System.Security.Principal.SecurityIdentifier]::new(
+        [byte[]]$entry.Properties["objectSid"].Value, 0)).Value
+    $description = [string]$entry.Properties["Description"].Value
     # DomainRole 4 = backup DC, 5 = primary DC.
     $isDomainController = (Get-CimInstance -ClassName Win32_ComputerSystem).DomainRole -ge 4
-    if ((-not $isDomainController) -or ($user.Description -eq ($DC_MANAGED_PREFIX + $env:COMPUTERNAME))) {
+    if ((-not $isDomainController) -or ($description -eq ($DC_MANAGED_PREFIX + $env:COMPUTERNAME))) {
         Write-Host "Removing account fivenines-agent (SID $sid)..."
-        Remove-LocalUser -Name "fivenines-agent" -ErrorAction Stop
+        ([ADSI]("WinNT://{0},computer" -f $env:COMPUTERNAME)).Delete("user", "fivenines-agent")
     } else {
-        Write-Host ("Keeping domain account fivenines-agent (Description={0}): other domain controllers may run the agent as it. Delete it in Active Directory once none does." -f $user.Description)
+        Write-Host ("Keeping domain account fivenines-agent (Description={0}): other domain controllers may run the agent as it. Delete it in Active Directory once none does." -f $description)
     }
 
     # Strip the account's SeServiceLogonRight entry from this machine's

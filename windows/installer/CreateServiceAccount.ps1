@@ -12,7 +12,7 @@
 #     bits) and create the account with it.
 #   * If the account exists AND has the MSI-managed Description tag we set
 #     on creation, this is an upgrade / reinstall: generate a fresh random
-#     password and update the existing account via Set-LocalUser. The old
+#     password and set it on the existing account. The old
 #     password lived only in the LSA secret of the just-removed service;
 #     the new ServiceInstall about to run receives our new password via
 #     sc.exe config. Operator workflow: no SERVICEACCOUNTPASSWORD needed.
@@ -20,18 +20,28 @@
 #     was created by something outside the MSI - Ansible, Chef, or a
 #     hand-rolled provisioning step. Require Password explicitly so we
 #     don't silently clobber operator-managed credentials.
-#   * On a DOMAIN CONTROLLER there are no local accounts: New-LocalUser
-#     creates a DOMAIN account, which every DC of the domain sees and may run
-#     the agent as. Rotating its password from one DC would stop the agent on
-#     the others, so a DC rotates only an account its own installer created
-#     with a random password; see the Description tags below.
+#   * On a DOMAIN CONTROLLER there are no local accounts: the account is a
+#     DOMAIN account, which every DC of the domain sees and may run the agent
+#     as. Rotating its password from one DC would stop the agent on the
+#     others, so a DC rotates only an account its own installer created with
+#     a random password; see the Description tags below.
 #   * Membership in 'Performance Monitor Users' is required for the PDH-based
 #     handle-count metric (files.py win32pdh path); 'Users' is required so the
 #     account inherits the default Read+Execute ACE on %ProgramFiles% and can
-#     load python311.dll out of the install dir. Both are joined by their
+#     load python311.dll out of the install dir. Both are found by their
 #     well-known SID, never by name: the names are translated with the OS
-#     install language, so the English names failed the install (1603) on
-#     every non-English Windows.
+#     install language, so a lookup by English name fails on a non-English
+#     Windows.
+#   * The account and its groups go through the ADSI WinNT provider (the
+#     NetUser*/NetLocalGroup* APIs 'net user' uses), NOT the LocalAccounts
+#     cmdlets: those enumerate SAM one entry at a time and drop every reply
+#     carrying more than one, which is what a domain controller's
+#     directory-backed SAM sends, so on a DC Get-LocalUser, Get-LocalGroup,
+#     Set-LocalUser and Add-LocalGroupMember find nothing (New-LocalUser,
+#     which enumerates nothing, did create the account: an English DC failed
+#     with "Group Performance Monitor Users was not found" right after it).
+#     WinNT://<ComputerName> is the machine's own account database on every
+#     role: the local SAM on a member server, the domain on a DC.
 #   * SeServiceLogonRight is required by SCM for any non-built-in account.
 
 param(
@@ -61,9 +71,20 @@ if ($bareName.Contains('\')) {
 $PERFORMANCE_MONITOR_USERS_SID = "S-1-5-32-558"
 $USERS_SID = "S-1-5-32-545"
 
+# HRESULT_FROM_WIN32(ERROR_MEMBER_IN_ALIAS, 1378): the account is already in
+# the group, which a re-run or an upgrade always finds. Matched by number:
+# the message is translated too.
+$HRESULT_MEMBER_IN_ALIAS = -2147023518  # 0x80070562
+
+# UserFlags of the account: ADS_UF_SCRIPT | ADS_UF_NORMAL_ACCOUNT (what every
+# account WinNT creates carries) | ADS_UF_PASSWD_CANT_CHANGE |
+# ADS_UF_DONT_EXPIRE_PASSWD. The account itself never expires: WinNT sets no
+# expiry date.
+$ACCOUNT_FLAGS = 0x1 -bor 0x200 -bor 0x40 -bor 0x10000
+
 # The account's Description records who manages its password, which decides
 # whether a later install may rotate it (Get-AccountPlan). 48 characters at
-# most: New-LocalUser refuses a longer one.
+# most, the SAM comment limit.
 #   * MSI_MANAGED_DESCRIPTION: created by this installer on a member server or
 #     a workgroup machine, where the account is local to the machine. Every
 #     release before domain-controller support also wrote it on a DC.
@@ -225,15 +246,46 @@ function Get-AccountPlan {
         "Domain account '{0}' exists (Description={1}) and this installer will not change its password: on a domain controller it is a domain account, which other domain controllers may run the agent as. Re-run with SERVICEACCOUNTPASSWORD=<the account's current password> (fivenines_setup.ps1 or fivenines_update.ps1 -ServiceAccountPassword)." -f $AccountName, $Description) }
 }
 
+# True when the exception, or one it wraps, carries this HRESULT. ADSI
+# errors reach PowerShell as a COMException inside one or two invocation
+# exceptions.
+function Test-HResult {
+    param([System.Exception]$Exception, [int]$HResult)
+
+    for ($e = $Exception; $e; $e = $e.InnerException) {
+        if ($e.HResult -eq $HResult) { return $true }
+    }
+    return $false
+}
+
+# Add the account to the BUILTIN group with this SID. Returns $true when it
+# was added, $false when it already was a member. The group's (translated)
+# name comes from its SID: the WinNT provider binds groups by name only.
+function Add-AccountToBuiltinGroup {
+    param([string]$GroupSid, [string]$AccountName)
+
+    $groupName = ([System.Security.Principal.SecurityIdentifier]$GroupSid).Translate(
+        [System.Security.Principal.NTAccount]).Value.Split('\')[-1]
+    $group = [ADSI]("WinNT://{0}/{1},group" -f $env:COMPUTERNAME, $groupName)
+    try {
+        $group.Add(("WinNT://{0}/{1},user" -f $env:COMPUTERNAME, $AccountName))
+        return $true
+    } catch {
+        if (Test-HResult $_.Exception $HRESULT_MEMBER_IN_ALIAS) { return $false }
+        throw
+    }
+}
+
 # DomainRole 4 = backup DC, 5 = primary DC.
 $isDomainController = (Get-CimInstance -ClassName Win32_ComputerSystem).DomainRole -ge 4
 $accountKind = if ($isDomainController) { "domain" } else { "local" }
 
-$existing = Get-LocalUser -Name $bareName -ErrorAction SilentlyContinue
-$existingDescription = if ($existing) { [string]$existing.Description } else { "" }
+$accountPath = "WinNT://{0}/{1},user" -f $env:COMPUTERNAME, $bareName
+$entry = if ([ADSI]::Exists($accountPath)) { [ADSI]$accountPath } else { $null }
+$existingDescription = if ($entry) { [string]$entry.Properties["Description"].Value } else { "" }
 $plan = Get-AccountPlan `
     -IsDomainController $isDomainController `
-    -Exists ([bool]$existing) `
+    -Exists ($null -ne $entry) `
     -Description $existingDescription `
     -HasPassword (-not [string]::IsNullOrEmpty($Password)) `
     -AccountName $bareName `
@@ -244,8 +296,7 @@ if ($plan.Action -eq "Refuse") {
 } elseif ($plan.Action -eq "Rotate") {
     # The old password is gone with the old service (see the header).
     $Password = New-RandomPassword
-    $securePwd = ConvertTo-SecureString $Password -AsPlainText -Force
-    Set-LocalUser -Name $bareName -Password $securePwd -ErrorAction Stop
+    $entry.SetPassword($Password)
     Write-Host ("Rotated password on MSI-managed {0} account '{1}' (upgrade path)." -f $accountKind, $bareName)
 } elseif ($plan.Action -eq "UseProvided") {
     Write-Host ("Account '{0}' already exists; using provided password." -f $bareName)
@@ -253,14 +304,15 @@ if ($plan.Action -eq "Refuse") {
     if ([string]::IsNullOrEmpty($Password)) {
         $Password = New-RandomPassword
     }
-    $securePwd = ConvertTo-SecureString $Password -AsPlainText -Force
-    New-LocalUser -Name $bareName `
-        -Password $securePwd `
-        -PasswordNeverExpires `
-        -UserMayNotChangePassword `
-        -AccountNeverExpires `
-        -Description $plan.Description `
-        -ErrorAction Stop | Out-Null
+    $computer = [ADSI]("WinNT://{0},computer" -f $env:COMPUTERNAME)
+    $entry = $computer.Create("user", $bareName)
+    $entry.SetPassword($Password)
+    $entry.Put("Description", $plan.Description)
+    $entry.Put("UserFlags", $ACCOUNT_FLAGS)
+    $entry.SetInfo()
+    # Rebind: a just-created entry's property cache holds only what was Put,
+    # not the objectSid the system assigned.
+    $entry = [ADSI]$accountPath
     if ($isDomainController) {
         Write-Host ("Created domain account '{0}' (a domain controller has no local accounts)." -f $bareName)
     } else {
@@ -268,23 +320,21 @@ if ($plan.Action -eq "Refuse") {
     }
 }
 if ($plan.Description -and $plan.Action -ne "Create") {
-    Set-LocalUser -Name $bareName -Description $plan.Description -ErrorAction Stop
+    $entry.Put("Description", $plan.Description)
+    $entry.SetInfo()
     Write-Host ("Tagged account '{0}': {1}." -f $bareName, $plan.Description)
 }
 
-$account = Get-LocalUser -Name $bareName -ErrorAction Stop
-$sid = $account.SID.Value
+$accountSid = [System.Security.Principal.SecurityIdentifier]::new(
+    [byte[]]$entry.Properties["objectSid"].Value, 0)
+$sid = $accountSid.Value
 
-# Idempotent group memberships, by SID (see the header). A re-run or an
-# upgrade finds the account already a member: MemberExistsException is
-# matched by type, since its message is translated too.
+# Idempotent group memberships, by SID (see the header).
 foreach ($groupSid in @($PERFORMANCE_MONITOR_USERS_SID, $USERS_SID)) {
-    $group = Get-LocalGroup -SID $groupSid -ErrorAction Stop
-    try {
-        Add-LocalGroupMember -Group $group -Member $account -ErrorAction Stop
-        Write-Host ("Added '{0}' to '{1}' ({2})." -f $bareName, $group.Name, $groupSid)
-    } catch [Microsoft.PowerShell.Commands.MemberExistsException] {
-        Write-Host ("'{0}' already in '{1}' ({2}) (ok)." -f $bareName, $group.Name, $groupSid)
+    if (Add-AccountToBuiltinGroup -GroupSid $groupSid -AccountName $bareName) {
+        Write-Host ("Added '{0}' to {1}." -f $bareName, $groupSid)
+    } else {
+        Write-Host ("'{0}' already in {1} (ok)." -f $bareName, $groupSid)
     }
 }
 
@@ -356,7 +406,7 @@ foreach ($d in $dirs) {
 # member server, <DOMAIN>\name on a domain controller, whose account domain
 # is the domain rather than the DC's own name (the MSI's default
 # SERVICEACCOUNT spells the latter).
-$qualified = $account.SID.Translate([System.Security.Principal.NTAccount]).Value
+$qualified = $accountSid.Translate([System.Security.Principal.NTAccount]).Value
 $scArgs = @("config", "fivenines-agent", "obj=", $qualified, "password=", $Password)
 $scOut = & sc.exe @scArgs 2>&1
 if ($LASTEXITCODE -ne 0) {
