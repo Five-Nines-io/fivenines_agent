@@ -225,7 +225,9 @@ jobs:
           }
           $pairs = @(
             @('Resolve-ServiceAccountSid', 'windows/installer/SetTokenFileAcl.ps1', 'windows/installer/DelegateWmiStorageNamespace.ps1'),
-            @('ConvertTo-MsiPasswordArgument', 'fivenines_setup.ps1', 'fivenines_update.ps1')
+            @('ConvertTo-MsiPasswordArgument', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
+            @('Test-HResult', 'windows/installer/CreateServiceAccount.ps1', 'fivenines_uninstall.ps1'),
+            @('Get-WinNTUser', 'windows/installer/CreateServiceAccount.ps1', 'fivenines_uninstall.ps1')
           )
           foreach ($p in $pairs) {
             if ((Get-Fn $p[1] $p[0]) -ne (Get-Fn $p[2] $p[0])) { throw "$($p[0]) differs between $($p[1]) and $($p[2])" }
@@ -457,7 +459,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $src = Get-Content windows/installer/CreateServiceAccount.ps1 -Raw
           Invoke-Expression ([regex]::Match($src, '(?m)^\$HRESULT_MEMBER_IN_ALIAS = .*$').Value)
-          foreach ($fn in 'Test-HResult', 'Add-AccountToBuiltinGroup') {
+          foreach ($fn in 'Test-HResult', 'Get-WinNTUser', 'Add-AccountToBuiltinGroup') {
             $m = [regex]::Match($src, "(?ms)^function $fn \{.*?^\}")
             if (-not $m.Success) { throw "$fn not found in CreateServiceAccount.ps1" }
             Invoke-Expression $m.Value
@@ -468,6 +470,11 @@ jobs:
             }
             Write-Host "Re-adding to ${groupSid}: already a member, recognized by HRESULT."
           }
+
+          # Get-WinNTUser tells an existing account from a missing one.
+          if ($null -eq (Get-WinNTUser "fivenines-agent")) { throw "Get-WinNTUser does not find fivenines-agent" }
+          if ($null -ne (Get-WinNTUser "no-such-fivenines-user")) { throw "Get-WinNTUser finds an account that does not exist" }
+          Write-Host "Get-WinNTUser: finds fivenines-agent, returns null for a missing account."
 
           $u = Get-LocalUser -Name "fivenines-agent"
           $m = [regex]::Match((Get-Content windows/installer/SetTokenFileAcl.ps1 -Raw), "(?ms)^function Resolve-ServiceAccountSid \{.*?^\}")

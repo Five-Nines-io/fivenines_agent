@@ -76,11 +76,10 @@ $USERS_SID = "S-1-5-32-545"
 # the message is translated too.
 $HRESULT_MEMBER_IN_ALIAS = -2147023518  # 0x80070562
 
-# UserFlags of the account: ADS_UF_SCRIPT | ADS_UF_NORMAL_ACCOUNT (what every
-# account WinNT creates carries) | ADS_UF_PASSWD_CANT_CHANGE |
+# UserFlags added to the account's: ADS_UF_PASSWD_CANT_CHANGE |
 # ADS_UF_DONT_EXPIRE_PASSWD. The account itself never expires: WinNT sets no
 # expiry date.
-$ACCOUNT_FLAGS = 0x1 -bor 0x200 -bor 0x40 -bor 0x10000
+$ACCOUNT_FLAGS = 0x40 -bor 0x10000
 
 # The account's Description records who manages its password, which decides
 # whether a later install may rotate it (Get-AccountPlan). 48 characters at
@@ -258,6 +257,26 @@ function Test-HResult {
     return $false
 }
 
+# Kept identical in fivenines_uninstall.ps1 (windows.yml checks it).
+# The WinNT entry of this machine's user NAME, or $null when there is none.
+# [ADSI]::Exists() does not answer that for WinNT: it raises NERR_UserNotFound
+# instead of returning false. [ADSI] binds lazily, so reading a property is
+# what finds out. Properties go through psbase: PowerShell's ADSI adapter
+# hides the DirectoryEntry's own .NET members.
+function Get-WinNTUser {
+    param([string]$Name)
+
+    $entry = [ADSI]("WinNT://{0}/{1},user" -f $env:COMPUTERNAME, $Name)
+    try {
+        $null = $entry.psbase.Properties["objectSid"].Value
+    } catch {
+        # NERR_UserNotFound (2221, 0x800708AD), ERROR_NO_SUCH_USER (1317, 0x80070525).
+        if ((Test-HResult $_.Exception -2147022675) -or (Test-HResult $_.Exception -2147023579)) { return $null }
+        throw
+    }
+    return $entry
+}
+
 # Add the account to the BUILTIN group with this SID. Returns $true when it
 # was added, $false when it already was a member. The group's (translated)
 # name comes from its SID: the WinNT provider binds groups by name only.
@@ -280,9 +299,8 @@ function Add-AccountToBuiltinGroup {
 $isDomainController = (Get-CimInstance -ClassName Win32_ComputerSystem).DomainRole -ge 4
 $accountKind = if ($isDomainController) { "domain" } else { "local" }
 
-$accountPath = "WinNT://{0}/{1},user" -f $env:COMPUTERNAME, $bareName
-$entry = if ([ADSI]::Exists($accountPath)) { [ADSI]$accountPath } else { $null }
-$existingDescription = if ($entry) { [string]$entry.Properties["Description"].Value } else { "" }
+$entry = Get-WinNTUser $bareName
+$existingDescription = if ($entry) { [string]$entry.psbase.Properties["Description"].Value } else { "" }
 $plan = Get-AccountPlan `
     -IsDomainController $isDomainController `
     -Exists ($null -ne $entry) `
@@ -308,11 +326,12 @@ if ($plan.Action -eq "Refuse") {
     $entry = $computer.Create("user", $bareName)
     $entry.SetPassword($Password)
     $entry.Put("Description", $plan.Description)
-    $entry.Put("UserFlags", $ACCOUNT_FLAGS)
     $entry.SetInfo()
     # Rebind: a just-created entry's property cache holds only what was Put,
-    # not the objectSid the system assigned.
-    $entry = [ADSI]$accountPath
+    # not the objectSid and flags the system assigned.
+    $entry = Get-WinNTUser $bareName
+    $entry.Put("UserFlags", ([int]$entry.psbase.Properties["UserFlags"].Value) -bor $ACCOUNT_FLAGS)
+    $entry.SetInfo()
     if ($isDomainController) {
         Write-Host ("Created domain account '{0}' (a domain controller has no local accounts)." -f $bareName)
     } else {
@@ -326,7 +345,7 @@ if ($plan.Description -and $plan.Action -ne "Create") {
 }
 
 $accountSid = [System.Security.Principal.SecurityIdentifier]::new(
-    [byte[]]$entry.Properties["objectSid"].Value, 0)
+    [byte[]]$entry.psbase.Properties["objectSid"].Value, 0)
 $sid = $accountSid.Value
 
 # Idempotent group memberships, by SID (see the header).

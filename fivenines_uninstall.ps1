@@ -76,16 +76,47 @@ if ($KeepAccount) {
 # installer created on a domain controller (windows.yml keeps the two equal).
 $DC_MANAGED_PREFIX = "Fivenines agent, managed on "
 
+# True when the exception, or one it wraps, carries this HRESULT. ADSI
+# errors reach PowerShell as a COMException inside one or two invocation
+# exceptions.
+function Test-HResult {
+    param([System.Exception]$Exception, [int]$HResult)
+
+    for ($e = $Exception; $e; $e = $e.InnerException) {
+        if ($e.HResult -eq $HResult) { return $true }
+    }
+    return $false
+}
+
+# Kept identical in CreateServiceAccount.ps1 (windows.yml checks it).
+# The WinNT entry of this machine's user NAME, or $null when there is none.
+# [ADSI]::Exists() does not answer that for WinNT: it raises NERR_UserNotFound
+# instead of returning false. [ADSI] binds lazily, so reading a property is
+# what finds out. Properties go through psbase: PowerShell's ADSI adapter
+# hides the DirectoryEntry's own .NET members.
+function Get-WinNTUser {
+    param([string]$Name)
+
+    $entry = [ADSI]("WinNT://{0}/{1},user" -f $env:COMPUTERNAME, $Name)
+    try {
+        $null = $entry.psbase.Properties["objectSid"].Value
+    } catch {
+        # NERR_UserNotFound (2221, 0x800708AD), ERROR_NO_SUCH_USER (1317, 0x80070525).
+        if ((Test-HResult $_.Exception -2147022675) -or (Test-HResult $_.Exception -2147023579)) { return $null }
+        throw
+    }
+    return $entry
+}
+
 # Capture the SID before deleting the account so we can clean up the
 # SeServiceLogonRight grant secedit left behind. The account goes through the
 # ADSI WinNT provider, as in CreateServiceAccount.ps1: the LocalAccounts
 # cmdlets find no account at all on a domain controller.
-$accountPath = "WinNT://{0}/fivenines-agent,user" -f $env:COMPUTERNAME
-if ([ADSI]::Exists($accountPath)) {
-    $entry = [ADSI]$accountPath
+$entry = Get-WinNTUser "fivenines-agent"
+if ($entry) {
     $sid = ([System.Security.Principal.SecurityIdentifier]::new(
-        [byte[]]$entry.Properties["objectSid"].Value, 0)).Value
-    $description = [string]$entry.Properties["Description"].Value
+        [byte[]]$entry.psbase.Properties["objectSid"].Value, 0)).Value
+    $description = [string]$entry.psbase.Properties["Description"].Value
     # DomainRole 4 = backup DC, 5 = primary DC.
     $isDomainController = (Get-CimInstance -ClassName Win32_ComputerSystem).DomainRole -ge 4
     if ((-not $isDomainController) -or ($description -eq ($DC_MANAGED_PREFIX + $env:COMPUTERNAME))) {

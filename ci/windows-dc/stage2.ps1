@@ -19,7 +19,6 @@ New-Item -ItemType File -Path "C:\fn\stage2.started" | Out-Null
 $NewMsi = "C:\fn\new.msi"
 $OldMsi = "C:\fn\old.msi"
 $Account = "fivenines-agent"
-$AccountPath = "WinNT://{0}/{1},user" -f $env:COMPUTERNAME, $Account
 $Domain = "KUEPFER"
 $Legacy = "Fivenines monitoring agent service account"
 $Own = "Fivenines agent, managed on " + $env:COMPUTERNAME
@@ -98,9 +97,14 @@ function Report-TokenInLog {
     Log ("INFO the TOKEN value appears in the verbose MSI log: {0}" -f [bool]$hit)
 }
 
+# The installer's own helpers, as they ship.
+$uninstallSource = Get-Content "C:\fn\fivenines_uninstall.ps1" -Raw
+foreach ($fn in @("Test-HResult", "Get-WinNTUser")) {
+    Invoke-Expression ([regex]::Match($uninstallSource, "(?ms)^function $fn \{.*?^\}").Value)
+}
+
 function Get-AccountEntry {
-    if ([ADSI]::Exists($AccountPath)) { return [ADSI]$AccountPath }
-    return $null
+    return Get-WinNTUser $Account
 }
 
 function Set-AccountDescription {
