@@ -243,7 +243,8 @@ iwr https://releases.fivenines.io/latest/fivenines_update.ps1 -OutFile update.ps
 .\update.ps1
 
 # Uninstall: removes the MSI, the service, the local service account,
-# its SeServiceLogonRight grant, and the config + log directories.
+# its SeServiceLogonRight grant and WMI Storage access, and the config +
+# log directories.
 # Pass -KeepAccount to leave a pre-staged account in place. On a domain
 # controller, an account shared with other DCs is kept.
 iwr https://releases.fivenines.io/latest/fivenines_uninstall.ps1 -OutFile uninstall.ps1

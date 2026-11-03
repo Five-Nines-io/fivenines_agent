@@ -43,6 +43,17 @@ This directory builds the Windows MSI installer for the fivenines agent.
   and its groups go through the ADSI WinNT provider (`WinNT://<ComputerName>`,
   the NetUser*/NetLocalGroup* APIs), which is the local SAM on a member server
   and the domain on a DC.
+- **The WMI namespace ACL in binary.** `DelegateWmiStorageNamespace.ps1` reads
+  and writes `root\Microsoft\Windows\Storage`'s descriptor with
+  `__SystemSecurity` `GetSD`/`SetSD` and `RawSecurityDescriptor`, never
+  `GetSecurityDescriptor`: that one resolves every ACE's trustee to a name and
+  fails ("unexpected error") once an ACE names a deleted account, which failed
+  a reinstall after `fivenines_uninstall.ps1` (or a hand-deleted account) with
+  1603. A grant already present is not added again, and the uninstall script
+  removes it. Two Windows PowerShell 5.1 traps met on the way: `-band` on a
+  byte-based enum such as `AceFlags` raises "Specified cast is not valid" (use
+  `IsInherited`), and `InvokeMethod` cannot take `New-Object`'s
+  PSObject-wrapped `byte[]` (use `[byte[]]::new`).
 - **Domain controllers.** On a DC the account is a domain account, the BUILTIN
   groups are the domain's, and the account's qualified name is `<DOMAIN>\name`,
   not the `[ComputerName]\name` the MSI defaults to, so every script resolves it
