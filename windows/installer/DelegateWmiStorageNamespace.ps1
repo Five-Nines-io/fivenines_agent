@@ -7,10 +7,11 @@
 # delegation the disk_health collector probes false on a low-priv install
 # and the headline feature silently degrades.
 #
-# This script reads the current namespace security descriptor, builds an
-# ACE granting WBEM_ENABLE | WBEM_METHOD_EXECUTE | WBEM_REMOTE_ENABLE to the
-# service account's SID, appends it to the DACL, and writes the SD back.
-# The ACE has CONTAINER_INHERIT set so sub-namespaces inherit the grant.
+# This script reads the current namespace security descriptor, adds an ACE
+# granting WBEM_ENABLE | WBEM_METHOD_EXECUTE | WBEM_REMOTE_ENABLE to the
+# service account's SID unless one already does (a reinstall keeps the
+# account), and writes the SD back. The ACE has CONTAINER_INHERIT set so
+# sub-namespaces inherit the grant.
 
 param(
     [Parameter(Mandatory=$true)][string]$ServiceAccount
@@ -45,58 +46,66 @@ function Resolve-ServiceAccountSid {
 # Resolve the service account to a SID. Translate raises if the account
 # does not exist - fail loudly here rather than silently writing a broken ACE.
 $sid = (Resolve-ServiceAccountSid $ServiceAccount).Value
-$accountName = $ServiceAccount.Split('\')[-1]
 Write-Host ("Service account {0} -> SID {1}" -f $ServiceAccount, $sid)
 
-# Read the current namespace security descriptor.
-# __SystemSecurity is a singleton; "__SystemSecurity=@" is the canonical
-# WMI path for the singleton instance (Invoke-WmiMethod can't be given the
-# class itself - it needs the instance).
-$secPath = "__SystemSecurity=@"
-$getResult = Invoke-WmiMethod `
-    -Namespace $Namespace `
-    -Path $secPath `
-    -Name GetSecurityDescriptor `
-    -ErrorAction Stop
-if ($getResult.ReturnValue -ne 0) {
-    throw ("GetSecurityDescriptor failed: ReturnValue={0}" -f $getResult.ReturnValue)
+# The descriptor is read and written in binary form (GetSD/SetSD), never as
+# the object GetSecurityDescriptor returns: that one resolves every ACE's
+# trustee to a name, and fails ("unexpected error") once an ACE names an
+# account that no longer exists -- which an uninstall that deleted the
+# account used to leave behind, so the next install failed with 1603.
+# __SystemSecurity is the namespace's singleton security object.
+$security = Get-WmiObject -Namespace $Namespace -Class __SystemSecurity
+$getResult = $security.PSBase.InvokeMethod("GetSD", $null, $null)
+if ($getResult["ReturnValue"] -ne 0) {
+    throw ("GetSD failed: ReturnValue={0}" -f $getResult["ReturnValue"])
 }
-$sd = $getResult.Descriptor
+$sd = [System.Security.AccessControl.RawSecurityDescriptor]::new([byte[]]$getResult["SD"], 0)
+if ($null -eq $sd.DiscretionaryAcl) {
+    throw ("WMI namespace {0} has no DACL" -f $Namespace)
+}
 
-# Build a new ACE granting the service account read access.
 $WBEM_ENABLE         = 0x1
 $WBEM_METHOD_EXECUTE = 0x2
 $WBEM_REMOTE_ENABLE  = 0x20
-$ACCESS_ALLOWED      = 0
-$CONTAINER_INHERIT   = 0x2
+$mask = $WBEM_ENABLE -bor $WBEM_METHOD_EXECUTE -bor $WBEM_REMOTE_ENABLE
+$sidObject = [System.Security.Principal.SecurityIdentifier]$sid
+$allowed = [System.Security.AccessControl.AceQualifier]::AccessAllowed
+$inherited = [System.Security.AccessControl.AceFlags]::Inherited
 
-# [wmiclass] needs "<namespace>:<class>" - the namespace already contains
-# the necessary backslashes and PowerShell double-quoted strings keep them
-# literal.
-$aceClass = [wmiclass]"$($Namespace):__ACE"
-$ace = $aceClass.CreateInstance()
-$ace.AccessMask = $WBEM_ENABLE -bor $WBEM_METHOD_EXECUTE -bor $WBEM_REMOTE_ENABLE
-$ace.AceType    = $ACCESS_ALLOWED
-$ace.AceFlags   = $CONTAINER_INHERIT
+$alreadyGranted = $false
+foreach ($existingAce in $sd.DiscretionaryAcl) {
+    if ($existingAce -is [System.Security.AccessControl.CommonAce] -and
+        $existingAce.AceQualifier -eq $allowed -and
+        $existingAce.SecurityIdentifier -eq $sidObject -and
+        ($existingAce.AccessMask -band $mask) -eq $mask) {
+        $alreadyGranted = $true
+    }
+}
 
-$trusteeClass = [wmiclass]"$($Namespace):__Trustee"
-$trustee = $trusteeClass.CreateInstance()
-$trustee.Name = $accountName
-$trustee.SidString = $sid
-$ace.Trustee = $trustee
+if ($alreadyGranted) {
+    Write-Host ("{0} already has read access to WMI namespace {1}" -f $ServiceAccount, $Namespace)
+    exit 0
+}
 
-# Append to the DACL and write back.
-$dacl = @($sd.DACL) + $ace
-$sd.DACL = $dacl
+# Explicit ACEs go before inherited ones (the canonical order).
+$position = $sd.DiscretionaryAcl.Count
+for ($i = 0; $i -lt $sd.DiscretionaryAcl.Count; $i++) {
+    if (($sd.DiscretionaryAcl[$i].AceFlags -band $inherited) -ne 0) {
+        $position = $i
+        break
+    }
+}
+$ace = [System.Security.AccessControl.CommonAce]::new(
+    [System.Security.AccessControl.AceFlags]::ContainerInherit, $allowed, $mask, $sidObject, $false, $null)
+$sd.DiscretionaryAcl.InsertAce($position, $ace)
 
-$setResult = Invoke-WmiMethod `
-    -Namespace $Namespace `
-    -Path $secPath `
-    -Name SetSecurityDescriptor `
-    -ArgumentList $sd `
-    -ErrorAction Stop
-if ($setResult.ReturnValue -ne 0) {
-    throw ("SetSecurityDescriptor failed: ReturnValue={0}" -f $setResult.ReturnValue)
+$bytes = New-Object byte[] $sd.BinaryLength
+$sd.GetBinaryForm($bytes, 0)
+$setParams = $security.PSBase.GetMethodParameters("SetSD")
+$setParams["SD"] = $bytes
+$setResult = $security.PSBase.InvokeMethod("SetSD", $setParams, $null)
+if ($setResult["ReturnValue"] -ne 0) {
+    throw ("SetSD failed: ReturnValue={0}" -f $setResult["ReturnValue"])
 }
 
 Write-Host ("Granted {0} read access to WMI namespace {1}" -f $ServiceAccount, $Namespace)

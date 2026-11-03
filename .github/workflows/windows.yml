@@ -584,6 +584,44 @@ jobs:
             Get-ChildItem $configDir -Recurse | Out-String
           }
 
+      # The account deleted by hand leaves its ACE on the WMI Storage
+      # namespace, naming a SID that no longer resolves: the next install's
+      # WMI delegation must cope (GetSecurityDescriptor failed outright on
+      # one, which a domain controller showed). Then fivenines_uninstall.ps1
+      # must delete the account and take its grant with it.
+      - name: Reinstall over an orphaned WMI grant, then fivenines_uninstall.ps1
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          function Get-StorageAceSids {
+            $security = Get-WmiObject -Namespace "root\Microsoft\Windows\Storage" -Class __SystemSecurity
+            $raw = $security.PSBase.InvokeMethod("GetSD", $null, $null)
+            $sd = [System.Security.AccessControl.RawSecurityDescriptor]::new([byte[]]$raw["SD"], 0)
+            return @($sd.DiscretionaryAcl | Where-Object { $_ -is [System.Security.AccessControl.KnownAce] } |
+                     ForEach-Object { $_.SecurityIdentifier.Value })
+          }
+
+          $orphan = (Get-LocalUser -Name "fivenines-agent").SID.Value
+          Remove-LocalUser -Name "fivenines-agent"
+          if ((Get-StorageAceSids) -notcontains $orphan) { throw "expected the deleted account's WMI grant to remain" }
+          Write-Host "Deleted fivenines-agent by hand; its WMI grant ($orphan) remains."
+
+          $p = Start-Process msiexec -ArgumentList "/i fivenines-agent.msi TOKEN=ci-reinstall-$(Get-Random) /qn /l*v reinstall.log" -Wait -PassThru
+          if ($p.ExitCode -ne 0) {
+            Get-Content reinstall.log | Select-String "WixQuietExec" | Select-Object -Last 40 | ForEach-Object { $_.Line }
+            throw "reinstall over the orphaned grant failed: $($p.ExitCode)"
+          }
+          $sid = (Get-LocalUser -Name "fivenines-agent").SID.Value
+          $count = @(Get-StorageAceSids | Where-Object { $_ -eq $sid }).Count
+          if ($count -ne 1) { throw "expected exactly one WMI grant for $sid, found $count" }
+          Write-Host "Reinstalled as $sid, granted once."
+
+          Start-Process msiexec -ArgumentList "/x fivenines-agent.msi /qn /l*v uninstall2.log" -Wait | Out-Null
+          & .\fivenines_uninstall.ps1 -LogFile uninstall-script.log
+          if (Get-LocalUser -Name "fivenines-agent" -ErrorAction SilentlyContinue) { throw "fivenines_uninstall.ps1 kept the account" }
+          if ((Get-StorageAceSids) -contains $sid) { throw "fivenines_uninstall.ps1 left the WMI grant for $sid" }
+          Write-Host "fivenines_uninstall.ps1 deleted the account and its WMI grant."
+
       - name: Cleanup service account
         if: always()
         shell: pwsh
@@ -597,6 +635,8 @@ jobs:
           path: |
             install.log
             uninstall.log
+            reinstall.log
+            uninstall2.log
           retention-days: 7
           if-no-files-found: ignore
 

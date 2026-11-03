@@ -140,6 +140,31 @@ function Wait-AgentRunning {
     return $false
 }
 
+# Run one of the bootstrap scripts (fivenines_setup.ps1, fivenines_uninstall.ps1)
+# in a job, bounded: they call msiexec /qb, whose basic UI shows a modal
+# error box when the install fails -- in this SYSTEM task's session 0 nobody
+# can close it, and msiexec would wait forever. Returns $null on success,
+# else why it failed.
+function Invoke-Bootstrap {
+    param([scriptblock]$Script, [object[]]$Arguments = @(), [int]$TimeoutSeconds = 600)
+
+    $job = Start-Job -ScriptBlock $Script -ArgumentList $Arguments
+    if (-not (Wait-Job $job -Timeout $TimeoutSeconds)) {
+        Stop-Job $job
+        Get-Process -Name msiexec -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+        return "timed out after $TimeoutSeconds s (an msiexec /qb error box?)"
+    }
+    try {
+        $output = @(Receive-Job $job -ErrorAction Stop)
+    } catch {
+        return "failed: $_"
+    }
+    foreach ($line in $output) { Log ("  | " + $line) }
+    if ($job.State -ne "Completed") { return "job $($job.State)" }
+    if (-not ($output -contains "EXIT:0")) { return "exit code: $(@($output | Where-Object { "$_" -like 'EXIT:*' }) -join ',')" }
+    return $null
+}
+
 function Test-Installed {
     param([string]$Label, [string]$Description)
 
@@ -166,8 +191,17 @@ function Test-Installed {
         Check ($granted -contains $want) "$Label TOKEN ACL grants $want"
     }
 
-    $sd = (Invoke-WmiMethod -Namespace "root\Microsoft\Windows\Storage" -Path "__SystemSecurity=@" -Name GetSecurityDescriptor).Descriptor
-    Check (@($sd.DACL | ForEach-Object { $_.Trustee.SIDString }) -contains $sid) "$Label WMI Storage namespace grants the account"
+    $grants = @(Get-WmiStorageAces | Where-Object { $_.SecurityIdentifier.Value -eq $sid })
+    Check ($grants.Count -eq 1) "$Label WMI Storage namespace grants the account exactly once (ACEs: $($grants.Count))"
+}
+
+# The WMI Storage namespace's ACEs, read in binary like the installer does
+# (GetSecurityDescriptor fails once an ACE names a deleted account).
+function Get-WmiStorageAces {
+    $security = Get-WmiObject -Namespace "root\Microsoft\Windows\Storage" -Class __SystemSecurity
+    $raw = $security.PSBase.InvokeMethod("GetSD", $null, $null)
+    $sd = [System.Security.AccessControl.RawSecurityDescriptor]::new([byte[]]$raw["SD"], 0)
+    return @($sd.DiscretionaryAcl | Where-Object { $_ -is [System.Security.AccessControl.KnownAce] })
 }
 
 try {
@@ -230,17 +264,15 @@ try {
     Log "== S5: the operator's password, through fivenines_setup.ps1 -ServiceAccountPassword"
     $password = New-TestPassword
     (Get-AccountEntry).SetPassword($password)
-    $secure = ConvertTo-SecureString $password -AsPlainText -Force
     # The script ends with 'exit 1' when the service does not run, and
     # throws (Write-Error under Stop) on any other failure.
-    $setupFailed = $null
-    $global:LASTEXITCODE = 0
-    try {
-        & "C:\fn\fivenines_setup.ps1" -Token ("ci-dc-token-" + (Get-Random)) -MsiUrl "file:///C:/fn/new.msi" `
+    $setupFailed = Invoke-Bootstrap -Arguments @($password, ("ci-dc-token-" + (Get-Random))) -Script {
+        param($Password, $Token)
+        $secure = ConvertTo-SecureString $Password -AsPlainText -Force
+        $global:LASTEXITCODE = 0
+        & "C:\fn\fivenines_setup.ps1" -Token $Token -MsiUrl "file:///C:/fn/new.msi" `
             -MsiPath "C:\fn\downloaded.msi" -LogFile "C:\fn\logs\s5-setup.log" -ServiceAccountPassword $secure
-        if ($LASTEXITCODE -ne 0) { $setupFailed = "exit $LASTEXITCODE" }
-    } catch {
-        $setupFailed = $_
+        "EXIT:$LASTEXITCODE"
     }
     Check ($null -eq $setupFailed) "S5 fivenines_setup.ps1 succeeds ($setupFailed)"
     if ($setupFailed) { Show-CustomActionOutput "C:\fn\logs\s5-setup.log" }
@@ -257,7 +289,13 @@ try {
     Test-Installed "S6" $Operator
 
     Log "== S7: fivenines_uninstall.ps1 keeps a shared account"
-    & "C:\fn\fivenines_uninstall.ps1" -LogFile "C:\fn\logs\s7-uninstall.log"
+    $failed = Invoke-Bootstrap -Arguments @("C:\fn\logs\s7-uninstall.log") -Script {
+        param($LogFile)
+        $global:LASTEXITCODE = 0
+        & "C:\fn\fivenines_uninstall.ps1" -LogFile $LogFile
+        "EXIT:$LASTEXITCODE"
+    }
+    Check ($null -eq $failed) "S7 fivenines_uninstall.ps1 succeeds ($failed)"
     Check ($null -eq (Get-Service -Name "fivenines-agent" -ErrorAction SilentlyContinue)) "S7 the service is gone"
     Check ((Get-AdAccount).Description -eq $Operator) "S7 the shared account is kept"
 
@@ -265,8 +303,23 @@ try {
     Set-AccountDescription $Own
     $r = Install-Agent "s8-install"
     Check ($r.ExitCode -eq 0) "S8 install exits 0"
-    & "C:\fn\fivenines_uninstall.ps1" -LogFile "C:\fn\logs\s8-uninstall.log"
+    $deletedSid = (Get-AdAccount).SID.Value
+    $failed = Invoke-Bootstrap -Arguments @("C:\fn\logs\s8-uninstall.log") -Script {
+        param($LogFile)
+        $global:LASTEXITCODE = 0
+        & "C:\fn\fivenines_uninstall.ps1" -LogFile $LogFile
+        "EXIT:$LASTEXITCODE"
+    }
+    Check ($null -eq $failed) "S8 fivenines_uninstall.ps1 succeeds ($failed)"
     Check ($null -eq (Get-AdAccount)) "S8 the account is deleted"
+    Check (@(Get-WmiStorageAces | Where-Object { $_.SecurityIdentifier.Value -eq $deletedSid }).Count -eq 0) "S8 no WMI grant left for the deleted account"
+
+    Log "== S8b: an account deleted by hand leaves its WMI grant behind; the next install must cope"
+    $r = Install-Agent "s8b-install"
+    Check ($r.ExitCode -eq 0) "S8b install exits 0"
+    Check ((Uninstall-Agent "s8b-uninstall").ExitCode -eq 0) "S8b uninstall exits 0"
+    ([ADSI]("WinNT://{0},computer" -f $env:COMPUTERNAME)).Delete("user", $Account)
+    Check ($null -eq (Get-AdAccount)) "S8b the account is deleted by hand"
 
     Log "== S9: a fresh install on a DC with no account yet"
     $r = Install-Agent "s9-fresh"

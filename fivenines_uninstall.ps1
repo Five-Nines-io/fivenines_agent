@@ -17,7 +17,9 @@
 #      removes %ProgramFiles%\fivenines-agent + the config + log dirs).
 #   4. Unless -KeepAccount, removes the local fivenines-agent user.
 #   5. Removes the SeServiceLogonRight grant for that SID (it lingers in the
-#      LSA after the user is deleted - tidy up so secedit /export is clean).
+#      LSA after the user is deleted - tidy up so secedit /export is clean)
+#      and its read access to the WMI Storage namespace (an ACE naming a
+#      deleted account broke the next install's WMI delegation).
 #
 # On a domain controller the account is a DOMAIN account (a DC has no local
 # ones), which other DCs may run the agent as. It is deleted only when this
@@ -112,6 +114,43 @@ function Get-WinNTUser {
     return $entry
 }
 
+# Remove every explicit ACE naming this SID from the WMI Storage namespace,
+# which DelegateWmiStorageNamespace.ps1 granted. Binary GetSD/SetSD, as there:
+# GetSecurityDescriptor fails outright once an ACE names a deleted account.
+function Remove-WmiStorageGrant {
+    param([string]$Sid)
+
+    $namespace = "root\Microsoft\Windows\Storage"
+    $security = Get-WmiObject -Namespace $namespace -Class __SystemSecurity
+    $getResult = $security.PSBase.InvokeMethod("GetSD", $null, $null)
+    if ($getResult["ReturnValue"] -ne 0) {
+        throw ("GetSD failed: ReturnValue={0}" -f $getResult["ReturnValue"])
+    }
+    $sd = [System.Security.AccessControl.RawSecurityDescriptor]::new([byte[]]$getResult["SD"], 0)
+    $sidObject = [System.Security.Principal.SecurityIdentifier]$Sid
+    $inherited = [System.Security.AccessControl.AceFlags]::Inherited
+    $removed = 0
+    for ($i = $sd.DiscretionaryAcl.Count - 1; $i -ge 0; $i--) {
+        $ace = $sd.DiscretionaryAcl[$i]
+        if ($ace -is [System.Security.AccessControl.KnownAce] -and
+            $ace.SecurityIdentifier -eq $sidObject -and
+            ($ace.AceFlags -band $inherited) -eq 0) {
+            $sd.DiscretionaryAcl.RemoveAce($i)
+            $removed++
+        }
+    }
+    if ($removed -eq 0) { return }
+    $bytes = New-Object byte[] $sd.BinaryLength
+    $sd.GetBinaryForm($bytes, 0)
+    $setParams = $security.PSBase.GetMethodParameters("SetSD")
+    $setParams["SD"] = $bytes
+    $setResult = $security.PSBase.InvokeMethod("SetSD", $setParams, $null)
+    if ($setResult["ReturnValue"] -ne 0) {
+        throw ("SetSD failed: ReturnValue={0}" -f $setResult["ReturnValue"])
+    }
+    Write-Host ("Removed {0} WMI Storage namespace grant(s) for {1}." -f $removed, $Sid)
+}
+
 # Capture the SID before deleting the account so we can clean up the
 # SeServiceLogonRight grant secedit left behind. The account goes through the
 # ADSI WinNT provider, as in CreateServiceAccount.ps1: the LocalAccounts
@@ -121,6 +160,14 @@ if ($entry) {
     $sid = ([System.Security.Principal.SecurityIdentifier]::new(
         [byte[]]$entry.psbase.Properties["objectSid"].Value, 0)).Value
     $description = [string]$entry.psbase.Properties["Description"].Value
+    # This machine's grant goes whether or not the account does: the agent
+    # it was for is gone from here. A failure must not stop the uninstall.
+    try {
+        Remove-WmiStorageGrant $sid
+    } catch {
+        Write-Warning ("Could not remove the WMI Storage namespace grant for {0}: {1}" -f $sid, $_)
+    }
+
     # DomainRole 4 = backup DC, 5 = primary DC.
     $isDomainController = (Get-CimInstance -ClassName Win32_ComputerSystem).DomainRole -ge 4
     if ((-not $isDomainController) -or ($description -eq ($DC_MANAGED_PREFIX + $env:COMPUTERNAME))) {
