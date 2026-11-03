@@ -109,7 +109,7 @@ function Report-TokenInLog {
 
 # The installer's own helpers, as they ship.
 $uninstallSource = Get-Content "C:\fn\fivenines_uninstall.ps1" -Raw
-foreach ($fn in @("Test-HResult", "Get-WinNTUser")) {
+foreach ($fn in @("Test-HResult", "Get-WinNTUser", "Get-WmiNamespaceSD")) {
     Invoke-Expression ([regex]::Match($uninstallSource, "(?ms)^function $fn \{.*?^\}").Value)
 }
 
@@ -208,9 +208,7 @@ function Test-Installed {
 # The WMI Storage namespace's ACEs, read in binary like the installer does
 # (GetSecurityDescriptor fails once an ACE names a deleted account).
 function Get-WmiStorageAces {
-    $security = Get-WmiObject -Namespace "root\Microsoft\Windows\Storage" -Class __SystemSecurity
-    $raw = $security.PSBase.InvokeMethod("GetSD", $null, $null)
-    $sd = [System.Security.AccessControl.RawSecurityDescriptor]::new([byte[]]$raw["SD"], 0)
+    $sd = Get-WmiNamespaceSD "root\Microsoft\Windows\Storage"
     return @($sd.DiscretionaryAcl | Where-Object { $_ -is [System.Security.AccessControl.KnownAce] })
 }
 

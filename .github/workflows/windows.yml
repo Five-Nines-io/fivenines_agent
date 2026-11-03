@@ -227,7 +227,9 @@ jobs:
             @('Resolve-ServiceAccountSid', 'windows/installer/SetTokenFileAcl.ps1', 'windows/installer/DelegateWmiStorageNamespace.ps1'),
             @('ConvertTo-MsiPasswordArgument', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
             @('Test-HResult', 'windows/installer/CreateServiceAccount.ps1', 'fivenines_uninstall.ps1'),
-            @('Get-WinNTUser', 'windows/installer/CreateServiceAccount.ps1', 'fivenines_uninstall.ps1')
+            @('Get-WinNTUser', 'windows/installer/CreateServiceAccount.ps1', 'fivenines_uninstall.ps1'),
+            @('Get-WmiNamespaceSD', 'windows/installer/DelegateWmiStorageNamespace.ps1', 'fivenines_uninstall.ps1'),
+            @('Set-WmiNamespaceSD', 'windows/installer/DelegateWmiStorageNamespace.ps1', 'fivenines_uninstall.ps1')
           )
           foreach ($p in $pairs) {
             if ((Get-Fn $p[1] $p[0]) -ne (Get-Fn $p[2] $p[0])) { throw "$($p[0]) differs between $($p[1]) and $($p[2])" }
@@ -593,10 +595,10 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
+          $src = Get-Content windows/installer/DelegateWmiStorageNamespace.ps1 -Raw
+          Invoke-Expression ([regex]::Match($src, "(?ms)^function Get-WmiNamespaceSD \{.*?^\}").Value)
           function Get-StorageAceSids {
-            $security = Get-WmiObject -Namespace "root\Microsoft\Windows\Storage" -Class __SystemSecurity
-            $raw = $security.PSBase.InvokeMethod("GetSD", $null, $null)
-            $sd = [System.Security.AccessControl.RawSecurityDescriptor]::new([byte[]]$raw["SD"], 0)
+            $sd = Get-WmiNamespaceSD "root\Microsoft\Windows\Storage"
             return @($sd.DiscretionaryAcl | Where-Object { $_ -is [System.Security.AccessControl.KnownAce] } |
                      ForEach-Object { $_.SecurityIdentifier.Value })
           }

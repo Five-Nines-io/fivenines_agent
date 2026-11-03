@@ -53,13 +53,33 @@ Write-Host ("Service account {0} -> SID {1}" -f $ServiceAccount, $sid)
 # trustee to a name, and fails ("unexpected error") once an ACE names an
 # account that no longer exists -- which an uninstall that deleted the
 # account used to leave behind, so the next install failed with 1603.
-# __SystemSecurity is the namespace's singleton security object.
-$security = Get-WmiObject -Namespace $Namespace -Class __SystemSecurity
-$getResult = $security.PSBase.InvokeMethod("GetSD", $null, $null)
-if ($getResult["ReturnValue"] -ne 0) {
-    throw ("GetSD failed: ReturnValue={0}" -f $getResult["ReturnValue"])
+# (Kept identical in fivenines_uninstall.ps1; windows.yml checks it.)
+# Read and write a WMI namespace's security descriptor in binary form
+# (__SystemSecurity GetSD/SetSD), with the args-array calling convention of
+# Microsoft's own namespace-security sample: the out parameter comes back in
+# the array, and SetSD takes the bytes as its one argument (setting them on a
+# GetMethodParameters object raised InvalidCastException).
+function Get-WmiNamespaceSD {
+    param([string]$Namespace)
+
+    $security = Get-WmiObject -Namespace $Namespace -Class __SystemSecurity
+    $out = @($null)
+    $rv = $security.PsBase.InvokeMethod("GetSD", $out)
+    if ($rv -ne 0) { throw ("GetSD on {0} failed: {1}" -f $Namespace, $rv) }
+    return [System.Security.AccessControl.RawSecurityDescriptor]::new([byte[]]$out[0], 0)
 }
-$sd = [System.Security.AccessControl.RawSecurityDescriptor]::new([byte[]]$getResult["SD"], 0)
+
+function Set-WmiNamespaceSD {
+    param([string]$Namespace, [System.Security.AccessControl.RawSecurityDescriptor]$Descriptor)
+
+    $bytes = New-Object byte[] $Descriptor.BinaryLength
+    $Descriptor.GetBinaryForm($bytes, 0)
+    $security = Get-WmiObject -Namespace $Namespace -Class __SystemSecurity
+    $rv = $security.PsBase.InvokeMethod("SetSD", (, $bytes))
+    if ($rv -ne 0) { throw ("SetSD on {0} failed: {1}" -f $Namespace, $rv) }
+}
+
+$sd = Get-WmiNamespaceSD $Namespace
 if ($null -eq $sd.DiscretionaryAcl) {
     throw ("WMI namespace {0} has no DACL" -f $Namespace)
 }
@@ -99,13 +119,6 @@ $ace = [System.Security.AccessControl.CommonAce]::new(
     [System.Security.AccessControl.AceFlags]::ContainerInherit, $allowed, $mask, $sidObject, $false, $null)
 $sd.DiscretionaryAcl.InsertAce($position, $ace)
 
-$bytes = New-Object byte[] $sd.BinaryLength
-$sd.GetBinaryForm($bytes, 0)
-$setParams = $security.PSBase.GetMethodParameters("SetSD")
-$setParams["SD"] = $bytes
-$setResult = $security.PSBase.InvokeMethod("SetSD", $setParams, $null)
-if ($setResult["ReturnValue"] -ne 0) {
-    throw ("SetSD failed: ReturnValue={0}" -f $setResult["ReturnValue"])
-}
+Set-WmiNamespaceSD $Namespace $sd
 
 Write-Host ("Granted {0} read access to WMI namespace {1}" -f $ServiceAccount, $Namespace)
