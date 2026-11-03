@@ -118,8 +118,7 @@ function Get-WinNTUser {
 # Read and write a WMI namespace's security descriptor in binary form
 # (__SystemSecurity GetSD/SetSD), with the args-array calling convention of
 # Microsoft's own namespace-security sample: the out parameter comes back in
-# the array, and SetSD takes the bytes as its one argument (setting them on a
-# GetMethodParameters object raised InvalidCastException).
+# the array, and SetSD takes the bytes as its one argument.
 function Get-WmiNamespaceSD {
     param([string]$Namespace)
 
@@ -133,10 +132,14 @@ function Get-WmiNamespaceSD {
 function Set-WmiNamespaceSD {
     param([string]$Namespace, [System.Security.AccessControl.RawSecurityDescriptor]$Descriptor)
 
-    $bytes = New-Object byte[] $Descriptor.BinaryLength
+    # Raw .NET arrays: New-Object would hand back a PSObject-wrapped byte[],
+    # which InvokeMethod cannot cast to System.Array.
+    $bytes = [byte[]]::new($Descriptor.BinaryLength)
     $Descriptor.GetBinaryForm($bytes, 0)
+    $arguments = [object[]]::new(1)
+    $arguments[0] = $bytes
     $security = Get-WmiObject -Namespace $Namespace -Class __SystemSecurity
-    $rv = $security.PsBase.InvokeMethod("SetSD", (, $bytes))
+    $rv = $security.PsBase.InvokeMethod("SetSD", $arguments)
     if ($rv -ne 0) { throw ("SetSD on {0} failed: {1}" -f $Namespace, $rv) }
 }
 
