@@ -311,7 +311,7 @@ def _declared_parameters(path):
     return {name.lower() for name in re.findall(r"\]\s*\$(\w+)", match.group(1))}
 
 
-# Value: protects=the remedy operators are given: the DC refusals in the MSI log, the README and the scripts' usage lines name bootstrap parameters that exist; fails_when=-ServiceAccountPassword (or -Token, -KeepAccount, ...) is renamed in a bootstrap script while the 1603 message, the README or the DC harness still name the old spelling (PowerShell then refuses the command the operator was told to run); why_new=the Get-AccountPlan cases only check that a refusal mentions SERVICEACCOUNTPASSWORD, nothing reads the README, and the DC run's S5 would catch the harness call an hour in, for the setup script only; seam=none; no_claim=that the parameters do what the docs say
+# Value: protects=the remedy operators are given: the DC refusals in the MSI log, the bootstraps' own refusals, the README and the scripts' usage lines name bootstrap parameters that exist; fails_when=-ServiceAccountPassword (or -Token, -KeepAccount, ...) is renamed in a bootstrap script while the 1603 message, the README or the DC harness still name the old spelling (PowerShell then refuses the command the operator was told to run); why_new=the Get-AccountPlan cases only check that a refusal mentions SERVICEACCOUNTPASSWORD, nothing reads the README, and the DC run's S5 would catch the harness call an hour in, for the setup script only; seam=none; no_claim=that the parameters do what the docs say
 def test_documented_bootstrap_parameters_exist():
     scripts = {"setup": SETUP, "update": UPDATE, "uninstall": UNINSTALL}
     references = []
@@ -333,8 +333,15 @@ def test_documented_bootstrap_parameters_exist():
         for match in re.finditer(invocation, text):
             for name in re.findall(r"(?<=\s)-(\w+)", match.group(2)):
                 references.append((path, match.group(1), name))
+    # The reinstall the bootstraps' own refusals and warnings advise.
+    advised = r"fivenines_(setup|update|uninstall)\.ps1((?: -\w+(?: <\w+>)?)*)"
+    for path in (SETUP, UPDATE):
+        for literal in re.findall(r'"([^"\n]*fivenines_[^"\n]*)"', _code(path)):
+            for match in re.finditer(advised, literal):
+                for name in re.findall(r"-(\w+)", match.group(2)):
+                    references.append((path, match.group(1), name))
     named = {name for _, _, name in references}
-    assert {"Token", "ServiceAccountPassword", "LogFile"} <= named, named
+    assert {"Token", "ServiceAccountPassword", "LogFile", "KeepAccount"} <= named, named
     for path, script, name in references:
         assert name.lower() in _declared_parameters(
             scripts[script]

@@ -235,9 +235,9 @@ another DC:
   service: run it on every DC after you change the password in Active
   Directory. It does so only when the service runs as `fivenines-agent`
   already; otherwise (an account of your own, or `fivenines-agent` deleted)
-  it changes nothing and asks you to reinstall: `uninstall.ps1`, then
-  `setup.ps1`. `setup.ps1` writes no `-Token` there: the agent keeps its
-  TOKEN.
+  it changes nothing and asks you to reinstall: `uninstall.ps1 -KeepAccount`,
+  then `setup.ps1 -Token TOKEN -ServiceAccountPassword $pw`. Applied in place,
+  `setup.ps1` writes no `-Token`: the agent keeps its TOKEN.
 - **Nothing is changed when the installer would refuse**: `setup.ps1` and
   `update.ps1` first ask the MSI they downloaded what it will do with the
   account, and stop before installing or removing anything when it would
@@ -245,10 +245,9 @@ another DC:
   without its password, or a password that does not log the account on).
   `msiexec` used directly refuses the same cases with exit code 1603 and the
   reason in the install log, but on an upgrade Windows Installer has already
-  removed the running agent by then. For the same reason an upgrade given a
-  password the check could not verify (the host lets the account log on
-  neither over the network nor as a service, for one) is refused too; elsewhere such a password is used with a
-  warning.
+  removed the running agent by then. A password the check could not verify
+  is used with a warning: if it is wrong, the service does not start, and
+  running the script again with the right password fixes it.
 - **Uninstalling** deletes the account only when this DC's installer created
   it, or when it is the account an earlier release left behind after failing
   on a DC (described `Fivenines monitoring agent service account`).

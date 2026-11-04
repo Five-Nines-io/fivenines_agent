@@ -217,17 +217,16 @@ function Get-PreflightVerdict {
         return @{ Action = "Refuse"; Message = ("Nothing was changed: {0}" -f $Plan.message) }
     }
 
-    # A password for an existing account that LogonUser did not answer for
-    # (the host denies that logon, Add-Type is blocked, or the MSI is too old
-    # to say). On an upgrade a wrong one would show only once the agent is
-    # gone.
+    # A password for an existing account that LogonUser could not answer for
+    # (Add-Type blocked, an error the account step does not name, or an MSI
+    # too old to say) is used as given, on an upgrade too: the account step
+    # applies it (sc.exe takes any password) and the install completes, so a
+    # wrong one leaves a service that does not start, which running the
+    # script again with the right password repairs in place. Refusing it
+    # would only block the update.
     $warning = $null
     if ($HasPassword -and $Plan.action -eq "UseProvided" -and $Plan.checked -ne $true) {
-        if ($Installed -eq "other") {
-            return @{ Action = "Refuse"; Message = (
-                "Nothing was changed: the -ServiceAccountPassword given could not be checked against account '{0}' (see the reason printed above), and this upgrade removes the installed agent before the installer uses it, so a wrong password would leave no agent installed. Let the check run, or reinstall: fivenines_uninstall.ps1 -KeepAccount, then fivenines_setup.ps1 -ServiceAccountPassword." -f $AccountName) }
-        }
-        $warning = "The -ServiceAccountPassword given could not be checked against account '{0}' (see the reason printed above): it is used unchecked, and the service does not start if it is wrong." -f $AccountName
+        $warning = "The -ServiceAccountPassword given could not be checked against account '{0}': it is used as given, and if it is wrong the service does not start; run this script again with the right password to fix that." -f $AccountName
     }
     if ($Installed -ne "same") {
         return @{ Action = "Install"; Message = $warning }
@@ -249,7 +248,7 @@ function Get-PreflightVerdict {
     }
     if ($why) {
         return @{ Action = "Refuse"; Message = (
-            "Nothing was changed: {0}, so -ServiceAccountPassword cannot be applied to the installed agent in place. To run the agent as '{1}' with that password, reinstall it: fivenines_uninstall.ps1, then fivenines_setup.ps1 -ServiceAccountPassword." -f $why, $AccountName) }
+            "Nothing was changed: {0}, so -ServiceAccountPassword cannot be applied to the installed agent in place. To run the agent as '{1}' with that password, reinstall it: fivenines_uninstall.ps1 -KeepAccount, then fivenines_setup.ps1 -Token <token> -ServiceAccountPassword <password>." -f $why, $AccountName) }
     }
     return @{ Action = "InPlace"; Message = $warning }
 }
@@ -264,9 +263,11 @@ function Get-PreflightVerdict {
 # the account, so the step itself applies the password (as this elevated
 # session) and the service is restarted with it, but only to the account the
 # service already runs as; returns $true then, as there is nothing left for
-# msiexec to do. Get-PreflightVerdict decides. An MSI too old for -PlanOnly,
-# or one that cannot be read, leaves the decision to the installer, except
-# over this very version.
+# msiexec to do. Get-PreflightVerdict decides. With a password and an agent
+# installed, an MSI whose ProductCode cannot be read is refused (it may be
+# this very version). An MSI too old for -PlanOnly, or whose account step
+# cannot be run, leaves the decision to the installer, except over this very
+# version.
 function Invoke-AccountPreflight {
     param([string]$MsiPath, [System.Security.SecureString]$Password, [string]$WorkDir)
 
@@ -400,7 +401,7 @@ if (-not $applied) {
     }
 } else {
     # Only the account step ran: TOKEN is written by the MSI, which did not.
-    Write-Warning "-Token was not written: this version was already installed, so only the service account password was applied, and the agent keeps the TOKEN it has. To enroll it with another token, reinstall it: fivenines_uninstall.ps1, then fivenines_setup.ps1 -Token <token>."
+    Write-Warning "-Token was not written: this version was already installed, so only the service account password was applied, and the agent keeps the TOKEN it has. To enroll it with another token, reinstall it: fivenines_uninstall.ps1 -KeepAccount, then fivenines_setup.ps1 -Token <token> -ServiceAccountPassword <password>."
 }
 
 Write-Host "Starting service..."
