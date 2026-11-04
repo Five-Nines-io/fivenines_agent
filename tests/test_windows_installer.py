@@ -77,8 +77,11 @@ def _constant(path, name):
     "name, first, second",
     [
         ("Resolve-ServiceAccountSid", TOKEN_ACL, DELEGATE_WMI),
+        ("Resolve-ServiceAccountSid", TOKEN_ACL, SETUP),
+        ("Resolve-ServiceAccountSid", TOKEN_ACL, UPDATE),
         ("ConvertTo-MsiPasswordArgument", SETUP, UPDATE),
         ("Get-MsiProductCode", SETUP, UPDATE),
+        ("Get-PreflightVerdict", SETUP, UPDATE),
         ("Invoke-AccountPreflight", SETUP, UPDATE),
         ("Get-WinNTUser", CREATE_ACCOUNT, UNINSTALL),
         ("Get-WmiNamespaceSD", DELEGATE_WMI, UNINSTALL),
@@ -138,13 +141,17 @@ def test_permission_ex_uses_only_names_wix_maps_to_a_sid():
     assert set(users) <= mapped_by_wix
 
 
-# Value: protects=a reinstall after the account was deleted; fails_when=the WMI namespace ACL is read through GetSecurityDescriptor again (it fails with "unexpected error" once an ACE names a deleted account, failing the install with 1603, found on a DC) or AceFlags is combined with -band (Windows PowerShell 5.1 raises "Specified cast is not valid"); why_new=both only fail on Windows, after the build; seam=none; no_claim=that GetSD/SetSD are called correctly
+# Value: protects=a reinstall after the account was deleted, and the inherit-only test of an existing WMI grant; fails_when=the WMI namespace ACL is read through GetSecurityDescriptor again (it fails with "unexpected error" once an ACE names a deleted account, failing the install with 1603, found on a DC) or AceFlags is combined with -band without an [int] cast first (Windows PowerShell 5.1 raises "Specified cast is not valid" on the byte enum, parenthesized or not); why_new=both only fail on Windows, after the build; seam=none; no_claim=that GetSD/SetSD are called correctly
 @pytest.mark.parametrize("path", [DELEGATE_WMI, UNINSTALL])
 def test_wmi_namespace_acl_is_read_in_binary(path):
     code = _code(path)
     assert "GetSecurityDescriptor" not in code
     assert "SetSecurityDescriptor" not in code
-    assert not re.search(r"AceFlags\s*-band|-band\s*\$?inherited", code, re.IGNORECASE)
+    assert not re.search(
+        r"(?<!\[int\])\$[\w.]*AceFlags\)?\s*-band|-band\s*\$?inherited",
+        code,
+        re.IGNORECASE,
+    )
 
 
 # Value: protects=account creation and the uninstall's delete-or-keep decision on a DC; fails_when=a Description tag outgrows the 48-character SAM comment limit (creation fails) or the uninstall spells DC_MANAGED_PREFIX differently (it then keeps, or worse deletes, the wrong account); why_new=windows.yml checks the prefix only on a Windows runner; seam=none; no_claim=that the tags drive the right plan, which Get-AccountPlan's cases cover
@@ -229,6 +236,39 @@ def test_bootstrap_checks_the_password_first_and_hands_it_to_msiexec(path):
     assert re.search(
         appended, after_built
     ), f"{path} does not pass the converted password to msiexec"
+
+
+# Value: protects=-ServiceAccountPassword with a relative -MsiPath on the version already installed; fails_when=the bootstrap stops resolving -MsiPath, or resolves it after the download (the ProductCode read goes through COM, which resolves a relative path against the process's working directory, usually System32, instead of PowerShell's location: it found no MSI, msiexec ran a maintenance pass and the script reported success without applying the password); why_new=the smoke-msi E2E runs it from another location, but only on Windows after the MSI build; seam=none; no_claim=that the resolved path is the one Invoke-WebRequest writes, which the E2E proves
+@pytest.mark.parametrize("path", [SETUP, UPDATE])
+def test_bootstrap_resolves_a_relative_msi_path_first(path):
+    code = _code(path)
+    resolve = re.search(
+        r"(?m)^\$MsiPath = \$ExecutionContext\.SessionState\.Path"
+        r"\.GetUnresolvedProviderPathFromPSPath\(\$MsiPath\)$",
+        code,
+    )
+    assert resolve, f"{path} does not resolve -MsiPath"
+    assert resolve.start() < code.index(
+        "Invoke-WebRequest"
+    ), f"{path} uses -MsiPath before resolving it"
+
+
+# Value: protects=the plan contract between CreateServiceAccount.ps1 -PlanOnly and the bootstraps' preflight; fails_when=one side renames a key (a verdict reading $Plan.verified finds nothing, so every password reads unchecked and every upgrade given one is refused; one reading $Plan.account finds no SID, so every in-place password step is refused); why_new=windows.yml checks each side alone (the real plan line's keys, the verdict on hand-built plans), so a rename on one side passes both; seam=none; no_claim=that the values are right, which those two steps check
+def test_preflight_reads_only_what_the_plan_line_prints():
+    line = re.search(
+        r'"FIVENINES_PLAN " \+ \(ConvertTo-Json -Compress @\{(.*?)\}\)',
+        _read(CREATE_ACCOUNT),
+        re.S,
+    )
+    assert line, "no FIVENINES_PLAN line in CreateServiceAccount.ps1"
+    printed = set(re.findall(r"(\w+) = ", line.group(1)))
+    assert printed == {"action", "message", "sid", "checked"}
+    for path in (SETUP, UPDATE):
+        read = set()
+        for name in ("Get-PreflightVerdict", "Invoke-AccountPreflight"):
+            body = _function(path, name)
+            read |= {key.lower() for key in re.findall(r"\$plan\.(\w+)", body, re.I)}
+        assert read == printed, f"{path} reads plan keys {sorted(read)}"
 
 
 def _declared_parameters(path):

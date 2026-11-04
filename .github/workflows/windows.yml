@@ -238,7 +238,8 @@ jobs:
       # grants leave one ACE, the uninstall's removal takes it, and a grant
       # must work while the namespace still carries the ACE of a deleted
       # account (the object-form GetSecurityDescriptor failed on one, which
-      # failed a reinstall with 1603 on a domain controller).
+      # failed a reinstall with 1603 on a domain controller); an inherit-only
+      # ACE is no grant, and the removal keeps deny ACEs.
       - name: Verify the WMI namespace delegation and its removal
         shell: powershell
         run: |
@@ -253,6 +254,15 @@ jobs:
           function Get-GrantCount($Sid) {
             return @((Get-WmiNamespaceSD $namespace).DiscretionaryAcl | Where-Object {
               $_ -is [System.Security.AccessControl.KnownAce] -and $_.SecurityIdentifier.Value -eq $Sid }).Count
+          }
+          # Explicit ACEs for the SID of one kind ("AccessAllowed" or
+          # "AccessDenied"), inherit-only (0x08, read as [int]: AceFlags is a
+          # byte enum) or not.
+          function Get-AceCount($Sid, $Qualifier, [bool]$InheritOnly) {
+            return @((Get-WmiNamespaceSD $namespace).DiscretionaryAcl | Where-Object {
+              $_ -is [System.Security.AccessControl.QualifiedAce] -and $_.SecurityIdentifier.Value -eq $Sid -and
+              -not $_.IsInherited -and "$($_.AceQualifier)" -eq $Qualifier -and
+              (((([int]$_.AceFlags) -band 0x08) -ne 0) -eq $InheritOnly) }).Count
           }
           function New-TestUser($Name) {
             $pw = ConvertTo-SecureString ("Aa1-" + [guid]::NewGuid()) -AsPlainText -Force
@@ -277,9 +287,38 @@ jobs:
             Remove-WmiStorageGrant $first
             if ((Get-GrantCount $second) -ne 0 -or (Get-GrantCount $first) -ne 0) { throw "Remove-WmiStorageGrant left an ACE" }
             Write-Host "Remove-WmiStorageGrant removed both, the orphaned one included."
+
+            # An inherit-only allow ACE applies to the sub-namespaces only, so
+            # it is no grant; and the removal takes the allow ACEs only,
+            # keeping a deny ACE someone else set (it is left behind for the
+            # deleted test account, which this runner never reuses).
+            $third = New-TestUser "fn-wmi-c"
+            $thirdSid = [System.Security.Principal.SecurityIdentifier]$third
+            $sd = Get-WmiNamespaceSD $namespace
+            $sd.DiscretionaryAcl.InsertAce(0, [System.Security.AccessControl.CommonAce]::new(
+              [System.Security.AccessControl.AceFlags]"ContainerInherit, InheritOnly",
+              [System.Security.AccessControl.AceQualifier]::AccessAllowed, 0x23, $thirdSid, $false, $null))
+            $sd.DiscretionaryAcl.InsertAce(0, [System.Security.AccessControl.CommonAce]::new(
+              [System.Security.AccessControl.AceFlags]::None,
+              [System.Security.AccessControl.AceQualifier]::AccessDenied, 0x20, $thirdSid, $false, $null))
+            Set-WmiNamespaceSD $namespace $sd
+            if ((Get-AceCount $third "AccessAllowed" $true) -ne 1 -or (Get-AceCount $third "AccessDenied" $false) -ne 1) {
+              throw "the inherit-only and deny test ACEs did not land as written"
+            }
+            & windows/installer/DelegateWmiStorageNamespace.ps1 -ServiceAccount ".\fn-wmi-c"
+            if ((Get-AceCount $third "AccessAllowed" $false) -ne 1) { throw "an inherit-only allow ACE was taken for a grant" }
+            Write-Host "Granted over an inherit-only allow ACE, which is no grant."
+
+            Remove-WmiStorageGrant $third
+            if ((Get-AceCount $third "AccessAllowed" $true) + (Get-AceCount $third "AccessAllowed" $false) -ne 0) {
+              throw "Remove-WmiStorageGrant left an allow ACE"
+            }
+            if ((Get-AceCount $third "AccessDenied" $false) -ne 1) { throw "Remove-WmiStorageGrant removed a deny ACE" }
+            Write-Host "Remove-WmiStorageGrant removed both allow ACEs and kept the deny ACE."
           } finally {
             Remove-LocalUser -Name "fn-wmi-a" -ErrorAction SilentlyContinue
             Remove-LocalUser -Name "fn-wmi-b" -ErrorAction SilentlyContinue
+            Remove-LocalUser -Name "fn-wmi-c" -ErrorAction SilentlyContinue
           }
 
       # Helpers duplicated across scripts that cannot share a file: the
@@ -296,8 +335,11 @@ jobs:
           }
           $pairs = @(
             @('Resolve-ServiceAccountSid', 'windows/installer/SetTokenFileAcl.ps1', 'windows/installer/DelegateWmiStorageNamespace.ps1'),
+            @('Resolve-ServiceAccountSid', 'windows/installer/SetTokenFileAcl.ps1', 'fivenines_setup.ps1'),
+            @('Resolve-ServiceAccountSid', 'windows/installer/SetTokenFileAcl.ps1', 'fivenines_update.ps1'),
             @('ConvertTo-MsiPasswordArgument', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
             @('Get-MsiProductCode', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
+            @('Get-PreflightVerdict', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
             @('Invoke-AccountPreflight', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
             @('Get-WinNTUser', 'windows/installer/CreateServiceAccount.ps1', 'fivenines_uninstall.ps1'),
             @('Get-WmiNamespaceSD', 'windows/installer/DelegateWmiStorageNamespace.ps1', 'fivenines_uninstall.ps1'),
@@ -321,6 +363,151 @@ jobs:
           $arg = ConvertTo-MsiPasswordArgument (ConvertTo-SecureString 'p a$s\w;rd' -AsPlainText -Force)
           if ($arg -ne 'SERVICEACCOUNTPASSWORD="p a$s\w;rd"') { throw "unexpected msiexec argument: $arg" }
           Write-Host "ConvertTo-MsiPasswordArgument refuses '', a quote, a trailing backslash and a leading '-'."
+
+      # The bootstraps' verdict on the plan the MSI's account step prints,
+      # case by case under Windows PowerShell 5.1 (Get-PreflightVerdict is
+      # pure): on the version already installed the password is applied in
+      # place only to the account the service already runs as, and a
+      # password LogonUser did not answer for is refused on an upgrade, which
+      # removes the installed agent before the installer uses it.
+      - name: Verify the bootstrap preflight's verdicts
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $m = [regex]::Match((Get-Content fivenines_setup.ps1 -Raw), "(?ms)^function Get-PreflightVerdict \{.*?^\}")
+          if (-not $m.Success) { throw "Get-PreflightVerdict not found in fivenines_setup.ps1" }
+          Invoke-Expression $m.Value
+
+          $accountSid = "S-1-5-21-1-2-3-1001"
+          $svc = "HOST\fivenines-agent"
+          $reinstall = "fivenines_uninstall.ps1, then fivenines_setup.ps1"
+          # A plan line as CreateServiceAccount.ps1 -PlanOnly prints it, and
+          # as v1.22.1's printed it (no sid, no checked).
+          function New-Plan($Action, $Sid = $accountSid, $Checked = $true, $Message = $null) {
+            return [pscustomobject]@{ action = $Action; message = $Message; sid = $Sid; checked = $Checked }
+          }
+          $older = [pscustomobject]@{ action = "UseProvided"; message = $null }
+
+          $script:failed = 0
+          function Check($Label, $Plan, $HasPassword, $Installed, $ServiceAccount, $ServiceSid, $Action, [string[]]$Mentions = @()) {
+            $v = Get-PreflightVerdict -Plan $Plan -HasPassword $HasPassword -Installed $Installed `
+              -AccountName "fivenines-agent" -ServiceAccount $ServiceAccount -ServiceSid $ServiceSid
+            $problem = $null
+            if ($v.Action -ne $Action) {
+              $problem = "$($v.Action), expected $Action"
+            } elseif (-not $Mentions -and $v.Message) {
+              $problem = "unexpected message"
+            } else {
+              foreach ($want in $Mentions) {
+                if (-not "$($v.Message)".Contains($want)) { $problem = "the message does not mention '$want'" }
+              }
+            }
+            if ($problem) { Write-Host "FAIL $Label -> $problem ($($v.Message))"; $script:failed++ }
+            else { Write-Host "ok   $Label -> $Action" }
+          }
+
+          # The MSI's own refusal stops everything.
+          Check "MSI refuses"              (New-Plan "Refuse" $accountSid $true "wrong password") $true "same" $svc $accountSid "Refuse" @("Nothing was changed: wrong password")
+          Check "MSI refuses, no password" (New-Plan "Refuse" $accountSid $false "needs a password") $false "none" "" "" "Refuse" @("Nothing was changed: needs a password")
+
+          # msiexec runs: a fresh install or an upgrade.
+          Check "create, no password"      (New-Plan "Create" $null $false) $false "none" "" "" "Install"
+          Check "rotate, no password"      (New-Plan "Rotate" $accountSid $false) $false "none" "" "" "Install"
+          Check "checked, upgrade"         (New-Plan "UseProvided") $true "other" "" "" "Install"
+          Check "create, upgrade"          (New-Plan "Create" $null $false) $true "other" "" "" "Install"
+
+          # A password LogonUser did not answer for: refused on an upgrade
+          # (from an MSI too old to report it too), else a warning.
+          Check "unchecked, upgrade"       (New-Plan "UseProvided" $accountSid $false) $true "other" "" "" "Refuse" @("could not be checked", "-KeepAccount")
+          Check "older MSI, upgrade"       $older $true "other" "" "" "Refuse" @("could not be checked")
+          Check "unchecked, not installed" (New-Plan "UseProvided" $accountSid $false) $true "none" "" "" "Install" @("used unchecked")
+          Check "unchecked, same version"  (New-Plan "UseProvided" $accountSid $false) $true "same" $svc $accountSid "InPlace" @("used unchecked")
+
+          # The version already installed: in place only for the account the
+          # service runs as; anything else is a reinstall.
+          Check "same, its account"        (New-Plan "UseProvided") $true "same" $svc $accountSid "InPlace"
+          Check "same, rotate"             (New-Plan "Rotate" $accountSid $false) $true "same" $svc $accountSid "InPlace"
+          Check "same, another account"    (New-Plan "UseProvided") $true "same" "HOST\monitoring" "S-1-5-21-1-2-3-1002" "Refuse" @("runs as 'HOST\monitoring'", $reinstall)
+          Check "same, unresolved account" (New-Plan "UseProvided") $true "same" "LocalSystem" "" "Refuse" @("runs as 'LocalSystem'", $reinstall)
+          Check "same, no service"         (New-Plan "UseProvided") $true "same" "" "" "Refuse" @("no fivenines-agent service", $reinstall)
+          Check "same, account deleted"    (New-Plan "Create" $null $false) $true "same" $svc "" "Refuse" @("would create account 'fivenines-agent'", $reinstall)
+          Check "same, older MSI"          $older $true "same" $svc $accountSid "Refuse" @("does not say which account", $reinstall)
+
+          if ($script:failed -gt 0) { throw "$($script:failed) preflight verdict case(s) failed" }
+
+      # CreateServiceAccount.ps1 -PlanOnly for real on this runner, which is
+      # in no domain: the plan line carries the existing account's SID and
+      # whether LogonUser answered for the password (the verdicts above rest
+      # on both), and an expired account is refused by name.
+      - name: Verify the -PlanOnly plan line (sid, checked)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          function Get-Plan($Account, $Password) {
+            $arguments = @{ ServiceAccount = $Account }
+            if ($Password) { $arguments.Password = $Password }
+            $line = @(& windows/installer/CreateServiceAccount.ps1 @arguments -PlanOnly) |
+              Where-Object { "$_" -like "FIVENINES_PLAN *" } | Select-Object -Last 1
+            if (-not $line) { throw "CreateServiceAccount.ps1 -PlanOnly printed no plan for $Account" }
+            return "$line".Substring("FIVENINES_PLAN ".Length) | ConvertFrom-Json
+          }
+          $script:failed = 0
+          function Check($Label, $Plan, $Action, $Sid, [bool]$Checked, $Mentions) {
+            $keys = (@($Plan.PSObject.Properties.Name) | Sort-Object) -join ","
+            $problem = $null
+            if ($keys -ne "action,checked,message,sid") {
+              $problem = "keys $keys"
+            } elseif (-not ($Plan.checked -is [bool])) {
+              $problem = "checked is not a boolean: '$($Plan.checked)'"
+            } elseif ($Plan.action -ne $Action -or "$($Plan.sid)" -ne "$Sid" -or $Plan.checked -ne $Checked) {
+              $problem = "$($Plan.action) sid=$($Plan.sid) checked=$($Plan.checked), expected $Action sid=$Sid checked=$Checked"
+            } elseif ($Mentions -and -not "$($Plan.message)".Contains($Mentions)) {
+              $problem = "the message does not mention '$Mentions': $($Plan.message)"
+            }
+            if ($problem) { Write-Host "FAIL $Label -> $problem"; $script:failed++ }
+            else { Write-Host "ok   $Label -> $Action sid=$($Plan.sid) checked=$($Plan.checked)" }
+          }
+          function New-TestUser($Name, $Password) {
+            New-LocalUser -Name $Name -Password (ConvertTo-SecureString $Password -AsPlainText -Force) -Description "ci: not MSI-managed" | Out-Null
+            return (Get-LocalUser -Name $Name).SID.Value
+          }
+
+          $password = "Aa1-" + [guid]::NewGuid()
+          $policy = Join-Path $env:TEMP "fn-plan-rights.cfg"
+          $policyDb = Join-Path $env:TEMP "fn-plan-rights.sdb"
+          try {
+            Check "absent account" (Get-Plan ".\fn-plan-absent") "Create" $null $false $null
+
+            $sid = New-TestUser "fn-plan-a" $password
+            Check "no password"    (Get-Plan "$env:COMPUTERNAME\fn-plan-a") "Refuse" $sid $false "SERVICEACCOUNTPASSWORD"
+            Check "right password" (Get-Plan ".\fn-plan-a" $password) "UseProvided" $sid $true $null
+            Check "wrong password" (Get-Plan ".\fn-plan-a" "Wrong-$password") "Refuse" $sid $true "wrong password"
+
+            # ERROR_ACCOUNT_EXPIRED (1793), refused by name.
+            $sid = New-TestUser "fn-plan-b" $password
+            Set-LocalUser -Name "fn-plan-b" -AccountExpires (Get-Date).AddDays(-2)
+            Check "expired account" (Get-Plan ".\fn-plan-b" $password) "Refuse" $sid $true "the account has expired"
+
+            # Network logon denied: LogonUser answers 1385
+            # (ERROR_LOGON_TYPE_NOT_GRANTED), which the script does not name,
+            # so the password is unchecked. The deny entry is left for the
+            # deleted test account, which this runner never reuses.
+            $sid = New-TestUser "fn-plan-c" $password
+            secedit /export /cfg $policy /areas USER_RIGHTS /quiet | Out-Null
+            $content = @(Get-Content $policy)
+            if ($content -match '^SeDenyNetworkLogonRight\s*=') {
+              $content = $content | ForEach-Object { if ($_ -match '^SeDenyNetworkLogonRight\s*=') { $_.TrimEnd() + ",*$sid" } else { $_ } }
+            } else {
+              $content = $content | ForEach-Object { $_; if ($_ -match '^\[Privilege Rights\]') { "SeDenyNetworkLogonRight = *$sid" } }
+            }
+            $content | Set-Content -Encoding ascii $policy
+            secedit /configure /db $policyDb /cfg $policy /areas USER_RIGHTS /quiet | Out-Null
+            Check "network logon denied" (Get-Plan ".\fn-plan-c" $password) "UseProvided" $sid $false $null
+          } finally {
+            foreach ($name in @("fn-plan-a", "fn-plan-b", "fn-plan-c")) { Remove-LocalUser -Name $name -ErrorAction SilentlyContinue }
+            Remove-Item $policy, $policyDb -ErrorAction SilentlyContinue
+          }
+          if ($script:failed -gt 0) { throw "$($script:failed) plan line case(s) failed" }
 
       - name: Upload Windows coverage
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -561,7 +748,11 @@ jobs:
           $u = Get-LocalUser -Name "fivenines-agent"
           $m = [regex]::Match((Get-Content windows/installer/SetTokenFileAcl.ps1 -Raw), "(?ms)^function Resolve-ServiceAccountSid \{.*?^\}")
           Invoke-Expression $m.Value
-          foreach ($spelling in @("$env:COMPUTERNAME\fivenines-agent", ".\fivenines-agent", "fivenines-agent")) {
+          # The service's StartName too, as the bootstraps resolve it before
+          # applying a password in place (sc.exe got the name the SID
+          # translates back to).
+          $startName = (Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'").StartName
+          foreach ($spelling in @("$env:COMPUTERNAME\fivenines-agent", ".\fivenines-agent", "fivenines-agent", $startName)) {
             $sid = Resolve-ServiceAccountSid $spelling
             if ($sid -ne $u.SID) { throw "'$spelling' resolved to $sid, expected $($u.SID)" }
             Write-Host "'$spelling' -> $sid"
@@ -653,20 +844,25 @@ jobs:
       # first (the MSI's own CreateServiceAccount.ps1 -PlanOnly, extracted by
       # an administrative install), refusing a wrong password before touching
       # anything, then applies a right one with that same account step and
-      # restarts the service -- no msiexec run, nothing removed.
-      - name: fivenines_update.ps1 -ServiceAccountPassword, wrong then right, on the installed version
+      # restarts the service -- no msiexec run, nothing removed. Then the
+      # same through fivenines_setup.ps1 with a relative -MsiPath (and a new
+      # -Token, which is not written there), and two refusals that change
+      # nothing: an MSI whose ProductCode cannot be read, and a service that
+      # no longer runs as the account the step would update.
+      - name: fivenines_update.ps1 and fivenines_setup.ps1 -ServiceAccountPassword on the installed version
         shell: powershell
         # Bootstrap scripts run msiexec /qb, whose modal error box would hold
         # the job for GitHub's six hours.
-        timeout-minutes: 20
+        timeout-minutes: 25
         run: |
           $ErrorActionPreference = "Stop"
           $msiUrl = "file:///" + (Resolve-Path fivenines-agent.msi).Path.Replace('\', '/')
-          $token = (Get-Content (Join-Path $env:ProgramData "fivenines_agent\TOKEN") -Raw).Trim()
-          function Invoke-Update($Password, $Log) {
+          $tokenPath = Join-Path $env:ProgramData "fivenines_agent\TOKEN"
+          $token = (Get-Content $tokenPath -Raw).Trim()
+          function Invoke-Update($Password, $Log, $Url = $msiUrl) {
             $secure = ConvertTo-SecureString $Password -AsPlainText -Force
             $global:LASTEXITCODE = 0
-            & .\fivenines_update.ps1 -MsiUrl $msiUrl -MsiPath (Join-Path $env:TEMP "fn-update.msi") -LogFile (Join-Path $PWD $Log) -ServiceAccountPassword $secure
+            & .\fivenines_update.ps1 -MsiUrl $Url -MsiPath (Join-Path $env:TEMP "fn-update.msi") -LogFile (Join-Path $PWD $Log) -ServiceAccountPassword $secure
             if ($LASTEXITCODE -ne 0) { throw "fivenines_update.ps1 exited $LASTEXITCODE" }
           }
           function Assert-Installed {
@@ -694,12 +890,73 @@ jobs:
           Restart-Service -Name "fivenines-agent"
           Assert-Installed
           if (Test-Path "update-right.log") { throw "msiexec ran although this version was already installed" }
+          Write-Host "Right password applied to the installed agent by the MSI's own account step; the service restarts with it."
+
+          # fivenines_setup.ps1 with a RELATIVE -MsiPath, from a location that
+          # is not the process's working directory: the ProductCode read (COM)
+          # used to resolve it against the latter, find no MSI and let msiexec
+          # run a maintenance pass that applied nothing. The new -Token is not
+          # written on this path, and the script says so.
+          $repo = $PWD.Path
+          $tokenBefore = Get-Content $tokenPath -Raw
+          # The script's warnings, as the operator sees them.
+          $transcript = Join-Path $env:TEMP "fn-setup-in-place.txt"
+          Push-Location $env:TEMP
+          Start-Transcript -Path $transcript | Out-Null
+          try {
+            $global:LASTEXITCODE = 0
+            & (Join-Path $repo "fivenines_setup.ps1") -Token ("ci-new-token-" + (Get-Random)) -MsiUrl $msiUrl `
+              -MsiPath "fn-setup-relative.msi" -LogFile (Join-Path $repo "setup-in-place.log") `
+              -ServiceAccountPassword (ConvertTo-SecureString $password -AsPlainText -Force)
+            if ($LASTEXITCODE -ne 0) { throw "fivenines_setup.ps1 exited $LASTEXITCODE" }
+          } finally {
+            Stop-Transcript | Out-Null
+            Pop-Location
+          }
+          if (Test-Path "setup-in-place.log") { throw "msiexec ran: the relative -MsiPath was not read as the installed version" }
+          if ((Get-Content $transcript -Raw) -notmatch "-Token was not written") { throw "fivenines_setup.ps1 did not warn that -Token was not written" }
+          if ((Get-Content $tokenPath -Raw) -ne $tokenBefore) { throw "the TOKEN file changed" }
+          Assert-Installed
+          Write-Host "fivenines_setup.ps1 with a relative -MsiPath applied the password in place, kept TOKEN and said so."
+
+          # An MSI whose ProductCode cannot be read (any file that is not
+          # one): it may be this very version, so a password is refused.
+          $refused = $null
+          try { Invoke-Update $password "update-unreadable.log" ("file:///" + (Resolve-Path README.md).Path.Replace('\', '/')) } catch { $refused = "$_" }
+          if (-not $refused -or $refused -notmatch "ProductCode") { throw "an MSI whose ProductCode cannot be read was not refused: $refused" }
+          if (Test-Path "update-unreadable.log") { throw "msiexec ran although the preflight refused" }
+          Assert-Installed
+          Write-Host "An unreadable ProductCode is refused before msiexec."
+
+          # The service moved to another account (LocalSystem here): the step
+          # would move it back to fivenines-agent without the rest of an
+          # install, so it is refused, and the service keeps its account.
+          # sc.exe needs no password for LocalSystem.
+          $scOut = & sc.exe config fivenines-agent obj= LocalSystem 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "sc.exe config obj= LocalSystem failed: $scOut" }
+          try {
+            $refused = $null
+            try { Invoke-Update $password "update-other-account.log" } catch { $refused = "$_" }
+            if (-not $refused -or $refused -notmatch "runs as 'LocalSystem'") { throw "the step for an account the service does not run as was not refused: $refused" }
+            if (Test-Path "update-other-account.log") { throw "msiexec ran although the preflight refused" }
+            $startName = (Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'").StartName
+            if ($startName -ne "LocalSystem") { throw "the refused step changed the service's account to '$startName'" }
+          } finally {
+            # Back to the account, as CreateServiceAccount.ps1 sets it.
+            $scArgs = @("config", "fivenines-agent", "obj=", "$env:COMPUTERNAME\fivenines-agent", "password=", $password)
+            $scOut = & sc.exe @scArgs 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "sc.exe config back to fivenines-agent failed: $scOut" }
+          }
+          Restart-Service -Name "fivenines-agent"
+          Assert-Installed
+          Write-Host "A service running as another account is refused; its account is untouched."
+
           foreach ($log in Get-ChildItem -Filter "*.log") {
             $text = [System.IO.File]::ReadAllText($log.FullName)
             if ($text.Contains($password)) { throw "the password is in $($log.Name)" }
             if ($text.Contains($token)) { throw "the TOKEN value is in $($log.Name)" }
           }
-          Write-Host "Right password applied to the installed agent by the MSI's own account step; the service restarts with it; no secret in any log."
+          Write-Host "No secret in any log."
 
       - name: Uninstall MSI silently
         shell: pwsh
