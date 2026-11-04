@@ -178,7 +178,7 @@ msiexec /i fivenines-agent-windows-amd64.msi TOKEN=xxxxx /qn /norestart
 |---|---|
 | `TOKEN` | Enrollment token (required). |
 | `SERVICEACCOUNT` | Use an existing **local** account instead of the MSI-managed one. Domain accounts must be pre-staged by the deployer. |
-| `SERVICEACCOUNTPASSWORD` | Required when `SERVICEACCOUNT` names an account the MSI did not create, so operator-managed credentials are never silently rotated, and on a domain controller whose account the MSI may not rotate (see [Domain controllers](#domain-controllers)). For an existing account it is checked first: a password that does not log the account on is refused. It cannot contain `"` or end with `\`. |
+| `SERVICEACCOUNTPASSWORD` | Required when `SERVICEACCOUNT` names an account the MSI did not create, so operator-managed credentials are never silently rotated, and on a domain controller whose account the MSI may not rotate (see [Domain controllers](#domain-controllers)). For an existing account it is checked first: a password that does not log the account on is refused. It cannot contain `"`, end with `\` or start with `-`. |
 
 `TOKEN` and `SERVICEACCOUNTPASSWORD` are declared in `MsiHiddenProperties`,
 and so is the custom-action data built from them, so neither lands in the
@@ -228,11 +228,10 @@ another DC:
 
   The account is then tagged `Fivenines agent, operator-managed password` and
   never rotated, and uninstalling the agent from a DC keeps it (only that DC's
-  `Log on as a service` grant and WMI access are removed). With
-  `-ServiceAccountPassword`, `update.ps1` (and `setup.ps1` on a DC where the
-  agent is installed) removes the installed agent and installs it again, the
-  account kept, so the password is applied even when the version does not
-  change; run it on every DC after you change the password in Active
+  `Log on as a service` grant and WMI access are removed). When the version
+  is already installed, `update.ps1 -ServiceAccountPassword` (and `setup.ps1`)
+  applies the password to it with the MSI's own account step and restarts the
+  service: run it on every DC after you change the password in Active
   Directory.
 - **Nothing is changed when the installer would refuse**: `setup.ps1` and
   `update.ps1` first ask the MSI they downloaded what it will do with the

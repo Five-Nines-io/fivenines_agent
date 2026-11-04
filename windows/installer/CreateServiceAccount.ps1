@@ -301,25 +301,56 @@ function Add-AccountToBuiltinGroup {
     }
 }
 
-# Whether this password logs the existing account on: a network-logon check
-# against the machine's SAM (member server) or the domain (DC). One failed
-# attempt counts toward the account's lockout threshold. A locked, disabled
-# or must-change-password account reads as a mismatch too, and the service
-# could not log on with it either.
+# Whether this password logs the existing account on, through LogonUser
+# with a network logon (no SMB session, unlike PrincipalContext's machine
+# check): $true, or why not ("wrong password", "locked", ...), or $null when
+# the check itself cannot run -- the host denies that logon type, or Add-Type
+# is blocked -- in which case the password is used unchecked, as before.
+# One failed attempt counts toward the account's lockout threshold.
 function Test-AccountPassword {
-    param([string]$AccountName, [string]$Password, [bool]$IsDomainController)
+    param([string]$AccountName, [string]$Domain, [string]$Password)
 
-    Add-Type -AssemblyName System.DirectoryServices.AccountManagement
-    $contextType = if ($IsDomainController) {
-        [System.DirectoryServices.AccountManagement.ContextType]::Domain
-    } else {
-        [System.DirectoryServices.AccountManagement.ContextType]::Machine
+    $reasons = @{
+        1326 = "wrong password"            # ERROR_LOGON_FAILURE
+        1909 = "the account is locked"     # ERROR_ACCOUNT_LOCKED_OUT
+        1331 = "the account is disabled"   # ERROR_ACCOUNT_DISABLED
+        1330 = "the password has expired"  # ERROR_PASSWORD_EXPIRED
+        1907 = "the password must be changed" # ERROR_PASSWORD_MUST_CHANGE
     }
-    $context = New-Object System.DirectoryServices.AccountManagement.PrincipalContext($contextType)
     try {
-        return $context.ValidateCredentials($AccountName, $Password)
-    } finally {
-        $context.Dispose()
+        # The error code is read inside the same native call: PowerShell runs
+        # interop code of its own between two statements, which can overwrite
+        # the thread's last error.
+        if (-not ("FiveninesLogon" -as [type])) {
+            Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class FiveninesLogon {
+    [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool LogonUser(string user, string domain, string password, int logonType, int provider, out IntPtr token);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool CloseHandle(IntPtr handle);
+    // 0 when the password logs the account on (LOGON32_LOGON_NETWORK,
+    // LOGON32_PROVIDER_DEFAULT), else the Win32 error.
+    public static int Check(string user, string domain, string password) {
+        IntPtr token;
+        if (LogonUser(user, domain, password, 3, 0, out token)) {
+            CloseHandle(token);
+            return 0;
+        }
+        return Marshal.GetLastWin32Error();
+    }
+}
+"@
+        }
+        $code = [FiveninesLogon]::Check($AccountName, $Domain, $Password)
+        if ($code -eq 0) { return $true }
+        if ($reasons.ContainsKey($code)) { return $reasons[$code] }
+        Write-Host ("Could not check the password of '{0}' (LogonUser error {1}); using it unchecked." -f $AccountName, $code)
+        return $null
+    } catch {
+        Write-Host ("Could not check the password of '{0}' ({1}); using it unchecked." -f $AccountName, $_.Exception.GetBaseException().Message)
+        return $null
     }
 }
 
@@ -339,9 +370,17 @@ $plan = Get-AccountPlan `
 
 # UseProvided is the one plan for an existing account that takes the
 # operator's password: check it before it is used, or retags anything.
-if ($plan.Action -eq "UseProvided" -and -not (Test-AccountPassword $bareName $Password $isDomainController)) {
-    $plan = @{ Action = "Refuse"; Description = $null; Message = (
-        "The SERVICEACCOUNTPASSWORD given does not log {0} account '{1}' on (wrong password, or the account is locked, disabled or must change its password). Nothing was changed." -f $accountKind, $bareName) }
+if ($plan.Action -eq "UseProvided") {
+    # The account's own domain: the machine on a member server, the domain on
+    # a DC (whose account domain is not its computer name).
+    $accountDomain = ([System.Security.Principal.SecurityIdentifier]::new(
+        [byte[]]$entry.psbase.Properties["objectSid"].Value, 0)).Translate(
+        [System.Security.Principal.NTAccount]).Value.Split('\')[0]
+    $check = Test-AccountPassword $bareName $accountDomain $Password
+    if ($check -is [string]) {
+        $plan = @{ Action = "Refuse"; Description = $null; Message = (
+            "The SERVICEACCOUNTPASSWORD given does not log {0} account '{1}' on: {2}." -f $accountKind, $bareName, $check) }
+    }
 }
 
 if ($PlanOnly) {

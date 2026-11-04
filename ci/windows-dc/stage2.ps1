@@ -333,27 +333,26 @@ try {
 
     Log "== S10: fivenines_update.ps1 without the password, on an operator-managed account"
     $failed = Invoke-UpdateScript "s10-update-no-password"
-    Check ($null -ne $failed) "S10 the update is refused"
+    Check ("$failed" -match "Nothing was changed") "S10 the update is refused ($failed)"
     Check (-not (Test-Path "C:\fn\logs\s10-update-no-password.log")) "S10 refused before msiexec ran"
     Check (Test-AgentInstalled) "S10 the agent is still installed"
     Check (Wait-AgentRunning) "S10 the service still runs"
 
     Log "== S11: fivenines_update.ps1 with a wrong password"
     $failed = Invoke-UpdateScript "s11-update-wrong" ("Fn9-wrong-" + (Get-Random))
-    Check ($null -ne $failed) "S11 the update is refused"
+    Check ("$failed" -match "does not log") "S11 the update is refused: wrong password ($failed)"
     Check (-not (Test-Path "C:\fn\logs\s11-update-wrong.log")) "S11 refused before msiexec ran"
     Check (Test-AgentInstalled) "S11 the agent is still installed"
     Check ((Get-AdAccount).Description -eq $Operator) "S11 no tag changed"
 
-    Log "== S12: a new password, applied by fivenines_update.ps1 on the installed version"
+    Log "== S12: a new password, applied by fivenines_update.ps1 to the installed version"
     $password = New-TestPassword
     (Get-AccountEntry).SetPassword($password)
     $agentToken = (Get-Content (Join-Path $env:ProgramData "fivenines_agent\TOKEN") -Raw).Trim()
     $failed = Invoke-UpdateScript "s12-update-new-password" $password
     Check ($null -eq $failed) "S12 fivenines_update.ps1 succeeds ($failed)"
     if ($failed) { Show-MsiErrors "C:\fn\logs\s12-update-new-password.log" }
-    Check-NoSecrets "C:\fn\logs\s12-update-new-password.log" "S12" $agentToken $password
-    Check-NoSecrets "C:\fn\logs\s12-update-new-password.remove.log" "S12 remove" $agentToken $password
+    Check (-not (Test-Path "C:\fn\logs\s12-update-new-password.log")) "S12 applied without an msiexec run"
     Restart-Service -Name "fivenines-agent" -ErrorAction SilentlyContinue
     Test-Installed "S12" $Operator
 

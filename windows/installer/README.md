@@ -55,8 +55,13 @@ This directory builds the Windows MSI installer for the fivenines agent.
   MSI they downloaded (an administrative install extracts it and runs no
   custom action) and stop on a refusal, because inside the MSI a refusal comes
   after Windows Installer has removed the running agent on an upgrade. With
-  `-ServiceAccountPassword` they remove an installed agent first: the same
-  version again is a maintenance run, which never reaches the account.
+  `-ServiceAccountPassword` and the same ProductCode installed, msiexec would
+  only run a maintenance pass, which never reaches the account: the scripts
+  run that account step themselves and restart the service, removing nothing.
+  A password is checked with a LogonUser network logon (no SMB session):
+  wrong, locked, disabled, expired and must-change are refused by name;
+  anything else (a host denying network logon) leaves it unchecked, as
+  before.
 - **The WMI namespace ACL in binary.** `DelegateWmiStorageNamespace.ps1` reads
   and writes `root\Microsoft\Windows\Storage`'s descriptor with
   `__SystemSecurity` `GetSD`/`SetSD` and `RawSecurityDescriptor`, never

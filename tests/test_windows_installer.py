@@ -78,7 +78,7 @@ def _constant(path, name):
     [
         ("Resolve-ServiceAccountSid", TOKEN_ACL, DELEGATE_WMI),
         ("ConvertTo-MsiPasswordArgument", SETUP, UPDATE),
-        ("Get-MsiAccountPlan", SETUP, UPDATE),
+        ("Get-MsiProductCode", SETUP, UPDATE),
         ("Invoke-AccountPreflight", SETUP, UPDATE),
         ("Get-WinNTUser", CREATE_ACCOUNT, UNINSTALL),
         ("Get-WmiNamespaceSD", DELEGATE_WMI, UNINSTALL),

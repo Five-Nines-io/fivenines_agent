@@ -297,7 +297,7 @@ jobs:
           $pairs = @(
             @('Resolve-ServiceAccountSid', 'windows/installer/SetTokenFileAcl.ps1', 'windows/installer/DelegateWmiStorageNamespace.ps1'),
             @('ConvertTo-MsiPasswordArgument', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
-            @('Get-MsiAccountPlan', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
+            @('Get-MsiProductCode', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
             @('Invoke-AccountPreflight', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
             @('Get-WinNTUser', 'windows/installer/CreateServiceAccount.ps1', 'fivenines_uninstall.ps1'),
             @('Get-WmiNamespaceSD', 'windows/installer/DelegateWmiStorageNamespace.ps1', 'fivenines_uninstall.ps1'),
@@ -311,7 +311,8 @@ jobs:
           # A password the MSI's quoted custom-action command line would split.
           Invoke-Expression (Get-Fn 'fivenines_setup.ps1' 'ConvertTo-MsiPasswordArgument')
           $empty = New-Object System.Security.SecureString
-          $bad = @($empty, (ConvertTo-SecureString 'pa"ss' -AsPlainText -Force), (ConvertTo-SecureString 'pass\' -AsPlainText -Force))
+          $bad = @($empty, (ConvertTo-SecureString 'pa"ss' -AsPlainText -Force), (ConvertTo-SecureString 'pass\' -AsPlainText -Force),
+                   (ConvertTo-SecureString '-pass' -AsPlainText -Force))
           foreach ($b in $bad) {
             $refused = $false
             try { ConvertTo-MsiPasswordArgument $b | Out-Null } catch { $refused = $true }
@@ -319,7 +320,7 @@ jobs:
           }
           $arg = ConvertTo-MsiPasswordArgument (ConvertTo-SecureString 'p a$s\w;rd' -AsPlainText -Force)
           if ($arg -ne 'SERVICEACCOUNTPASSWORD="p a$s\w;rd"') { throw "unexpected msiexec argument: $arg" }
-          Write-Host "ConvertTo-MsiPasswordArgument refuses '', a quote and a trailing backslash."
+          Write-Host "ConvertTo-MsiPasswordArgument refuses '', a quote, a trailing backslash and a leading '-'."
 
       - name: Upload Windows coverage
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -651,9 +652,13 @@ jobs:
       # the account and report success. The bootstrap checks the account
       # first (the MSI's own CreateServiceAccount.ps1 -PlanOnly, extracted by
       # an administrative install), refusing a wrong password before touching
-      # anything, then removes and reinstalls the agent to apply a right one.
+      # anything, then applies a right one with that same account step and
+      # restarts the service -- no msiexec run, nothing removed.
       - name: fivenines_update.ps1 -ServiceAccountPassword, wrong then right, on the installed version
         shell: powershell
+        # Bootstrap scripts run msiexec /qb, whose modal error box would hold
+        # the job for GitHub's six hours.
+        timeout-minutes: 20
         run: |
           $ErrorActionPreference = "Stop"
           $msiUrl = "file:///" + (Resolve-Path fivenines-agent.msi).Path.Replace('\', '/')
@@ -688,12 +693,13 @@ jobs:
           Assert-Installed
           Restart-Service -Name "fivenines-agent"
           Assert-Installed
-          foreach ($log in "update-right.log", "update-right.remove.log") {
-            $text = [System.IO.File]::ReadAllText((Resolve-Path $log))
-            if ($text.Contains($password)) { throw "the password is in $log" }
-            if ($text.Contains($token)) { throw "the TOKEN value is in $log" }
+          if (Test-Path "update-right.log") { throw "msiexec ran although this version was already installed" }
+          foreach ($log in Get-ChildItem -Filter "*.log") {
+            $text = [System.IO.File]::ReadAllText($log.FullName)
+            if ($text.Contains($password)) { throw "the password is in $($log.Name)" }
+            if ($text.Contains($token)) { throw "the TOKEN value is in $($log.Name)" }
           }
-          Write-Host "Right password applied by a remove-and-reinstall; the service restarts with it; no secret in the logs."
+          Write-Host "Right password applied to the installed agent by the MSI's own account step; the service restarts with it; no secret in any log."
 
       - name: Uninstall MSI silently
         shell: pwsh
@@ -722,11 +728,14 @@ jobs:
       #    namespace names a SID that no longer resolves: the WMI delegation
       #    must cope (GetSecurityDescriptor failed outright on one, which a
       #    domain controller showed). That install passes the password, one
-      #    with a leading '-', a space, '$', ';' and an inner '\', as an
-      #    operator would: the service runs only if it reached sc.exe intact;
+      #    with a space, a '-', '$', ';' and an inner '\', as an operator
+      #    would: the service runs only if it reached sc.exe intact;
       # 3. fivenines_uninstall.ps1 must delete the account and its grant.
       - name: Reinstall keeping the account, over an orphaned WMI grant, then fivenines_uninstall.ps1
         shell: powershell
+        # Bootstrap scripts run msiexec /qb, whose modal error box would hold
+        # the job for GitHub's six hours.
+        timeout-minutes: 20
         run: |
           $ErrorActionPreference = "Stop"
           $src = Get-Content windows/installer/DelegateWmiStorageNamespace.ps1 -Raw
@@ -773,7 +782,7 @@ jobs:
           Remove-LocalUser -Name "fivenines-agent"
           if ((Get-StorageAceSids) -notcontains $orphan) { throw "expected the deleted account's WMI grant to remain" }
           Write-Host "Deleted fivenines-agent by hand; its WMI grant ($orphan) remains."
-          $password = '-Fn9 p$a;ss\w0rd_' + (Get-Random)
+          $password = 'Fn9 -p$a;ss\w0rd_' + (Get-Random)
           Install-Msi "reinstall.log" ('SERVICEACCOUNTPASSWORD="{0}"' -f $password) $password
           Wait-Running
           $sid = (Get-LocalUser -Name "fivenines-agent").SID.Value
@@ -801,8 +810,6 @@ jobs:
           path: |
             install.log
             uninstall.log
-            update-right.log
-            update-right.remove.log
             rotate.log
             uninstall-rotate.log
             reinstall.log

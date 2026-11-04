@@ -55,7 +55,8 @@ if (-not (Test-IsAdmin)) {
 # SERVICEACCOUNTPASSWORD as msiexec takes it. The MSI embeds the value in
 # the custom action's command line between double quotes, so a '"' in it, or
 # a trailing '\' (which escapes the closing quote), would split the command
-# line: refused here rather than failing the install with 1603.
+# line, and powershell.exe -File reads a value starting with '-' as a
+# parameter name: refused here rather than failing the install with 1603.
 function ConvertTo-MsiPasswordArgument {
     param([Parameter(Mandatory=$true)][System.Security.SecureString]$Password)
 
@@ -63,71 +64,101 @@ function ConvertTo-MsiPasswordArgument {
     if ([string]::IsNullOrEmpty($plain)) {
         throw "-ServiceAccountPassword is empty."
     }
-    if ($plain.Contains('"') -or $plain.EndsWith('\')) {
-        throw "-ServiceAccountPassword cannot contain a double quote or end with a backslash (the MSI passes it on a quoted command line). Set a password without them on the account first."
+    # PowerShell takes an en, em or horizontal-bar dash (U+2013..U+2015) for
+    # '-' too.
+    if ($plain.Contains('"') -or $plain.EndsWith('\') -or ($plain[0] -in @([char]'-', [char]0x2013, [char]0x2014, [char]0x2015))) {
+        throw "-ServiceAccountPassword cannot contain a double quote, end with a backslash or start with a dash (the MSI passes it on a quoted powershell.exe -File command line, which reads a leading dash as a parameter name). Set a password without them on the account first."
     }
     return "SERVICEACCOUNTPASSWORD=`"$plain`""
 }
 
-# The account decision the MSI will make, made before msiexec runs: the
-# MSI's own CreateServiceAccount.ps1, extracted by an administrative install
-# (which runs no custom action), in -PlanOnly mode reads the account and,
-# for an existing one, checks the password, changing nothing. Returns its
-# {action, message}, or $null for an MSI too old to have -PlanOnly. Inside
-# the MSI a refusal comes too late on an upgrade: Windows Installer has
-# already removed the running agent, and a failed install does not put it
-# back.
-function Get-MsiAccountPlan {
-    param([string]$MsiPath, [string]$Password)
 
-    $image = Join-Path $env:TEMP ("fivenines-plan-" + [guid]::NewGuid())
+# The ProductCode of an MSI file, read from its Property table (read-only).
+# Equal to the installed agent's, msiexec /i only runs the MSI in maintenance
+# mode, which never reaches the account step.
+function Get-MsiProductCode {
+    param([string]$MsiPath)
+
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    $database = $installer.GetType().InvokeMember("OpenDatabase", "InvokeMethod", $null, $installer, @($MsiPath, 0))
+    $view = $database.GetType().InvokeMember("OpenView", "InvokeMethod", $null, $database, @("SELECT Value FROM Property WHERE Property = 'ProductCode'"))
     try {
-        $extract = Start-Process msiexec.exe -ArgumentList @("/a", "`"$MsiPath`"", "/qn", "TARGETDIR=`"$image`"") -Wait -PassThru
-        if ($extract.ExitCode -ne 0) {
-            throw ("extracting the MSI failed (msiexec /a exit {0})" -f $extract.ExitCode)
-        }
-        $planScript = Get-ChildItem -LiteralPath $image -Recurse -File -Filter "CreateServiceAccount.ps1" | Select-Object -First 1
-        if (-not $planScript) { throw "the MSI carries no CreateServiceAccount.ps1" }
-        if (-not (Select-String -LiteralPath $planScript.FullName -SimpleMatch '[switch]$PlanOnly' -Quiet)) { return $null }
-        $arguments = @{ ServiceAccount = "$env:COMPUTERNAME\fivenines-agent"; PlanOnly = $true }
-        if ($Password) { $arguments.Password = $Password }
-        $line = @(& $planScript.FullName @arguments) | Where-Object { "$_" -like "FIVENINES_PLAN *" } | Select-Object -Last 1
-        if (-not $line) { throw "CreateServiceAccount.ps1 -PlanOnly printed no plan" }
-        return ("$line".Substring("FIVENINES_PLAN ".Length) | ConvertFrom-Json)
+        [void]$view.GetType().InvokeMember("Execute", "InvokeMethod", $null, $view, $null)
+        $record = $view.GetType().InvokeMember("Fetch", "InvokeMethod", $null, $view, $null)
+        if (-not $record) { return $null }
+        return $record.GetType().InvokeMember("StringData", "GetProperty", $null, $record, 1)
     } finally {
-        Remove-Item -LiteralPath $image -Recurse -Force -ErrorAction SilentlyContinue
+        [void]$view.GetType().InvokeMember("Close", "InvokeMethod", $null, $view, $null)
+        foreach ($com in @($view, $database, $installer)) {
+            [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($com)
+        }
     }
 }
 
-# Refuse before msiexec what the MSI would refuse, then, with a password,
-# remove an installed agent first (its account is kept): installing the
-# same version again is a maintenance run of the MSI, which never reaches
-# the account, so the password would silently not be applied.
+# The account step of the MSI about to be installed, run before msiexec: the
+# MSI's own CreateServiceAccount.ps1, extracted by an administrative install
+# (which runs no custom action). Its -PlanOnly run reads the account and
+# checks a supplied password, changing nothing, and a refusal stops here:
+# inside the MSI it comes too late on an upgrade, after Windows Installer has
+# removed the running agent. With a password and this very version already
+# installed, msiexec would only run in maintenance mode, which never reaches
+# the account, so the step itself applies the password (as this elevated
+# session) and the service is restarted with it; returns $true then, as
+# there is nothing left for msiexec to do. An MSI too old for -PlanOnly, or
+# one that cannot be read, leaves the decision to the installer.
 function Invoke-AccountPreflight {
-    param([string]$MsiPath, [System.Security.SecureString]$Password, [string]$LogFile)
+    param([string]$MsiPath, [System.Security.SecureString]$Password)
 
     $plain = if ($Password) {
         (New-Object System.Management.Automation.PSCredential("x", $Password)).GetNetworkCredential().Password
     } else { "" }
-    $plan = $null
+    $sameProduct = $false
+    if ($plain) {
+        $agent = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
+            Where-Object { $_.DisplayName -match "Fivenines Monitoring Agent" } |
+            Select-Object -First 1
+        try {
+            $sameProduct = [bool]($agent -and ($agent.PSChildName -eq (Get-MsiProductCode $MsiPath)))
+        } catch {
+            Write-Warning ("Could not read the MSI's ProductCode ({0}); installing it as usual." -f $_)
+        }
+    }
+    $image = Join-Path $env:TEMP ("fivenines-plan-" + [guid]::NewGuid())
     try {
-        $plan = Get-MsiAccountPlan -MsiPath $MsiPath -Password $plain
-    } catch {
-        Write-Warning ("Could not check the service account before installing ({0}); the installer still checks it." -f $_)
-    }
-    if ($plan -and $plan.action -eq "Refuse") {
-        throw ("Nothing was changed: {0}" -f $plan.message)
-    }
-    if (-not $Password) { return }
-    $agent = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
-        Where-Object { $_.DisplayName -match "Fivenines Monitoring Agent" } |
-        Select-Object -First 1
-    if (-not $agent) { return }
-    Write-Host ("Removing {0} {1} to apply the service account password (the account is kept)..." -f $agent.DisplayName, $agent.DisplayVersion)
-    $removeLog = [System.IO.Path]::ChangeExtension($LogFile, ".remove.log")
-    $remove = Start-Process msiexec.exe -ArgumentList @("/x", $agent.PSChildName, "/qb", "/l*v", "`"$removeLog`"") -Wait -PassThru
-    if ($remove.ExitCode -ne 0) {
-        throw ("removing the installed agent failed (msiexec /x exit {0}, log {1})" -f $remove.ExitCode, $removeLog)
+        $plan = $null
+        $planScript = $null
+        try {
+            $extract = Start-Process msiexec.exe -ArgumentList @("/a", "`"$MsiPath`"", "/qn", "TARGETDIR=`"$image`"") -Wait -PassThru
+            if ($extract.ExitCode -ne 0) {
+                throw ("extracting the MSI failed (msiexec /a exit {0})" -f $extract.ExitCode)
+            }
+            $planScript = Get-ChildItem -LiteralPath $image -Recurse -File -Filter "CreateServiceAccount.ps1" | Select-Object -First 1
+            if (-not $planScript) { throw "the MSI carries no CreateServiceAccount.ps1" }
+            if (-not (Select-String -LiteralPath $planScript.FullName -SimpleMatch '[switch]$PlanOnly' -Quiet)) {
+                throw "the MSI's CreateServiceAccount.ps1 has no -PlanOnly"
+            }
+            $arguments = @{ ServiceAccount = "$env:COMPUTERNAME\fivenines-agent" }
+            if ($plain) { $arguments.Password = $plain }
+            $line = @(& $planScript.FullName @arguments -PlanOnly) | Where-Object { "$_" -like "FIVENINES_PLAN *" } | Select-Object -Last 1
+            if (-not $line) { throw "CreateServiceAccount.ps1 -PlanOnly printed no plan" }
+            $plan = "$line".Substring("FIVENINES_PLAN ".Length) | ConvertFrom-Json
+        } catch {
+            if ($sameProduct) {
+                throw ("Could not run the MSI's account step ({0}), so -ServiceAccountPassword cannot be applied to the installed agent. Nothing was changed." -f $_)
+            }
+            Write-Warning ("Could not check the service account before installing ({0}); the installer still checks it." -f $_)
+            return $false
+        }
+        if ($plan.action -eq "Refuse") {
+            throw ("Nothing was changed: {0}" -f $plan.message)
+        }
+        if (-not $sameProduct) { return $false }
+        Write-Host "This version is already installed: applying the service account password to it..."
+        & $planScript.FullName @arguments | Out-Host
+        Restart-Service -Name "fivenines-agent" -ErrorAction Stop
+        return $true
+    } finally {
+        Remove-Item -LiteralPath $image -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -182,27 +213,30 @@ try {
 }
 Unblock-File -Path $MsiPath
 
+$applied = $false
 try {
-    Invoke-AccountPreflight -MsiPath $MsiPath -Password $ServiceAccountPassword -LogFile $LogFile
+    $applied = Invoke-AccountPreflight -MsiPath $MsiPath -Password $ServiceAccountPassword
 } catch {
     Write-Error $_
     exit 1
 }
 
-Write-Host "Running upgrade (log: $LogFile)..."
-$msiArgs = @(
-    "/i", "`"$MsiPath`"",
-    "TOKEN=$token",
-    "/qb",
-    "/l*v", "`"$LogFile`""
-)
-if ($passwordArgument) {
-    $msiArgs += $passwordArgument
-}
-$proc = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
-if ($proc.ExitCode -ne 0) {
-    Write-Error "msiexec failed with exit code $($proc.ExitCode). See $LogFile."
-    exit $proc.ExitCode
+if (-not $applied) {
+    Write-Host "Running upgrade (log: $LogFile)..."
+    $msiArgs = @(
+        "/i", "`"$MsiPath`"",
+        "TOKEN=$token",
+        "/qb",
+        "/l*v", "`"$LogFile`""
+    )
+    if ($passwordArgument) {
+        $msiArgs += $passwordArgument
+    }
+    $proc = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
+    if ($proc.ExitCode -ne 0) {
+        Write-Error "msiexec failed with exit code $($proc.ExitCode). See $LogFile."
+        exit $proc.ExitCode
+    }
 }
 
 # After a MajorUpgrade the MSI's StartAgentService CA has already kicked
