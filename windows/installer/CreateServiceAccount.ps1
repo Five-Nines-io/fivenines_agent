@@ -308,12 +308,17 @@ function Add-AccountToBuiltinGroup {
 # Whether this password logs the existing account on, through LogonUser
 # with a network logon (no SMB session, unlike PrincipalContext's machine
 # check): $true, or why not ("wrong password", "locked", ...), or $null when
-# the check itself cannot run -- the host denies that logon type, or Add-Type
-# is blocked -- in which case the password is used unchecked, as before.
+# the check cannot tell (Add-Type blocked, an error not named below), in
+# which case the password is used as given and the bootstraps warn.
+# ERROR_LOGON_TYPE_NOT_GRANTED (1385, a host that denies the account network
+# logon: CIS-hardened hosts deny it to every local account) counts as $true:
+# LSA checks the logon type only once the credentials were accepted, so a
+# wrong password still answers 1326 there.
 # One failed attempt counts toward the account's lockout threshold.
 function Test-AccountPassword {
     param([string]$AccountName, [string]$Domain, [string]$Password)
 
+    $ERROR_LOGON_TYPE_NOT_GRANTED = 1385
     $reasons = @{
         1326 = "wrong password"            # ERROR_LOGON_FAILURE
         1909 = "the account is locked"     # ERROR_ACCOUNT_LOCKED_OUT
@@ -335,22 +340,11 @@ public static class FiveninesLogon {
     static extern bool LogonUser(string user, string domain, string password, int logonType, int provider, out IntPtr token);
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool CloseHandle(IntPtr handle);
-    // 0 when the password logs the account on, else the Win32 error. A
-    // network logon first (LOGON32_LOGON_NETWORK); where the host denies it
-    // to the account (ERROR_LOGON_TYPE_NOT_GRANTED, 1385: CIS-hardened hosts
-    // deny it to every local account), a service logon instead
-    // (LOGON32_LOGON_SERVICE), which an account the agent already runs as
-    // is granted.
+    // 0 when the password logs the account on (LOGON32_LOGON_NETWORK,
+    // LOGON32_PROVIDER_DEFAULT), else the Win32 error.
     public static int Check(string user, string domain, string password) {
-        int code = Logon(user, domain, password, 3);
-        if (code == 1385) {
-            code = Logon(user, domain, password, 5);
-        }
-        return code;
-    }
-    static int Logon(string user, string domain, string password, int logonType) {
         IntPtr token;
-        if (LogonUser(user, domain, password, logonType, 0, out token)) {
+        if (LogonUser(user, domain, password, 3, 0, out token)) {
             CloseHandle(token);
             return 0;
         }
@@ -360,12 +354,12 @@ public static class FiveninesLogon {
 "@
         }
         $code = [FiveninesLogon]::Check($AccountName, $Domain, $Password)
-        if ($code -eq 0) { return $true }
+        if ($code -eq 0 -or $code -eq $ERROR_LOGON_TYPE_NOT_GRANTED) { return $true }
         if ($reasons.ContainsKey($code)) { return $reasons[$code] }
-        Write-Host ("Could not check the password of '{0}' (LogonUser error {1}); using it unchecked." -f $AccountName, $code)
+        Write-Host ("Could not check the password of '{0}' (LogonUser error {1}); using it as given." -f $AccountName, $code)
         return $null
     } catch {
-        Write-Host ("Could not check the password of '{0}' ({1}); using it unchecked." -f $AccountName, $_.Exception.GetBaseException().Message)
+        Write-Host ("Could not check the password of '{0}' ({1}); using it as given." -f $AccountName, $_.Exception.GetBaseException().Message)
         return $null
     }
 }

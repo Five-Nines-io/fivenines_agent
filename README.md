@@ -245,10 +245,9 @@ another DC:
   without its password, or a password that does not log the account on).
   `msiexec` used directly refuses the same cases with exit code 1603 and the
   reason in the install log, but on an upgrade Windows Installer has already
-  removed the running agent by then. For the same reason an upgrade given a
-  password the check could not verify (the host lets the account log on
-  neither over the network nor as a service, for one) is refused too; elsewhere such a password is used with a
-  warning.
+  removed the running agent by then. A password the check could not verify
+  is used with a warning: if it is wrong, the service does not start, and
+  running the script again with the right password fixes it.
 - **Uninstalling** deletes the account only when this DC's installer created
   it, or when it is the account an earlier release left behind after failing
   on a DC (described `Fivenines monitoring agent service account`).
