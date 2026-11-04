@@ -233,7 +233,11 @@ another DC:
   is already installed, `update.ps1 -ServiceAccountPassword` (and `setup.ps1`)
   applies the password to it with the MSI's own account step and restarts the
   service: run it on every DC after you change the password in Active
-  Directory.
+  Directory. It does so only when the service runs as `fivenines-agent`
+  already; otherwise (an account of your own, or `fivenines-agent` deleted)
+  it changes nothing and asks you to reinstall: `uninstall.ps1`, then
+  `setup.ps1`. `setup.ps1` writes no `-Token` there: the agent keeps its
+  TOKEN.
 - **Nothing is changed when the installer would refuse**: `setup.ps1` and
   `update.ps1` first ask the MSI they downloaded what it will do with the
   account, and stop before installing or removing anything when it would
@@ -241,7 +245,10 @@ another DC:
   without its password, or a password that does not log the account on).
   `msiexec` used directly refuses the same cases with exit code 1603 and the
   reason in the install log, but on an upgrade Windows Installer has already
-  removed the running agent by then.
+  removed the running agent by then. For the same reason an upgrade given a
+  password the check could not verify (the host denies the network logon it
+  uses, for one) is refused too; elsewhere such a password is used with a
+  warning.
 - **Uninstalling** deletes the account only when this DC's installer created
   it, or when it is the account an earlier release left behind after failing
   on a DC (described `Fivenines monitoring agent service account`).
@@ -266,13 +273,18 @@ iwr https://releases.fivenines.io/latest/fivenines_update.ps1 -OutFile update.ps
 .\update.ps1
 
 # Uninstall: removes the MSI, the service, the local service account,
-# its SeServiceLogonRight grant and WMI Storage access, and the config +
-# log directories.
+# its SeServiceLogonRight grant and WMI Storage access (a deny entry set
+# for it is kept), and the config + log directories.
 # Pass -KeepAccount to leave a pre-staged account in place. On a domain
 # controller, an account shared with other DCs is kept.
 iwr https://releases.fivenines.io/latest/fivenines_uninstall.ps1 -OutFile uninstall.ps1
 .\uninstall.ps1
 ```
+
+`update.ps1 -ServiceAccountPassword` passes the password of an account the
+MSI does not rotate; on the version already installed it applies it in place,
+to the account the service runs as only (see
+[Domain controllers](#domain-controllers)).
 
 #### Security model
 
