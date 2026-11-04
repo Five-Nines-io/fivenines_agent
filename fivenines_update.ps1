@@ -30,7 +30,7 @@
 param(
     [string]$MsiUrl = "https://releases.fivenines.io/latest/fivenines-agent-windows-amd64.msi",
 
-    # Both default to a new private directory under %TEMP%
+    # Both default to a new private directory under %SystemRoot%\Temp
     # (New-PrivateWorkDirectory below). A path given here is used as is: pick
     # a directory only administrators can write to.
     [string]$MsiPath = "",
@@ -56,7 +56,8 @@ $ErrorActionPreference = "Stop"
 # exists with the inherited one (Windows PowerShell 5.1's .NET Framework has
 # a Directory.CreateDirectory overload taking it; PowerShell 7's .NET moved
 # it to FileSystemAclExtensions), and checked after: a file system without
-# ACLs drops it silently.
+# ACLs drops it silently. It is then recorded for Remove-EarlierWorkDirectories,
+# with a random marker written both in the record and in a file inside it.
 function New-PrivateWorkDirectory {
     param([string]$Prefix)
 
@@ -98,21 +99,57 @@ function New-PrivateWorkDirectory {
         ($granted -join ",") -ne ((@($expected) | Sort-Object -Unique) -join ",")) {
         throw "$path did not keep its access control list (does its file system support ACLs?)"
     }
+    $marker = [guid]::NewGuid().ToString()
+    Set-Content -LiteralPath (Join-Path $path ".fivenines-work-directory") -Value $marker
+    New-ItemProperty -LiteralPath (Get-WorkDirectoryKey) -Name (Split-Path -Leaf $path) -Value $marker -PropertyType String -Force | Out-Null
     return $path
 }
 
-# Removes the work directories earlier runs of these scripts left under
-# %SystemRoot%\Temp, so a scheduled run does not leave one MSI copy per run.
-# Only directories it can tell are its own: a fivenines-setup-, -update- or
-# -uninstall-<guid> name, owned by Administrators (no other user can create
-# one so owned) with a protected ACL, not a link, and at least $MinAgeMinutes
-# old (a run still in progress keeps its own). Kept: $Keep (this run's), and
-# the installed product's recorded install source, from which Windows
-# Installer reads the MSI to repair it (its cached copy keeps no embedded
-# cabinet).
+# The registry key recording the work directories New-PrivateWorkDirectory
+# created, each by name with its marker. Open to SYSTEM and Administrators
+# only, reading included: a marker is what tells one of these directories
+# from anything else at its path.
+function Get-WorkDirectoryKey {
+    $key = "HKLM:\SOFTWARE\Five-Nines.io\fivenines-bootstrap"
+    if (-not (Test-Path -LiteralPath $key)) { New-Item -Path $key -Force | Out-Null }
+    $expected = @("S-1-5-18", "S-1-5-32-544")  # SYSTEM, Administrators
+    $acl = Get-Acl -LiteralPath $key
+    $granted = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) |
+        ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+    if (-not $acl.AreAccessRulesProtected -or ($granted -join ",") -ne ($expected -join ",")) {
+        $security = New-Object System.Security.AccessControl.RegistrySecurity
+        $security.SetAccessRuleProtection($true, $false)
+        foreach ($sid in $expected) {
+            $security.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule(
+                (New-Object System.Security.Principal.SecurityIdentifier($sid)),
+                [System.Security.AccessControl.RegistryRights]::FullControl,
+                [System.Security.AccessControl.InheritanceFlags]::ContainerInherit,
+                [System.Security.AccessControl.PropagationFlags]::None,
+                [System.Security.AccessControl.AccessControlType]::Allow)))
+        }
+        Set-Acl -LiteralPath $key -AclObject $security
+    }
+    return $key
+}
+
+# Removes the work directories earlier runs of these scripts left, so a
+# scheduled run does not leave one MSI copy per run: only those the key
+# records, never a directory found by its name. Any local user can create a
+# directory of any name under %SystemRoot%\Temp and turn it into a link to
+# another directory at any moment, so no check of a path proves what a
+# removal through it will reach. A recorded directory is removed only when
+# the file inside it holds its recorded marker: only that directory holds
+# it, and while it stands at its path no other user can rename, replace or
+# write in it, so the removal reaches it and nothing else. Anything else at
+# a recorded path (the directory gone, a temp cleaner removed it) loses its
+# record and is left alone. Kept: $Keep (this run's), a directory younger
+# than $MinAgeMinutes (a run still in progress), and the installed product's
+# recorded install source, from which Windows Installer reads the MSI to
+# repair it (its cached copy keeps no embedded cabinet).
 function Remove-EarlierWorkDirectories {
     param([string]$Keep, [int]$MinAgeMinutes = 60)
 
+    $key = Get-WorkDirectoryKey
     $keepPaths = @($Keep.TrimEnd('\'))
     $product = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
         Where-Object { $_.DisplayName -match "Fivenines Monitoring Agent" } |
@@ -120,17 +157,24 @@ function Remove-EarlierWorkDirectories {
     if ($product -and $product.InstallSource) { $keepPaths += ([string]$product.InstallSource).TrimEnd('\') }
     $cutoff = (Get-Date).ToUniversalTime().AddMinutes(-$MinAgeMinutes)
     $parent = Join-Path $env:SystemRoot "Temp"
-    $candidates = @(Get-ChildItem -LiteralPath $parent -Directory -Force -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '^fivenines-(setup|update|uninstall)-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$' })
-    foreach ($dir in $candidates) {
-        if ($keepPaths -contains $dir.FullName.TrimEnd('\')) { continue }
-        if (([int]$dir.Attributes -band 0x400) -ne 0) { continue }  # a junction or a link: never followed
-        if ($dir.CreationTimeUtc -gt $cutoff) { continue }
+    $record = Get-Item -LiteralPath $key
+    $names = @($record.GetValueNames() |
+        Where-Object { $_ -match '^fivenines-(setup|update|uninstall)-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$' })
+    foreach ($name in $names) {
+        $path = Join-Path $parent $name
+        if ($keepPaths -contains $path) { continue }
         try {
-            $acl = Get-Acl -LiteralPath $dir.FullName
-            if (-not $acl.AreAccessRulesProtected) { continue }
-            if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne "S-1-5-32-544") { continue }
-            Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction SilentlyContinue
+            $marker = [string]$record.GetValue($name)
+            $found = $null
+            if (Test-Path -LiteralPath $path) {
+                $found = Get-Content -LiteralPath (Join-Path $path ".fivenines-work-directory") -TotalCount 1 -ErrorAction SilentlyContinue
+            }
+            if ($marker -and $found -eq $marker) {
+                if ((Get-Item -LiteralPath $path -Force).CreationTimeUtc -gt $cutoff) { continue }
+                Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+                if (Test-Path -LiteralPath $path) { continue }  # in use: the next run retries
+            }
+            Remove-ItemProperty -LiteralPath $key -Name $name -ErrorAction SilentlyContinue
         } catch {
             continue
         }

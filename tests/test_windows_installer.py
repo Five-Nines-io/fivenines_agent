@@ -87,6 +87,8 @@ def _constant(path, name):
         ("New-PrivateWorkDirectory", SETUP, UNINSTALL),
         ("Remove-EarlierWorkDirectories", SETUP, UPDATE),
         ("Remove-EarlierWorkDirectories", SETUP, UNINSTALL),
+        ("Get-WorkDirectoryKey", SETUP, UPDATE),
+        ("Get-WorkDirectoryKey", SETUP, UNINSTALL),
         ("Get-WinNTUser", CREATE_ACCOUNT, UNINSTALL),
         ("Get-WmiNamespaceSD", DELEGATE_WMI, UNINSTALL),
         ("Set-WmiNamespaceSD", DELEGATE_WMI, UNINSTALL),
@@ -295,6 +297,18 @@ def test_bootstrap_downloads_into_a_private_directory(path):
     assert "$security.SetOwner($admins)" in helper
     assert "did not keep its access control list" in helper
     assert "FileSystemAclExtensions]::CreateDirectory($security, $path)" in helper
+    # Recorded with a marker, written in the record and in the directory.
+    assert 'Join-Path $path ".fivenines-work-directory") -Value $marker' in helper
+    assert "-Name (Split-Path -Leaf $path) -Value $marker" in helper
+    # The pruning removes only recorded directories that hold their marker,
+    # never one found by its name: any local user can create one of any name
+    # under %SystemRoot%\Temp and turn it into a link at any moment.
+    prune_helper = _function(path, "Remove-EarlierWorkDirectories")
+    assert "Get-ChildItem" not in prune_helper
+    assert ".GetValueNames()" in prune_helper
+    guard = prune_helper.index("if ($marker -and $found -eq $marker) {")
+    assert prune_helper.index("Remove-Item -LiteralPath $path -Recurse") > guard
+    assert prune_helper.count("Remove-Item ") == 1
 
 
 # Value: protects=the uninstall log; fails_when=fivenines_uninstall.ps1's -LogFile default goes back to a bare $env:TEMP name (C:\\Windows\\Temp under an RMM tool running as SYSTEM) or a successful uninstall stops removing its work directory; why_new=the Windows runs pass an explicit -LogFile; seam=none; no_claim=that the ACL is private, which windows.yml's work directory steps check
@@ -305,13 +319,20 @@ def test_uninstall_logs_into_a_private_directory():
     assert re.search(
         r"(?m)^if \(-not \$LogFile\) \{ \$LogFile = Join-Path \$WorkDir ", code
     )
-    removal = "Remove-Item -LiteralPath $WorkDir -Recurse -Force -ErrorAction SilentlyContinue"
-    prune = "Remove-EarlierWorkDirectories -Keep $WorkDir"
-    # after -KeepAccount's exit 0, and at the end, each after the msiexec /x
-    # failure exit
-    assert code.count(removal) == 2 and code.count(prune) == 2
-    assert code.index(prune) > code.index("exit $proc.ExitCode")
-    after = code.rsplit(removal, 1)[1].strip().splitlines()
+    helper = _function(UNINSTALL, "Remove-AllWorkDirectories")
+    assert "Remove-EarlierWorkDirectories -Keep $WorkDir" in helper
+    assert (
+        "Remove-Item -LiteralPath $WorkDir -Recurse -Force -ErrorAction SilentlyContinue"
+        in helper
+    )
+    # Before -KeepAccount's exit 0, and at the end, each after the msiexec /x
+    # failure exit.
+    calls = re.findall(r"(?m)^\s*Remove-AllWorkDirectories$", code)
+    assert len(calls) == 2
+    first = re.search(r"(?m)^\s*Remove-AllWorkDirectories$", code)
+    assert first.start() > code.index("exit $proc.ExitCode")
+    assert code.split(first.group(0), 1)[1].lstrip().startswith("exit 0")
+    after = code.rsplit("Remove-AllWorkDirectories", 1)[1].strip().splitlines()
     assert all(line.startswith("Write-Host ") for line in after if line.strip()), after
 
 

@@ -340,17 +340,23 @@ jobs:
       # The bootstraps' work directory: under %SystemRoot%\Temp, owned by
       # Administrators, protected from inheritance, writable by SYSTEM and
       # Administrators only, so no other local user can create or rewrite the
-      # MSI, its extracted copy or the log in it.
+      # MSI, its extracted copy or the log in it; recorded with its marker.
       - name: Verify the bootstrap's private work directory
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
           $src = Get-Content fivenines_setup.ps1 -Raw
-          $m = [regex]::Match($src, "(?ms)^function New-PrivateWorkDirectory \{.*?^\}")
-          if (-not $m.Success) { throw "New-PrivateWorkDirectory not found in fivenines_setup.ps1" }
-          Invoke-Expression $m.Value
+          foreach ($fn in 'Get-WorkDirectoryKey', 'New-PrivateWorkDirectory') {
+            $m = [regex]::Match($src, "(?ms)^function $fn \{.*?^\}")
+            if (-not $m.Success) { throw "$fn not found in fivenines_setup.ps1" }
+            Invoke-Expression $m.Value
+          }
           $dir = New-PrivateWorkDirectory "fn-ci"
+          $key = Get-WorkDirectoryKey
           try {
+            # Recorded with its marker, in the directory and in the key.
+            $marker = (Get-Item -LiteralPath $key).GetValue((Split-Path -Leaf $dir))
+            if (-not $marker -or (Get-Content -LiteralPath (Join-Path $dir ".fivenines-work-directory") -TotalCount 1) -ne $marker) { throw "$dir is not recorded with its marker" }
             $acl = Get-Acl -LiteralPath $dir
             if (-not $acl.AreAccessRulesProtected) { throw "$dir inherits its parent's ACL" }
             # Under %SystemRoot%\Temp, owned by Administrators; SYSTEM and
@@ -373,6 +379,7 @@ jobs:
             Write-Host "$dir and what is created in it: SYSTEM and Administrators, and the running user read-only."
           } finally {
             Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-ItemProperty -LiteralPath $key -Name (Split-Path -Leaf $dir) -ErrorAction SilentlyContinue
           }
 
       # The same under PowerShell 7, whose .NET has no
@@ -383,11 +390,17 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $src = Get-Content fivenines_setup.ps1 -Raw
-          $m = [regex]::Match($src, "(?ms)^function New-PrivateWorkDirectory \{.*?^\}")
-          if (-not $m.Success) { throw "New-PrivateWorkDirectory not found in fivenines_setup.ps1" }
-          Invoke-Expression $m.Value
+          foreach ($fn in 'Get-WorkDirectoryKey', 'New-PrivateWorkDirectory') {
+            $m = [regex]::Match($src, "(?ms)^function $fn \{.*?^\}")
+            if (-not $m.Success) { throw "$fn not found in fivenines_setup.ps1" }
+            Invoke-Expression $m.Value
+          }
           $dir = New-PrivateWorkDirectory "fn-ci"
+          $key = Get-WorkDirectoryKey
           try {
+            # Recorded with its marker, in the directory and in the key.
+            $marker = (Get-Item -LiteralPath $key).GetValue((Split-Path -Leaf $dir))
+            if (-not $marker -or (Get-Content -LiteralPath (Join-Path $dir ".fivenines-work-directory") -TotalCount 1) -ne $marker) { throw "$dir is not recorded with its marker" }
             $acl = Get-Acl -LiteralPath $dir
             if (-not $acl.AreAccessRulesProtected) { throw "$dir inherits its parent's ACL" }
             # Under %SystemRoot%\Temp, owned by Administrators; SYSTEM and
@@ -410,53 +423,69 @@ jobs:
             Write-Host "$dir and what is created in it: SYSTEM and Administrators, and the running user read-only."
           } finally {
             Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-ItemProperty -LiteralPath $key -Name (Split-Path -Leaf $dir) -ErrorAction SilentlyContinue
           }
 
       # What a successful run removes: the work directories earlier runs
-      # left, and only those it can tell are its own. Kept: this run's, one
-      # newer than the age floor, one with the right name but an inherited
-      # ACL or another owner (anyone may create such a name under
-      # %SystemRoot%\Temp, protected and owned by themselves), and a junction
-      # with the right name to a directory that would pass every check,
-      # whose content is never touched.
+      # recorded, and only while each holds its recorded marker. An earlier
+      # run's directory goes, with its record, once older than the age
+      # floor. Kept: this run's; one that passes every check but was never
+      # recorded; and what stands at a recorded path once its directory is
+      # gone (a plain directory holding a forged marker, a junction to
+      # another of these directories), whose record goes. A record whose
+      # directory is gone goes too.
       - name: Verify the pruning of earlier work directories
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
           $src = Get-Content fivenines_setup.ps1 -Raw
-          foreach ($fn in 'New-PrivateWorkDirectory', 'Remove-EarlierWorkDirectories') {
+          foreach ($fn in 'Get-WorkDirectoryKey', 'New-PrivateWorkDirectory', 'Remove-EarlierWorkDirectories') {
             $m = [regex]::Match($src, "(?ms)^function $fn \{.*?^\}")
             if (-not $m.Success) { throw "$fn not found in fivenines_setup.ps1" }
             Invoke-Expression $m.Value
           }
-          $temp = Join-Path $env:SystemRoot "Temp"
+          $key = Get-WorkDirectoryKey
+          function Test-Recorded([string]$Path) { return $null -ne (Get-Item -LiteralPath $key).GetValue((Split-Path -Leaf $Path)) }
           $current = New-PrivateWorkDirectory "fivenines-update"
           $earlier = New-PrivateWorkDirectory "fivenines-setup"
           Set-Content -LiteralPath (Join-Path $earlier "fivenines-agent-windows-amd64.msi") -Value "x"
-          $foreign = Join-Path $temp ("fivenines-update-" + [guid]::NewGuid())
-          New-Item -ItemType Directory -Path $foreign | Out-Null
-          $owned = New-PrivateWorkDirectory "fivenines-setup"
-          $acl = Get-Acl -LiteralPath $owned
-          $acl.SetOwner([System.Security.Principal.WindowsIdentity]::GetCurrent().User)
-          Set-Acl -LiteralPath $owned -AclObject $acl
+          $unrecorded = New-PrivateWorkDirectory "fivenines-setup"
+          Remove-ItemProperty -LiteralPath $key -Name (Split-Path -Leaf $unrecorded)
+          $forged = New-PrivateWorkDirectory "fivenines-setup"
+          Remove-Item -LiteralPath $forged -Recurse -Force
+          New-Item -ItemType Directory -Path $forged | Out-Null
+          Set-Content -LiteralPath (Join-Path $forged ".fivenines-work-directory") -Value ([guid]::NewGuid().ToString())
           $target = New-PrivateWorkDirectory "fn-prune-target"
           Set-Content -LiteralPath (Join-Path $target "keep.txt") -Value "x"
-          $link = Join-Path $temp ("fivenines-update-" + [guid]::NewGuid())
-          cmd /c mklink /J "$link" "$target" | Out-Null
+          $linked = New-PrivateWorkDirectory "fivenines-update"
+          Remove-Item -LiteralPath $linked -Recurse -Force
+          cmd /c mklink /J "$linked" "$target" | Out-Null
+          if (-not (Test-Path -LiteralPath $linked)) { throw "mklink /J failed" }
+          $gone = New-PrivateWorkDirectory "fivenines-uninstall"
+          Remove-Item -LiteralPath $gone -Recurse -Force
           try {
             Remove-EarlierWorkDirectories -Keep $current
-            if (-not (Test-Path -LiteralPath $earlier)) { throw "a directory newer than the age floor was removed" }
+            if (-not (Test-Path -LiteralPath $earlier) -or -not (Test-Recorded $earlier)) { throw "a directory younger than the age floor was removed" }
             Remove-EarlierWorkDirectories -Keep $current -MinAgeMinutes 0
-            if (Test-Path -LiteralPath $earlier) { throw "an earlier run's directory was kept" }
-            if (-not (Test-Path -LiteralPath $current)) { throw "this run's directory was removed" }
-            if (-not (Test-Path -LiteralPath $foreign)) { throw "a directory with an inherited ACL was removed" }
-            if (-not (Test-Path -LiteralPath $owned)) { throw "a directory owned by another account was removed" }
-            if (-not (Test-Path -LiteralPath $link)) { throw "a junction was removed" }
+            if ((Test-Path -LiteralPath $earlier) -or (Test-Recorded $earlier)) { throw "an earlier run's directory or its record was kept" }
+            if (-not (Test-Path -LiteralPath $current) -or -not (Test-Recorded $current)) { throw "this run's directory or its record was removed" }
+            if (-not (Test-Path -LiteralPath $unrecorded)) { throw "a directory never recorded was removed" }
+            if (-not (Test-Path -LiteralPath $forged)) { throw "a directory holding a forged marker was removed" }
+            if (Test-Recorded $forged) { throw "the record of a replaced directory was kept" }
+            if (-not (Test-Path -LiteralPath $linked)) { throw "a junction was removed" }
             if (-not (Test-Path -LiteralPath (Join-Path $target "keep.txt"))) { throw "the junction's target was touched" }
-            Write-Host "Removed an earlier run's directory; kept this run's, a newer one, two foreign ones and a junction with its target."
+            if (Test-Recorded $linked) { throw "the record of a directory replaced by a junction was kept" }
+            if (Test-Recorded $gone) { throw "the record of a directory gone was kept" }
+            $acl = Get-Acl -LiteralPath $key
+            $granted = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+            if (-not $acl.AreAccessRulesProtected -or ($granted -join ",") -ne "S-1-5-18,S-1-5-32-544") { throw "$key is open to: $($granted -join ', ')" }
+            Write-Host "Removed an earlier run's directory and the records of three replaced or gone; kept this run's, a newer one, one never recorded, a forged one and a junction with its target. The key is open to SYSTEM and Administrators only."
           } finally {
-            cmd /c rmdir "$link" | Out-Null
-            foreach ($d in @($current, $earlier, $foreign, $owned, $target)) { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
+            cmd /c rmdir "$linked" | Out-Null
+            foreach ($d in @($current, $earlier, $unrecorded, $forged, $target, $linked, $gone)) {
+              Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
+              Remove-ItemProperty -LiteralPath $key -Name (Split-Path -Leaf $d) -ErrorAction SilentlyContinue
+            }
           }
 
       # Helpers duplicated across scripts that cannot share a file: the
@@ -483,6 +512,8 @@ jobs:
             @('New-PrivateWorkDirectory', 'fivenines_setup.ps1', 'fivenines_uninstall.ps1'),
             @('Remove-EarlierWorkDirectories', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
             @('Remove-EarlierWorkDirectories', 'fivenines_setup.ps1', 'fivenines_uninstall.ps1'),
+            @('Get-WorkDirectoryKey', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
+            @('Get-WorkDirectoryKey', 'fivenines_setup.ps1', 'fivenines_uninstall.ps1'),
             @('Get-WinNTUser', 'windows/installer/CreateServiceAccount.ps1', 'fivenines_uninstall.ps1'),
             @('Get-WmiNamespaceSD', 'windows/installer/DelegateWmiStorageNamespace.ps1', 'fivenines_uninstall.ps1'),
             @('Set-WmiNamespaceSD', 'windows/installer/DelegateWmiStorageNamespace.ps1', 'fivenines_uninstall.ps1')
