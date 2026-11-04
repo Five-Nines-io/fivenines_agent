@@ -335,11 +335,22 @@ public static class FiveninesLogon {
     static extern bool LogonUser(string user, string domain, string password, int logonType, int provider, out IntPtr token);
     [DllImport("kernel32.dll", SetLastError = true)]
     static extern bool CloseHandle(IntPtr handle);
-    // 0 when the password logs the account on (LOGON32_LOGON_NETWORK,
-    // LOGON32_PROVIDER_DEFAULT), else the Win32 error.
+    // 0 when the password logs the account on, else the Win32 error. A
+    // network logon first (LOGON32_LOGON_NETWORK); where the host denies it
+    // to the account (ERROR_LOGON_TYPE_NOT_GRANTED, 1385: CIS-hardened hosts
+    // deny it to every local account), a service logon instead
+    // (LOGON32_LOGON_SERVICE), which an account the agent already runs as
+    // is granted.
     public static int Check(string user, string domain, string password) {
+        int code = Logon(user, domain, password, 3);
+        if (code == 1385) {
+            code = Logon(user, domain, password, 5);
+        }
+        return code;
+    }
+    static int Logon(string user, string domain, string password, int logonType) {
         IntPtr token;
-        if (LogonUser(user, domain, password, 3, 0, out token)) {
+        if (LogonUser(user, domain, password, logonType, 0, out token)) {
             CloseHandle(token);
             return 0;
         }

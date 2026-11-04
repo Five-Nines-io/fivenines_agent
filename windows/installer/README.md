@@ -66,9 +66,10 @@ This directory builds the Windows MSI installer for the fivenines agent.
   agent installed, an unreadable ProductCode is a refusal too (it may be
   this very version). The decision is `Get-PreflightVerdict`, pure, tested
   case by case in `windows.yml`. A password is checked with a LogonUser
-  network logon (no SMB session): wrong, locked, disabled, password expired,
-  must-change and account expired are refused by name; anything else (a
-  host denying network logon) leaves it unchecked, which the plan reports
+  network logon (no SMB session), or a service logon where the host denies
+  the account network logon: wrong, locked, disabled, password expired,
+  must-change and account expired are refused by name; anything else (an
+  account that may not log on either way) leaves it unchecked, which the plan reports
   (`checked: false`) and the scripts refuse on an upgrade, where a wrong
   password would show only after the agent was removed.
 - **The WMI namespace ACL in binary.** `DelegateWmiStorageNamespace.ps1` reads
