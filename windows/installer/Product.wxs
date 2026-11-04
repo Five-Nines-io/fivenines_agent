@@ -11,7 +11,9 @@
       (F1) and runs the WMI Storage-namespace delegation (D19).
     - Service runs as a dedicated low-privilege account, added to the
       Performance Monitor Users group by the MSI (D12). Account name and
-      password are SERVICEACCOUNT / SERVICEACCOUNTPASSWORD properties.
+      password are SERVICEACCOUNT / SERVICEACCOUNTPASSWORD properties. On a
+      domain controller the account is a domain account (see
+      CreateServiceAccount.ps1).
     - Major upgrades are clean (UpgradeCode kept stable); uninstall removes
       the service, config dir, and logs.
 
@@ -68,6 +70,16 @@
          in our PowerShell scripts. -->
     <Property Id="SERVICEACCOUNT" />
     <Property Id="SERVICEACCOUNTPASSWORD" Secure="yes" Hidden="yes" />
+
+    <!-- The custom-action data built from TOKEN and SERVICEACCOUNTPASSWORD.
+         Hiding TOKEN and SERVICEACCOUNTPASSWORD themselves is not enough:
+         the SetProperty actions below copy them into the CreateServiceAccount
+         and WriteTokenAcl properties, which the verbose log then printed in
+         cleartext (PROPERTY CHANGE, the deferred CustomActionData and the
+         final property dump), and the bootstrap scripts always log with /l*v.
+         Hidden here, and HideTarget on the two custom actions. -->
+    <Property Id="CreateServiceAccount" Hidden="yes" />
+    <Property Id="WriteTokenAcl" Hidden="yes" />
 
     <!-- Resolve [ComputerName] before any CA reads SERVICEACCOUNT.
          Sequence="both" so this runs in InstallUI and InstallExecute alike;
@@ -201,12 +213,17 @@
          CreateServiceAccount.ps1 via icacls. util:PermissionEx replaces the
          inherited ProgramData ACL (which would otherwise give BUILTIN\Users
          read access), so even if our CA were to fail we don't degrade to a
-         world-listable config dir. -->
+         world-listable config dir.
+         User="LocalSystem", never "SYSTEM": WiX maps a few well-known names
+         ("Administrators", "LocalSystem", "Users", ...) straight to their
+         SID, and passes any other name to LookupAccountName, which only
+         knows the OS install language's spelling ("Systeme" with an accent
+         on a French Windows), so "SYSTEM" could fail the install there. -->
     <ComponentGroup Id="ConfigDirComponents" Directory="CONFIGDIR">
       <Component Id="ConfigDirComponent">
         <CreateFolder>
           <util:PermissionEx User="Administrators" GenericAll="yes" />
-          <util:PermissionEx User="SYSTEM" GenericAll="yes" />
+          <util:PermissionEx User="LocalSystem" GenericAll="yes" />
         </CreateFolder>
         <RemoveFolder Id="RemoveConfigDir" On="uninstall" />
         <!-- Required: every Component needs a KeyPath -->
@@ -223,7 +240,7 @@
       <Component Id="LogDirComponent">
         <CreateFolder>
           <util:PermissionEx User="Administrators" GenericAll="yes" />
-          <util:PermissionEx User="SYSTEM" GenericAll="yes" />
+          <util:PermissionEx User="LocalSystem" GenericAll="yes" />
         </CreateFolder>
         <RemoveFolder Id="RemoveLogDir" On="uninstall" />
         <RegistryValue Root="HKLM"
@@ -265,6 +282,7 @@
                   Execute="deferred"
                   Impersonate="no"
                   Return="check"
+                  HideTarget="yes"
                   BinaryRef="Wix4UtilCA_X64" />
 
     <SetProperty Id="WriteTokenAcl"
@@ -276,6 +294,7 @@
                   Execute="deferred"
                   Impersonate="no"
                   Return="check"
+                  HideTarget="yes"
                   BinaryRef="Wix4UtilCA_X64" />
 
     <SetProperty Id="DelegateWmi"

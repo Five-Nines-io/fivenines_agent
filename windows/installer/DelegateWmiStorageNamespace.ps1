@@ -7,10 +7,11 @@
 # delegation the disk_health collector probes false on a low-priv install
 # and the headline feature silently degrades.
 #
-# This script reads the current namespace security descriptor, builds an
-# ACE granting WBEM_ENABLE | WBEM_METHOD_EXECUTE | WBEM_REMOTE_ENABLE to the
-# service account's SID, appends it to the DACL, and writes the SD back.
-# The ACE has CONTAINER_INHERIT set so sub-namespaces inherit the grant.
+# This script reads the current namespace security descriptor, adds an ACE
+# granting WBEM_ENABLE | WBEM_METHOD_EXECUTE | WBEM_REMOTE_ENABLE to the
+# service account's SID unless one already does (a reinstall keeps the
+# account), and writes the SD back. The ACE has CONTAINER_INHERIT set so
+# sub-namespaces inherit the grant.
 
 param(
     [Parameter(Mandatory=$true)][string]$ServiceAccount
@@ -20,67 +21,108 @@ $ErrorActionPreference = "Stop"
 
 $Namespace = "root\Microsoft\Windows\Storage"
 
+# Resolve the MSI's SERVICEACCOUNT to its SID. A "." or <ComputerName> prefix
+# is dropped and the bare name looked up instead: on a domain controller the
+# account the MSI created is a DOMAIN account (a DC has no local ones), and
+# the MSI's default "<DCNAME>\name" is not how the domain names it, while a
+# bare name is looked up in the machine's own account database on every
+# role (the local SAM on a member server, the domain on a DC).
+# Kept identical in SetTokenFileAcl.ps1 and DelegateWmiStorageNamespace.ps1
+# (windows.yml checks it).
+function Resolve-ServiceAccountSid {
+    param([Parameter(Mandatory=$true)][string]$Account)
+
+    $name = $Account
+    if ($name.Contains('\')) {
+        $parts = $name.Split('\', 2)
+        if ($parts[0] -eq '.' -or $parts[0] -eq $env:COMPUTERNAME) {
+            $name = $parts[1]
+        }
+    }
+    $ntAccount = New-Object System.Security.Principal.NTAccount($name)
+    return $ntAccount.Translate([System.Security.Principal.SecurityIdentifier])
+}
+
 # Resolve the service account to a SID. Translate raises if the account
 # does not exist - fail loudly here rather than silently writing a broken ACE.
-# Normalize ".\name" -> "name": NTAccount can't always resolve the dot-prefix
-# even though MSI uses it as the local-machine convention.
-$accountName = $ServiceAccount
-if ($accountName.StartsWith('.\')) {
-    $accountName = $accountName.Substring(2)
-}
-$ntAccount = New-Object System.Security.Principal.NTAccount($accountName)
-$sid = $ntAccount.Translate([System.Security.Principal.SecurityIdentifier]).Value
-Write-Host ("Service account {0} (resolved as {1}) -> SID {2}" -f $ServiceAccount, $accountName, $sid)
+$sid = (Resolve-ServiceAccountSid $ServiceAccount).Value
+Write-Host ("Service account {0} -> SID {1}" -f $ServiceAccount, $sid)
 
-# Read the current namespace security descriptor.
-# __SystemSecurity is a singleton; "__SystemSecurity=@" is the canonical
-# WMI path for the singleton instance (Invoke-WmiMethod can't be given the
-# class itself - it needs the instance).
-$secPath = "__SystemSecurity=@"
-$getResult = Invoke-WmiMethod `
-    -Namespace $Namespace `
-    -Path $secPath `
-    -Name GetSecurityDescriptor `
-    -ErrorAction Stop
-if ($getResult.ReturnValue -ne 0) {
-    throw ("GetSecurityDescriptor failed: ReturnValue={0}" -f $getResult.ReturnValue)
-}
-$sd = $getResult.Descriptor
+# The descriptor is read and written in binary form (GetSD/SetSD), never as
+# the object GetSecurityDescriptor returns: that one resolves every ACE's
+# trustee to a name, and fails ("unexpected error") once an ACE names an
+# account that no longer exists -- which an uninstall that deleted the
+# account used to leave behind, so the next install failed with 1603.
+# (Kept identical in fivenines_uninstall.ps1; windows.yml checks it.)
+# Read and write a WMI namespace's security descriptor in binary form
+# (__SystemSecurity GetSD/SetSD), with the args-array calling convention of
+# Microsoft's own namespace-security sample: the out parameter comes back in
+# the array, and SetSD takes the bytes as its one argument.
+function Get-WmiNamespaceSD {
+    param([string]$Namespace)
 
-# Build a new ACE granting the service account read access.
+    $security = Get-WmiObject -Namespace $Namespace -Class __SystemSecurity
+    $out = @($null)
+    $rv = $security.PsBase.InvokeMethod("GetSD", $out)
+    if ($rv -ne 0) { throw ("GetSD on {0} failed: {1}" -f $Namespace, $rv) }
+    return [System.Security.AccessControl.RawSecurityDescriptor]::new([byte[]]$out[0], 0)
+}
+
+function Set-WmiNamespaceSD {
+    param([string]$Namespace, [System.Security.AccessControl.RawSecurityDescriptor]$Descriptor)
+
+    # Raw .NET arrays: New-Object would hand back a PSObject-wrapped byte[],
+    # which InvokeMethod cannot cast to System.Array.
+    $bytes = [byte[]]::new($Descriptor.BinaryLength)
+    $Descriptor.GetBinaryForm($bytes, 0)
+    $arguments = [object[]]::new(1)
+    $arguments[0] = $bytes
+    $security = Get-WmiObject -Namespace $Namespace -Class __SystemSecurity
+    $rv = $security.PsBase.InvokeMethod("SetSD", $arguments)
+    if ($rv -ne 0) { throw ("SetSD on {0} failed: {1}" -f $Namespace, $rv) }
+}
+
+$sd = Get-WmiNamespaceSD $Namespace
+if ($null -eq $sd.DiscretionaryAcl) {
+    throw ("WMI namespace {0} has no DACL" -f $Namespace)
+}
+
 $WBEM_ENABLE         = 0x1
 $WBEM_METHOD_EXECUTE = 0x2
 $WBEM_REMOTE_ENABLE  = 0x20
-$ACCESS_ALLOWED      = 0
-$CONTAINER_INHERIT   = 0x2
+$mask = $WBEM_ENABLE -bor $WBEM_METHOD_EXECUTE -bor $WBEM_REMOTE_ENABLE
+$sidObject = [System.Security.Principal.SecurityIdentifier]$sid
+$allowed = [System.Security.AccessControl.AceQualifier]::AccessAllowed
 
-# [wmiclass] needs "<namespace>:<class>" - the namespace already contains
-# the necessary backslashes and PowerShell double-quoted strings keep them
-# literal.
-$aceClass = [wmiclass]"$($Namespace):__ACE"
-$ace = $aceClass.CreateInstance()
-$ace.AccessMask = $WBEM_ENABLE -bor $WBEM_METHOD_EXECUTE -bor $WBEM_REMOTE_ENABLE
-$ace.AceType    = $ACCESS_ALLOWED
-$ace.AceFlags   = $CONTAINER_INHERIT
-
-$trusteeClass = [wmiclass]"$($Namespace):__Trustee"
-$trustee = $trusteeClass.CreateInstance()
-$trustee.Name = $accountName
-$trustee.SidString = $sid
-$ace.Trustee = $trustee
-
-# Append to the DACL and write back.
-$dacl = @($sd.DACL) + $ace
-$sd.DACL = $dacl
-
-$setResult = Invoke-WmiMethod `
-    -Namespace $Namespace `
-    -Path $secPath `
-    -Name SetSecurityDescriptor `
-    -ArgumentList $sd `
-    -ErrorAction Stop
-if ($setResult.ReturnValue -ne 0) {
-    throw ("SetSecurityDescriptor failed: ReturnValue={0}" -f $setResult.ReturnValue)
+$alreadyGranted = $false
+foreach ($existingAce in $sd.DiscretionaryAcl) {
+    if ($existingAce -is [System.Security.AccessControl.CommonAce] -and
+        $existingAce.AceQualifier -eq $allowed -and
+        $existingAce.SecurityIdentifier -eq $sidObject -and
+        ($existingAce.AccessMask -band $mask) -eq $mask) {
+        $alreadyGranted = $true
+    }
 }
+
+if ($alreadyGranted) {
+    Write-Host ("{0} already has read access to WMI namespace {1}" -f $ServiceAccount, $Namespace)
+    exit 0
+}
+
+# Explicit ACEs go before inherited ones (the canonical order). IsInherited,
+# not "AceFlags -band Inherited": AceFlags is a byte enum, and Windows
+# PowerShell 5.1's -band on one raises "Specified cast is not valid".
+$position = $sd.DiscretionaryAcl.Count
+for ($i = 0; $i -lt $sd.DiscretionaryAcl.Count; $i++) {
+    if ($sd.DiscretionaryAcl[$i].IsInherited) {
+        $position = $i
+        break
+    }
+}
+$ace = [System.Security.AccessControl.CommonAce]::new(
+    [System.Security.AccessControl.AceFlags]::ContainerInherit, $allowed, $mask, $sidObject, $false, $null)
+$sd.DiscretionaryAcl.InsertAce($position, $ace)
+
+Set-WmiNamespaceSD $Namespace $sd
 
 Write-Host ("Granted {0} read access to WMI namespace {1}" -f $ServiceAccount, $Namespace)

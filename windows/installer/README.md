@@ -5,7 +5,8 @@ This directory builds the Windows MSI installer for the fivenines agent.
 - Install location: `%ProgramFiles%\fivenines-agent\` (admin-write-only).
 - Config dir: `%ProgramData%\fivenines_agent\` with a restrictive ACL.
 - Service: registered as `fivenines-agent` (Automatic Delayed Start) running
-  as a dedicated low-privilege local account in the Performance Monitor Users
+  as a dedicated low-privilege local account (a domain account on a domain
+  controller, see "Domain controllers" below) in the Performance Monitor Users
   group (D12). WMI Storage-namespace read access is delegated to that account
   by `DelegateWmiStorageNamespace.ps1` (D19) so disk-health works.
 - Token: passed via the **hidden** `TOKEN` MSI property (D21). Written to
@@ -15,12 +16,77 @@ This directory builds the Windows MSI installer for the fivenines agent.
 ## Files
 
 - `Product.wxs` - WiX 4 source. Components, service registration, ACL
-  components, and the two security custom-action hookups.
+  components, and the security custom-action hookups.
+- `CreateServiceAccount.ps1` - deferred custom action: creates (or rotates)
+  the service account, joins its groups, grants SeServiceLogonRight and the
+  config-dir ACL, and flips the service to it.
 - `SetTokenFileAcl.ps1` - deferred custom action: writes TOKEN with a
   restrictive ACL, inheritance broken.
 - `DelegateWmiStorageNamespace.ps1` - deferred custom action: grants the
   service account read access to `root\Microsoft\Windows\Storage` so the
   disk-health collector can query `MSFT_PhysicalDisk` without admin.
+
+## Rules the custom actions keep
+
+- **No principal by name.** Group and built-in account names are translated
+  with the OS install language, so `Performance Monitor Users`, `Users`,
+  `BUILTIN\Administrators` and `NT AUTHORITY\SYSTEM` are looked up by their
+  well-known SID (S-1-5-32-558, -545, -544, S-1-5-18), errors are matched by
+  HRESULT rather than message, and WiX's `util:PermissionEx` uses the names it
+  maps to a SID itself (`Administrators`, `LocalSystem`). A lookup by English
+  name fails on a non-English Windows.
+- **No LocalAccounts cmdlets for the account.** `Get-LocalUser`,
+  `Get-LocalGroup`, `Set-LocalUser` and `Add-LocalGroupMember` enumerate SAM one
+  entry at a time and drop any reply carrying more than one, which is what a
+  domain controller's directory-backed SAM sends: on a DC they find nothing
+  (only `New-LocalUser` works, so v1.22.0 created the account, then failed with
+  "Group Performance Monitor Users was not found" on an English DC). The account
+  and its groups go through the ADSI WinNT provider (`WinNT://<ComputerName>`,
+  the NetUser*/NetLocalGroup* APIs), which is the local SAM on a member server
+  and the domain on a DC.
+- **No secret in the log.** TOKEN and SERVICEACCOUNTPASSWORD are hidden
+  properties, and so are the CreateServiceAccount and WriteTokenAcl
+  properties the SetProperty actions copy them into, with `HideTarget` on
+  both custom actions: otherwise the verbose log (which the bootstrap scripts
+  always write) printed them three times each. The E2E and the DC runs search
+  every log for the values.
+- **Decide before msiexec.** `CreateServiceAccount.ps1 -PlanOnly` reads the
+  account, checks a supplied password and prints the plan without changing
+  anything. `fivenines_setup.ps1` and `fivenines_update.ps1` run it from the
+  MSI they downloaded (an administrative install extracts it and runs no
+  custom action) and stop on a refusal, because inside the MSI a refusal comes
+  after Windows Installer has removed the running agent on an upgrade. With
+  `-ServiceAccountPassword` and the same ProductCode installed, msiexec would
+  only run a maintenance pass, which never reaches the account: the scripts
+  run that account step themselves and restart the service, removing nothing.
+  A password is checked with a LogonUser network logon (no SMB session):
+  wrong, locked, disabled, expired and must-change are refused by name;
+  anything else (a host denying network logon) leaves it unchecked, as
+  before.
+- **The WMI namespace ACL in binary.** `DelegateWmiStorageNamespace.ps1` reads
+  and writes `root\Microsoft\Windows\Storage`'s descriptor with
+  `__SystemSecurity` `GetSD`/`SetSD` and `RawSecurityDescriptor`, never
+  `GetSecurityDescriptor`: that one resolves every ACE's trustee to a name and
+  fails ("unexpected error") once an ACE names a deleted account, which failed
+  a reinstall after `fivenines_uninstall.ps1` (or a hand-deleted account) with
+  1603. A grant already present is not added again, and the uninstall script
+  removes it. Two Windows PowerShell 5.1 traps met on the way: `-band` on a
+  byte-based enum such as `AceFlags` raises "Specified cast is not valid" (use
+  `IsInherited`), and `InvokeMethod` cannot take `New-Object`'s
+  PSObject-wrapped `byte[]` (use `[byte[]]::new`).
+- **Domain controllers.** On a DC the account is a domain account, the BUILTIN
+  groups are the domain's, and the account's qualified name is `<DOMAIN>\name`,
+  not the `[ComputerName]\name` the MSI defaults to, so every script resolves it
+  by SID (`Resolve-ServiceAccountSid`) and `sc.exe` gets the name the SID
+  translates back to. Whether a DC may rotate the password is `Get-AccountPlan`
+  in `CreateServiceAccount.ps1`, tracked by the account's Description (the
+  user-facing rules are in the main README, "Domain controllers"). No GitHub
+  runner can become a DC (promotion needs a reboot), so `windows.yml` tests
+  `Get-AccountPlan` case by case on every run, and its on-request
+  `smoke-msi-domain-controller` job (`gh workflow run windows.yml --ref <branch>
+  -f domain_controller=true`, about an hour) installs Windows Server 2019 in
+  English and German in QEMU/KVM, promotes it, reproduces v1.22.0's failure
+  and plays every account scenario (`ci/windows-dc/`).
 
 ## Build prerequisites
 

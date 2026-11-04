@@ -178,12 +178,16 @@ msiexec /i fivenines-agent-windows-amd64.msi TOKEN=xxxxx /qn /norestart
 |---|---|
 | `TOKEN` | Enrollment token (required). |
 | `SERVICEACCOUNT` | Use an existing **local** account instead of the MSI-managed one. Domain accounts must be pre-staged by the deployer. |
-| `SERVICEACCOUNTPASSWORD` | Required when `SERVICEACCOUNT` names an account the MSI did not create, so operator-managed credentials are never silently rotated. |
+| `SERVICEACCOUNTPASSWORD` | Required when `SERVICEACCOUNT` names an account the MSI did not create, so operator-managed credentials are never silently rotated, and on a domain controller whose account the MSI may not rotate (see [Domain controllers](#domain-controllers)). For an existing account it is checked first: a password that does not log the account on is refused. It cannot contain `"`, end with `\` or start with `-`. |
 
-`TOKEN` is declared in `MsiHiddenProperties`, so it does **not** land in the
-installer log. It is still briefly visible on the process command line and in
+`TOKEN` and `SERVICEACCOUNTPASSWORD` are declared in `MsiHiddenProperties`,
+and so is the custom-action data built from them, so neither lands in the
+installer log (`fivenines_setup.ps1` and `fivenines_update.ps1` always write a
+verbose one). Both are still briefly visible on the process command line, and
+so in process-creation auditing if your policy records command lines, and in
 your deployment tool's history -- acceptable for an enrollment-only secret,
-which the backend swaps for a per-host token on the agent's first sync.
+which the backend swaps for a per-host token on the agent's first sync; for a
+service account password, prefer the account the MSI manages itself.
 
 - **GPO**: assign the MSI per-machine (Computer Configuration -> Software
   Installation). Per-user assignment will not work; the service is machine-scoped.
@@ -198,6 +202,62 @@ newer MSI over an older one stops and re-registers the service and rotates the
 MSI-managed service-account password automatically -- no operator credentials
 needed.
 
+#### Domain controllers
+
+A domain controller has no local accounts, so on a DC the MSI creates
+`fivenines-agent` as a **domain** account (in the `Users` container). The
+installer adds it to the domain's built-in `Performance Monitor Users` and
+`Users`, which every DC of the domain shares; like every domain account, it is
+also in `Domain Users`, its primary group. A domain account can be shared by
+several DCs, so on a DC the password is rotated only when that cannot break
+another DC:
+
+- **One DC**: install as usual. The account gets a random password and the
+  description `Fivenines agent, managed on <DC name>`; that DC's updates rotate
+  it, uninstalling there deletes it.
+- **Several DCs, one account**: pick a password and pass it on every DC, the
+  first one included, at install **and** update. The first install creates the
+  account with it; if the account already exists (say, the first DC was
+  installed without a password), set that password on it in Active Directory
+  first, then update the first DC with it too:
+
+  ```powershell
+  $pw = Read-Host -AsSecureString "fivenines-agent password"
+  .\setup.ps1 -Token TOKEN -ServiceAccountPassword $pw
+  .\update.ps1 -ServiceAccountPassword $pw
+  ```
+
+  The account is then tagged `Fivenines agent, operator-managed password` and
+  never rotated, and uninstalling the agent from a DC keeps it (only that DC's
+  `Log on as a service` grant and WMI access are removed). When the version
+  is already installed, `update.ps1 -ServiceAccountPassword` (and `setup.ps1`)
+  applies the password to it with the MSI's own account step and restarts the
+  service: run it on every DC after you change the password in Active
+  Directory.
+- **Nothing is changed when the installer would refuse**: `setup.ps1` and
+  `update.ps1` first ask the MSI they downloaded what it will do with the
+  account, and stop before installing or removing anything when it would
+  refuse (a second DC without the password, an operator-managed account
+  without its password, or a password that does not log the account on).
+  `msiexec` used directly refuses the same cases with exit code 1603 and the
+  reason in the install log, but on an upgrade Windows Installer has already
+  removed the running agent by then.
+- **Uninstalling** deletes the account only when this DC's installer created
+  it, or when it is the account an earlier release left behind after failing
+  on a DC (described `Fivenines monitoring agent service account`).
+- **`Log on as a service`** is granted in the DC's own security policy, which
+  the Default Domain Controllers Policy leaves undefined. If one of your GPOs
+  defines that right for the domain controllers, add `fivenines-agent` to it,
+  or the next policy refresh removes the grant and the service no longer
+  starts.
+- **Install one DC at a time**, and on the next DC only once the account has
+  replicated to it: two DCs that both find no account create two
+  `fivenines-agent` users.
+- **Renaming a DC** makes the account it created read as another DC's: its
+  next update asks for `-ServiceAccountPassword`, and uninstalling keeps the
+  account. Set a password on the account and pass it, as for several DCs.
+- Read-only domain controllers have not been tested.
+
 #### Update and uninstall
 
 ```powershell
@@ -206,8 +266,10 @@ iwr https://releases.fivenines.io/latest/fivenines_update.ps1 -OutFile update.ps
 .\update.ps1
 
 # Uninstall: removes the MSI, the service, the local service account,
-# its SeServiceLogonRight grant, and the config + log directories.
-# Pass -KeepAccount to leave a pre-staged account in place.
+# its SeServiceLogonRight grant and WMI Storage access, and the config +
+# log directories.
+# Pass -KeepAccount to leave a pre-staged account in place. On a domain
+# controller, an account shared with other DCs is kept.
 iwr https://releases.fivenines.io/latest/fivenines_uninstall.ps1 -OutFile uninstall.ps1
 .\uninstall.ps1
 ```
@@ -218,16 +280,22 @@ The Windows install is least-privilege by construction -- the agent never runs
 as `LocalSystem` and never as an administrator:
 
 - **Dedicated local service account.** The MSI creates a local account --
-  `<ComputerName>\fivenines-agent` unless you override `SERVICEACCOUNT` -- with a
+  `<ComputerName>\fivenines-agent` unless you override `SERVICEACCOUNT`; a
+  domain account on a domain controller, see
+  [Domain controllers](#domain-controllers) -- with a
   cryptographically random 192-bit password that is never displayed and never
   written to the install log; only the SCM's LSA secret holds it. Its only group
   memberships are `Users` (to read the install directory) and **Performance
-  Monitor Users** (for the PDH handle-count metric), and it is granted exactly
-  one privilege: `SeServiceLogonRight`, which the SCM requires to start a service
-  under a non-built-in account. Re-installs rotate the password. If the account
+  Monitor Users** (for the PDH handle-count metric), plus, on a domain
+  controller, `Domain Users`, the primary group of every domain account; and it
+  is granted exactly one privilege: `SeServiceLogonRight`, which the SCM
+  requires to start a service under a non-built-in account. Re-installs rotate
+  the password. If the account
   already exists and was **not** created by the MSI, the install stops and asks
   for `SERVICEACCOUNTPASSWORD` instead of clobbering credentials your
-  config-management system may own.
+  config-management system may own. Groups and built-in principals are
+  resolved by their well-known SID, never by name, so the install works
+  whatever language Windows was installed in.
 - **Scoped WMI delegation.** Disk health reads
   `root\Microsoft\Windows\Storage`, which is admin-only by default. Rather than
   making the account an administrator, the installer delegates read access to
