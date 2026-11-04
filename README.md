@@ -205,9 +205,10 @@ needed.
 #### Domain controllers
 
 A domain controller has no local accounts, so on a DC the MSI creates
-`fivenines-agent` as a **domain** account (in the `Users` container), and its
-group memberships are the domain's built-in `Performance Monitor Users` and
-`Users`, which every DC of the domain shares. A domain account can be shared by
+`fivenines-agent` as a **domain** account (in the `Users` container). The
+installer adds it to the domain's built-in `Performance Monitor Users` and
+`Users`, which every DC of the domain shares; like every domain account, it is
+also in `Domain Users`, its primary group. A domain account can be shared by
 several DCs, so on a DC the password is rotated only when that cannot break
 another DC:
 
@@ -243,7 +244,7 @@ another DC:
   removed the running agent by then.
 - **Uninstalling** deletes the account only when this DC's installer created
   it, or when it is the account an earlier release left behind after failing
-  on this DC (described `Fivenines monitoring agent service account`).
+  on a DC (described `Fivenines monitoring agent service account`).
 - **`Log on as a service`** is granted in the DC's own security policy, which
   the Default Domain Controllers Policy leaves undefined. If one of your GPOs
   defines that right for the domain controllers, add `fivenines-agent` to it,
@@ -285,9 +286,11 @@ as `LocalSystem` and never as an administrator:
   cryptographically random 192-bit password that is never displayed and never
   written to the install log; only the SCM's LSA secret holds it. Its only group
   memberships are `Users` (to read the install directory) and **Performance
-  Monitor Users** (for the PDH handle-count metric), and it is granted exactly
-  one privilege: `SeServiceLogonRight`, which the SCM requires to start a service
-  under a non-built-in account. Re-installs rotate the password. If the account
+  Monitor Users** (for the PDH handle-count metric), plus, on a domain
+  controller, `Domain Users`, the primary group of every domain account; and it
+  is granted exactly one privilege: `SeServiceLogonRight`, which the SCM
+  requires to start a service under a non-built-in account. Re-installs rotate
+  the password. If the account
   already exists and was **not** created by the MSI, the install stops and asks
   for `SERVICEACCOUNTPASSWORD` instead of clobbering credentials your
   config-management system may own. Groups and built-in principals are
