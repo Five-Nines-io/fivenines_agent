@@ -396,7 +396,9 @@ jobs:
           if ($code -ne 1603 -or (Get-Calls).Count -ne 1) { throw "a failure was retried: exit $code after $((Get-Calls).Count) calls" }
           New-Fake @(0)
           Invoke-Msiexec -Arguments @("/a", "x.msi") -Quiet -FilePath $fake -RetrySeconds 0 | Out-Null
-          if ((Get-Calls)[0] -notmatch "/qn") { throw "-Quiet did not force /qn: $((Get-Calls)[0])" }
+          # @(...) around the call: a function's one-element array comes back as its element.
+          $first = @(Get-Calls)[0]
+          if ($first -notmatch "/qn") { throw "-Quiet did not force /qn: $first" }
           Write-Host "Always busy: four calls, then the code. A failure: one call. -Quiet: /qn."
           Remove-Item -LiteralPath $dir -Recurse -Force
 
