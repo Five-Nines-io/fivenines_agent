@@ -272,9 +272,11 @@ def test_bootstrap_downloads_into_a_private_directory(path):
     assert "-WorkDir $WorkDir" in code
     outside = _read(path).replace(_function(path, "New-PrivateWorkDirectory"), "")
     assert "$env:TEMP" not in outside
-    # Gone after a run that succeeds (the script's last statement), kept by a
-    # failed one; the extraction goes in the preflight's finally either way.
-    removal = "Remove-Item -LiteralPath $WorkDir -Recurse -Force -ErrorAction SilentlyContinue"
+    # Emptied after a run that succeeds (the script's last statement), kept
+    # whole by a failed one; the extraction goes in the preflight's finally
+    # either way. The directory itself stays: it is the recorded install
+    # source, whose path another user could otherwise recreate.
+    removal = "Get-ChildItem -LiteralPath $WorkDir -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue"
     assert code.count(removal) == 1
     after = code.split(removal, 1)[1].strip().splitlines()
     assert all(line.startswith("Write-Host ") for line in after if line.strip()), after

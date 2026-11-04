@@ -414,11 +414,13 @@ if ($svc.Status -ne "Running") {
     exit 1
 }
 
-# The run succeeded: its work directory goes (the MSI, and the log unless
-# -LogFile named another path), so a scheduled run (an RMM tool, a task)
-# leaves nothing behind in %TEMP%; a failed run exits before this line and
-# keeps it, for the log. Only SYSTEM and Administrators can write in it, so
-# the recursive removal meets nothing another user planted.
-Remove-Item -LiteralPath $WorkDir -Recurse -Force -ErrorAction SilentlyContinue
+# The run succeeded: what its work directory holds goes (the MSI, and the
+# log unless -LogFile named another path), so a scheduled run (an RMM tool, a
+# task) leaves no MSI copy behind in %TEMP%; a failed run exits before this
+# line and keeps it, for the log. The empty directory stays: Windows
+# Installer recorded it as the product's install source, and removed, its
+# path under C:\Windows\Temp could be recreated by any local user. Only SYSTEM
+# and Administrators can write in it, so the removal meets nothing planted.
+Get-ChildItem -LiteralPath $WorkDir -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host "Done. The agent will appear on the fivenines.io dashboard shortly."
