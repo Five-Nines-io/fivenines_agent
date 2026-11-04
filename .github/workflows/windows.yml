@@ -315,10 +315,26 @@ jobs:
             }
             if ((Get-AceCount $third "AccessDenied" $false) -ne 1) { throw "Remove-WmiStorageGrant removed a deny ACE" }
             Write-Host "Remove-WmiStorageGrant removed both allow ACEs and kept the deny ACE."
+
+            # An allow ACE without the whole mask (enable only) is no grant
+            # either: the grant adds the full one, and the removal takes both.
+            $fourth = New-TestUser "fn-wmi-d"
+            $sd = Get-WmiNamespaceSD $namespace
+            $sd.DiscretionaryAcl.InsertAce(0, [System.Security.AccessControl.CommonAce]::new(
+              [System.Security.AccessControl.AceFlags]::None,
+              [System.Security.AccessControl.AceQualifier]::AccessAllowed, 0x01,
+              [System.Security.Principal.SecurityIdentifier]$fourth, $false, $null))
+            Set-WmiNamespaceSD $namespace $sd
+            & windows/installer/DelegateWmiStorageNamespace.ps1 -ServiceAccount ".\fn-wmi-d"
+            if ((Get-AceCount $fourth "AccessAllowed" $false) -ne 2) { throw "a partial-mask allow ACE was taken for a grant" }
+            Remove-WmiStorageGrant $fourth
+            if ((Get-AceCount $fourth "AccessAllowed" $false) -ne 0) { throw "Remove-WmiStorageGrant left a partial-mask allow ACE" }
+            Write-Host "Granted over a partial-mask allow ACE; the removal took both."
           } finally {
             Remove-LocalUser -Name "fn-wmi-a" -ErrorAction SilentlyContinue
             Remove-LocalUser -Name "fn-wmi-b" -ErrorAction SilentlyContinue
             Remove-LocalUser -Name "fn-wmi-c" -ErrorAction SilentlyContinue
+            Remove-LocalUser -Name "fn-wmi-d" -ErrorAction SilentlyContinue
           }
 
       # The bootstraps' work directory: protected from inheritance, open to
@@ -397,8 +413,7 @@ jobs:
       # case by case under Windows PowerShell 5.1 (Get-PreflightVerdict is
       # pure): on the version already installed the password is applied in
       # place only to the account the service already runs as, and a
-      # password LogonUser did not answer for is refused on an upgrade, which
-      # removes the installed agent before the installer uses it.
+      # password LogonUser could not answer for is used with a warning.
       - name: Verify the bootstrap preflight's verdicts
         shell: powershell
         run: |
@@ -409,7 +424,7 @@ jobs:
 
           $accountSid = "S-1-5-21-1-2-3-1001"
           $svc = "HOST\fivenines-agent"
-          $reinstall = "fivenines_uninstall.ps1, then fivenines_setup.ps1"
+          $reinstall = "fivenines_uninstall.ps1 -KeepAccount, then fivenines_setup.ps1 -Token <token> -ServiceAccountPassword <password>"
           # A plan line as CreateServiceAccount.ps1 -PlanOnly prints it, and
           # as v1.22.1's printed it (no sid, no checked).
           function New-Plan($Action, $Sid = $accountSid, $Checked = $true, $Message = $null) {
@@ -437,6 +452,7 @@ jobs:
 
           # The MSI's own refusal stops everything.
           Check "MSI refuses"              (New-Plan "Refuse" $accountSid $true "wrong password") $true "same" $svc $accountSid "Refuse" @("Nothing was changed: wrong password")
+          Check "MSI refuses, upgrade"     (New-Plan "Refuse" $accountSid $true "wrong password") $true "other" "" "" "Refuse" @("Nothing was changed: wrong password")
           Check "MSI refuses, no password" (New-Plan "Refuse" $accountSid $false "needs a password") $false "none" "" "" "Refuse" @("Nothing was changed: needs a password")
 
           # msiexec runs: a fresh install or an upgrade.
@@ -445,12 +461,14 @@ jobs:
           Check "checked, upgrade"         (New-Plan "UseProvided") $true "other" "" "" "Install"
           Check "create, upgrade"          (New-Plan "Create" $null $false) $true "other" "" "" "Install"
 
-          # A password LogonUser did not answer for: refused on an upgrade
-          # (from an MSI too old to report it too), else a warning.
-          Check "unchecked, upgrade"       (New-Plan "UseProvided" $accountSid $false) $true "other" "" "" "Refuse" @("could not be checked", "-KeepAccount")
-          Check "older MSI, upgrade"       $older $true "other" "" "" "Refuse" @("could not be checked")
-          Check "unchecked, not installed" (New-Plan "UseProvided" $accountSid $false) $true "none" "" "" "Install" @("used unchecked")
-          Check "unchecked, same version"  (New-Plan "UseProvided" $accountSid $false) $true "same" $svc $accountSid "InPlace" @("used unchecked")
+          # A password LogonUser could not answer for (or an MSI too old to
+          # say) is used as given, with a warning, an upgrade included: the
+          # account step applies it, and a rerun repairs a wrong one in place.
+          Check "unchecked, upgrade"       (New-Plan "UseProvided" $accountSid $false) $true "other" "" "" "Install" @("could not be checked", "run this script again")
+          Check "older MSI, upgrade"       $older $true "other" "" "" "Install" @("could not be checked")
+          Check "older MSI, not installed" $older $true "none" "" "" "Install" @("could not be checked")
+          Check "unchecked, not installed" (New-Plan "UseProvided" $accountSid $false) $true "none" "" "" "Install" @("used as given")
+          Check "unchecked, same version"  (New-Plan "UseProvided" $accountSid $false) $true "same" $svc $accountSid "InPlace" @("used as given")
 
           # The version already installed: in place only for the account the
           # service runs as; anything else is a reinstall.
@@ -517,15 +535,15 @@ jobs:
             Set-LocalUser -Name "fn-plan-b" -AccountExpires (Get-Date).AddDays(-2)
             Check "expired account" (Get-Plan ".\fn-plan-b" $password) "Refuse" $sid $true "the account has expired"
 
-            # Network logon denied: LogonUser answers 1385
-            # (ERROR_LOGON_TYPE_NOT_GRANTED) and the script retries as a
-            # service logon. fn-plan-c may not log on as a service either, so
-            # its password is unchecked; fn-plan-d may (an account the agent
-            # already runs as, on a CIS-hardened host), so its password is
-            # checked, wrong and right. The entries are left for the deleted
-            # test accounts, which this runner never reuses.
+            # Network logon denied to the account, as CIS-hardened hosts deny
+            # it to every local account: LogonUser answers 1385
+            # (ERROR_LOGON_TYPE_NOT_GRANTED) only once the password was
+            # accepted, so the right password reads as checked and a wrong one
+            # still answers 1326. The entry is left for the deleted test
+            # account, which this runner never reuses.
             function Add-Right($Right, $Sid) {
               secedit /export /cfg $policy /areas USER_RIGHTS /quiet | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "secedit /export failed: $LASTEXITCODE" }
               $content = @(Get-Content $policy)
               if ($content -match "^$Right\s*=") {
                 $content = $content | ForEach-Object { if ($_ -match "^$Right\s*=") { $_.TrimEnd() + ",*$Sid" } else { $_ } }
@@ -534,18 +552,14 @@ jobs:
               }
               $content | Set-Content -Encoding ascii $policy
               secedit /configure /db $policyDb /cfg $policy /areas USER_RIGHTS /quiet | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "secedit /configure failed: $LASTEXITCODE" }
             }
             $sid = New-TestUser "fn-plan-c" $password
             Add-Right "SeDenyNetworkLogonRight" $sid
-            Check "network logon denied" (Get-Plan ".\fn-plan-c" $password) "UseProvided" $sid $false $null
-
-            $sid = New-TestUser "fn-plan-d" $password
-            Add-Right "SeDenyNetworkLogonRight" $sid
-            Add-Right "SeServiceLogonRight" $sid
-            Check "network denied, service granted, right password" (Get-Plan ".\fn-plan-d" $password) "UseProvided" $sid $true $null
-            Check "network denied, service granted, wrong password" (Get-Plan ".\fn-plan-d" "Wrong-$password") "Refuse" $sid $true "wrong password"
+            Check "network logon denied, right password" (Get-Plan ".\fn-plan-c" $password) "UseProvided" $sid $true $null
+            Check "network logon denied, wrong password" (Get-Plan ".\fn-plan-c" "Wrong-$password") "Refuse" $sid $true "wrong password"
           } finally {
-            foreach ($name in @("fn-plan-a", "fn-plan-b", "fn-plan-c", "fn-plan-d")) { Remove-LocalUser -Name $name -ErrorAction SilentlyContinue }
+            foreach ($name in @("fn-plan-a", "fn-plan-b", "fn-plan-c")) { Remove-LocalUser -Name $name -ErrorAction SilentlyContinue }
             Remove-Item $policy, $policyDb -ErrorAction SilentlyContinue
           }
           if ($script:failed -gt 0) { throw "$($script:failed) plan line case(s) failed" }
