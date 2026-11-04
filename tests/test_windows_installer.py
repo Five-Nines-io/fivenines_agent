@@ -84,6 +84,7 @@ def _constant(path, name):
         ("Get-PreflightVerdict", SETUP, UPDATE),
         ("Invoke-AccountPreflight", SETUP, UPDATE),
         ("New-PrivateWorkDirectory", SETUP, UPDATE),
+        ("New-PrivateWorkDirectory", SETUP, UNINSTALL),
         ("Get-WinNTUser", CREATE_ACCOUNT, UNINSTALL),
         ("Get-WmiNamespaceSD", DELEGATE_WMI, UNINSTALL),
         ("Set-WmiNamespaceSD", DELEGATE_WMI, UNINSTALL),
@@ -254,7 +255,7 @@ def test_bootstrap_resolves_a_relative_msi_path_first(path):
     ), f"{path} uses -MsiPath before resolving it"
 
 
-# Value: protects=the downloaded MSI, its extracted copy and the install log; fails_when=a default path, the extraction or the log goes back to a bare $env:TEMP (C:\\Windows\\Temp under an RMM tool running as SYSTEM, where a file any local user created stays theirs to rewrite before msiexec runs it); why_new=the E2E and the DC runs pass explicit -MsiPath/-LogFile, so the defaults run nowhere in CI; seam=none; no_claim=that the directory's ACL is private, which windows.yml's "Verify the bootstrap's private work directory" step checks on Windows
+# Value: protects=the downloaded MSI, its extracted copy and the install log; fails_when=a default path, the extraction or the log goes back to a bare $env:TEMP (C:\\Windows\\Temp under an RMM tool running as SYSTEM, where a file any local user created stays theirs to rewrite before msiexec runs it); why_new=the E2E and the DC runs pass explicit -MsiPath/-LogFile, so the defaults run nowhere in CI; seam=none; no_claim=that the directory's ACL is private, which windows.yml's "Verify the bootstrap's private work directory" steps check on Windows, under PowerShell 5.1 and 7
 @pytest.mark.parametrize("path", [SETUP, UPDATE])
 def test_bootstrap_downloads_into_a_private_directory(path):
     code = _code(path)
@@ -267,10 +268,37 @@ def test_bootstrap_downloads_into_a_private_directory(path):
     assert re.search(
         r"(?m)^if \(-not \$LogFile\) \{ \$LogFile = Join-Path \$WorkDir ", code
     )
-    assert "$image = Join-Path $WorkDir " in code
+    assert '$image = Join-Path $WorkDir "plan"' in code
     assert "-WorkDir $WorkDir" in code
     outside = _read(path).replace(_function(path, "New-PrivateWorkDirectory"), "")
     assert "$env:TEMP" not in outside
+    # Gone after a run that succeeds (the script's last statement), kept by a
+    # failed one; the extraction goes in the preflight's finally either way.
+    removal = "Remove-Item -LiteralPath $WorkDir -Recurse -Force -ErrorAction SilentlyContinue"
+    assert code.count(removal) == 1
+    after = code.split(removal, 1)[1].strip().splitlines()
+    assert all(line.startswith("Write-Host ") for line in after if line.strip()), after
+    assert re.search(
+        r"\} finally \{\s*Remove-Item -LiteralPath \$image ",
+        _function(path, "Invoke-AccountPreflight"),
+    )
+    # PowerShell 7's .NET has no Directory.CreateDirectory(path, ACL).
+    helper = _function(path, "New-PrivateWorkDirectory")
+    assert "FileSystemAclExtensions]::CreateDirectory($security, $path)" in helper
+
+
+# Value: protects=the uninstall log; fails_when=fivenines_uninstall.ps1's -LogFile default goes back to a bare $env:TEMP name (C:\\Windows\\Temp under an RMM tool running as SYSTEM) or a successful uninstall stops removing its work directory; why_new=the Windows runs pass an explicit -LogFile; seam=none; no_claim=that the ACL is private, which windows.yml's work directory steps check
+def test_uninstall_logs_into_a_private_directory():
+    code = _code(UNINSTALL)
+    assert re.search(r'(?m)^    \[string\]\$LogFile = ""$', code)
+    assert re.search(r"(?m)^\$WorkDir = New-PrivateWorkDirectory ", code)
+    assert re.search(
+        r"(?m)^if \(-not \$LogFile\) \{ \$LogFile = Join-Path \$WorkDir ", code
+    )
+    removal = "Remove-Item -LiteralPath $WorkDir -Recurse -Force -ErrorAction SilentlyContinue"
+    assert code.count(removal) == 2  # after -KeepAccount's exit 0, and at the end
+    after = code.rsplit(removal, 1)[1].strip().splitlines()
+    assert all(line.startswith("Write-Host ") for line in after if line.strip()), after
 
 
 # Value: protects=the plan contract between CreateServiceAccount.ps1 -PlanOnly and the bootstraps' preflight; fails_when=one side renames a key (a verdict reading $Plan.verified finds nothing, so every password reads unchecked and every upgrade given one is refused; one reading $Plan.account finds no SID, so every in-place password step is refused); why_new=windows.yml checks each side alone (the real plan line's keys, the verdict on hand-built plans), so a rename on one side passes both; seam=none; no_claim=that the values are right, which those two steps check

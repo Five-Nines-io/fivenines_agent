@@ -352,15 +352,55 @@ jobs:
           try {
             $acl = Get-Acl -LiteralPath $dir
             if (-not $acl.AreAccessRulesProtected) { throw "$dir inherits its parent's ACL" }
+            # SYSTEM and Administrators, plus read-only for this runner's user
+            # (the user running a bootstrap reads its log unelevated).
+            $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            $expected = (@("S-1-5-18", "S-1-5-32-544", $me) | Sort-Object -Unique) -join ","
+            $write = [int][System.Security.AccessControl.FileSystemRights]::Write
             $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
             $sids = @($rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
-            if (($sids -join ",") -ne "S-1-5-18,S-1-5-32-544") { throw "$dir is open to: $($sids -join ', ')" }
+            if (($sids -join ",") -ne $expected) { throw "$dir is open to: $($sids -join ', ')" }
             if (@($rules | Where-Object { $_.IsInherited -or $_.AccessControlType -ne 'Allow' }).Count -ne 0) { throw "$dir has an inherited or deny rule" }
+            if (@($rules | Where-Object { $_.IdentityReference.Value -eq $me -and ([int]$_.FileSystemRights -band $write) -ne 0 }).Count -ne 0) { throw "the running user can write in $dir" }
             Set-Content -LiteralPath (Join-Path $dir "probe.txt") -Value "x"
             $file = @((Get-Acl -LiteralPath (Join-Path $dir "probe.txt")).GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) |
               ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
-            if (($file -join ",") -ne "S-1-5-18,S-1-5-32-544") { throw "a file in $dir is open to: $($file -join ', ')" }
-            Write-Host "$dir and what is created in it are open to SYSTEM and Administrators only."
+            if (($file -join ",") -ne $expected) { throw "a file in $dir is open to: $($file -join ', ')" }
+            Write-Host "$dir and what is created in it: SYSTEM and Administrators, and the running user read-only."
+          } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      # The same under PowerShell 7, whose .NET has no
+      # Directory.CreateDirectory overload taking an ACL: the bootstraps are
+      # also run from pwsh.
+      - name: Verify the bootstrap's private work directory (PowerShell 7)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = Get-Content fivenines_setup.ps1 -Raw
+          $m = [regex]::Match($src, "(?ms)^function New-PrivateWorkDirectory \{.*?^\}")
+          if (-not $m.Success) { throw "New-PrivateWorkDirectory not found in fivenines_setup.ps1" }
+          Invoke-Expression $m.Value
+          $dir = New-PrivateWorkDirectory "fn-ci"
+          try {
+            $acl = Get-Acl -LiteralPath $dir
+            if (-not $acl.AreAccessRulesProtected) { throw "$dir inherits its parent's ACL" }
+            # SYSTEM and Administrators, plus read-only for this runner's user
+            # (the user running a bootstrap reads its log unelevated).
+            $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            $expected = (@("S-1-5-18", "S-1-5-32-544", $me) | Sort-Object -Unique) -join ","
+            $write = [int][System.Security.AccessControl.FileSystemRights]::Write
+            $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+            $sids = @($rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+            if (($sids -join ",") -ne $expected) { throw "$dir is open to: $($sids -join ', ')" }
+            if (@($rules | Where-Object { $_.IsInherited -or $_.AccessControlType -ne 'Allow' }).Count -ne 0) { throw "$dir has an inherited or deny rule" }
+            if (@($rules | Where-Object { $_.IdentityReference.Value -eq $me -and ([int]$_.FileSystemRights -band $write) -ne 0 }).Count -ne 0) { throw "the running user can write in $dir" }
+            Set-Content -LiteralPath (Join-Path $dir "probe.txt") -Value "x"
+            $file = @((Get-Acl -LiteralPath (Join-Path $dir "probe.txt")).GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) |
+              ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+            if (($file -join ",") -ne $expected) { throw "a file in $dir is open to: $($file -join ', ')" }
+            Write-Host "$dir and what is created in it: SYSTEM and Administrators, and the running user read-only."
           } finally {
             Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
           }
@@ -386,6 +426,7 @@ jobs:
             @('Get-PreflightVerdict', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
             @('Invoke-AccountPreflight', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
             @('New-PrivateWorkDirectory', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
+            @('New-PrivateWorkDirectory', 'fivenines_setup.ps1', 'fivenines_uninstall.ps1'),
             @('Get-WinNTUser', 'windows/installer/CreateServiceAccount.ps1', 'fivenines_uninstall.ps1'),
             @('Get-WmiNamespaceSD', 'windows/installer/DelegateWmiStorageNamespace.ps1', 'fivenines_uninstall.ps1'),
             @('Set-WmiNamespaceSD', 'windows/installer/DelegateWmiStorageNamespace.ps1', 'fivenines_uninstall.ps1')

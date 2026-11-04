@@ -38,7 +38,8 @@ param(
     [string]$MsiUrl = "https://releases.fivenines.io/latest/fivenines-agent-windows-amd64.msi",
 
     # Both default to a new private directory under %TEMP%
-    # (New-PrivateWorkDirectory below).
+    # (New-PrivateWorkDirectory below). A path given here is used as is: pick
+    # a directory only administrators can write to.
     [string]$MsiPath = "",
 
     [string]$LogFile = "",
@@ -50,12 +51,16 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# A new directory under %TEMP% that only SYSTEM and Administrators can open,
+# A new directory under %TEMP% that only SYSTEM and Administrators can write
+# to (the user running the script can read it),
 # for the downloaded MSI, its extracted copy and the install log; kept after
 # the run, for the log. Run as SYSTEM (an RMM tool, Intune, a scheduled task),
 # %TEMP% is C:\Windows\Temp, where any local user can create a file, and a
 # file a user created stays theirs to rewrite. The directory is created with
-# its ACL in one call, so it never exists with the inherited one.
+# its ACL in one call, so it never exists with the inherited one (Windows
+# PowerShell 5.1's .NET Framework has a Directory.CreateDirectory overload
+# taking the ACL; PowerShell 7's .NET moved it to FileSystemAclExtensions).
+# A run that succeeds removes it; a failed one keeps it, for the log.
 function New-PrivateWorkDirectory {
     param([string]$Prefix)
 
@@ -69,9 +74,25 @@ function New-PrivateWorkDirectory {
             [System.Security.AccessControl.PropagationFlags]::None,
             [System.Security.AccessControl.AccessControlType]::Allow)))
     }
+    # The user running the script reads what it leaves (the log of a failed
+    # run) from a session that is not elevated too, where the Administrators
+    # group does not apply: read-only, nothing to rewrite the MSI with.
+    $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    if ($user.Value -ne "S-1-5-18") {
+        $security.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $user,
+            [System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
+            [System.Security.AccessControl.InheritanceFlags]"ContainerInherit, ObjectInherit",
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow)))
+    }
     $path = Join-Path $env:TEMP ("{0}-{1}" -f $Prefix, [guid]::NewGuid())
     if (Test-Path -LiteralPath $path) { throw "$path already exists" }
-    [System.IO.Directory]::CreateDirectory($path, $security) | Out-Null
+    if ($PSVersionTable.PSEdition -eq "Core") {
+        [System.IO.FileSystemAclExtensions]::CreateDirectory($security, $path) | Out-Null
+    } else {
+        [System.IO.Directory]::CreateDirectory($path, $security) | Out-Null
+    }
     return $path
 }
 
@@ -266,7 +287,9 @@ function Invoke-AccountPreflight {
             $installed = if ($agent.PSChildName -eq $productCode) { "same" } else { "other" }
         }
     }
-    $image = Join-Path $WorkDir ("plan-" + [guid]::NewGuid())
+    # $WorkDir is already unique: a short name keeps the extracted payload's
+    # deepest path under MAX_PATH, which msiexec /a cannot exceed.
+    $image = Join-Path $WorkDir "plan"
     try {
         $plan = $null
         $planScript = $null
@@ -390,5 +413,12 @@ if ($svc.Status -ne "Running") {
     Write-Warning "Service did not reach Running state. Check the WinSW log at C:\ProgramData\fivenines_agent\logs\."
     exit 1
 }
+
+# The run succeeded: its work directory goes (the MSI, and the log unless
+# -LogFile named another path), so a scheduled run (an RMM tool, a task)
+# leaves nothing behind in %TEMP%; a failed run exits before this line and
+# keeps it, for the log. Only SYSTEM and Administrators can write in it, so
+# the recursive removal meets nothing another user planted.
+Remove-Item -LiteralPath $WorkDir -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host "Done. The agent will appear on the fivenines.io dashboard shortly."
