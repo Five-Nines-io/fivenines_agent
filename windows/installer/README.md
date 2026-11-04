@@ -82,11 +82,15 @@ This directory builds the Windows MSI installer for the fivenines agent.
   in `CreateServiceAccount.ps1`, tracked by the account's Description (the
   user-facing rules are in the main README, "Domain controllers"). No GitHub
   runner can become a DC (promotion needs a reboot), so `windows.yml` tests
-  `Get-AccountPlan` case by case on every run, and its on-request
-  `smoke-msi-domain-controller` job (`gh workflow run windows.yml --ref <branch>
-  -f domain_controller=true`, about an hour) installs Windows Server 2019 in
-  English and German in QEMU/KVM, promotes it, reproduces v1.22.0's failure
-  and plays every account scenario (`ci/windows-dc/`).
+  `Get-AccountPlan` case by case on every run, and its
+  `smoke-msi-domain-controller` job (about an hour) installs Windows Server 2019
+  in English and German in QEMU/KVM, promotes it, reproduces v1.22.0's failure
+  and plays every account scenario (`ci/windows-dc/`). It runs on a push that
+  changes `windows/installer/`, a `fivenines_*.ps1` bootstrap script,
+  `ci/windows-dc/` or `windows.yml`, and on request (`gh workflow run
+  windows.yml --ref <branch> -f domain_controller=true`), never on a tag: a
+  release waits for the member-server E2E only, since the DC job depends on
+  Microsoft's evaluation ISOs.
 
 ## Build prerequisites
 

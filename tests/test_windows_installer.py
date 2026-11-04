@@ -1,8 +1,9 @@
 """Static checks on the Windows installer's PowerShell and WiX sources.
 
 The scripts only run on Windows: .github/workflows/windows.yml exercises them
-on a member server, and its on-request smoke-msi-domain-controller job on real
-Windows Server 2019 domain controllers (ci/windows-dc/). Each check here pins
+on a member server, and its smoke-msi-domain-controller job (on a push that
+changes the installer, or on request) on real Windows Server 2019 domain
+controllers (ci/windows-dc/). Each check here pins
 a rule one of those runs taught, so a regression fails on any machine before
 a Windows run is ever dispatched:
 
@@ -32,6 +33,7 @@ SETUP = "fivenines_setup.ps1"
 UPDATE = "fivenines_update.ps1"
 UNINSTALL = "fivenines_uninstall.ps1"
 WINDOWS_WORKFLOW = ".github/workflows/windows.yml"
+RELEASE_WORKFLOW = ".github/workflows/build-release.yml"
 DC_UNATTEND = "ci/windows-dc/autounattend.xml.in"
 DC_RUNNER = "ci/windows-dc/run-vm.sh"
 DC_STAGE_SCRIPTS = (
@@ -177,18 +179,56 @@ def test_dc_harness_fills_every_template_field_and_ships_its_scripts():
         assert any(c.is_file() for c in candidates), name
 
 
-# Value: protects=what the DC job downloads; fails_when=an evaluation ISO or the v1.22.0 MSI loses its pinned SHA-256, or the hour-long job starts running on every push; why_new=nothing else reads these pins; seam=none; no_claim=that Microsoft still serves the same ISO
-def test_dc_job_pins_its_downloads_and_runs_on_request_only():
+# Value: protects=what the DC job downloads, and when its hour runs; fails_when=an evaluation ISO or the v1.22.0 MSI loses its pinned SHA-256, the job runs on a push that changed no installer file or on a tag (where a release would then depend on Microsoft's ISOs), or it stops running on a push that changed one; why_new=nothing else reads these pins or the trigger; seam=none; no_claim=that Microsoft still serves the same ISO, or that the path list names every file the DC scenarios exercise
+def test_dc_job_pins_its_downloads_and_runs_when_the_installer_changes():
     workflow = _read(WINDOWS_WORKFLOW)
     start = workflow.index("  smoke-msi-domain-controller:")
     job = workflow[start:]
+    assert "needs: [build-msi, installer-changed]" in job
     assert (
-        "if: github.event_name == 'workflow_dispatch' && inputs.domain_controller"
-        in job
+        "(github.event_name == 'workflow_dispatch' && inputs.domain_controller)" in job
     )
+    assert "needs.installer-changed.outputs.changed == 'true'" in job
     assert len(re.findall(r"iso_sha256: [0-9a-f]{64}\n", job)) == 2
     assert re.search(r"OLD_MSI_SHA256: [0-9a-f]{64}\n", job)
     assert "sha256sum -c -" in job
+
+    gate_start = workflow.index("  installer-changed:")
+    gate = workflow[gate_start:start]
+    assert (
+        "if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')"
+        in gate
+    )
+    paths = re.search(r"grep -E '\^\((.*)\)'", gate)
+    assert paths, "installer-changed lost its path list"
+    for watched in (
+        "windows/installer/",
+        "ci/windows-dc/",
+        "fivenines_(setup|update|uninstall)\\.ps1$",
+        "\\.github/workflows/windows\\.yml$",
+    ):
+        assert watched in paths.group(1), watched
+
+
+# Value: protects=every release's MSI; fails_when=the release job stops waiting for windows.yml's member-server E2E, windows.yml triggers on tags again (a second, unwaited run), or one of its artifacts matches the release's fivenines-agent-* download pattern (the E2E's MSI published as a release asset, or an upload clash with build-windows-amd64 in the same run); why_new=before this a release published whatever windows.yml said, and nothing reads the cross-workflow wiring; seam=none; no_claim=that the E2E itself is sufficient, which the E2E steps decide
+def test_release_waits_for_the_windows_e2e():
+    release = _read(RELEASE_WORKFLOW)
+    call_start = release.index("  windows-e2e:")
+    call = release[call_start:].split("\n  release:\n", 1)[0]
+    assert "if: startsWith(github.ref, 'refs/tags/v')" in call
+    assert "uses: ./.github/workflows/windows.yml" in call
+    needs = re.search(r"\n  release:\n(?:    #.*\n)*    needs: \[([^\]]*)\]", release)
+    assert needs, "release job lost its needs list"
+    assert "windows-e2e" in [n.strip() for n in needs.group(1).split(",")]
+
+    workflow = _read(WINDOWS_WORKFLOW)
+    on_start = workflow.index("\non:\n")
+    triggers = workflow[on_start:].split("\nconcurrency:", 1)[0]
+    assert "workflow_call:" in triggers
+    assert "tags:" not in triggers
+    assert "group: ${{ github.workflow }}" not in workflow
+    for name in re.findall(r"^\s+name: (\S+)$", workflow, re.MULTILINE):
+        assert not name.startswith("fivenines-agent-"), name
 
 
 # Value: protects=the upgrade of every account an earlier release created, and what the DC harness expects of the tags; fails_when=MSI_MANAGED_DESCRIPTION is reworded (a member-server upgrade then finds the account v1.22.0 or older created "not MSI-managed" and fails with 1603, and a DC no longer adopts it) or stage2.ps1's $Legacy/$Own/$OtherDc/$Operator drift from the installer's tags (S2/S4/S5 fail an hour into the DC run); why_new=windows.yml's Get-AccountPlan cases read the constants from the script, so they follow a reword, and only the member smoke's literal and the DC run's S2 catch it, on Windows; seam=none; no_claim=that the tags drive the right plan, which the Get-AccountPlan cases cover
