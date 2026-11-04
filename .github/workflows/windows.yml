@@ -349,6 +349,57 @@ jobs:
             Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
           }
 
+      # The bootstraps' msiexec wrapper, against a stand-in msiexec that
+      # answers 1618 twice, then 0: the busy answers are retried, a failure is
+      # not, and every call carries /norestart and exactly one UI level.
+      - name: Verify msiexec retries
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = Get-Content fivenines_setup.ps1 -Raw
+          $m = [regex]::Match($src, "(?ms)^function Invoke-Msiexec \{.*?^\}")
+          if (-not $m.Success) { throw "Invoke-Msiexec not found in fivenines_setup.ps1" }
+          Invoke-Expression $m.Value
+          $dir = Join-Path $env:RUNNER_TEMP ("fn-msiexec-" + [guid]::NewGuid())
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          $fake = Join-Path $dir "fake-msiexec.cmd"
+          $callsFile = Join-Path $dir "calls.txt"
+          # Answers the Nth call with the Nth code of $Codes, the last one after.
+          function New-Fake($Codes) {
+            $lines = @(
+              '@echo off',
+              'echo %*>>"%~dp0calls.txt"',
+              'for /f %%c in (''find /c /v "" ^< "%~dp0calls.txt"'') do set n=%%c'
+            )
+            for ($i = 0; $i -lt $Codes.Count - 1; $i++) { $lines += ('if %n%=={0} exit /b {1}' -f ($i + 1), $Codes[$i]) }
+            $lines += ('exit /b {0}' -f $Codes[-1])
+            Set-Content -LiteralPath $fake -Value $lines -Encoding ascii
+            Remove-Item -LiteralPath $callsFile -ErrorAction SilentlyContinue
+          }
+          function Get-Calls { return @(Get-Content -LiteralPath $callsFile) }
+
+          New-Fake @(1618, 1618, 0)
+          $code = Invoke-Msiexec -Arguments @("/i", "x.msi") -FilePath $fake -RetrySeconds 0
+          $calls = Get-Calls
+          if ($code -ne 0 -or $calls.Count -ne 3) { throw "busy twice then done: exit $code after $($calls.Count) calls, expected 0 after 3" }
+          foreach ($call in $calls) {
+            $ui = @($call -split " " | Where-Object { $_ -in @("/qb", "/qn") })
+            if ($ui.Count -ne 1 -or $call -notmatch "/norestart") { throw "unexpected msiexec arguments: $call" }
+          }
+          Write-Host "1618 twice, then 0: three calls, each with one UI level ($ui) and /norestart."
+
+          New-Fake @(1601)
+          $code = Invoke-Msiexec -Arguments @("/x", "{x}") -FilePath $fake -RetrySeconds 0
+          if ($code -ne 1601 -or (Get-Calls).Count -ne 4) { throw "always busy: exit $code after $((Get-Calls).Count) calls, expected 1601 after 4" }
+          New-Fake @(1603)
+          $code = Invoke-Msiexec -Arguments @("/i", "x.msi") -FilePath $fake -RetrySeconds 0
+          if ($code -ne 1603 -or (Get-Calls).Count -ne 1) { throw "a failure was retried: exit $code after $((Get-Calls).Count) calls" }
+          New-Fake @(0)
+          Invoke-Msiexec -Arguments @("/a", "x.msi") -Quiet -FilePath $fake -RetrySeconds 0 | Out-Null
+          if ((Get-Calls)[0] -notmatch "/qn") { throw "-Quiet did not force /qn: $((Get-Calls)[0])" }
+          Write-Host "Always busy: four calls, then the code. A failure: one call. -Quiet: /qn."
+          Remove-Item -LiteralPath $dir -Recurse -Force
+
       # Helpers duplicated across scripts that cannot share a file: the
       # custom actions are separate MSI files, the bootstraps are downloaded
       # one by one.
@@ -370,6 +421,8 @@ jobs:
             @('Get-PreflightVerdict', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
             @('Invoke-AccountPreflight', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
             @('New-PrivateWorkDirectory', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
+            @('Invoke-Msiexec', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
+            @('Invoke-Msiexec', 'fivenines_setup.ps1', 'fivenines_uninstall.ps1'),
             @('Get-WinNTUser', 'windows/installer/CreateServiceAccount.ps1', 'fivenines_uninstall.ps1'),
             @('Get-WmiNamespaceSD', 'windows/installer/DelegateWmiStorageNamespace.ps1', 'fivenines_uninstall.ps1'),
             @('Set-WmiNamespaceSD', 'windows/installer/DelegateWmiStorageNamespace.ps1', 'fivenines_uninstall.ps1')

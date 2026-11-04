@@ -84,6 +84,8 @@ def _constant(path, name):
         ("Get-PreflightVerdict", SETUP, UPDATE),
         ("Invoke-AccountPreflight", SETUP, UPDATE),
         ("New-PrivateWorkDirectory", SETUP, UPDATE),
+        ("Invoke-Msiexec", SETUP, UPDATE),
+        ("Invoke-Msiexec", SETUP, UNINSTALL),
         ("Get-WinNTUser", CREATE_ACCOUNT, UNINSTALL),
         ("Get-WmiNamespaceSD", DELEGATE_WMI, UNINSTALL),
         ("Set-WmiNamespaceSD", DELEGATE_WMI, UNINSTALL),
@@ -215,7 +217,7 @@ def test_tags_match_earlier_releases_and_the_dc_harness():
     assert _constant(stage2, "Operator") == operator
 
 
-# Value: protects=-ServiceAccountPassword on fivenines_setup.ps1 and fivenines_update.ps1: refused before the MSI is downloaded, and once accepted handed to msiexec; fails_when=the converted argument stops reaching the array msiexec gets (PowerShell reads a renamed or misspelled variable as $null, so the install silently runs without the password and fails with 1603 on a DC whose account is shared) or the check moves after the download; why_new=no Windows run executes fivenines_update.ps1 (the DC run's S5 runs only fivenines_setup.ps1) and windows.yml checks ConvertTo-MsiPasswordArgument's body, not how the scripts use it; seam=none; no_claim=that msiexec and the custom action parse the argument, which S5 proves for the setup script
+# Value: protects=-ServiceAccountPassword on fivenines_setup.ps1 and fivenines_update.ps1: refused before the MSI is downloaded, and once accepted handed to msiexec; fails_when=the converted argument stops reaching the array msiexec gets (PowerShell reads a renamed or misspelled variable as $null, so the install silently runs without the password and fails with 1603 on a DC whose account is shared) or the check moves after the download; why_new=the E2Es run the scripts only on Windows after the MSI build, and windows.yml checks ConvertTo-MsiPasswordArgument's body, not how the scripts use it; seam=none; no_claim=that msiexec and the custom action parse the argument, which S5 proves for the setup script
 @pytest.mark.parametrize("path", [SETUP, UPDATE])
 def test_bootstrap_checks_the_password_first_and_hands_it_to_msiexec(path):
     code = _code(path)
@@ -226,7 +228,7 @@ def test_bootstrap_checks_the_password_first_and_hands_it_to_msiexec(path):
     assert convert.start() < code.index(
         "Invoke-WebRequest"
     ), f"{path} downloads the MSI before checking -ServiceAccountPassword"
-    msiexec = re.search(r"Start-Process msiexec\.exe -ArgumentList \$(\w+)", code)
+    msiexec = re.search(r"Invoke-Msiexec -Arguments \$(\w+)", code)
     assert msiexec, f"{path} does not run msiexec"
     before_msiexec = code[: msiexec.start()]
     built = list(re.finditer(r"\$%s = @\(" % msiexec.group(1), before_msiexec))
@@ -271,6 +273,18 @@ def test_bootstrap_downloads_into_a_private_directory(path):
     assert "-WorkDir $WorkDir" in code
     outside = _read(path).replace(_function(path, "New-PrivateWorkDirectory"), "")
     assert "$env:TEMP" not in outside
+
+
+# Value: protects=every install, update and uninstall the bootstraps run; fails_when=an msiexec call bypasses Invoke-Msiexec (no retry of the Windows Installer service's 1601/1618, /qb's error box hanging an RMM run forever, an automatic restart under /qn) or a "/qb" comes back in a call site; why_new=windows.yml tests Invoke-Msiexec's body, not that the scripts call it; seam=none; no_claim=that the retry and the window choice work, which windows.yml's "Verify msiexec retries" step runs
+@pytest.mark.parametrize("path", [SETUP, UPDATE, UNINSTALL])
+def test_bootstraps_run_msiexec_only_through_invoke_msiexec(path):
+    outside = _code(path).replace(_function(path, "Invoke-Msiexec"), "")
+    assert "Invoke-Msiexec -Arguments" in outside
+    assert not re.search(r"Start-Process\s+msiexec", outside, re.IGNORECASE)
+    assert '"/qb"' not in outside
+    helper = _function(path, "Invoke-Msiexec")
+    assert '"/norestart"' in helper
+    assert "1601" in helper and "1618" in helper
 
 
 # Value: protects=the plan contract between CreateServiceAccount.ps1 -PlanOnly and the bootstraps' preflight; fails_when=one side renames a key (a verdict reading $Plan.verified finds nothing, so every password reads unchecked and every upgrade given one is refused; one reading $Plan.account finds no SID, so every in-place password step is refused); why_new=windows.yml checks each side alone (the real plan line's keys, the verdict on hand-built plans), so a rename on one side passes both; seam=none; no_claim=that the values are right, which those two steps check
