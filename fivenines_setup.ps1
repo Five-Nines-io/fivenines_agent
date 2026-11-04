@@ -37,9 +37,11 @@ param(
 
     [string]$MsiUrl = "https://releases.fivenines.io/latest/fivenines-agent-windows-amd64.msi",
 
-    [string]$MsiPath = (Join-Path $env:TEMP "fivenines-agent-windows-amd64.msi"),
+    # Both default to a new private directory under %TEMP%
+    # (New-PrivateWorkDirectory below).
+    [string]$MsiPath = "",
 
-    [string]$LogFile = (Join-Path $env:TEMP "fivenines-setup.log"),
+    [string]$LogFile = "",
 
     # The service account's password, when the account already exists and
     # is not one the MSI may rotate (see the domain controller note above).
@@ -47,6 +49,35 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# A new directory under %TEMP% that only SYSTEM and Administrators can open,
+# for the downloaded MSI, its extracted copy and the install log; kept after
+# the run, for the log. Run as SYSTEM (an RMM tool, Intune, a scheduled task),
+# %TEMP% is C:\Windows\Temp, where any local user can create a file, and a
+# file a user created stays theirs to rewrite. The directory is created with
+# its ACL in one call, so it never exists with the inherited one.
+function New-PrivateWorkDirectory {
+    param([string]$Prefix)
+
+    $security = New-Object System.Security.AccessControl.DirectorySecurity
+    $security.SetAccessRuleProtection($true, $false)
+    foreach ($sid in @("S-1-5-18", "S-1-5-32-544")) {  # SYSTEM, Administrators
+        $security.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            (New-Object System.Security.Principal.SecurityIdentifier($sid)),
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            [System.Security.AccessControl.InheritanceFlags]"ContainerInherit, ObjectInherit",
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow)))
+    }
+    $path = Join-Path $env:TEMP ("{0}-{1}" -f $Prefix, [guid]::NewGuid())
+    if (Test-Path -LiteralPath $path) { throw "$path already exists" }
+    [System.IO.Directory]::CreateDirectory($path, $security) | Out-Null
+    return $path
+}
+
+$WorkDir = New-PrivateWorkDirectory "fivenines-setup"
+if (-not $MsiPath) { $MsiPath = Join-Path $WorkDir "fivenines-agent-windows-amd64.msi" }
+if (-not $LogFile) { $LogFile = Join-Path $WorkDir "fivenines-setup.log" }
 
 # A relative -MsiPath, resolved once against PowerShell's current location:
 # the ProductCode read (COM) resolves one against the process's working
@@ -207,7 +238,7 @@ function Get-PreflightVerdict {
 # or one that cannot be read, leaves the decision to the installer, except
 # over this very version.
 function Invoke-AccountPreflight {
-    param([string]$MsiPath, [System.Security.SecureString]$Password)
+    param([string]$MsiPath, [System.Security.SecureString]$Password, [string]$WorkDir)
 
     $plain = if ($Password) {
         (New-Object System.Management.Automation.PSCredential("x", $Password)).GetNetworkCredential().Password
@@ -234,7 +265,7 @@ function Invoke-AccountPreflight {
             $installed = if ($agent.PSChildName -eq $productCode) { "same" } else { "other" }
         }
     }
-    $image = Join-Path $env:TEMP ("fivenines-plan-" + [guid]::NewGuid())
+    $image = Join-Path $WorkDir ("plan-" + [guid]::NewGuid())
     try {
         $plan = $null
         $planScript = $null
@@ -314,7 +345,7 @@ Unblock-File -Path $MsiPath
 
 $applied = $false
 try {
-    $applied = Invoke-AccountPreflight -MsiPath $MsiPath -Password $ServiceAccountPassword
+    $applied = Invoke-AccountPreflight -MsiPath $MsiPath -Password $ServiceAccountPassword -WorkDir $WorkDir
 } catch {
     Write-Error $_
     exit 1

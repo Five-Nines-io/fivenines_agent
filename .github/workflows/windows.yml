@@ -321,6 +321,34 @@ jobs:
             Remove-LocalUser -Name "fn-wmi-c" -ErrorAction SilentlyContinue
           }
 
+      # The bootstraps' work directory: protected from inheritance, open to
+      # SYSTEM and Administrators only, so no other local user can create or
+      # rewrite the MSI, its extracted copy or the log in it.
+      - name: Verify the bootstrap's private work directory
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = Get-Content fivenines_setup.ps1 -Raw
+          $m = [regex]::Match($src, "(?ms)^function New-PrivateWorkDirectory \{.*?^\}")
+          if (-not $m.Success) { throw "New-PrivateWorkDirectory not found in fivenines_setup.ps1" }
+          Invoke-Expression $m.Value
+          $dir = New-PrivateWorkDirectory "fn-ci"
+          try {
+            $acl = Get-Acl -LiteralPath $dir
+            if (-not $acl.AreAccessRulesProtected) { throw "$dir inherits its parent's ACL" }
+            $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+            $sids = @($rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+            if (($sids -join ",") -ne "S-1-5-18,S-1-5-32-544") { throw "$dir is open to: $($sids -join ', ')" }
+            if (@($rules | Where-Object { $_.IsInherited -or $_.AccessControlType -ne 'Allow' }).Count -ne 0) { throw "$dir has an inherited or deny rule" }
+            Set-Content -LiteralPath (Join-Path $dir "probe.txt") -Value "x"
+            $file = @((Get-Acl -LiteralPath (Join-Path $dir "probe.txt")).GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) |
+              ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+            if (($file -join ",") -ne "S-1-5-18,S-1-5-32-544") { throw "a file in $dir is open to: $($file -join ', ')" }
+            Write-Host "$dir and what is created in it are open to SYSTEM and Administrators only."
+          } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
       # Helpers duplicated across scripts that cannot share a file: the
       # custom actions are separate MSI files, the bootstraps are downloaded
       # one by one.
@@ -341,6 +369,7 @@ jobs:
             @('Get-MsiProductCode', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
             @('Get-PreflightVerdict', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
             @('Invoke-AccountPreflight', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
+            @('New-PrivateWorkDirectory', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
             @('Get-WinNTUser', 'windows/installer/CreateServiceAccount.ps1', 'fivenines_uninstall.ps1'),
             @('Get-WmiNamespaceSD', 'windows/installer/DelegateWmiStorageNamespace.ps1', 'fivenines_uninstall.ps1'),
             @('Set-WmiNamespaceSD', 'windows/installer/DelegateWmiStorageNamespace.ps1', 'fivenines_uninstall.ps1')

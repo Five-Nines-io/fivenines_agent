@@ -83,6 +83,7 @@ def _constant(path, name):
         ("Get-MsiProductCode", SETUP, UPDATE),
         ("Get-PreflightVerdict", SETUP, UPDATE),
         ("Invoke-AccountPreflight", SETUP, UPDATE),
+        ("New-PrivateWorkDirectory", SETUP, UPDATE),
         ("Get-WinNTUser", CREATE_ACCOUNT, UNINSTALL),
         ("Get-WmiNamespaceSD", DELEGATE_WMI, UNINSTALL),
         ("Set-WmiNamespaceSD", DELEGATE_WMI, UNINSTALL),
@@ -251,6 +252,25 @@ def test_bootstrap_resolves_a_relative_msi_path_first(path):
     assert resolve.start() < code.index(
         "Invoke-WebRequest"
     ), f"{path} uses -MsiPath before resolving it"
+
+
+# Value: protects=the downloaded MSI, its extracted copy and the install log; fails_when=a default path, the extraction or the log goes back to a bare $env:TEMP (C:\\Windows\\Temp under an RMM tool running as SYSTEM, where a file any local user created stays theirs to rewrite before msiexec runs it); why_new=the E2E and the DC runs pass explicit -MsiPath/-LogFile, so the defaults run nowhere in CI; seam=none; no_claim=that the directory's ACL is private, which windows.yml's "Verify the bootstrap's private work directory" step checks on Windows
+@pytest.mark.parametrize("path", [SETUP, UPDATE])
+def test_bootstrap_downloads_into_a_private_directory(path):
+    code = _code(path)
+    assert re.search(r'(?m)^    \[string\]\$MsiPath = "",$', code)
+    assert re.search(r'(?m)^    \[string\]\$LogFile = "",$', code)
+    assert re.search(r"(?m)^\$WorkDir = New-PrivateWorkDirectory ", code)
+    assert re.search(
+        r"(?m)^if \(-not \$MsiPath\) \{ \$MsiPath = Join-Path \$WorkDir ", code
+    )
+    assert re.search(
+        r"(?m)^if \(-not \$LogFile\) \{ \$LogFile = Join-Path \$WorkDir ", code
+    )
+    assert "$image = Join-Path $WorkDir " in code
+    assert "-WorkDir $WorkDir" in code
+    outside = _read(path).replace(_function(path, "New-PrivateWorkDirectory"), "")
+    assert "$env:TEMP" not in outside
 
 
 # Value: protects=the plan contract between CreateServiceAccount.ps1 -PlanOnly and the bootstraps' preflight; fails_when=one side renames a key (a verdict reading $Plan.verified finds nothing, so every password reads unchecked and every upgrade given one is refused; one reading $Plan.account finds no SID, so every in-place password step is refused); why_new=windows.yml checks each side alone (the real plan line's keys, the verdict on hand-built plans), so a rename on one side passes both; seam=none; no_claim=that the values are right, which those two steps check
