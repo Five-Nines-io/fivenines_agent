@@ -43,10 +43,21 @@
 #     WinNT://<ComputerName> is the machine's own account database on every
 #     role: the local SAM on a member server, the domain on a DC.
 #   * SeServiceLogonRight is required by SCM for any non-built-in account.
+#   * A password supplied for an EXISTING account is checked against it
+#     before anything uses it: sc.exe accepts any password, so a wrong one
+#     used to surface only as a service that never starts (and, on a DC,
+#     after the account had been retagged).
+#   * -PlanOnly decides and changes nothing: it prints one
+#     "FIVENINES_PLAN <json>" line ({action, message}) and exits. The
+#     bootstrap scripts run it from the MSI they are about to install, before
+#     msiexec, because a refusal inside the MSI comes too late on an upgrade:
+#     Windows Installer has already removed the running agent by then, and a
+#     failed install does not put it back.
 
 param(
     [Parameter(Mandatory=$true)][string]$ServiceAccount,
-    [string]$Password = ""
+    [string]$Password = "",
+    [switch]$PlanOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -245,18 +256,6 @@ function Get-AccountPlan {
         "Domain account '{0}' exists (Description={1}) and this installer will not change its password: on a domain controller it is a domain account, which other domain controllers may run the agent as. Re-run with SERVICEACCOUNTPASSWORD=<the account's current password> (fivenines_setup.ps1 or fivenines_update.ps1 -ServiceAccountPassword)." -f $AccountName, $Description) }
 }
 
-# True when the exception, or one it wraps, carries this HRESULT. ADSI
-# errors reach PowerShell as a COMException inside one or two invocation
-# exceptions.
-function Test-HResult {
-    param([System.Exception]$Exception, [int]$HResult)
-
-    for ($e = $Exception; $e; $e = $e.InnerException) {
-        if ($e.HResult -eq $HResult) { return $true }
-    }
-    return $false
-}
-
 # Kept identical in fivenines_uninstall.ps1 (windows.yml checks it).
 # The WinNT entry of this machine's user NAME, or $null when there is none.
 # [ADSI]::Exists() does not answer that for WinNT: it raises NERR_UserNotFound
@@ -271,8 +270,11 @@ function Get-WinNTUser {
     try {
         $entry.psbase.RefreshCache()
     } catch {
-        # NERR_UserNotFound (2221, 0x800708AD), ERROR_NO_SUCH_USER (1317, 0x80070525).
-        if ((Test-HResult $_.Exception -2147022675) -or (Test-HResult $_.Exception -2147023579)) { return $null }
+        # NERR_UserNotFound (2221, 0x800708AD), ERROR_NO_SUCH_USER (1317,
+        # 0x80070525), from the COMException that PowerShell's invocation
+        # exceptions wrap (the innermost one).
+        $hresult = $_.Exception.GetBaseException().HResult
+        if ($hresult -eq -2147022675 -or $hresult -eq -2147023579) { return $null }
         throw
     }
     if ($null -eq $entry.psbase.Properties["objectSid"].Value) {
@@ -294,8 +296,30 @@ function Add-AccountToBuiltinGroup {
         $group.Add(("WinNT://{0}/{1},user" -f $env:COMPUTERNAME, $AccountName))
         return $true
     } catch {
-        if (Test-HResult $_.Exception $HRESULT_MEMBER_IN_ALIAS) { return $false }
+        if ($_.Exception.GetBaseException().HResult -eq $HRESULT_MEMBER_IN_ALIAS) { return $false }
         throw
+    }
+}
+
+# Whether this password logs the existing account on: a network-logon check
+# against the machine's SAM (member server) or the domain (DC). One failed
+# attempt counts toward the account's lockout threshold. A locked, disabled
+# or must-change-password account reads as a mismatch too, and the service
+# could not log on with it either.
+function Test-AccountPassword {
+    param([string]$AccountName, [string]$Password, [bool]$IsDomainController)
+
+    Add-Type -AssemblyName System.DirectoryServices.AccountManagement
+    $contextType = if ($IsDomainController) {
+        [System.DirectoryServices.AccountManagement.ContextType]::Domain
+    } else {
+        [System.DirectoryServices.AccountManagement.ContextType]::Machine
+    }
+    $context = New-Object System.DirectoryServices.AccountManagement.PrincipalContext($contextType)
+    try {
+        return $context.ValidateCredentials($AccountName, $Password)
+    } finally {
+        $context.Dispose()
     }
 }
 
@@ -312,6 +336,18 @@ $plan = Get-AccountPlan `
     -HasPassword (-not [string]::IsNullOrEmpty($Password)) `
     -AccountName $bareName `
     -ComputerName $env:COMPUTERNAME
+
+# UseProvided is the one plan for an existing account that takes the
+# operator's password: check it before it is used, or retags anything.
+if ($plan.Action -eq "UseProvided" -and -not (Test-AccountPassword $bareName $Password $isDomainController)) {
+    $plan = @{ Action = "Refuse"; Description = $null; Message = (
+        "The SERVICEACCOUNTPASSWORD given does not log {0} account '{1}' on (wrong password, or the account is locked, disabled or must change its password). Nothing was changed." -f $accountKind, $bareName) }
+}
+
+if ($PlanOnly) {
+    Write-Output ("FIVENINES_PLAN " + (ConvertTo-Json -Compress @{ action = $plan.Action; message = $plan.Message }))
+    exit 0
+}
 
 if ($plan.Action -eq "Refuse") {
     throw $plan.Message

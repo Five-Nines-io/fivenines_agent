@@ -42,6 +42,8 @@ DC_STAGE_SCRIPTS = (
 
 
 def _read(path):
+    # Text mode: a CRLF checkout (Windows CI) reads as LF, so the multiline
+    # regexes' ^ and $ hold there too.
     return (REPO_ROOT / path).read_text(encoding="utf-8")
 
 
@@ -58,7 +60,7 @@ def _code(path):
 def _function(path, name):
     match = re.search(
         r"(?ms)^function %s \{.*?^\}" % re.escape(name),
-        _read(path).replace("\r\n", "\n"),
+        _read(path),
     )
     assert match, f"function {name} not found in {path}"
     return match.group(0)
@@ -76,7 +78,8 @@ def _constant(path, name):
     [
         ("Resolve-ServiceAccountSid", TOKEN_ACL, DELEGATE_WMI),
         ("ConvertTo-MsiPasswordArgument", SETUP, UPDATE),
-        ("Test-HResult", CREATE_ACCOUNT, UNINSTALL),
+        ("Get-MsiAccountPlan", SETUP, UPDATE),
+        ("Invoke-AccountPreflight", SETUP, UPDATE),
         ("Get-WinNTUser", CREATE_ACCOUNT, UNINSTALL),
         ("Get-WmiNamespaceSD", DELEGATE_WMI, UNINSTALL),
         ("Set-WmiNamespaceSD", DELEGATE_WMI, UNINSTALL),
@@ -154,6 +157,9 @@ def test_description_tags_fit_and_agree():
     ):
         assert len(tag) <= 48, tag
     assert _constant(UNINSTALL, "DC_MANAGED_PREFIX") == prefix
+    assert _constant(UNINSTALL, "MSI_MANAGED_DESCRIPTION") == _constant(
+        CREATE_ACCOUNT, "MSI_MANAGED_DESCRIPTION"
+    )
 
 
 # Value: protects=the domain-controller E2E harness; fails_when=the autounattend template gains a field run-vm.sh does not fill (Setup then stops on a literal @FIELD@) or the runner copies a stage script or bootstrap script that no longer exists; why_new=a broken harness only shows after an hour-long VM run; seam=none; no_claim=that Windows Setup accepts the answer file
@@ -183,3 +189,120 @@ def test_dc_job_pins_its_downloads_and_runs_on_request_only():
     assert len(re.findall(r"iso_sha256: [0-9a-f]{64}\n", job)) == 2
     assert re.search(r"OLD_MSI_SHA256: [0-9a-f]{64}\n", job)
     assert "sha256sum -c -" in job
+
+
+# Value: protects=the upgrade of every account an earlier release created, and what the DC harness expects of the tags; fails_when=MSI_MANAGED_DESCRIPTION is reworded (a member-server upgrade then finds the account v1.22.0 or older created "not MSI-managed" and fails with 1603, and a DC no longer adopts it) or stage2.ps1's $Legacy/$Own/$OtherDc/$Operator drift from the installer's tags (S2/S4/S5 fail an hour into the DC run); why_new=windows.yml's Get-AccountPlan cases read the constants from the script, so they follow a reword, and only the member smoke's literal and the DC run's S2 catch it, on Windows; seam=none; no_claim=that the tags drive the right plan, which the Get-AccountPlan cases cover
+def test_tags_match_earlier_releases_and_the_dc_harness():
+    legacy = _constant(CREATE_ACCOUNT, "MSI_MANAGED_DESCRIPTION")
+    # Written by every release since Windows support (#57), v1.22.0 included.
+    assert legacy == "Fivenines monitoring agent service account"
+    stage2 = "ci/windows-dc/stage2.ps1"
+    assert _constant(stage2, "Legacy") == legacy
+    prefix = _constant(CREATE_ACCOUNT, "DC_MANAGED_PREFIX")
+    own = r'(?m)^\$Own = "%s" \+ \$env:COMPUTERNAME$' % re.escape(prefix)
+    assert re.search(own, _read(stage2))
+    other_dc = _constant(stage2, "OtherDc")
+    assert other_dc.startswith(prefix) and len(other_dc) > len(prefix)
+    operator = _constant(CREATE_ACCOUNT, "DC_OPERATOR_DESCRIPTION")
+    assert _constant(stage2, "Operator") == operator
+
+
+# Value: protects=-ServiceAccountPassword on fivenines_setup.ps1 and fivenines_update.ps1: refused before the MSI is downloaded, and once accepted handed to msiexec; fails_when=the converted argument stops reaching the array msiexec gets (PowerShell reads a renamed or misspelled variable as $null, so the install silently runs without the password and fails with 1603 on a DC whose account is shared) or the check moves after the download; why_new=no Windows run executes fivenines_update.ps1 (the DC run's S5 runs only fivenines_setup.ps1) and windows.yml checks ConvertTo-MsiPasswordArgument's body, not how the scripts use it; seam=none; no_claim=that msiexec and the custom action parse the argument, which S5 proves for the setup script
+@pytest.mark.parametrize("path", [SETUP, UPDATE])
+def test_bootstrap_checks_the_password_first_and_hands_it_to_msiexec(path):
+    code = _code(path)
+    convert = re.search(
+        r"\$(\w+) = ConvertTo-MsiPasswordArgument \$ServiceAccountPassword\b", code
+    )
+    assert convert, f"{path} does not convert -ServiceAccountPassword"
+    assert convert.start() < code.index(
+        "Invoke-WebRequest"
+    ), f"{path} downloads the MSI before checking -ServiceAccountPassword"
+    msiexec = re.search(r"Start-Process msiexec\.exe -ArgumentList \$(\w+)", code)
+    assert msiexec, f"{path} does not run msiexec"
+    before_msiexec = code[: msiexec.start()]
+    built = list(re.finditer(r"\$%s = @\(" % msiexec.group(1), before_msiexec))
+    assert built, f"{path} never builds the msiexec arguments"
+    appended = r"\$%s \+= \$%s\b" % (msiexec.group(1), convert.group(1))
+    built_end = built[-1].end()
+    after_built = before_msiexec[built_end:]
+    assert re.search(
+        appended, after_built
+    ), f"{path} does not pass the converted password to msiexec"
+
+
+def _declared_parameters(path):
+    match = re.search(r"(?ms)^param\($(.*?)^\)", _read(path))
+    assert match, f"no param block in {path}"
+    return {name.lower() for name in re.findall(r"\]\s*\$(\w+)", match.group(1))}
+
+
+# Value: protects=the remedy operators are given: the DC refusals in the MSI log, the README and the scripts' usage lines name bootstrap parameters that exist; fails_when=-ServiceAccountPassword (or -Token, -KeepAccount, ...) is renamed in a bootstrap script while the 1603 message, the README or the DC harness still name the old spelling (PowerShell then refuses the command the operator was told to run); why_new=the Get-AccountPlan cases only check that a refusal mentions SERVICEACCOUNTPASSWORD, nothing reads the README, and the DC run's S5 would catch the harness call an hour in, for the setup script only; seam=none; no_claim=that the parameters do what the docs say
+def test_documented_bootstrap_parameters_exist():
+    scripts = {"setup": SETUP, "update": UPDATE, "uninstall": UNINSTALL}
+    references = []
+    # The refusals' remedy, as an operator reads it in the MSI log.
+    remedy = (
+        r"\(fivenines_(setup|update)\.ps1"
+        r"(?: or fivenines_(setup|update)\.ps1)? -(\w+)\)"
+    )
+    for match in re.finditer(remedy, _read(CREATE_ACCOUNT)):
+        for script in filter(None, match.group(1, 2)):
+            references.append((CREATE_ACCOUNT, script, match.group(3)))
+    # Every command line the docs, the usage lines and the DC harness give.
+    invocation = (
+        r'(?:\.\\|& "C:\\fn\\)(?:fivenines_)?'
+        r'(setup|update|uninstall)\.ps1"?([^\n(#]*)'
+    )
+    for path in ("README.md", SETUP, UPDATE, UNINSTALL, "ci/windows-dc/stage2.ps1"):
+        text = re.sub(r"`\n\s*", " ", _read(path))
+        for match in re.finditer(invocation, text):
+            for name in re.findall(r"(?<=\s)-(\w+)", match.group(2)):
+                references.append((path, match.group(1), name))
+    named = {name for _, _, name in references}
+    assert {"Token", "ServiceAccountPassword", "LogFile"} <= named, named
+    for path, script, name in references:
+        assert name.lower() in _declared_parameters(
+            scripts[script]
+        ), f"{path} passes -{name}, which fivenines_{script}.ps1 does not declare"
+
+
+# Source suffixes only: a local WiX build leaves fivenines-agent.msi (and
+# .wixpdb) in windows/installer, which is not gitignored.
+WINDOWS_SOURCE_SUFFIXES = {".ps1", ".wxs", ".xml", ".in", ".sh"}
+
+
+def _windows_sources():
+    paths = set(REPO_ROOT.glob("*.ps1"))
+    paths |= set(REPO_ROOT.glob("windows/**/*"))
+    paths |= set(REPO_ROOT.glob("ci/windows-dc/*"))
+    return sorted(
+        p for p in paths if p.is_file() and p.suffix in WINDOWS_SOURCE_SUFFIXES
+    )
+
+
+# Value: protects=the Windows scripts parsing alike whatever the install language: Windows PowerShell 5.1, the custom actions' and bootstraps' runtime, reads a .ps1 without a BOM in the machine's ANSI code page; fails_when=a non-ASCII character lands in a .ps1, the WiX source or the DC answer file (a German group name typed with its umlaut matches nothing once read as cp1252, and an en dash's UTF-8 bytes end in 0x93, a curly quote PowerShell takes for a string delimiter); why_new=the lint job's ASCII check (build-release.yml) covers .py/.toml/.yml/.yaml/.json/.sh only; seam=none; no_claim=that a file saved with a BOM would be read right
+def test_windows_sources_are_ascii():
+    sources = _windows_sources()
+    names = {p.relative_to(REPO_ROOT).as_posix() for p in sources}
+    assert {CREATE_ACCOUNT, PRODUCT_WXS, SETUP, UNINSTALL, DC_UNATTEND} <= names
+    for path in sources:
+        data = path.read_bytes()
+        bad = next((i for i, b in enumerate(data) if b > 0x7F), None)
+        assert bad is None, f"{path}: non-ASCII byte at offset {bad}"
+
+
+# Value: protects=TOKEN and SERVICEACCOUNTPASSWORD staying out of the /l*v MSI log the bootstrap scripts always write; fails_when=a custom action whose SetProperty data carries [TOKEN] or [SERVICEACCOUNTPASSWORD] loses HideTarget or its hidden property (the log then prints the data in cleartext: PROPERTY CHANGE, CustomActionData, the property dump, observed on a DC run); why_new=only the Windows E2E reads the logs, after a build; seam=none; no_claim=that Windows Installer masks every line, which the E2E and DC runs check
+def test_custom_actions_carrying_secrets_hide_their_data():
+    wxs = _read(PRODUCT_WXS)
+    hidden = set(re.findall(r'<Property Id="([^"]+)"[^>]*Hidden="yes"', wxs))
+    carriers = set()
+    for match in re.finditer(r'<SetProperty Id="([^"]+)"\s+Value="([^"]*)"', wxs):
+        if "[TOKEN]" in match.group(2) or "[SERVICEACCOUNTPASSWORD]" in match.group(2):
+            carriers.add(match.group(1))
+    assert carriers >= {"CreateServiceAccount", "WriteTokenAcl"}
+    for name in carriers:
+        assert name in hidden, f"the {name} property is not hidden"
+        action = re.search(r'<CustomAction Id="%s"[^>]*/>' % re.escape(name), wxs)
+        assert action, f"no CustomAction {name}"
+        assert 'HideTarget="yes"' in action.group(0), f"{name} logs its data"

@@ -178,12 +178,16 @@ msiexec /i fivenines-agent-windows-amd64.msi TOKEN=xxxxx /qn /norestart
 |---|---|
 | `TOKEN` | Enrollment token (required). |
 | `SERVICEACCOUNT` | Use an existing **local** account instead of the MSI-managed one. Domain accounts must be pre-staged by the deployer. |
-| `SERVICEACCOUNTPASSWORD` | Required when `SERVICEACCOUNT` names an account the MSI did not create, so operator-managed credentials are never silently rotated, and on a domain controller whose account the MSI may not rotate (see [Domain controllers](#domain-controllers)). It cannot contain `"` or end with `\`. |
+| `SERVICEACCOUNTPASSWORD` | Required when `SERVICEACCOUNT` names an account the MSI did not create, so operator-managed credentials are never silently rotated, and on a domain controller whose account the MSI may not rotate (see [Domain controllers](#domain-controllers)). For an existing account it is checked first: a password that does not log the account on is refused. It cannot contain `"` or end with `\`. |
 
-`TOKEN` is declared in `MsiHiddenProperties`, so it does **not** land in the
-installer log. It is still briefly visible on the process command line and in
+`TOKEN` and `SERVICEACCOUNTPASSWORD` are declared in `MsiHiddenProperties`,
+and so is the custom-action data built from them, so neither lands in the
+installer log (`fivenines_setup.ps1` and `fivenines_update.ps1` always write a
+verbose one). Both are still briefly visible on the process command line, and
+so in process-creation auditing if your policy records command lines, and in
 your deployment tool's history -- acceptable for an enrollment-only secret,
-which the backend swaps for a per-host token on the agent's first sync.
+which the backend swaps for a per-host token on the agent's first sync; for a
+service account password, prefer the account the MSI manages itself.
 
 - **GPO**: assign the MSI per-machine (Computer Configuration -> Software
   Installation). Per-user assignment will not work; the service is machine-scoped.
@@ -224,15 +228,34 @@ another DC:
 
   The account is then tagged `Fivenines agent, operator-managed password` and
   never rotated, and uninstalling the agent from a DC keeps it (only that DC's
-  `Log on as a service` grant is removed). Installing on a second DC without
-  the password fails (exit code 1603, the reason is in the install log) before
-  touching the account, instead of rotating the password the first DC runs
-  with.
+  `Log on as a service` grant and WMI access are removed). With
+  `-ServiceAccountPassword`, `update.ps1` (and `setup.ps1` on a DC where the
+  agent is installed) removes the installed agent and installs it again, the
+  account kept, so the password is applied even when the version does not
+  change; run it on every DC after you change the password in Active
+  Directory.
+- **Nothing is changed when the installer would refuse**: `setup.ps1` and
+  `update.ps1` first ask the MSI they downloaded what it will do with the
+  account, and stop before installing or removing anything when it would
+  refuse (a second DC without the password, an operator-managed account
+  without its password, or a password that does not log the account on).
+  `msiexec` used directly refuses the same cases with exit code 1603 and the
+  reason in the install log, but on an upgrade Windows Installer has already
+  removed the running agent by then.
+- **Uninstalling** deletes the account only when this DC's installer created
+  it, or when it is the account an earlier release left behind after failing
+  on this DC (described `Fivenines monitoring agent service account`).
 - **`Log on as a service`** is granted in the DC's own security policy, which
   the Default Domain Controllers Policy leaves undefined. If one of your GPOs
   defines that right for the domain controllers, add `fivenines-agent` to it,
   or the next policy refresh removes the grant and the service no longer
   starts.
+- **Install one DC at a time**, and on the next DC only once the account has
+  replicated to it: two DCs that both find no account create two
+  `fivenines-agent` users.
+- **Renaming a DC** makes the account it created read as another DC's: its
+  next update asks for `-ServiceAccountPassword`, and uninstalling keeps the
+  account. Set a password on the account and pass it, as for several DCs.
 - Read-only domain controllers have not been tested.
 
 #### Update and uninstall

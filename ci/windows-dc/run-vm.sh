@@ -75,19 +75,16 @@ qemu-system-x86_64 \
     -monitor unix:"$work/monitor.sock",server,nowait &
 qemu=$!
 
-# Follow the serial log until the VM powers off; a screenshot every 3 minutes
-# shows where Setup or a stage stopped when nothing reaches the serial port.
+# Follow the serial log until the VM powers off (tail exits with QEMU); a
+# screenshot every 3 minutes shows where Setup or a stage stopped when
+# nothing reaches the serial port.
+tail -n +1 -f --pid="$qemu" "$serial" &
+follower=$!
 deadline=$(( $(date +%s) + ${FN_VM_TIMEOUT_MIN:-130} * 60 ))
-shown=0
 shot=0
 timed_out=0
 while kill -0 "$qemu" 2>/dev/null; do
     sleep 30
-    lines=$(wc -l < "$serial")
-    if [ "$lines" -gt "$shown" ]; then
-        sed -n "$((shown + 1)),${lines}p" "$serial"
-        shown=$lines
-    fi
     if [ $(( $(date +%s) / 180 )) -ne "$shot" ]; then
         shot=$(( $(date +%s) / 180 ))
         ( echo "screendump $out/screens/$(date +%H%M%S).png -f png" | socat - UNIX-CONNECT:"$work/monitor.sock" ) > /dev/null 2>&1 || true
@@ -102,23 +99,24 @@ while kill -0 "$qemu" 2>/dev/null; do
     fi
 done
 wait "$qemu" 2>/dev/null || true
-sed -n "$((shown + 1)),\$p" "$serial"
+wait "$follower" 2>/dev/null || true
 
 # The VM's own logs (MSI, setup, progress), read from its disk. Best effort:
-# a VM killed mid-write may leave an NTFS volume ntfs-3g will not mount.
-{
-    sudo modprobe nbd max_part=8
-    sudo qemu-nbd --connect=/dev/nbd0 --read-only "$work/disk.qcow2"
-    sleep 2
-    sudo mkdir -p "$work/c"
-    sudo mount -t ntfs-3g -o ro /dev/nbd0p1 "$work/c"
-    mkdir -p "$out/vm"
-    sudo cp -r "$work/c/fn/logs" "$work/c/fn/progress.log" "$out/vm/" 2>/dev/null || true
-    sudo cp -r "$work/c/ProgramData/fivenines_agent/logs" "$out/vm/agent-logs" 2>/dev/null || true
-    sudo cp "$work/c/Windows/Panther/setupact.log" "$work/c/Windows/Panther/setuperr.log" "$out/vm/" 2>/dev/null || true
-    sudo umount "$work/c"
-    sudo chown -R "$(id -u):$(id -g)" "$out/vm"
-} || echo "could not read the VM's disk" >&2
+# a VM killed mid-write may leave an NTFS volume ntfs-3g will not mount. The
+# steps are chained with &&: errexit is off on the left of ||, so a failed
+# mount would otherwise carry on silently.
+sudo modprobe nbd max_part=8 &&
+    sudo qemu-nbd --connect=/dev/nbd0 --read-only "$work/disk.qcow2" &&
+    sleep 2 &&
+    sudo mkdir -p "$work/c" &&
+    sudo mount -t ntfs-3g -o ro /dev/nbd0p1 "$work/c" &&
+    mkdir -p "$out/vm" &&
+    { sudo cp -r "$work/c/fn/logs" "$work/c/fn/progress.log" "$out/vm/" 2>/dev/null || true; } &&
+    { sudo cp -r "$work/c/ProgramData/fivenines_agent/logs" "$out/vm/agent-logs" 2>/dev/null || true; } &&
+    { sudo cp "$work/c/Windows/Panther/setupact.log" "$work/c/Windows/Panther/setuperr.log" "$out/vm/" 2>/dev/null || true; } &&
+    sudo umount "$work/c" &&
+    sudo chown -R "$(id -u):$(id -g)" "$out/vm" ||
+    echo "could not read the VM's disk" >&2
 sudo qemu-nbd --disconnect /dev/nbd0 > /dev/null 2>&1 || true
 
 if [ "$timed_out" -eq 0 ] && grep -q "FN-RESULT: PASS" "$serial"; then

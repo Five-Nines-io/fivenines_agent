@@ -77,17 +77,21 @@ if ($KeepAccount) {
 # Same tag as CreateServiceAccount.ps1, which writes it on an account the
 # installer created on a domain controller (windows.yml keeps the two equal).
 $DC_MANAGED_PREFIX = "Fivenines agent, managed on "
+$MSI_MANAGED_DESCRIPTION = "Fivenines monitoring agent service account"
 
-# True when the exception, or one it wraps, carries this HRESULT. ADSI
-# errors reach PowerShell as a COMException inside one or two invocation
-# exceptions.
-function Test-HResult {
-    param([System.Exception]$Exception, [int]$HResult)
+# Whether the uninstall deletes the account. On a member server, always (it
+# is local to the machine; -KeepAccount keeps it). On a domain controller,
+# where it is a domain account other DCs may run the agent as, only when
+# this DC's installer created it (its own tag) or when a release before
+# domain-controller support left it (MSI_MANAGED_DESCRIPTION): those
+# releases failed on every DC before configuring the service, so no DC runs
+# the agent as such an account, and CreateServiceAccount.ps1 adopts it the
+# same way. Pure, so CI checks it case by case.
+function Test-UninstallDeletesAccount {
+    param([bool]$IsDomainController, [string]$Description, [string]$ComputerName)
 
-    for ($e = $Exception; $e; $e = $e.InnerException) {
-        if ($e.HResult -eq $HResult) { return $true }
-    }
-    return $false
+    if (-not $IsDomainController) { return $true }
+    return ($Description -eq ($DC_MANAGED_PREFIX + $ComputerName)) -or ($Description -eq $MSI_MANAGED_DESCRIPTION)
 }
 
 # Kept identical in CreateServiceAccount.ps1 (windows.yml checks it).
@@ -104,8 +108,11 @@ function Get-WinNTUser {
     try {
         $entry.psbase.RefreshCache()
     } catch {
-        # NERR_UserNotFound (2221, 0x800708AD), ERROR_NO_SUCH_USER (1317, 0x80070525).
-        if ((Test-HResult $_.Exception -2147022675) -or (Test-HResult $_.Exception -2147023579)) { return $null }
+        # NERR_UserNotFound (2221, 0x800708AD), ERROR_NO_SUCH_USER (1317,
+        # 0x80070525), from the COMException that PowerShell's invocation
+        # exceptions wrap (the innermost one).
+        $hresult = $_.Exception.GetBaseException().HResult
+        if ($hresult -eq -2147022675 -or $hresult -eq -2147023579) { return $null }
         throw
     }
     if ($null -eq $entry.psbase.Properties["objectSid"].Value) {
@@ -186,7 +193,7 @@ if ($entry) {
 
     # DomainRole 4 = backup DC, 5 = primary DC.
     $isDomainController = (Get-CimInstance -ClassName Win32_ComputerSystem).DomainRole -ge 4
-    if ((-not $isDomainController) -or ($description -eq ($DC_MANAGED_PREFIX + $env:COMPUTERNAME))) {
+    if (Test-UninstallDeletesAccount -IsDomainController $isDomainController -Description $description -ComputerName $env:COMPUTERNAME) {
         Write-Host "Removing account fivenines-agent (SID $sid)..."
         ([ADSI]("WinNT://{0},computer" -f $env:COMPUTERNAME)).Delete("user", "fivenines-agent")
     } else {

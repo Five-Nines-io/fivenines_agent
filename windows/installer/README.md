@@ -43,6 +43,20 @@ This directory builds the Windows MSI installer for the fivenines agent.
   and its groups go through the ADSI WinNT provider (`WinNT://<ComputerName>`,
   the NetUser*/NetLocalGroup* APIs), which is the local SAM on a member server
   and the domain on a DC.
+- **No secret in the log.** TOKEN and SERVICEACCOUNTPASSWORD are hidden
+  properties, and so are the CreateServiceAccount and WriteTokenAcl
+  properties the SetProperty actions copy them into, with `HideTarget` on
+  both custom actions: otherwise the verbose log (which the bootstrap scripts
+  always write) printed them three times each. The E2E and the DC runs search
+  every log for the values.
+- **Decide before msiexec.** `CreateServiceAccount.ps1 -PlanOnly` reads the
+  account, checks a supplied password and prints the plan without changing
+  anything. `fivenines_setup.ps1` and `fivenines_update.ps1` run it from the
+  MSI they downloaded (an administrative install extracts it and runs no
+  custom action) and stop on a refusal, because inside the MSI a refusal comes
+  after Windows Installer has removed the running agent on an upgrade. With
+  `-ServiceAccountPassword` they remove an installed agent first: the same
+  version again is a maintenance run, which never reaches the account.
 - **The WMI namespace ACL in binary.** `DelegateWmiStorageNamespace.ps1` reads
   and writes `root\Microsoft\Windows\Storage`'s descriptor with
   `__SystemSecurity` `GetSD`/`SetSD` and `RawSecurityDescriptor`, never

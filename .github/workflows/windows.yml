@@ -148,8 +148,8 @@ jobs:
           if (-not $m.Success) { throw "Get-AccountPlan not found in CreateServiceAccount.ps1" }
           Invoke-Expression $m.Value
 
-          # New-LocalUser refuses a Description over 48 characters; a
-          # NetBIOS computer name is at most 15.
+          # A SAM account comment (Description) holds at most 48 characters;
+          # a NetBIOS computer name is at most 15.
           foreach ($d in @($MSI_MANAGED_DESCRIPTION, $DC_OPERATOR_DESCRIPTION, ($DC_MANAGED_PREFIX + ('X' * 15)))) {
             if ($d.Length -gt 48) { throw "Description over 48 characters: '$d'" }
           }
@@ -157,8 +157,10 @@ jobs:
           # The uninstall script deletes a DC's account only when it carries
           # this DC's tag, so it must spell the prefix the same way.
           $uninstall = Get-Content fivenines_uninstall.ps1 -Raw
-          $line = [regex]::Match($src, '(?m)^\$DC_MANAGED_PREFIX = ".*"').Value
-          if (-not $uninstall.Contains($line)) { throw "fivenines_uninstall.ps1 does not carry: $line" }
+          foreach ($name in 'DC_MANAGED_PREFIX', 'MSI_MANAGED_DESCRIPTION') {
+            $line = [regex]::Match($src, ('(?m)^\${0} = ".*"' -f $name)).Value
+            if (-not $uninstall.Contains($line)) { throw "fivenines_uninstall.ps1 does not carry: $line" }
+          }
 
           $own = $DC_MANAGED_PREFIX + "DC1"
           $other = $DC_MANAGED_PREFIX + "DC2"
@@ -208,6 +210,27 @@ jobs:
           Check $true $true  $MSI_MANAGED_DESCRIPTION  $true  "UseProvided" $DC_OPERATOR_DESCRIPTION $null
           Check $true $true  $DC_OPERATOR_DESCRIPTION  $true  "UseProvided" $null $null
           Check $true $true  "Ansible-managed"         $true  "UseProvided" $null $null
+
+          # The uninstall's delete-or-keep rule, every tag on both roles.
+          $m = [regex]::Match($uninstall, "(?ms)^function Test-UninstallDeletesAccount \{.*?^\}")
+          if (-not $m.Success) { throw "Test-UninstallDeletesAccount not found in fivenines_uninstall.ps1" }
+          Invoke-Expression $m.Value
+          function CheckUninstall($IsDc, $Description, $Deletes) {
+            $got = Test-UninstallDeletesAccount -IsDomainController $IsDc -Description $Description -ComputerName "DC1"
+            $label = "uninstall dc=$IsDc description='$Description'"
+            if ($got -ne $Deletes) { Write-Host "FAIL $label -> deletes=$got, expected $Deletes"; $script:failed++ }
+            else { Write-Host "ok   $label -> deletes=$Deletes" }
+          }
+          CheckUninstall $false $MSI_MANAGED_DESCRIPTION $true
+          CheckUninstall $false "Ansible-managed"        $true
+          CheckUninstall $false ""                       $true
+          CheckUninstall $true  $own                     $true
+          CheckUninstall $true  ($DC_MANAGED_PREFIX + "dc1") $true
+          CheckUninstall $true  $MSI_MANAGED_DESCRIPTION $true
+          CheckUninstall $true  $other                   $false
+          CheckUninstall $true  $DC_OPERATOR_DESCRIPTION $false
+          CheckUninstall $true  "Ansible-managed"        $false
+          CheckUninstall $true  ""                       $false
 
           if ($script:failed -gt 0) { throw "$($script:failed) service-account rule case(s) failed" }
 
@@ -274,7 +297,8 @@ jobs:
           $pairs = @(
             @('Resolve-ServiceAccountSid', 'windows/installer/SetTokenFileAcl.ps1', 'windows/installer/DelegateWmiStorageNamespace.ps1'),
             @('ConvertTo-MsiPasswordArgument', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
-            @('Test-HResult', 'windows/installer/CreateServiceAccount.ps1', 'fivenines_uninstall.ps1'),
+            @('Get-MsiAccountPlan', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
+            @('Invoke-AccountPreflight', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
             @('Get-WinNTUser', 'windows/installer/CreateServiceAccount.ps1', 'fivenines_uninstall.ps1'),
             @('Get-WmiNamespaceSD', 'windows/installer/DelegateWmiStorageNamespace.ps1', 'fivenines_uninstall.ps1'),
             @('Set-WmiNamespaceSD', 'windows/installer/DelegateWmiStorageNamespace.ps1', 'fivenines_uninstall.ps1')
@@ -457,6 +481,13 @@ jobs:
             Get-Content install.log -Tail 200
             exit 1
           }
+          # The verbose log must not carry the token (README; a DC run found
+          # it on three lines before the custom-action data was hidden). The
+          # log is UTF-16 with a BOM, which ReadAllText decodes.
+          if ([System.IO.File]::ReadAllText((Resolve-Path install.log)) -match [regex]::Escape($token)) {
+            Write-Error "the TOKEN value is in install.log"
+            exit 1
+          }
 
       - name: Verify service account was provisioned by the MSI
         shell: pwsh
@@ -509,7 +540,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $src = Get-Content windows/installer/CreateServiceAccount.ps1 -Raw
           Invoke-Expression ([regex]::Match($src, '(?m)^\$HRESULT_MEMBER_IN_ALIAS = .*$').Value)
-          foreach ($fn in 'Test-HResult', 'Get-WinNTUser', 'Add-AccountToBuiltinGroup') {
+          foreach ($fn in 'Get-WinNTUser', 'Add-AccountToBuiltinGroup') {
             $m = [regex]::Match($src, "(?ms)^function $fn \{.*?^\}")
             if (-not $m.Success) { throw "$fn not found in CreateServiceAccount.ps1" }
             Invoke-Expression $m.Value
@@ -615,6 +646,55 @@ jobs:
             }
           }
 
+      # fivenines_update.ps1 -ServiceAccountPassword on the version already
+      # installed: the MSI alone would run in maintenance mode, never reach
+      # the account and report success. The bootstrap checks the account
+      # first (the MSI's own CreateServiceAccount.ps1 -PlanOnly, extracted by
+      # an administrative install), refusing a wrong password before touching
+      # anything, then removes and reinstalls the agent to apply a right one.
+      - name: fivenines_update.ps1 -ServiceAccountPassword, wrong then right, on the installed version
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $msiUrl = "file:///" + (Resolve-Path fivenines-agent.msi).Path.Replace('\', '/')
+          $token = (Get-Content (Join-Path $env:ProgramData "fivenines_agent\TOKEN") -Raw).Trim()
+          function Invoke-Update($Password, $Log) {
+            $secure = ConvertTo-SecureString $Password -AsPlainText -Force
+            $global:LASTEXITCODE = 0
+            & .\fivenines_update.ps1 -MsiUrl $msiUrl -MsiPath (Join-Path $env:TEMP "fn-update.msi") -LogFile (Join-Path $PWD $Log) -ServiceAccountPassword $secure
+            if ($LASTEXITCODE -ne 0) { throw "fivenines_update.ps1 exited $LASTEXITCODE" }
+          }
+          function Assert-Installed {
+            $agent = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
+                     Where-Object { $_.DisplayName -match "Fivenines Monitoring Agent" }
+            if (-not $agent) { throw "the agent is no longer installed" }
+            for ($i = 0; $i -lt 30; $i++) {
+              if ((Get-Service -Name "fivenines-agent").Status -eq "Running") { return }
+              Start-Sleep -Seconds 2
+            }
+            throw "the service is not Running"
+          }
+
+          $refused = $null
+          try { Invoke-Update ("Wrong-" + [guid]::NewGuid()) "update-wrong.log" } catch { $refused = "$_" }
+          if (-not $refused -or $refused -notmatch "does not log") { throw "a wrong password was not refused before msiexec: $refused" }
+          if (Test-Path "update-wrong.log") { throw "msiexec ran although the preflight refused" }
+          Assert-Installed
+          Write-Host "Wrong password refused before msiexec; the agent is still installed and Running."
+
+          $password = 'Fn9 r$i;ght\pw_' + (Get-Random)
+          Set-LocalUser -Name "fivenines-agent" -Password (ConvertTo-SecureString $password -AsPlainText -Force)
+          Invoke-Update $password "update-right.log"
+          Assert-Installed
+          Restart-Service -Name "fivenines-agent"
+          Assert-Installed
+          foreach ($log in "update-right.log", "update-right.remove.log") {
+            $text = [System.IO.File]::ReadAllText((Resolve-Path $log))
+            if ($text.Contains($password)) { throw "the password is in $log" }
+            if ($text.Contains($token)) { throw "the TOKEN value is in $log" }
+          }
+          Write-Host "Right password applied by a remove-and-reinstall; the service restarts with it; no secret in the logs."
+
       - name: Uninstall MSI silently
         shell: pwsh
         run: |
@@ -634,12 +714,18 @@ jobs:
             Get-ChildItem $configDir -Recurse | Out-String
           }
 
-      # The account deleted by hand leaves its ACE on the WMI Storage
-      # namespace, naming a SID that no longer resolves: the next install's
-      # WMI delegation must cope (GetSecurityDescriptor failed outright on
-      # one, which a domain controller showed). Then fivenines_uninstall.ps1
-      # must delete the account and take its grant with it.
-      - name: Reinstall over an orphaned WMI grant, then fivenines_uninstall.ps1
+      # Three installs over what earlier ones left, then the uninstall script:
+      # 1. the account kept (an upgrade or reinstall): Rotate, through WinNT
+      #    SetPassword, on a local SAM -- the DC run is the only other place
+      #    it runs;
+      # 2. the account deleted by hand, so its ACE on the WMI Storage
+      #    namespace names a SID that no longer resolves: the WMI delegation
+      #    must cope (GetSecurityDescriptor failed outright on one, which a
+      #    domain controller showed). That install passes the password, one
+      #    with a leading '-', a space, '$', ';' and an inner '\', as an
+      #    operator would: the service runs only if it reached sc.exe intact;
+      # 3. fivenines_uninstall.ps1 must delete the account and its grant.
+      - name: Reinstall keeping the account, over an orphaned WMI grant, then fivenines_uninstall.ps1
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
@@ -650,22 +736,52 @@ jobs:
             return @($sd.DiscretionaryAcl | Where-Object { $_ -is [System.Security.AccessControl.KnownAce] } |
                      ForEach-Object { $_.SecurityIdentifier.Value })
           }
+          function Install-Msi($Log, $Extra, $Secret) {
+            $token = "ci-reinstall-$(Get-Random)"
+            $arguments = "/i fivenines-agent.msi TOKEN=$token /qn /l*v $Log $Extra"
+            $p = Start-Process msiexec -ArgumentList $arguments -Wait -PassThru
+            if ($p.ExitCode -ne 0) {
+              Get-Content $Log | Select-String "WixQuietExec" | Where-Object { $_.Line -notmatch "powershell\.exe" } |
+                Select-Object -Last 40 | ForEach-Object { $_.Line }
+              throw "msiexec ($Log) failed: $($p.ExitCode)"
+            }
+            $text = [System.IO.File]::ReadAllText((Resolve-Path $Log))
+            if ($text.Contains($token)) { throw "the TOKEN value is in $Log" }
+            if ($Secret -and $text.Contains($Secret)) { throw "the service account password is in $Log" }
+          }
+          function Wait-Running {
+            for ($i = 0; $i -lt 30; $i++) {
+              if ((Get-Service -Name "fivenines-agent" -ErrorAction SilentlyContinue).Status -eq "Running") { return }
+              Start-Sleep -Seconds 2
+            }
+            throw "the service did not reach Running"
+          }
 
-          $orphan = (Get-LocalUser -Name "fivenines-agent").SID.Value
+          # 1. Rotate.
+          $kept = Get-LocalUser -Name "fivenines-agent"
+          Install-Msi "rotate.log" ""
+          Wait-Running
+          $after = Get-LocalUser -Name "fivenines-agent"
+          if ($after.SID -ne $kept.SID) { throw "the reinstall replaced the account instead of rotating it" }
+          if ($after.Description -ne $kept.Description) { throw "the reinstall retagged a member server's account: '$($after.Description)'" }
+          if (-not $after.PasswordLastSet -or $after.PasswordLastSet -le $kept.PasswordLastSet) { throw "the password was not rotated" }
+          Write-Host "Reinstalled over the kept account: rotated, same SID and tag, service Running."
+          Start-Process msiexec -ArgumentList "/x fivenines-agent.msi /qn /l*v uninstall-rotate.log" -Wait | Out-Null
+
+          # 2. Orphaned grant, operator password.
+          $orphan = $after.SID.Value
           Remove-LocalUser -Name "fivenines-agent"
           if ((Get-StorageAceSids) -notcontains $orphan) { throw "expected the deleted account's WMI grant to remain" }
           Write-Host "Deleted fivenines-agent by hand; its WMI grant ($orphan) remains."
-
-          $p = Start-Process msiexec -ArgumentList "/i fivenines-agent.msi TOKEN=ci-reinstall-$(Get-Random) /qn /l*v reinstall.log" -Wait -PassThru
-          if ($p.ExitCode -ne 0) {
-            Get-Content reinstall.log | Select-String "WixQuietExec" | Select-Object -Last 40 | ForEach-Object { $_.Line }
-            throw "reinstall over the orphaned grant failed: $($p.ExitCode)"
-          }
+          $password = '-Fn9 p$a;ss\w0rd_' + (Get-Random)
+          Install-Msi "reinstall.log" ('SERVICEACCOUNTPASSWORD="{0}"' -f $password) $password
+          Wait-Running
           $sid = (Get-LocalUser -Name "fivenines-agent").SID.Value
           $count = @(Get-StorageAceSids | Where-Object { $_ -eq $sid }).Count
           if ($count -ne 1) { throw "expected exactly one WMI grant for $sid, found $count" }
-          Write-Host "Reinstalled as $sid, granted once."
+          Write-Host "Reinstalled as $sid with the operator's password, granted once, service Running."
 
+          # 3. The uninstall script.
           Start-Process msiexec -ArgumentList "/x fivenines-agent.msi /qn /l*v uninstall2.log" -Wait | Out-Null
           & .\fivenines_uninstall.ps1 -LogFile uninstall-script.log
           if (Get-LocalUser -Name "fivenines-agent" -ErrorAction SilentlyContinue) { throw "fivenines_uninstall.ps1 kept the account" }
@@ -685,6 +801,10 @@ jobs:
           path: |
             install.log
             uninstall.log
+            update-right.log
+            update-right.remove.log
+            rotate.log
+            uninstall-rotate.log
             reinstall.log
             uninstall2.log
           retention-days: 7

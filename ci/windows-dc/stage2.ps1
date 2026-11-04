@@ -62,7 +62,37 @@ function Install-Agent {
     if ($Password) { $arguments += "SERVICEACCOUNTPASSWORD=`"$Password`"" }
     $r = Invoke-Msi $Name $arguments
     $r.Token = $token
+    # This MSI's verbose log carries neither secret (v1.22.0's did).
+    if ($Msi -eq $NewMsi) { Check-NoSecrets $r.Log $Name $token $Password }
     return $r
+}
+
+function Check-NoSecrets {
+    param([string]$LogPath, [string]$Label, [string]$Token, [string]$Password)
+
+    if (-not (Test-Path $LogPath)) { return }
+    $text = [System.IO.File]::ReadAllText($LogPath)
+    Check (-not $text.Contains($Token)) "$Label the TOKEN value is not in the MSI log"
+    if ($Password) { Check (-not $text.Contains($Password)) "$Label the password is not in the MSI log" }
+}
+
+function Test-AgentInstalled {
+    return [bool](Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -match "Fivenines Monitoring Agent" })
+}
+
+# fivenines_update.ps1 from the payload, bounded; $null on success.
+function Invoke-UpdateScript {
+    param([string]$Name, [string]$Password = "")
+
+    return Invoke-Bootstrap -Arguments @($Name, $Password) -Script {
+        param($Name, $Password)
+        $arguments = @{ MsiUrl = "file:///C:/fn/new.msi"; MsiPath = "C:\fn\downloaded-update.msi"; LogFile = "C:\fn\logs\$Name.log" }
+        if ($Password) { $arguments.ServiceAccountPassword = ConvertTo-SecureString $Password -AsPlainText -Force }
+        $global:LASTEXITCODE = 0
+        & "C:\fn\fivenines_update.ps1" @arguments
+        "EXIT:$LASTEXITCODE"
+    }
 }
 
 function Uninstall-Agent {
@@ -107,16 +137,9 @@ function Test-CustomActionSaid {
     return ($joined -replace "\s", "").Contains(($Text -replace "\s", ""))
 }
 
-function Report-TokenInLog {
-    param($Result)
-
-    $hit = Select-String -Path $Result.Log -SimpleMatch $Result.Token -Quiet
-    Log ("INFO the TOKEN value appears in the verbose MSI log: {0}" -f [bool]$hit)
-}
-
 # The installer's own helpers, as they ship.
 $uninstallSource = Get-Content "C:\fn\fivenines_uninstall.ps1" -Raw
-foreach ($fn in @("Test-HResult", "Get-WinNTUser", "Get-WmiNamespaceSD")) {
+foreach ($fn in @("Get-WinNTUser", "Get-WmiNamespaceSD")) {
     Invoke-Expression ([regex]::Match($uninstallSource, "(?ms)^function $fn \{.*?^\}").Value)
 }
 
@@ -257,7 +280,6 @@ try {
     $r = Install-Agent "s2-retry"
     Check ($r.ExitCode -eq 0) "S2 install exits 0"
     if ($r.ExitCode -ne 0) { Show-CustomActionOutput $r.Log }
-    Report-TokenInLog $r
     Test-Installed "S2" $Own
 
     Log "== S3: reinstall, the account tagged for this DC is rotated"
@@ -281,7 +303,8 @@ try {
     (Get-AccountEntry).SetPassword($password)
     # The script ends with 'exit 1' when the service does not run, and
     # throws (Write-Error under Stop) on any other failure.
-    $setupFailed = Invoke-Bootstrap -Arguments @($password, ("ci-dc-token-" + (Get-Random))) -Script {
+    $setupToken = "ci-dc-token-" + (Get-Random)
+    $setupFailed = Invoke-Bootstrap -Arguments @($password, $setupToken) -Script {
         param($Password, $Token)
         $secure = ConvertTo-SecureString $Password -AsPlainText -Force
         $global:LASTEXITCODE = 0
@@ -291,6 +314,7 @@ try {
     }
     Check ($null -eq $setupFailed) "S5 fivenines_setup.ps1 succeeds ($setupFailed)"
     if ($setupFailed) { Show-CustomActionOutput "C:\fn\logs\s5-setup.log"; Show-MsiErrors "C:\fn\logs\s5-setup.log" }
+    Check-NoSecrets "C:\fn\logs\s5-setup.log" "S5" $setupToken $password
     Test-Installed "S5" $Operator
 
     Log "== S6: an operator-managed account needs its password"
@@ -298,10 +322,40 @@ try {
     $r = Install-Agent "s6-no-password"
     Check ($r.ExitCode -eq 1603) "S6 install without the password fails with 1603"
     Check (Test-CustomActionSaid $r.Log "SERVICEACCOUNTPASSWORD=<the account's current password>") "S6 the log says why"
+    $r = Install-Agent "s6-wrong-password" -Password ("Fn9-wrong-" + (Get-Random))
+    Check ($r.ExitCode -eq 1603) "S6 install with a wrong password fails with 1603"
+    Check (Test-CustomActionSaid $r.Log "does not log domain account 'fivenines-agent' on") "S6 the log says the password is wrong"
+    Check ((Get-AdAccount).Description -eq $Operator) "S6 a wrong password changes no tag"
     $r = Install-Agent "s6-password" -Password $password
     Check ($r.ExitCode -eq 0) "S6 install with the password exits 0"
     if ($r.ExitCode -ne 0) { Show-CustomActionOutput $r.Log }
     Test-Installed "S6" $Operator
+
+    Log "== S10: fivenines_update.ps1 without the password, on an operator-managed account"
+    $failed = Invoke-UpdateScript "s10-update-no-password"
+    Check ($null -ne $failed) "S10 the update is refused"
+    Check (-not (Test-Path "C:\fn\logs\s10-update-no-password.log")) "S10 refused before msiexec ran"
+    Check (Test-AgentInstalled) "S10 the agent is still installed"
+    Check (Wait-AgentRunning) "S10 the service still runs"
+
+    Log "== S11: fivenines_update.ps1 with a wrong password"
+    $failed = Invoke-UpdateScript "s11-update-wrong" ("Fn9-wrong-" + (Get-Random))
+    Check ($null -ne $failed) "S11 the update is refused"
+    Check (-not (Test-Path "C:\fn\logs\s11-update-wrong.log")) "S11 refused before msiexec ran"
+    Check (Test-AgentInstalled) "S11 the agent is still installed"
+    Check ((Get-AdAccount).Description -eq $Operator) "S11 no tag changed"
+
+    Log "== S12: a new password, applied by fivenines_update.ps1 on the installed version"
+    $password = New-TestPassword
+    (Get-AccountEntry).SetPassword($password)
+    $agentToken = (Get-Content (Join-Path $env:ProgramData "fivenines_agent\TOKEN") -Raw).Trim()
+    $failed = Invoke-UpdateScript "s12-update-new-password" $password
+    Check ($null -eq $failed) "S12 fivenines_update.ps1 succeeds ($failed)"
+    if ($failed) { Show-MsiErrors "C:\fn\logs\s12-update-new-password.log" }
+    Check-NoSecrets "C:\fn\logs\s12-update-new-password.log" "S12" $agentToken $password
+    Check-NoSecrets "C:\fn\logs\s12-update-new-password.remove.log" "S12 remove" $agentToken $password
+    Restart-Service -Name "fivenines-agent" -ErrorAction SilentlyContinue
+    Test-Installed "S12" $Operator
 
     Log "== S7: fivenines_uninstall.ps1 keeps a shared account"
     $failed = Invoke-Bootstrap -Arguments @("C:\fn\logs\s7-uninstall.log") -Script {
