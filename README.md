@@ -235,9 +235,9 @@ another DC:
   service: run it on every DC after you change the password in Active
   Directory. It does so only when the service runs as `fivenines-agent`
   already; otherwise (an account of your own, or `fivenines-agent` deleted)
-  it changes nothing and asks you to reinstall: `uninstall.ps1`, then
-  `setup.ps1`. `setup.ps1` writes no `-Token` there: the agent keeps its
-  TOKEN.
+  it changes nothing and asks you to reinstall: `uninstall.ps1 -KeepAccount`,
+  then `setup.ps1 -Token TOKEN -ServiceAccountPassword $pw`. Applied in place,
+  `setup.ps1` writes no `-Token`: the agent keeps its TOKEN.
 - **Nothing is changed when the installer would refuse**: `setup.ps1` and
   `update.ps1` first ask the MSI they downloaded what it will do with the
   account, and stop before installing or removing anything when it would
