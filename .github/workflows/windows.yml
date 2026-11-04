@@ -337,9 +337,10 @@ jobs:
             Remove-LocalUser -Name "fn-wmi-d" -ErrorAction SilentlyContinue
           }
 
-      # The bootstraps' work directory: protected from inheritance, open to
-      # SYSTEM and Administrators only, so no other local user can create or
-      # rewrite the MSI, its extracted copy or the log in it.
+      # The bootstraps' work directory: under %SystemRoot%\Temp, owned by
+      # Administrators, protected from inheritance, writable by SYSTEM and
+      # Administrators only, so no other local user can create or rewrite the
+      # MSI, its extracted copy or the log in it.
       - name: Verify the bootstrap's private work directory
         shell: powershell
         run: |
@@ -352,16 +353,19 @@ jobs:
           try {
             $acl = Get-Acl -LiteralPath $dir
             if (-not $acl.AreAccessRulesProtected) { throw "$dir inherits its parent's ACL" }
-            # SYSTEM and Administrators, plus read-only for this runner's user
-            # (the user running a bootstrap reads its log unelevated).
+            # Under %SystemRoot%\Temp, owned by Administrators; SYSTEM and
+            # Administrators, plus read-only for this runner's user (the user
+            # running a bootstrap reads its log unelevated).
+            if ((Split-Path -Parent $dir) -ne (Join-Path $env:SystemRoot "Temp")) { throw "$dir is not under %SystemRoot%\Temp" }
+            if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne "S-1-5-32-544") { throw "$dir is not owned by Administrators" }
             $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
             $expected = (@("S-1-5-18", "S-1-5-32-544", $me) | Sort-Object -Unique) -join ","
-            $write = [int][System.Security.AccessControl.FileSystemRights]::Write
+            $readOnly = [int][System.Security.AccessControl.FileSystemRights]::ReadAndExecute -bor [int][System.Security.AccessControl.FileSystemRights]::Synchronize
             $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
             $sids = @($rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
             if (($sids -join ",") -ne $expected) { throw "$dir is open to: $($sids -join ', ')" }
             if (@($rules | Where-Object { $_.IsInherited -or $_.AccessControlType -ne 'Allow' }).Count -ne 0) { throw "$dir has an inherited or deny rule" }
-            if (@($rules | Where-Object { $_.IdentityReference.Value -eq $me -and ([int]$_.FileSystemRights -band $write) -ne 0 }).Count -ne 0) { throw "the running user can write in $dir" }
+            if (@($rules | Where-Object { $_.IdentityReference.Value -eq $me -and ([int]$_.FileSystemRights -band -bnot $readOnly) -ne 0 }).Count -ne 0) { throw "the running user has more than read access to $dir" }
             Set-Content -LiteralPath (Join-Path $dir "probe.txt") -Value "x"
             $file = @((Get-Acl -LiteralPath (Join-Path $dir "probe.txt")).GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) |
               ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
@@ -386,16 +390,19 @@ jobs:
           try {
             $acl = Get-Acl -LiteralPath $dir
             if (-not $acl.AreAccessRulesProtected) { throw "$dir inherits its parent's ACL" }
-            # SYSTEM and Administrators, plus read-only for this runner's user
-            # (the user running a bootstrap reads its log unelevated).
+            # Under %SystemRoot%\Temp, owned by Administrators; SYSTEM and
+            # Administrators, plus read-only for this runner's user (the user
+            # running a bootstrap reads its log unelevated).
+            if ((Split-Path -Parent $dir) -ne (Join-Path $env:SystemRoot "Temp")) { throw "$dir is not under %SystemRoot%\Temp" }
+            if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne "S-1-5-32-544") { throw "$dir is not owned by Administrators" }
             $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
             $expected = (@("S-1-5-18", "S-1-5-32-544", $me) | Sort-Object -Unique) -join ","
-            $write = [int][System.Security.AccessControl.FileSystemRights]::Write
+            $readOnly = [int][System.Security.AccessControl.FileSystemRights]::ReadAndExecute -bor [int][System.Security.AccessControl.FileSystemRights]::Synchronize
             $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
             $sids = @($rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
             if (($sids -join ",") -ne $expected) { throw "$dir is open to: $($sids -join ', ')" }
             if (@($rules | Where-Object { $_.IsInherited -or $_.AccessControlType -ne 'Allow' }).Count -ne 0) { throw "$dir has an inherited or deny rule" }
-            if (@($rules | Where-Object { $_.IdentityReference.Value -eq $me -and ([int]$_.FileSystemRights -band $write) -ne 0 }).Count -ne 0) { throw "the running user can write in $dir" }
+            if (@($rules | Where-Object { $_.IdentityReference.Value -eq $me -and ([int]$_.FileSystemRights -band -bnot $readOnly) -ne 0 }).Count -ne 0) { throw "the running user has more than read access to $dir" }
             Set-Content -LiteralPath (Join-Path $dir "probe.txt") -Value "x"
             $file = @((Get-Acl -LiteralPath (Join-Path $dir "probe.txt")).GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) |
               ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
@@ -403,6 +410,53 @@ jobs:
             Write-Host "$dir and what is created in it: SYSTEM and Administrators, and the running user read-only."
           } finally {
             Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      # What a successful run removes: the work directories earlier runs
+      # left, and only those it can tell are its own. Kept: this run's, one
+      # newer than the age floor, one with the right name but an inherited
+      # ACL or another owner (anyone may create such a name under
+      # %SystemRoot%\Temp, protected and owned by themselves), and a junction
+      # with the right name to a directory that would pass every check,
+      # whose content is never touched.
+      - name: Verify the pruning of earlier work directories
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = Get-Content fivenines_setup.ps1 -Raw
+          foreach ($fn in 'New-PrivateWorkDirectory', 'Remove-EarlierWorkDirectories') {
+            $m = [regex]::Match($src, "(?ms)^function $fn \{.*?^\}")
+            if (-not $m.Success) { throw "$fn not found in fivenines_setup.ps1" }
+            Invoke-Expression $m.Value
+          }
+          $temp = Join-Path $env:SystemRoot "Temp"
+          $current = New-PrivateWorkDirectory "fivenines-update"
+          $earlier = New-PrivateWorkDirectory "fivenines-setup"
+          Set-Content -LiteralPath (Join-Path $earlier "fivenines-agent-windows-amd64.msi") -Value "x"
+          $foreign = Join-Path $temp ("fivenines-update-" + [guid]::NewGuid())
+          New-Item -ItemType Directory -Path $foreign | Out-Null
+          $owned = New-PrivateWorkDirectory "fivenines-setup"
+          $acl = Get-Acl -LiteralPath $owned
+          $acl.SetOwner([System.Security.Principal.WindowsIdentity]::GetCurrent().User)
+          Set-Acl -LiteralPath $owned -AclObject $acl
+          $target = New-PrivateWorkDirectory "fn-prune-target"
+          Set-Content -LiteralPath (Join-Path $target "keep.txt") -Value "x"
+          $link = Join-Path $temp ("fivenines-update-" + [guid]::NewGuid())
+          cmd /c mklink /J "$link" "$target" | Out-Null
+          try {
+            Remove-EarlierWorkDirectories -Keep $current
+            if (-not (Test-Path -LiteralPath $earlier)) { throw "a directory newer than the age floor was removed" }
+            Remove-EarlierWorkDirectories -Keep $current -MinAgeMinutes 0
+            if (Test-Path -LiteralPath $earlier) { throw "an earlier run's directory was kept" }
+            if (-not (Test-Path -LiteralPath $current)) { throw "this run's directory was removed" }
+            if (-not (Test-Path -LiteralPath $foreign)) { throw "a directory with an inherited ACL was removed" }
+            if (-not (Test-Path -LiteralPath $owned)) { throw "a directory owned by another account was removed" }
+            if (-not (Test-Path -LiteralPath $link)) { throw "a junction was removed" }
+            if (-not (Test-Path -LiteralPath (Join-Path $target "keep.txt"))) { throw "the junction's target was touched" }
+            Write-Host "Removed an earlier run's directory; kept this run's, a newer one, two foreign ones and a junction with its target."
+          } finally {
+            cmd /c rmdir "$link" | Out-Null
+            foreach ($d in @($current, $earlier, $foreign, $owned, $target)) { Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue }
           }
 
       # Helpers duplicated across scripts that cannot share a file: the
@@ -427,6 +481,8 @@ jobs:
             @('Invoke-AccountPreflight', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
             @('New-PrivateWorkDirectory', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
             @('New-PrivateWorkDirectory', 'fivenines_setup.ps1', 'fivenines_uninstall.ps1'),
+            @('Remove-EarlierWorkDirectories', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
+            @('Remove-EarlierWorkDirectories', 'fivenines_setup.ps1', 'fivenines_uninstall.ps1'),
             @('Get-WinNTUser', 'windows/installer/CreateServiceAccount.ps1', 'fivenines_uninstall.ps1'),
             @('Get-WmiNamespaceSD', 'windows/installer/DelegateWmiStorageNamespace.ps1', 'fivenines_uninstall.ps1'),
             @('Set-WmiNamespaceSD', 'windows/installer/DelegateWmiStorageNamespace.ps1', 'fivenines_uninstall.ps1')

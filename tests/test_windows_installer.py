@@ -85,6 +85,8 @@ def _constant(path, name):
         ("Invoke-AccountPreflight", SETUP, UPDATE),
         ("New-PrivateWorkDirectory", SETUP, UPDATE),
         ("New-PrivateWorkDirectory", SETUP, UNINSTALL),
+        ("Remove-EarlierWorkDirectories", SETUP, UPDATE),
+        ("Remove-EarlierWorkDirectories", SETUP, UNINSTALL),
         ("Get-WinNTUser", CREATE_ACCOUNT, UNINSTALL),
         ("Get-WmiNamespaceSD", DELEGATE_WMI, UNINSTALL),
         ("Set-WmiNamespaceSD", DELEGATE_WMI, UNINSTALL),
@@ -270,22 +272,28 @@ def test_bootstrap_downloads_into_a_private_directory(path):
     )
     assert '$image = Join-Path $WorkDir "plan"' in code
     assert "-WorkDir $WorkDir" in code
-    outside = _read(path).replace(_function(path, "New-PrivateWorkDirectory"), "")
-    assert "$env:TEMP" not in outside
-    # Emptied after a run that succeeds (the script's last statement), kept
-    # whole by a failed one; the extraction goes in the preflight's finally
-    # either way. The directory itself stays: it is the recorded install
-    # source, whose path another user could otherwise recreate.
-    removal = "Get-ChildItem -LiteralPath $WorkDir -Force | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue"
-    assert code.count(removal) == 1
-    after = code.split(removal, 1)[1].strip().splitlines()
+    assert "$env:TEMP" not in code
+    # After a run that succeeds (the script's last statement) only earlier
+    # runs' directories go: this one holds the recorded install source a
+    # repair reads, and a failed run keeps it for its log. The extraction
+    # goes in the preflight's finally either way.
+    prune = "Remove-EarlierWorkDirectories -Keep $WorkDir"
+    assert code.count(prune) == 1
+    after = code.split(prune, 1)[1].strip().splitlines()
     assert all(line.startswith("Write-Host ") for line in after if line.strip()), after
+    assert "Remove-Item -LiteralPath $WorkDir" not in code
+    assert "Get-ChildItem -LiteralPath $WorkDir" not in code
     assert re.search(
         r"\} finally \{\s*Remove-Item -LiteralPath \$image ",
         _function(path, "Invoke-AccountPreflight"),
     )
+    # Under %SystemRoot%\Temp (no user can rename another's directory
+    # there), owned by Administrators, its ACL checked after creation;
     # PowerShell 7's .NET has no Directory.CreateDirectory(path, ACL).
     helper = _function(path, "New-PrivateWorkDirectory")
+    assert 'Join-Path (Join-Path $env:SystemRoot "Temp")' in helper
+    assert "$security.SetOwner($admins)" in helper
+    assert "did not keep its access control list" in helper
     assert "FileSystemAclExtensions]::CreateDirectory($security, $path)" in helper
 
 
@@ -298,7 +306,11 @@ def test_uninstall_logs_into_a_private_directory():
         r"(?m)^if \(-not \$LogFile\) \{ \$LogFile = Join-Path \$WorkDir ", code
     )
     removal = "Remove-Item -LiteralPath $WorkDir -Recurse -Force -ErrorAction SilentlyContinue"
-    assert code.count(removal) == 2  # after -KeepAccount's exit 0, and at the end
+    prune = "Remove-EarlierWorkDirectories -Keep $WorkDir"
+    # after -KeepAccount's exit 0, and at the end, each after the msiexec /x
+    # failure exit
+    assert code.count(removal) == 2 and code.count(prune) == 2
+    assert code.index(prune) > code.index("exit $proc.ExitCode")
     after = code.rsplit(removal, 1)[1].strip().splitlines()
     assert all(line.startswith("Write-Host ") for line in after if line.strip()), after
 
