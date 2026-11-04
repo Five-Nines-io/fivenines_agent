@@ -27,8 +27,8 @@ $Namespace = "root\Microsoft\Windows\Storage"
 # the MSI's default "<DCNAME>\name" is not how the domain names it, while a
 # bare name is looked up in the machine's own account database on every
 # role (the local SAM on a member server, the domain on a DC).
-# Kept identical in SetTokenFileAcl.ps1 and DelegateWmiStorageNamespace.ps1
-# (windows.yml checks it).
+# Kept identical in SetTokenFileAcl.ps1, DelegateWmiStorageNamespace.ps1,
+# fivenines_setup.ps1 and fivenines_update.ps1 (windows.yml checks it).
 function Resolve-ServiceAccountSid {
     param([Parameter(Mandatory=$true)][string]$Account)
 
