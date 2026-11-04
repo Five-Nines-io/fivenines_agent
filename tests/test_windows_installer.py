@@ -208,6 +208,7 @@ def test_dc_job_pins_its_downloads_and_runs_when_the_installer_changes():
         "\\.github/workflows/windows\\.yml$",
     ):
         assert watched in paths.group(1), watched
+    assert "grep -v '\\.md$'" in gate
 
 
 # Value: protects=every release's MSI; fails_when=the release job stops waiting for windows.yml's member-server E2E, windows.yml triggers on tags again (a second, unwaited run), or one of its artifacts matches the release's fivenines-agent-* download pattern (the E2E's MSI published as a release asset, or an upload clash with build-windows-amd64 in the same run); why_new=before this a release published whatever windows.yml said, and nothing reads the cross-workflow wiring; seam=none; no_claim=that the E2E itself is sufficient, which the E2E steps decide

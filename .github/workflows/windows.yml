@@ -828,7 +828,8 @@ jobs:
           if-no-files-found: ignore
 
   # Whether this push changed what the domain-controller E2E tests: the MSI
-  # sources, the bootstrap scripts, the DC harness or this workflow. Compared
+  # sources, the bootstrap scripts, the DC harness or this workflow (their
+  # Markdown aside). Compared
   # with the commit the push replaced; a new branch (or a force push whose old
   # head is gone) is compared with where it left main. Never on a tag: the tag
   # names a main commit whose own push already ran it.
@@ -859,7 +860,8 @@ jobs:
             fi
           fi
           echo "Comparing ${base} with $(git rev-parse HEAD)"
-          files=$(git diff --name-only "$base" HEAD)
+          # Markdown under those directories is documentation, not tested.
+          files=$(git diff --name-only "$base" HEAD | grep -v '\.md$' || true)
           if printf '%s\n' "$files" | grep -E '^(windows/installer/|ci/windows-dc/|fivenines_(setup|update|uninstall)\.ps1$|\.github/workflows/windows\.yml$)'; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
           else
