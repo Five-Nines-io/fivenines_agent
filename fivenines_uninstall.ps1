@@ -150,8 +150,10 @@ function Set-WmiNamespaceSD {
     if ($rv -ne 0) { throw ("SetSD on {0} failed: {1}" -f $Namespace, $rv) }
 }
 
-# Remove every explicit ACE naming this SID from the WMI Storage namespace,
-# which DelegateWmiStorageNamespace.ps1 granted. Binary GetSD/SetSD, as there:
+# Remove every explicit allow ACE naming this SID from the WMI Storage
+# namespace, which DelegateWmiStorageNamespace.ps1 granted. A deny ACE stays:
+# it was set by someone else, and on a domain controller that keeps the
+# account, it may still be meant to hold. Binary GetSD/SetSD, as there:
 # GetSecurityDescriptor fails outright once an ACE names a deleted account.
 function Remove-WmiStorageGrant {
     param([string]$Sid)
@@ -159,10 +161,12 @@ function Remove-WmiStorageGrant {
     $namespace = "root\Microsoft\Windows\Storage"
     $sd = Get-WmiNamespaceSD $namespace
     $sidObject = [System.Security.Principal.SecurityIdentifier]$Sid
+    $allowed = [System.Security.AccessControl.AceQualifier]::AccessAllowed
     $removed = 0
     for ($i = $sd.DiscretionaryAcl.Count - 1; $i -ge 0; $i--) {
         $ace = $sd.DiscretionaryAcl[$i]
-        if ($ace -is [System.Security.AccessControl.KnownAce] -and
+        if ($ace -is [System.Security.AccessControl.QualifiedAce] -and
+            $ace.AceQualifier -eq $allowed -and
             $ace.SecurityIdentifier -eq $sidObject -and
             -not $ace.IsInherited) {
             $sd.DiscretionaryAcl.RemoveAce($i)
