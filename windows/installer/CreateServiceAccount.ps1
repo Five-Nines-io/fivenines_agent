@@ -474,27 +474,73 @@ try {
     Remove-Item $tmpCfg, $tmpDb -ErrorAction SilentlyContinue
 }
 
+# Gives the account FullControl on one of the agent's directories, inherited
+# by what is created in it; returns $false when the directory already carries
+# that grant, which is left as it is. Everything here runs as SYSTEM inside
+# directories the account can write to, so:
+#   * a directory that is a reparse point (a junction or a symbolic link),
+#     or sits under one below $Root, is refused: the grant would land on
+#     what the link points at;
+#   * an existing grant is not applied again, so an upgrade or a re-run never
+#     touches what the account wrote;
+#   * no /T, which would walk and rewrite every child: the inheritable ACE
+#     reaches what the agent creates later, and Windows propagates it to the
+#     existing children that inherit, which every file the agent writes does.
+# FileAttributes and the rights enums are int-based, but compared as [int]
+# anyway: Windows PowerShell 5.1's -band throws on a byte-based enum.
+function Grant-AgentDirectory {
+    param([string]$Path, [string]$Sid, [string]$Root)
+
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $cursor = Get-Item -LiteralPath $Path -Force
+    while ($cursor -and $cursor.FullName.TrimEnd('\') -ne $rootFull) {
+        if (([int]$cursor.Attributes -band 0x400) -ne 0) {
+            throw ("{0} is a junction or a symbolic link, so the installer will not grant the service account access through it. Replace it with a plain directory and run the installer again." -f $cursor.FullName)
+        }
+        $cursor = $cursor.Parent
+    }
+
+    $fullControl = [int][System.Security.AccessControl.FileSystemRights]::FullControl
+    $inherit = [int][System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+    $inheritOnly = [int][System.Security.AccessControl.PropagationFlags]::InheritOnly
+    $rules = (Get-Acl -LiteralPath $Path).GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier])
+    foreach ($rule in $rules) {
+        if ($rule.IdentityReference.Value -eq $Sid -and
+            $rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
+            (([int]$rule.FileSystemRights -band $fullControl) -eq $fullControl) -and
+            (([int]$rule.InheritanceFlags -band $inherit) -eq $inherit) -and
+            (([int]$rule.PropagationFlags -band $inheritOnly) -eq 0)) {
+            return $false
+        }
+    }
+
+    $icaclsOut = & icacls.exe $Path /grant "*$($Sid):(OI)(CI)F" /C 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw ("icacls /grant failed for {0} (exit {1}): {2}" -f $Path, $LASTEXITCODE, ($icaclsOut -join "`n"))
+    }
+    return $true
+}
+
 # Grant the service account FullControl on the config + log dirs. The MSI
 # created these dirs with only Administrators + SYSTEM via util:PermissionEx
 # (because [SERVICEACCOUNT] couldn't be resolved at InstallFiles time); now
 # that the account exists, give it the access it needs to read the config
-# and write rolling log files. /T applies recursively so anything WinSW or
-# the agent later creates inherits the grant.
+# and write rolling log files.
 $programData = if ($env:ProgramData) { $env:ProgramData } else { Join-Path $env:SystemDrive "ProgramData" }
 $dirs = @(
     (Join-Path $programData "fivenines_agent"),
     (Join-Path $programData "fivenines_agent\logs")
 )
 foreach ($d in $dirs) {
-    if (-not (Test-Path $d)) {
+    if (-not (Test-Path -LiteralPath $d)) {
         Write-Warning ("Expected directory {0} not present; skipping ACL grant." -f $d)
         continue
     }
-    $icaclsOut = & icacls.exe $d /grant "*$($sid):(OI)(CI)F" /T /C 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw ("icacls /grant failed for {0} (exit {1}): {2}" -f $d, $LASTEXITCODE, ($icaclsOut -join "`n"))
+    if (Grant-AgentDirectory -Path $d -Sid $sid -Root $programData) {
+        Write-Host ("Granted FullControl on {0} to '{1}'." -f $d, $bareName)
+    } else {
+        Write-Host ("'{0}' already has FullControl on {1}." -f $bareName, $d)
     }
-    Write-Host ("Granted FullControl on {0} to '{1}'." -f $d, $bareName)
 }
 
 # Switch the service from the LocalSystem placeholder (set by InstallServices)

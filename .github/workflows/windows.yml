@@ -282,6 +282,57 @@ jobs:
             Remove-LocalUser -Name "fn-wmi-b" -ErrorAction SilentlyContinue
           }
 
+      # The agent-directory grant, for real on this runner: it lands once and
+      # is then left alone, and a directory that is a junction, or sits under
+      # one, is refused without touching what the junction points at.
+      - name: Verify the agent directory grant
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = Get-Content windows/installer/CreateServiceAccount.ps1 -Raw
+          $m = [regex]::Match($src, "(?ms)^function Grant-AgentDirectory \{.*?^\}")
+          if (-not $m.Success) { throw "Grant-AgentDirectory not found in CreateServiceAccount.ps1" }
+          Invoke-Expression $m.Value
+          $sid = "S-1-5-19"  # LOCAL SERVICE: any principal the test can grant
+          function Get-GrantCount($Path) {
+            return @((Get-Acl -LiteralPath $Path).GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) |
+              Where-Object { $_.IdentityReference.Value -eq $sid }).Count
+          }
+
+          $root = Join-Path $env:RUNNER_TEMP ("fn-grant-" + [guid]::NewGuid())
+          $agent = Join-Path $root "fivenines_agent"
+          $logs = Join-Path $agent "logs"
+          $target = Join-Path $root "elsewhere"
+          New-Item -ItemType Directory -Path $logs, $target | Out-Null
+          Set-Content -LiteralPath (Join-Path $logs "agent.log") -Value "x"
+
+          if (-not (Grant-AgentDirectory -Path $agent -Sid $sid -Root $root)) { throw "the first grant reported an existing one" }
+          if ((Get-GrantCount $agent) -ne 1) { throw "the grant did not land" }
+          $inherited = @((Get-Acl -LiteralPath (Join-Path $logs "agent.log")).GetAccessRules($false, $true, [System.Security.Principal.SecurityIdentifier]) |
+            Where-Object { $_.IdentityReference.Value -eq $sid }).Count
+          if ($inherited -lt 1) { throw "an existing file did not inherit the grant" }
+          if (Grant-AgentDirectory -Path $agent -Sid $sid -Root $root) { throw "a second grant was applied again" }
+          Write-Host "Granted once, inherited by an existing file, then left alone."
+
+          Remove-Item -LiteralPath $logs -Recurse -Force
+          cmd /c mklink /J "$logs" "$target" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "mklink /J failed" }
+          $refused = $false
+          try { Grant-AgentDirectory -Path $logs -Sid $sid -Root $root | Out-Null } catch { $refused = $true; Write-Host "Refused: $_" }
+          if (-not $refused) { throw "a junction was granted" }
+          if ((Get-GrantCount $target) -ne 0) { throw "the junction's target was granted" }
+
+          $real = Join-Path $root "real"
+          New-Item -ItemType Directory -Path (Join-Path $real "logs") | Out-Null
+          $link = Join-Path $root "link"
+          cmd /c mklink /J "$link" "$real" | Out-Null
+          $refused = $false
+          try { Grant-AgentDirectory -Path (Join-Path $link "logs") -Sid $sid -Root $root | Out-Null } catch { $refused = $true }
+          if (-not $refused) { throw "a directory under a junction was granted" }
+          if ((Get-GrantCount (Join-Path $real "logs")) -ne 0) { throw "the directory under the junction was granted" }
+          Write-Host "Refused a junction and a directory under one, their targets untouched."
+          cmd /c rmdir "$logs" "$link" | Out-Null
+
       # Helpers duplicated across scripts that cannot share a file: the
       # custom actions are separate MSI files, the bootstraps are downloaded
       # one by one.
