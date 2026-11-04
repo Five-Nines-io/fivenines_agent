@@ -357,6 +357,10 @@ jobs:
             # Recorded with its marker, in the directory and in the key.
             $marker = (Get-Item -LiteralPath $key).GetValue((Split-Path -Leaf $dir))
             if (-not $marker -or (Get-Content -LiteralPath (Join-Path $dir ".fivenines-work-directory") -TotalCount 1) -ne $marker) { throw "$dir is not recorded with its marker" }
+            # The marker file: SYSTEM and Administrators only, the running user excluded.
+            $markerAcl = Get-Acl -LiteralPath (Join-Path $dir ".fivenines-work-directory")
+            $markerSids = @($markerAcl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+            if (-not $markerAcl.AreAccessRulesProtected -or ($markerSids -join ",") -ne "S-1-5-18,S-1-5-32-544" -or $markerAcl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne "S-1-5-32-544") { throw "the marker in $dir is open to: $($markerSids -join ', ')" }
             $acl = Get-Acl -LiteralPath $dir
             if (-not $acl.AreAccessRulesProtected) { throw "$dir inherits its parent's ACL" }
             # Under %SystemRoot%\Temp, owned by Administrators; SYSTEM and
@@ -401,6 +405,10 @@ jobs:
             # Recorded with its marker, in the directory and in the key.
             $marker = (Get-Item -LiteralPath $key).GetValue((Split-Path -Leaf $dir))
             if (-not $marker -or (Get-Content -LiteralPath (Join-Path $dir ".fivenines-work-directory") -TotalCount 1) -ne $marker) { throw "$dir is not recorded with its marker" }
+            # The marker file: SYSTEM and Administrators only, the running user excluded.
+            $markerAcl = Get-Acl -LiteralPath (Join-Path $dir ".fivenines-work-directory")
+            $markerSids = @($markerAcl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+            if (-not $markerAcl.AreAccessRulesProtected -or ($markerSids -join ",") -ne "S-1-5-18,S-1-5-32-544" -or $markerAcl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne "S-1-5-32-544") { throw "the marker in $dir is open to: $($markerSids -join ', ')" }
             $acl = Get-Acl -LiteralPath $dir
             if (-not $acl.AreAccessRulesProtected) { throw "$dir inherits its parent's ACL" }
             # Under %SystemRoot%\Temp, owned by Administrators; SYSTEM and
@@ -426,20 +434,22 @@ jobs:
             Remove-ItemProperty -LiteralPath $key -Name (Split-Path -Leaf $dir) -ErrorAction SilentlyContinue
           }
 
-      # What a successful run removes: the work directories earlier runs
-      # recorded, and only while each holds its recorded marker. An earlier
-      # run's directory goes, with its record, once older than the age
-      # floor. Kept: this run's; one that passes every check but was never
-      # recorded; and what stands at a recorded path once its directory is
-      # gone (a plain directory holding a forged marker, a junction to
-      # another of these directories), whose record goes. A record whose
-      # directory is gone goes too.
+      # What a run removes: the work directories earlier runs recorded, and
+      # only while each is a plain directory owned by Administrators that
+      # holds its recorded marker. An earlier run's directory goes, with its
+      # record, once older than the age floor; one a file in use keeps stays
+      # with its marker and record, and goes once the file is closed. Kept:
+      # this run's; one that passes every check but was never recorded; and
+      # what stands at a recorded path once its directory is gone (a plain
+      # directory holding a forged marker, one owned by another account, a
+      # junction to another of these directories), whose record goes. A
+      # record whose directory is gone goes too.
       - name: Verify the pruning of earlier work directories
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
           $src = Get-Content fivenines_setup.ps1 -Raw
-          foreach ($fn in 'Get-WorkDirectoryKey', 'New-PrivateWorkDirectory', 'Remove-EarlierWorkDirectories') {
+          foreach ($fn in 'Get-WorkDirectoryKey', 'New-PrivateWorkDirectory', 'Remove-WorkDirectory', 'Remove-EarlierWorkDirectories') {
             $m = [regex]::Match($src, "(?ms)^function $fn \{.*?^\}")
             if (-not $m.Success) { throw "$fn not found in fivenines_setup.ps1" }
             Invoke-Expression $m.Value
@@ -463,9 +473,18 @@ jobs:
           if (-not (Test-Path -LiteralPath $linked)) { throw "mklink /J failed" }
           $gone = New-PrivateWorkDirectory "fivenines-uninstall"
           Remove-Item -LiteralPath $gone -Recurse -Force
+          $owned = New-PrivateWorkDirectory "fivenines-setup"
+          $ownedAcl = Get-Acl -LiteralPath $owned
+          $ownedAcl.SetOwner([System.Security.Principal.WindowsIdentity]::GetCurrent().User)
+          Set-Acl -LiteralPath $owned -AclObject $ownedAcl
+          $busy = New-PrivateWorkDirectory "fivenines-update"
+          $busyFile = Join-Path $busy "fivenines-update.log"
+          Set-Content -LiteralPath $busyFile -Value "x"
+          $held = $null
           try {
             Remove-EarlierWorkDirectories -Keep $current
             if (-not (Test-Path -LiteralPath $earlier) -or -not (Test-Recorded $earlier)) { throw "a directory younger than the age floor was removed" }
+            $held = [System.IO.File]::Open($busyFile, 'Open', 'Read', 'Read')
             Remove-EarlierWorkDirectories -Keep $current -MinAgeMinutes 0
             if ((Test-Path -LiteralPath $earlier) -or (Test-Recorded $earlier)) { throw "an earlier run's directory or its record was kept" }
             if (-not (Test-Path -LiteralPath $current) -or -not (Test-Recorded $current)) { throw "this run's directory or its record was removed" }
@@ -476,16 +495,167 @@ jobs:
             if (-not (Test-Path -LiteralPath (Join-Path $target "keep.txt"))) { throw "the junction's target was touched" }
             if (Test-Recorded $linked) { throw "the record of a directory replaced by a junction was kept" }
             if (Test-Recorded $gone) { throw "the record of a directory gone was kept" }
-            $acl = Get-Acl -LiteralPath $key
+            if (-not (Test-Path -LiteralPath $owned)) { throw "a directory owned by another account was removed" }
+            if (Test-Recorded $owned) { throw "the record of a directory owned by another account was kept" }
+            if (-not (Test-Path -LiteralPath (Join-Path $busy ".fivenines-work-directory")) -or -not (Test-Recorded $busy)) { throw "a directory a file in use kept lost its marker or its record" }
+            $held.Dispose(); $held = $null
+            Remove-EarlierWorkDirectories -Keep $current -MinAgeMinutes 0
+            if ((Test-Path -LiteralPath $busy) -or (Test-Recorded $busy)) { throw "a directory a file in use kept was not removed once the file was closed" }
+            $acl = Get-Acl -Path $key
             $granted = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
             if (-not $acl.AreAccessRulesProtected -or ($granted -join ",") -ne "S-1-5-18,S-1-5-32-544") { throw "$key is open to: $($granted -join ', ')" }
-            Write-Host "Removed an earlier run's directory and the records of three replaced or gone; kept this run's, a newer one, one never recorded, a forged one and a junction with its target. The key is open to SYSTEM and Administrators only."
+            Write-Host "Removed an earlier run's directory, and one a file in use kept once the file was closed; dropped the records of four replaced or gone; kept this run's, a newer one, one never recorded, a forged one, one owned by another account and a junction with its target. The key is open to SYSTEM and Administrators only."
           } finally {
+            if ($held) { $held.Dispose() }
             cmd /c rmdir "$linked" | Out-Null
-            foreach ($d in @($current, $earlier, $unrecorded, $forged, $target, $linked, $gone)) {
+            foreach ($d in @($current, $earlier, $unrecorded, $forged, $target, $linked, $gone, $owned, $busy)) {
               Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
               Remove-ItemProperty -LiteralPath $key -Name (Split-Path -Leaf $d) -ErrorAction SilentlyContinue
             }
+          }
+
+      # The installed product's recorded install source (the MSI a repair
+      # reads) survives the pruning, matched whatever its case and with the
+      # trailing backslash Windows Installer writes. And the record key's ACL
+      # is reset when it is not exactly SYSTEM and Administrators, so no
+      # local user can read a marker and forge one.
+      # Value: protects=the installed product's recorded install source survives the pruning; fails_when=the InstallSource keep is dropped or compares paths wrongly (trailing backslash, case); why_new=no CI case seeds an Uninstall entry; seam=none; no_claim=a real msiexec repair
+      # Value: protects=the markers stay unreadable to local users, so none can forge one; fails_when=the repair branch of Get-WorkDirectoryKey stops resetting an ACL that is not exactly SYSTEM and Administrators; why_new=CI only ever sees a fresh or already-correct key; seam=none; no_claim=that the window between key creation and the ACL reset is closed
+      - name: Verify the install source is kept and the record key's ACL repaired
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = Get-Content fivenines_setup.ps1 -Raw
+          foreach ($fn in 'Get-WorkDirectoryKey', 'New-PrivateWorkDirectory', 'Remove-WorkDirectory', 'Remove-EarlierWorkDirectories') {
+            $m = [regex]::Match($src, "(?ms)^function $fn \{.*?^\}")
+            if (-not $m.Success) { throw "$fn not found in fivenines_setup.ps1" }
+            Invoke-Expression $m.Value
+          }
+          $key = Get-WorkDirectoryKey
+          $uninstall = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+          if (@(Get-ItemProperty "$uninstall\*" -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match "Fivenines Monitoring Agent" }).Count -ne 0) {
+            throw "a Fivenines Monitoring Agent product is already registered on this runner; this step needs none"
+          }
+          $source = New-PrivateWorkDirectory "fivenines-setup"
+          $current = New-PrivateWorkDirectory "fivenines-update"
+          $entry = Join-Path $uninstall ("{" + [guid]::NewGuid().ToString().ToUpper() + "}")
+          try {
+            New-Item -Path $entry -Force | Out-Null
+            New-ItemProperty -LiteralPath $entry -Name DisplayName -Value "Fivenines Monitoring Agent" -PropertyType String | Out-Null
+            New-ItemProperty -LiteralPath $entry -Name InstallSource -Value ($source.ToUpper() + "\") -PropertyType String | Out-Null
+            Remove-EarlierWorkDirectories -Keep $current -MinAgeMinutes 0
+            if (-not (Test-Path -LiteralPath $source)) { throw "the installed product's install source was removed" }
+            if ($null -eq (Get-Item -LiteralPath $key).GetValue((Split-Path -Leaf $source))) { throw "the install source's record was removed" }
+
+            # Open the key to BUILTIN\Users, then let Get-WorkDirectoryKey repair it.
+            $acl = Get-Acl -Path $key
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule(
+              (New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-545")),
+              [System.Security.AccessControl.RegistryRights]::ReadKey,
+              [System.Security.AccessControl.InheritanceFlags]::ContainerInherit,
+              [System.Security.AccessControl.PropagationFlags]::None,
+              [System.Security.AccessControl.AccessControlType]::Allow)))
+            Set-Acl -Path $key -AclObject $acl
+            $opened = @((Get-Acl -Path $key).GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value })
+            if ($opened -notcontains "S-1-5-32-545") { throw "could not open $key to BUILTIN\Users for the test" }
+            Get-WorkDirectoryKey | Out-Null
+            $acl = Get-Acl -Path $key
+            $granted = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+            if (-not $acl.AreAccessRulesProtected -or ($granted -join ",") -ne "S-1-5-18,S-1-5-32-544") { throw "$key was not repaired; open to: $($granted -join ', ')" }
+            Write-Host "Kept the install source an Uninstall entry records (upper case, trailing backslash) with its record; reset a key opened to BUILTIN\Users to SYSTEM and Administrators."
+          } finally {
+            Remove-Item -LiteralPath $entry -Recurse -Force -ErrorAction SilentlyContinue
+            foreach ($d in @($source, $current)) {
+              Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
+              Remove-ItemProperty -LiteralPath $key -Name (Split-Path -Leaf $d) -ErrorAction SilentlyContinue
+            }
+          }
+
+      # What a successful uninstall leaves: no work directory these scripts
+      # recorded, whatever its age, except one a file in use keeps (with its
+      # record, so the key stays); no fivenines-bootstrap key once it
+      # records nothing; and no Five-Nines.io key once it is empty -- never
+      # a vendor key that still holds something.
+      # Value: protects=a successful uninstall leaves no work directory, no fivenines-bootstrap key and no empty Five-Nines.io key, and never removes a vendor key that still holds something; fails_when=the record, key or vendor cleanup regresses, or a non-empty vendor key is removed; why_new=only a static check covers it; seam=none; no_claim=msiexec /x itself
+      - name: Verify the uninstall removes its work directory and empty keys
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = Get-Content fivenines_setup.ps1 -Raw
+          foreach ($fn in 'Get-WorkDirectoryKey', 'New-PrivateWorkDirectory', 'Remove-WorkDirectory', 'Remove-EarlierWorkDirectories') {
+            $m = [regex]::Match($src, "(?ms)^function $fn \{.*?^\}")
+            if (-not $m.Success) { throw "$fn not found in fivenines_setup.ps1" }
+            Invoke-Expression $m.Value
+          }
+          $m = [regex]::Match((Get-Content fivenines_uninstall.ps1 -Raw), "(?ms)^function Remove-AllWorkDirectories \{.*?^\}")
+          if (-not $m.Success) { throw "Remove-AllWorkDirectories not found in fivenines_uninstall.ps1" }
+          Invoke-Expression $m.Value
+          $vendor = "HKLM:\SOFTWARE\Five-Nines.io"
+          $bootstrap = "$vendor\fivenines-bootstrap"
+          $sibling = "$vendor\fn-ci-sibling"
+          # Content in the vendor key this step did not create (other than the
+          # bootstrap key earlier steps use) means scenario (b) cannot expect it gone.
+          $foreign = $false
+          $v = Get-Item -LiteralPath $vendor -ErrorAction SilentlyContinue
+          if ($v) {
+            $foreign = ($v.ValueCount -ne 0) -or (@($v.GetSubKeyNames() | Where-Object { $_ -ne "fivenines-bootstrap" -and $_ -ne "fn-ci-sibling" }).Count -ne 0)
+          }
+          function Test-Recorded([string]$Path) { return (Test-Path -LiteralPath $bootstrap) -and $null -ne (Get-Item -LiteralPath $bootstrap).GetValue((Split-Path -Leaf $Path)) }
+          $createdSibling = $false
+          $held = $null
+          $dirs = @()
+          try {
+            if (-not (Test-Path -LiteralPath $sibling)) { New-Item -Path $sibling -Force | Out-Null; $createdSibling = $true }
+
+            # (a) A recent setup's directory goes whatever its age; one a file
+            # in use keeps stays with its record, so the bootstrap key stays,
+            # and the vendor key, which also holds another subkey, stays.
+            $WorkDir = New-PrivateWorkDirectory "fivenines-uninstall"
+            $dirs += $WorkDir
+            Set-Content -LiteralPath (Join-Path $WorkDir "fivenines_uninstall.log") -Value "x"
+            $young = New-PrivateWorkDirectory "fivenines-setup"
+            $dirs += $young
+            Set-Content -LiteralPath (Join-Path $young "fivenines-agent-windows-amd64.msi") -Value "x"
+            $busy = New-PrivateWorkDirectory "fivenines-update"
+            $dirs += $busy
+            $busyFile = Join-Path $busy "fivenines-update.log"
+            Set-Content -LiteralPath $busyFile -Value "x"
+            $held = [System.IO.File]::Open($busyFile, 'Open', 'Read', 'Read')
+            Remove-AllWorkDirectories
+            if (Test-Path -LiteralPath $WorkDir) { throw "the uninstall's work directory was kept" }
+            if (Test-Recorded $WorkDir) { throw "the uninstall's record was kept" }
+            if ((Test-Path -LiteralPath $young) -or (Test-Recorded $young)) { throw "a recent setup's directory or its record was kept" }
+            if (-not (Test-Path -LiteralPath $busy) -or -not (Test-Recorded $busy)) { throw "a directory a file in use kept lost its record, or the bootstrap key went" }
+            if (-not (Test-Path -LiteralPath $vendor)) { throw "$vendor was removed though it holds another subkey" }
+            if (-not (Test-Path -LiteralPath $sibling)) { throw "$sibling was removed" }
+            $held.Dispose(); $held = $null
+
+            # (b) No sibling, no file in use: everything goes, the empty
+            # bootstrap and vendor keys too.
+            if ($createdSibling) { Remove-Item -LiteralPath $sibling -Force; $createdSibling = $false }
+            $WorkDir = New-PrivateWorkDirectory "fivenines-uninstall"
+            $dirs += $WorkDir
+            Set-Content -LiteralPath (Join-Path $WorkDir "fivenines_uninstall.log") -Value "x"
+            Remove-AllWorkDirectories
+            if (Test-Path -LiteralPath $WorkDir) { throw "the uninstall's work directory was kept" }
+            if ((Test-Path -LiteralPath $busy) -or (Test-Recorded $busy)) { throw "the directory a file in use kept was not removed once the file was closed" }
+            $left = @()
+            if (Test-Path -LiteralPath $bootstrap) { $left = @((Get-Item -LiteralPath $bootstrap).GetValueNames()) }
+            if ($left.Count -eq 0 -and (Test-Path -LiteralPath $bootstrap)) { throw "$bootstrap was kept though it records nothing" }
+            $checked = "skipped: $vendor holds content this step did not create (records left: $($left -join ', '))"
+            if (-not $foreign -and ((Test-Path -LiteralPath $sibling) -or $left.Count -ne 0)) { $foreign = $true }
+            if (-not $foreign) {
+              if (Test-Path -LiteralPath $vendor) { throw "$vendor was kept though empty" }
+              $checked = "the empty $vendor went too"
+            }
+            Write-Host "Removed the uninstall's work directory, a recent setup's and, once its file was closed, one a file in use kept, with their records and the empty bootstrap key; kept $vendor while it held another subkey; vendor key check: $checked."
+          } finally {
+            if ($held) { $held.Dispose() }
+            foreach ($d in $dirs) {
+              Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
+              if (Test-Path -LiteralPath $bootstrap) { Remove-ItemProperty -LiteralPath $bootstrap -Name (Split-Path -Leaf $d) -ErrorAction SilentlyContinue }
+            }
+            if ($createdSibling) { Remove-Item -LiteralPath $sibling -Force -ErrorAction SilentlyContinue }
           }
 
       # Helpers duplicated across scripts that cannot share a file: the
@@ -514,6 +684,8 @@ jobs:
             @('Remove-EarlierWorkDirectories', 'fivenines_setup.ps1', 'fivenines_uninstall.ps1'),
             @('Get-WorkDirectoryKey', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
             @('Get-WorkDirectoryKey', 'fivenines_setup.ps1', 'fivenines_uninstall.ps1'),
+            @('Remove-WorkDirectory', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
+            @('Remove-WorkDirectory', 'fivenines_setup.ps1', 'fivenines_uninstall.ps1'),
             @('Get-WinNTUser', 'windows/installer/CreateServiceAccount.ps1', 'fivenines_uninstall.ps1'),
             @('Get-WmiNamespaceSD', 'windows/installer/DelegateWmiStorageNamespace.ps1', 'fivenines_uninstall.ps1'),
             @('Set-WmiNamespaceSD', 'windows/installer/DelegateWmiStorageNamespace.ps1', 'fivenines_uninstall.ps1')

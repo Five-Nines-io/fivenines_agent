@@ -89,6 +89,8 @@ def _constant(path, name):
         ("Remove-EarlierWorkDirectories", SETUP, UNINSTALL),
         ("Get-WorkDirectoryKey", SETUP, UPDATE),
         ("Get-WorkDirectoryKey", SETUP, UNINSTALL),
+        ("Remove-WorkDirectory", SETUP, UPDATE),
+        ("Remove-WorkDirectory", SETUP, UNINSTALL),
         ("Get-WinNTUser", CREATE_ACCOUNT, UNINSTALL),
         ("Get-WmiNamespaceSD", DELEGATE_WMI, UNINSTALL),
         ("Set-WmiNamespaceSD", DELEGATE_WMI, UNINSTALL),
@@ -275,13 +277,20 @@ def test_bootstrap_downloads_into_a_private_directory(path):
     assert '$image = Join-Path $WorkDir "plan"' in code
     assert "-WorkDir $WorkDir" in code
     assert "$env:TEMP" not in code
-    # After a run that succeeds (the script's last statement) only earlier
-    # runs' directories go: this one holds the recorded install source a
-    # repair reads, and a failed run keeps it for its log. The extraction
-    # goes in the preflight's finally either way.
+    # Earlier runs' directories go right after this run's is created (a run
+    # that keeps failing does not pile them up) and again as the last
+    # statement of a run that succeeds; this one stays, as the recorded
+    # install source a repair reads, or for a failed run's log. The
+    # extraction goes in the preflight's finally either way.
     prune = "Remove-EarlierWorkDirectories -Keep $WorkDir"
-    assert code.count(prune) == 1
-    after = code.split(prune, 1)[1].strip().splitlines()
+    assert code.count(prune) == 2
+    assert re.search(
+        r'(?m)^\$WorkDir = New-PrivateWorkDirectory "[a-z-]+"\n(#[^\n]*\n)*'
+        + re.escape(prune)
+        + "$",
+        code,
+    )
+    after = code.rsplit(prune, 1)[1].strip().splitlines()
     assert all(line.startswith("Write-Host ") for line in after if line.strip()), after
     assert "Remove-Item -LiteralPath $WorkDir" not in code
     assert "Get-ChildItem -LiteralPath $WorkDir" not in code
@@ -297,18 +306,37 @@ def test_bootstrap_downloads_into_a_private_directory(path):
     assert "$security.SetOwner($admins)" in helper
     assert "did not keep its access control list" in helper
     assert "FileSystemAclExtensions]::CreateDirectory($security, $path)" in helper
-    # Recorded with a marker, written in the record and in the directory.
-    assert 'Join-Path $path ".fivenines-work-directory") -Value $marker' in helper
-    assert "-Name (Split-Path -Leaf $path) -Value $marker" in helper
-    # The pruning removes only recorded directories that hold their marker,
-    # never one found by its name: any local user can create one of any name
-    # under %SystemRoot%\Temp and turn it into a link at any moment.
+    # Recorded with a marker before the directory exists (a run stopped in
+    # between leaves no directory unrecorded), and the marker written in a
+    # file whose own ACL, set while it is still empty, shuts out the user.
+    record = helper.index("-Name (Split-Path -Leaf $path) -Value $marker")
+    assert record < helper.index("CreateDirectory(")
+    acl = helper.index("Set-Acl -LiteralPath $markerFile -AclObject $markerSecurity")
+    assert acl < helper.index("Set-Content -LiteralPath $markerFile -Value $marker")
+    assert "$markerSecurity.SetAccessRuleProtection($true, $false)" in helper
+    # Windows PowerShell 5.1's Get-Acl and Set-Acl find no registry key by
+    # -LiteralPath (the CI step failed on it).
+    key_helper = _function(path, "Get-WorkDirectoryKey")
+    assert "Get-Acl -Path $key" in key_helper
+    assert "Set-Acl -Path $key" in key_helper
+    assert "Acl -LiteralPath" not in key_helper
+    # The pruning removes only recorded directories, never one found by its
+    # name: any local user can create one of any name under %SystemRoot%\Temp
+    # and turn it into a link at any moment. A recorded path must first be a
+    # plain directory owned by Administrators before its marker is read, and
+    # the removal goes through Remove-WorkDirectory, the marker last.
     prune_helper = _function(path, "Remove-EarlierWorkDirectories")
     assert "Get-ChildItem" not in prune_helper
+    assert "Remove-Item " not in prune_helper
     assert ".GetValueNames()" in prune_helper
+    owner = prune_helper.index('.Value -eq "S-1-5-32-544"')
+    assert owner < prune_helper.index("$found = Get-Content")
     guard = prune_helper.index("if ($marker -and $found -eq $marker) {")
-    assert prune_helper.index("Remove-Item -LiteralPath $path -Recurse") > guard
-    assert prune_helper.count("Remove-Item ") == 1
+    assert prune_helper.index("Remove-WorkDirectory $path") > guard
+    remover = _function(path, "Remove-WorkDirectory")
+    assert remover.index('$_.Name -ne ".fivenines-work-directory"') < remover.index(
+        "Remove-Item -LiteralPath $Path -Recurse"
+    )
 
 
 # Value: protects=the uninstall log; fails_when=fivenines_uninstall.ps1's -LogFile default goes back to a bare $env:TEMP name (C:\\Windows\\Temp under an RMM tool running as SYSTEM) or a successful uninstall stops removing its work directory; why_new=the Windows runs pass an explicit -LogFile; seam=none; no_claim=that the ACL is private, which windows.yml's work directory steps check
@@ -319,12 +347,18 @@ def test_uninstall_logs_into_a_private_directory():
     assert re.search(
         r"(?m)^if \(-not \$LogFile\) \{ \$LogFile = Join-Path \$WorkDir ", code
     )
-    helper = _function(UNINSTALL, "Remove-AllWorkDirectories")
-    assert "Remove-EarlierWorkDirectories -Keep $WorkDir" in helper
-    assert (
-        "Remove-Item -LiteralPath $WorkDir -Recurse -Force -ErrorAction SilentlyContinue"
-        in helper
+    # Earlier runs' directories go at the start, as in setup and update.
+    assert re.search(
+        r'(?m)^\$WorkDir = New-PrivateWorkDirectory "fivenines-uninstall"\n(#[^\n]*\n)*'
+        + re.escape("Remove-EarlierWorkDirectories -Keep $WorkDir")
+        + "$",
+        code,
     )
+    # After it succeeds no repair is left to protect: every recorded
+    # directory goes whatever its age, its own too, the marker last.
+    helper = _function(UNINSTALL, "Remove-AllWorkDirectories")
+    assert "Remove-EarlierWorkDirectories -Keep $WorkDir -MinAgeMinutes 0" in helper
+    assert "Remove-WorkDirectory $WorkDir" in helper
     # Before -KeepAccount's exit 0, and at the end, each after the msiexec /x
     # failure exit.
     calls = re.findall(r"(?m)^\s*Remove-AllWorkDirectories$", code)
@@ -436,3 +470,9 @@ def test_custom_actions_carrying_secrets_hide_their_data():
         action = re.search(r'<CustomAction Id="%s"[^>]*/>' % re.escape(name), wxs)
         assert action, f"no CustomAction {name}"
         assert 'HideTarget="yes"' in action.group(0), f"{name} logs its data"
+
+
+# Value: protects=an unelevated run refused before it touches %SystemRoot%\Temp or HKLM; fails_when=#Requires -RunAsAdministrator is dropped from a bootstrap; why_new=no test checks #Requires, and New-PrivateWorkDirectory runs before Test-IsAdmin; seam=none; no_claim=a script fed to iex, where #Requires is not applied
+@pytest.mark.parametrize("path", [SETUP, UPDATE, UNINSTALL])
+def test_bootstraps_require_elevation(path):
+    assert re.search(r"(?m)^#Requires -RunAsAdministrator$", _read(path))
