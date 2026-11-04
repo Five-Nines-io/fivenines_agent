@@ -57,7 +57,8 @@ def _code(path):
 
 def _function(path, name):
     match = re.search(
-        r"(?ms)^function %s \{.*?^\}" % re.escape(name), _read(path).replace("\r\n", "\n")
+        r"(?ms)^function %s \{.*?^\}" % re.escape(name),
+        _read(path).replace("\r\n", "\n"),
     )
     assert match, f"function {name} not found in {path}"
     return match.group(0)
@@ -97,7 +98,9 @@ def test_account_scripts_avoid_the_local_accounts_cmdlets(path):
         "Get-LocalGroup",
         "Add-LocalGroupMember",
     ):
-        assert cmdlet not in code, f"{path} calls {cmdlet}, which sees nothing on a domain controller"
+        assert (
+            cmdlet not in code
+        ), f"{path} calls {cmdlet}, which sees nothing on a domain controller"
 
 
 # Value: protects=installs on a non-English Windows; fails_when=a group or built-in principal is looked up by its English name again (the German "Leistungsueberwachungsbenutzer" is not "Performance Monitor Users"); why_new=the English runner finds English names; the E2E only catches the three groups it renames; seam=none; no_claim=that every SID is the right one
@@ -171,8 +174,12 @@ def test_dc_harness_fills_every_template_field_and_ships_its_scripts():
 # Value: protects=what the DC job downloads; fails_when=an evaluation ISO or the v1.22.0 MSI loses its pinned SHA-256, or the hour-long job starts running on every push; why_new=nothing else reads these pins; seam=none; no_claim=that Microsoft still serves the same ISO
 def test_dc_job_pins_its_downloads_and_runs_on_request_only():
     workflow = _read(WINDOWS_WORKFLOW)
-    job = workflow[workflow.index("  smoke-msi-domain-controller:") :]
-    assert "if: github.event_name == 'workflow_dispatch' && inputs.domain_controller" in job
+    start = workflow.index("  smoke-msi-domain-controller:")
+    job = workflow[start:]
+    assert (
+        "if: github.event_name == 'workflow_dispatch' && inputs.domain_controller"
+        in job
+    )
     assert len(re.findall(r"iso_sha256: [0-9a-f]{64}\n", job)) == 2
     assert re.search(r"OLD_MSI_SHA256: [0-9a-f]{64}\n", job)
     assert "sha256sum -c -" in job
