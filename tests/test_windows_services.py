@@ -5,6 +5,7 @@ contract fixture's 'scm' inputs; on Windows, test_real_service_control_manager
 reads the runner's own services through pywin32 and ctypes.
 """
 
+import io
 import json
 import os
 import sys
@@ -209,6 +210,31 @@ def test_fixture_is_ascii():
         f.read().decode("ascii")
 
 
+# --- registry dispatch ---------------------------------------------------------
+
+
+# Value: protects=config["windows_services"] is a plain boolean never splatted:
+# a dict value still collects the full list; fails_when=the registry entry's
+# pass_kwargs flips to True (the dict then raises TypeError, shipped as null);
+# why_new=every other test sends True, which is never splatted; seam=none;
+# no_claim=what the server sends (a fake win32service serves the contract
+# fixture; unit only)
+def test_a_dict_config_value_is_not_splatted_into_the_collector():
+    """config["windows_services"] is a TOP-LEVEL plain boolean (pass_kwargs=False):
+    a dict value must still collect, not be splatted into a TypeError the
+    dispatcher would ship as null. Asserted on the full list and a telemetry
+    entry with no errors, never on None."""
+    scenario = _scenario("typical_server")
+    fake = FakeWin32Service(scenario["scm"])
+    data, telemetry = {}, {}
+    with patch.dict(sys.modules, {"win32service": fake}), patch.object(
+        ws, "is_windows", return_value=True
+    ), patch.object(ws, "_trigger_count", side_effect=fake.trigger_count):
+        collect_metrics({"windows_services": {"unexpected": 1}}, data, telemetry)
+    assert data == scenario["payload"]
+    assert "errors" not in telemetry["windows_services"]
+
+
 # --- the read ----------------------------------------------------------------
 
 
@@ -272,6 +298,36 @@ def test_names_are_scrubbed_for_the_wire():
     assert b"\x00" not in entry_json
     assert entry["name"] == "bad?name"
     assert entry["display_name"] == "display"
+
+
+# Value: protects=a debug-level log of a failed service read never sinks the
+# whole read on a Windows service's strict ANSI-code-page stdout; fails_when=a
+# name or OS message reaches print() unescaped (repr keeps printable non-ASCII);
+# why_new=only the wire path was tested with non-ASCII; seam=none;
+# no_claim=WinSW's own stdout (an io.TextIOWrapper stands in for it)
+def test_debug_log_of_a_name_stdout_cannot_encode_keeps_the_read(monkeypatch):
+    monkeypatch.setenv("LOG_LEVEL", "debug")
+    stdout = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+    rows = [
+        _row("\u670d\u52a1", config={"open_error": 5}),
+        _row(
+            "\u5e94\u7528",
+            config={"start_type_error": 5, "delayed": False, "triggers": 0},
+        ),
+        _row("ok"),
+    ]
+    with patch.object(sys, "stdout", stdout):
+        result, _ = _collect({"services": rows})
+    assert not isinstance(result, Exception), result
+    by_name = {s["name"]: s for s in result["services"]}
+    assert set(by_name) == {"ok", "\u670d\u52a1", "\u5e94\u7528"}
+    assert by_name["\u670d\u52a1"]["start_type"] is None
+    assert by_name["\u5e94\u7528"]["start_type"] is None
+    assert by_name["ok"]["start_type"] == "automatic"
+    stdout.flush()
+    logged = stdout.buffer.getvalue().decode("cp1252")
+    assert "cannot open \\u670d\\u52a1" in logged
+    assert "cannot read the start type of \\u5e94\\u7528" in logged
 
 
 def test_sort_is_case_insensitive_and_stable_on_case():
@@ -375,6 +431,54 @@ def test_probe_access_when_the_scm_refuses():
         available, reason = probe_access()
     assert available is False
     assert reason.startswith("Service Control Manager unavailable: FakeScmError: ")
+
+
+# Value: protects=the probe, which runs on the collection loop, never waits on a
+# wedged services.exe and shares the collector's single flight; fails_when=the
+# probe's open is unbounded, or it ignores (or forgets to record) a stalled
+# worker; why_new=the probe was only tested against a fake that answers at once;
+# seam=none; no_claim=a real wedged SCM (a blocking open stands in for it)
+def test_probe_open_is_bounded_and_shares_the_single_flight():
+    release = threading.Event()
+    opens = []
+
+    class WedgedScm(FakeWin32Service):
+        def OpenSCManager(self, machine, database, access):
+            opens.append(1)
+            release.wait(5)  # bounded, so a missing join FAILS instead of hanging
+            return super().OpenSCManager(machine, database, access)
+
+    fake = WedgedScm({"services": []})
+    with patch.dict(sys.modules, {"win32service": fake}), patch.object(
+        ws, "SCM_READ_TIMEOUT", 0.05
+    ), patch.object(ws, "is_windows", return_value=True):
+        try:
+            start = time.monotonic()
+            available, reason = probe_access()
+            assert time.monotonic() - start < 1
+            assert (available, reason) == (
+                False,
+                "Service Control Manager did not answer within 0.05s",
+            )
+            assert ws._stalled_worker.daemon
+
+            # While it is blocked, neither the probe nor the collector opens again.
+            assert probe_access() == (
+                False,
+                "a Service Control Manager read is still blocked",
+            )
+            assert windows_services() is None
+            assert len(opens) == 1
+        finally:
+            release.set()
+            ws._stalled_worker.join(5)
+
+        # Once it returned, the next probe clears it and opens again.
+        with patch.object(ws, "SCM_READ_TIMEOUT", 5):
+            assert probe_access() == (True, None)
+        assert ws._stalled_worker is None
+        assert len(opens) == 2
+    assert not fake.open_handles
 
 
 # --- the trigger count (ctypes) --------------------------------------------------

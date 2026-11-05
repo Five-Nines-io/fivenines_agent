@@ -15,10 +15,10 @@ from fivenines_agent.bounded import WorkerTimeout, call_bounded
 from fivenines_agent.debug import log
 from fivenines_agent.env import is_windows
 from fivenines_agent.openvpn import probe_management_access
-from fivenines_agent.windows_services import probe_access as probe_services_access
 from fivenines_agent.qemu import DEFAULT_LIBVIRT_URI
 from fivenines_agent.scrub import log_safe
 from fivenines_agent.subprocess_utils import get_clean_env, run_privileged
+from fivenines_agent.windows_services import probe_access as probe_services_access
 from fivenines_agent.wireguard import (
     WG_DUMP_ARGV,
     WG_DUMP_TIMEOUT,

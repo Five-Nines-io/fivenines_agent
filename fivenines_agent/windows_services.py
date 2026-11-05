@@ -25,9 +25,10 @@ Payload (tests/fixtures/windows_services_contract_payload.json):
                  "delayed_auto_start": false, "trigger_start": false,
                  "pid": 1532, "exit_code": 0, "service_exit_code": 0}, ...]}
 
-None off Windows, when the Service Control Manager cannot be read, when more
-than MAX_SERVICES services are listed, and while a read that outlived
-SCM_READ_TIMEOUT is still blocked: never a partial list. The list itself is
+None off Windows, and while a read that outlived SCM_READ_TIMEOUT is still
+blocked. A read that fails -- the Service Control Manager refused, the listing
+failed, more than MAX_SERVICES services listed -- raises, and the dispatcher
+reports null: never a partial list. The list itself is
 what the agent's account can see -- EnumServicesStatusEx silently omits a
 service whose security descriptor denies it SERVICE_QUERY_STATUS -- so a
 service missing from one tick's list was not necessarily removed.
@@ -36,7 +37,7 @@ service missing from one tick's list was not necessarily removed.
 from fivenines_agent.bounded import WorkerTimeout, call_bounded
 from fivenines_agent.debug import debug, log
 from fivenines_agent.env import is_windows
-from fivenines_agent.scrub import scrub_str
+from fivenines_agent.scrub import log_safe, scrub_str
 
 # winsvc.h
 SC_MANAGER_CONNECT = 0x0001
@@ -91,8 +92,8 @@ SCM_READ_TIMEOUT = 10
 # first call fits; a larger `needed` is still honoured once.
 _TRIGGER_BUFFER_BYTES = 8192
 
-# The worker of a read that outlived SCM_READ_TIMEOUT, while it is still alive:
-# no second read starts until it returns.
+# The worker of a read (or a probe's open) that outlived SCM_READ_TIMEOUT, while
+# it is still alive: no second read or probe starts until it returns.
 _stalled_worker = None
 
 # QueryServiceConfig2W from advapi32, with its argument types set once.
@@ -114,14 +115,9 @@ def windows_services():
     global _stalled_worker
     if not is_windows():
         return None
-    if _stalled_worker is not None:
-        if _stalled_worker.is_alive():
-            log(
-                "windows_services: previous read still blocked; reporting None",
-                "debug",
-            )
-            return None
-        _stalled_worker = None
+    if _still_blocked():
+        log("windows_services: previous read still blocked; reporting None", "debug")
+        return None
 
     try:
         return call_bounded(_read_services, SCM_READ_TIMEOUT, name="windows-services")
@@ -139,18 +135,41 @@ def probe_access():
     """(available, reason) for the capability probe.
 
     The same pywin32 import and SCM open the collector makes, so the two
-    cannot drift; the per-service reads are the collector's own business.
+    cannot drift; the per-service reads are the collector's own business. The
+    probe runs on the collection loop too (at start-up, on every full re-probe
+    and on SIGHUP), so its open is bounded like the collector's read and shares
+    its single flight: while either is blocked, neither starts again.
     """
+    global _stalled_worker
     try:
         import win32service  # type: ignore[import-not-found]
     except ImportError as e:
         return False, f"pywin32 not installed: {e}"
+    if _still_blocked():
+        return False, "a Service Control Manager read is still blocked"
+
+    def open_and_close():
+        win32service.CloseServiceHandle(_open_scm(win32service))
+
     try:
-        scm = _open_scm(win32service)
+        call_bounded(open_and_close, SCM_READ_TIMEOUT, name="windows-services-probe")
+    except WorkerTimeout as stalled:
+        _stalled_worker = stalled.worker
+        return (
+            False,
+            f"Service Control Manager did not answer within {SCM_READ_TIMEOUT}s",
+        )
     except Exception as e:
         return False, f"Service Control Manager unavailable: {type(e).__name__}: {e}"
-    win32service.CloseServiceHandle(scm)
     return True, None
+
+
+def _still_blocked():
+    """True while a read or probe abandoned at SCM_READ_TIMEOUT has not returned."""
+    global _stalled_worker
+    if _stalled_worker is not None and not _stalled_worker.is_alive():
+        _stalled_worker = None
+    return _stalled_worker is not None
 
 
 def _open_scm(win32service):
@@ -220,7 +239,9 @@ def _service_config(win32service, scm, name):
             return None
         # A service whose security descriptor grants the agent's account its
         # status but not its configuration: listed, configuration unknown.
-        log(f"windows_services: cannot open {name!r}: {e}", "debug")
+        # log_safe: a name or OS message outside the code page of a Windows
+        # service's stdout would make print() raise and sink the whole read.
+        log(f"windows_services: cannot open {log_safe(name)}: {log_safe(e)}", "debug")
         return None, None, None
     try:
         start_type = _read(
@@ -247,7 +268,11 @@ def _read(name, what, fn):
     try:
         return fn()
     except Exception as e:
-        log(f"windows_services: cannot read the {what} of {name!r}: {e}", "debug")
+        log(
+            f"windows_services: cannot read the {what} of {log_safe(name)}: "
+            f"{log_safe(e)}",
+            "debug",
+        )
         return None
 
 
