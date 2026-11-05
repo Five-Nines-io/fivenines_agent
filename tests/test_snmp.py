@@ -323,14 +323,22 @@ class TestParseSnmpLine:
             "1.3.6.1.2.1.31.1.1.1.18.1", "uplink(2)"
         )
 
-    def test_no_such_object(self):
-        line = (
-            ".1.3.6.1.2.1.31.1.1.1.1 = "
-            "No Such Object available on this agent at this OID"
-        )
-        oid, val = _parse_snmp_line(line)
-        assert oid == "1.3.6.1.2.1.31.1.1.1.1"
-        assert val is None
+    # Value: protects=both net-snmp exception spellings (noSuchObject and
+    # noSuchInstance) read as no value; fails_when=the prefix check is
+    # narrowed to one spelling, and a custom OID or sysName ships "No Such
+    # Instance currently exists at this OID" as its value; why_new=only "No
+    # Such Object" was tested; seam=none; no_claim=a device capture (the
+    # wording is net-snmp's exception text, typed here, not captured)
+    @pytest.mark.parametrize(
+        "exception",
+        [
+            "No Such Object available on this agent at this OID",
+            "No Such Instance currently exists at this OID",
+        ],
+    )
+    def test_no_such_exception_carries_no_value(self, exception):
+        line = ".1.3.6.1.2.1.31.1.1.1.1 = " + exception
+        assert _parse_snmp_line(line) == ("1.3.6.1.2.1.31.1.1.1.1", None)
 
     def test_end_of_mib_view_carries_no_value(self):
         """endOfMibView only ends a walk (#275): no row, not a "No Such"."""
