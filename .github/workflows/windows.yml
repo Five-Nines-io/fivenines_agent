@@ -690,6 +690,85 @@ jobs:
             if ($createdSibling) { Remove-Item -LiteralPath $sibling -Force -ErrorAction SilentlyContinue }
           }
 
+      # The bootstraps' msiexec wrapper, against a stand-in msiexec that
+      # answers 1618 twice, then 0: the busy answers are retried, a failure is
+      # not, and every call carries /norestart and exactly one UI level,
+      # /passive or /qn, never one that shows a modal box. Run as SYSTEM in
+      # session 0 (a scheduled task, as an RMM tool or Intune runs it), the
+      # level is /qn.
+      - name: Verify msiexec retries
+        shell: powershell
+        # A lost retry bound would spin until GitHub's six-hour limit.
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = Get-Content fivenines_setup.ps1 -Raw
+          $m = [regex]::Match($src, "(?ms)^function Invoke-Msiexec \{.*?^\}")
+          if (-not $m.Success) { throw "Invoke-Msiexec not found in fivenines_setup.ps1" }
+          Invoke-Expression $m.Value
+          $dir = Join-Path $env:RUNNER_TEMP ("fn-msiexec-" + [guid]::NewGuid())
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          $fake = Join-Path $dir "fake-msiexec.cmd"
+          $callsFile = Join-Path $dir "calls.txt"
+          # Answers the Nth call with the Nth code of $Codes, the last one after.
+          function New-Fake($Codes) {
+            $lines = @(
+              '@echo off',
+              'echo %*>>"%~dp0calls.txt"',
+              'for /f %%c in (''find /c /v "" ^< "%~dp0calls.txt"'') do set n=%%c'
+            )
+            for ($i = 0; $i -lt $Codes.Count - 1; $i++) { $lines += ('if %n%=={0} exit /b {1}' -f ($i + 1), $Codes[$i]) }
+            $lines += ('exit /b {0}' -f $Codes[-1])
+            Set-Content -LiteralPath $fake -Value $lines -Encoding ascii
+            Remove-Item -LiteralPath $callsFile -ErrorAction SilentlyContinue
+          }
+          function Get-Calls { return @(Get-Content -LiteralPath $callsFile) }
+
+          New-Fake @(1618, 1618, 0)
+          $code = Invoke-Msiexec -Arguments @("/i", "x.msi") -FilePath $fake -RetrySeconds 0
+          $calls = Get-Calls
+          if ($code -ne 0 -or $calls.Count -ne 3) { throw "busy twice then done: exit $code after $($calls.Count) calls, expected 0 after 3" }
+          foreach ($call in $calls) {
+            if ($call -match "/q[br]") { throw "a UI level that shows modal boxes: $call" }
+            $ui = @($call -split " " | Where-Object { $_ -in @("/passive", "/qn") })
+            if ($ui.Count -ne 1 -or $call -notmatch "/norestart") { throw "unexpected msiexec arguments: $call" }
+          }
+          Write-Host "1618 twice, then 0: three calls, each with one UI level ($ui) and /norestart."
+
+          New-Fake @(1601)
+          $code = Invoke-Msiexec -Arguments @("/x", "{x}") -FilePath $fake -RetrySeconds 0
+          if ($code -ne 1601 -or (Get-Calls).Count -ne 4) { throw "always busy: exit $code after $((Get-Calls).Count) calls, expected 1601 after 4" }
+          New-Fake @(1603)
+          $code = Invoke-Msiexec -Arguments @("/i", "x.msi") -FilePath $fake -RetrySeconds 0
+          if ($code -ne 1603 -or (Get-Calls).Count -ne 1) { throw "a failure was retried: exit $code after $((Get-Calls).Count) calls" }
+          New-Fake @(0)
+          Invoke-Msiexec -Arguments @("/a", "x.msi") -Quiet -FilePath $fake -RetrySeconds 0 | Out-Null
+          # @(...) around the call: a function's one-element array comes back as its element.
+          $first = @(Get-Calls)[0]
+          if ($first -notmatch "/qn") { throw "-Quiet did not force /qn: $first" }
+          Write-Host "Always busy: four calls, then the code. A failure: one call. -Quiet: /qn."
+
+          New-Fake @(0)
+          $run = Join-Path $dir "session0.ps1"
+          Set-Content -LiteralPath $run -Encoding ascii -Value ($m.Value + "`r`nInvoke-Msiexec -Arguments @('/i', 'x.msi') -FilePath '$fake' -RetrySeconds 0 | Out-Null`r`n")
+          $task = "fn-ci-msiexec-session0"
+          $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ('-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $run)
+          Register-ScheduledTask -TaskName $task -Action $action -User "SYSTEM" -RunLevel Highest -Force | Out-Null
+          try {
+            Start-ScheduledTask -TaskName $task
+            $deadline = (Get-Date).AddSeconds(120)
+            while (-not (Test-Path -LiteralPath $callsFile)) {
+              if ((Get-Date) -gt $deadline) { throw "the SYSTEM task never called msiexec" }
+              Start-Sleep -Seconds 1
+            }
+            $first = @(Get-Calls)[0]
+            if ($first -notmatch "/qn" -or $first -notmatch "/norestart") { throw "session 0 did not get /qn /norestart: $first" }
+            Write-Host "As SYSTEM in session 0: /qn /norestart."
+          } finally {
+            Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
+          }
+          Remove-Item -LiteralPath $dir -Recurse -Force
+
       # Helpers duplicated across scripts that cannot share a file: the
       # custom actions are separate MSI files, the bootstraps are downloaded
       # one by one.
@@ -711,6 +790,8 @@ jobs:
             @('Get-PreflightVerdict', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
             @('Invoke-AccountPreflight', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
             @('New-PrivateWorkDirectory', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
+            @('Invoke-Msiexec', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
+            @('Invoke-Msiexec', 'fivenines_setup.ps1', 'fivenines_uninstall.ps1'),
             @('New-PrivateWorkDirectory', 'fivenines_setup.ps1', 'fivenines_uninstall.ps1'),
             @('Remove-EarlierWorkDirectories', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
             @('Remove-EarlierWorkDirectories', 'fivenines_setup.ps1', 'fivenines_uninstall.ps1'),
@@ -1238,8 +1319,8 @@ jobs:
       # no longer runs as the account the step would update.
       - name: fivenines_update.ps1 and fivenines_setup.ps1 -ServiceAccountPassword on the installed version
         shell: powershell
-        # Bootstrap scripts run msiexec /qb, whose modal error box would hold
-        # the job for GitHub's six hours.
+        # A hung bootstrap (msiexec stuck, or the Windows Installer service
+        # busy through the retries) must not hold the job for six hours.
         timeout-minutes: 25
         run: |
           $ErrorActionPreference = "Stop"
@@ -1249,8 +1330,12 @@ jobs:
           function Invoke-Update($Password, $Log, $Url = $msiUrl) {
             $secure = ConvertTo-SecureString $Password -AsPlainText -Force
             $global:LASTEXITCODE = 0
-            & .\fivenines_update.ps1 -MsiUrl $Url -MsiPath (Join-Path $env:TEMP "fn-update.msi") -LogFile (Join-Path $PWD $Log) -ServiceAccountPassword $secure
-            if ($LASTEXITCODE -ne 0) { throw "fivenines_update.ps1 exited $LASTEXITCODE" }
+            # A refusal is an error the script writes before it exits 1 (it
+            # goes on past Write-Error to exit with its own code): kept, for
+            # the throw the checks below read.
+            $scriptErrors = $null
+            & .\fivenines_update.ps1 -MsiUrl $Url -MsiPath (Join-Path $env:TEMP "fn-update.msi") -LogFile (Join-Path $PWD $Log) -ServiceAccountPassword $secure -ErrorVariable scriptErrors
+            if ($LASTEXITCODE -ne 0) { throw ("fivenines_update.ps1 exited {0}: {1}" -f $LASTEXITCODE, ($scriptErrors -join " ")) }
           }
           function Assert-Installed {
             $agent = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
@@ -1377,8 +1462,8 @@ jobs:
       # 3. fivenines_uninstall.ps1 must delete the account and its grant.
       - name: Reinstall keeping the account, over an orphaned WMI grant, then fivenines_uninstall.ps1
         shell: powershell
-        # Bootstrap scripts run msiexec /qb, whose modal error box would hold
-        # the job for GitHub's six hours.
+        # A hung bootstrap (msiexec stuck, or the Windows Installer service
+        # busy through the retries) must not hold the job for six hours.
         timeout-minutes: 20
         run: |
           $ErrorActionPreference = "Stop"

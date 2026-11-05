@@ -47,14 +47,27 @@ def _read(path):
     return (REPO_ROOT / path).read_text(encoding="utf-8")
 
 
-def _code(path):
-    """The script without its comments: full-line ones and ' # ' trailers."""
+def _strip_comments(text):
+    """Text without its comments: full-line ones and ' # ' trailers."""
     lines = []
-    for line in _read(path).splitlines():
+    for line in text.splitlines():
         if line.lstrip().startswith("#"):
             continue
         lines.append(re.sub(r"\s#\s.*$", "", line))
     return "\n".join(lines)
+
+
+def _code(path):
+    """The script without its comments."""
+    return _strip_comments(_read(path))
+
+
+def _code_without(path, name):
+    """The script without function `name`, then without its comments."""
+    raw = _read(path)
+    function = _function(path, name)
+    assert function in raw
+    return _strip_comments(raw.replace(function, ""))
 
 
 def _function(path, name):
@@ -84,6 +97,8 @@ def _constant(path, name):
         ("Get-PreflightVerdict", SETUP, UPDATE),
         ("Invoke-AccountPreflight", SETUP, UPDATE),
         ("New-PrivateWorkDirectory", SETUP, UPDATE),
+        ("Invoke-Msiexec", SETUP, UPDATE),
+        ("Invoke-Msiexec", SETUP, UNINSTALL),
         ("New-PrivateWorkDirectory", SETUP, UNINSTALL),
         ("Remove-EarlierWorkDirectories", SETUP, UPDATE),
         ("Remove-EarlierWorkDirectories", SETUP, UNINSTALL),
@@ -222,7 +237,7 @@ def test_tags_match_earlier_releases_and_the_dc_harness():
     assert _constant(stage2, "Operator") == operator
 
 
-# Value: protects=-ServiceAccountPassword on fivenines_setup.ps1 and fivenines_update.ps1: refused before the MSI is downloaded, and once accepted handed to msiexec; fails_when=the converted argument stops reaching the array msiexec gets (PowerShell reads a renamed or misspelled variable as $null, so the install silently runs without the password and fails with 1603 on a DC whose account is shared) or the check moves after the download; why_new=no Windows run executes fivenines_update.ps1 (the DC run's S5 runs only fivenines_setup.ps1) and windows.yml checks ConvertTo-MsiPasswordArgument's body, not how the scripts use it; seam=none; no_claim=that msiexec and the custom action parse the argument, which S5 proves for the setup script
+# Value: protects=-ServiceAccountPassword on fivenines_setup.ps1 and fivenines_update.ps1: refused before the MSI is downloaded, and once accepted handed to msiexec; fails_when=the converted argument stops reaching the array msiexec gets (PowerShell reads a renamed or misspelled variable as $null, so the install silently runs without the password and fails with 1603 on a DC whose account is shared) or the check moves after the download; why_new=the E2Es run the scripts only on Windows after the MSI build, and windows.yml checks ConvertTo-MsiPasswordArgument's body, not how the scripts use it; seam=none; no_claim=that msiexec and the custom action parse the argument, which S5 proves for the setup script
 @pytest.mark.parametrize("path", [SETUP, UPDATE])
 def test_bootstrap_checks_the_password_first_and_hands_it_to_msiexec(path):
     code = _code(path)
@@ -233,7 +248,7 @@ def test_bootstrap_checks_the_password_first_and_hands_it_to_msiexec(path):
     assert convert.start() < code.index(
         "Invoke-WebRequest"
     ), f"{path} downloads the MSI before checking -ServiceAccountPassword"
-    msiexec = re.search(r"Start-Process msiexec\.exe -ArgumentList \$(\w+)", code)
+    msiexec = re.search(r"Invoke-Msiexec -Arguments \$(\w+)", code)
     assert msiexec, f"{path} does not run msiexec"
     before_msiexec = code[: msiexec.start()]
     built = list(re.finditer(r"\$%s = @\(" % msiexec.group(1), before_msiexec))
@@ -291,7 +306,11 @@ def test_bootstrap_downloads_into_a_private_directory(path):
         code,
     )
     after = code.rsplit(prune, 1)[1].strip().splitlines()
-    assert all(line.startswith("Write-Host ") for line in after if line.strip()), after
+    assert all(
+        line.startswith("Write-Host ") or line == "if ($restartPending) { exit 3010 }"
+        for line in after
+        if line.strip()
+    ), after
     assert "Remove-Item -LiteralPath $WorkDir" not in code
     assert "Get-ChildItem -LiteralPath $WorkDir" not in code
     assert re.search(
@@ -376,10 +395,34 @@ def test_uninstall_logs_into_a_private_directory():
     calls = re.findall(r"(?m)^\s*Remove-AllWorkDirectories$", code)
     assert len(calls) == 2
     first = re.search(r"(?m)^\s*Remove-AllWorkDirectories$", code)
-    assert first.start() > code.index("exit $proc.ExitCode")
-    assert code.split(first.group(0), 1)[1].lstrip().startswith("exit 0")
+    assert first.start() > code.index("exit $exitCode")
+    rest = code.split(first.group(0), 1)[1].split("\n")
+    assert [line.strip() for line in rest[1:3]] == [
+        "if ($restartPending) { exit 3010 }",
+        "exit 0",
+    ], rest[:3]
     after = code.rsplit("Remove-AllWorkDirectories", 1)[1].strip().splitlines()
-    assert all(line.startswith("Write-Host ") for line in after if line.strip()), after
+    assert all(
+        line.startswith("Write-Host ") or line == "if ($restartPending) { exit 3010 }"
+        for line in after
+        if line.strip()
+    ), after
+
+
+# Value: protects=every install, update and uninstall the bootstraps run; fails_when=an msiexec call bypasses Invoke-Msiexec (no retry of the Windows Installer service's 1601/1618, an automatic restart under /qn) or a UI switch comes back at a call site, or the wrapper uses one that shows modal boxes (/qb, /qr, /qf), which hang an RMM or scheduled-task run forever; why_new=windows.yml tests Invoke-Msiexec's body, not that the scripts call it; seam=none; no_claim=that the retry and the window choice work, which windows.yml's "Verify msiexec retries" step runs
+@pytest.mark.parametrize("path", [SETUP, UPDATE, UNINSTALL])
+def test_bootstraps_run_msiexec_only_through_invoke_msiexec(path):
+    outside = _code_without(path, "Invoke-Msiexec")
+    assert "Invoke-Msiexec -Arguments" in outside
+    # No other way to start msiexec, and no UI switch outside the wrapper.
+    assert "Start-Process" not in outside
+    assert not re.search(r"(?im)^\s*&\s*[\"']?msiexec", outside)
+    assert not re.search(r"(?i)[\"']/(q[nbrf][+!-]*|quiet|passive)[\"']", outside)
+    helper = _function(path, "Invoke-Msiexec")
+    assert '"/norestart"' in helper
+    assert "1601" in helper and "1618" in helper
+    # Never a UI level that shows modal boxes (/qb, /qr, /qf).
+    assert not re.search(r"(?i)[\"']/q[brf]", helper)
 
 
 # Value: protects=the plan contract between CreateServiceAccount.ps1 -PlanOnly and the bootstraps' preflight; fails_when=one side renames a key (a verdict reading $Plan.verified finds nothing, so every password reads unchecked and every upgrade given one is refused; one reading $Plan.account finds no SID, so every in-place password step is refused); why_new=windows.yml checks each side alone (the real plan line's keys, the verdict on hand-built plans), so a rename on one side passes both; seam=none; no_claim=that the values are right, which those two steps check
@@ -488,3 +531,45 @@ def test_custom_actions_carrying_secrets_hide_their_data():
 @pytest.mark.parametrize("path", [SETUP, UPDATE, UNINSTALL])
 def test_bootstraps_require_elevation(path):
     assert re.search(r"(?m)^#Requires -RunAsAdministrator$", _read(path))
+
+
+# Value: protects=what an install, update or uninstall run reports: a 3010 is a warning, the script finishes its work and exits 3010, a failed msiexec exits with its own code; fails_when=3010 falls into the failure branch (the agent is left unstarted), the final exit 3010 goes (a deployment tool never schedules the restart), or a bare Write-Error under "Stop" turns every failure into exit 1; why_new=windows.yml's stand-in msiexec tests only Invoke-Msiexec, never a call site; seam=none; no_claim=that msiexec returns 3010 when a restart is needed, or how a given RMM reads 3010
+@pytest.mark.parametrize("path", [SETUP, UPDATE, UNINSTALL])
+def test_bootstraps_report_3010_as_a_warning_not_a_failure(path):
+    outside = _code_without(path, "Invoke-Msiexec")
+    site = re.search(
+        r"\$exitCode = Invoke-Msiexec -Arguments [^\n]+\n"
+        r"\s*if \(\$exitCode -eq 3010\) \{\n\s*\$restartPending = \$true\n"
+        r"\s*Write-Warning [^\n]+\n"
+        r"\s*\} elseif \(\$exitCode -ne 0\) \{\n"
+        r"\s*Write-Error [^\n]+ -ErrorAction Continue\n"
+        r"\s*exit \$exitCode\n",
+        outside,
+    )
+    assert (
+        site
+    ), f"{path}: 3010 is not a warning, or a failure does not exit with its code"
+    # Under "Stop" a bare Write-Error ends the script with 1; the 3010 is
+    # the script's own exit code once its work is done.
+    assert outside.rstrip().endswith("if ($restartPending) { exit 3010 }")
+
+
+# Value: protects=a setup or update that finds the Windows Installer service still busy during the preflight's msiexec /a: it stops before anything changes, with msiexec's code; fails_when=the busy check goes (the run falls through to msiexec /i without the account preflight, after a second retry budget), the preflight's catch swallows the busy error as a warning, or the caller exits 1 instead of the code; why_new=windows.yml tests Invoke-Msiexec alone, never the preflight around it; seam=none; no_claim=that msiexec returns 1601/1618 while another installation runs
+@pytest.mark.parametrize("path", [SETUP, UPDATE])
+def test_preflight_stops_on_a_busy_windows_installer(path):
+    preflight = _strip_comments(_function(path, "Invoke-AccountPreflight"))
+    busy = preflight.index("if ($extract -eq 1601 -or $extract -eq 1618) {")
+    assert preflight.index('$busy.Data["MsiexecExitCode"] = $extract') > busy
+    assert preflight.index("throw $busy") > busy
+    assert busy < preflight.index("if ($extract -ne 0) {")
+    rethrow = 'if ($_.Exception.Data.Contains("MsiexecExitCode")) { throw }'
+    assert rethrow in preflight
+    code = _code_without(path, "Invoke-AccountPreflight")
+    assert re.search(
+        r"\$applied = Invoke-AccountPreflight [^\n]+\n\} catch \{\n"
+        r"\s*Write-Error \$_ -ErrorAction Continue\n"
+        r'\s*if \(\$_\.Exception\.Data\.Contains\("MsiexecExitCode"\)\) '
+        r'\{ exit \$_\.Exception\.Data\["MsiexecExitCode"\] \}\n'
+        r"\s*exit 1\n",
+        code,
+    )

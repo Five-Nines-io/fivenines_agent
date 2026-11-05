@@ -249,6 +249,38 @@ function Test-IsAdmin {
         [Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+# Runs msiexec with $Arguments, waits for it and returns its exit code.
+#   * 1601 (the Windows Installer service could not be accessed) and 1618
+#     (another installation is already in progress) are the service still
+#     finishing an earlier operation, not a result: retried three times,
+#     $RetrySeconds apart.
+#   * /passive (a progress bar) only where someone can see it, /qn (no
+#     window) in session 0 or a non-interactive window station (an RMM
+#     agent, Intune, a scheduled task as SYSTEM). Neither shows a modal box
+#     (an error, 1618's "another installation is in progress"): one would
+#     hold the script until a click, and no one may be there even in a
+#     visible session (a scheduled task run as the logged-on user). The log
+#     says what failed. -Quiet forces /qn.
+#   * /norestart always: under /qn, a package that needs a restart would
+#     otherwise restart the server by itself. 3010 then reports it.
+# -FilePath and -RetrySeconds are there for windows.yml's test.
+function Invoke-Msiexec {
+    param([string[]]$Arguments, [switch]$Quiet, [string]$FilePath = "msiexec.exe", [int]$RetrySeconds = 20)
+
+    $visible = [Environment]::UserInteractive -and
+        ([System.Diagnostics.Process]::GetCurrentProcess().SessionId -ne 0)
+    $ui = if ($visible -and -not $Quiet) { "/passive" } else { "/qn" }
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        $proc = Start-Process $FilePath -ArgumentList (@($Arguments) + @($ui, "/norestart")) -Wait -PassThru
+        $code = $proc.ExitCode
+        if (($code -ne 1601 -and $code -ne 1618) -or $attempt -gt 3) { return $code }
+        Write-Host ("msiexec exit {0}: the Windows Installer service is still busy; retrying in {1} s." -f $code, $RetrySeconds)
+        Start-Sleep -Seconds $RetrySeconds
+    }
+}
+
 if (-not (Test-IsAdmin)) {
     Write-Error "This script must be run from an elevated PowerShell session (Run as administrator)."
     exit 1
@@ -431,9 +463,16 @@ function Invoke-AccountPreflight {
         $plan = $null
         $planScript = $null
         try {
-            $extract = Start-Process msiexec.exe -ArgumentList @("/a", "`"$MsiPath`"", "/qn", "TARGETDIR=`"$image`"") -Wait -PassThru
-            if ($extract.ExitCode -ne 0) {
-                throw ("extracting the MSI failed (msiexec /a exit {0})" -f $extract.ExitCode)
+            $extract = Invoke-Msiexec -Arguments @("/a", "`"$MsiPath`"", "TARGETDIR=`"$image`"") -Quiet
+            if ($extract -eq 1601 -or $extract -eq 1618) {
+                # Still busy after the retries, as the install would be:
+                # stop before anything changes, with msiexec's code.
+                $busy = New-Object System.InvalidOperationException ("the Windows Installer service is still busy (msiexec /a exit {0}); nothing was changed, run this script again later" -f $extract)
+                $busy.Data["MsiexecExitCode"] = $extract
+                throw $busy
+            }
+            if ($extract -ne 0) {
+                throw ("extracting the MSI failed (msiexec /a exit {0})" -f $extract)
             }
             $planScript = Get-ChildItem -LiteralPath $image -Recurse -File -Filter "CreateServiceAccount.ps1" | Select-Object -First 1
             if (-not $planScript) { throw "the MSI carries no CreateServiceAccount.ps1" }
@@ -446,6 +485,7 @@ function Invoke-AccountPreflight {
             if (-not $line) { throw "CreateServiceAccount.ps1 -PlanOnly printed no plan" }
             $plan = "$line".Substring("FIVENINES_PLAN ".Length) | ConvertFrom-Json
         } catch {
+            if ($_.Exception.Data.Contains("MsiexecExitCode")) { throw }
             if ($installed -eq "same") {
                 throw ("Could not run the MSI's account step ({0}), so -ServiceAccountPassword cannot be applied to the installed agent. Nothing was changed." -f $_)
             }
@@ -532,10 +572,12 @@ try {
 Unblock-File -Path $MsiPath
 
 $applied = $false
+$restartPending = $false
 try {
     $applied = Invoke-AccountPreflight -MsiPath $MsiPath -Password $ServiceAccountPassword -WorkDir $WorkDir
 } catch {
-    Write-Error $_
+    Write-Error $_ -ErrorAction Continue
+    if ($_.Exception.Data.Contains("MsiexecExitCode")) { exit $_.Exception.Data["MsiexecExitCode"] }
     exit 1
 }
 
@@ -544,16 +586,19 @@ if (-not $applied) {
     $msiArgs = @(
         "/i", "`"$MsiPath`"",
         "TOKEN=$token",
-        "/qb",
         "/l*v", "`"$LogFile`""
     )
     if ($passwordArgument) {
         $msiArgs += $passwordArgument
     }
-    $proc = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
-    if ($proc.ExitCode -ne 0) {
-        Write-Error "msiexec failed with exit code $($proc.ExitCode). See $LogFile."
-        exit $proc.ExitCode
+    $exitCode = Invoke-Msiexec -Arguments $msiArgs
+    if ($exitCode -eq 3010) {
+        $restartPending = $true
+        Write-Warning "Installed; Windows needs a restart to finish replacing files in use (msiexec 3010). See $LogFile."
+    } elseif ($exitCode -ne 0) {
+        # Continue: under "Stop" Write-Error would end the script with 1.
+        Write-Error "msiexec failed with exit code $exitCode. See $LogFile." -ErrorAction Continue
+        exit $exitCode
     }
 }
 
@@ -586,3 +631,7 @@ if ($updated) {
 # run's stays: when msiexec ran, the MSI in it is the installed product's
 # recorded install source, which a repair reads.
 Remove-EarlierWorkDirectories -Keep $WorkDir
+
+# msiexec asked for a restart (3010): the work is done, and this exit code
+# lets a deployment tool (Intune, ConfigMgr) schedule the restart.
+if ($restartPending) { exit 3010 }

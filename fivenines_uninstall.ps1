@@ -260,6 +260,38 @@ function Test-IsAdmin {
         [Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+# Runs msiexec with $Arguments, waits for it and returns its exit code.
+#   * 1601 (the Windows Installer service could not be accessed) and 1618
+#     (another installation is already in progress) are the service still
+#     finishing an earlier operation, not a result: retried three times,
+#     $RetrySeconds apart.
+#   * /passive (a progress bar) only where someone can see it, /qn (no
+#     window) in session 0 or a non-interactive window station (an RMM
+#     agent, Intune, a scheduled task as SYSTEM). Neither shows a modal box
+#     (an error, 1618's "another installation is in progress"): one would
+#     hold the script until a click, and no one may be there even in a
+#     visible session (a scheduled task run as the logged-on user). The log
+#     says what failed. -Quiet forces /qn.
+#   * /norestart always: under /qn, a package that needs a restart would
+#     otherwise restart the server by itself. 3010 then reports it.
+# -FilePath and -RetrySeconds are there for windows.yml's test.
+function Invoke-Msiexec {
+    param([string[]]$Arguments, [switch]$Quiet, [string]$FilePath = "msiexec.exe", [int]$RetrySeconds = 20)
+
+    $visible = [Environment]::UserInteractive -and
+        ([System.Diagnostics.Process]::GetCurrentProcess().SessionId -ne 0)
+    $ui = if ($visible -and -not $Quiet) { "/passive" } else { "/qn" }
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        $proc = Start-Process $FilePath -ArgumentList (@($Arguments) + @($ui, "/norestart")) -Wait -PassThru
+        $code = $proc.ExitCode
+        if (($code -ne 1601 -and $code -ne 1618) -or $attempt -gt 3) { return $code }
+        Write-Host ("msiexec exit {0}: the Windows Installer service is still busy; retrying in {1} s." -f $code, $RetrySeconds)
+        Start-Sleep -Seconds $RetrySeconds
+    }
+}
+
 if (-not (Test-IsAdmin)) {
     Write-Error "This script must be run from an elevated PowerShell session (Run as administrator)."
     exit 1
@@ -272,22 +304,27 @@ $installed = Get-ItemProperty `
     Where-Object { $_.DisplayName -match "Fivenines Monitoring Agent" } |
     Select-Object -First 1
 
+$restartPending = $false
 if (-not $installed) {
     Write-Host "Fivenines agent is not installed. Nothing to uninstall."
 } else {
     $productCode = $installed.PSChildName
     Write-Host ("Uninstalling {0} ({1})..." -f $installed.DisplayName, $productCode)
-    $msiArgs = @("/x", $productCode, "/qb", "/l*v", "`"$LogFile`"")
-    $proc = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
-    if ($proc.ExitCode -ne 0) {
-        Write-Error "msiexec /x failed with exit code $($proc.ExitCode). See $LogFile."
-        exit $proc.ExitCode
+    $exitCode = Invoke-Msiexec -Arguments @("/x", $productCode, "/l*v", "`"$LogFile`"")
+    if ($exitCode -eq 3010) {
+        $restartPending = $true
+        Write-Warning "Uninstalled; Windows needs a restart to finish removing files in use (msiexec 3010)."
+    } elseif ($exitCode -ne 0) {
+        # Continue: under "Stop" Write-Error would end the script with 1.
+        Write-Error "msiexec /x failed with exit code $exitCode. See $LogFile." -ErrorAction Continue
+        exit $exitCode
     }
 }
 
 if ($KeepAccount) {
     Write-Host "-KeepAccount set; leaving fivenines-agent local account in place."
     Remove-AllWorkDirectories
+    if ($restartPending) { exit 3010 }
     exit 0
 }
 
@@ -463,3 +500,7 @@ if ($entry) {
 Remove-AllWorkDirectories
 
 Write-Host "Uninstall complete."
+
+# msiexec asked for a restart (3010): the uninstall is done, and this exit
+# code lets a deployment tool (Intune, ConfigMgr) schedule the restart.
+if ($restartPending) { exit 3010 }

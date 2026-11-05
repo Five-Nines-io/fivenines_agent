@@ -110,8 +110,8 @@ function Get-CustomActionLines {
     return @(Get-Content $LogPath | Where-Object { $_ -match "WixQuietExec" -and $_ -notmatch "powershell\.exe" })
 }
 
-# The errors an MSI log recorded (a bootstrap script's msiexec /qb run shows
-# them in a modal box nobody here can see).
+# The errors an MSI log recorded (a bootstrap script's msiexec runs with no
+# window in this session 0 task: the log is the only place they show).
 function Show-MsiErrors {
     param([string]$LogPath)
 
@@ -181,10 +181,10 @@ function Wait-AgentRunning {
 }
 
 # Run one of the bootstrap scripts (fivenines_setup.ps1, fivenines_uninstall.ps1)
-# in a job, bounded: they call msiexec /qb, whose basic UI shows a modal
-# error box when the install fails -- in this SYSTEM task's session 0 nobody
-# can close it, and msiexec would wait forever. Returns $null on success,
-# else why it failed.
+# in a job, bounded: in this SYSTEM task's session 0 their msiexec runs /qn,
+# so nothing waits for a click, but a hung msiexec, or the Windows Installer
+# service still busy through the retries, must not hold the stage. Returns
+# $null on success, else why it failed.
 function Invoke-Bootstrap {
     param([scriptblock]$Script, [object[]]$Arguments = @(), [int]$TimeoutSeconds = 600)
 
@@ -192,7 +192,7 @@ function Invoke-Bootstrap {
     if (-not (Wait-Job $job -Timeout $TimeoutSeconds)) {
         Stop-Job $job
         Get-Process -Name msiexec -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-        return "timed out after $TimeoutSeconds s (an msiexec /qb error box?)"
+        return "timed out after $TimeoutSeconds s (a hung msiexec?)"
     }
     try {
         $output = @(Receive-Job $job -ErrorAction Stop)
@@ -373,8 +373,8 @@ try {
     $r = Install-Agent "s8-install"
     Check ($r.ExitCode -eq 0) "S8 install exits 0"
     # An uninstall a second after the install finds the service still
-    # starting, and msiexec /qb's "could not stop the service" box would
-    # wait for a click: let it come up, as on a real host.
+    # starting, which msiexec cannot stop yet: let it come up, as on a real
+    # host.
     Check (Wait-AgentRunning) "S8 service reaches Running"
     $deletedSid = (Get-AdAccount).SID.Value
     $failed = Invoke-Bootstrap -Arguments @("C:\fn\logs\s8-uninstall.log") -Script {
