@@ -101,6 +101,18 @@ def test_dry_run_config_includes_io_topology():
     assert _DRY_RUN_CONFIG.get("io_topology")  # present and truthy
 
 
+# Value: protects=--dry-run on Windows exercises the windows_services collector;
+# fails_when=the key is dropped from _DRY_RUN_CONFIG or set falsy, so the
+# `if not config_value` gate skips it; why_new=no test read the key; seam=none;
+# no_claim=that the collector runs (the capability gate and the OS still decide)
+def test_dry_run_config_includes_windows_services():
+    """The Windows services collector is a host-local read with no external
+    config (the disk_health class), so --dry-run must exercise it on Windows.
+    Same regression class as systemd/zfs: without the key, collect_metrics'
+    `if not config_value` gate skips it."""
+    assert _DRY_RUN_CONFIG.get("windows_services")  # present and truthy
+
+
 def test_dry_run_config_includes_docker():
     """The Docker collector had NO key in _DRY_RUN_CONFIG, so --dry-run never
     exercised it. Must be truthy (not {}, which collect_metrics' `if not

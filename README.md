@@ -333,7 +333,7 @@ as `LocalSystem` and never as an administrator:
 #### Windows-specific collectors
 
 Core metrics (CPU, memory, disk I/O, network, partitions, ports, processes) and
-every HTTP-based application integration behave the same as on Linux. Three
+every HTTP-based application integration behave the same as on Linux. Four
 things differ:
 
 - **Disk health** (the Windows counterpart to SMART) reads `MSFT_PhysicalDisk`
@@ -343,6 +343,13 @@ things differ:
   error counts and SSD wear. It runs as a short-lived `Get-CimInstance`
   subprocess with a hard 5s timeout, so a wedged WMI service cannot stall a
   collection tick.
+- **Windows services** (the counterpart to the systemd units) lists every
+  Windows service with its state (running, stopped, paused...), start type
+  (automatic, manual, disabled), the "delayed start" and "trigger start" flags
+  services.msc shows, its process id and its exit codes, read from the Service
+  Control Manager on every collection. Per-user services and drivers are left
+  out. The service account is not an administrator, and Windows hides from it
+  any service whose security settings deny it the status read.
 - **Software inventory** enumerates the `Uninstall` registry keys under
   `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall` **and** the 32-bit
   `WOW6432Node` view, so 32-bit applications on a 64-bit host are not missed.
@@ -892,6 +899,7 @@ The agent works without sudo, but these features will be unavailable (this is al
 | Docker image vulnerability scanning | same Docker socket as container metrics (no extra privilege) |
 | HAProxy stats socket | read access to the socket (e.g. `/run/haproxy/admin.sock`); the HTTP CSV endpoint needs none |
 | Windows disk health | WMI `root\Microsoft\Windows\Storage` read access (delegated by the MSI) |
+| Windows services | Service Control Manager connect + enumerate access; a service whose security settings deny the account the status read is left out of the list |
 | Windows software inventory | `HKLM\...\Uninstall` registry read access |
 
 ### Capabilities by Permission Level
@@ -1078,8 +1086,8 @@ When the agent starts, it displays a banner showing which features are available
 ```
 
 Windows reports a Windows-shaped capability set rather than Linux keys marked
-unavailable -- no load average, and two native groups instead of the Linux
-storage and security ones:
+unavailable -- no load average, and three native groups instead of the Linux
+storage, services and security ones:
 
 ```
   Core Metrics:
@@ -1099,6 +1107,9 @@ storage and security ones:
 
   Storage:
     [+] Disk Health
+
+  Services:
+    [+] Windows Services
 
   Inventory:
     [+] Software Inventory

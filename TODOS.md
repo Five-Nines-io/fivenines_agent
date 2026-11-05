@@ -93,10 +93,10 @@ stall can outlast `WatchdogSec=90` and restart the agent. `io_topology` (#155)
 is the first to bound its own read (a single-flight worker abandoned after
 `TOPOLOGY_READ_TIMEOUT`), and `pbs` bounds its whole collection the same way
 (`PBS_HARD_DEADLINE`, which also covers DNS and connecting to every address of
-a host name), as does `mongodb` (#258, `COLLECT_DEADLINE`); the others are not. The uniform fix is a per-collector
+a host name), as does `mongodb` (#258, `COLLECT_DEADLINE`), and `windows_services` bounds its Service Control Manager read (`SCM_READ_TIMEOUT`, a single flight its capability probe shares); the others are not. The uniform fix is a per-collector
 wall-clock bound in `collectors.collect_metrics` built on `bounded.call_bounded`
 (already shared by `run_privileged`, the libvirt probe, `io_topology` and the
-`qemu`, `pbs` and `mongodb` collectors), which changes every collector's failure mode -- hence its own
+`qemu`, `pbs`, `mongodb` and `windows_services` collectors), which changes every collector's failure mode -- hence its own
 change. Two things it must handle, both found reviewing #155: `run_privileged`
 has no single-flight, so a wedged sudoers backend leaks one thread and one
 blocked root `sudo` per call site per tick, and its per-call bounds (30s + 2s for

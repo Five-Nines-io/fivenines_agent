@@ -328,6 +328,15 @@ def test_distro_test_checks_the_optional_modules_each_build_checks():
     assert re.search(
         r"^& \$exePath --check-imports .*\bpymongo\b", windows, re.MULTILINE
     )
+    # Value: protects=the Windows build proves win32service, which the
+    # windows_services collector and its probe import only inside a function;
+    # fails_when=win32service is dropped from py2exe_windows.ps1's
+    # --check-imports line; why_new=only pymongo was pinned there; seam=none;
+    # no_claim=that PyInstaller bundles it or that the frozen import succeeds
+    # (the Windows build job runs the check itself)
+    assert re.search(
+        r"^& \$exePath --check-imports .*\bwin32service\b", windows, re.MULTILINE
+    )
     # Each script passes its list to the binary.
     assert (
         '--check-imports "${CHECK_IMPORTS[@]}"' in (REPO_ROOT / "py2exe.sh").read_text()

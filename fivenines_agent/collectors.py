@@ -33,6 +33,7 @@ from fivenines_agent.qemu import qemu_metrics
 from fivenines_agent.rabbitmq import rabbitmq_metrics
 from fivenines_agent.raid_storage import raid_storage_health
 from fivenines_agent.redis import redis_metrics
+from fivenines_agent.scrub import log_safe
 from fivenines_agent.sglang import sglang_metrics
 from fivenines_agent.smart_storage import (
     smart_storage_health,
@@ -43,6 +44,7 @@ from fivenines_agent.tailscale import tailscale_metrics
 from fivenines_agent.temperatures import temperatures
 from fivenines_agent.tsdb import tsdb_metrics
 from fivenines_agent.vllm import vllm_metrics
+from fivenines_agent.windows_services import windows_services
 from fivenines_agent.wireguard import wireguard_metrics
 from fivenines_agent.zfs import zfs_storage_health
 
@@ -207,6 +209,12 @@ COLLECTORS = [
     # Windows-only: gated by the disk_health capability, only present in the
     # Windows-tailored capability set (D13 - permissions._build_windows_*).
     ("disk_health", [("disk_health", disk_health_windows, False)]),
+    # Windows-only: the state and start type of every Windows service, the
+    # counterpart of the systemd collector's unit health. A TOP-LEVEL plain
+    # boolean; pass_kwargs=False, so a later dict value is ignored rather than
+    # splatted into a TypeError. Gated by the windows_services capability (only
+    # in the Windows capability set); None off Windows.
+    ("windows_services", [("windows_services", windows_services, False)]),
 ]
 
 
@@ -344,7 +352,12 @@ def _collect_with_telemetry(name, fn, telemetry, /, *args, **kwargs):
             errors.append(str(e))
             duration_ms = round((time.monotonic() - start) * 1000, 2)
             telemetry[name] = {"duration_ms": duration_ms, "errors": errors}
-        log(f"Error collecting {name}: {e}", "error")
+        # log_safe, not the raw message: an OS error text (a localized
+        # pywintypes.error or OSError strerror) can hold a character a Windows
+        # service's strict ANSI-code-page stdout cannot encode, and a print()
+        # raising here would escape this handler and end the collection loop.
+        # The telemetry entry above keeps the message as raised.
+        log(f"Error collecting {name}: {log_safe(e)}", "error")
         return None
 
     if capture:
