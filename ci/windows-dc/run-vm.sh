@@ -57,13 +57,23 @@ genisoimage -quiet -J -R -input-charset utf-8 -V FNPAYLOAD -o "$work/payload.iso
 
 qemu-img create -q -f qcow2 "$work/disk.qcow2" 40G
 
+# cache=unsafe: QEMU ignores the guest's flushes on the system disk. Windows
+# servicing flushes after nearly every write, and with the default cache each
+# flush waits for an fsync of the runner's disk: on a runner whose disk was
+# slow to sync, Install-WindowsFeature AD-Domain-Services took 6 minutes to
+# commit its files instead of 4 seconds, DFSR then did not start within the
+# service timeout, the servicing stack failed and the role install gave up
+# after an hour ("could not update the provided feature files in the time
+# allowed"). Losing the guest's writes on a host crash costs nothing here: the
+# disk is thrown away, and QEMU writes everything out when it exits (SIGTERM
+# included), before the logs are read from it below.
 serial="$out/serial.log"
 : > "$serial"
 qemu-system-x86_64 \
     -machine q35,accel=kvm -cpu host -smp 4 -m 8192 \
     -rtc base=localtime \
     -device ahci,id=ahci \
-    -drive file="$work/disk.qcow2",if=none,id=disk,format=qcow2 \
+    -drive file="$work/disk.qcow2",if=none,id=disk,format=qcow2,cache=unsafe \
     -device ide-hd,drive=disk,bus=ahci.0,bootindex=0 \
     -drive file="$iso",if=none,id=install,media=cdrom,readonly=on \
     -device ide-cd,drive=install,bus=ahci.1,bootindex=1 \
