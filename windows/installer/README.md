@@ -121,15 +121,20 @@ This directory builds the Windows MSI installer for the fivenines agent.
   `Get-AccountPlan` case by case on every run, and its
   `smoke-msi-domain-controller` job (about an hour) installs Windows Server 2019
   in English and German in QEMU/KVM, promotes it, reproduces v1.22.0's failure
-  and plays every account scenario (`ci/windows-dc/`). It runs on a push that
-  changes `windows/installer/` or `windows/winsw/`, a `fivenines_*.ps1`
-  bootstrap script, `ci/windows-dc/` or `windows.yml` (Markdown aside),
-  compared cumulatively so a run a newer push cancelled is made up by the
-  next (main against its latest v* tag, a branch against where it left main),
-  and on request (`gh workflow run
-  windows.yml --ref <branch> -f domain_controller=true`), never on a tag: a
-  release waits for the member-server E2E only, since the DC job depends on
-  Microsoft's evaluation ISOs.
+  and plays every account scenario (`ci/windows-dc/`). It runs on a push when
+  `windows/installer/` or `windows/winsw/`, a `fivenines_*.ps1` bootstrap
+  script, `ci/windows-dc/` or `windows.yml` changed (Markdown aside) since a
+  cumulative base: main's latest v* tag, or where a branch left main. So once
+  a branch changes one of them, that push and every later push of the branch
+  run it, and on main every push does until the next v* tag; a head that is
+  its own base (a branch at main's tip, a main commit that already carries
+  the latest tag) is compared with its parent only. A run a newer push
+  cancelled is covered by the newer push's run, except on main once the
+  cancelled commit carries a v* tag: the next main push compares with that
+  tag. It also runs on request (`gh workflow run windows.yml --ref <branch>
+  -f domain_controller=true`), never on a tag push: a release waits for the
+  member-server E2E only, since the DC job depends on Microsoft's evaluation
+  ISOs.
 
 ## Build prerequisites
 
