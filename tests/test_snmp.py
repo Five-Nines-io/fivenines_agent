@@ -148,6 +148,13 @@ IFXTABLE_NO_SUPPORT = """\
 .1.3.6.1.2.1.31.1.1.1.1 = No Such Object available on this agent at this OID
 """
 
+# The line snmpbulkwalk ends a walk with when it reaches the end of the
+# device's MIB view: a view that ends with ifXTable (#275).
+END_OF_VIEW = (
+    ".1.3.6.1.2.1.31.1.1.1.18.2 = No more variables left in this MIB View "
+    "(It is past the end of the MIB tree)\n"
+)
+
 PRINTER_IFTABLE = """\
 .1.3.6.1.2.1.2.2.1.1.1 = INTEGER: 1
 .1.3.6.1.2.1.2.2.1.3.1 = INTEGER: 6
@@ -325,10 +332,23 @@ class TestParseSnmpLine:
         assert oid == "1.3.6.1.2.1.31.1.1.1.1"
         assert val is None
 
-    def test_no_more_variables(self):
-        line = ".1.3.6.1.2.1.2.2.1.22.1 = No more variables left in this MIB"
-        oid, val = _parse_snmp_line(line)
-        assert val is None
+    def test_end_of_mib_view_carries_no_value(self):
+        """endOfMibView only ends a walk (#275): no row, not a "No Such"."""
+        line = (
+            ".1.3.6.1.2.1.31.1.1.1.18.2 = No more variables left in this MIB "
+            "View (It is past the end of the MIB tree)"
+        )
+        assert _parse_snmp_line(line) is None
+
+    # Value: protects=a string value that merely mentions an SNMP exception
+    # stays a value; fails_when=the exception check matches anywhere in the
+    # value again (an ifAlias "No Such Port" disabled the 64-bit counters);
+    # why_new=only bare exception lines were tested; seam=none;
+    # no_claim=none beyond protects
+    @pytest.mark.parametrize("alias", ["No Such Port", "No more than 1G"])
+    def test_a_string_mentioning_an_exception_is_a_value(self, alias):
+        line = f'.1.3.6.1.2.1.31.1.1.1.18.1 = STRING: "{alias}"'
+        assert _parse_snmp_line(line) == ("1.3.6.1.2.1.31.1.1.1.18.1", alias)
 
     def test_empty_line(self):
         assert _parse_snmp_line("") is None
@@ -751,6 +771,47 @@ class TestPollInterfaces:
         assert c["bytes_out"] == 3870844
         assert c["discards_in"] == 2386
         assert c["broadcast_in"] == 0  # default
+
+    # Value: protects=a device whose MIB view ends with ifXTable keeps its
+    # 64-bit octet counters (#275); fails_when=the end-of-view line is read as
+    # "No Such" again and the 32-bit counters, which wrap within a poll on a
+    # 1 Gb/s link, are reported instead; why_new=no fixture ended a walk at
+    # the end of the view; seam=none; no_claim=a real device (net-snmp's
+    # output line as reproduced against a simulated one)
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_a_view_ending_with_ifxtable_keeps_the_64_bit_counters(self, mock_cmd):
+        mock_cmd.side_effect = [
+            (IFTABLE_OUTPUT, None),
+            (IFXTABLE_OUTPUT + END_OF_VIEW, None),
+        ]
+        collector = SNMPCollector([_make_target()])
+        ifaces, counters, hc, error = collector._poll_interfaces([])
+        assert error is None
+        assert hc is True
+        by_index = {c["if_index"]: c for c in counters}
+        assert by_index[1]["bytes_in"] == 9000000000
+        assert by_index[1]["bytes_out"] == 7000000000
+        assert by_index[2]["bytes_in"] == 8000000000
+        assert {i["if_index"]: i["if_alias"] for i in ifaces} == {
+            1: "Uplink",
+            2: "Server",
+        }
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_a_view_ending_before_ifxtable_keeps_the_32_bit_counters(self, mock_cmd):
+        """The view ends right after ifTable: no ifXTable row, no HC data."""
+        mock_cmd.side_effect = [
+            (IFTABLE_OUTPUT, None),
+            (END_OF_VIEW, None),
+        ]
+        collector = SNMPCollector([_make_target()])
+        ifaces, counters, hc, error = collector._poll_interfaces([])
+        assert error is None
+        assert hc is False
+        assert {c["if_index"]: c["bytes_in"] for c in counters} == {
+            1: 1000000,
+            2: 2000000,
+        }
 
     @patch("fivenines_agent.snmp._run_snmp_cmd")
     def test_iftable_error(self, mock_cmd):
