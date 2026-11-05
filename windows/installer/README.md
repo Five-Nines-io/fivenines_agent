@@ -74,6 +74,19 @@ This directory builds the Windows MSI installer for the fivenines agent.
   use it as given, since the account step applies any password and a wrong
   one leaves a service that does not start, which a rerun with the right
   password repairs in place.
+- **The agent directories through handles.** The account step gives the
+  account FullControl on `%ProgramData%\fivenines_agent` and its `logs`
+  (`Grant-AgentDirectory`, through the `FiveninesAgentDirectory` type it
+  compiles with Add-Type), as SYSTEM, in directories the account can write
+  to. A grant already there is kept (read by path: a directory moved behind
+  a junction that already has it is left as it is). Otherwise every
+  directory from the one below `%ProgramData%` down to the target is opened
+  without following a link at it and shared for reading only, so none can be
+  renamed, deleted or replaced meanwhile; a junction, a symbolic link or
+  anything that is not a directory (a hard link to a file) is refused, and
+  `-PlanOnly` refuses it too, before msiexec; the ACE is written through the
+  last handle. No `/T` and no walk of its own: Windows propagates the
+  inheritable ACE to the existing children that inherit it.
 - **The WMI namespace ACL in binary.** `DelegateWmiStorageNamespace.ps1` reads
   and writes `root\Microsoft\Windows\Storage`'s descriptor with
   `__SystemSecurity` `GetSD`/`SetSD` and `RawSecurityDescriptor`, never

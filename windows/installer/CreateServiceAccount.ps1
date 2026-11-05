@@ -52,7 +52,9 @@
 #     existing account's, null when there is none), checked (true when
 #     LogonUser answered for the supplied password; false when that check
 #     could not run or returned an error this script does not name, and for
-#     every plan that checks no password)}. The bootstrap scripts run it from
+#     every plan that checks no password)}. It also refuses an agent
+#     directory the account step would refuse to grant (a link, or not a
+#     directory; see Grant-AgentDirectory). The bootstrap scripts run it from
 #     the MSI they are about to install, before msiexec, because a refusal
 #     inside the MSI comes too late on an upgrade: Windows Installer has
 #     already removed the running agent by then, and a failed install does
@@ -364,6 +366,198 @@ public static class FiveninesLogon {
     }
 }
 
+# The agent's two directories, which the account step grants the account
+# FullControl on (see Grant-AgentDirectory) and -PlanOnly checks first.
+$programData = if ($env:ProgramData) { $env:ProgramData } else { Join-Path $env:SystemDrive "ProgramData" }
+$agentDirectories = @(
+    (Join-Path $programData "fivenines_agent"),
+    (Join-Path $programData "fivenines_agent\logs")
+)
+
+# The account step runs as SYSTEM inside directories the account can write
+# to, and the account (FullControl there, so DELETE and WRITE_DAC) can
+# rename, replace or relink any of them at any moment. No check of a path
+# proves what a later call on that same path reaches, so the grant goes
+# through handles, compiled once per process like FiveninesLogon:
+#   * every directory from the one below $Root down to the agent's is opened
+#     without following a link at it and shared for reading only, so none of
+#     them can be renamed, deleted or replaced while the handles are open;
+#   * each is refused when its handle shows a link (a junction or a symbolic
+#     link) or something that is not a directory (a hard link to a file);
+#   * the ACE is added and written through the last handle, so it lands on
+#     the directory that was checked and nothing else.
+# Windows then propagates the inheritable ACE to the existing children that
+# inherit, which every file the agent writes does: no walk of its own (the
+# old icacls /T rewrote everything below, following what the account had
+# planted there).
+function Initialize-AgentDirectoryType {
+    if ("FiveninesAgentDirectory" -as [type]) { return }
+    Add-Type -TypeDefinition @"
+    using System;
+    using System.Collections.Generic;
+    using System.ComponentModel;
+    using System.IO;
+    using System.Runtime.InteropServices;
+    using System.Security.AccessControl;
+    using System.Security.Principal;
+    using Microsoft.Win32.SafeHandles;
+
+    public static class FiveninesAgentDirectory {
+        const uint FILE_READ_ATTRIBUTES = 0x80, READ_CONTROL = 0x20000, WRITE_DAC = 0x40000;
+        const uint FILE_SHARE_READ = 1, FILE_SHARE_ALL = 7, OPEN_EXISTING = 3;
+        const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000, FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+        const uint FILE_ATTRIBUTE_DIRECTORY = 0x10, FILE_ATTRIBUTE_REPARSE_POINT = 0x400;
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct FileInformation {
+            public uint Attributes, CreationLow, CreationHigh, AccessLow, AccessHigh, WriteLow, WriteHigh;
+            public uint VolumeSerial, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        static extern bool GetFileInformationByHandle(SafeFileHandle handle, out FileInformation info);
+
+        // A directory's DACL, read and written through its handle.
+        sealed class HandleSecurity : ObjectSecurity<FileSystemRights> {
+            public HandleSecurity(SafeHandle handle) : base(true, ResourceType.FileObject, handle, AccessControlSections.Access) { }
+            public void Save(SafeHandle handle) { Persist(handle, AccessControlSections.Access); }
+        }
+
+        static void Close(List<SafeFileHandle> handles) {
+            foreach (SafeFileHandle handle in handles) { handle.Dispose(); }
+        }
+
+        // The handles of every directory from the one below root down to
+        // path, the last one opened with leafAccess; null, with the reason in
+        // refusal, when one of them is a link or not a directory.
+        static List<SafeFileHandle> Open(string path, string root, uint leafAccess, out string refusal) {
+            string full = Path.GetFullPath(path).TrimEnd('\\');
+            string rootFull = Path.GetFullPath(root).TrimEnd('\\');
+            if (!full.StartsWith(rootFull + "\\", StringComparison.OrdinalIgnoreCase)) {
+                throw new ArgumentException(full + " is not below " + rootFull);
+            }
+            string[] parts = full.Substring(rootFull.Length + 1).Split('\\');
+            List<SafeFileHandle> handles = new List<SafeFileHandle>();
+            string current = rootFull;
+            refusal = null;
+            try {
+                for (int i = 0; i < parts.Length; i++) {
+                    current += "\\" + parts[i];
+                    uint access = FILE_READ_ATTRIBUTES | (i == parts.Length - 1 ? leafAccess : 0);
+                    SafeFileHandle handle = CreateFileW(current, access, FILE_SHARE_READ, IntPtr.Zero, OPEN_EXISTING,
+                        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
+                    if (handle.IsInvalid) { throw new Win32Exception(Marshal.GetLastWin32Error(), "cannot open " + current); }
+                    handles.Add(handle);
+                    FileInformation info;
+                    if (!GetFileInformationByHandle(handle, out info)) {
+                        throw new Win32Exception(Marshal.GetLastWin32Error(), "cannot read " + current);
+                    }
+                    if ((info.Attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+                        refusal = current + " is a junction or a symbolic link";
+                    } else if ((info.Attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+                        refusal = current + " is not a directory";
+                    }
+                    if (refusal != null) { Close(handles); return null; }
+                }
+                return handles;
+            } catch {
+                Close(handles);
+                throw;
+            }
+        }
+
+        // Whether path, opened following links (a read: it changes nothing),
+        // carries sid's grant: an explicit allow ACE with FullControl,
+        // inherited by files and subdirectories, not inherit-only.
+        public static bool HasGrant(string path, string sid) {
+            SafeFileHandle handle = CreateFileW(path, READ_CONTROL, FILE_SHARE_ALL, IntPtr.Zero, OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero);
+            if (handle.IsInvalid) { throw new Win32Exception(Marshal.GetLastWin32Error(), "cannot open " + path); }
+            using (handle) {
+                InheritanceFlags inherit = InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit;
+                foreach (AccessRule<FileSystemRights> rule in new HandleSecurity(handle).GetAccessRules(true, false, typeof(SecurityIdentifier))) {
+                    if (string.Equals(rule.IdentityReference.Value, sid, StringComparison.OrdinalIgnoreCase) &&
+                        rule.AccessControlType == AccessControlType.Allow &&
+                        (rule.Rights & FileSystemRights.FullControl) == FileSystemRights.FullControl &&
+                        (rule.InheritanceFlags & inherit) == inherit &&
+                        (rule.PropagationFlags & PropagationFlags.InheritOnly) == 0) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        // Why the grant on path would be refused, or null.
+        public static string Refusal(string path, string root) {
+            string refusal;
+            List<SafeFileHandle> handles = Open(path, root, READ_CONTROL, out refusal);
+            if (handles != null) { Close(handles); }
+            return refusal;
+        }
+
+        // Adds sid's inheritable FullControl to path's DACL through its
+        // handle; returns null, or the reason it was refused.
+        public static string Grant(string path, string root, string sid) {
+            SecurityIdentifier account = new SecurityIdentifier(sid);
+            string refusal;
+            List<SafeFileHandle> handles = Open(path, root, READ_CONTROL | WRITE_DAC, out refusal);
+            if (handles == null) { return refusal; }
+            try {
+                SafeFileHandle leaf = handles[handles.Count - 1];
+                HandleSecurity security = new HandleSecurity(leaf);
+                security.AddAccessRule(new AccessRule<FileSystemRights>(account, FileSystemRights.FullControl,
+                    InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None,
+                    AccessControlType.Allow));
+                security.Save(leaf);
+                return null;
+            } finally {
+                Close(handles);
+            }
+        }
+    }
+"@
+}
+
+# Whether Path already carries the account's grant: an explicit allow ACE with
+# FullControl, inherited by files and subdirectories, not inherit-only. A
+# read through a handle that follows links (Get-Acl reads a junction's own
+# ACL): it changes nothing, and a directory an operator moved behind a
+# junction that already has the grant (as icacls /T left it) is left as it is.
+function Test-AgentDirectoryGrant {
+    param([string]$Path, [string]$Sid)
+
+    Initialize-AgentDirectoryType
+    return [FiveninesAgentDirectory]::HasGrant($Path, $Sid)
+}
+
+# The message refusing a grant for the reason FiveninesAgentDirectory gave.
+function Format-AgentDirectoryRefusal {
+    param([string]$Reason)
+
+    return ("{0}, so the installer will not grant the service account access through it. Replace it with a plain directory and run the installer again." -f $Reason)
+}
+
+# Gives the account FullControl on one of the agent's directories, inherited
+# by what is created in it (see the comment above Initialize-AgentDirectoryType);
+# returns $false when the directory already carries that grant, which is left
+# as it is, so an upgrade or a re-run never touches what the account wrote.
+function Grant-AgentDirectory {
+    param([string]$Path, [string]$Sid, [string]$Root)
+
+    if (Test-AgentDirectoryGrant -Path $Path -Sid $Sid) { return $false }
+    Initialize-AgentDirectoryType
+    try {
+        $refusal = [FiveninesAgentDirectory]::Grant($Path, $Root, $Sid)
+    } catch {
+        throw ("Could not grant the service account access to {0}: {1}" -f $Path, $_.Exception.GetBaseException().Message)
+    }
+    if ($refusal) { throw (Format-AgentDirectoryRefusal $refusal) }
+    return $true
+}
+
 # DomainRole 4 = backup DC, 5 = primary DC.
 $isDomainController = (Get-CimInstance -ClassName Win32_ComputerSystem).DomainRole -ge 4
 $accountKind = if ($isDomainController) { "domain" } else { "local" }
@@ -399,6 +593,28 @@ if ($plan.Action -eq "UseProvided") {
 
 if ($PlanOnly) {
     $sidValue = if ($existingSid) { $existingSid.Value } else { $null }
+    # A directory the account step would refuse to grant is refused here too,
+    # so the bootstraps stop before msiexec. One that already carries the
+    # existing account's grant is not checked: the account step leaves it as
+    # it is. A check that cannot run (Add-Type blocked) refuses nothing here;
+    # the account step fails on it instead.
+    if ($plan.Action -ne "Refuse") {
+        foreach ($d in $agentDirectories) {
+            if (-not (Test-Path -LiteralPath $d)) { continue }
+            try {
+                Initialize-AgentDirectoryType
+                if ($sidValue -and (Test-AgentDirectoryGrant -Path $d -Sid $sidValue)) { continue }
+                $refusal = [FiveninesAgentDirectory]::Refusal($d, $programData)
+            } catch {
+                Write-Host ("Could not check {0} ({1}); the installer checks it again." -f $d, $_.Exception.GetBaseException().Message)
+                continue
+            }
+            if ($refusal) {
+                $plan = @{ Action = "Refuse"; Description = $null; Message = (Format-AgentDirectoryRefusal $refusal) }
+                break
+            }
+        }
+    }
     Write-Output ("FIVENINES_PLAN " + (ConvertTo-Json -Compress @{
         action = $plan.Action; message = $plan.Message; sid = $sidValue; checked = $checked }))
     exit 0
@@ -490,64 +706,12 @@ try {
     Remove-Item $tmpCfg, $tmpDb -ErrorAction SilentlyContinue
 }
 
-# Gives the account FullControl on one of the agent's directories, inherited
-# by what is created in it; returns $false when the directory already carries
-# that grant, which is left as it is. Everything here runs as SYSTEM inside
-# directories the account can write to, so:
-#   * a directory that is a reparse point (a junction or a symbolic link),
-#     or sits under one below $Root, is refused: the grant would land on
-#     what the link points at;
-#   * an existing grant is not applied again, so an upgrade or a re-run never
-#     touches what the account wrote;
-#   * no /T, which would walk and rewrite every child: the inheritable ACE
-#     reaches what the agent creates later, and Windows propagates it to the
-#     existing children that inherit, which every file the agent writes does.
-# FileAttributes and the rights enums are int-based, but compared as [int]
-# anyway: Windows PowerShell 5.1's -band throws on a byte-based enum.
-function Grant-AgentDirectory {
-    param([string]$Path, [string]$Sid, [string]$Root)
-
-    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
-    $cursor = Get-Item -LiteralPath $Path -Force
-    while ($cursor -and $cursor.FullName.TrimEnd('\') -ne $rootFull) {
-        if (([int]$cursor.Attributes -band 0x400) -ne 0) {
-            throw ("{0} is a junction or a symbolic link, so the installer will not grant the service account access through it. Replace it with a plain directory and run the installer again." -f $cursor.FullName)
-        }
-        $cursor = $cursor.Parent
-    }
-
-    $fullControl = [int][System.Security.AccessControl.FileSystemRights]::FullControl
-    $inherit = [int][System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
-    $inheritOnly = [int][System.Security.AccessControl.PropagationFlags]::InheritOnly
-    $rules = (Get-Acl -LiteralPath $Path).GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier])
-    foreach ($rule in $rules) {
-        if ($rule.IdentityReference.Value -eq $Sid -and
-            $rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and
-            (([int]$rule.FileSystemRights -band $fullControl) -eq $fullControl) -and
-            (([int]$rule.InheritanceFlags -band $inherit) -eq $inherit) -and
-            (([int]$rule.PropagationFlags -band $inheritOnly) -eq 0)) {
-            return $false
-        }
-    }
-
-    $icaclsOut = & icacls.exe $Path /grant "*$($Sid):(OI)(CI)F" /C 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw ("icacls /grant failed for {0} (exit {1}): {2}" -f $Path, $LASTEXITCODE, ($icaclsOut -join "`n"))
-    }
-    return $true
-}
-
 # Grant the service account FullControl on the config + log dirs. The MSI
 # created these dirs with only Administrators + SYSTEM via util:PermissionEx
 # (because [SERVICEACCOUNT] couldn't be resolved at InstallFiles time); now
 # that the account exists, give it the access it needs to read the config
 # and write rolling log files.
-$programData = if ($env:ProgramData) { $env:ProgramData } else { Join-Path $env:SystemDrive "ProgramData" }
-$dirs = @(
-    (Join-Path $programData "fivenines_agent"),
-    (Join-Path $programData "fivenines_agent\logs")
-)
-foreach ($d in $dirs) {
+foreach ($d in $agentDirectories) {
     if (-not (Test-Path -LiteralPath $d)) {
         Write-Warning ("Expected directory {0} not present; skipping ACL grant." -f $d)
         continue

@@ -221,14 +221,18 @@ def test_dc_job_pins_its_downloads_and_runs_on_request_only():
     assert "sha256sum -c -" in job
 
 
-# Value: protects=the agent directories' ACLs; fails_when=the grant goes back to a recursive icacls /T, or one of the two directories stops going through Grant-AgentDirectory (which refuses a link and skips an existing grant); why_new=only the Windows unit step exercises the function, and it cannot see a call site that bypasses it; seam=none; no_claim=that the function behaves, which windows.yml's "Verify the agent directory grant" step runs for real
+# Value: protects=the agent directories' ACLs; fails_when=an icacls call comes back (it resolves the path again, and /T walks what the account planted), one of the two directories stops going through Grant-AgentDirectory, or -PlanOnly stops refusing before its exit; why_new=only the Windows unit step exercises the function, and it cannot see a call site that bypasses it; seam=none; no_claim=that the function behaves, which windows.yml's "Verify the agent directory grant" step runs for real
 def test_agent_directories_are_granted_without_a_recursive_walk():
     script = _read(CREATE_ACCOUNT)
-    assert not re.search(r"icacls[^\n]*/T\b", script)
+    assert "icacls" not in _code(CREATE_ACCOUNT).lower()
     assert "function Grant-AgentDirectory {" in script
     assert "Grant-AgentDirectory -Path $d -Sid $sid -Root $programData" in script
     assert '(Join-Path $programData "fivenines_agent"),' in script
     assert '(Join-Path $programData "fivenines_agent\\logs")' in script
+    # -PlanOnly refuses what the account step would refuse, before its exit.
+    assert script.index("[FiveninesAgentDirectory]::Refusal(") < script.index(
+        '"FIVENINES_PLAN "'
+    )
 
 
 # Value: protects=the upgrade of every account an earlier release created, and what the DC harness expects of the tags; fails_when=MSI_MANAGED_DESCRIPTION is reworded (a member-server upgrade then finds the account v1.22.0 or older created "not MSI-managed" and fails with 1603, and a DC no longer adopts it) or stage2.ps1's $Legacy/$Own/$OtherDc/$Operator drift from the installer's tags (S2/S4/S5 fail an hour into the DC run); why_new=windows.yml's Get-AccountPlan cases read the constants from the script, so they follow a reword, and only the member smoke's literal and the DC run's S2 catch it, on Windows; seam=none; no_claim=that the tags drive the right plan, which the Get-AccountPlan cases cover
