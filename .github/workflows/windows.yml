@@ -692,9 +692,14 @@ jobs:
 
       # The bootstraps' msiexec wrapper, against a stand-in msiexec that
       # answers 1618 twice, then 0: the busy answers are retried, a failure is
-      # not, and every call carries /norestart and exactly one UI level.
+      # not, and every call carries /norestart and exactly one UI level,
+      # /passive or /qn, never one that shows a modal box. Run as SYSTEM in
+      # session 0 (a scheduled task, as an RMM tool or Intune runs it), the
+      # level is /qn.
       - name: Verify msiexec retries
         shell: powershell
+        # A lost retry bound would spin until GitHub's six-hour limit.
+        timeout-minutes: 5
         run: |
           $ErrorActionPreference = "Stop"
           $src = Get-Content fivenines_setup.ps1 -Raw
@@ -724,7 +729,8 @@ jobs:
           $calls = Get-Calls
           if ($code -ne 0 -or $calls.Count -ne 3) { throw "busy twice then done: exit $code after $($calls.Count) calls, expected 0 after 3" }
           foreach ($call in $calls) {
-            $ui = @($call -split " " | Where-Object { $_ -in @("/qb", "/qn") })
+            if ($call -match "/q[br]") { throw "a UI level that shows modal boxes: $call" }
+            $ui = @($call -split " " | Where-Object { $_ -in @("/passive", "/qn") })
             if ($ui.Count -ne 1 -or $call -notmatch "/norestart") { throw "unexpected msiexec arguments: $call" }
           }
           Write-Host "1618 twice, then 0: three calls, each with one UI level ($ui) and /norestart."
@@ -741,6 +747,26 @@ jobs:
           $first = @(Get-Calls)[0]
           if ($first -notmatch "/qn") { throw "-Quiet did not force /qn: $first" }
           Write-Host "Always busy: four calls, then the code. A failure: one call. -Quiet: /qn."
+
+          New-Fake @(0)
+          $run = Join-Path $dir "session0.ps1"
+          Set-Content -LiteralPath $run -Encoding ascii -Value ($m.Value + "`r`nInvoke-Msiexec -Arguments @('/i', 'x.msi') -FilePath '$fake' -RetrySeconds 0 | Out-Null`r`n")
+          $task = "fn-ci-msiexec-session0"
+          $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ('-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $run)
+          Register-ScheduledTask -TaskName $task -Action $action -User "SYSTEM" -RunLevel Highest -Force | Out-Null
+          try {
+            Start-ScheduledTask -TaskName $task
+            $deadline = (Get-Date).AddSeconds(120)
+            while (-not (Test-Path -LiteralPath $callsFile)) {
+              if ((Get-Date) -gt $deadline) { throw "the SYSTEM task never called msiexec" }
+              Start-Sleep -Seconds 1
+            }
+            $first = @(Get-Calls)[0]
+            if ($first -notmatch "/qn" -or $first -notmatch "/norestart") { throw "session 0 did not get /qn /norestart: $first" }
+            Write-Host "As SYSTEM in session 0: /qn /norestart."
+          } finally {
+            Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
+          }
           Remove-Item -LiteralPath $dir -Recurse -Force
 
       # Helpers duplicated across scripts that cannot share a file: the
@@ -1293,8 +1319,8 @@ jobs:
       # no longer runs as the account the step would update.
       - name: fivenines_update.ps1 and fivenines_setup.ps1 -ServiceAccountPassword on the installed version
         shell: powershell
-        # Bootstrap scripts run msiexec /qb, whose modal error box would hold
-        # the job for GitHub's six hours.
+        # A hung bootstrap (msiexec stuck, or the Windows Installer service
+        # busy through the retries) must not hold the job for six hours.
         timeout-minutes: 25
         run: |
           $ErrorActionPreference = "Stop"
@@ -1432,8 +1458,8 @@ jobs:
       # 3. fivenines_uninstall.ps1 must delete the account and its grant.
       - name: Reinstall keeping the account, over an orphaned WMI grant, then fivenines_uninstall.ps1
         shell: powershell
-        # Bootstrap scripts run msiexec /qb, whose modal error box would hold
-        # the job for GitHub's six hours.
+        # A hung bootstrap (msiexec stuck, or the Windows Installer service
+        # busy through the retries) must not hold the job for six hours.
         timeout-minutes: 20
         run: |
           $ErrorActionPreference = "Stop"
