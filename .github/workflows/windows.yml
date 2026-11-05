@@ -355,7 +355,7 @@ jobs:
           $key = Get-WorkDirectoryKey
           try {
             # Recorded with its marker, in the directory and in the key.
-            $marker = (Get-Item -LiteralPath $key).GetValue((Split-Path -Leaf $dir))
+            $marker = ([string](Get-Item -LiteralPath $key).GetValue((Split-Path -Leaf $dir))).Split('|')[0]
             if (-not $marker -or (Get-Content -LiteralPath (Join-Path $dir ".fivenines-work-directory") -TotalCount 1) -ne $marker) { throw "$dir is not recorded with its marker" }
             # The marker file: SYSTEM and Administrators only, the running user excluded.
             $markerAcl = Get-Acl -LiteralPath (Join-Path $dir ".fivenines-work-directory")
@@ -403,7 +403,7 @@ jobs:
           $key = Get-WorkDirectoryKey
           try {
             # Recorded with its marker, in the directory and in the key.
-            $marker = (Get-Item -LiteralPath $key).GetValue((Split-Path -Leaf $dir))
+            $marker = ([string](Get-Item -LiteralPath $key).GetValue((Split-Path -Leaf $dir))).Split('|')[0]
             if (-not $marker -or (Get-Content -LiteralPath (Join-Path $dir ".fivenines-work-directory") -TotalCount 1) -ne $marker) { throw "$dir is not recorded with its marker" }
             # The marker file: SYSTEM and Administrators only, the running user excluded.
             $markerAcl = Get-Acl -LiteralPath (Join-Path $dir ".fivenines-work-directory")
