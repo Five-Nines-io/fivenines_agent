@@ -285,6 +285,15 @@ MSI does not rotate; on the version already installed it applies it in place,
 to the account the service runs as only (see
 [Domain controllers](#domain-controllers)).
 
+Exit codes, for RMM, Intune or SCCM deployments: `setup.ps1`, `update.ps1`
+and `uninstall.ps1` exit 0 on success, and 3010 when the work is done but
+Windows needs a restart to finish (the scripts never restart it themselves).
+A failed `msiexec` ends the script with msiexec's own exit code. When the
+Windows Installer service is busy (1601 or 1618), msiexec is retried three
+times, 20 seconds apart, before that code is returned; when it stays busy
+during their preflight check, `setup.ps1` and `update.ps1` exit 1601 or 1618
+before changing anything. Any other refusal or failure exits 1.
+
 #### Security model
 
 The Windows install is least-privilege by construction -- the agent never runs
