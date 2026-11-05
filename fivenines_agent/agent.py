@@ -181,6 +181,9 @@ _DRY_RUN_CONFIG = {
     "mongodb": {"host": "127.0.0.1", "port": 27017},
     "fail2ban": True,
     "disk_health": True,
+    # Windows services: no external config, the disk_health class; reports
+    # null off Windows.
+    "windows_services": True,
     # True (not a dict) -> docker_metrics() runs with default socket resolution.
     # Without this key, --dry-run never exercised the Docker collector at all.
     # Gated on the "docker" capability, so it is a no-op where the socket is

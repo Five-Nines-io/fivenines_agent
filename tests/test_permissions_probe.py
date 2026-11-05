@@ -35,6 +35,7 @@ _PROBE_METHODS = (
     "_can_query_psutil_sensors",
     "_can_query_wmi_storage",
     "_can_read_uninstall_registry",
+    "_can_list_services",
 )
 
 _ALL_TRUE_CAPS = {
@@ -466,6 +467,7 @@ def test_build_windows_capabilities_has_windows_shape(mock_iw):
     # Windows-native entries are present.
     assert "disk_health" in probe.capabilities
     assert "software_inventory" in probe.capabilities
+    assert "windows_services" in probe.capabilities
 
     # Core metrics are unconditionally True on Windows (psutil works).
     # load_average is intentionally absent on Windows - see comment in
@@ -592,8 +594,36 @@ def test_can_read_uninstall_registry_openkey_oserror():
         assert probe._can_read_uninstall_registry() is False
 
 
+def test_can_list_services_delegates_to_the_collector_probe():
+    probe = _new_probe_with({})
+    with patch(
+        "fivenines_agent.permissions.probe_services_access", return_value=(True, None)
+    ):
+        assert probe._can_list_services() is True
+
+
+def test_can_list_services_records_the_reason():
+    probe = _new_probe_with({})
+    with patch(
+        "fivenines_agent.permissions.probe_services_access",
+        return_value=(False, "Service Control Manager unavailable: error: denied"),
+    ), patch.object(probe, "_set_reason") as set_reason:
+        assert probe._can_list_services() is False
+    set_reason.assert_called_once_with(
+        "Service Control Manager unavailable: error: denied"
+    )
+
+
+def test_windows_services_is_not_a_linux_capability():
+    """The Linux probe never lists it: the collector reports None there."""
+    probe = _new_probe_with({})
+    assert "windows_services" not in probe._linux_probe_specs()
+    assert "windows_services" in probe._windows_probe_specs()
+
+
 def test_banner_uses_windows_groups(capsys):
-    """On Windows, the banner shows Windows groupings (no Services/Security/Networking)."""
+    """On Windows, the banner shows Windows groupings: its Services section holds
+    Windows services only, and there is no Security/Networking section."""
     import fivenines_agent.permissions as perm
     original_probe = perm._probe
     perm._probe = None  # force fresh singleton inside the Windows mock
@@ -606,5 +636,8 @@ def test_banner_uses_windows_groups(capsys):
     out = capsys.readouterr().out
     assert "Inventory" in out  # Windows-only banner section
     assert "Disk Health" in out  # Windows-only capability
-    assert "Services" not in out  # Linux services section absent
+    assert "Windows Services" in out  # Windows-only capability
+    for linux_service in ("Docker", "Qemu", "Proxmox", "Systemd", "Cgroup"):
+        assert linux_service not in out  # Linux services absent
+    assert "Security" not in out and "Networking" not in out
     assert "Fail2Ban" not in out  # Linux-only capability absent

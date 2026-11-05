@@ -43,6 +43,7 @@ from fivenines_agent.tailscale import tailscale_metrics
 from fivenines_agent.temperatures import temperatures
 from fivenines_agent.tsdb import tsdb_metrics
 from fivenines_agent.vllm import vllm_metrics
+from fivenines_agent.windows_services import windows_services
 from fivenines_agent.wireguard import wireguard_metrics
 from fivenines_agent.zfs import zfs_storage_health
 
@@ -207,6 +208,12 @@ COLLECTORS = [
     # Windows-only: gated by the disk_health capability, only present in the
     # Windows-tailored capability set (D13 - permissions._build_windows_*).
     ("disk_health", [("disk_health", disk_health_windows, False)]),
+    # Windows-only: the state and start type of every Windows service, the
+    # counterpart of the systemd collector's unit health. A TOP-LEVEL plain
+    # boolean; pass_kwargs=False, so a later dict value is ignored rather than
+    # splatted into a TypeError. Gated by the windows_services capability (only
+    # in the Windows capability set); None off Windows.
+    ("windows_services", [("windows_services", windows_services, False)]),
 ]
 
 

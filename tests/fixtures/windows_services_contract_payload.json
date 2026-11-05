@@ -1,0 +1,78 @@
+{
+  "description": "Shared Windows services contract fixture between fivenines-agent and fivenines-server. Source of truth: fivenines-agent tests/fixtures/windows_services_contract_payload.json, asserted end-to-end by tests/test_windows_services.py::test_contract_fixture_round_trip -- each scenario's 'scm' is served by a fake win32service module (the pywin32 calls the collector makes: OpenSCManager, EnumServicesStatusEx, OpenService, QueryServiceConfig, QueryServiceConfig2) plus the trigger count the agent reads through ctypes, and windows_services() must equal scenario['payload']['windows_services']. 'scm' is an agent-side input the server ignores. The server ingests data['windows_services'] == payload['windows_services']; it is a TOP-LEVEL config flag, config['windows_services'] = true, a plain boolean, sent to Windows agents only. Change the payload shape only in lockstep with the server spec and its byte-identical fixture copy.",
+  "agent_min_version": "1.23.0",
+  "_agent_min_version_note": "MINOR on the 1.x train: a new collector. Gate the config flag on it (older agents ignore the unknown key, so an ungated flag is harmless, just inert).",
+  "null_contract": "data['windows_services'] ABSENT means not reported: an older agent, the flag off, or the windows_services capability probed false (pywin32 missing, or the Service Control Manager refused the agent's account; the reason is in capability_reasons). null means the collection failed this tick: not Windows, the Service Control Manager could not be opened or listed, more than 2000 services were listed, or a read blocked past the agent's 10s bound (then null on every tick until that read returns). Neither ABSENT nor null says anything about any service: keep every stored row as it is, open no incident and resolve none.",
+  "list_contract": "{'services': [...]} is every Win32 service the agent's account can see, sorted by name (case-insensitively), drivers and per-user services excluded (a per-user service template, type bit 0x40, and its per-logon instances, named <template>_<LUID>, which come and go with each logon). It is NOT proof that a missing service was removed: the Service Control Manager silently omits a service whose security descriptor denies the account SERVICE_QUERY_STATUS, and the account is a non-administrator. A service that disappears was uninstalled OR hidden; prune it only after it has been absent for a while (the server's choice), never on one tick. {'services': []} is a real (if unlikely) answer: nothing visible.",
+  "entry_contract": "Every entry has exactly these keys. name: the service (key) name, unique on the host, case-insensitive in Windows -- the row identity. display_name: as services.msc shows it, in the OS install language. state: 'stopped', 'start_pending', 'stop_pending', 'running', 'continue_pending', 'pause_pending' or 'paused' (null for a value outside them, which Windows does not send). start_type: 'automatic', 'manual' or 'disabled' ('boot' and 'system' exist for drivers only); null when the account may see the service but not read its configuration. delayed_auto_start: bool, the 'Automatic (Delayed Start)' flag (read for every service, meaningful for automatic ones only); null when unreadable. trigger_start: bool, true when the service has start or stop triggers ('(Trigger Start)' in services.msc): such a service starts and stops on its own, so 'automatic and stopped' is not a failure for it; null when unreadable. pid: the service process id, null when it has none (stopped or starting). exit_code: Win32ExitCode as reported, an int: 0 after a clean stop, 1077 for a service never started since boot, 1066 (ERROR_SERVICE_SPECIFIC_ERROR) when the service set its own code, which is then service_exit_code (an int, shipped as reported). The state, start type and flags are read on every tick, uncached.",
+  "scenarios": [
+    {
+      "name": "typical_server",
+      "comment": "A running automatic service; an automatic service that stopped after a failure (exit 1066 with its own code 3: an incident); a manual trigger-start service never started (1077); an automatic delayed trigger-start service that stopped cleanly on its own (not a failure); a disabled one; a paused one; a localized display name; a service whose configuration the account cannot open (listed, start type unknown); one whose delayed-start and trigger reads both failed (start type known, flags unknown); and, absent from the payload, a per-user service template, its per-logon instance, and a service deleted between the listing and its configuration read.",
+      "scm": {
+        "services": [
+          {"ServiceName": "wuauserv", "DisplayName": "Windows Update", "ServiceType": 32, "CurrentState": 1, "ControlsAccepted": 0, "Win32ExitCode": 1077, "ServiceSpecificExitCode": 0, "CheckPoint": 0, "WaitHint": 0, "ProcessId": 0, "ServiceFlags": 0,
+           "config": {"start_type": 3, "delayed": false, "triggers": 2}},
+          {"ServiceName": "EventLog", "DisplayName": "Windows Event Log", "ServiceType": 32, "CurrentState": 4, "ControlsAccepted": 129, "Win32ExitCode": 0, "ServiceSpecificExitCode": 0, "CheckPoint": 0, "WaitHint": 0, "ProcessId": 1532, "ServiceFlags": 0,
+           "config": {"start_type": 2, "delayed": false, "triggers": 0}},
+          {"ServiceName": "ExampleApp", "DisplayName": "Example Application Server", "ServiceType": 16, "CurrentState": 1, "ControlsAccepted": 0, "Win32ExitCode": 1066, "ServiceSpecificExitCode": 3, "CheckPoint": 0, "WaitHint": 0, "ProcessId": 0, "ServiceFlags": 0,
+           "config": {"start_type": 2, "delayed": false, "triggers": 0}},
+          {"ServiceName": "sppsvc", "DisplayName": "Software Protection", "ServiceType": 16, "CurrentState": 1, "ControlsAccepted": 0, "Win32ExitCode": 0, "ServiceSpecificExitCode": 0, "CheckPoint": 0, "WaitHint": 0, "ProcessId": 0, "ServiceFlags": 0,
+           "config": {"start_type": 2, "delayed": true, "triggers": 1}},
+          {"ServiceName": "tzautoupdate", "DisplayName": "Auto Time Zone Updater", "ServiceType": 32, "CurrentState": 1, "ControlsAccepted": 0, "Win32ExitCode": 1077, "ServiceSpecificExitCode": 0, "CheckPoint": 0, "WaitHint": 0, "ProcessId": 0, "ServiceFlags": 0,
+           "config": {"start_type": 4, "delayed": false, "triggers": 0}},
+          {"ServiceName": "ExamplePausable", "DisplayName": "Example Pausable Service", "ServiceType": 16, "CurrentState": 7, "ControlsAccepted": 3, "Win32ExitCode": 0, "ServiceSpecificExitCode": 0, "CheckPoint": 0, "WaitHint": 0, "ProcessId": 4410, "ServiceFlags": 0,
+           "config": {"start_type": 3, "delayed": false, "triggers": 0}},
+          {"ServiceName": "Spooler", "DisplayName": "Spouleur d'impression", "ServiceType": 16, "CurrentState": 4, "ControlsAccepted": 1, "Win32ExitCode": 0, "ServiceSpecificExitCode": 0, "CheckPoint": 0, "WaitHint": 0, "ProcessId": 2288, "ServiceFlags": 0,
+           "config": {"start_type": 2, "delayed": false, "triggers": 0}},
+          {"ServiceName": "W32Time", "DisplayName": "Horloge Windows \u00e9tendue", "ServiceType": 32, "CurrentState": 4, "ControlsAccepted": 197, "Win32ExitCode": 0, "ServiceSpecificExitCode": 0, "CheckPoint": 0, "WaitHint": 0, "ProcessId": 1460, "ServiceFlags": 0,
+           "config": {"start_type": 3, "delayed": false, "triggers": 1}},
+          {"ServiceName": "ExampleEdrSvc", "DisplayName": "Example Endpoint Protection", "ServiceType": 16, "CurrentState": 4, "ControlsAccepted": 0, "Win32ExitCode": 0, "ServiceSpecificExitCode": 0, "CheckPoint": 0, "WaitHint": 0, "ProcessId": 3120, "ServiceFlags": 0,
+           "config": {"open_error": 5}},
+          {"ServiceName": "ExampleAgent", "DisplayName": "Example Monitoring Agent", "ServiceType": 16, "CurrentState": 2, "ControlsAccepted": 0, "Win32ExitCode": 0, "ServiceSpecificExitCode": 0, "CheckPoint": 1, "WaitHint": 30000, "ProcessId": 0, "ServiceFlags": 0,
+           "config": {"start_type": 2, "delayed_error": 5, "triggers_error": 5}},
+          {"ServiceName": "CDPUserSvc", "DisplayName": "Connected Devices Platform User Service", "ServiceType": 96, "CurrentState": 1, "ControlsAccepted": 0, "Win32ExitCode": 1077, "ServiceSpecificExitCode": 0, "CheckPoint": 0, "WaitHint": 0, "ProcessId": 0, "ServiceFlags": 0,
+           "config": {"start_type": 2, "delayed": false, "triggers": 0}},
+          {"ServiceName": "CDPUserSvc_4a3b2", "DisplayName": "Connected Devices Platform User Service_4a3b2", "ServiceType": 224, "CurrentState": 4, "ControlsAccepted": 0, "Win32ExitCode": 0, "ServiceSpecificExitCode": 0, "CheckPoint": 0, "WaitHint": 0, "ProcessId": 5120, "ServiceFlags": 0,
+           "config": {"start_type": 2, "delayed": false, "triggers": 0}},
+          {"ServiceName": "ExampleUpdater", "DisplayName": "Example Updater", "ServiceType": 16, "CurrentState": 1, "ControlsAccepted": 0, "Win32ExitCode": 0, "ServiceSpecificExitCode": 0, "CheckPoint": 0, "WaitHint": 0, "ProcessId": 0, "ServiceFlags": 0,
+           "config": {"open_error": 1060}}
+        ]
+      },
+      "payload": {
+        "windows_services": {
+          "services": [
+            {"name": "EventLog", "display_name": "Windows Event Log", "state": "running", "start_type": "automatic", "delayed_auto_start": false, "trigger_start": false, "pid": 1532, "exit_code": 0, "service_exit_code": 0},
+            {"name": "ExampleAgent", "display_name": "Example Monitoring Agent", "state": "start_pending", "start_type": "automatic", "delayed_auto_start": null, "trigger_start": null, "pid": null, "exit_code": 0, "service_exit_code": 0},
+            {"name": "ExampleApp", "display_name": "Example Application Server", "state": "stopped", "start_type": "automatic", "delayed_auto_start": false, "trigger_start": false, "pid": null, "exit_code": 1066, "service_exit_code": 3},
+            {"name": "ExampleEdrSvc", "display_name": "Example Endpoint Protection", "state": "running", "start_type": null, "delayed_auto_start": null, "trigger_start": null, "pid": 3120, "exit_code": 0, "service_exit_code": 0},
+            {"name": "ExamplePausable", "display_name": "Example Pausable Service", "state": "paused", "start_type": "manual", "delayed_auto_start": false, "trigger_start": false, "pid": 4410, "exit_code": 0, "service_exit_code": 0},
+            {"name": "Spooler", "display_name": "Spouleur d'impression", "state": "running", "start_type": "automatic", "delayed_auto_start": false, "trigger_start": false, "pid": 2288, "exit_code": 0, "service_exit_code": 0},
+            {"name": "sppsvc", "display_name": "Software Protection", "state": "stopped", "start_type": "automatic", "delayed_auto_start": true, "trigger_start": true, "pid": null, "exit_code": 0, "service_exit_code": 0},
+            {"name": "tzautoupdate", "display_name": "Auto Time Zone Updater", "state": "stopped", "start_type": "disabled", "delayed_auto_start": false, "trigger_start": false, "pid": null, "exit_code": 1077, "service_exit_code": 0},
+            {"name": "W32Time", "display_name": "Horloge Windows \u00e9tendue", "state": "running", "start_type": "manual", "delayed_auto_start": false, "trigger_start": true, "pid": 1460, "exit_code": 0, "service_exit_code": 0},
+            {"name": "wuauserv", "display_name": "Windows Update", "state": "stopped", "start_type": "manual", "delayed_auto_start": false, "trigger_start": true, "pid": null, "exit_code": 1077, "service_exit_code": 0}
+          ]
+        }
+      }
+    },
+    {
+      "name": "nothing_visible",
+      "comment": "The listing succeeded and showed nothing (every service hidden from the account): an empty list, not null.",
+      "scm": {"services": []},
+      "payload": {"windows_services": {"services": []}}
+    },
+    {
+      "name": "scm_refused",
+      "comment": "OpenSCManager refused (error 5): a failed collection, null. The capability probe makes the same open, so a steady refusal makes the key ABSENT instead, with the reason in capability_reasons.",
+      "scm": {"open_error": 5},
+      "payload": {"windows_services": null}
+    },
+    {
+      "name": "listing_failed",
+      "comment": "The SCM opened but EnumServicesStatusEx failed: null, never a partial list.",
+      "scm": {"enum_error": 1726},
+      "payload": {"windows_services": null}
+    }
+  ]
+}

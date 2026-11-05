@@ -56,6 +56,7 @@ def test_registry_has_expected_config_keys():
         "openvpn",
         "systemd",
         "disk_health",
+        "windows_services",
     ]
     assert config_keys == expected
 

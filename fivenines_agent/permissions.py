@@ -15,6 +15,7 @@ from fivenines_agent.bounded import WorkerTimeout, call_bounded
 from fivenines_agent.debug import log
 from fivenines_agent.env import is_windows
 from fivenines_agent.openvpn import probe_management_access
+from fivenines_agent.windows_services import probe_access as probe_services_access
 from fivenines_agent.qemu import DEFAULT_LIBVIRT_URI
 from fivenines_agent.scrub import log_safe
 from fivenines_agent.subprocess_utils import get_clean_env, run_privileged
@@ -110,6 +111,7 @@ CAPABILITY_HINTS = {
     "cgroup": "no /sys/fs/cgroup hierarchy found",
     "disk_health": "requires WMI Storage namespace access",
     "software_inventory": "requires Uninstall registry key access",
+    "windows_services": "requires Service Control Manager access",
 }
 
 # Banner group layout per OS. Each entry is (section title, [capability keys]).
@@ -157,6 +159,7 @@ WINDOWS_BANNER_GROUPS = [
     ),
     ("Hardware Sensors", ["temperatures", "fans", "nvidia_gpu"]),
     ("Storage", ["disk_health"]),
+    ("Services", ["windows_services"]),
     ("Inventory", ["software_inventory"]),
 ]
 
@@ -363,6 +366,8 @@ class PermissionProbe:
             "disk_health": (self._can_query_wmi_storage, ()),
             # Windows-native: registry Uninstall key (classic Win32 installed programs)
             "software_inventory": (self._can_read_uninstall_registry, ()),
+            # Windows-native: Service Control Manager (the collector's own open)
+            "windows_services": (self._can_list_services, ()),
         }
 
     def _build_windows_capabilities(self):
@@ -373,7 +378,7 @@ class PermissionProbe:
         smart_storage via smartctl, packages via dpkg/rpm) are omitted: D13
         sends a Windows-shaped payload rather than Linux keys marked N/A.
         Windows-native entries: disk_health (WMI Storage), software_inventory
-        (registry Uninstall key).
+        (registry Uninstall key), windows_services (Service Control Manager).
         """
         # Core metrics - psutil handles these cross-platform.
         # load_average is intentionally absent: Windows has no equivalent
@@ -1175,6 +1180,18 @@ class PermissionProbe:
         except OSError as e:
             self._set_reason(f"Uninstall registry key unreadable: {e}")
             return False
+
+    def _can_list_services(self):
+        """Probe whether the Service Control Manager opens for enumeration.
+
+        Delegates to windows_services.probe_access, which makes the collector's
+        own pywin32 import and SCM open, so the probe and the collector cannot
+        disagree on what "available" means.
+        """
+        available, reason = probe_services_access()
+        if not available:
+            self._set_reason(reason)
+        return available
 
     def get(self, capability, default=False):
         """Get a specific capability status."""
