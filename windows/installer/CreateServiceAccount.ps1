@@ -380,8 +380,11 @@ $agentDirectories = @(
 # proves what a later call on that same path reaches, so the grant goes
 # through handles, compiled once per process like FiveninesLogon:
 #   * every directory from the one below $Root down to the agent's is opened
-#     without following a link at it and shared for reading only, so none of
-#     them can be renamed, deleted or replaced while the handles are open;
+#     without following a link at it, with the right to list it, and shared
+#     for reading only, so none of them can be renamed, deleted or replaced
+#     while the handles are open (Windows applies a share mode only to a
+#     handle holding a data right such as listing: one holding only
+#     attribute or ACL rights would pin nothing);
 #   * each is refused when its handle shows a link (a junction or a symbolic
 #     link) or something that is not a directory (a hard link to a file);
 #   * the ACE is added and written through the last handle, so it lands on
@@ -403,7 +406,7 @@ function Initialize-AgentDirectoryType {
     using Microsoft.Win32.SafeHandles;
 
     public static class FiveninesAgentDirectory {
-        const uint FILE_READ_ATTRIBUTES = 0x80, READ_CONTROL = 0x20000, WRITE_DAC = 0x40000;
+        const uint FILE_LIST_DIRECTORY = 0x1, FILE_READ_ATTRIBUTES = 0x80, READ_CONTROL = 0x20000, WRITE_DAC = 0x40000;
         const uint FILE_SHARE_READ = 1, FILE_SHARE_ALL = 7, OPEN_EXISTING = 3;
         const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000, FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
         const uint FILE_ATTRIBUTE_DIRECTORY = 0x10, FILE_ATTRIBUTE_REPARSE_POINT = 0x400;
@@ -423,6 +426,13 @@ function Initialize-AgentDirectoryType {
         sealed class HandleSecurity : ObjectSecurity<FileSystemRights> {
             public HandleSecurity(SafeHandle handle) : base(true, ResourceType.FileObject, handle, AccessControlSections.Access) { }
             public void Save(SafeHandle handle) { Persist(handle, AccessControlSections.Access); }
+        }
+
+        // The last Win32 error, named: the code alone tells a sharing
+        // violation (32) from a denied access (5) in the MSI log.
+        static Win32Exception Failure(string what) {
+            int code = Marshal.GetLastWin32Error();
+            return new Win32Exception(code, what + ": " + new Win32Exception(code).Message + " (error " + code + ")");
         }
 
         static void Close(List<SafeFileHandle> handles) {
@@ -445,14 +455,14 @@ function Initialize-AgentDirectoryType {
             try {
                 for (int i = 0; i < parts.Length; i++) {
                     current += "\\" + parts[i];
-                    uint access = FILE_READ_ATTRIBUTES | (i == parts.Length - 1 ? leafAccess : 0);
+                    uint access = FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | (i == parts.Length - 1 ? leafAccess : 0);
                     SafeFileHandle handle = CreateFileW(current, access, FILE_SHARE_READ, IntPtr.Zero, OPEN_EXISTING,
                         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, IntPtr.Zero);
-                    if (handle.IsInvalid) { throw new Win32Exception(Marshal.GetLastWin32Error(), "cannot open " + current); }
+                    if (handle.IsInvalid) { throw Failure("cannot open " + current); }
                     handles.Add(handle);
                     FileInformation info;
                     if (!GetFileInformationByHandle(handle, out info)) {
-                        throw new Win32Exception(Marshal.GetLastWin32Error(), "cannot read " + current);
+                        throw Failure("cannot read " + current);
                     }
                     if ((info.Attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
                         refusal = current + " is a junction or a symbolic link";
@@ -474,7 +484,7 @@ function Initialize-AgentDirectoryType {
         public static bool HasGrant(string path, string sid) {
             SafeFileHandle handle = CreateFileW(path, READ_CONTROL, FILE_SHARE_ALL, IntPtr.Zero, OPEN_EXISTING,
                 FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero);
-            if (handle.IsInvalid) { throw new Win32Exception(Marshal.GetLastWin32Error(), "cannot open " + path); }
+            if (handle.IsInvalid) { throw Failure("cannot open " + path); }
             using (handle) {
                 InheritanceFlags inherit = InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit;
                 foreach (AccessRule<FileSystemRights> rule in new HandleSecurity(handle).GetAccessRules(true, false, typeof(SecurityIdentifier))) {

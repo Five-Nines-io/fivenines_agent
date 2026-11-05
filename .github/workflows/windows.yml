@@ -350,6 +350,7 @@ jobs:
       # ACL left as it was.
       # Value: protects=one grant, inherited by existing files and never re-applied, and no grant through a junction at or below the path down to Root; fails_when=the link check goes, or the existing-grant check stops returning $false; why_new=only the static pytest sees the call site; seam=none; no_claim=symbolic links (same attribute bit, not exercised)
       # Value: protects=a hard link to a file put where a directory is expected is refused and its target keeps its ACL; fails_when=the check tests only the link attribute, not that it is a directory; why_new=a hard link carries no reparse bit; seam=none; no_claim=a hard link swapped in after the check, which the open handles rule out
+      # Value: protects=the open handles' share mode applies, so a directory in the chain cannot be renamed or replaced between the check and the write; fails_when=the handles hold no data right (Windows then ignores their share mode) or share deleting; why_new=only a handle held open for deleting shows it; seam=none; no_claim=a rename attempted while the grant runs, which needs a hook between two calls
       # Value: protects=a junction that already reaches the account's grant is left as it is, not refused; fails_when=the link check runs before the existing-grant check; why_new=a logs dir an operator moved behind a junction, granted by icacls /T, was refused on every upgrade; seam=none; no_claim=a junction reaching no grant, which is refused
       # Value: protects=the check stops at Root and never inspects Root itself, even a Root that is a junction or written with a trailing backslash; fails_when=the check starts at Root, or Root's trailing backslash is no longer trimmed; why_new=nothing at or above the step's root is a link, so a check running past Root passed; seam=none; no_claim=a drive-root Root
       # Value: protects=a junction the account plants inside its directory never carries the SYSTEM-applied grant to its target; fails_when=/T comes back, or Windows' propagation follows a junction child; why_new=the step only links the granted dir itself or a parent; seam=none; no_claim=hard links inside, which share their target's ACL
@@ -428,6 +429,32 @@ jobs:
           if ((Get-Acl -LiteralPath $plain).Sddl -ne $sddl) { throw "the grant reached the file a hard link shares its ACL with" }
           Remove-Item -LiteralPath $hardLink -Force
           Write-Host "Refused a hard link to a file, the file's ACL untouched."
+
+          # The handles pin the directories only because they hold a data
+          # right (listing): Windows applies their share mode, which refuses
+          # any other handle that could rename or delete them, and applies it
+          # both ways, so a directory already open for deleting is not
+          # granted (a sharing violation, error 32) and keeps its ACL.
+          Add-Type -TypeDefinition @"
+            using System;
+            using System.Runtime.InteropServices;
+            using Microsoft.Win32.SafeHandles;
+            public static class FnCiHandle {
+                [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+                public static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+            }
+          "@
+          $held = Join-Path $root "held"
+          New-Item -ItemType Directory -Path $held | Out-Null
+          # DELETE, shared for everything, as a rename holds it; directories
+          # open only with FILE_FLAG_BACKUP_SEMANTICS.
+          $deleting = [FnCiHandle]::CreateFileW($held, 0x10000, 7, [IntPtr]::Zero, 3, 0x02000000, [IntPtr]::Zero)
+          if ($deleting.IsInvalid) { throw "could not open $held for deleting" }
+          $raised = $null
+          try { Grant-AgentDirectory -Path $held -Sid $sid -Root $root | Out-Null } catch { $raised = $_.Exception.Message } finally { $deleting.Dispose() }
+          if ($raised -notmatch "\(error 32\)") { throw "a directory open for deleting was granted, or failed otherwise: $raised" }
+          if ((Get-GrantCount $held) -ne 0) { throw "the directory open for deleting was granted" }
+          Write-Host "A directory open for deleting is not granted: $raised"
 
           # A junction that already reaches the grant (a directory an
           # operator moved behind a junction, which icacls /T granted) is
