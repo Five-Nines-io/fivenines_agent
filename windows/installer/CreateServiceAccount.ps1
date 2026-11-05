@@ -387,6 +387,11 @@ $agentDirectories = @(
 #     attribute or ACL rights would pin nothing);
 #   * each is refused when its handle shows a link (a junction or a symbolic
 #     link) or something that is not a directory (a hard link to a file);
+#   * the last handle's final path must be the agent directory's own, under
+#     $Root as it resolves: a directory pinned that way can still be emptied
+#     and turned into a junction (that takes only the right to write its
+#     attributes, which no share mode refuses), and the next directory, opened
+#     by its full path, would then be reached through it;
 #   * the ACE is added and written through the last handle, so it lands on
 #     the directory that was checked and nothing else.
 # Windows then propagates the inheritable ACE to the existing children that
@@ -403,6 +408,7 @@ function Initialize-AgentDirectoryType {
     using System.Runtime.InteropServices;
     using System.Security.AccessControl;
     using System.Security.Principal;
+    using System.Text;
     using Microsoft.Win32.SafeHandles;
 
     public static class FiveninesAgentDirectory {
@@ -421,6 +427,8 @@ function Initialize-AgentDirectoryType {
         static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
         [DllImport("kernel32.dll", SetLastError = true)]
         static extern bool GetFileInformationByHandle(SafeFileHandle handle, out FileInformation info);
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle, StringBuilder path, uint size, uint flags);
 
         // A directory's DACL, read and written through its handle.
         sealed class HandleSecurity : ObjectSecurity<FileSystemRights> {
@@ -433,6 +441,19 @@ function Initialize-AgentDirectoryType {
         static Win32Exception Failure(string what) {
             int code = Marshal.GetLastWin32Error();
             return new Win32Exception(code, what + ": " + new Win32Exception(code).Message + " (error " + code + ")");
+        }
+
+        // Where handle's object actually is, normalized (FILE_NAME_NORMALIZED,
+        // VOLUME_NAME_DOS).
+        static string FinalPath(SafeFileHandle handle, string what) {
+            StringBuilder path = new StringBuilder(512);
+            uint length = GetFinalPathNameByHandleW(handle, path, (uint)path.Capacity, 0);
+            if (length >= path.Capacity) {
+                path = new StringBuilder((int)length + 1);
+                length = GetFinalPathNameByHandleW(handle, path, (uint)path.Capacity, 0);
+            }
+            if (length == 0 || length >= path.Capacity) { throw Failure("cannot resolve " + what); }
+            return path.ToString(0, (int)length).TrimEnd('\\');
         }
 
         static void Close(List<SafeFileHandle> handles) {
@@ -449,6 +470,13 @@ function Initialize-AgentDirectoryType {
                 throw new ArgumentException(full + " is not below " + rootFull);
             }
             string[] parts = full.Substring(rootFull.Length + 1).Split('\\');
+            // root itself is not the account's: followed, it may be a junction.
+            string expected;
+            using (SafeFileHandle rootHandle = CreateFileW(rootFull, FILE_READ_ATTRIBUTES, FILE_SHARE_ALL, IntPtr.Zero,
+                    OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, IntPtr.Zero)) {
+                if (rootHandle.IsInvalid) { throw Failure("cannot open " + rootFull); }
+                expected = FinalPath(rootHandle, rootFull) + full.Substring(rootFull.Length);
+            }
             List<SafeFileHandle> handles = new List<SafeFileHandle>();
             string current = rootFull;
             refusal = null;
@@ -470,6 +498,11 @@ function Initialize-AgentDirectoryType {
                         refusal = current + " is not a directory";
                     }
                     if (refusal != null) { Close(handles); return null; }
+                }
+                if (!string.Equals(FinalPath(handles[handles.Count - 1], full), expected, StringComparison.OrdinalIgnoreCase)) {
+                    Close(handles);
+                    refusal = full + " sits under a junction or a symbolic link";
+                    return null;
                 }
                 return handles;
             } catch {
@@ -536,11 +569,17 @@ function Initialize-AgentDirectoryType {
 # read through a handle that follows links (Get-Acl reads a junction's own
 # ACL): it changes nothing, and a directory an operator moved behind a
 # junction that already has the grant (as icacls /T left it) is left as it is.
+# A read that fails (a junction whose target is gone or cannot be opened) is
+# no grant: the handle check then refuses the link, or names its own error.
 function Test-AgentDirectoryGrant {
     param([string]$Path, [string]$Sid)
 
     Initialize-AgentDirectoryType
-    return [FiveninesAgentDirectory]::HasGrant($Path, $Sid)
+    try {
+        return [FiveninesAgentDirectory]::HasGrant($Path, $Sid)
+    } catch {
+        return $false
+    }
 }
 
 # The message refusing a grant for the reason FiveninesAgentDirectory gave.
@@ -557,9 +596,8 @@ function Format-AgentDirectoryRefusal {
 function Grant-AgentDirectory {
     param([string]$Path, [string]$Sid, [string]$Root)
 
-    if (Test-AgentDirectoryGrant -Path $Path -Sid $Sid) { return $false }
-    Initialize-AgentDirectoryType
     try {
+        if (Test-AgentDirectoryGrant -Path $Path -Sid $Sid) { return $false }
         $refusal = [FiveninesAgentDirectory]::Grant($Path, $Root, $Sid)
     } catch {
         throw ("Could not grant the service account access to {0}: {1}" -f $Path, $_.Exception.GetBaseException().Message)

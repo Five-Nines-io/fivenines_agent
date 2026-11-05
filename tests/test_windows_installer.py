@@ -290,7 +290,7 @@ def test_bootstrap_resolves_a_relative_msi_path_first(path):
     ), f"{path} uses -MsiPath before resolving it"
 
 
-# Value: protects=the downloaded MSI, its extracted copy and the install log; fails_when=a default path, the extraction or the log goes back to a bare $env:TEMP (C:\\Windows\\Temp under an RMM tool running as SYSTEM, where a file any local user created stays theirs to rewrite before msiexec runs it); why_new=the E2E and the DC runs pass explicit -MsiPath/-LogFile, so the defaults run nowhere in CI; seam=none; no_claim=that the directory's ACL is private, which windows.yml's "Verify the bootstrap's private work directory" steps check on Windows, under PowerShell 5.1 and 7
+# Value: protects=the downloaded MSI, its extracted copy and the install log; fails_when=a default path, the extraction or the log goes back to a bare $env:TEMP (C:\\Windows\\Temp under an RMM tool running as SYSTEM, where a file any local user created stays theirs to rewrite before msiexec runs it), or the account step run in this process compiles its C# in the operator's own %TEMP%; why_new=the E2E and the DC runs pass explicit -MsiPath/-LogFile, so the defaults run nowhere in CI; seam=none; no_claim=that the directory's ACL is private, which windows.yml's "Verify the bootstrap's private work directory" steps check on Windows, under PowerShell 5.1 and 7
 @pytest.mark.parametrize("path", [SETUP, UPDATE])
 def test_bootstrap_downloads_into_a_private_directory(path):
     code = _code(path)
@@ -305,7 +305,18 @@ def test_bootstrap_downloads_into_a_private_directory(path):
     )
     assert '$image = Join-Path $WorkDir "plan"' in code
     assert "-WorkDir $WorkDir" in code
-    assert "$env:TEMP" not in code
+    # %TEMP% is only ever pointed at the work directory, around the MSI's
+    # account step run in this process (its Add-Type compiles in %TEMP%).
+    redirect = (
+        "$savedTemp = $env:TEMP",
+        "$env:TEMP = $WorkDir",
+        "$env:TEMP = $savedTemp",
+    )
+    rest = code
+    for line in redirect:
+        assert line in code
+        rest = rest.replace(line, "")
+    assert "$env:TEMP" not in rest
     # Earlier runs' directories go right after this run's is created (a run
     # that keeps failing does not pile them up) and again as the last
     # statement of a run that succeeds; this one stays, as the recorded

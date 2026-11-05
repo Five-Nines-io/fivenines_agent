@@ -352,6 +352,7 @@ jobs:
       # Value: protects=a hard link to a file put where a directory is expected is refused and its target keeps its ACL; fails_when=the check tests only the link attribute, not that it is a directory; why_new=a hard link carries no reparse bit; seam=none; no_claim=a hard link swapped in after the check, which the open handles rule out
       # Value: protects=the open handles' share mode applies, so a directory in the chain cannot be renamed or replaced between the check and the write; fails_when=the handles hold no data right (Windows then ignores their share mode) or share deleting; why_new=only a handle held open for deleting shows it; seam=none; no_claim=a rename attempted while the grant runs, which needs a hook between two calls
       # Value: protects=a junction that already reaches the account's grant is left as it is, not refused; fails_when=the link check runs before the existing-grant check; why_new=a logs dir an operator moved behind a junction, granted by icacls /T, was refused on every upgrade; seam=none; no_claim=a junction reaching no grant, which is refused
+      # Value: protects=a dangling junction is refused by the handle check, in the account step and the plan alike; fails_when=a failed read of the existing grant escapes as an error (the plan then lets msiexec remove the agent before the step fails); why_new=every other junction case has a live target; seam=none; no_claim=a target that exists but cannot be opened
       # Value: protects=the check stops at Root and never inspects Root itself, even a Root that is a junction or written with a trailing backslash; fails_when=the check starts at Root, or Root's trailing backslash is no longer trimmed; why_new=nothing at or above the step's root is a link, so a check running past Root passed; seam=none; no_claim=a drive-root Root
       # Value: protects=a junction the account plants inside its directory never carries the SYSTEM-applied grant to its target; fails_when=/T comes back, or Windows' propagation follows a junction child; why_new=the step only links the granted dir itself or a parent; seam=none; no_claim=hard links inside, which share their target's ACL
       # Value: protects=a read-only, container-only, object-only or inherit-only ACE is no grant: the full one lands, on the dir, new files and new subdirs; fails_when=the existing-grant check drops its rights test, either inheritance half or its IO test; why_new=only a real full grant is re-checked; seam=none; no_claim=deny ACEs
@@ -470,6 +471,20 @@ jobs:
           if ($again) { throw "a junction reaching the grant was granted again" }
           cmd /c rmdir "$grantedLink" | Out-Null
           Write-Host "A junction that already reaches the grant is left as it is."
+
+          # A junction whose target is gone: reading its grant fails, which
+          # is no grant, and the handle check refuses the junction itself
+          # (not an unnamed error).
+          $goneTarget = Join-Path $root "gone-target"
+          $dangling = Join-Path $root "dangling"
+          New-Item -ItemType Directory -Path $goneTarget | Out-Null
+          cmd /c mklink /J "$dangling" "$goneTarget" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "mklink /J failed" }
+          Remove-Item -LiteralPath $goneTarget -Force
+          $refusal = Get-Refusal $dangling $root
+          if ($refusal -notmatch ("^" + [regex]::Escape($dangling) + " is a junction or a symbolic link")) { throw "a dangling junction was not refused: $refusal" }
+          cmd /c rmdir "$dangling" | Out-Null
+          Write-Host "A dangling junction is refused."
 
           # The check stops at Root without looking at Root itself: a plain
           # directory under a Root that is a junction is granted (on the
@@ -1201,6 +1216,10 @@ jobs:
               cmd /c mklink /J "$planLogs" "$elsewhere" | Out-Null
               if ($LASTEXITCODE -ne 0) { throw "mklink /J failed" }
               Check "logs directory a junction" (Get-Plan ".\fn-plan-absent") "Refuse" $null $false "is a junction or a symbolic link"
+              # Its target gone: the plan still refuses it, as the account
+              # step would, rather than letting msiexec remove the agent.
+              Remove-Item -LiteralPath $elsewhere -Force
+              Check "logs directory a dangling junction" (Get-Plan ".\fn-plan-absent") "Refuse" $null $false "is a junction or a symbolic link"
               cmd /c rmdir "$planLogs" | Out-Null
             } finally {
               $env:ProgramData = $savedProgramData
