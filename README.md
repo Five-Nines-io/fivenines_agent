@@ -242,7 +242,9 @@ another DC:
   `update.ps1` first ask the MSI they downloaded what it will do with the
   account, and stop before installing or removing anything when it would
   refuse (a second DC without the password, an operator-managed account
-  without its password, or a password that does not log the account on).
+  without its password, a password that does not log the account on, or an
+  agent directory under `%ProgramData%` that is a junction, a symbolic link
+  or not a directory at all and does not carry the account's access yet).
   `msiexec` used directly refuses the same cases with exit code 1603 and the
   reason in the install log, but on an upgrade Windows Installer has already
   removed the running agent by then. A password the check could not verify

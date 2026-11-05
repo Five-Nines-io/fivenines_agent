@@ -221,6 +221,20 @@ def test_dc_job_pins_its_downloads_and_runs_on_request_only():
     assert "sha256sum -c -" in job
 
 
+# Value: protects=the agent directories' ACLs; fails_when=an icacls call comes back (it resolves the path again, and /T walks what the account planted), one of the two directories stops going through Grant-AgentDirectory, or -PlanOnly stops refusing before its exit; why_new=only the Windows unit step exercises the function, and it cannot see a call site that bypasses it; seam=none; no_claim=that the function behaves, which windows.yml's "Verify the agent directory grant" step runs for real
+def test_agent_directories_are_granted_without_a_recursive_walk():
+    script = _read(CREATE_ACCOUNT)
+    assert "icacls" not in _code(CREATE_ACCOUNT).lower()
+    assert "function Grant-AgentDirectory {" in script
+    assert "Grant-AgentDirectory -Path $d -Sid $sid -Root $programData" in script
+    assert '(Join-Path $programData "fivenines_agent"),' in script
+    assert '(Join-Path $programData "fivenines_agent\\logs")' in script
+    # -PlanOnly refuses what the account step would refuse, before its exit.
+    assert script.index("[FiveninesAgentDirectory]::Refusal(") < script.index(
+        '"FIVENINES_PLAN "'
+    )
+
+
 # Value: protects=the upgrade of every account an earlier release created, and what the DC harness expects of the tags; fails_when=MSI_MANAGED_DESCRIPTION is reworded (a member-server upgrade then finds the account v1.22.0 or older created "not MSI-managed" and fails with 1603, and a DC no longer adopts it) or stage2.ps1's $Legacy/$Own/$OtherDc/$Operator drift from the installer's tags (S2/S4/S5 fail an hour into the DC run); why_new=windows.yml's Get-AccountPlan cases read the constants from the script, so they follow a reword, and only the member smoke's literal and the DC run's S2 catch it, on Windows; seam=none; no_claim=that the tags drive the right plan, which the Get-AccountPlan cases cover
 def test_tags_match_earlier_releases_and_the_dc_harness():
     legacy = _constant(CREATE_ACCOUNT, "MSI_MANAGED_DESCRIPTION")
@@ -276,7 +290,7 @@ def test_bootstrap_resolves_a_relative_msi_path_first(path):
     ), f"{path} uses -MsiPath before resolving it"
 
 
-# Value: protects=the downloaded MSI, its extracted copy and the install log; fails_when=a default path, the extraction or the log goes back to a bare $env:TEMP (C:\\Windows\\Temp under an RMM tool running as SYSTEM, where a file any local user created stays theirs to rewrite before msiexec runs it); why_new=the E2E and the DC runs pass explicit -MsiPath/-LogFile, so the defaults run nowhere in CI; seam=none; no_claim=that the directory's ACL is private, which windows.yml's "Verify the bootstrap's private work directory" steps check on Windows, under PowerShell 5.1 and 7
+# Value: protects=the downloaded MSI, its extracted copy and the install log; fails_when=a default path, the extraction or the log goes back to a bare $env:TEMP (C:\\Windows\\Temp under an RMM tool running as SYSTEM, where a file any local user created stays theirs to rewrite before msiexec runs it), or the account step run in this process compiles its C# in the operator's own %TEMP%; why_new=the E2E and the DC runs pass explicit -MsiPath/-LogFile, so the defaults run nowhere in CI; seam=none; no_claim=that the directory's ACL is private, which windows.yml's "Verify the bootstrap's private work directory" steps check on Windows, under PowerShell 5.1 and 7
 @pytest.mark.parametrize("path", [SETUP, UPDATE])
 def test_bootstrap_downloads_into_a_private_directory(path):
     code = _code(path)
@@ -291,7 +305,18 @@ def test_bootstrap_downloads_into_a_private_directory(path):
     )
     assert '$image = Join-Path $WorkDir "plan"' in code
     assert "-WorkDir $WorkDir" in code
-    assert "$env:TEMP" not in code
+    # %TEMP% is only ever pointed at the work directory, around the MSI's
+    # account step run in this process (its Add-Type compiles in %TEMP%).
+    redirect = (
+        "$savedTemp = $env:TEMP",
+        "$env:TEMP = $WorkDir",
+        "$env:TEMP = $savedTemp",
+    )
+    rest = code
+    for line in redirect:
+        assert line in code
+        rest = rest.replace(line, "")
+    assert "$env:TEMP" not in rest
     # Earlier runs' directories go right after this run's is created (a run
     # that keeps failing does not pile them up) and again as the last
     # statement of a run that succeeds; this one stays, as the recorded

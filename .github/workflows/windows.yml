@@ -337,6 +337,235 @@ jobs:
             Remove-LocalUser -Name "fn-wmi-d" -ErrorAction SilentlyContinue
           }
 
+      # The agent-directory grant, for real on this runner: it lands once and
+      # is then left alone, and a directory that is a junction, sits under
+      # one, or is not a directory at all (a hard link to a file) is refused
+      # without touching what it points at, while a link that already
+      # reaches the grant is left as it is. The check stops at Root without
+      # looking at Root itself, even when Root is a junction or is written
+      # with a trailing backslash. A junction inside a granted directory keeps
+      # its target untouched (the inheritance Windows propagates must not
+      # follow it), an ACE that is not the whole grant is no grant, and a
+      # failure of the grant is raised with the function's own message, the
+      # ACL left as it was.
+      # Value: protects=one grant, inherited by existing files and never re-applied, and no grant through a junction at or below the path down to Root; fails_when=the link check goes, or the existing-grant check stops returning $false; why_new=only the static pytest sees the call site; seam=none; no_claim=symbolic links (same attribute bit, not exercised)
+      # Value: protects=a hard link to a file put where a directory is expected is refused and its target keeps its ACL; fails_when=the check tests only the link attribute, not that it is a directory; why_new=a hard link carries no reparse bit; seam=none; no_claim=a hard link swapped in after the check, which the open handles rule out
+      # Value: protects=the open handles' share mode applies, so a directory in the chain cannot be renamed or replaced between the check and the write; fails_when=the handles hold no data right (Windows then ignores their share mode) or share deleting; why_new=only a handle held open for deleting shows it; seam=none; no_claim=a rename attempted while the grant runs, which needs a hook between two calls
+      # Value: protects=a junction that already reaches the account's grant is left as it is, not refused; fails_when=the link check runs before the existing-grant check; why_new=a logs dir an operator moved behind a junction, granted by icacls /T, was refused on every upgrade; seam=none; no_claim=a junction reaching no grant, which is refused
+      # Value: protects=a dangling junction is refused by the handle check, in the account step and the plan alike; fails_when=a failed read of the existing grant escapes as an error (the plan then lets msiexec remove the agent before the step fails); why_new=every other junction case has a live target; seam=none; no_claim=a target that exists but cannot be opened
+      # Value: protects=the check stops at Root and never inspects Root itself, even a Root that is a junction or written with a trailing backslash; fails_when=the check starts at Root, or Root's trailing backslash is no longer trimmed; why_new=nothing at or above the step's root is a link, so a check running past Root passed; seam=none; no_claim=a drive-root Root
+      # Value: protects=a junction the account plants inside its directory never carries the SYSTEM-applied grant to its target; fails_when=/T comes back, or Windows' propagation follows a junction child; why_new=the step only links the granted dir itself or a parent; seam=none; no_claim=hard links inside, which share their target's ACL
+      # Value: protects=a read-only, container-only, object-only or inherit-only ACE is no grant: the full one lands, on the dir, new files and new subdirs; fails_when=the existing-grant check drops its rights test, either inheritance half or its IO test; why_new=only a real full grant is re-checked; seam=none; no_claim=deny ACEs
+      # Value: protects=a failure of the grant (an unparseable SID) fails the account step (the install's 1603) with the function's message, the ACL unchanged; fails_when=the failure is swallowed and reported as a grant, or the message loses the path; why_new=nothing else makes the grant fail; seam=none; no_claim=which Win32 errors the handle calls raise
+      - name: Verify the agent directory grant
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = Get-Content windows/installer/CreateServiceAccount.ps1 -Raw
+          foreach ($fn in 'Initialize-AgentDirectoryType', 'Test-AgentDirectoryGrant', 'Format-AgentDirectoryRefusal', 'Grant-AgentDirectory') {
+            $m = [regex]::Match($src, "(?ms)^function $fn \{.*?^\}")
+            if (-not $m.Success) { throw "$fn not found in CreateServiceAccount.ps1" }
+            Invoke-Expression $m.Value
+          }
+          $sid = "S-1-5-19"  # LOCAL SERVICE: any principal the test can grant
+          function Get-GrantCount($Path) {
+            return @((Get-Acl -LiteralPath $Path).GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) |
+              Where-Object { $_.IdentityReference.Value -eq $sid }).Count
+          }
+          # The message of the refusal Grant-AgentDirectory throws for Path,
+          # or $null when it did not throw; any other error fails the step.
+          function Get-Refusal($Path, $Root) {
+            try { Grant-AgentDirectory -Path $Path -Sid $sid -Root $Root | Out-Null } catch {
+              if ($_.Exception.Message -match "so the installer will not grant the service account access through it") { return $_.Exception.Message }
+              throw
+            }
+            return $null
+          }
+
+          $root = Join-Path $env:RUNNER_TEMP ("fn-grant-" + [guid]::NewGuid())
+          $agent = Join-Path $root "fivenines_agent"
+          $logs = Join-Path $agent "logs"
+          $target = Join-Path $root "elsewhere"
+          New-Item -ItemType Directory -Path $logs, $target | Out-Null
+          Set-Content -LiteralPath (Join-Path $logs "agent.log") -Value "x"
+
+          if (-not (Grant-AgentDirectory -Path $agent -Sid $sid -Root $root)) { throw "the first grant reported an existing one" }
+          if ((Get-GrantCount $agent) -ne 1) { throw "the grant did not land" }
+          $inherited = @((Get-Acl -LiteralPath (Join-Path $logs "agent.log")).GetAccessRules($false, $true, [System.Security.Principal.SecurityIdentifier]) |
+            Where-Object { $_.IdentityReference.Value -eq $sid }).Count
+          if ($inherited -lt 1) { throw "an existing file did not inherit the grant" }
+          if (Grant-AgentDirectory -Path $agent -Sid $sid -Root $root) { throw "a second grant was applied again" }
+          Write-Host "Granted once, inherited by an existing file, then left alone."
+
+          Remove-Item -LiteralPath $logs -Recurse -Force
+          cmd /c mklink /J "$logs" "$target" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "mklink /J failed" }
+          $refusal = Get-Refusal $logs $root
+          if ($refusal -notmatch ("^" + [regex]::Escape($logs) + " is a junction or a symbolic link")) { throw "a junction was not refused: $refusal" }
+          Write-Host "Refused: $refusal"
+          if ((Get-GrantCount $target) -ne 0) { throw "the junction's target was granted" }
+
+          $real = Join-Path $root "real"
+          New-Item -ItemType Directory -Path (Join-Path $real "logs") | Out-Null
+          $link = Join-Path $root "link"
+          cmd /c mklink /J "$link" "$real" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "mklink /J failed" }
+          $refusal = Get-Refusal (Join-Path $link "logs") $root
+          if ($refusal -notmatch ("^" + [regex]::Escape($link) + " is a junction or a symbolic link")) { throw "a directory under a junction was not refused: $refusal" }
+          if ((Get-GrantCount (Join-Path $real "logs")) -ne 0) { throw "the directory under the junction was granted" }
+          Write-Host "Refused a junction and a directory under one, their targets untouched."
+          cmd /c rmdir "$logs" "$link" | Out-Null
+
+          # A hard link to a file where a directory is expected: no link
+          # attribute, so only the directory check refuses it, and the file
+          # it shares its ACL with keeps that ACL.
+          $plain = Join-Path $root "plain.txt"
+          Set-Content -LiteralPath $plain -Value "x"
+          $hardLink = Join-Path $agent "hard-linked"
+          cmd /c mklink /H "$hardLink" "$plain" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "mklink /H failed" }
+          $sddl = (Get-Acl -LiteralPath $plain).Sddl
+          $refusal = Get-Refusal $hardLink $root
+          if ($refusal -notmatch ("^" + [regex]::Escape($hardLink) + " is not a directory")) { throw "a hard link to a file was not refused: $refusal" }
+          if ((Get-Acl -LiteralPath $plain).Sddl -ne $sddl) { throw "the grant reached the file a hard link shares its ACL with" }
+          Remove-Item -LiteralPath $hardLink -Force
+          Write-Host "Refused a hard link to a file, the file's ACL untouched."
+
+          # The handles pin the directories only because they hold a data
+          # right (listing): Windows applies their share mode, which refuses
+          # any other handle that could rename or delete them, and applies it
+          # both ways, so a directory already open for deleting is not
+          # granted (a sharing violation, error 32) and keeps its ACL.
+          Add-Type -TypeDefinition @"
+            using System;
+            using System.Runtime.InteropServices;
+            using Microsoft.Win32.SafeHandles;
+            public static class FnCiHandle {
+                [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+                public static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+            }
+          "@
+          $held = Join-Path $root "held"
+          New-Item -ItemType Directory -Path $held | Out-Null
+          # DELETE, shared for everything, as a rename holds it; directories
+          # open only with FILE_FLAG_BACKUP_SEMANTICS.
+          $deleting = [FnCiHandle]::CreateFileW($held, 0x10000, 7, [IntPtr]::Zero, 3, 0x02000000, [IntPtr]::Zero)
+          if ($deleting.IsInvalid) { throw "could not open $held for deleting" }
+          $raised = $null
+          try { Grant-AgentDirectory -Path $held -Sid $sid -Root $root | Out-Null } catch { $raised = $_.Exception.Message } finally { $deleting.Dispose() }
+          if ($raised -notmatch "\(error 32\)") { throw "a directory open for deleting was granted, or failed otherwise: $raised" }
+          if ((Get-GrantCount $held) -ne 0) { throw "the directory open for deleting was granted" }
+          Write-Host "A directory open for deleting is not granted: $raised"
+
+          # A junction that already reaches the grant (a directory an
+          # operator moved behind a junction, which icacls /T granted) is
+          # left as it is: nothing would be written through it.
+          $grantedReal = Join-Path $root "granted-real"
+          $grantedLink = Join-Path $root "granted-link"
+          New-Item -ItemType Directory -Path $grantedReal | Out-Null
+          if (-not (Grant-AgentDirectory -Path $grantedReal -Sid $sid -Root $root)) { throw "the grant on a plain directory reported an existing one" }
+          cmd /c mklink /J "$grantedLink" "$grantedReal" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "mklink /J failed" }
+          $again = $null
+          try { $again = Grant-AgentDirectory -Path $grantedLink -Sid $sid -Root $root } catch { throw "a junction reaching the grant was refused: $_" }
+          if ($again) { throw "a junction reaching the grant was granted again" }
+          cmd /c rmdir "$grantedLink" | Out-Null
+          Write-Host "A junction that already reaches the grant is left as it is."
+
+          # A junction whose target is gone: reading its grant fails, which
+          # is no grant, and the handle check refuses the junction itself
+          # (not an unnamed error).
+          $goneTarget = Join-Path $root "gone-target"
+          $dangling = Join-Path $root "dangling"
+          New-Item -ItemType Directory -Path $goneTarget | Out-Null
+          cmd /c mklink /J "$dangling" "$goneTarget" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "mklink /J failed" }
+          Remove-Item -LiteralPath $goneTarget -Force
+          $refusal = Get-Refusal $dangling $root
+          if ($refusal -notmatch ("^" + [regex]::Escape($dangling) + " is a junction or a symbolic link")) { throw "a dangling junction was not refused: $refusal" }
+          cmd /c rmdir "$dangling" | Out-Null
+          Write-Host "A dangling junction is refused."
+
+          # The check stops at Root without looking at Root itself: a plain
+          # directory under a Root that is a junction is granted (on the
+          # junction's target, which the path reaches), and so is it with Root
+          # written with a trailing backslash. A check starting at Root, or
+          # comparing it untrimmed, reaches the junction and refuses.
+          $rootReal = Join-Path $root "root-real"
+          $rootLink = Join-Path $root "root-link"
+          New-Item -ItemType Directory -Path (Join-Path $rootReal "child") | Out-Null
+          cmd /c mklink /J "$rootLink" "$rootReal" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "mklink /J failed" }
+          $child = Join-Path $rootLink "child"
+          $granted = $null
+          try { $granted = Grant-AgentDirectory -Path $child -Sid $sid -Root $rootLink } catch { throw "the check went past a Root that is a junction: $_" }
+          if (-not $granted) { throw "the grant under a junction Root reported an existing one" }
+          if ((Get-GrantCount (Join-Path $rootReal "child")) -ne 1) { throw "the grant under a junction Root did not land" }
+          $again = $null
+          try { $again = Grant-AgentDirectory -Path $child -Sid $sid -Root ($rootLink + "\") } catch { throw "the check went past a Root written with a trailing backslash: $_" }
+          if ($again) { throw "the grant under a Root written with a trailing backslash was applied again" }
+          cmd /c rmdir "$rootLink" | Out-Null
+          Write-Host "The check stops at Root, a junction itself, with or without a trailing backslash."
+
+          # A junction inside the granted directory, as the account could
+          # plant one: the grant lands on the directory, and the junction's
+          # target (a directory and a file in it) keeps its ACL as it was.
+          $fresh = Join-Path $root "fresh"
+          $victim = Join-Path $root "victim"
+          $victimFile = Join-Path $victim "file.txt"
+          $planted = Join-Path $fresh "planted"
+          New-Item -ItemType Directory -Path $fresh, $victim | Out-Null
+          Set-Content -LiteralPath $victimFile -Value "x"
+          cmd /c mklink /J "$planted" "$victim" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "mklink /J failed" }
+          $before = @{}
+          foreach ($p in @($victim, $victimFile)) { $before[$p] = (Get-Acl -LiteralPath $p).Sddl }
+          if (-not (Grant-AgentDirectory -Path $fresh -Sid $sid -Root $root)) { throw "the grant over a planted junction reported an existing one" }
+          if ((Get-GrantCount $fresh) -ne 1) { throw "the grant did not land on a directory holding a junction" }
+          foreach ($p in @($victim, $victimFile)) {
+            if ((Get-Acl -LiteralPath $p).Sddl -ne $before[$p]) { throw "the grant reached $p through a junction inside the granted directory" }
+          }
+          cmd /c rmdir "$planted" | Out-Null
+          Write-Host "A junction inside a granted directory: its target untouched."
+
+          # An ACE that is not the whole grant is no grant: the full one lands
+          # over it, on the directory and on a file and a subdirectory created
+          # in it afterwards (an object-only ACE already reaches the file and
+          # the directory itself, so only the subdirectory tells it apart).
+          function Test-FullControl($Path, [bool]$Inherited) {
+            return @((Get-Acl -LiteralPath $Path).GetAccessRules((-not $Inherited), $Inherited, [System.Security.Principal.SecurityIdentifier]) |
+              Where-Object { $_.IdentityReference.Value -eq $sid -and "$($_.AccessControlType)" -eq "Allow" -and
+                (([int]$_.FileSystemRights -band 0x1F01FF) -eq 0x1F01FF) -and (([int]$_.PropagationFlags -band 2) -eq 0) }).Count -gt 0
+          }
+          foreach ($partial in @("(OI)(CI)R", "(CI)F", "(OI)F", "(OI)(CI)(IO)F")) {
+            $dir = Join-Path $root ("partial-" + [guid]::NewGuid())
+            New-Item -ItemType Directory -Path $dir | Out-Null
+            $out = & icacls.exe $dir /grant "*$($sid):$partial" 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "icacls $partial failed: $out" }
+            if (-not (Grant-AgentDirectory -Path $dir -Sid $sid -Root $root)) { throw "an existing $partial ACE was taken for the grant" }
+            $probe = Join-Path $dir "probe.txt"
+            $probeDir = Join-Path $dir "probe-dir"
+            Set-Content -LiteralPath $probe -Value "x"
+            New-Item -ItemType Directory -Path $probeDir | Out-Null
+            if (-not (Test-FullControl $dir $false) -or -not (Test-FullControl $probe $true) -or -not (Test-FullControl $probeDir $true)) {
+              throw "the grant over an existing $partial ACE did not land on the directory, a new file and a new subdirectory"
+            }
+          }
+          Write-Host "Read-only, container-only, object-only and inherit-only ACEs are no grant: the full one lands over each."
+
+          # A failure of the grant (a SID it cannot parse) is raised with the
+          # function's own message, never reported as a grant, and changes
+          # nothing.
+          $sddl = (Get-Acl -LiteralPath $fresh).Sddl
+          $raised = $null
+          try { Grant-AgentDirectory -Path $fresh -Sid "S-1-5-21-0-bogus" -Root $root | Out-Null } catch { $raised = $_.Exception.Message }
+          if ($null -eq $raised) { throw "a failed grant was reported as a grant" }
+          Write-Host "Failed grant raised: $raised"
+          if ($raised -notmatch ("^Could not grant the service account access to " + [regex]::Escape($fresh) + ": \S")) {
+            throw "the failed grant was not raised with the function's message: $raised"
+          }
+          if ((Get-Acl -LiteralPath $fresh).Sddl -ne $sddl) { throw "the failed grant changed the ACL of $fresh" }
+
       # The bootstraps' work directory: under %SystemRoot%\Temp, owned by
       # Administrators, protected from inheritance, writable by SYSTEM and
       # Administrators only, so no other local user can create or rewrite the
@@ -898,7 +1127,8 @@ jobs:
       # CreateServiceAccount.ps1 -PlanOnly for real on this runner, which is
       # in no domain: the plan line carries the existing account's SID and
       # whether LogonUser answered for the password (the verdicts above rest
-      # on both), and an expired account is refused by name.
+      # on both), an expired account is refused by name, and so is an agent
+      # directory the account step would refuse to grant.
       - name: Verify the -PlanOnly plan line (sid, checked)
         shell: powershell
         run: |
@@ -971,6 +1201,29 @@ jobs:
             Add-Right "SeDenyNetworkLogonRight" $sid
             Check "network logon denied, right password" (Get-Plan ".\fn-plan-c" $password) "UseProvided" $sid $true $null
             Check "network logon denied, wrong password" (Get-Plan ".\fn-plan-c" "Wrong-$password") "Refuse" $sid $true "wrong password"
+
+            # An agent directory the account step would refuse to grant (here
+            # a logs directory that is a junction) is refused by the plan too,
+            # so the bootstraps stop before msiexec; a plain one is not.
+            $programDataRoot = Join-Path $env:RUNNER_TEMP ("fn-plan-pd-" + [guid]::NewGuid())
+            $elsewhere = Join-Path $programDataRoot "elsewhere"
+            $planLogs = Join-Path $programDataRoot "fivenines_agent\logs"
+            New-Item -ItemType Directory -Path (Join-Path $programDataRoot "fivenines_agent"), $elsewhere | Out-Null
+            $savedProgramData = $env:ProgramData
+            try {
+              $env:ProgramData = $programDataRoot
+              Check "plain agent directory" (Get-Plan ".\fn-plan-absent") "Create" $null $false $null
+              cmd /c mklink /J "$planLogs" "$elsewhere" | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "mklink /J failed" }
+              Check "logs directory a junction" (Get-Plan ".\fn-plan-absent") "Refuse" $null $false "is a junction or a symbolic link"
+              # Its target gone: the plan still refuses it, as the account
+              # step would, rather than letting msiexec remove the agent.
+              Remove-Item -LiteralPath $elsewhere -Force
+              Check "logs directory a dangling junction" (Get-Plan ".\fn-plan-absent") "Refuse" $null $false "is a junction or a symbolic link"
+              cmd /c rmdir "$planLogs" | Out-Null
+            } finally {
+              $env:ProgramData = $savedProgramData
+            }
           } finally {
             foreach ($name in @("fn-plan-a", "fn-plan-b", "fn-plan-c")) { Remove-LocalUser -Name $name -ErrorAction SilentlyContinue }
             Remove-Item $policy, $policyDb -ErrorAction SilentlyContinue
@@ -1304,6 +1557,28 @@ jobs:
               Write-Error "TOKEN ACL does not grant $want (SIDs: $($sids -join ', '))"
               exit 1
             }
+          }
+
+      # The account step's grant on the agent's two directories, as the MSI
+      # leaves it: an explicit allow ACE giving the account FullControl,
+      # inherited by files and subdirectories (the config dir's state files,
+      # WinSW's logs). The service reaching Running shows only the log dir's.
+      # Value: protects=after a real install the config and log dirs both grant the account inheritable FullControl; fails_when=the account step skips or misgrants one of them; why_new=the static test reads the call site, and the service running proves only logs; seam=none; no_claim=upgrades
+      - name: Verify the agent directories grant the account FullControl
+        shell: pwsh
+        run: |
+          $sid = (Get-LocalUser -Name "fivenines-agent").SID.Value
+          foreach ($dir in @("fivenines_agent", "fivenines_agent\logs")) {
+            $path = Join-Path $env:ProgramData $dir
+            $grants = @((Get-Acl -LiteralPath $path).GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) | Where-Object {
+              $_.IdentityReference.Value -eq $sid -and "$($_.AccessControlType)" -eq "Allow" -and
+              (([int]$_.FileSystemRights -band 0x1F01FF) -eq 0x1F01FF) -and
+              (([int]$_.InheritanceFlags -band 3) -eq 3) -and (([int]$_.PropagationFlags -band 2) -eq 0) })
+            if ($grants.Count -lt 1) {
+              Write-Error "$path does not grant fivenines-agent ($sid) inheritable FullControl"
+              exit 1
+            }
+            Write-Host "OK: $path grants $sid FullControl, inherited below it."
           }
 
       # fivenines_update.ps1 -ServiceAccountPassword on the version already

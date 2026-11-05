@@ -466,6 +466,23 @@ function Invoke-AccountPreflight {
     # $WorkDir is already unique: a short name keeps the extracted payload's
     # deepest path under MAX_PATH, which msiexec /a cannot exceed.
     $image = Join-Path $WorkDir "plan"
+    # The MSI's account step, run in this process with TEMP and TMP pointed at
+    # $WorkDir: it compiles C# with Add-Type, which writes the source and the
+    # assembly it then loads in %TEMP%, and an administrator's own %TEMP% is
+    # writable by their unelevated processes.
+    $runAccountStep = {
+        param([switch]$PlanOnly)
+        $savedTemp = $env:TEMP
+        $savedTmp = $env:TMP
+        $env:TEMP = $WorkDir
+        $env:TMP = $WorkDir
+        try {
+            & $planScript.FullName @arguments -PlanOnly:$PlanOnly
+        } finally {
+            $env:TEMP = $savedTemp
+            $env:TMP = $savedTmp
+        }
+    }
     try {
         $plan = $null
         $planScript = $null
@@ -488,7 +505,7 @@ function Invoke-AccountPreflight {
             }
             $arguments = @{ ServiceAccount = "$env:COMPUTERNAME\$account" }
             if ($plain) { $arguments.Password = $plain }
-            $line = @(& $planScript.FullName @arguments -PlanOnly) | Where-Object { "$_" -like "FIVENINES_PLAN *" } | Select-Object -Last 1
+            $line = @(& $runAccountStep -PlanOnly) | Where-Object { "$_" -like "FIVENINES_PLAN *" } | Select-Object -Last 1
             if (-not $line) { throw "CreateServiceAccount.ps1 -PlanOnly printed no plan" }
             $plan = "$line".Substring("FIVENINES_PLAN ".Length) | ConvertFrom-Json
         } catch {
@@ -519,7 +536,7 @@ function Invoke-AccountPreflight {
         if ($verdict.Message) { Write-Warning $verdict.Message }
         if ($verdict.Action -ne "InPlace") { return $false }
         Write-Host "This version is already installed: applying the service account password to it..."
-        & $planScript.FullName @arguments | Out-Host
+        & $runAccountStep | Out-Host
         Restart-Service -Name "fivenines-agent" -ErrorAction Stop
         return $true
     } finally {
