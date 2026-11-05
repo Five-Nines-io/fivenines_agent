@@ -33,6 +33,7 @@ from fivenines_agent.qemu import qemu_metrics
 from fivenines_agent.rabbitmq import rabbitmq_metrics
 from fivenines_agent.raid_storage import raid_storage_health
 from fivenines_agent.redis import redis_metrics
+from fivenines_agent.scrub import log_safe
 from fivenines_agent.sglang import sglang_metrics
 from fivenines_agent.smart_storage import (
     smart_storage_health,
@@ -351,7 +352,12 @@ def _collect_with_telemetry(name, fn, telemetry, /, *args, **kwargs):
             errors.append(str(e))
             duration_ms = round((time.monotonic() - start) * 1000, 2)
             telemetry[name] = {"duration_ms": duration_ms, "errors": errors}
-        log(f"Error collecting {name}: {e}", "error")
+        # log_safe, not the raw message: an OS error text (a localized
+        # pywintypes.error or OSError strerror) can hold a character a Windows
+        # service's strict ANSI-code-page stdout cannot encode, and a print()
+        # raising here would escape this handler and end the collection loop.
+        # The telemetry entry above keeps the message as raised.
+        log(f"Error collecting {name}: {log_safe(e)}", "error")
         return None
 
     if capture:

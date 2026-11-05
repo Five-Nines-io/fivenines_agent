@@ -45,8 +45,8 @@ def _reset_module_state():
 class FakeScmError(Exception):
     """pywintypes.error: (winerror, funcname, strerror), .winerror set."""
 
-    def __init__(self, winerror, funcname="Fake"):
-        super().__init__(winerror, funcname, f"error {winerror}")
+    def __init__(self, winerror, funcname="Fake", strerror=None):
+        super().__init__(winerror, funcname, strerror or f"error {winerror}")
         self.winerror = winerror
 
 
@@ -106,14 +106,18 @@ class FakeWin32Service:
             row["config"] for row in self.scm["services"] if row["ServiceName"] == name
         )
         if config.get("open_error"):
-            raise FakeScmError(config["open_error"], "OpenService")
+            raise FakeScmError(
+                config["open_error"], "OpenService", config.get("message")
+            )
         return self._handle(name)
 
     def QueryServiceConfig(self, handle):
         assert handle.number in self.open_handles
         config = self._config(handle)
         if config.get("start_type_error"):
-            raise FakeScmError(config["start_type_error"], "QueryServiceConfig")
+            raise FakeScmError(
+                config["start_type_error"], "QueryServiceConfig", config.get("message")
+            )
         return (16, config["start_type"], 1, "C:\\x.exe", "", 0, [], "LocalSystem", "x")
 
     def QueryServiceConfig2(self, handle, level):
@@ -314,13 +318,26 @@ def test_debug_log_of_a_name_stdout_cannot_encode_keeps_the_read(monkeypatch):
             "\u5e94\u7528",
             config={"start_type_error": 5, "delayed": False, "triggers": 0},
         ),
+        # An OS message in a display language other than the system locale's.
+        _row("a", config={"open_error": 5, "message": "\u62d2\u5426"}),
+        _row(
+            "b",
+            config={
+                "start_type_error": 5,
+                "message": "\u62d2\u5426",
+                "delayed": False,
+                "triggers": 0,
+            },
+        ),
         _row("ok"),
     ]
     with patch.object(sys, "stdout", stdout):
         result, _ = _collect({"services": rows})
     assert not isinstance(result, Exception), result
     by_name = {s["name"]: s for s in result["services"]}
-    assert set(by_name) == {"ok", "\u670d\u52a1", "\u5e94\u7528"}
+    assert set(by_name) == {"a", "b", "ok", "\u670d\u52a1", "\u5e94\u7528"}
+    assert by_name["a"]["start_type"] is None
+    assert by_name["b"]["start_type"] is None
     assert by_name["\u670d\u52a1"]["start_type"] is None
     assert by_name["\u5e94\u7528"]["start_type"] is None
     assert by_name["ok"]["start_type"] == "automatic"
@@ -328,6 +345,7 @@ def test_debug_log_of_a_name_stdout_cannot_encode_keeps_the_read(monkeypatch):
     logged = stdout.buffer.getvalue().decode("cp1252")
     assert "cannot open \\u670d\\u52a1" in logged
     assert "cannot read the start type of \\u5e94\\u7528" in logged
+    assert "cannot open a: (5, 'OpenService', '\\u62d2\\u5426')" in logged
 
 
 def test_sort_is_case_insensitive_and_stable_on_case():
@@ -469,6 +487,13 @@ def test_probe_open_is_bounded_and_shares_the_single_flight():
             )
             assert windows_services() is None
             assert len(opens) == 1
+
+            # The contract's ABSENT: a probe during the stall gates the key out.
+            data = {}
+            collect_metrics(
+                {"windows_services": True}, data, {}, {"windows_services": available}
+            )
+            assert "windows_services" not in data
         finally:
             release.set()
             ws._stalled_worker.join(5)

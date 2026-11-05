@@ -225,6 +225,33 @@ def test_collect_metrics_with_telemetry_captures_error():
     assert "fail" in telemetry["broken"]["errors"]
 
 
+# Value: protects=a collector failure whose message a Windows service's strict
+# ANSI-code-page stdout cannot encode still reads null instead of ending the
+# collection loop; fails_when=the dispatcher's 'Error collecting' line prints the
+# raw message again; why_new=every error-path test raised ASCII text; seam=none;
+# no_claim=WinSW's own stdout (an io.TextIOWrapper stands in for it)
+def test_a_failure_message_stdout_cannot_encode_still_reads_null():
+    import io
+
+    message = "OpenSCManager: \u62d2\u5426\u8bbf\u95ee"
+    registry = [
+        ("broken", [("broken", MagicMock(side_effect=OSError(message)), False)])
+    ]
+    stdout = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", errors="strict")
+    data, telemetry = {}, {}
+
+    with patch("fivenines_agent.collectors.COLLECTORS", registry), patch.object(
+        sys, "stdout", stdout
+    ):
+        collect_metrics({"broken": True}, data, telemetry)
+
+    assert data == {"broken": None}
+    assert telemetry["broken"]["errors"] == [message]  # the telemetry keeps it raw
+    stdout.flush()
+    logged = stdout.buffer.getvalue().decode("cp1252")
+    assert "Error collecting broken: OpenSCManager: \\u62d2" in logged
+
+
 def test_collect_metrics_with_telemetry_kwargs():
     """Kwargs collector works correctly with telemetry."""
     mock_fn = MagicMock(return_value={"ok": True})
