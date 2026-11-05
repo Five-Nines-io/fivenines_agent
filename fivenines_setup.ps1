@@ -37,8 +37,9 @@ param(
 
     [string]$MsiUrl = "https://releases.fivenines.io/latest/fivenines-agent-windows-amd64.msi",
 
-    # Both default to a new private directory under %TEMP%
-    # (New-PrivateWorkDirectory below).
+    # Both default to a new private directory under %SystemRoot%\Temp
+    # (New-PrivateWorkDirectory below). A path given here is used as is: pick
+    # a directory only administrators can write to.
     [string]$MsiPath = "",
 
     [string]$LogFile = "",
@@ -50,18 +51,33 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# A new directory under %TEMP% that only SYSTEM and Administrators can open,
-# for the downloaded MSI, its extracted copy and the install log; kept after
-# the run, for the log. Run as SYSTEM (an RMM tool, Intune, a scheduled task),
-# %TEMP% is C:\Windows\Temp, where any local user can create a file, and a
-# file a user created stays theirs to rewrite. The directory is created with
-# its ACL in one call, so it never exists with the inherited one.
+# A new directory for the downloaded MSI, its extracted copy and the install
+# log, always under %SystemRoot%\Temp, whatever the session. No user may
+# rename or delete there what someone else created: an administrator's own
+# %TEMP% would let their unelevated processes replace the directory through
+# its parent, and run as SYSTEM (an RMM tool, Intune, a scheduled task)
+# %TEMP% is that directory anyway. Owned by Administrators, open to SYSTEM
+# and Administrators, read-only to the user running the script (who reads a
+# failed run's log unelevated, where the Administrators group does not
+# apply). The ACL is set in the call that creates the directory, so it never
+# exists with the inherited one (Windows PowerShell 5.1's .NET Framework has
+# a Directory.CreateDirectory overload taking it; PowerShell 7's .NET moved
+# it to FileSystemAclExtensions), and checked after: a file system without
+# ACLs drops it silently. It is recorded for Remove-EarlierWorkDirectories
+# before it exists, with the process running this script (its ID and start
+# time: no other run touches a directory whose run is still alive) and a
+# random marker, also written in a file inside it that only SYSTEM and
+# Administrators can read: the marker proves a directory is this one, so not
+# even the user's own unelevated processes may learn it.
 function New-PrivateWorkDirectory {
     param([string]$Prefix)
 
+    $admins = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
     $security = New-Object System.Security.AccessControl.DirectorySecurity
+    $security.SetOwner($admins)
     $security.SetAccessRuleProtection($true, $false)
-    foreach ($sid in @("S-1-5-18", "S-1-5-32-544")) {  # SYSTEM, Administrators
+    $expected = @("S-1-5-18", "S-1-5-32-544")
+    foreach ($sid in $expected) {  # SYSTEM, Administrators
         $security.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
             (New-Object System.Security.Principal.SecurityIdentifier($sid)),
             [System.Security.AccessControl.FileSystemRights]::FullControl,
@@ -69,13 +85,162 @@ function New-PrivateWorkDirectory {
             [System.Security.AccessControl.PropagationFlags]::None,
             [System.Security.AccessControl.AccessControlType]::Allow)))
     }
-    $path = Join-Path $env:TEMP ("{0}-{1}" -f $Prefix, [guid]::NewGuid())
+    $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    if ($user.Value -ne "S-1-5-18") {
+        $expected += $user.Value
+        $security.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $user,
+            [System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
+            [System.Security.AccessControl.InheritanceFlags]"ContainerInherit, ObjectInherit",
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow)))
+    }
+    $path = Join-Path (Join-Path $env:SystemRoot "Temp") ("{0}-{1}" -f $Prefix, [guid]::NewGuid())
     if (Test-Path -LiteralPath $path) { throw "$path already exists" }
-    [System.IO.Directory]::CreateDirectory($path, $security) | Out-Null
+    $marker = [guid]::NewGuid().ToString()
+    $run = "{0}|{1}|{2}" -f $marker, $PID, (Get-Process -Id $PID).StartTime.ToFileTimeUtc()
+    New-ItemProperty -LiteralPath (Get-WorkDirectoryKey) -Name (Split-Path -Leaf $path) -Value $run -PropertyType String -Force | Out-Null
+    if ($PSVersionTable.PSEdition -eq "Core") {
+        [System.IO.FileSystemAclExtensions]::CreateDirectory($security, $path) | Out-Null
+    } else {
+        [System.IO.Directory]::CreateDirectory($path, $security) | Out-Null
+    }
+    $acl = Get-Acl -LiteralPath $path
+    $granted = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) |
+        ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+    if (-not $acl.AreAccessRulesProtected -or
+        $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $admins.Value -or
+        ($granted -join ",") -ne ((@($expected) | Sort-Object -Unique) -join ",")) {
+        throw "$path did not keep its access control list (does its file system support ACLs?)"
+    }
+    # The marker file gets its own ACL while still empty, then the marker.
+    $markerFile = Join-Path $path ".fivenines-work-directory"
+    $markerSecurity = New-Object System.Security.AccessControl.FileSecurity
+    $markerSecurity.SetOwner($admins)
+    $markerSecurity.SetAccessRuleProtection($true, $false)
+    foreach ($sid in @("S-1-5-18", "S-1-5-32-544")) {
+        $markerSecurity.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            (New-Object System.Security.Principal.SecurityIdentifier($sid)),
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            [System.Security.AccessControl.AccessControlType]::Allow)))
+    }
+    New-Item -ItemType File -Path $markerFile | Out-Null
+    Set-Acl -LiteralPath $markerFile -AclObject $markerSecurity
+    Set-Content -LiteralPath $markerFile -Value $marker
     return $path
 }
 
+# The registry key recording the work directories New-PrivateWorkDirectory
+# created, each by name with "marker|process ID|process start time". Open
+# to SYSTEM and Administrators only, reading included: a marker is what
+# tells one of these directories from anything else at its path. Its ACL is
+# read and set by -Path: Windows PowerShell 5.1's Get-Acl and Set-Acl find no
+# registry key by -LiteralPath (the path holds no wildcard character).
+function Get-WorkDirectoryKey {
+    $key = "HKLM:\SOFTWARE\Five-Nines.io\fivenines-bootstrap"
+    if (-not (Test-Path -LiteralPath $key)) { New-Item -Path $key -Force | Out-Null }
+    $expected = @("S-1-5-18", "S-1-5-32-544")  # SYSTEM, Administrators
+    $acl = Get-Acl -Path $key
+    $granted = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) |
+        ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+    if (-not $acl.AreAccessRulesProtected -or ($granted -join ",") -ne ($expected -join ",")) {
+        $security = New-Object System.Security.AccessControl.RegistrySecurity
+        $security.SetAccessRuleProtection($true, $false)
+        foreach ($sid in $expected) {
+            $security.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule(
+                (New-Object System.Security.Principal.SecurityIdentifier($sid)),
+                [System.Security.AccessControl.RegistryRights]::FullControl,
+                [System.Security.AccessControl.InheritanceFlags]::ContainerInherit,
+                [System.Security.AccessControl.PropagationFlags]::None,
+                [System.Security.AccessControl.AccessControlType]::Allow)))
+        }
+        Set-Acl -Path $key -AclObject $security
+    }
+    return $key
+}
+
+# Removes one of these work directories, its marker last: a file in use
+# stops the removal, and a directory left without its marker would never be
+# removed again. Called only on a directory known to be one of these.
+function Remove-WorkDirectory {
+    param([string]$Path)
+
+    Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne ".fivenines-work-directory" } |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    $left = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne ".fivenines-work-directory" })
+    if ($left.Count -eq 0) { Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+# Removes the work directories earlier runs of these scripts left, so a
+# scheduled run does not leave one MSI copy per run: only those the key
+# records, never a directory found by its name. Any local user can create a
+# directory of any name under %SystemRoot%\Temp and turn it into a link to
+# another directory at any moment, so no check of a path proves what a
+# removal through it will reach. A recorded path is first refused unless it
+# is a plain directory owned by Administrators with a protected ACL (no
+# other user can own one so, nor turn it into a link), so the script reads
+# no file of another user's; then removed only when the file inside it holds
+# its recorded marker: only that directory holds it, and while it stands at
+# its path no other user can rename, replace or write in it, so the removal
+# reaches it and nothing else. Anything else at a recorded path (the
+# directory gone, a temp cleaner removed it) loses its record and is left
+# alone. Kept with its record, whatever its age: what a run still alive
+# recorded (its record names a process still running, same ID and start
+# time), since once removed its directory could be recreated by another user
+# before that run reads its MSI or plan script back. Also kept: $Keep (this
+# run's), a directory younger than $MinAgeMinutes, and the installed
+# product's recorded install source, from which Windows Installer reads the
+# MSI to repair it (its cached copy keeps no embedded cabinet).
+function Remove-EarlierWorkDirectories {
+    param([string]$Keep, [int]$MinAgeMinutes = 60)
+
+    $key = Get-WorkDirectoryKey
+    $keepPaths = @($Keep.TrimEnd('\'))
+    $product = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -match "Fivenines Monitoring Agent" } |
+        Select-Object -First 1
+    if ($product -and $product.InstallSource) { $keepPaths += ([string]$product.InstallSource).TrimEnd('\') }
+    $cutoff = (Get-Date).ToUniversalTime().AddMinutes(-$MinAgeMinutes)
+    $parent = Join-Path $env:SystemRoot "Temp"
+    $record = Get-Item -LiteralPath $key
+    $names = @($record.GetValueNames() |
+        Where-Object { $_ -match '^fivenines-(setup|update|uninstall)-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$' })
+    foreach ($name in $names) {
+        $path = Join-Path $parent $name
+        if ($keepPaths -contains $path) { continue }
+        try {
+            $marker, $ownerId, $ownerStart = ([string]$record.GetValue($name)).Split('|')
+            if ($ownerId -and [int]$ownerId -ne $PID) {
+                $owner = Get-Process -Id ([int]$ownerId) -ErrorAction SilentlyContinue
+                if ($owner -and [string]$owner.StartTime.ToFileTimeUtc() -eq $ownerStart) { continue }  # its run is still alive
+            }
+            $found = $null
+            $dir = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            if ($dir -and $dir.PSIsContainer -and ([int]$dir.Attributes -band 0x400) -eq 0) {
+                $acl = Get-Acl -LiteralPath $path
+                if ($acl.AreAccessRulesProtected -and
+                    $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -eq "S-1-5-32-544") {
+                    $found = Get-Content -LiteralPath (Join-Path $path ".fivenines-work-directory") -TotalCount 1 -ErrorAction SilentlyContinue
+                }
+            }
+            if ($marker -and $found -eq $marker) {
+                if ($dir.CreationTimeUtc -gt $cutoff) { continue }
+                Remove-WorkDirectory $path
+                if (Test-Path -LiteralPath $path) { continue }  # a file in use: the next run retries
+            }
+            Remove-ItemProperty -LiteralPath $key -Name $name -ErrorAction SilentlyContinue
+        } catch {
+            continue
+        }
+    }
+}
+
 $WorkDir = New-PrivateWorkDirectory "fivenines-setup"
+# Every run removes the work directories earlier runs left once they are an
+# hour old, so a run that keeps failing does not leave one MSI copy per run.
+Remove-EarlierWorkDirectories -Keep $WorkDir
 if (-not $MsiPath) { $MsiPath = Join-Path $WorkDir "fivenines-agent-windows-amd64.msi" }
 if (-not $LogFile) { $LogFile = Join-Path $WorkDir "fivenines-setup.log" }
 
@@ -296,7 +461,9 @@ function Invoke-AccountPreflight {
             $installed = if ($agent.PSChildName -eq $productCode) { "same" } else { "other" }
         }
     }
-    $image = Join-Path $WorkDir ("plan-" + [guid]::NewGuid())
+    # $WorkDir is already unique: a short name keeps the extracted payload's
+    # deepest path under MAX_PATH, which msiexec /a cannot exceed.
+    $image = Join-Path $WorkDir "plan"
     try {
         $plan = $null
         $planScript = $null
@@ -421,5 +588,11 @@ if ($svc.Status -ne "Running") {
     Write-Warning "Service did not reach Running state. Check the WinSW log at C:\ProgramData\fivenines_agent\logs\."
     exit 1
 }
+
+# The run succeeded: the work directories earlier runs left go again, the
+# previous install source included now that msiexec recorded this one. This
+# run's stays: when msiexec ran, the MSI in it is the installed product's
+# recorded install source, which a repair reads.
+Remove-EarlierWorkDirectories -Keep $WorkDir
 
 Write-Host "Done. The agent will appear on the fivenines.io dashboard shortly."
