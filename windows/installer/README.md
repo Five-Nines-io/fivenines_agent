@@ -73,20 +73,30 @@ This directory builds the Windows MSI installer for the fivenines agent.
   leaves it unchecked (`checked: false` in the plan): the scripts warn and
   use it as given, since the account step applies any password and a wrong
   one leaves a service that does not start, which a rerun with the right
-  password repairs in place.
+  password repairs in place. The scripts run the step in their own process,
+  for the plan and in place alike, with `TEMP` and `TMP` pointed at their
+  private work directory: it compiles C# with Add-Type, which writes the
+  source and the assembly it then loads in `%TEMP%`, and an administrator's
+  own `%TEMP%` is writable by their unelevated processes.
 - **The agent directories through handles.** The account step gives the
   account FullControl on `%ProgramData%\fivenines_agent` and its `logs`
   (`Grant-AgentDirectory`, through the `FiveninesAgentDirectory` type it
   compiles with Add-Type), as SYSTEM, in directories the account can write
   to. A grant already there is kept (read by path: a directory moved behind
-  a junction that already has it is left as it is). Otherwise every
-  directory from the one below `%ProgramData%` down to the target is opened
-  without following a link at it and shared for reading only, so none can be
-  renamed, deleted or replaced meanwhile; a junction, a symbolic link or
-  anything that is not a directory (a hard link to a file) is refused, and
-  `-PlanOnly` refuses it too, before msiexec; the ACE is written through the
-  last handle. No `/T` and no walk of its own: Windows propagates the
-  inheritable ACE to the existing children that inherit it.
+  a junction that already has it is left as it is; a read that fails counts
+  as no grant). Otherwise every directory from the one below `%ProgramData%`
+  down to the target is opened without following a link at it, with the
+  right to list it, and shared for reading only, so none can be renamed,
+  deleted or replaced meanwhile (Windows applies a share mode only to a
+  handle holding a data right such as listing); a junction, a symbolic link
+  or anything that is not a directory (a hard link to a file) is refused, and
+  so is a target whose last handle's final path is not its own under
+  `%ProgramData%` as that resolves (a share mode does not keep a directory
+  from being turned into a junction). `-PlanOnly` refuses the same, before
+  msiexec (a check it cannot run, Add-Type blocked, is left to the account
+  step); the ACE is written through the last handle. No `/T` and no walk of
+  its own: Windows propagates the inheritable ACE to the existing children
+  that inherit it.
 - **The WMI namespace ACL in binary.** `DelegateWmiStorageNamespace.ps1` reads
   and writes `root\Microsoft\Windows\Storage`'s descriptor with
   `__SystemSecurity` `GetSD`/`SetSD` and `RawSecurityDescriptor`, never
