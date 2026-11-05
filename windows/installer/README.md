@@ -122,8 +122,11 @@ This directory builds the Windows MSI installer for the fivenines agent.
   `smoke-msi-domain-controller` job (about an hour) installs Windows Server 2019
   in English and German in QEMU/KVM, promotes it, reproduces v1.22.0's failure
   and plays every account scenario (`ci/windows-dc/`). It runs on a push that
-  changes `windows/installer/`, a `fivenines_*.ps1` bootstrap script,
-  `ci/windows-dc/` or `windows.yml`, and on request (`gh workflow run
+  changes `windows/installer/` or `windows/winsw/`, a `fivenines_*.ps1`
+  bootstrap script, `ci/windows-dc/` or `windows.yml` (Markdown aside),
+  compared cumulatively so a run a newer push cancelled is made up by the
+  next (main against its latest v* tag, a branch against where it left main),
+  and on request (`gh workflow run
   windows.yml --ref <branch> -f domain_controller=true`), never on a tag: a
   release waits for the member-server E2E only, since the DC job depends on
   Microsoft's evaluation ISOs.

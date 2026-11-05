@@ -1101,11 +1101,14 @@ jobs:
   # Production release for version tags
   # The Windows CI (tests, the frozen binary, the MSI and its member-server
   # E2E: install, service, report, update, password rotation, uninstall) on
-  # the tagged commit, so a release whose MSI fails it is never published.
-  # windows.yml no longer triggers on tags itself. Its domain-controller E2E
-  # does not run here: it downloads Microsoft's evaluation ISOs, which can
-  # change or disappear without any change in this repository; the main push
-  # that the tag names ran it when the installer changed.
+  # the tagged commit, so a release is never published from a commit whose
+  # MSI fails it. It tests windows.yml's own build of that commit, by the
+  # same recipe as build-windows-amd64, unsigned: not the signed file the
+  # release publishes. windows.yml no longer triggers on tags itself. Its
+  # domain-controller E2E does not run here: it downloads Microsoft's
+  # evaluation ISOs, which can change or disappear without any change in
+  # this repository; every main push since the last release ran it when the
+  # installer changed (installer-changed compares main with its latest tag).
   windows-e2e:
     if: startsWith(github.ref, 'refs/tags/v')
     uses: ./.github/workflows/windows.yml
