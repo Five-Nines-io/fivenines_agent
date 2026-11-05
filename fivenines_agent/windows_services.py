@@ -38,7 +38,6 @@ from fivenines_agent.debug import debug, log
 from fivenines_agent.env import is_windows
 from fivenines_agent.scrub import scrub_str
 
-
 # winsvc.h
 SC_MANAGER_CONNECT = 0x0001
 SC_MANAGER_ENUMERATE_SERVICE = 0x0004

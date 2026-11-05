@@ -18,7 +18,6 @@ import fivenines_agent.windows_services as ws
 from fivenines_agent.collectors import collect_metrics
 from fivenines_agent.windows_services import probe_access, windows_services
 
-
 _FIXTURE_PATH = os.path.join(
     os.path.dirname(__file__), "fixtures", "windows_services_contract_payload.json"
 )
