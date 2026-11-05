@@ -438,7 +438,9 @@ jobs:
       # only while each is a plain directory owned by Administrators that
       # holds its recorded marker. An earlier run's directory goes, with its
       # record, once older than the age floor; one a file in use keeps stays
-      # with its marker and record, and goes once the file is closed. Kept:
+      # with its marker and record, and goes once the file is closed; one a
+      # run still alive recorded stays, record included, until that run
+      # ends, and so does its record of a directory not created yet. Kept:
       # this run's; one that passes every check but was never recorded; and
       # what stands at a recorded path once its directory is gone (a plain
       # directory holding a forged marker, one owned by another account, a
@@ -481,6 +483,16 @@ jobs:
           $busyFile = Join-Path $busy "fivenines-update.log"
           Set-Content -LiteralPath $busyFile -Value "x"
           $held = $null
+          # A run still alive (another process): its directory and its record
+          # stay whatever their age, and so does the record of a directory it
+          # has not created yet.
+          $sleeper = Start-Process powershell -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Seconds 900' -PassThru -WindowStyle Hidden
+          $sleeperRun = "{0}|{1}" -f $sleeper.Id, (Get-Process -Id $sleeper.Id).StartTime.ToFileTimeUtc()
+          $live = New-PrivateWorkDirectory "fivenines-update"
+          $liveMarker = ([string](Get-Item -LiteralPath $key).GetValue((Split-Path -Leaf $live))).Split('|')[0]
+          Set-ItemProperty -LiteralPath $key -Name (Split-Path -Leaf $live) -Value "$liveMarker|$sleeperRun"
+          $pending = "fivenines-setup-" + [guid]::NewGuid()
+          New-ItemProperty -LiteralPath $key -Name $pending -Value "$([guid]::NewGuid())|$sleeperRun" -PropertyType String | Out-Null
           try {
             Remove-EarlierWorkDirectories -Keep $current
             if (-not (Test-Path -LiteralPath $earlier) -or -not (Test-Recorded $earlier)) { throw "a directory younger than the age floor was removed" }
@@ -498,17 +510,24 @@ jobs:
             if (-not (Test-Path -LiteralPath $owned)) { throw "a directory owned by another account was removed" }
             if (Test-Recorded $owned) { throw "the record of a directory owned by another account was kept" }
             if (-not (Test-Path -LiteralPath (Join-Path $busy ".fivenines-work-directory")) -or -not (Test-Recorded $busy)) { throw "a directory a file in use kept lost its marker or its record" }
+            if (-not (Test-Path -LiteralPath $live) -or -not (Test-Recorded $live)) { throw "a live run's directory or its record was removed" }
+            if ($null -eq (Get-Item -LiteralPath $key).GetValue($pending)) { throw "a live run's record of a directory not created yet was dropped" }
             $held.Dispose(); $held = $null
+            Stop-Process -Id $sleeper.Id -Force; $sleeper.WaitForExit()
             Remove-EarlierWorkDirectories -Keep $current -MinAgeMinutes 0
             if ((Test-Path -LiteralPath $busy) -or (Test-Recorded $busy)) { throw "a directory a file in use kept was not removed once the file was closed" }
+            if ((Test-Path -LiteralPath $live) -or (Test-Recorded $live)) { throw "a finished run's directory or its record was kept" }
+            if ($null -ne (Get-Item -LiteralPath $key).GetValue($pending)) { throw "a finished run's record of nothing was kept" }
             $acl = Get-Acl -Path $key
             $granted = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
             if (-not $acl.AreAccessRulesProtected -or ($granted -join ",") -ne "S-1-5-18,S-1-5-32-544") { throw "$key is open to: $($granted -join ', ')" }
-            Write-Host "Removed an earlier run's directory, and one a file in use kept once the file was closed; dropped the records of four replaced or gone; kept this run's, a newer one, one never recorded, a forged one, one owned by another account and a junction with its target. The key is open to SYSTEM and Administrators only."
+            Write-Host "Removed an earlier run's directory, one a file in use kept once the file was closed, and a live run's once it ended; dropped the records of four replaced or gone; kept this run's, a newer one, one never recorded, a forged one, one owned by another account and a junction with its target. The key is open to SYSTEM and Administrators only."
           } finally {
             if ($held) { $held.Dispose() }
+            Stop-Process -Id $sleeper.Id -Force -ErrorAction SilentlyContinue
+            Remove-ItemProperty -LiteralPath $key -Name $pending -ErrorAction SilentlyContinue
             cmd /c rmdir "$linked" | Out-Null
-            foreach ($d in @($current, $earlier, $unrecorded, $forged, $target, $linked, $gone, $owned, $busy)) {
+            foreach ($d in @($current, $earlier, $unrecorded, $forged, $target, $linked, $gone, $owned, $busy, $live)) {
               Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
               Remove-ItemProperty -LiteralPath $key -Name (Split-Path -Leaf $d) -ErrorAction SilentlyContinue
             }
@@ -572,8 +591,9 @@ jobs:
           }
 
       # What a successful uninstall leaves: no work directory these scripts
-      # recorded, whatever its age, except one a file in use keeps (with its
-      # record, so the key stays); no fivenines-bootstrap key once it
+      # recorded, whatever its age, except one a file in use keeps and one a
+      # run still alive recorded (each with its record, so the key stays); no
+      # fivenines-bootstrap key once it
       # records nothing; and no Five-Nines.io key once it is empty -- never
       # a vendor key that still holds something.
       # Value: protects=a successful uninstall leaves no work directory, no fivenines-bootstrap key and no empty Five-Nines.io key, and never removes a vendor key that still holds something; fails_when=the record, key or vendor cleanup regresses, or a non-empty vendor key is removed; why_new=only a static check covers it; seam=none; no_claim=msiexec /x itself
@@ -603,6 +623,7 @@ jobs:
           function Test-Recorded([string]$Path) { return (Test-Path -LiteralPath $bootstrap) -and $null -ne (Get-Item -LiteralPath $bootstrap).GetValue((Split-Path -Leaf $Path)) }
           $createdSibling = $false
           $held = $null
+          $sleeper = $null
           $dirs = @()
           try {
             if (-not (Test-Path -LiteralPath $sibling)) { New-Item -Path $sibling -Force | Out-Null; $createdSibling = $true }
@@ -621,6 +642,13 @@ jobs:
             $busyFile = Join-Path $busy "fivenines-update.log"
             Set-Content -LiteralPath $busyFile -Value "x"
             $held = [System.IO.File]::Open($busyFile, 'Open', 'Read', 'Read')
+            # A setup still running (another process) while the uninstall ends:
+            # its directory stays, record included, whatever its age.
+            $sleeper = Start-Process powershell -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Seconds 900' -PassThru -WindowStyle Hidden
+            $live = New-PrivateWorkDirectory "fivenines-setup"
+            $dirs += $live
+            $liveMarker = ([string](Get-Item -LiteralPath $bootstrap).GetValue((Split-Path -Leaf $live))).Split('|')[0]
+            Set-ItemProperty -LiteralPath $bootstrap -Name (Split-Path -Leaf $live) -Value ("{0}|{1}|{2}" -f $liveMarker, $sleeper.Id, (Get-Process -Id $sleeper.Id).StartTime.ToFileTimeUtc())
             Remove-AllWorkDirectories
             if (Test-Path -LiteralPath $WorkDir) { throw "the uninstall's work directory was kept" }
             if (Test-Recorded $WorkDir) { throw "the uninstall's record was kept" }
@@ -628,7 +656,9 @@ jobs:
             if (-not (Test-Path -LiteralPath $busy) -or -not (Test-Recorded $busy)) { throw "a directory a file in use kept lost its record, or the bootstrap key went" }
             if (-not (Test-Path -LiteralPath $vendor)) { throw "$vendor was removed though it holds another subkey" }
             if (-not (Test-Path -LiteralPath $sibling)) { throw "$sibling was removed" }
+            if (-not (Test-Path -LiteralPath $live) -or -not (Test-Recorded $live)) { throw "the uninstall removed the directory or the record of a setup still running" }
             $held.Dispose(); $held = $null
+            Stop-Process -Id $sleeper.Id -Force; $sleeper.WaitForExit()
 
             # (b) No sibling, no file in use: everything goes, the empty
             # bootstrap and vendor keys too.
@@ -639,6 +669,7 @@ jobs:
             Remove-AllWorkDirectories
             if (Test-Path -LiteralPath $WorkDir) { throw "the uninstall's work directory was kept" }
             if ((Test-Path -LiteralPath $busy) -or (Test-Recorded $busy)) { throw "the directory a file in use kept was not removed once the file was closed" }
+            if ((Test-Path -LiteralPath $live) -or (Test-Recorded $live)) { throw "a finished setup's directory or its record was kept" }
             $left = @()
             if (Test-Path -LiteralPath $bootstrap) { $left = @((Get-Item -LiteralPath $bootstrap).GetValueNames()) }
             if ($left.Count -eq 0 -and (Test-Path -LiteralPath $bootstrap)) { throw "$bootstrap was kept though it records nothing" }
@@ -648,9 +679,10 @@ jobs:
               if (Test-Path -LiteralPath $vendor) { throw "$vendor was kept though empty" }
               $checked = "the empty $vendor went too"
             }
-            Write-Host "Removed the uninstall's work directory, a recent setup's and, once its file was closed, one a file in use kept, with their records and the empty bootstrap key; kept $vendor while it held another subkey; vendor key check: $checked."
+            Write-Host "Removed the uninstall's work directory, a recent setup's and, once its file was closed or its run ended, one a file in use kept and one a running setup recorded, with their records and the empty bootstrap key; kept $vendor while it held another subkey; vendor key check: $checked."
           } finally {
             if ($held) { $held.Dispose() }
+            if ($sleeper) { Stop-Process -Id $sleeper.Id -Force -ErrorAction SilentlyContinue }
             foreach ($d in $dirs) {
               Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
               if (Test-Path -LiteralPath $bootstrap) { Remove-ItemProperty -LiteralPath $bootstrap -Name (Split-Path -Leaf $d) -ErrorAction SilentlyContinue }

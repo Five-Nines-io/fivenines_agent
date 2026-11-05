@@ -309,7 +309,13 @@ def test_bootstrap_downloads_into_a_private_directory(path):
     # Recorded with a marker before the directory exists (a run stopped in
     # between leaves no directory unrecorded), and the marker written in a
     # file whose own ACL, set while it is still empty, shuts out the user.
-    record = helper.index("-Name (Split-Path -Leaf $path) -Value $marker")
+    # The record also names the process running this script (ID and start
+    # time), so no other run touches the directory while it is alive.
+    assert (
+        '$run = "{0}|{1}|{2}" -f $marker, $PID, (Get-Process -Id $PID).StartTime'
+        in helper
+    )
+    record = helper.index("-Name (Split-Path -Leaf $path) -Value $run")
     assert record < helper.index("CreateDirectory(")
     acl = helper.index("Set-Acl -LiteralPath $markerFile -AclObject $markerSecurity")
     assert acl < helper.index("Set-Content -LiteralPath $markerFile -Value $marker")
@@ -329,6 +335,12 @@ def test_bootstrap_downloads_into_a_private_directory(path):
     assert "Get-ChildItem" not in prune_helper
     assert "Remove-Item " not in prune_helper
     assert ".GetValueNames()" in prune_helper
+    # A record whose process is still running (same ID and start time,
+    # another process than this one) is skipped before anything is read or
+    # removed: that run still reads its directory back.
+    alive = prune_helper.index("Get-Process -Id ([int]$ownerId)")
+    assert "[int]$ownerId -ne $PID" in prune_helper
+    assert alive < prune_helper.index("Get-Item -LiteralPath $path")
     owner = prune_helper.index('.Value -eq "S-1-5-32-544"')
     assert owner < prune_helper.index("$found = Get-Content")
     guard = prune_helper.index("if ($marker -and $found -eq $marker) {")

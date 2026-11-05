@@ -64,11 +64,11 @@ $ErrorActionPreference = "Stop"
 # a Directory.CreateDirectory overload taking it; PowerShell 7's .NET moved
 # it to FileSystemAclExtensions), and checked after: a file system without
 # ACLs drops it silently. It is recorded for Remove-EarlierWorkDirectories
-# before it exists (a run stopped in between leaves a record of nothing,
-# which the next run drops, never a directory no run removes), with a random
-# marker also written in a file inside it that only SYSTEM and Administrators
-# can read: the marker proves a directory is this one, so not even the
-# user's own unelevated processes may learn it.
+# before it exists, with the process running this script (its ID and start
+# time: no other run touches a directory whose run is still alive) and a
+# random marker, also written in a file inside it that only SYSTEM and
+# Administrators can read: the marker proves a directory is this one, so not
+# even the user's own unelevated processes may learn it.
 function New-PrivateWorkDirectory {
     param([string]$Prefix)
 
@@ -98,7 +98,8 @@ function New-PrivateWorkDirectory {
     $path = Join-Path (Join-Path $env:SystemRoot "Temp") ("{0}-{1}" -f $Prefix, [guid]::NewGuid())
     if (Test-Path -LiteralPath $path) { throw "$path already exists" }
     $marker = [guid]::NewGuid().ToString()
-    New-ItemProperty -LiteralPath (Get-WorkDirectoryKey) -Name (Split-Path -Leaf $path) -Value $marker -PropertyType String -Force | Out-Null
+    $run = "{0}|{1}|{2}" -f $marker, $PID, (Get-Process -Id $PID).StartTime.ToFileTimeUtc()
+    New-ItemProperty -LiteralPath (Get-WorkDirectoryKey) -Name (Split-Path -Leaf $path) -Value $run -PropertyType String -Force | Out-Null
     if ($PSVersionTable.PSEdition -eq "Core") {
         [System.IO.FileSystemAclExtensions]::CreateDirectory($security, $path) | Out-Null
     } else {
@@ -130,11 +131,11 @@ function New-PrivateWorkDirectory {
 }
 
 # The registry key recording the work directories New-PrivateWorkDirectory
-# created, each by name with its marker. Open to SYSTEM and Administrators
-# only, reading included: a marker is what tells one of these directories
-# from anything else at its path. Its ACL is read and set by -Path: Windows
-# PowerShell 5.1's Get-Acl and Set-Acl find no registry key by -LiteralPath
-# (the path holds no wildcard character).
+# created, each by name with "marker|process ID|process start time". Open
+# to SYSTEM and Administrators only, reading included: a marker is what
+# tells one of these directories from anything else at its path. Its ACL is
+# read and set by -Path: Windows PowerShell 5.1's Get-Acl and Set-Acl find no
+# registry key by -LiteralPath (the path holds no wildcard character).
 function Get-WorkDirectoryKey {
     $key = "HKLM:\SOFTWARE\Five-Nines.io\fivenines-bootstrap"
     if (-not (Test-Path -LiteralPath $key)) { New-Item -Path $key -Force | Out-Null }
@@ -185,10 +186,13 @@ function Remove-WorkDirectory {
 # its path no other user can rename, replace or write in it, so the removal
 # reaches it and nothing else. Anything else at a recorded path (the
 # directory gone, a temp cleaner removed it) loses its record and is left
-# alone. Kept: $Keep (this run's), a directory younger than $MinAgeMinutes
-# (a run still in progress), and the installed product's recorded install
-# source, from which Windows Installer reads the MSI to repair it (its
-# cached copy keeps no embedded cabinet).
+# alone. Kept with its record, whatever its age: what a run still alive
+# recorded (its record names a process still running, same ID and start
+# time), since once removed its directory could be recreated by another user
+# before that run reads its MSI or plan script back. Also kept: $Keep (this
+# run's), a directory younger than $MinAgeMinutes, and the installed
+# product's recorded install source, from which Windows Installer reads the
+# MSI to repair it (its cached copy keeps no embedded cabinet).
 function Remove-EarlierWorkDirectories {
     param([string]$Keep, [int]$MinAgeMinutes = 60)
 
@@ -207,7 +211,11 @@ function Remove-EarlierWorkDirectories {
         $path = Join-Path $parent $name
         if ($keepPaths -contains $path) { continue }
         try {
-            $marker = [string]$record.GetValue($name)
+            $marker, $ownerId, $ownerStart = ([string]$record.GetValue($name)).Split('|')
+            if ($ownerId -and [int]$ownerId -ne $PID) {
+                $owner = Get-Process -Id ([int]$ownerId) -ErrorAction SilentlyContinue
+                if ($owner -and [string]$owner.StartTime.ToFileTimeUtc() -eq $ownerStart) { continue }  # its run is still alive
+            }
             $found = $null
             $dir = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
             if ($dir -and $dir.PSIsContainer -and ([int]$dir.Attributes -band 0x400) -eq 0) {
@@ -218,7 +226,7 @@ function Remove-EarlierWorkDirectories {
                 }
             }
             if ($marker -and $found -eq $marker) {
-                if ($dir.CreationTimeUtc -gt $cutoff) { continue }  # a run still in progress
+                if ($dir.CreationTimeUtc -gt $cutoff) { continue }
                 Remove-WorkDirectory $path
                 if (Test-Path -LiteralPath $path) { continue }  # a file in use: the next run retries
             }
