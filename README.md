@@ -886,7 +886,7 @@ The agent works without sudo, but these features will be unavailable (this is al
 | QEMU/KVM VMs | `libvirt` group membership for the default `qemu:///system` URI; a `qemu:///session` URI instead needs that user's own session daemon already running (the agent never auto-spawns it) |
 | ZFS pools | ZFS delegation or permissions |
 | NVIDIA GPU metrics | NVIDIA driver + pynvml library |
-| SNMP device polling | `net-snmp` tools (`snmpget`, `snmpbulkwalk`) |
+| SNMP device polling | `net-snmp` tools (`snmpget`, `snmpbulkwalk`); on Windows, Cygwin's `net-snmp-utils` on the system `Path` (see [SNMP Network Device Monitoring](#snmp-network-device-monitoring)) |
 | systemd unit metrics | `systemd` init system (`systemctl`; `journalctl` only for failure journal tails) |
 | systemd failure journal tails | journal read access: the bundled service unit grants `SupplementaryGroups=systemd-journal`; for user installs add your user to the `systemd-journal` group (tails degrade to empty without it) |
 | Log monitoring (journald capture + signals) | journal read access (`systemd-journal` group) |
@@ -1871,6 +1871,28 @@ sudo yum install net-snmp-utils
 # Alpine
 sudo apk add net-snmp-tools
 ```
+
+On **Windows** the agent runs the same tools. Their maintained Windows build is
+Cygwin's `net-snmp-utils` package; that package is all the agent needs, not a
+Cygwin environment:
+
+1. Run Cygwin's installer (`setup-x86_64.exe`, from
+   [cygwin.com/install.html](https://cygwin.com/install.html)) and select the
+   `net-snmp-utils` package. Unattended, from an elevated prompt:
+
+   ```powershell
+   .\setup-x86_64.exe --quiet-mode --root C:\cygwin64 --site https://mirrors.kernel.org/sourceware/cygwin/ --packages net-snmp-utils
+   ```
+
+2. Append `C:\cygwin64\bin` to the **end** of the system `Path` (appended, so
+   Windows' own `find.exe` and `sort.exe` stay first).
+3. **Reboot.** A Windows service only sees a new system `Path` entry after a
+   reboot; restarting the `fivenines-agent` service is not enough, and until
+   then the agent logs `snmpget not found in PATH`.
+
+Then check from a prompt that the device answers:
+`snmpget -v2c -c <community> -t 5 -r 1 -On <device-ip> 1.3.6.1.2.1.1.5.0`.
+Verified with SNMPv2c against Net-SNMP 5.9.5.2 on Windows Server 2022.
 
 ### Supported Protocols
 
