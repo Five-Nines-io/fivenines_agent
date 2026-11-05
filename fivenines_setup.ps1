@@ -37,9 +37,12 @@ param(
 
     [string]$MsiUrl = "https://releases.fivenines.io/latest/fivenines-agent-windows-amd64.msi",
 
-    [string]$MsiPath = (Join-Path $env:TEMP "fivenines-agent-windows-amd64.msi"),
+    # Both default to a new private directory under %SystemRoot%\Temp
+    # (New-PrivateWorkDirectory below). A path given here is used as is: pick
+    # a directory only administrators can write to.
+    [string]$MsiPath = "",
 
-    [string]$LogFile = (Join-Path $env:TEMP "fivenines-setup.log"),
+    [string]$LogFile = "",
 
     # The service account's password, when the account already exists and
     # is not one the MSI may rotate (see the domain controller note above).
@@ -48,10 +51,241 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# A new directory for the downloaded MSI, its extracted copy and the install
+# log, always under %SystemRoot%\Temp, whatever the session. No user may
+# rename or delete there what someone else created: an administrator's own
+# %TEMP% would let their unelevated processes replace the directory through
+# its parent, and run as SYSTEM (an RMM tool, Intune, a scheduled task)
+# %TEMP% is that directory anyway. Owned by Administrators, open to SYSTEM
+# and Administrators, read-only to the user running the script (who reads a
+# failed run's log unelevated, where the Administrators group does not
+# apply). The ACL is set in the call that creates the directory, so it never
+# exists with the inherited one (Windows PowerShell 5.1's .NET Framework has
+# a Directory.CreateDirectory overload taking it; PowerShell 7's .NET moved
+# it to FileSystemAclExtensions), and checked after: a file system without
+# ACLs drops it silently. It is recorded for Remove-EarlierWorkDirectories
+# before it exists, with the process running this script (its ID and start
+# time: no other run touches a directory whose run is still alive) and a
+# random marker, also written in a file inside it that only SYSTEM and
+# Administrators can read: the marker proves a directory is this one, so not
+# even the user's own unelevated processes may learn it.
+function New-PrivateWorkDirectory {
+    param([string]$Prefix)
+
+    $admins = New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-544")
+    $security = New-Object System.Security.AccessControl.DirectorySecurity
+    $security.SetOwner($admins)
+    $security.SetAccessRuleProtection($true, $false)
+    $expected = @("S-1-5-18", "S-1-5-32-544")
+    foreach ($sid in $expected) {  # SYSTEM, Administrators
+        $security.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            (New-Object System.Security.Principal.SecurityIdentifier($sid)),
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            [System.Security.AccessControl.InheritanceFlags]"ContainerInherit, ObjectInherit",
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow)))
+    }
+    $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    if ($user.Value -ne "S-1-5-18") {
+        $expected += $user.Value
+        $security.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $user,
+            [System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
+            [System.Security.AccessControl.InheritanceFlags]"ContainerInherit, ObjectInherit",
+            [System.Security.AccessControl.PropagationFlags]::None,
+            [System.Security.AccessControl.AccessControlType]::Allow)))
+    }
+    $path = Join-Path (Join-Path $env:SystemRoot "Temp") ("{0}-{1}" -f $Prefix, [guid]::NewGuid())
+    if (Test-Path -LiteralPath $path) { throw "$path already exists" }
+    $marker = [guid]::NewGuid().ToString()
+    $run = "{0}|{1}|{2}" -f $marker, $PID, (Get-Process -Id $PID).StartTime.ToFileTimeUtc()
+    New-ItemProperty -LiteralPath (Get-WorkDirectoryKey) -Name (Split-Path -Leaf $path) -Value $run -PropertyType String -Force | Out-Null
+    if ($PSVersionTable.PSEdition -eq "Core") {
+        [System.IO.FileSystemAclExtensions]::CreateDirectory($security, $path) | Out-Null
+    } else {
+        [System.IO.Directory]::CreateDirectory($path, $security) | Out-Null
+    }
+    $acl = Get-Acl -LiteralPath $path
+    $granted = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) |
+        ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+    if (-not $acl.AreAccessRulesProtected -or
+        $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne $admins.Value -or
+        ($granted -join ",") -ne ((@($expected) | Sort-Object -Unique) -join ",")) {
+        throw "$path did not keep its access control list (does its file system support ACLs?)"
+    }
+    # The marker file gets its own ACL while still empty, then the marker.
+    $markerFile = Join-Path $path ".fivenines-work-directory"
+    $markerSecurity = New-Object System.Security.AccessControl.FileSecurity
+    $markerSecurity.SetOwner($admins)
+    $markerSecurity.SetAccessRuleProtection($true, $false)
+    foreach ($sid in @("S-1-5-18", "S-1-5-32-544")) {
+        $markerSecurity.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            (New-Object System.Security.Principal.SecurityIdentifier($sid)),
+            [System.Security.AccessControl.FileSystemRights]::FullControl,
+            [System.Security.AccessControl.AccessControlType]::Allow)))
+    }
+    New-Item -ItemType File -Path $markerFile | Out-Null
+    Set-Acl -LiteralPath $markerFile -AclObject $markerSecurity
+    Set-Content -LiteralPath $markerFile -Value $marker
+    return $path
+}
+
+# The registry key recording the work directories New-PrivateWorkDirectory
+# created, each by name with "marker|process ID|process start time". Open
+# to SYSTEM and Administrators only, reading included: a marker is what
+# tells one of these directories from anything else at its path. Its ACL is
+# read and set by -Path: Windows PowerShell 5.1's Get-Acl and Set-Acl find no
+# registry key by -LiteralPath (the path holds no wildcard character).
+function Get-WorkDirectoryKey {
+    $key = "HKLM:\SOFTWARE\Five-Nines.io\fivenines-bootstrap"
+    if (-not (Test-Path -LiteralPath $key)) { New-Item -Path $key -Force | Out-Null }
+    $expected = @("S-1-5-18", "S-1-5-32-544")  # SYSTEM, Administrators
+    $acl = Get-Acl -Path $key
+    $granted = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) |
+        ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+    if (-not $acl.AreAccessRulesProtected -or ($granted -join ",") -ne ($expected -join ",")) {
+        $security = New-Object System.Security.AccessControl.RegistrySecurity
+        $security.SetAccessRuleProtection($true, $false)
+        foreach ($sid in $expected) {
+            $security.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule(
+                (New-Object System.Security.Principal.SecurityIdentifier($sid)),
+                [System.Security.AccessControl.RegistryRights]::FullControl,
+                [System.Security.AccessControl.InheritanceFlags]::ContainerInherit,
+                [System.Security.AccessControl.PropagationFlags]::None,
+                [System.Security.AccessControl.AccessControlType]::Allow)))
+        }
+        Set-Acl -Path $key -AclObject $security
+    }
+    return $key
+}
+
+# Removes one of these work directories, its marker last: a file in use
+# stops the removal, and a directory left without its marker would never be
+# removed again. Called only on a directory known to be one of these.
+function Remove-WorkDirectory {
+    param([string]$Path)
+
+    Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne ".fivenines-work-directory" } |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    $left = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne ".fivenines-work-directory" })
+    if ($left.Count -eq 0) { Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+# Removes the work directories earlier runs of these scripts left, so a
+# scheduled run does not leave one MSI copy per run: only those the key
+# records, never a directory found by its name. Any local user can create a
+# directory of any name under %SystemRoot%\Temp and turn it into a link to
+# another directory at any moment, so no check of a path proves what a
+# removal through it will reach. A recorded path is first refused unless it
+# is a plain directory owned by Administrators with a protected ACL (no
+# other user can own one so, nor turn it into a link), so the script reads
+# no file of another user's; then removed only when the file inside it holds
+# its recorded marker: only that directory holds it, and while it stands at
+# its path no other user can rename, replace or write in it, so the removal
+# reaches it and nothing else. Anything else at a recorded path (the
+# directory gone, a temp cleaner removed it) loses its record and is left
+# alone. Kept with its record, whatever its age: what a run still alive
+# recorded (its record names a process still running, same ID and start
+# time), since once removed its directory could be recreated by another user
+# before that run reads its MSI or plan script back. Also kept: $Keep (this
+# run's), a directory younger than $MinAgeMinutes, and the installed
+# product's recorded install source, from which Windows Installer reads the
+# MSI to repair it (its cached copy keeps no embedded cabinet).
+function Remove-EarlierWorkDirectories {
+    param([string]$Keep, [int]$MinAgeMinutes = 60)
+
+    $key = Get-WorkDirectoryKey
+    $keepPaths = @($Keep.TrimEnd('\'))
+    $product = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName -match "Fivenines Monitoring Agent" } |
+        Select-Object -First 1
+    if ($product -and $product.InstallSource) { $keepPaths += ([string]$product.InstallSource).TrimEnd('\') }
+    $cutoff = (Get-Date).ToUniversalTime().AddMinutes(-$MinAgeMinutes)
+    $parent = Join-Path $env:SystemRoot "Temp"
+    $record = Get-Item -LiteralPath $key
+    $names = @($record.GetValueNames() |
+        Where-Object { $_ -match '^fivenines-(setup|update|uninstall)-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$' })
+    foreach ($name in $names) {
+        $path = Join-Path $parent $name
+        if ($keepPaths -contains $path) { continue }
+        try {
+            $marker, $ownerId, $ownerStart = ([string]$record.GetValue($name)).Split('|')
+            if ($ownerId -and [int]$ownerId -ne $PID) {
+                $owner = Get-Process -Id ([int]$ownerId) -ErrorAction SilentlyContinue
+                if ($owner -and [string]$owner.StartTime.ToFileTimeUtc() -eq $ownerStart) { continue }  # its run is still alive
+            }
+            $found = $null
+            $dir = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            if ($dir -and $dir.PSIsContainer -and ([int]$dir.Attributes -band 0x400) -eq 0) {
+                $acl = Get-Acl -LiteralPath $path
+                if ($acl.AreAccessRulesProtected -and
+                    $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -eq "S-1-5-32-544") {
+                    $found = Get-Content -LiteralPath (Join-Path $path ".fivenines-work-directory") -TotalCount 1 -ErrorAction SilentlyContinue
+                }
+            }
+            if ($marker -and $found -eq $marker) {
+                if ($dir.CreationTimeUtc -gt $cutoff) { continue }
+                Remove-WorkDirectory $path
+                if (Test-Path -LiteralPath $path) { continue }  # a file in use: the next run retries
+            }
+            Remove-ItemProperty -LiteralPath $key -Name $name -ErrorAction SilentlyContinue
+        } catch {
+            continue
+        }
+    }
+}
+
+$WorkDir = New-PrivateWorkDirectory "fivenines-setup"
+# Every run removes the work directories earlier runs left once they are an
+# hour old, so a run that keeps failing does not leave one MSI copy per run.
+Remove-EarlierWorkDirectories -Keep $WorkDir
+if (-not $MsiPath) { $MsiPath = Join-Path $WorkDir "fivenines-agent-windows-amd64.msi" }
+if (-not $LogFile) { $LogFile = Join-Path $WorkDir "fivenines-setup.log" }
+
+# A relative -MsiPath, resolved once against PowerShell's current location:
+# the ProductCode read (COM) resolves one against the process's working
+# directory instead, usually System32, where it found no MSI (or another
+# one), so the password went unapplied.
+$MsiPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($MsiPath)
+
 function Test-IsAdmin {
     $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
     return ([Security.Principal.WindowsPrincipal]$id).IsInRole(
         [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# Runs msiexec with $Arguments, waits for it and returns its exit code.
+#   * 1601 (the Windows Installer service could not be accessed) and 1618
+#     (another installation is already in progress) are the service still
+#     finishing an earlier operation, not a result: retried three times,
+#     $RetrySeconds apart.
+#   * /passive (a progress bar) only where someone can see it, /qn (no
+#     window) in session 0 or a non-interactive window station (an RMM
+#     agent, Intune, a scheduled task as SYSTEM). Neither shows a modal box
+#     (an error, 1618's "another installation is in progress"): one would
+#     hold the script until a click, and no one may be there even in a
+#     visible session (a scheduled task run as the logged-on user). The log
+#     says what failed. -Quiet forces /qn.
+#   * /norestart always: under /qn, a package that needs a restart would
+#     otherwise restart the server by itself. 3010 then reports it.
+# -FilePath and -RetrySeconds are there for windows.yml's test.
+function Invoke-Msiexec {
+    param([string[]]$Arguments, [switch]$Quiet, [string]$FilePath = "msiexec.exe", [int]$RetrySeconds = 20)
+
+    $visible = [Environment]::UserInteractive -and
+        ([System.Diagnostics.Process]::GetCurrentProcess().SessionId -ne 0)
+    $ui = if ($visible -and -not $Quiet) { "/passive" } else { "/qn" }
+    $attempt = 0
+    while ($true) {
+        $attempt++
+        $proc = Start-Process $FilePath -ArgumentList (@($Arguments) + @($ui, "/norestart")) -Wait -PassThru
+        $code = $proc.ExitCode
+        if (($code -ne 1601 -and $code -ne 1618) -or $attempt -gt 3) { return $code }
+        Write-Host ("msiexec exit {0}: the Windows Installer service is still busy; retrying in {1} s." -f $code, $RetrySeconds)
+        Start-Sleep -Seconds $RetrySeconds
+    }
 }
 
 if (-not (Test-IsAdmin)) {
@@ -102,6 +336,90 @@ function Get-MsiProductCode {
     }
 }
 
+# Resolve an account name, as the installed service's StartName spells it, to
+# its SID. A "." or <ComputerName> prefix is dropped and the bare name looked
+# up instead: on a domain controller the account the MSI created is a DOMAIN
+# account (a DC has no local ones), and the MSI's default "<DCNAME>\name" is
+# not how the domain names it, while a bare name is looked up in the
+# machine's own account database on every role (the local SAM on a member
+# server, the domain on a DC).
+# Kept identical in SetTokenFileAcl.ps1, DelegateWmiStorageNamespace.ps1,
+# fivenines_setup.ps1 and fivenines_update.ps1 (windows.yml checks it).
+function Resolve-ServiceAccountSid {
+    param([Parameter(Mandatory=$true)][string]$Account)
+
+    $name = $Account
+    if ($name.Contains('\')) {
+        $parts = $name.Split('\', 2)
+        if ($parts[0] -eq '.' -or $parts[0] -eq $env:COMPUTERNAME) {
+            $name = $parts[1]
+        }
+    }
+    $ntAccount = New-Object System.Security.Principal.NTAccount($name)
+    return $ntAccount.Translate([System.Security.Principal.SecurityIdentifier])
+}
+
+# What the preflight makes of the plan the MSI's account step printed
+# ({action, message, sid, checked}). Pure (no system calls), so CI checks it
+# case by case. $Installed is what msiexec would find: "none" (or not looked
+# for: only a password needs it), "same" (this very version: msiexec would
+# only run a maintenance pass, which never reaches the account) or "other"
+# (an upgrade, which removes the installed agent before the installer uses
+# the account). $ServiceSid is the SID the installed service's StartName
+# ($ServiceAccount) resolves to, empty when it does not. Returns
+# @{ Action; Message }:
+#   Action   Refuse | Install (run msiexec) | InPlace (run the step here)
+#   Message  the refusal, or a warning to print for Install and InPlace
+function Get-PreflightVerdict {
+    param(
+        $Plan,
+        [bool]$HasPassword,
+        [string]$Installed,
+        [string]$AccountName,
+        [string]$ServiceAccount,
+        [string]$ServiceSid
+    )
+
+    if ($Plan.action -eq "Refuse") {
+        return @{ Action = "Refuse"; Message = ("Nothing was changed: {0}" -f $Plan.message) }
+    }
+
+    # A password for an existing account that LogonUser could not answer for
+    # (Add-Type blocked, an error the account step does not name, or an MSI
+    # too old to say) is used as given, on an upgrade too: the account step
+    # applies it (sc.exe takes any password) and the install completes, so a
+    # wrong one leaves a service that does not start, which running the
+    # script again with the right password repairs in place. Refusing it
+    # would only block the update.
+    $warning = $null
+    if ($HasPassword -and $Plan.action -eq "UseProvided" -and $Plan.checked -ne $true) {
+        $warning = "The -ServiceAccountPassword given could not be checked against account '{0}': it is used as given, and if it is wrong the service does not start; run this script again with the right password to fix that." -f $AccountName
+    }
+    if ($Installed -ne "same") {
+        return @{ Action = "Install"; Message = $warning }
+    }
+
+    # In place, the step may only update the account the installed service
+    # already runs as: run alone, it would move the service to another
+    # account, or create one, without the rest of the install (that
+    # account's WMI Storage access).
+    $why = $null
+    if ($Plan.action -notin @("Rotate", "UseProvided")) {
+        $why = "the MSI's account step would {0} account '{1}' rather than update it" -f "$($Plan.action)".ToLower(), $AccountName
+    } elseif (-not $Plan.sid) {
+        $why = "the MSI's account step does not say which account '{0}' is" -f $AccountName
+    } elseif (-not $ServiceAccount) {
+        $why = "the installed agent has no fivenines-agent service"
+    } elseif ($ServiceSid -ne $Plan.sid) {
+        $why = "the installed service runs as '{0}', not as account '{1}'" -f $ServiceAccount, $AccountName
+    }
+    if ($why) {
+        return @{ Action = "Refuse"; Message = (
+            "Nothing was changed: {0}, so -ServiceAccountPassword cannot be applied to the installed agent in place. To run the agent as '{1}' with that password, reinstall it: fivenines_uninstall.ps1 -KeepAccount, then fivenines_setup.ps1 -Token <token> -ServiceAccountPassword <password>." -f $why, $AccountName) }
+    }
+    return @{ Action = "InPlace"; Message = $warning }
+}
+
 # The account step of the MSI about to be installed, run before msiexec: the
 # MSI's own CreateServiceAccount.ps1, extracted by an administrative install
 # (which runs no custom action). Its -PlanOnly run reads the account and
@@ -110,58 +428,115 @@ function Get-MsiProductCode {
 # removed the running agent. With a password and this very version already
 # installed, msiexec would only run in maintenance mode, which never reaches
 # the account, so the step itself applies the password (as this elevated
-# session) and the service is restarted with it; returns $true then, as
-# there is nothing left for msiexec to do. An MSI too old for -PlanOnly, or
-# one that cannot be read, leaves the decision to the installer.
+# session) and the service is restarted with it, but only to the account the
+# service already runs as; returns $true then, as there is nothing left for
+# msiexec to do. Get-PreflightVerdict decides. With a password and an agent
+# installed, an MSI whose ProductCode cannot be read is refused (it may be
+# this very version). An MSI too old for -PlanOnly, or whose account step
+# cannot be run, leaves the decision to the installer, except over this very
+# version.
 function Invoke-AccountPreflight {
-    param([string]$MsiPath, [System.Security.SecureString]$Password)
+    param([string]$MsiPath, [System.Security.SecureString]$Password, [string]$WorkDir)
 
     $plain = if ($Password) {
         (New-Object System.Management.Automation.PSCredential("x", $Password)).GetNetworkCredential().Password
     } else { "" }
-    $sameProduct = $false
+    $account = "fivenines-agent"
+    $installed = "none"
     if ($plain) {
         $agent = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
             Where-Object { $_.DisplayName -match "Fivenines Monitoring Agent" } |
             Select-Object -First 1
-        try {
-            $sameProduct = [bool]($agent -and ($agent.PSChildName -eq (Get-MsiProductCode $MsiPath)))
-        } catch {
-            Write-Warning ("Could not read the MSI's ProductCode ({0}); installing it as usual." -f $_)
+        if ($agent) {
+            # Unread, this could be the installed version, which msiexec
+            # would report done without applying the password.
+            $productCode = $null
+            $why = "it has none"
+            try {
+                $productCode = Get-MsiProductCode $MsiPath
+            } catch {
+                $why = "$_"
+            }
+            if (-not $productCode) {
+                throw ("Nothing was changed: could not read the MSI's ProductCode ({0}), so whether it is the version already installed, to which msiexec would not apply -ServiceAccountPassword, is not known." -f $why)
+            }
+            $installed = if ($agent.PSChildName -eq $productCode) { "same" } else { "other" }
         }
     }
-    $image = Join-Path $env:TEMP ("fivenines-plan-" + [guid]::NewGuid())
+    # $WorkDir is already unique: a short name keeps the extracted payload's
+    # deepest path under MAX_PATH, which msiexec /a cannot exceed.
+    $image = Join-Path $WorkDir "plan"
+    # The MSI's account step, run in this process with TEMP and TMP pointed at
+    # $WorkDir: it compiles C# with Add-Type, which writes the source and the
+    # assembly it then loads in %TEMP%, and an administrator's own %TEMP% is
+    # writable by their unelevated processes.
+    $runAccountStep = {
+        param([switch]$PlanOnly)
+        $savedTemp = $env:TEMP
+        $savedTmp = $env:TMP
+        $env:TEMP = $WorkDir
+        $env:TMP = $WorkDir
+        try {
+            & $planScript.FullName @arguments -PlanOnly:$PlanOnly
+        } finally {
+            $env:TEMP = $savedTemp
+            $env:TMP = $savedTmp
+        }
+    }
     try {
         $plan = $null
         $planScript = $null
         try {
-            $extract = Start-Process msiexec.exe -ArgumentList @("/a", "`"$MsiPath`"", "/qn", "TARGETDIR=`"$image`"") -Wait -PassThru
-            if ($extract.ExitCode -ne 0) {
-                throw ("extracting the MSI failed (msiexec /a exit {0})" -f $extract.ExitCode)
+            $extract = Invoke-Msiexec -Arguments @("/a", "`"$MsiPath`"", "TARGETDIR=`"$image`"") -Quiet
+            if ($extract -eq 1601 -or $extract -eq 1618) {
+                # Still busy after the retries, as the install would be:
+                # stop before anything changes, with msiexec's code.
+                $busy = New-Object System.InvalidOperationException ("the Windows Installer service is still busy (msiexec /a exit {0}); nothing was changed, run this script again later" -f $extract)
+                $busy.Data["MsiexecExitCode"] = $extract
+                throw $busy
+            }
+            if ($extract -ne 0) {
+                throw ("extracting the MSI failed (msiexec /a exit {0})" -f $extract)
             }
             $planScript = Get-ChildItem -LiteralPath $image -Recurse -File -Filter "CreateServiceAccount.ps1" | Select-Object -First 1
             if (-not $planScript) { throw "the MSI carries no CreateServiceAccount.ps1" }
             if (-not (Select-String -LiteralPath $planScript.FullName -SimpleMatch '[switch]$PlanOnly' -Quiet)) {
                 throw "the MSI's CreateServiceAccount.ps1 has no -PlanOnly"
             }
-            $arguments = @{ ServiceAccount = "$env:COMPUTERNAME\fivenines-agent" }
+            $arguments = @{ ServiceAccount = "$env:COMPUTERNAME\$account" }
             if ($plain) { $arguments.Password = $plain }
-            $line = @(& $planScript.FullName @arguments -PlanOnly) | Where-Object { "$_" -like "FIVENINES_PLAN *" } | Select-Object -Last 1
+            $line = @(& $runAccountStep -PlanOnly) | Where-Object { "$_" -like "FIVENINES_PLAN *" } | Select-Object -Last 1
             if (-not $line) { throw "CreateServiceAccount.ps1 -PlanOnly printed no plan" }
             $plan = "$line".Substring("FIVENINES_PLAN ".Length) | ConvertFrom-Json
         } catch {
-            if ($sameProduct) {
+            if ($_.Exception.Data.Contains("MsiexecExitCode")) { throw }
+            if ($installed -eq "same") {
                 throw ("Could not run the MSI's account step ({0}), so -ServiceAccountPassword cannot be applied to the installed agent. Nothing was changed." -f $_)
             }
             Write-Warning ("Could not check the service account before installing ({0}); the installer still checks it." -f $_)
             return $false
         }
-        if ($plan.action -eq "Refuse") {
-            throw ("Nothing was changed: {0}" -f $plan.message)
+        # Who the installed service logs on as, for the in-place step.
+        $serviceAccount = ""
+        $serviceSid = ""
+        if ($installed -eq "same") {
+            $service = Get-CimInstance -ClassName Win32_Service -Filter "Name='fivenines-agent'"
+            if ($service) {
+                $serviceAccount = [string]$service.StartName
+                try {
+                    $serviceSid = (Resolve-ServiceAccountSid $serviceAccount).Value
+                } catch {
+                    $serviceSid = ""
+                }
+            }
         }
-        if (-not $sameProduct) { return $false }
+        $verdict = Get-PreflightVerdict -Plan $plan -HasPassword ([bool]$plain) -Installed $installed `
+            -AccountName $account -ServiceAccount $serviceAccount -ServiceSid $serviceSid
+        if ($verdict.Action -eq "Refuse") { throw $verdict.Message }
+        if ($verdict.Message) { Write-Warning $verdict.Message }
+        if ($verdict.Action -ne "InPlace") { return $false }
         Write-Host "This version is already installed: applying the service account password to it..."
-        & $planScript.FullName @arguments | Out-Host
+        & $runAccountStep | Out-Host
         Restart-Service -Name "fivenines-agent" -ErrorAction Stop
         return $true
     } finally {
@@ -194,10 +569,12 @@ try {
 Unblock-File -Path $MsiPath
 
 $applied = $false
+$restartPending = $false
 try {
-    $applied = Invoke-AccountPreflight -MsiPath $MsiPath -Password $ServiceAccountPassword
+    $applied = Invoke-AccountPreflight -MsiPath $MsiPath -Password $ServiceAccountPassword -WorkDir $WorkDir
 } catch {
-    Write-Error $_
+    Write-Error $_ -ErrorAction Continue
+    if ($_.Exception.Data.Contains("MsiexecExitCode")) { exit $_.Exception.Data["MsiexecExitCode"] }
     exit 1
 }
 
@@ -206,17 +583,23 @@ if (-not $applied) {
     $msiArgs = @(
         "/i", "`"$MsiPath`"",
         "TOKEN=$Token",
-        "/qb",
         "/l*v", "`"$LogFile`""
     )
     if ($passwordArgument) {
         $msiArgs += $passwordArgument
     }
-    $proc = Start-Process msiexec.exe -ArgumentList $msiArgs -Wait -PassThru
-    if ($proc.ExitCode -ne 0) {
-        Write-Error "msiexec failed with exit code $($proc.ExitCode). See $LogFile."
-        exit $proc.ExitCode
+    $exitCode = Invoke-Msiexec -Arguments $msiArgs
+    if ($exitCode -eq 3010) {
+        $restartPending = $true
+        Write-Warning "Installed; Windows needs a restart to finish replacing files in use (msiexec 3010). See $LogFile."
+    } elseif ($exitCode -ne 0) {
+        # Continue: under "Stop" Write-Error would end the script with 1.
+        Write-Error "msiexec failed with exit code $exitCode. See $LogFile." -ErrorAction Continue
+        exit $exitCode
     }
+} else {
+    # Only the account step ran: TOKEN is written by the MSI, which did not.
+    Write-Warning "-Token was not written: this version was already installed, so only the service account password was applied, and the agent keeps the TOKEN it has. To enroll it with another token, reinstall it: fivenines_uninstall.ps1 -KeepAccount, then fivenines_setup.ps1 -Token <token> -ServiceAccountPassword <password>."
 }
 
 Write-Host "Starting service..."
@@ -237,4 +620,14 @@ if ($svc.Status -ne "Running") {
     exit 1
 }
 
+# The run succeeded: the work directories earlier runs left go again, the
+# previous install source included now that msiexec recorded this one. This
+# run's stays: when msiexec ran, the MSI in it is the installed product's
+# recorded install source, which a repair reads.
+Remove-EarlierWorkDirectories -Keep $WorkDir
+
 Write-Host "Done. The agent will appear on the fivenines.io dashboard shortly."
+
+# msiexec asked for a restart (3010): the work is done, and this exit code
+# lets a deployment tool (Intune, ConfigMgr) schedule the restart.
+if ($restartPending) { exit 3010 }

@@ -58,21 +58,57 @@ This directory builds the Windows MSI installer for the fivenines agent.
   after Windows Installer has removed the running agent on an upgrade. With
   `-ServiceAccountPassword` and the same ProductCode installed, msiexec would
   only run a maintenance pass, which never reaches the account: the scripts
-  run that account step themselves and restart the service, removing nothing.
-  A password is checked with a LogonUser network logon (no SMB session):
-  wrong, locked, disabled, expired and must-change are refused by name;
-  anything else (a host denying network logon) leaves it unchecked, as
-  before.
+  run that account step themselves and restart the service, removing nothing,
+  but only for a Rotate or UseProvided plan whose account (the plan's `sid`)
+  is the one the service's StartName resolves to. Run alone, the step would
+  otherwise move the service to another account, or create one without its
+  WMI grant: they refuse and point to a reinstall. With a password and an
+  agent installed, an unreadable ProductCode is a refusal too (it may be
+  this very version). The decision is `Get-PreflightVerdict`, pure, tested
+  case by case in `windows.yml`. A password is checked with a LogonUser
+  network logon (no SMB session): wrong, locked, disabled, password expired,
+  must-change and account expired are refused by name, and 1385 (the host
+  denies the account network logon) counts as checked, since Windows checks
+  the logon type only once the credentials were accepted. Anything else
+  leaves it unchecked (`checked: false` in the plan): the scripts warn and
+  use it as given, since the account step applies any password and a wrong
+  one leaves a service that does not start, which a rerun with the right
+  password repairs in place. The scripts run the step in their own process,
+  for the plan and in place alike, with `TEMP` and `TMP` pointed at their
+  private work directory: it compiles C# with Add-Type, which writes the
+  source and the assembly it then loads in `%TEMP%`, and an administrator's
+  own `%TEMP%` is writable by their unelevated processes.
+- **The agent directories through handles.** The account step gives the
+  account FullControl on `%ProgramData%\fivenines_agent` and its `logs`
+  (`Grant-AgentDirectory`, through the `FiveninesAgentDirectory` type it
+  compiles with Add-Type), as SYSTEM, in directories the account can write
+  to. A grant already there is kept (read by path: a directory moved behind
+  a junction that already has it is left as it is; a read that fails counts
+  as no grant). Otherwise every directory from the one below `%ProgramData%`
+  down to the target is opened without following a link at it, with the
+  right to list it, and shared for reading only, so none can be renamed,
+  deleted or replaced meanwhile (Windows applies a share mode only to a
+  handle holding a data right such as listing); a junction, a symbolic link
+  or anything that is not a directory (a hard link to a file) is refused, and
+  so is a target whose last handle's final path is not its own under
+  `%ProgramData%` as that resolves (a share mode does not keep a directory
+  from being turned into a junction). `-PlanOnly` refuses the same, before
+  msiexec (a check it cannot run, Add-Type blocked, is left to the account
+  step); the ACE is written through the last handle. No `/T` and no walk of
+  its own: Windows propagates the inheritable ACE to the existing children
+  that inherit it.
 - **The WMI namespace ACL in binary.** `DelegateWmiStorageNamespace.ps1` reads
   and writes `root\Microsoft\Windows\Storage`'s descriptor with
   `__SystemSecurity` `GetSD`/`SetSD` and `RawSecurityDescriptor`, never
   `GetSecurityDescriptor`: that one resolves every ACE's trustee to a name and
   fails ("unexpected error") once an ACE names a deleted account, which failed
   a reinstall after `fivenines_uninstall.ps1` (or a hand-deleted account) with
-  1603. A grant already present is not added again, and the uninstall script
-  removes it. Two Windows PowerShell 5.1 traps met on the way: `-band` on a
-  byte-based enum such as `AceFlags` raises "Specified cast is not valid" (use
-  `IsInherited`), and `InvokeMethod` cannot take `New-Object`'s
+  1603. A grant already present is not added again (only an allow ACE that
+  applies to the namespace itself counts: not an inherit-only one), and the
+  uninstall script removes the account's allow ACEs, keeping deny ACEs. Two
+  Windows PowerShell 5.1 traps met on the way: `-band` on a byte-based enum
+  such as `AceFlags` raises "Specified cast is not valid" (use `IsInherited`,
+  or cast to `[int]` first), and `InvokeMethod` cannot take `New-Object`'s
   PSObject-wrapped `byte[]` (use `[byte[]]::new`).
 - **Domain controllers.** On a DC the account is a domain account, the BUILTIN
   groups are the domain's, and the account's qualified name is `<DOMAIN>\name`,

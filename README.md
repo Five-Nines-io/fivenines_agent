@@ -233,15 +233,23 @@ another DC:
   is already installed, `update.ps1 -ServiceAccountPassword` (and `setup.ps1`)
   applies the password to it with the MSI's own account step and restarts the
   service: run it on every DC after you change the password in Active
-  Directory.
+  Directory. It does so only when the service runs as `fivenines-agent`
+  already; otherwise (an account of your own, or `fivenines-agent` deleted)
+  it changes nothing and asks you to reinstall: `uninstall.ps1 -KeepAccount`,
+  then `setup.ps1 -Token TOKEN -ServiceAccountPassword $pw`. Applied in place,
+  `setup.ps1` writes no `-Token`: the agent keeps its TOKEN.
 - **Nothing is changed when the installer would refuse**: `setup.ps1` and
   `update.ps1` first ask the MSI they downloaded what it will do with the
   account, and stop before installing or removing anything when it would
   refuse (a second DC without the password, an operator-managed account
-  without its password, or a password that does not log the account on).
+  without its password, a password that does not log the account on, or an
+  agent directory under `%ProgramData%` that is a junction, a symbolic link
+  or not a directory at all and does not carry the account's access yet).
   `msiexec` used directly refuses the same cases with exit code 1603 and the
   reason in the install log, but on an upgrade Windows Installer has already
-  removed the running agent by then.
+  removed the running agent by then. A password the check could not verify
+  is used with a warning: if it is wrong, the service does not start, and
+  running the script again with the right password fixes it.
 - **Uninstalling** deletes the account only when this DC's installer created
   it, or when it is the account an earlier release left behind after failing
   on a DC (described `Fivenines monitoring agent service account`).
@@ -266,13 +274,27 @@ iwr https://releases.fivenines.io/latest/fivenines_update.ps1 -OutFile update.ps
 .\update.ps1
 
 # Uninstall: removes the MSI, the service, the local service account,
-# its SeServiceLogonRight grant and WMI Storage access, and the config +
-# log directories.
+# its SeServiceLogonRight grant and WMI Storage access (a deny entry set
+# for it is kept), and the config + log directories.
 # Pass -KeepAccount to leave a pre-staged account in place. On a domain
 # controller, an account shared with other DCs is kept.
 iwr https://releases.fivenines.io/latest/fivenines_uninstall.ps1 -OutFile uninstall.ps1
 .\uninstall.ps1
 ```
+
+`update.ps1 -ServiceAccountPassword` passes the password of an account the
+MSI does not rotate; on the version already installed it applies it in place,
+to the account the service runs as only (see
+[Domain controllers](#domain-controllers)).
+
+Exit codes, for RMM, Intune or SCCM deployments: `setup.ps1`, `update.ps1`
+and `uninstall.ps1` exit 0 on success, and 3010 when the work is done but
+Windows needs a restart to finish (the scripts never restart it themselves).
+A failed `msiexec` ends the script with msiexec's own exit code. When the
+Windows Installer service is busy (1601 or 1618), msiexec is retried three
+times, 20 seconds apart, before that code is returned; when it stays busy
+during their preflight check, `setup.ps1` and `update.ps1` exit 1601 or 1618
+before changing anything. Any other refusal or failure exits 1.
 
 #### Security model
 

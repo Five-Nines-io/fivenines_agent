@@ -244,7 +244,8 @@ jobs:
       # grants leave one ACE, the uninstall's removal takes it, and a grant
       # must work while the namespace still carries the ACE of a deleted
       # account (the object-form GetSecurityDescriptor failed on one, which
-      # failed a reinstall with 1603 on a domain controller).
+      # failed a reinstall with 1603 on a domain controller); an inherit-only
+      # ACE is no grant, and the removal keeps deny ACEs.
       - name: Verify the WMI namespace delegation and its removal
         shell: powershell
         run: |
@@ -259,6 +260,15 @@ jobs:
           function Get-GrantCount($Sid) {
             return @((Get-WmiNamespaceSD $namespace).DiscretionaryAcl | Where-Object {
               $_ -is [System.Security.AccessControl.KnownAce] -and $_.SecurityIdentifier.Value -eq $Sid }).Count
+          }
+          # Explicit ACEs for the SID of one kind ("AccessAllowed" or
+          # "AccessDenied"), inherit-only (0x08, read as [int]: AceFlags is a
+          # byte enum) or not.
+          function Get-AceCount($Sid, $Qualifier, [bool]$InheritOnly) {
+            return @((Get-WmiNamespaceSD $namespace).DiscretionaryAcl | Where-Object {
+              $_ -is [System.Security.AccessControl.QualifiedAce] -and $_.SecurityIdentifier.Value -eq $Sid -and
+              -not $_.IsInherited -and "$($_.AceQualifier)" -eq $Qualifier -and
+              (((([int]$_.AceFlags) -band 0x08) -ne 0) -eq $InheritOnly) }).Count
           }
           function New-TestUser($Name) {
             $pw = ConvertTo-SecureString ("Aa1-" + [guid]::NewGuid()) -AsPlainText -Force
@@ -283,10 +293,716 @@ jobs:
             Remove-WmiStorageGrant $first
             if ((Get-GrantCount $second) -ne 0 -or (Get-GrantCount $first) -ne 0) { throw "Remove-WmiStorageGrant left an ACE" }
             Write-Host "Remove-WmiStorageGrant removed both, the orphaned one included."
+
+            # An inherit-only allow ACE applies to the sub-namespaces only, so
+            # it is no grant; and the removal takes the allow ACEs only,
+            # keeping a deny ACE someone else set (it is left behind for the
+            # deleted test account, which this runner never reuses).
+            $third = New-TestUser "fn-wmi-c"
+            $thirdSid = [System.Security.Principal.SecurityIdentifier]$third
+            $sd = Get-WmiNamespaceSD $namespace
+            $sd.DiscretionaryAcl.InsertAce(0, [System.Security.AccessControl.CommonAce]::new(
+              [System.Security.AccessControl.AceFlags]"ContainerInherit, InheritOnly",
+              [System.Security.AccessControl.AceQualifier]::AccessAllowed, 0x23, $thirdSid, $false, $null))
+            $sd.DiscretionaryAcl.InsertAce(0, [System.Security.AccessControl.CommonAce]::new(
+              [System.Security.AccessControl.AceFlags]::None,
+              [System.Security.AccessControl.AceQualifier]::AccessDenied, 0x20, $thirdSid, $false, $null))
+            Set-WmiNamespaceSD $namespace $sd
+            if ((Get-AceCount $third "AccessAllowed" $true) -ne 1 -or (Get-AceCount $third "AccessDenied" $false) -ne 1) {
+              throw "the inherit-only and deny test ACEs did not land as written"
+            }
+            & windows/installer/DelegateWmiStorageNamespace.ps1 -ServiceAccount ".\fn-wmi-c"
+            if ((Get-AceCount $third "AccessAllowed" $false) -ne 1) { throw "an inherit-only allow ACE was taken for a grant" }
+            Write-Host "Granted over an inherit-only allow ACE, which is no grant."
+
+            Remove-WmiStorageGrant $third
+            if ((Get-AceCount $third "AccessAllowed" $true) + (Get-AceCount $third "AccessAllowed" $false) -ne 0) {
+              throw "Remove-WmiStorageGrant left an allow ACE"
+            }
+            if ((Get-AceCount $third "AccessDenied" $false) -ne 1) { throw "Remove-WmiStorageGrant removed a deny ACE" }
+            Write-Host "Remove-WmiStorageGrant removed both allow ACEs and kept the deny ACE."
+
+            # An allow ACE without the whole mask (enable only) is no grant
+            # either: the grant adds the full one, and the removal takes both.
+            $fourth = New-TestUser "fn-wmi-d"
+            $sd = Get-WmiNamespaceSD $namespace
+            $sd.DiscretionaryAcl.InsertAce(0, [System.Security.AccessControl.CommonAce]::new(
+              [System.Security.AccessControl.AceFlags]::None,
+              [System.Security.AccessControl.AceQualifier]::AccessAllowed, 0x01,
+              [System.Security.Principal.SecurityIdentifier]$fourth, $false, $null))
+            Set-WmiNamespaceSD $namespace $sd
+            & windows/installer/DelegateWmiStorageNamespace.ps1 -ServiceAccount ".\fn-wmi-d"
+            if ((Get-AceCount $fourth "AccessAllowed" $false) -ne 2) { throw "a partial-mask allow ACE was taken for a grant" }
+            Remove-WmiStorageGrant $fourth
+            if ((Get-AceCount $fourth "AccessAllowed" $false) -ne 0) { throw "Remove-WmiStorageGrant left a partial-mask allow ACE" }
+            Write-Host "Granted over a partial-mask allow ACE; the removal took both."
           } finally {
             Remove-LocalUser -Name "fn-wmi-a" -ErrorAction SilentlyContinue
             Remove-LocalUser -Name "fn-wmi-b" -ErrorAction SilentlyContinue
+            Remove-LocalUser -Name "fn-wmi-c" -ErrorAction SilentlyContinue
+            Remove-LocalUser -Name "fn-wmi-d" -ErrorAction SilentlyContinue
           }
+
+      # The agent-directory grant, for real on this runner: it lands once and
+      # is then left alone, and a directory that is a junction, sits under
+      # one, or is not a directory at all (a hard link to a file) is refused
+      # without touching what it points at, while a link that already
+      # reaches the grant is left as it is. The check stops at Root without
+      # looking at Root itself, even when Root is a junction or is written
+      # with a trailing backslash. A junction inside a granted directory keeps
+      # its target untouched (the inheritance Windows propagates must not
+      # follow it), an ACE that is not the whole grant is no grant, and a
+      # failure of the grant is raised with the function's own message, the
+      # ACL left as it was.
+      # Value: protects=one grant, inherited by existing files and never re-applied, and no grant through a junction at or below the path down to Root; fails_when=the link check goes, or the existing-grant check stops returning $false; why_new=only the static pytest sees the call site; seam=none; no_claim=symbolic links (same attribute bit, not exercised)
+      # Value: protects=a hard link to a file put where a directory is expected is refused and its target keeps its ACL; fails_when=the check tests only the link attribute, not that it is a directory; why_new=a hard link carries no reparse bit; seam=none; no_claim=a hard link swapped in after the check, which the open handles rule out
+      # Value: protects=the open handles' share mode applies, so a directory in the chain cannot be renamed or replaced between the check and the write; fails_when=the handles hold no data right (Windows then ignores their share mode) or share deleting; why_new=only a handle held open for deleting shows it; seam=none; no_claim=a rename attempted while the grant runs, which needs a hook between two calls
+      # Value: protects=a junction that already reaches the account's grant is left as it is, not refused; fails_when=the link check runs before the existing-grant check; why_new=a logs dir an operator moved behind a junction, granted by icacls /T, was refused on every upgrade; seam=none; no_claim=a junction reaching no grant, which is refused
+      # Value: protects=a dangling junction is refused by the handle check, in the account step and the plan alike; fails_when=a failed read of the existing grant escapes as an error (the plan then lets msiexec remove the agent before the step fails); why_new=every other junction case has a live target; seam=none; no_claim=a target that exists but cannot be opened
+      # Value: protects=the check stops at Root and never inspects Root itself, even a Root that is a junction or written with a trailing backslash; fails_when=the check starts at Root, or Root's trailing backslash is no longer trimmed; why_new=nothing at or above the step's root is a link, so a check running past Root passed; seam=none; no_claim=a drive-root Root
+      # Value: protects=a junction the account plants inside its directory never carries the SYSTEM-applied grant to its target; fails_when=/T comes back, or Windows' propagation follows a junction child; why_new=the step only links the granted dir itself or a parent; seam=none; no_claim=hard links inside, which share their target's ACL
+      # Value: protects=a read-only, container-only, object-only or inherit-only ACE is no grant: the full one lands, on the dir, new files and new subdirs; fails_when=the existing-grant check drops its rights test, either inheritance half or its IO test; why_new=only a real full grant is re-checked; seam=none; no_claim=deny ACEs
+      # Value: protects=a failure of the grant (an unparseable SID) fails the account step (the install's 1603) with the function's message, the ACL unchanged; fails_when=the failure is swallowed and reported as a grant, or the message loses the path; why_new=nothing else makes the grant fail; seam=none; no_claim=which Win32 errors the handle calls raise
+      - name: Verify the agent directory grant
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = Get-Content windows/installer/CreateServiceAccount.ps1 -Raw
+          foreach ($fn in 'Initialize-AgentDirectoryType', 'Test-AgentDirectoryGrant', 'Format-AgentDirectoryRefusal', 'Grant-AgentDirectory') {
+            $m = [regex]::Match($src, "(?ms)^function $fn \{.*?^\}")
+            if (-not $m.Success) { throw "$fn not found in CreateServiceAccount.ps1" }
+            Invoke-Expression $m.Value
+          }
+          $sid = "S-1-5-19"  # LOCAL SERVICE: any principal the test can grant
+          function Get-GrantCount($Path) {
+            return @((Get-Acl -LiteralPath $Path).GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) |
+              Where-Object { $_.IdentityReference.Value -eq $sid }).Count
+          }
+          # The message of the refusal Grant-AgentDirectory throws for Path,
+          # or $null when it did not throw; any other error fails the step.
+          function Get-Refusal($Path, $Root) {
+            try { Grant-AgentDirectory -Path $Path -Sid $sid -Root $Root | Out-Null } catch {
+              if ($_.Exception.Message -match "so the installer will not grant the service account access through it") { return $_.Exception.Message }
+              throw
+            }
+            return $null
+          }
+
+          $root = Join-Path $env:RUNNER_TEMP ("fn-grant-" + [guid]::NewGuid())
+          $agent = Join-Path $root "fivenines_agent"
+          $logs = Join-Path $agent "logs"
+          $target = Join-Path $root "elsewhere"
+          New-Item -ItemType Directory -Path $logs, $target | Out-Null
+          Set-Content -LiteralPath (Join-Path $logs "agent.log") -Value "x"
+
+          if (-not (Grant-AgentDirectory -Path $agent -Sid $sid -Root $root)) { throw "the first grant reported an existing one" }
+          if ((Get-GrantCount $agent) -ne 1) { throw "the grant did not land" }
+          $inherited = @((Get-Acl -LiteralPath (Join-Path $logs "agent.log")).GetAccessRules($false, $true, [System.Security.Principal.SecurityIdentifier]) |
+            Where-Object { $_.IdentityReference.Value -eq $sid }).Count
+          if ($inherited -lt 1) { throw "an existing file did not inherit the grant" }
+          if (Grant-AgentDirectory -Path $agent -Sid $sid -Root $root) { throw "a second grant was applied again" }
+          Write-Host "Granted once, inherited by an existing file, then left alone."
+
+          Remove-Item -LiteralPath $logs -Recurse -Force
+          cmd /c mklink /J "$logs" "$target" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "mklink /J failed" }
+          $refusal = Get-Refusal $logs $root
+          if ($refusal -notmatch ("^" + [regex]::Escape($logs) + " is a junction or a symbolic link")) { throw "a junction was not refused: $refusal" }
+          Write-Host "Refused: $refusal"
+          if ((Get-GrantCount $target) -ne 0) { throw "the junction's target was granted" }
+
+          $real = Join-Path $root "real"
+          New-Item -ItemType Directory -Path (Join-Path $real "logs") | Out-Null
+          $link = Join-Path $root "link"
+          cmd /c mklink /J "$link" "$real" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "mklink /J failed" }
+          $refusal = Get-Refusal (Join-Path $link "logs") $root
+          if ($refusal -notmatch ("^" + [regex]::Escape($link) + " is a junction or a symbolic link")) { throw "a directory under a junction was not refused: $refusal" }
+          if ((Get-GrantCount (Join-Path $real "logs")) -ne 0) { throw "the directory under the junction was granted" }
+          Write-Host "Refused a junction and a directory under one, their targets untouched."
+          cmd /c rmdir "$logs" "$link" | Out-Null
+
+          # A hard link to a file where a directory is expected: no link
+          # attribute, so only the directory check refuses it, and the file
+          # it shares its ACL with keeps that ACL.
+          $plain = Join-Path $root "plain.txt"
+          Set-Content -LiteralPath $plain -Value "x"
+          $hardLink = Join-Path $agent "hard-linked"
+          cmd /c mklink /H "$hardLink" "$plain" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "mklink /H failed" }
+          $sddl = (Get-Acl -LiteralPath $plain).Sddl
+          $refusal = Get-Refusal $hardLink $root
+          if ($refusal -notmatch ("^" + [regex]::Escape($hardLink) + " is not a directory")) { throw "a hard link to a file was not refused: $refusal" }
+          if ((Get-Acl -LiteralPath $plain).Sddl -ne $sddl) { throw "the grant reached the file a hard link shares its ACL with" }
+          Remove-Item -LiteralPath $hardLink -Force
+          Write-Host "Refused a hard link to a file, the file's ACL untouched."
+
+          # The handles pin the directories only because they hold a data
+          # right (listing): Windows applies their share mode, which refuses
+          # any other handle that could rename or delete them, and applies it
+          # both ways, so a directory already open for deleting is not
+          # granted (a sharing violation, error 32) and keeps its ACL.
+          Add-Type -TypeDefinition @"
+            using System;
+            using System.Runtime.InteropServices;
+            using Microsoft.Win32.SafeHandles;
+            public static class FnCiHandle {
+                [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+                public static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+            }
+          "@
+          $held = Join-Path $root "held"
+          New-Item -ItemType Directory -Path $held | Out-Null
+          # DELETE, shared for everything, as a rename holds it; directories
+          # open only with FILE_FLAG_BACKUP_SEMANTICS.
+          $deleting = [FnCiHandle]::CreateFileW($held, 0x10000, 7, [IntPtr]::Zero, 3, 0x02000000, [IntPtr]::Zero)
+          if ($deleting.IsInvalid) { throw "could not open $held for deleting" }
+          $raised = $null
+          try { Grant-AgentDirectory -Path $held -Sid $sid -Root $root | Out-Null } catch { $raised = $_.Exception.Message } finally { $deleting.Dispose() }
+          if ($raised -notmatch "\(error 32\)") { throw "a directory open for deleting was granted, or failed otherwise: $raised" }
+          if ((Get-GrantCount $held) -ne 0) { throw "the directory open for deleting was granted" }
+          Write-Host "A directory open for deleting is not granted: $raised"
+
+          # A junction that already reaches the grant (a directory an
+          # operator moved behind a junction, which icacls /T granted) is
+          # left as it is: nothing would be written through it.
+          $grantedReal = Join-Path $root "granted-real"
+          $grantedLink = Join-Path $root "granted-link"
+          New-Item -ItemType Directory -Path $grantedReal | Out-Null
+          if (-not (Grant-AgentDirectory -Path $grantedReal -Sid $sid -Root $root)) { throw "the grant on a plain directory reported an existing one" }
+          cmd /c mklink /J "$grantedLink" "$grantedReal" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "mklink /J failed" }
+          $again = $null
+          try { $again = Grant-AgentDirectory -Path $grantedLink -Sid $sid -Root $root } catch { throw "a junction reaching the grant was refused: $_" }
+          if ($again) { throw "a junction reaching the grant was granted again" }
+          cmd /c rmdir "$grantedLink" | Out-Null
+          Write-Host "A junction that already reaches the grant is left as it is."
+
+          # A junction whose target is gone: reading its grant fails, which
+          # is no grant, and the handle check refuses the junction itself
+          # (not an unnamed error).
+          $goneTarget = Join-Path $root "gone-target"
+          $dangling = Join-Path $root "dangling"
+          New-Item -ItemType Directory -Path $goneTarget | Out-Null
+          cmd /c mklink /J "$dangling" "$goneTarget" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "mklink /J failed" }
+          Remove-Item -LiteralPath $goneTarget -Force
+          $refusal = Get-Refusal $dangling $root
+          if ($refusal -notmatch ("^" + [regex]::Escape($dangling) + " is a junction or a symbolic link")) { throw "a dangling junction was not refused: $refusal" }
+          cmd /c rmdir "$dangling" | Out-Null
+          Write-Host "A dangling junction is refused."
+
+          # The check stops at Root without looking at Root itself: a plain
+          # directory under a Root that is a junction is granted (on the
+          # junction's target, which the path reaches), and so is it with Root
+          # written with a trailing backslash. A check starting at Root, or
+          # comparing it untrimmed, reaches the junction and refuses.
+          $rootReal = Join-Path $root "root-real"
+          $rootLink = Join-Path $root "root-link"
+          New-Item -ItemType Directory -Path (Join-Path $rootReal "child") | Out-Null
+          cmd /c mklink /J "$rootLink" "$rootReal" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "mklink /J failed" }
+          $child = Join-Path $rootLink "child"
+          $granted = $null
+          try { $granted = Grant-AgentDirectory -Path $child -Sid $sid -Root $rootLink } catch { throw "the check went past a Root that is a junction: $_" }
+          if (-not $granted) { throw "the grant under a junction Root reported an existing one" }
+          if ((Get-GrantCount (Join-Path $rootReal "child")) -ne 1) { throw "the grant under a junction Root did not land" }
+          $again = $null
+          try { $again = Grant-AgentDirectory -Path $child -Sid $sid -Root ($rootLink + "\") } catch { throw "the check went past a Root written with a trailing backslash: $_" }
+          if ($again) { throw "the grant under a Root written with a trailing backslash was applied again" }
+          cmd /c rmdir "$rootLink" | Out-Null
+          Write-Host "The check stops at Root, a junction itself, with or without a trailing backslash."
+
+          # A junction inside the granted directory, as the account could
+          # plant one: the grant lands on the directory, and the junction's
+          # target (a directory and a file in it) keeps its ACL as it was.
+          $fresh = Join-Path $root "fresh"
+          $victim = Join-Path $root "victim"
+          $victimFile = Join-Path $victim "file.txt"
+          $planted = Join-Path $fresh "planted"
+          New-Item -ItemType Directory -Path $fresh, $victim | Out-Null
+          Set-Content -LiteralPath $victimFile -Value "x"
+          cmd /c mklink /J "$planted" "$victim" | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "mklink /J failed" }
+          $before = @{}
+          foreach ($p in @($victim, $victimFile)) { $before[$p] = (Get-Acl -LiteralPath $p).Sddl }
+          if (-not (Grant-AgentDirectory -Path $fresh -Sid $sid -Root $root)) { throw "the grant over a planted junction reported an existing one" }
+          if ((Get-GrantCount $fresh) -ne 1) { throw "the grant did not land on a directory holding a junction" }
+          foreach ($p in @($victim, $victimFile)) {
+            if ((Get-Acl -LiteralPath $p).Sddl -ne $before[$p]) { throw "the grant reached $p through a junction inside the granted directory" }
+          }
+          cmd /c rmdir "$planted" | Out-Null
+          Write-Host "A junction inside a granted directory: its target untouched."
+
+          # An ACE that is not the whole grant is no grant: the full one lands
+          # over it, on the directory and on a file and a subdirectory created
+          # in it afterwards (an object-only ACE already reaches the file and
+          # the directory itself, so only the subdirectory tells it apart).
+          function Test-FullControl($Path, [bool]$Inherited) {
+            return @((Get-Acl -LiteralPath $Path).GetAccessRules((-not $Inherited), $Inherited, [System.Security.Principal.SecurityIdentifier]) |
+              Where-Object { $_.IdentityReference.Value -eq $sid -and "$($_.AccessControlType)" -eq "Allow" -and
+                (([int]$_.FileSystemRights -band 0x1F01FF) -eq 0x1F01FF) -and (([int]$_.PropagationFlags -band 2) -eq 0) }).Count -gt 0
+          }
+          foreach ($partial in @("(OI)(CI)R", "(CI)F", "(OI)F", "(OI)(CI)(IO)F")) {
+            $dir = Join-Path $root ("partial-" + [guid]::NewGuid())
+            New-Item -ItemType Directory -Path $dir | Out-Null
+            $out = & icacls.exe $dir /grant "*$($sid):$partial" 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "icacls $partial failed: $out" }
+            if (-not (Grant-AgentDirectory -Path $dir -Sid $sid -Root $root)) { throw "an existing $partial ACE was taken for the grant" }
+            $probe = Join-Path $dir "probe.txt"
+            $probeDir = Join-Path $dir "probe-dir"
+            Set-Content -LiteralPath $probe -Value "x"
+            New-Item -ItemType Directory -Path $probeDir | Out-Null
+            if (-not (Test-FullControl $dir $false) -or -not (Test-FullControl $probe $true) -or -not (Test-FullControl $probeDir $true)) {
+              throw "the grant over an existing $partial ACE did not land on the directory, a new file and a new subdirectory"
+            }
+          }
+          Write-Host "Read-only, container-only, object-only and inherit-only ACEs are no grant: the full one lands over each."
+
+          # A failure of the grant (a SID it cannot parse) is raised with the
+          # function's own message, never reported as a grant, and changes
+          # nothing.
+          $sddl = (Get-Acl -LiteralPath $fresh).Sddl
+          $raised = $null
+          try { Grant-AgentDirectory -Path $fresh -Sid "S-1-5-21-0-bogus" -Root $root | Out-Null } catch { $raised = $_.Exception.Message }
+          if ($null -eq $raised) { throw "a failed grant was reported as a grant" }
+          Write-Host "Failed grant raised: $raised"
+          if ($raised -notmatch ("^Could not grant the service account access to " + [regex]::Escape($fresh) + ": \S")) {
+            throw "the failed grant was not raised with the function's message: $raised"
+          }
+          if ((Get-Acl -LiteralPath $fresh).Sddl -ne $sddl) { throw "the failed grant changed the ACL of $fresh" }
+
+      # The bootstraps' work directory: under %SystemRoot%\Temp, owned by
+      # Administrators, protected from inheritance, writable by SYSTEM and
+      # Administrators only, so no other local user can create or rewrite the
+      # MSI, its extracted copy or the log in it; recorded with its marker.
+      - name: Verify the bootstrap's private work directory
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = Get-Content fivenines_setup.ps1 -Raw
+          foreach ($fn in 'Get-WorkDirectoryKey', 'New-PrivateWorkDirectory') {
+            $m = [regex]::Match($src, "(?ms)^function $fn \{.*?^\}")
+            if (-not $m.Success) { throw "$fn not found in fivenines_setup.ps1" }
+            Invoke-Expression $m.Value
+          }
+          $dir = New-PrivateWorkDirectory "fn-ci"
+          $key = Get-WorkDirectoryKey
+          try {
+            # Recorded with its marker, in the directory and in the key.
+            $marker = ([string](Get-Item -LiteralPath $key).GetValue((Split-Path -Leaf $dir))).Split('|')[0]
+            if (-not $marker -or (Get-Content -LiteralPath (Join-Path $dir ".fivenines-work-directory") -TotalCount 1) -ne $marker) { throw "$dir is not recorded with its marker" }
+            # The marker file: SYSTEM and Administrators only, the running user excluded.
+            $markerAcl = Get-Acl -LiteralPath (Join-Path $dir ".fivenines-work-directory")
+            $markerSids = @($markerAcl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+            if (-not $markerAcl.AreAccessRulesProtected -or ($markerSids -join ",") -ne "S-1-5-18,S-1-5-32-544" -or $markerAcl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne "S-1-5-32-544") { throw "the marker in $dir is open to: $($markerSids -join ', ')" }
+            $acl = Get-Acl -LiteralPath $dir
+            if (-not $acl.AreAccessRulesProtected) { throw "$dir inherits its parent's ACL" }
+            # Under %SystemRoot%\Temp, owned by Administrators; SYSTEM and
+            # Administrators, plus read-only for this runner's user (the user
+            # running a bootstrap reads its log unelevated).
+            if ((Split-Path -Parent $dir) -ne (Join-Path $env:SystemRoot "Temp")) { throw "$dir is not under %SystemRoot%\Temp" }
+            if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne "S-1-5-32-544") { throw "$dir is not owned by Administrators" }
+            $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            $expected = (@("S-1-5-18", "S-1-5-32-544", $me) | Sort-Object -Unique) -join ","
+            $readOnly = [int][System.Security.AccessControl.FileSystemRights]::ReadAndExecute -bor [int][System.Security.AccessControl.FileSystemRights]::Synchronize
+            $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+            $sids = @($rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+            if (($sids -join ",") -ne $expected) { throw "$dir is open to: $($sids -join ', ')" }
+            if (@($rules | Where-Object { $_.IsInherited -or $_.AccessControlType -ne 'Allow' }).Count -ne 0) { throw "$dir has an inherited or deny rule" }
+            if (@($rules | Where-Object { $_.IdentityReference.Value -eq $me -and ([int]$_.FileSystemRights -band -bnot $readOnly) -ne 0 }).Count -ne 0) { throw "the running user has more than read access to $dir" }
+            Set-Content -LiteralPath (Join-Path $dir "probe.txt") -Value "x"
+            $file = @((Get-Acl -LiteralPath (Join-Path $dir "probe.txt")).GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) |
+              ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+            if (($file -join ",") -ne $expected) { throw "a file in $dir is open to: $($file -join ', ')" }
+            Write-Host "$dir and what is created in it: SYSTEM and Administrators, and the running user read-only."
+          } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-ItemProperty -LiteralPath $key -Name (Split-Path -Leaf $dir) -ErrorAction SilentlyContinue
+          }
+
+      # The same under PowerShell 7, whose .NET has no
+      # Directory.CreateDirectory overload taking an ACL: the bootstraps are
+      # also run from pwsh.
+      - name: Verify the bootstrap's private work directory (PowerShell 7)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = Get-Content fivenines_setup.ps1 -Raw
+          foreach ($fn in 'Get-WorkDirectoryKey', 'New-PrivateWorkDirectory') {
+            $m = [regex]::Match($src, "(?ms)^function $fn \{.*?^\}")
+            if (-not $m.Success) { throw "$fn not found in fivenines_setup.ps1" }
+            Invoke-Expression $m.Value
+          }
+          $dir = New-PrivateWorkDirectory "fn-ci"
+          $key = Get-WorkDirectoryKey
+          try {
+            # Recorded with its marker, in the directory and in the key.
+            $marker = ([string](Get-Item -LiteralPath $key).GetValue((Split-Path -Leaf $dir))).Split('|')[0]
+            if (-not $marker -or (Get-Content -LiteralPath (Join-Path $dir ".fivenines-work-directory") -TotalCount 1) -ne $marker) { throw "$dir is not recorded with its marker" }
+            # The marker file: SYSTEM and Administrators only, the running user excluded.
+            $markerAcl = Get-Acl -LiteralPath (Join-Path $dir ".fivenines-work-directory")
+            $markerSids = @($markerAcl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+            if (-not $markerAcl.AreAccessRulesProtected -or ($markerSids -join ",") -ne "S-1-5-18,S-1-5-32-544" -or $markerAcl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne "S-1-5-32-544") { throw "the marker in $dir is open to: $($markerSids -join ', ')" }
+            $acl = Get-Acl -LiteralPath $dir
+            if (-not $acl.AreAccessRulesProtected) { throw "$dir inherits its parent's ACL" }
+            # Under %SystemRoot%\Temp, owned by Administrators; SYSTEM and
+            # Administrators, plus read-only for this runner's user (the user
+            # running a bootstrap reads its log unelevated).
+            if ((Split-Path -Parent $dir) -ne (Join-Path $env:SystemRoot "Temp")) { throw "$dir is not under %SystemRoot%\Temp" }
+            if ($acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value -ne "S-1-5-32-544") { throw "$dir is not owned by Administrators" }
+            $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+            $expected = (@("S-1-5-18", "S-1-5-32-544", $me) | Sort-Object -Unique) -join ","
+            $readOnly = [int][System.Security.AccessControl.FileSystemRights]::ReadAndExecute -bor [int][System.Security.AccessControl.FileSystemRights]::Synchronize
+            $rules = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]))
+            $sids = @($rules | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+            if (($sids -join ",") -ne $expected) { throw "$dir is open to: $($sids -join ', ')" }
+            if (@($rules | Where-Object { $_.IsInherited -or $_.AccessControlType -ne 'Allow' }).Count -ne 0) { throw "$dir has an inherited or deny rule" }
+            if (@($rules | Where-Object { $_.IdentityReference.Value -eq $me -and ([int]$_.FileSystemRights -band -bnot $readOnly) -ne 0 }).Count -ne 0) { throw "the running user has more than read access to $dir" }
+            Set-Content -LiteralPath (Join-Path $dir "probe.txt") -Value "x"
+            $file = @((Get-Acl -LiteralPath (Join-Path $dir "probe.txt")).GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) |
+              ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+            if (($file -join ",") -ne $expected) { throw "a file in $dir is open to: $($file -join ', ')" }
+            Write-Host "$dir and what is created in it: SYSTEM and Administrators, and the running user read-only."
+          } finally {
+            Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-ItemProperty -LiteralPath $key -Name (Split-Path -Leaf $dir) -ErrorAction SilentlyContinue
+          }
+
+      # What a run removes: the work directories earlier runs recorded, and
+      # only while each is a plain directory owned by Administrators that
+      # holds its recorded marker. An earlier run's directory goes, with its
+      # record, once older than the age floor; one a file in use keeps stays
+      # with its marker and record, and goes once the file is closed; one a
+      # run still alive recorded stays, record included, until that run
+      # ends, and so does its record of a directory not created yet. Kept:
+      # this run's; one that passes every check but was never recorded; and
+      # what stands at a recorded path once its directory is gone (a plain
+      # directory holding a forged marker, one owned by another account, a
+      # junction to another of these directories), whose record goes. A
+      # record whose directory is gone goes too.
+      - name: Verify the pruning of earlier work directories
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = Get-Content fivenines_setup.ps1 -Raw
+          foreach ($fn in 'Get-WorkDirectoryKey', 'New-PrivateWorkDirectory', 'Remove-WorkDirectory', 'Remove-EarlierWorkDirectories') {
+            $m = [regex]::Match($src, "(?ms)^function $fn \{.*?^\}")
+            if (-not $m.Success) { throw "$fn not found in fivenines_setup.ps1" }
+            Invoke-Expression $m.Value
+          }
+          $key = Get-WorkDirectoryKey
+          function Test-Recorded([string]$Path) { return $null -ne (Get-Item -LiteralPath $key).GetValue((Split-Path -Leaf $Path)) }
+          $current = New-PrivateWorkDirectory "fivenines-update"
+          $earlier = New-PrivateWorkDirectory "fivenines-setup"
+          Set-Content -LiteralPath (Join-Path $earlier "fivenines-agent-windows-amd64.msi") -Value "x"
+          $unrecorded = New-PrivateWorkDirectory "fivenines-setup"
+          Remove-ItemProperty -LiteralPath $key -Name (Split-Path -Leaf $unrecorded)
+          $forged = New-PrivateWorkDirectory "fivenines-setup"
+          Remove-Item -LiteralPath $forged -Recurse -Force
+          New-Item -ItemType Directory -Path $forged | Out-Null
+          Set-Content -LiteralPath (Join-Path $forged ".fivenines-work-directory") -Value ([guid]::NewGuid().ToString())
+          $target = New-PrivateWorkDirectory "fn-prune-target"
+          Set-Content -LiteralPath (Join-Path $target "keep.txt") -Value "x"
+          $linked = New-PrivateWorkDirectory "fivenines-update"
+          Remove-Item -LiteralPath $linked -Recurse -Force
+          cmd /c mklink /J "$linked" "$target" | Out-Null
+          if (-not (Test-Path -LiteralPath $linked)) { throw "mklink /J failed" }
+          $gone = New-PrivateWorkDirectory "fivenines-uninstall"
+          Remove-Item -LiteralPath $gone -Recurse -Force
+          $owned = New-PrivateWorkDirectory "fivenines-setup"
+          $ownedAcl = Get-Acl -LiteralPath $owned
+          $ownedAcl.SetOwner([System.Security.Principal.WindowsIdentity]::GetCurrent().User)
+          Set-Acl -LiteralPath $owned -AclObject $ownedAcl
+          $busy = New-PrivateWorkDirectory "fivenines-update"
+          $busyFile = Join-Path $busy "fivenines-update.log"
+          Set-Content -LiteralPath $busyFile -Value "x"
+          $held = $null
+          # A run still alive (another process): its directory and its record
+          # stay whatever their age, and so does the record of a directory it
+          # has not created yet.
+          $sleeper = Start-Process powershell -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Seconds 900' -PassThru -WindowStyle Hidden
+          $sleeperRun = "{0}|{1}" -f $sleeper.Id, (Get-Process -Id $sleeper.Id).StartTime.ToFileTimeUtc()
+          $live = New-PrivateWorkDirectory "fivenines-update"
+          $liveMarker = ([string](Get-Item -LiteralPath $key).GetValue((Split-Path -Leaf $live))).Split('|')[0]
+          Set-ItemProperty -LiteralPath $key -Name (Split-Path -Leaf $live) -Value "$liveMarker|$sleeperRun"
+          $pending = "fivenines-setup-" + [guid]::NewGuid()
+          New-ItemProperty -LiteralPath $key -Name $pending -Value "$([guid]::NewGuid())|$sleeperRun" -PropertyType String | Out-Null
+          try {
+            Remove-EarlierWorkDirectories -Keep $current
+            if (-not (Test-Path -LiteralPath $earlier) -or -not (Test-Recorded $earlier)) { throw "a directory younger than the age floor was removed" }
+            $held = [System.IO.File]::Open($busyFile, 'Open', 'Read', 'Read')
+            Remove-EarlierWorkDirectories -Keep $current -MinAgeMinutes 0
+            if ((Test-Path -LiteralPath $earlier) -or (Test-Recorded $earlier)) { throw "an earlier run's directory or its record was kept" }
+            if (-not (Test-Path -LiteralPath $current) -or -not (Test-Recorded $current)) { throw "this run's directory or its record was removed" }
+            if (-not (Test-Path -LiteralPath $unrecorded)) { throw "a directory never recorded was removed" }
+            if (-not (Test-Path -LiteralPath $forged)) { throw "a directory holding a forged marker was removed" }
+            if (Test-Recorded $forged) { throw "the record of a replaced directory was kept" }
+            if (-not (Test-Path -LiteralPath $linked)) { throw "a junction was removed" }
+            if (-not (Test-Path -LiteralPath (Join-Path $target "keep.txt"))) { throw "the junction's target was touched" }
+            if (Test-Recorded $linked) { throw "the record of a directory replaced by a junction was kept" }
+            if (Test-Recorded $gone) { throw "the record of a directory gone was kept" }
+            if (-not (Test-Path -LiteralPath $owned)) { throw "a directory owned by another account was removed" }
+            if (Test-Recorded $owned) { throw "the record of a directory owned by another account was kept" }
+            if (-not (Test-Path -LiteralPath (Join-Path $busy ".fivenines-work-directory")) -or -not (Test-Recorded $busy)) { throw "a directory a file in use kept lost its marker or its record" }
+            if (-not (Test-Path -LiteralPath $live) -or -not (Test-Recorded $live)) { throw "a live run's directory or its record was removed" }
+            if ($null -eq (Get-Item -LiteralPath $key).GetValue($pending)) { throw "a live run's record of a directory not created yet was dropped" }
+            $held.Dispose(); $held = $null
+            Stop-Process -Id $sleeper.Id -Force; $sleeper.WaitForExit()
+            Remove-EarlierWorkDirectories -Keep $current -MinAgeMinutes 0
+            if ((Test-Path -LiteralPath $busy) -or (Test-Recorded $busy)) { throw "a directory a file in use kept was not removed once the file was closed" }
+            if ((Test-Path -LiteralPath $live) -or (Test-Recorded $live)) { throw "a finished run's directory or its record was kept" }
+            if ($null -ne (Get-Item -LiteralPath $key).GetValue($pending)) { throw "a finished run's record of nothing was kept" }
+            $acl = Get-Acl -Path $key
+            $granted = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+            if (-not $acl.AreAccessRulesProtected -or ($granted -join ",") -ne "S-1-5-18,S-1-5-32-544") { throw "$key is open to: $($granted -join ', ')" }
+            Write-Host "Removed an earlier run's directory, one a file in use kept once the file was closed, and a live run's once it ended; dropped the records of four replaced or gone; kept this run's, a newer one, one never recorded, a forged one, one owned by another account and a junction with its target. The key is open to SYSTEM and Administrators only."
+          } finally {
+            if ($held) { $held.Dispose() }
+            Stop-Process -Id $sleeper.Id -Force -ErrorAction SilentlyContinue
+            Remove-ItemProperty -LiteralPath $key -Name $pending -ErrorAction SilentlyContinue
+            cmd /c rmdir "$linked" | Out-Null
+            foreach ($d in @($current, $earlier, $unrecorded, $forged, $target, $linked, $gone, $owned, $busy, $live)) {
+              Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
+              Remove-ItemProperty -LiteralPath $key -Name (Split-Path -Leaf $d) -ErrorAction SilentlyContinue
+            }
+          }
+
+      # The installed product's recorded install source (the MSI a repair
+      # reads) survives the pruning, matched whatever its case and with the
+      # trailing backslash Windows Installer writes. And the record key's ACL
+      # is reset when it is not exactly SYSTEM and Administrators, so no
+      # local user can read a marker and forge one.
+      # Value: protects=the installed product's recorded install source survives the pruning; fails_when=the InstallSource keep is dropped or compares paths wrongly (trailing backslash, case); why_new=no CI case seeds an Uninstall entry; seam=none; no_claim=a real msiexec repair
+      # Value: protects=the markers stay unreadable to local users, so none can forge one; fails_when=the repair branch of Get-WorkDirectoryKey stops resetting an ACL that is not exactly SYSTEM and Administrators; why_new=CI only ever sees a fresh or already-correct key; seam=none; no_claim=that the window between key creation and the ACL reset is closed
+      - name: Verify the install source is kept and the record key's ACL repaired
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = Get-Content fivenines_setup.ps1 -Raw
+          foreach ($fn in 'Get-WorkDirectoryKey', 'New-PrivateWorkDirectory', 'Remove-WorkDirectory', 'Remove-EarlierWorkDirectories') {
+            $m = [regex]::Match($src, "(?ms)^function $fn \{.*?^\}")
+            if (-not $m.Success) { throw "$fn not found in fivenines_setup.ps1" }
+            Invoke-Expression $m.Value
+          }
+          $key = Get-WorkDirectoryKey
+          $uninstall = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+          if (@(Get-ItemProperty "$uninstall\*" -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match "Fivenines Monitoring Agent" }).Count -ne 0) {
+            throw "a Fivenines Monitoring Agent product is already registered on this runner; this step needs none"
+          }
+          $source = New-PrivateWorkDirectory "fivenines-setup"
+          $current = New-PrivateWorkDirectory "fivenines-update"
+          $entry = Join-Path $uninstall ("{" + [guid]::NewGuid().ToString().ToUpper() + "}")
+          try {
+            New-Item -Path $entry -Force | Out-Null
+            New-ItemProperty -LiteralPath $entry -Name DisplayName -Value "Fivenines Monitoring Agent" -PropertyType String | Out-Null
+            New-ItemProperty -LiteralPath $entry -Name InstallSource -Value ($source.ToUpper() + "\") -PropertyType String | Out-Null
+            Remove-EarlierWorkDirectories -Keep $current -MinAgeMinutes 0
+            if (-not (Test-Path -LiteralPath $source)) { throw "the installed product's install source was removed" }
+            if ($null -eq (Get-Item -LiteralPath $key).GetValue((Split-Path -Leaf $source))) { throw "the install source's record was removed" }
+
+            # Open the key to BUILTIN\Users, then let Get-WorkDirectoryKey repair it.
+            $acl = Get-Acl -Path $key
+            $acl.AddAccessRule((New-Object System.Security.AccessControl.RegistryAccessRule(
+              (New-Object System.Security.Principal.SecurityIdentifier("S-1-5-32-545")),
+              [System.Security.AccessControl.RegistryRights]::ReadKey,
+              [System.Security.AccessControl.InheritanceFlags]::ContainerInherit,
+              [System.Security.AccessControl.PropagationFlags]::None,
+              [System.Security.AccessControl.AccessControlType]::Allow)))
+            Set-Acl -Path $key -AclObject $acl
+            $opened = @((Get-Acl -Path $key).GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value })
+            if ($opened -notcontains "S-1-5-32-545") { throw "could not open $key to BUILTIN\Users for the test" }
+            Get-WorkDirectoryKey | Out-Null
+            $acl = Get-Acl -Path $key
+            $granted = @($acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier]) | ForEach-Object { $_.IdentityReference.Value } | Sort-Object -Unique)
+            if (-not $acl.AreAccessRulesProtected -or ($granted -join ",") -ne "S-1-5-18,S-1-5-32-544") { throw "$key was not repaired; open to: $($granted -join ', ')" }
+            Write-Host "Kept the install source an Uninstall entry records (upper case, trailing backslash) with its record; reset a key opened to BUILTIN\Users to SYSTEM and Administrators."
+          } finally {
+            Remove-Item -LiteralPath $entry -Recurse -Force -ErrorAction SilentlyContinue
+            foreach ($d in @($source, $current)) {
+              Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
+              Remove-ItemProperty -LiteralPath $key -Name (Split-Path -Leaf $d) -ErrorAction SilentlyContinue
+            }
+          }
+
+      # What a successful uninstall leaves: no work directory these scripts
+      # recorded, whatever its age, except one a file in use keeps and one a
+      # run still alive recorded (each with its record, so the key stays); no
+      # fivenines-bootstrap key once it
+      # records nothing; and no Five-Nines.io key once it is empty -- never
+      # a vendor key that still holds something.
+      # Value: protects=a successful uninstall leaves no work directory, no fivenines-bootstrap key and no empty Five-Nines.io key, and never removes a vendor key that still holds something; fails_when=the record, key or vendor cleanup regresses, or a non-empty vendor key is removed; why_new=only a static check covers it; seam=none; no_claim=msiexec /x itself
+      - name: Verify the uninstall removes its work directory and empty keys
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = Get-Content fivenines_setup.ps1 -Raw
+          foreach ($fn in 'Get-WorkDirectoryKey', 'New-PrivateWorkDirectory', 'Remove-WorkDirectory', 'Remove-EarlierWorkDirectories') {
+            $m = [regex]::Match($src, "(?ms)^function $fn \{.*?^\}")
+            if (-not $m.Success) { throw "$fn not found in fivenines_setup.ps1" }
+            Invoke-Expression $m.Value
+          }
+          $m = [regex]::Match((Get-Content fivenines_uninstall.ps1 -Raw), "(?ms)^function Remove-AllWorkDirectories \{.*?^\}")
+          if (-not $m.Success) { throw "Remove-AllWorkDirectories not found in fivenines_uninstall.ps1" }
+          Invoke-Expression $m.Value
+          $vendor = "HKLM:\SOFTWARE\Five-Nines.io"
+          $bootstrap = "$vendor\fivenines-bootstrap"
+          $sibling = "$vendor\fn-ci-sibling"
+          # Content in the vendor key this step did not create (other than the
+          # bootstrap key earlier steps use) means scenario (b) cannot expect it gone.
+          $foreign = $false
+          $v = Get-Item -LiteralPath $vendor -ErrorAction SilentlyContinue
+          if ($v) {
+            $foreign = ($v.ValueCount -ne 0) -or (@($v.GetSubKeyNames() | Where-Object { $_ -ne "fivenines-bootstrap" -and $_ -ne "fn-ci-sibling" }).Count -ne 0)
+          }
+          function Test-Recorded([string]$Path) { return (Test-Path -LiteralPath $bootstrap) -and $null -ne (Get-Item -LiteralPath $bootstrap).GetValue((Split-Path -Leaf $Path)) }
+          $createdSibling = $false
+          $held = $null
+          $sleeper = $null
+          $dirs = @()
+          try {
+            if (-not (Test-Path -LiteralPath $sibling)) { New-Item -Path $sibling -Force | Out-Null; $createdSibling = $true }
+
+            # (a) A recent setup's directory goes whatever its age; one a file
+            # in use keeps stays with its record, so the bootstrap key stays,
+            # and the vendor key, which also holds another subkey, stays.
+            $WorkDir = New-PrivateWorkDirectory "fivenines-uninstall"
+            $dirs += $WorkDir
+            Set-Content -LiteralPath (Join-Path $WorkDir "fivenines_uninstall.log") -Value "x"
+            $young = New-PrivateWorkDirectory "fivenines-setup"
+            $dirs += $young
+            Set-Content -LiteralPath (Join-Path $young "fivenines-agent-windows-amd64.msi") -Value "x"
+            $busy = New-PrivateWorkDirectory "fivenines-update"
+            $dirs += $busy
+            $busyFile = Join-Path $busy "fivenines-update.log"
+            Set-Content -LiteralPath $busyFile -Value "x"
+            $held = [System.IO.File]::Open($busyFile, 'Open', 'Read', 'Read')
+            # A setup still running (another process) while the uninstall ends:
+            # its directory stays, record included, whatever its age.
+            $sleeper = Start-Process powershell -ArgumentList '-NoProfile', '-Command', 'Start-Sleep -Seconds 900' -PassThru -WindowStyle Hidden
+            $live = New-PrivateWorkDirectory "fivenines-setup"
+            $dirs += $live
+            $liveMarker = ([string](Get-Item -LiteralPath $bootstrap).GetValue((Split-Path -Leaf $live))).Split('|')[0]
+            Set-ItemProperty -LiteralPath $bootstrap -Name (Split-Path -Leaf $live) -Value ("{0}|{1}|{2}" -f $liveMarker, $sleeper.Id, (Get-Process -Id $sleeper.Id).StartTime.ToFileTimeUtc())
+            Remove-AllWorkDirectories
+            if (Test-Path -LiteralPath $WorkDir) { throw "the uninstall's work directory was kept" }
+            if (Test-Recorded $WorkDir) { throw "the uninstall's record was kept" }
+            if ((Test-Path -LiteralPath $young) -or (Test-Recorded $young)) { throw "a recent setup's directory or its record was kept" }
+            if (-not (Test-Path -LiteralPath $busy) -or -not (Test-Recorded $busy)) { throw "a directory a file in use kept lost its record, or the bootstrap key went" }
+            if (-not (Test-Path -LiteralPath $vendor)) { throw "$vendor was removed though it holds another subkey" }
+            if (-not (Test-Path -LiteralPath $sibling)) { throw "$sibling was removed" }
+            if (-not (Test-Path -LiteralPath $live) -or -not (Test-Recorded $live)) { throw "the uninstall removed the directory or the record of a setup still running" }
+            $held.Dispose(); $held = $null
+            Stop-Process -Id $sleeper.Id -Force; $sleeper.WaitForExit()
+
+            # (b) No sibling, no file in use: everything goes, the empty
+            # bootstrap and vendor keys too.
+            if ($createdSibling) { Remove-Item -LiteralPath $sibling -Force; $createdSibling = $false }
+            $WorkDir = New-PrivateWorkDirectory "fivenines-uninstall"
+            $dirs += $WorkDir
+            Set-Content -LiteralPath (Join-Path $WorkDir "fivenines_uninstall.log") -Value "x"
+            Remove-AllWorkDirectories
+            if (Test-Path -LiteralPath $WorkDir) { throw "the uninstall's work directory was kept" }
+            if ((Test-Path -LiteralPath $busy) -or (Test-Recorded $busy)) { throw "the directory a file in use kept was not removed once the file was closed" }
+            if ((Test-Path -LiteralPath $live) -or (Test-Recorded $live)) { throw "a finished setup's directory or its record was kept" }
+            $left = @()
+            if (Test-Path -LiteralPath $bootstrap) { $left = @((Get-Item -LiteralPath $bootstrap).GetValueNames()) }
+            if ($left.Count -eq 0 -and (Test-Path -LiteralPath $bootstrap)) { throw "$bootstrap was kept though it records nothing" }
+            $checked = "skipped: $vendor holds content this step did not create (records left: $($left -join ', '))"
+            if (-not $foreign -and ((Test-Path -LiteralPath $sibling) -or $left.Count -ne 0)) { $foreign = $true }
+            if (-not $foreign) {
+              if (Test-Path -LiteralPath $vendor) { throw "$vendor was kept though empty" }
+              $checked = "the empty $vendor went too"
+            }
+            Write-Host "Removed the uninstall's work directory, a recent setup's and, once its file was closed or its run ended, one a file in use kept and one a running setup recorded, with their records and the empty bootstrap key; kept $vendor while it held another subkey; vendor key check: $checked."
+          } finally {
+            if ($held) { $held.Dispose() }
+            if ($sleeper) { Stop-Process -Id $sleeper.Id -Force -ErrorAction SilentlyContinue }
+            foreach ($d in $dirs) {
+              Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
+              if (Test-Path -LiteralPath $bootstrap) { Remove-ItemProperty -LiteralPath $bootstrap -Name (Split-Path -Leaf $d) -ErrorAction SilentlyContinue }
+            }
+            if ($createdSibling) { Remove-Item -LiteralPath $sibling -Force -ErrorAction SilentlyContinue }
+          }
+
+      # The bootstraps' msiexec wrapper, against a stand-in msiexec that
+      # answers 1618 twice, then 0: the busy answers are retried, a failure is
+      # not, and every call carries /norestart and exactly one UI level,
+      # /passive or /qn, never one that shows a modal box. Run as SYSTEM in
+      # session 0 (a scheduled task, as an RMM tool or Intune runs it), the
+      # level is /qn.
+      - name: Verify msiexec retries
+        shell: powershell
+        # A lost retry bound would spin until GitHub's six-hour limit.
+        timeout-minutes: 5
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = Get-Content fivenines_setup.ps1 -Raw
+          $m = [regex]::Match($src, "(?ms)^function Invoke-Msiexec \{.*?^\}")
+          if (-not $m.Success) { throw "Invoke-Msiexec not found in fivenines_setup.ps1" }
+          Invoke-Expression $m.Value
+          $dir = Join-Path $env:RUNNER_TEMP ("fn-msiexec-" + [guid]::NewGuid())
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          $fake = Join-Path $dir "fake-msiexec.cmd"
+          $callsFile = Join-Path $dir "calls.txt"
+          # Answers the Nth call with the Nth code of $Codes, the last one after.
+          function New-Fake($Codes) {
+            $lines = @(
+              '@echo off',
+              'echo %*>>"%~dp0calls.txt"',
+              'for /f %%c in (''find /c /v "" ^< "%~dp0calls.txt"'') do set n=%%c'
+            )
+            for ($i = 0; $i -lt $Codes.Count - 1; $i++) { $lines += ('if %n%=={0} exit /b {1}' -f ($i + 1), $Codes[$i]) }
+            $lines += ('exit /b {0}' -f $Codes[-1])
+            Set-Content -LiteralPath $fake -Value $lines -Encoding ascii
+            Remove-Item -LiteralPath $callsFile -ErrorAction SilentlyContinue
+          }
+          function Get-Calls { return @(Get-Content -LiteralPath $callsFile) }
+
+          New-Fake @(1618, 1618, 0)
+          $code = Invoke-Msiexec -Arguments @("/i", "x.msi") -FilePath $fake -RetrySeconds 0
+          $calls = Get-Calls
+          if ($code -ne 0 -or $calls.Count -ne 3) { throw "busy twice then done: exit $code after $($calls.Count) calls, expected 0 after 3" }
+          foreach ($call in $calls) {
+            if ($call -match "/q[br]") { throw "a UI level that shows modal boxes: $call" }
+            $ui = @($call -split " " | Where-Object { $_ -in @("/passive", "/qn") })
+            if ($ui.Count -ne 1 -or $call -notmatch "/norestart") { throw "unexpected msiexec arguments: $call" }
+          }
+          Write-Host "1618 twice, then 0: three calls, each with one UI level ($ui) and /norestart."
+
+          New-Fake @(1601)
+          $code = Invoke-Msiexec -Arguments @("/x", "{x}") -FilePath $fake -RetrySeconds 0
+          if ($code -ne 1601 -or (Get-Calls).Count -ne 4) { throw "always busy: exit $code after $((Get-Calls).Count) calls, expected 1601 after 4" }
+          New-Fake @(1603)
+          $code = Invoke-Msiexec -Arguments @("/i", "x.msi") -FilePath $fake -RetrySeconds 0
+          if ($code -ne 1603 -or (Get-Calls).Count -ne 1) { throw "a failure was retried: exit $code after $((Get-Calls).Count) calls" }
+          New-Fake @(0)
+          Invoke-Msiexec -Arguments @("/a", "x.msi") -Quiet -FilePath $fake -RetrySeconds 0 | Out-Null
+          # @(...) around the call: a function's one-element array comes back as its element.
+          $first = @(Get-Calls)[0]
+          if ($first -notmatch "/qn") { throw "-Quiet did not force /qn: $first" }
+          Write-Host "Always busy: four calls, then the code. A failure: one call. -Quiet: /qn."
+
+          New-Fake @(0)
+          $run = Join-Path $dir "session0.ps1"
+          Set-Content -LiteralPath $run -Encoding ascii -Value ($m.Value + "`r`nInvoke-Msiexec -Arguments @('/i', 'x.msi') -FilePath '$fake' -RetrySeconds 0 | Out-Null`r`n")
+          $task = "fn-ci-msiexec-session0"
+          $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument ('-NoProfile -ExecutionPolicy Bypass -File "{0}"' -f $run)
+          Register-ScheduledTask -TaskName $task -Action $action -User "SYSTEM" -RunLevel Highest -Force | Out-Null
+          try {
+            Start-ScheduledTask -TaskName $task
+            $deadline = (Get-Date).AddSeconds(120)
+            while (-not (Test-Path -LiteralPath $callsFile)) {
+              if ((Get-Date) -gt $deadline) { throw "the SYSTEM task never called msiexec" }
+              Start-Sleep -Seconds 1
+            }
+            $first = @(Get-Calls)[0]
+            if ($first -notmatch "/qn" -or $first -notmatch "/norestart") { throw "session 0 did not get /qn /norestart: $first" }
+            Write-Host "As SYSTEM in session 0: /qn /norestart."
+          } finally {
+            Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
+          }
+          Remove-Item -LiteralPath $dir -Recurse -Force
 
       # Helpers duplicated across scripts that cannot share a file: the
       # custom actions are separate MSI files, the bootstraps are downloaded
@@ -302,9 +1018,22 @@ jobs:
           }
           $pairs = @(
             @('Resolve-ServiceAccountSid', 'windows/installer/SetTokenFileAcl.ps1', 'windows/installer/DelegateWmiStorageNamespace.ps1'),
+            @('Resolve-ServiceAccountSid', 'windows/installer/SetTokenFileAcl.ps1', 'fivenines_setup.ps1'),
+            @('Resolve-ServiceAccountSid', 'windows/installer/SetTokenFileAcl.ps1', 'fivenines_update.ps1'),
             @('ConvertTo-MsiPasswordArgument', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
             @('Get-MsiProductCode', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
+            @('Get-PreflightVerdict', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
             @('Invoke-AccountPreflight', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
+            @('New-PrivateWorkDirectory', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
+            @('Invoke-Msiexec', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
+            @('Invoke-Msiexec', 'fivenines_setup.ps1', 'fivenines_uninstall.ps1'),
+            @('New-PrivateWorkDirectory', 'fivenines_setup.ps1', 'fivenines_uninstall.ps1'),
+            @('Remove-EarlierWorkDirectories', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
+            @('Remove-EarlierWorkDirectories', 'fivenines_setup.ps1', 'fivenines_uninstall.ps1'),
+            @('Get-WorkDirectoryKey', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
+            @('Get-WorkDirectoryKey', 'fivenines_setup.ps1', 'fivenines_uninstall.ps1'),
+            @('Remove-WorkDirectory', 'fivenines_setup.ps1', 'fivenines_update.ps1'),
+            @('Remove-WorkDirectory', 'fivenines_setup.ps1', 'fivenines_uninstall.ps1'),
             @('Get-WinNTUser', 'windows/installer/CreateServiceAccount.ps1', 'fivenines_uninstall.ps1'),
             @('Get-WmiNamespaceSD', 'windows/installer/DelegateWmiStorageNamespace.ps1', 'fivenines_uninstall.ps1'),
             @('Set-WmiNamespaceSD', 'windows/installer/DelegateWmiStorageNamespace.ps1', 'fivenines_uninstall.ps1')
@@ -327,6 +1056,185 @@ jobs:
           $arg = ConvertTo-MsiPasswordArgument (ConvertTo-SecureString 'p a$s\w;rd' -AsPlainText -Force)
           if ($arg -ne 'SERVICEACCOUNTPASSWORD="p a$s\w;rd"') { throw "unexpected msiexec argument: $arg" }
           Write-Host "ConvertTo-MsiPasswordArgument refuses '', a quote, a trailing backslash and a leading '-'."
+
+      # The bootstraps' verdict on the plan the MSI's account step prints,
+      # case by case under Windows PowerShell 5.1 (Get-PreflightVerdict is
+      # pure): on the version already installed the password is applied in
+      # place only to the account the service already runs as, and a
+      # password LogonUser could not answer for is used with a warning.
+      - name: Verify the bootstrap preflight's verdicts
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $m = [regex]::Match((Get-Content fivenines_setup.ps1 -Raw), "(?ms)^function Get-PreflightVerdict \{.*?^\}")
+          if (-not $m.Success) { throw "Get-PreflightVerdict not found in fivenines_setup.ps1" }
+          Invoke-Expression $m.Value
+
+          $accountSid = "S-1-5-21-1-2-3-1001"
+          $svc = "HOST\fivenines-agent"
+          $reinstall = "fivenines_uninstall.ps1 -KeepAccount, then fivenines_setup.ps1 -Token <token> -ServiceAccountPassword <password>"
+          # A plan line as CreateServiceAccount.ps1 -PlanOnly prints it, and
+          # as v1.22.1's printed it (no sid, no checked).
+          function New-Plan($Action, $Sid = $accountSid, $Checked = $true, $Message = $null) {
+            return [pscustomobject]@{ action = $Action; message = $Message; sid = $Sid; checked = $Checked }
+          }
+          $older = [pscustomobject]@{ action = "UseProvided"; message = $null }
+
+          $script:failed = 0
+          function Check($Label, $Plan, $HasPassword, $Installed, $ServiceAccount, $ServiceSid, $Action, [string[]]$Mentions = @()) {
+            $v = Get-PreflightVerdict -Plan $Plan -HasPassword $HasPassword -Installed $Installed `
+              -AccountName "fivenines-agent" -ServiceAccount $ServiceAccount -ServiceSid $ServiceSid
+            $problem = $null
+            if ($v.Action -ne $Action) {
+              $problem = "$($v.Action), expected $Action"
+            } elseif (-not $Mentions -and $v.Message) {
+              $problem = "unexpected message"
+            } else {
+              foreach ($want in $Mentions) {
+                if (-not "$($v.Message)".Contains($want)) { $problem = "the message does not mention '$want'" }
+              }
+            }
+            if ($problem) { Write-Host "FAIL $Label -> $problem ($($v.Message))"; $script:failed++ }
+            else { Write-Host "ok   $Label -> $Action" }
+          }
+
+          # The MSI's own refusal stops everything.
+          Check "MSI refuses"              (New-Plan "Refuse" $accountSid $true "wrong password") $true "same" $svc $accountSid "Refuse" @("Nothing was changed: wrong password")
+          Check "MSI refuses, upgrade"     (New-Plan "Refuse" $accountSid $true "wrong password") $true "other" "" "" "Refuse" @("Nothing was changed: wrong password")
+          Check "MSI refuses, no password" (New-Plan "Refuse" $accountSid $false "needs a password") $false "none" "" "" "Refuse" @("Nothing was changed: needs a password")
+
+          # msiexec runs: a fresh install or an upgrade.
+          Check "create, no password"      (New-Plan "Create" $null $false) $false "none" "" "" "Install"
+          Check "rotate, no password"      (New-Plan "Rotate" $accountSid $false) $false "none" "" "" "Install"
+          Check "checked, upgrade"         (New-Plan "UseProvided") $true "other" "" "" "Install"
+          Check "create, upgrade"          (New-Plan "Create" $null $false) $true "other" "" "" "Install"
+
+          # A password LogonUser could not answer for (or an MSI too old to
+          # say) is used as given, with a warning, an upgrade included: the
+          # account step applies it, and a rerun repairs a wrong one in place.
+          Check "unchecked, upgrade"       (New-Plan "UseProvided" $accountSid $false) $true "other" "" "" "Install" @("could not be checked", "run this script again")
+          Check "older MSI, upgrade"       $older $true "other" "" "" "Install" @("could not be checked")
+          Check "older MSI, not installed" $older $true "none" "" "" "Install" @("could not be checked")
+          Check "unchecked, not installed" (New-Plan "UseProvided" $accountSid $false) $true "none" "" "" "Install" @("used as given")
+          Check "unchecked, same version"  (New-Plan "UseProvided" $accountSid $false) $true "same" $svc $accountSid "InPlace" @("used as given")
+
+          # The version already installed: in place only for the account the
+          # service runs as; anything else is a reinstall.
+          Check "same, its account"        (New-Plan "UseProvided") $true "same" $svc $accountSid "InPlace"
+          Check "same, rotate"             (New-Plan "Rotate" $accountSid $false) $true "same" $svc $accountSid "InPlace"
+          Check "same, another account"    (New-Plan "UseProvided") $true "same" "HOST\monitoring" "S-1-5-21-1-2-3-1002" "Refuse" @("runs as 'HOST\monitoring'", $reinstall)
+          Check "same, unresolved account" (New-Plan "UseProvided") $true "same" "LocalSystem" "" "Refuse" @("runs as 'LocalSystem'", $reinstall)
+          Check "same, no service"         (New-Plan "UseProvided") $true "same" "" "" "Refuse" @("no fivenines-agent service", $reinstall)
+          Check "same, account deleted"    (New-Plan "Create" $null $false) $true "same" $svc "" "Refuse" @("would create account 'fivenines-agent'", $reinstall)
+          Check "same, older MSI"          $older $true "same" $svc $accountSid "Refuse" @("does not say which account", $reinstall)
+
+          if ($script:failed -gt 0) { throw "$($script:failed) preflight verdict case(s) failed" }
+
+      # CreateServiceAccount.ps1 -PlanOnly for real on this runner, which is
+      # in no domain: the plan line carries the existing account's SID and
+      # whether LogonUser answered for the password (the verdicts above rest
+      # on both), an expired account is refused by name, and so is an agent
+      # directory the account step would refuse to grant.
+      - name: Verify the -PlanOnly plan line (sid, checked)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          function Get-Plan($Account, $Password) {
+            $arguments = @{ ServiceAccount = $Account }
+            if ($Password) { $arguments.Password = $Password }
+            $line = @(& windows/installer/CreateServiceAccount.ps1 @arguments -PlanOnly) |
+              Where-Object { "$_" -like "FIVENINES_PLAN *" } | Select-Object -Last 1
+            if (-not $line) { throw "CreateServiceAccount.ps1 -PlanOnly printed no plan for $Account" }
+            return "$line".Substring("FIVENINES_PLAN ".Length) | ConvertFrom-Json
+          }
+          $script:failed = 0
+          function Check($Label, $Plan, $Action, $Sid, [bool]$Checked, $Mentions) {
+            $keys = (@($Plan.PSObject.Properties.Name) | Sort-Object) -join ","
+            $problem = $null
+            if ($keys -ne "action,checked,message,sid") {
+              $problem = "keys $keys"
+            } elseif (-not ($Plan.checked -is [bool])) {
+              $problem = "checked is not a boolean: '$($Plan.checked)'"
+            } elseif ($Plan.action -ne $Action -or "$($Plan.sid)" -ne "$Sid" -or $Plan.checked -ne $Checked) {
+              $problem = "$($Plan.action) sid=$($Plan.sid) checked=$($Plan.checked), expected $Action sid=$Sid checked=$Checked"
+            } elseif ($Mentions -and -not "$($Plan.message)".Contains($Mentions)) {
+              $problem = "the message does not mention '$Mentions': $($Plan.message)"
+            }
+            if ($problem) { Write-Host "FAIL $Label -> $problem"; $script:failed++ }
+            else { Write-Host "ok   $Label -> $Action sid=$($Plan.sid) checked=$($Plan.checked)" }
+          }
+          function New-TestUser($Name, $Password) {
+            New-LocalUser -Name $Name -Password (ConvertTo-SecureString $Password -AsPlainText -Force) -Description "ci: not MSI-managed" | Out-Null
+            return (Get-LocalUser -Name $Name).SID.Value
+          }
+
+          $password = "Aa1-" + [guid]::NewGuid()
+          $policy = Join-Path $env:TEMP "fn-plan-rights.cfg"
+          $policyDb = Join-Path $env:TEMP "fn-plan-rights.sdb"
+          try {
+            Check "absent account" (Get-Plan ".\fn-plan-absent") "Create" $null $false $null
+
+            $sid = New-TestUser "fn-plan-a" $password
+            Check "no password"    (Get-Plan "$env:COMPUTERNAME\fn-plan-a") "Refuse" $sid $false "SERVICEACCOUNTPASSWORD"
+            Check "right password" (Get-Plan ".\fn-plan-a" $password) "UseProvided" $sid $true $null
+            Check "wrong password" (Get-Plan ".\fn-plan-a" "Wrong-$password") "Refuse" $sid $true "wrong password"
+
+            # ERROR_ACCOUNT_EXPIRED (1793), refused by name.
+            $sid = New-TestUser "fn-plan-b" $password
+            Set-LocalUser -Name "fn-plan-b" -AccountExpires (Get-Date).AddDays(-2)
+            Check "expired account" (Get-Plan ".\fn-plan-b" $password) "Refuse" $sid $true "the account has expired"
+
+            # Network logon denied to the account, as CIS-hardened hosts deny
+            # it to every local account: LogonUser answers 1385
+            # (ERROR_LOGON_TYPE_NOT_GRANTED) only once the password was
+            # accepted, so the right password reads as checked and a wrong one
+            # still answers 1326. The entry is left for the deleted test
+            # account, which this runner never reuses.
+            function Add-Right($Right, $Sid) {
+              secedit /export /cfg $policy /areas USER_RIGHTS /quiet | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "secedit /export failed: $LASTEXITCODE" }
+              $content = @(Get-Content $policy)
+              if ($content -match "^$Right\s*=") {
+                $content = $content | ForEach-Object { if ($_ -match "^$Right\s*=") { $_.TrimEnd() + ",*$Sid" } else { $_ } }
+              } else {
+                $content = $content | ForEach-Object { $_; if ($_ -match '^\[Privilege Rights\]') { "$Right = *$Sid" } }
+              }
+              $content | Set-Content -Encoding ascii $policy
+              secedit /configure /db $policyDb /cfg $policy /areas USER_RIGHTS /quiet | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "secedit /configure failed: $LASTEXITCODE" }
+            }
+            $sid = New-TestUser "fn-plan-c" $password
+            Add-Right "SeDenyNetworkLogonRight" $sid
+            Check "network logon denied, right password" (Get-Plan ".\fn-plan-c" $password) "UseProvided" $sid $true $null
+            Check "network logon denied, wrong password" (Get-Plan ".\fn-plan-c" "Wrong-$password") "Refuse" $sid $true "wrong password"
+
+            # An agent directory the account step would refuse to grant (here
+            # a logs directory that is a junction) is refused by the plan too,
+            # so the bootstraps stop before msiexec; a plain one is not.
+            $programDataRoot = Join-Path $env:RUNNER_TEMP ("fn-plan-pd-" + [guid]::NewGuid())
+            $elsewhere = Join-Path $programDataRoot "elsewhere"
+            $planLogs = Join-Path $programDataRoot "fivenines_agent\logs"
+            New-Item -ItemType Directory -Path (Join-Path $programDataRoot "fivenines_agent"), $elsewhere | Out-Null
+            $savedProgramData = $env:ProgramData
+            try {
+              $env:ProgramData = $programDataRoot
+              Check "plain agent directory" (Get-Plan ".\fn-plan-absent") "Create" $null $false $null
+              cmd /c mklink /J "$planLogs" "$elsewhere" | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "mklink /J failed" }
+              Check "logs directory a junction" (Get-Plan ".\fn-plan-absent") "Refuse" $null $false "is a junction or a symbolic link"
+              # Its target gone: the plan still refuses it, as the account
+              # step would, rather than letting msiexec remove the agent.
+              Remove-Item -LiteralPath $elsewhere -Force
+              Check "logs directory a dangling junction" (Get-Plan ".\fn-plan-absent") "Refuse" $null $false "is a junction or a symbolic link"
+              cmd /c rmdir "$planLogs" | Out-Null
+            } finally {
+              $env:ProgramData = $savedProgramData
+            }
+          } finally {
+            foreach ($name in @("fn-plan-a", "fn-plan-b", "fn-plan-c")) { Remove-LocalUser -Name $name -ErrorAction SilentlyContinue }
+            Remove-Item $policy, $policyDb -ErrorAction SilentlyContinue
+          }
+          if ($script:failed -gt 0) { throw "$($script:failed) plan line case(s) failed" }
 
       - name: Upload Windows coverage
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -571,7 +1479,11 @@ jobs:
           $u = Get-LocalUser -Name "fivenines-agent"
           $m = [regex]::Match((Get-Content windows/installer/SetTokenFileAcl.ps1 -Raw), "(?ms)^function Resolve-ServiceAccountSid \{.*?^\}")
           Invoke-Expression $m.Value
-          foreach ($spelling in @("$env:COMPUTERNAME\fivenines-agent", ".\fivenines-agent", "fivenines-agent")) {
+          # The service's StartName too, as the bootstraps resolve it before
+          # applying a password in place (sc.exe got the name the SID
+          # translates back to).
+          $startName = (Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'").StartName
+          foreach ($spelling in @("$env:COMPUTERNAME\fivenines-agent", ".\fivenines-agent", "fivenines-agent", $startName)) {
             $sid = Resolve-ServiceAccountSid $spelling
             if ($sid -ne $u.SID) { throw "'$spelling' resolved to $sid, expected $($u.SID)" }
             Write-Host "'$spelling' -> $sid"
@@ -657,27 +1569,58 @@ jobs:
             }
           }
 
+      # The account step's grant on the agent's two directories, as the MSI
+      # leaves it: an explicit allow ACE giving the account FullControl,
+      # inherited by files and subdirectories (the config dir's state files,
+      # WinSW's logs). The service reaching Running shows only the log dir's.
+      # Value: protects=after a real install the config and log dirs both grant the account inheritable FullControl; fails_when=the account step skips or misgrants one of them; why_new=the static test reads the call site, and the service running proves only logs; seam=none; no_claim=upgrades
+      - name: Verify the agent directories grant the account FullControl
+        shell: pwsh
+        run: |
+          $sid = (Get-LocalUser -Name "fivenines-agent").SID.Value
+          foreach ($dir in @("fivenines_agent", "fivenines_agent\logs")) {
+            $path = Join-Path $env:ProgramData $dir
+            $grants = @((Get-Acl -LiteralPath $path).GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) | Where-Object {
+              $_.IdentityReference.Value -eq $sid -and "$($_.AccessControlType)" -eq "Allow" -and
+              (([int]$_.FileSystemRights -band 0x1F01FF) -eq 0x1F01FF) -and
+              (([int]$_.InheritanceFlags -band 3) -eq 3) -and (([int]$_.PropagationFlags -band 2) -eq 0) })
+            if ($grants.Count -lt 1) {
+              Write-Error "$path does not grant fivenines-agent ($sid) inheritable FullControl"
+              exit 1
+            }
+            Write-Host "OK: $path grants $sid FullControl, inherited below it."
+          }
+
       # fivenines_update.ps1 -ServiceAccountPassword on the version already
       # installed: the MSI alone would run in maintenance mode, never reach
       # the account and report success. The bootstrap checks the account
       # first (the MSI's own CreateServiceAccount.ps1 -PlanOnly, extracted by
       # an administrative install), refusing a wrong password before touching
       # anything, then applies a right one with that same account step and
-      # restarts the service -- no msiexec run, nothing removed.
-      - name: fivenines_update.ps1 -ServiceAccountPassword, wrong then right, on the installed version
+      # restarts the service -- no msiexec run, nothing removed. Then the
+      # same through fivenines_setup.ps1 with a relative -MsiPath (and a new
+      # -Token, which is not written there), and two refusals that change
+      # nothing: an MSI whose ProductCode cannot be read, and a service that
+      # no longer runs as the account the step would update.
+      - name: fivenines_update.ps1 and fivenines_setup.ps1 -ServiceAccountPassword on the installed version
         shell: powershell
-        # Bootstrap scripts run msiexec /qb, whose modal error box would hold
-        # the job for GitHub's six hours.
-        timeout-minutes: 20
+        # A hung bootstrap (msiexec stuck, or the Windows Installer service
+        # busy through the retries) must not hold the job for six hours.
+        timeout-minutes: 25
         run: |
           $ErrorActionPreference = "Stop"
           $msiUrl = "file:///" + (Resolve-Path fivenines-agent.msi).Path.Replace('\', '/')
-          $token = (Get-Content (Join-Path $env:ProgramData "fivenines_agent\TOKEN") -Raw).Trim()
-          function Invoke-Update($Password, $Log) {
+          $tokenPath = Join-Path $env:ProgramData "fivenines_agent\TOKEN"
+          $token = (Get-Content $tokenPath -Raw).Trim()
+          function Invoke-Update($Password, $Log, $Url = $msiUrl) {
             $secure = ConvertTo-SecureString $Password -AsPlainText -Force
             $global:LASTEXITCODE = 0
-            & .\fivenines_update.ps1 -MsiUrl $msiUrl -MsiPath (Join-Path $env:TEMP "fn-update.msi") -LogFile (Join-Path $PWD $Log) -ServiceAccountPassword $secure
-            if ($LASTEXITCODE -ne 0) { throw "fivenines_update.ps1 exited $LASTEXITCODE" }
+            # A refusal is an error the script writes before it exits 1 (it
+            # goes on past Write-Error to exit with its own code): kept, for
+            # the throw the checks below read.
+            $scriptErrors = $null
+            & .\fivenines_update.ps1 -MsiUrl $Url -MsiPath (Join-Path $env:TEMP "fn-update.msi") -LogFile (Join-Path $PWD $Log) -ServiceAccountPassword $secure -ErrorVariable scriptErrors
+            if ($LASTEXITCODE -ne 0) { throw ("fivenines_update.ps1 exited {0}: {1}" -f $LASTEXITCODE, ($scriptErrors -join " ")) }
           }
           function Assert-Installed {
             $agent = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
@@ -704,12 +1647,73 @@ jobs:
           Restart-Service -Name "fivenines-agent"
           Assert-Installed
           if (Test-Path "update-right.log") { throw "msiexec ran although this version was already installed" }
+          Write-Host "Right password applied to the installed agent by the MSI's own account step; the service restarts with it."
+
+          # fivenines_setup.ps1 with a RELATIVE -MsiPath, from a location that
+          # is not the process's working directory: the ProductCode read (COM)
+          # used to resolve it against the latter, find no MSI and let msiexec
+          # run a maintenance pass that applied nothing. The new -Token is not
+          # written on this path, and the script says so.
+          $repo = $PWD.Path
+          $tokenBefore = Get-Content $tokenPath -Raw
+          # The script's warnings, as the operator sees them.
+          $transcript = Join-Path $env:TEMP "fn-setup-in-place.txt"
+          Push-Location $env:TEMP
+          Start-Transcript -Path $transcript | Out-Null
+          try {
+            $global:LASTEXITCODE = 0
+            & (Join-Path $repo "fivenines_setup.ps1") -Token ("ci-new-token-" + (Get-Random)) -MsiUrl $msiUrl `
+              -MsiPath "fn-setup-relative.msi" -LogFile (Join-Path $repo "setup-in-place.log") `
+              -ServiceAccountPassword (ConvertTo-SecureString $password -AsPlainText -Force)
+            if ($LASTEXITCODE -ne 0) { throw "fivenines_setup.ps1 exited $LASTEXITCODE" }
+          } finally {
+            Stop-Transcript | Out-Null
+            Pop-Location
+          }
+          if (Test-Path "setup-in-place.log") { throw "msiexec ran: the relative -MsiPath was not read as the installed version" }
+          if ((Get-Content $transcript -Raw) -notmatch "-Token was not written") { throw "fivenines_setup.ps1 did not warn that -Token was not written" }
+          if ((Get-Content $tokenPath -Raw) -ne $tokenBefore) { throw "the TOKEN file changed" }
+          Assert-Installed
+          Write-Host "fivenines_setup.ps1 with a relative -MsiPath applied the password in place, kept TOKEN and said so."
+
+          # An MSI whose ProductCode cannot be read (any file that is not
+          # one): it may be this very version, so a password is refused.
+          $refused = $null
+          try { Invoke-Update $password "update-unreadable.log" ("file:///" + (Resolve-Path README.md).Path.Replace('\', '/')) } catch { $refused = "$_" }
+          if (-not $refused -or $refused -notmatch "ProductCode") { throw "an MSI whose ProductCode cannot be read was not refused: $refused" }
+          if (Test-Path "update-unreadable.log") { throw "msiexec ran although the preflight refused" }
+          Assert-Installed
+          Write-Host "An unreadable ProductCode is refused before msiexec."
+
+          # The service moved to another account (LocalSystem here): the step
+          # would move it back to fivenines-agent without the rest of an
+          # install, so it is refused, and the service keeps its account.
+          # sc.exe needs no password for LocalSystem.
+          $scOut = & sc.exe config fivenines-agent obj= LocalSystem 2>&1
+          if ($LASTEXITCODE -ne 0) { throw "sc.exe config obj= LocalSystem failed: $scOut" }
+          try {
+            $refused = $null
+            try { Invoke-Update $password "update-other-account.log" } catch { $refused = "$_" }
+            if (-not $refused -or $refused -notmatch "runs as 'LocalSystem'") { throw "the step for an account the service does not run as was not refused: $refused" }
+            if (Test-Path "update-other-account.log") { throw "msiexec ran although the preflight refused" }
+            $startName = (Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'").StartName
+            if ($startName -ne "LocalSystem") { throw "the refused step changed the service's account to '$startName'" }
+          } finally {
+            # Back to the account, as CreateServiceAccount.ps1 sets it.
+            $scArgs = @("config", "fivenines-agent", "obj=", "$env:COMPUTERNAME\fivenines-agent", "password=", $password)
+            $scOut = & sc.exe @scArgs 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "sc.exe config back to fivenines-agent failed: $scOut" }
+          }
+          Restart-Service -Name "fivenines-agent"
+          Assert-Installed
+          Write-Host "A service running as another account is refused; its account is untouched."
+
           foreach ($log in Get-ChildItem -Filter "*.log") {
             $text = [System.IO.File]::ReadAllText($log.FullName)
             if ($text.Contains($password)) { throw "the password is in $($log.Name)" }
             if ($text.Contains($token)) { throw "the TOKEN value is in $($log.Name)" }
           }
-          Write-Host "Right password applied to the installed agent by the MSI's own account step; the service restarts with it; no secret in any log."
+          Write-Host "No secret in any log."
 
       - name: Uninstall MSI silently
         shell: pwsh
@@ -743,8 +1747,8 @@ jobs:
       # 3. fivenines_uninstall.ps1 must delete the account and its grant.
       - name: Reinstall keeping the account, over an orphaned WMI grant, then fivenines_uninstall.ps1
         shell: powershell
-        # Bootstrap scripts run msiexec /qb, whose modal error box would hold
-        # the job for GitHub's six hours.
+        # A hung bootstrap (msiexec stuck, or the Windows Installer service
+        # busy through the retries) must not hold the job for six hours.
         timeout-minutes: 20
         run: |
           $ErrorActionPreference = "Stop"
