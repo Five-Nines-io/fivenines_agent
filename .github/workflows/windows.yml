@@ -1330,8 +1330,12 @@ jobs:
           function Invoke-Update($Password, $Log, $Url = $msiUrl) {
             $secure = ConvertTo-SecureString $Password -AsPlainText -Force
             $global:LASTEXITCODE = 0
-            & .\fivenines_update.ps1 -MsiUrl $Url -MsiPath (Join-Path $env:TEMP "fn-update.msi") -LogFile (Join-Path $PWD $Log) -ServiceAccountPassword $secure
-            if ($LASTEXITCODE -ne 0) { throw "fivenines_update.ps1 exited $LASTEXITCODE" }
+            # A refusal is an error the script writes before it exits 1 (it
+            # goes on past Write-Error to exit with its own code): kept, for
+            # the throw the checks below read.
+            $scriptErrors = $null
+            & .\fivenines_update.ps1 -MsiUrl $Url -MsiPath (Join-Path $env:TEMP "fn-update.msi") -LogFile (Join-Path $PWD $Log) -ServiceAccountPassword $secure -ErrorVariable scriptErrors
+            if ($LASTEXITCODE -ne 0) { throw ("fivenines_update.ps1 exited {0}: {1}" -f $LASTEXITCODE, ($scriptErrors -join " ")) }
           }
           function Assert-Installed {
             $agent = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
