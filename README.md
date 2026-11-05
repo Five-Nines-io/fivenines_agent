@@ -899,6 +899,7 @@ The agent works without sudo, but these features will be unavailable (this is al
 | Docker image vulnerability scanning | same Docker socket as container metrics (no extra privilege) |
 | HAProxy stats socket | read access to the socket (e.g. `/run/haproxy/admin.sock`); the HTTP CSV endpoint needs none |
 | Windows disk health | WMI `root\Microsoft\Windows\Storage` read access (delegated by the MSI) |
+| Windows services | Service Control Manager connect + enumerate access; a service whose security settings deny the account the status read is left out of the list |
 | Windows software inventory | `HKLM\...\Uninstall` registry read access |
 
 ### Capabilities by Permission Level
@@ -1085,8 +1086,8 @@ When the agent starts, it displays a banner showing which features are available
 ```
 
 Windows reports a Windows-shaped capability set rather than Linux keys marked
-unavailable -- no load average, and two native groups instead of the Linux
-storage and security ones:
+unavailable -- no load average, and three native groups instead of the Linux
+storage, services and security ones:
 
 ```
   Core Metrics:
@@ -1106,6 +1107,9 @@ storage and security ones:
 
   Storage:
     [+] Disk Health
+
+  Services:
+    [+] Windows Services
 
   Inventory:
     [+] Software Inventory
