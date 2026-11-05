@@ -27,8 +27,8 @@ $Namespace = "root\Microsoft\Windows\Storage"
 # the MSI's default "<DCNAME>\name" is not how the domain names it, while a
 # bare name is looked up in the machine's own account database on every
 # role (the local SAM on a member server, the domain on a DC).
-# Kept identical in SetTokenFileAcl.ps1 and DelegateWmiStorageNamespace.ps1
-# (windows.yml checks it).
+# Kept identical in SetTokenFileAcl.ps1, DelegateWmiStorageNamespace.ps1,
+# fivenines_setup.ps1 and fivenines_update.ps1 (windows.yml checks it).
 function Resolve-ServiceAccountSid {
     param([Parameter(Mandatory=$true)][string]$Account)
 
@@ -93,12 +93,19 @@ $WBEM_REMOTE_ENABLE  = 0x20
 $mask = $WBEM_ENABLE -bor $WBEM_METHOD_EXECUTE -bor $WBEM_REMOTE_ENABLE
 $sidObject = [System.Security.Principal.SecurityIdentifier]$sid
 $allowed = [System.Security.AccessControl.AceQualifier]::AccessAllowed
+# INHERIT_ONLY_ACE: the ACE applies to sub-namespaces only, not to this one.
+# AceFlags is a byte enum, which Windows PowerShell 5.1's -band refuses, so
+# it is read as [int].
+$INHERIT_ONLY = 0x08
 
+# Only an allow ACE that applies to the namespace itself is a grant: a deny
+# ACE, or an inherit-only one, does not let the account read it.
 $alreadyGranted = $false
 foreach ($existingAce in $sd.DiscretionaryAcl) {
     if ($existingAce -is [System.Security.AccessControl.CommonAce] -and
         $existingAce.AceQualifier -eq $allowed -and
         $existingAce.SecurityIdentifier -eq $sidObject -and
+        (([int]$existingAce.AceFlags) -band $INHERIT_ONLY) -eq 0 -and
         ($existingAce.AccessMask -band $mask) -eq $mask) {
         $alreadyGranted = $true
     }

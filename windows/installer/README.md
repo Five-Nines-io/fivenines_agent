@@ -58,21 +58,34 @@ This directory builds the Windows MSI installer for the fivenines agent.
   after Windows Installer has removed the running agent on an upgrade. With
   `-ServiceAccountPassword` and the same ProductCode installed, msiexec would
   only run a maintenance pass, which never reaches the account: the scripts
-  run that account step themselves and restart the service, removing nothing.
-  A password is checked with a LogonUser network logon (no SMB session):
-  wrong, locked, disabled, expired and must-change are refused by name;
-  anything else (a host denying network logon) leaves it unchecked, as
-  before.
+  run that account step themselves and restart the service, removing nothing,
+  but only for a Rotate or UseProvided plan whose account (the plan's `sid`)
+  is the one the service's StartName resolves to. Run alone, the step would
+  otherwise move the service to another account, or create one without its
+  WMI grant: they refuse and point to a reinstall. With a password and an
+  agent installed, an unreadable ProductCode is a refusal too (it may be
+  this very version). The decision is `Get-PreflightVerdict`, pure, tested
+  case by case in `windows.yml`. A password is checked with a LogonUser
+  network logon (no SMB session): wrong, locked, disabled, password expired,
+  must-change and account expired are refused by name, and 1385 (the host
+  denies the account network logon) counts as checked, since Windows checks
+  the logon type only once the credentials were accepted. Anything else
+  leaves it unchecked (`checked: false` in the plan): the scripts warn and
+  use it as given, since the account step applies any password and a wrong
+  one leaves a service that does not start, which a rerun with the right
+  password repairs in place.
 - **The WMI namespace ACL in binary.** `DelegateWmiStorageNamespace.ps1` reads
   and writes `root\Microsoft\Windows\Storage`'s descriptor with
   `__SystemSecurity` `GetSD`/`SetSD` and `RawSecurityDescriptor`, never
   `GetSecurityDescriptor`: that one resolves every ACE's trustee to a name and
   fails ("unexpected error") once an ACE names a deleted account, which failed
   a reinstall after `fivenines_uninstall.ps1` (or a hand-deleted account) with
-  1603. A grant already present is not added again, and the uninstall script
-  removes it. Two Windows PowerShell 5.1 traps met on the way: `-band` on a
-  byte-based enum such as `AceFlags` raises "Specified cast is not valid" (use
-  `IsInherited`), and `InvokeMethod` cannot take `New-Object`'s
+  1603. A grant already present is not added again (only an allow ACE that
+  applies to the namespace itself counts: not an inherit-only one), and the
+  uninstall script removes the account's allow ACEs, keeping deny ACEs. Two
+  Windows PowerShell 5.1 traps met on the way: `-band` on a byte-based enum
+  such as `AceFlags` raises "Specified cast is not valid" (use `IsInherited`,
+  or cast to `[int]` first), and `InvokeMethod` cannot take `New-Object`'s
   PSObject-wrapped `byte[]` (use `[byte[]]::new`).
 - **Domain controllers.** On a DC the account is a domain account, the BUILTIN
   groups are the domain's, and the account's qualified name is `<DOMAIN>\name`,

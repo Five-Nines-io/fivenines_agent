@@ -48,11 +48,15 @@
 #     used to surface only as a service that never starts (and, on a DC,
 #     after the account had been retagged).
 #   * -PlanOnly decides and changes nothing: it prints one
-#     "FIVENINES_PLAN <json>" line ({action, message}) and exits. The
-#     bootstrap scripts run it from the MSI they are about to install, before
-#     msiexec, because a refusal inside the MSI comes too late on an upgrade:
-#     Windows Installer has already removed the running agent by then, and a
-#     failed install does not put it back.
+#     "FIVENINES_PLAN <json>" line and exits: {action, message, sid (the
+#     existing account's, null when there is none), checked (true when
+#     LogonUser answered for the supplied password; false when that check
+#     could not run or returned an error this script does not name, and for
+#     every plan that checks no password)}. The bootstrap scripts run it from
+#     the MSI they are about to install, before msiexec, because a refusal
+#     inside the MSI comes too late on an upgrade: Windows Installer has
+#     already removed the running agent by then, and a failed install does
+#     not put it back.
 
 param(
     [Parameter(Mandatory=$true)][string]$ServiceAccount,
@@ -304,18 +308,24 @@ function Add-AccountToBuiltinGroup {
 # Whether this password logs the existing account on, through LogonUser
 # with a network logon (no SMB session, unlike PrincipalContext's machine
 # check): $true, or why not ("wrong password", "locked", ...), or $null when
-# the check itself cannot run -- the host denies that logon type, or Add-Type
-# is blocked -- in which case the password is used unchecked, as before.
+# the check cannot tell (Add-Type blocked, an error not named below), in
+# which case the password is used as given and the bootstraps warn.
+# ERROR_LOGON_TYPE_NOT_GRANTED (1385, a host that denies the account network
+# logon: CIS-hardened hosts deny it to every local account) counts as $true:
+# LSA checks the logon type only once the credentials were accepted, so a
+# wrong password still answers 1326 there.
 # One failed attempt counts toward the account's lockout threshold.
 function Test-AccountPassword {
     param([string]$AccountName, [string]$Domain, [string]$Password)
 
+    $ERROR_LOGON_TYPE_NOT_GRANTED = 1385
     $reasons = @{
         1326 = "wrong password"            # ERROR_LOGON_FAILURE
         1909 = "the account is locked"     # ERROR_ACCOUNT_LOCKED_OUT
         1331 = "the account is disabled"   # ERROR_ACCOUNT_DISABLED
         1330 = "the password has expired"  # ERROR_PASSWORD_EXPIRED
         1907 = "the password must be changed" # ERROR_PASSWORD_MUST_CHANGE
+        1793 = "the account has expired"   # ERROR_ACCOUNT_EXPIRED
     }
     try {
         # The error code is read inside the same native call: PowerShell runs
@@ -344,12 +354,12 @@ public static class FiveninesLogon {
 "@
         }
         $code = [FiveninesLogon]::Check($AccountName, $Domain, $Password)
-        if ($code -eq 0) { return $true }
+        if ($code -eq 0 -or $code -eq $ERROR_LOGON_TYPE_NOT_GRANTED) { return $true }
         if ($reasons.ContainsKey($code)) { return $reasons[$code] }
-        Write-Host ("Could not check the password of '{0}' (LogonUser error {1}); using it unchecked." -f $AccountName, $code)
+        Write-Host ("Could not check the password of '{0}' (LogonUser error {1}); using it as given." -f $AccountName, $code)
         return $null
     } catch {
-        Write-Host ("Could not check the password of '{0}' ({1}); using it unchecked." -f $AccountName, $_.Exception.GetBaseException().Message)
+        Write-Host ("Could not check the password of '{0}' ({1}); using it as given." -f $AccountName, $_.Exception.GetBaseException().Message)
         return $null
     }
 }
@@ -360,6 +370,9 @@ $accountKind = if ($isDomainController) { "domain" } else { "local" }
 
 $entry = Get-WinNTUser $bareName
 $existingDescription = if ($entry) { [string]$entry.psbase.Properties["Description"].Value } else { "" }
+$existingSid = if ($entry) {
+    [System.Security.Principal.SecurityIdentifier]::new([byte[]]$entry.psbase.Properties["objectSid"].Value, 0)
+} else { $null }
 $plan = Get-AccountPlan `
     -IsDomainController $isDomainController `
     -Exists ($null -ne $entry) `
@@ -370,13 +383,14 @@ $plan = Get-AccountPlan `
 
 # UseProvided is the one plan for an existing account that takes the
 # operator's password: check it before it is used, or retags anything.
+$checked = $false
 if ($plan.Action -eq "UseProvided") {
     # The account's own domain: the machine on a member server, the domain on
     # a DC (whose account domain is not its computer name).
-    $accountDomain = ([System.Security.Principal.SecurityIdentifier]::new(
-        [byte[]]$entry.psbase.Properties["objectSid"].Value, 0)).Translate(
+    $accountDomain = $existingSid.Translate(
         [System.Security.Principal.NTAccount]).Value.Split('\')[0]
     $check = Test-AccountPassword $bareName $accountDomain $Password
+    $checked = $null -ne $check
     if ($check -is [string]) {
         $plan = @{ Action = "Refuse"; Description = $null; Message = (
             "The SERVICEACCOUNTPASSWORD given does not log {0} account '{1}' on: {2}." -f $accountKind, $bareName, $check) }
@@ -384,7 +398,9 @@ if ($plan.Action -eq "UseProvided") {
 }
 
 if ($PlanOnly) {
-    Write-Output ("FIVENINES_PLAN " + (ConvertTo-Json -Compress @{ action = $plan.Action; message = $plan.Message }))
+    $sidValue = if ($existingSid) { $existingSid.Value } else { $null }
+    Write-Output ("FIVENINES_PLAN " + (ConvertTo-Json -Compress @{
+        action = $plan.Action; message = $plan.Message; sid = $sidValue; checked = $checked }))
     exit 0
 }
 
