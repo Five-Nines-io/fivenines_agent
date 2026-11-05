@@ -43,9 +43,8 @@ env:
   # build included, so it is pinned by digest instead of the mutable
   # buildx-stable-1 tag (v0.32.2 is what that tag named when this was pinned).
   BUILDKIT_IMAGE: 'moby/buildkit:v0.32.2@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8'
-  # Windows build pins. Kept aligned with .github/workflows/windows.yml; the
-  # smoke job in that workflow is the CI quality gate and must stay green
-  # before the artifacts built here ship.
+  # Windows build pins. Kept aligned with .github/workflows/windows.yml, whose
+  # member-server E2E the release job waits for (windows-e2e below).
   PYTHON_VERSION_WINDOWS: '3.11'
   WIX_VERSION: '5.0.2'
   WINSW_VERSION: '2.12.0'
@@ -439,8 +438,8 @@ jobs:
   # Windows AMD64 - PyInstaller frozen binary + WiX MSI installer.
   # The Windows smoke test (E2E install -> service -> uninstall) lives in
   # .github/workflows/windows.yml and runs on the same branches as this
-  # workflow; it's the CI quality gate. This job is the release-asset
-  # producer - same recipe, same pins, same sources.
+  # workflow, and on a v* tag through windows-e2e below. This job is the
+  # release-asset producer - same recipe, same pins, same sources.
   build-windows-amd64:
     needs: [lint]
     runs-on: windows-latest
@@ -1100,11 +1099,28 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # Production release for version tags
+  # The Windows CI (tests, the frozen binary, the MSI and its member-server
+  # E2E: install, service, report, update, password rotation, uninstall) on
+  # the tagged commit, so a release is never published from a commit whose
+  # MSI fails it. It tests windows.yml's own build of that commit, by the
+  # same recipe as build-windows-amd64, unsigned: not the signed file the
+  # release publishes. windows.yml no longer triggers on tags itself. Its
+  # domain-controller E2E does not run here: it downloads Microsoft's
+  # evaluation ISOs, which can change or disappear without any change in
+  # this repository; every main push since the last release ran it when the
+  # installer changed (installer-changed compares main with its latest tag).
+  windows-e2e:
+    if: startsWith(github.ref, 'refs/tags/v')
+    uses: ./.github/workflows/windows.yml
+    permissions:
+      contents: read
+
   release:
     # shellcheck-scripts carries the signature-verification test and the
     # shared-function sync check (which covers the embedded public key in
     # every installer): a release must not publish scripts that failed them.
-    needs: [build-amd64, build-arm64, build-alpine-amd64, build-alpine-arm64, build-synology-amd64, build-synology-arm64, build-windows-amd64, test-distro-matrix, test-selinux-vm, shellcheck-scripts]
+    # windows-e2e is the MSI's end-to-end test (above).
+    needs: [build-amd64, build-arm64, build-alpine-amd64, build-alpine-arm64, build-synology-amd64, build-synology-arm64, build-windows-amd64, test-distro-matrix, test-selinux-vm, shellcheck-scripts, windows-e2e]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     # RELEASE_SIGNING_KEY and the R2 credentials are secrets of this GitHub

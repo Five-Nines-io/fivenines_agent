@@ -30,6 +30,10 @@ A change comes with tests for what it changes, and new functionality comes
 with tests that cover it. `make test` fails below 100% line coverage of
 `fivenines_agent`. CI runs the whole suite on Windows (`windows.yml`) and runs
 the built Linux binaries across a matrix of distributions (`build-release.yml`).
+Once a branch changes the Windows installer or its CI (the paths are listed in
+`windows/installer/README.md`, "Domain controllers"), that push and every later
+push of the branch also run the MSI on real domain controllers (`windows.yml`'s
+DC job, about an hour).
 
 ## Security checks
 

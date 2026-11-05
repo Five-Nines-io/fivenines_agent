@@ -4,6 +4,10 @@ name: Windows Build
 # end-to-end install smoke (D14 + D20 - CI is the quality gate for the
 # single combined release).
 #
+# build-release.yml calls this workflow on a v* tag (workflow_call) and its
+# release job waits for it, so a release whose MSI fails the member-server
+# E2E is never published. It therefore does not trigger on tags itself.
+#
 # Coverage handling per D3: the per-OS pytest run uses --cov but NOT
 # --cov-fail-under (Windows alone cannot reach 100% because Linux-only
 # branches are unreachable here, and vice versa on the Linux CI in
@@ -20,8 +24,7 @@ on:
       - 'feature/**'
       - 'fix/**'
       - 'spuyet/windows-server-support'
-    tags:
-      - 'v*'
+  workflow_call:
   workflow_dispatch:
     inputs:
       domain_controller:
@@ -29,8 +32,11 @@ on:
         type: boolean
         default: false
 
+# A literal group, not github.workflow: in a called workflow that names the
+# CALLER, and sharing build-release.yml's group would make the call wait for
+# its own caller.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: windows-build-${{ github.ref }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 # Nothing here writes to the repository, whatever the default token allows.
@@ -1262,10 +1268,14 @@ jobs:
           TARGET_ARCH: amd64
         run: .\py2exe_windows.ps1
 
+      # windows-ci-* artifact names: called on a tag, this run is also
+      # build-release.yml's, whose release job publishes every fivenines-agent-*
+      # artifact and whose own Windows build uploads
+      # fivenines-agent-windows-amd64 (two uploads of one name fail).
       - name: Upload Windows binary
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: fivenines-agent-windows-amd64
+          name: windows-ci-agent
           path: dist/windows/fivenines-agent-windows-amd64/
           retention-days: 7
 
@@ -1281,7 +1291,7 @@ jobs:
       - name: Download agent binary
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: fivenines-agent-windows-amd64
+          name: windows-ci-agent
           path: dist/windows/fivenines-agent-windows-amd64/
 
       - name: Download WinSW
@@ -1332,7 +1342,7 @@ jobs:
       - name: Upload MSI
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: fivenines-agent-msi
+          name: windows-ci-msi
           path: windows/installer/fivenines-agent.msi
           retention-days: 30
 
@@ -1348,7 +1358,7 @@ jobs:
       - name: Download MSI
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: fivenines-agent-msi
+          name: windows-ci-msi
           path: .
 
       # A non-English Windows, simulated: its built-in group names are
@@ -1821,17 +1831,73 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+  # Whether this push changed what the domain-controller E2E tests: the MSI
+  # sources (windows/installer/, and windows/winsw/ for the service it
+  # installs), the bootstrap scripts, the DC harness or this workflow (their
+  # Markdown aside). Compared cumulatively, so a run a newer push cancelled
+  # (the concurrency group cancels a running one) is made up by the next:
+  # main with the latest v* tag, any other branch with where it left main.
+  # Never on a tag: the main push before it ran it for every installer change
+  # since the last release.
+  installer-changed:
+    name: Installer changed?
+    if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Compare with the latest release or where the branch left main
+        id: diff
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            tag=$(git describe --tags --abbrev=0 --match 'v*' HEAD 2>/dev/null || true)
+            if [ -n "$tag" ]; then
+              base=$(git rev-parse "${tag}^{commit}")
+            else
+              base=$(git rev-list --max-parents=0 HEAD | tail -n 1)
+            fi
+          else
+            base=$(git merge-base origin/main HEAD)
+          fi
+          # A head that is its own base (a branch at main's tip, a main commit
+          # that is the tag): compared with the commit before it.
+          if [ "$base" = "$(git rev-parse HEAD)" ]; then
+            base=$(git rev-parse HEAD^)
+          fi
+          echo "Comparing ${base} with $(git rev-parse HEAD)"
+          # Markdown under those directories is documentation, not tested.
+          # --no-renames: a file moved out of a watched directory counts.
+          files=$(git diff --name-only --no-renames "$base" HEAD | grep -v '\.md$' || true)
+          if printf '%s\n' "$files" | grep -E '^(windows/installer/|windows/winsw/|ci/windows-dc/|fivenines_(setup|update|uninstall)\.ps1$|\.github/workflows/windows\.yml$)'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No installer file changed."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
   # The MSI on real domain controllers, which no GitHub runner can become
   # (promotion needs a reboot): a Windows Server 2019 evaluation VM in
   # QEMU/KVM on a Linux runner, installed in English and in German, promoted
   # to the first DC of a new forest. It first reproduces the failure a trial
   # reported with v1.22.0, then plays every account scenario a DC meets
-  # (ci/windows-dc/stage2.ps1). About an hour, so on request only:
+  # (ci/windows-dc/stage2.ps1). About an hour, so it runs only on a push that
+  # changed the installer (installer-changed above), or on request:
   #   gh workflow run windows.yml --ref <branch> -f domain_controller=true
+  # A release never waits for it: it downloads Microsoft's evaluation ISOs,
+  # which can change or disappear without any change here.
   smoke-msi-domain-controller:
     name: E2E on a domain controller (Server 2019 ${{ matrix.lang }})
-    needs: build-msi
-    if: github.event_name == 'workflow_dispatch' && inputs.domain_controller
+    needs: [build-msi, installer-changed]
+    if: >-
+      ${{ !cancelled() && needs.build-msi.result == 'success' &&
+      ((github.event_name == 'workflow_dispatch' && inputs.domain_controller) ||
+      (github.event_name == 'push' && needs.installer-changed.outputs.changed == 'true')) }}
     runs-on: ubuntu-latest
     timeout-minutes: 170
     strategy:
@@ -1865,7 +1931,7 @@ jobs:
       - name: Download MSI
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          name: fivenines-agent-msi
+          name: windows-ci-msi
           path: msi
 
       - name: Install QEMU and image tools

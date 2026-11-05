@@ -1,8 +1,9 @@
 """Static checks on the Windows installer's PowerShell and WiX sources.
 
 The scripts only run on Windows: .github/workflows/windows.yml exercises them
-on a member server, and its on-request smoke-msi-domain-controller job on real
-Windows Server 2019 domain controllers (ci/windows-dc/). Each check here pins
+on a member server, and its smoke-msi-domain-controller job (on a push that
+changes the installer, or on request) on real Windows Server 2019 domain
+controllers (ci/windows-dc/). Each check here pins
 a rule one of those runs taught, so a regression fails on any machine before
 a Windows run is ever dispatched:
 
@@ -17,7 +18,12 @@ a Windows run is ever dispatched:
   scripts downloaded one by one) must not drift apart.
 """
 
+import fnmatch
+import os
 import re
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -32,6 +38,7 @@ SETUP = "fivenines_setup.ps1"
 UPDATE = "fivenines_update.ps1"
 UNINSTALL = "fivenines_uninstall.ps1"
 WINDOWS_WORKFLOW = ".github/workflows/windows.yml"
+RELEASE_WORKFLOW = ".github/workflows/build-release.yml"
 DC_UNATTEND = "ci/windows-dc/autounattend.xml.in"
 DC_RUNNER = "ci/windows-dc/run-vm.sh"
 DC_STAGE_SCRIPTS = (
@@ -207,18 +214,541 @@ def test_dc_harness_fills_every_template_field_and_ships_its_scripts():
         assert any(c.is_file() for c in candidates), name
 
 
-# Value: protects=what the DC job downloads; fails_when=an evaluation ISO or the v1.22.0 MSI loses its pinned SHA-256, or the hour-long job starts running on every push; why_new=nothing else reads these pins; seam=none; no_claim=that Microsoft still serves the same ISO
-def test_dc_job_pins_its_downloads_and_runs_on_request_only():
+# Value: protects=what the DC job downloads, and when its hour runs; fails_when=an evaluation ISO or the v1.22.0 MSI loses its pinned SHA-256, the job runs on a push that changed no installer file or on a tag (where a release would then depend on Microsoft's ISOs), or it stops running on a push that changed one; why_new=nothing else reads these pins or the trigger; seam=none; no_claim=that Microsoft still serves the same ISO, or that the path list names every file the DC scenarios exercise
+def test_dc_job_pins_its_downloads_and_runs_when_the_installer_changes():
     workflow = _read(WINDOWS_WORKFLOW)
     start = workflow.index("  smoke-msi-domain-controller:")
     job = workflow[start:]
+    assert "needs: [build-msi, installer-changed]" in job
     assert (
-        "if: github.event_name == 'workflow_dispatch' && inputs.domain_controller"
-        in job
+        "(github.event_name == 'workflow_dispatch' && inputs.domain_controller)" in job
     )
+    assert "needs.installer-changed.outputs.changed == 'true'" in job
     assert len(re.findall(r"iso_sha256: [0-9a-f]{64}\n", job)) == 2
     assert re.search(r"OLD_MSI_SHA256: [0-9a-f]{64}\n", job)
     assert "sha256sum -c -" in job
+
+    gate_start = workflow.index("  installer-changed:")
+    gate = workflow[gate_start:start]
+    assert (
+        "if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')"
+        in gate
+    )
+    paths = re.search(r"grep -E '\^\((.*)\)'", gate)
+    assert paths, "installer-changed lost its path list"
+    for watched in (
+        "windows/installer/",
+        "ci/windows-dc/",
+        "fivenines_(setup|update|uninstall)\\.ps1$",
+        "\\.github/workflows/windows\\.yml$",
+    ):
+        assert watched in paths.group(1), watched
+    assert "grep -v '\\.md$'" in gate
+
+
+# Value: protects=every release's MSI; fails_when=the release job stops waiting for windows.yml's member-server E2E, windows.yml triggers on tags again (a second, unwaited run), or one of its artifacts matches the release's fivenines-agent-* download pattern (the E2E's MSI published as a release asset, or an upload clash with any build-release.yml artifact in the same run); why_new=before this a release published whatever windows.yml said, and nothing reads the cross-workflow wiring; seam=none; no_claim=that the E2E itself is sufficient, which the E2E steps decide
+def test_release_waits_for_the_windows_e2e():
+    release = _read(RELEASE_WORKFLOW)
+    call_start = release.index("  windows-e2e:")
+    call = release[call_start:].split("\n  release:\n", 1)[0]
+    assert "if: startsWith(github.ref, 'refs/tags/v')" in call
+    assert "uses: ./.github/workflows/windows.yml" in call
+    needs = re.search(r"\n  release:\n(?:    #.*\n)*    needs: \[([^\]]*)\]", release)
+    assert needs, "release job lost its needs list"
+    assert "windows-e2e" in [n.strip() for n in needs.group(1).split(",")]
+
+    workflow = _read(WINDOWS_WORKFLOW)
+    on_start = workflow.index("\non:\n")
+    triggers = workflow[on_start:].split("\nconcurrency:", 1)[0]
+    assert "workflow_call:" in triggers
+    assert "tags:" not in triggers
+    assert "group: ${{ github.workflow }}" not in workflow
+    for name in re.findall(r"^\s+name: (\S+)$", workflow, re.MULTILINE):
+        assert not name.startswith("fivenines-agent-"), name
+    # Called on a tag, windows.yml's jobs run in build-release.yml's run, where
+    # a second upload of one name fails and every download sees both
+    # workflows' artifacts: no windows.yml upload may share a name with an
+    # artifact build-release.yml uploads or downloads.
+    uploads = _artifact_names(workflow, "upload")
+    assert {"windows-ci-agent", "windows-ci-msi"} <= set(uploads), uploads
+    theirs = _artifact_names(release, "upload") + _artifact_names(release, "download")
+    assert {"fivenines-agent-windows-amd64", "fivenines-agent-*"} <= set(theirs), theirs
+    for name in uploads:
+        for other in theirs:
+            assert not _may_name_one_artifact(name, other), (name, other)
+
+
+def _artifact_names(workflow, action):
+    """The name or pattern of every actions/<action>-artifact step, each
+    ${{ }} expression read as *, and * for a step naming none (a download
+    of every artifact)."""
+    names = []
+    lines = workflow.splitlines()
+    for i, line in enumerate(lines):
+        match = re.match(r"( +)(- +)?uses: actions/%s-artifact@" % action, line)
+        if not match:
+            continue
+        indent = len(match.group(1)) + len(match.group(2) or "")
+        next_line = i + 1
+        found = []
+        for following in lines[next_line:]:
+            if following.strip() and len(following) - len(following.lstrip()) < indent:
+                break
+            key = re.match(r" {%d,}(?:name|pattern): (.+)$" % (indent + 1), following)
+            if key:
+                found.append(re.sub(r"\$\{\{[^}]*\}\}", "*", key.group(1).strip()))
+        assert len(found) <= 1, found
+        names.extend(found or ["*"])
+    return names
+
+
+def _may_name_one_artifact(first, second):
+    """Whether two artifact names or patterns (* any text) can name the same
+    artifact; two that differ before either's first * cannot."""
+    first, second = first.lower(), second.lower()
+    if "*" not in first and "*" not in second:
+        return first == second
+    if "*" not in first:
+        return fnmatch.fnmatchcase(first, second)
+    if "*" not in second:
+        return fnmatch.fnmatchcase(second, first)
+    a, b = first.split("*", 1)[0], second.split("*", 1)[0]
+    return a.startswith(b) or b.startswith(a)
+
+
+def _job(workflow, name):
+    """Job `name` of a workflow, up to the next job's key."""
+    lines = workflow.splitlines(keepends=True)
+    start = lines.index("  %s:\n" % name)
+    end = next(
+        (i for i in range(start + 1, len(lines)) if re.match(r"  [\w-]+:\n", lines[i])),
+        len(lines),
+    )
+    return "".join(lines[start:end])
+
+
+def _job_needs(job):
+    match = re.search(r"(?m)^    needs: (.*)$", job)
+    if not match:
+        return []
+    value = match.group(1).strip()
+    if value.startswith("["):
+        return [name.strip() for name in value[1:-1].split(",")]
+    return [value]
+
+
+def _job_condition(job):
+    """A job's if:, its folding and its ${{ }} wrapper undone."""
+    match = re.search(r"(?m)^    if: (.*)$", job)
+    assert match, "the job has no if:"
+    value = match.group(1).strip()
+    if value in (">", ">-"):
+        folded = []
+        end = match.end()
+        for line in job[end:].splitlines()[1:]:
+            if not line.startswith("      "):
+                break
+            folded.append(line.strip())
+        value = " ".join(folded)
+    if value.startswith("${{") and value.endswith("}}"):
+        value = value[3:-2]
+    return value.strip()
+
+
+def _truthy(value):
+    return value not in (None, False, 0, "")
+
+
+_EXPRESSION_TOKEN = re.compile(
+    r"\s*(?:(?P<op>\|\||&&|==|!=|!|\(|\)|,)|'(?P<str>[^']*)'|(?P<name>[A-Za-z_][\w.-]*))"
+)
+
+
+def _expression(text):
+    """A GitHub Actions expression as a function of its contexts, for the
+    subset these workflows use: ! (binding tightest), == and != (strings
+    compared ignoring case), && and || (returning an operand), parentheses,
+    strings, true/false/null, calls, and dotted names, each of which the
+    contexts must name (KeyError otherwise)."""
+    tokens = []
+    pos = 0
+    text = text.strip()
+    while pos < len(text):
+        match = _EXPRESSION_TOKEN.match(text, pos)
+        assert match and match.end() > pos, f"cannot read {text[pos:]!r}"
+        pos = match.end()
+        tokens.append((match.lastgroup, match.group(match.lastgroup)))
+    at = [0]
+
+    def peek():
+        return tokens[at[0]] if at[0] < len(tokens) else (None, None)
+
+    def take(op=None):
+        token = peek()
+        assert op is None or token == ("op", op), (op, token)
+        at[0] += 1
+        return token
+
+    def primary():
+        kind, value = take()
+        if (kind, value) == ("op", "("):
+            inner = disjunction()
+            take(")")
+            return inner
+        if kind == "str":
+            return lambda ctx: value
+        assert kind == "name", (kind, value)
+        if peek() == ("op", "("):
+            take("(")
+            args = []
+            while peek() != ("op", ")"):
+                args.append(disjunction())
+                if peek() == ("op", ","):
+                    take(",")
+            take(")")
+            return lambda ctx: ctx[value + "()"](*(arg(ctx) for arg in args))
+        if value in ("true", "false", "null"):
+            literal = {"true": True, "false": False, "null": None}[value]
+            return lambda ctx: literal
+        return lambda ctx: ctx[value]
+
+    def unary():
+        if peek() == ("op", "!"):
+            take("!")
+            operand = unary()
+            return lambda ctx: not _truthy(operand(ctx))
+        return primary()
+
+    def comparison():
+        left = unary()
+        if peek() not in (("op", "=="), ("op", "!=")):
+            return left
+        equal = take()[1] == "=="
+        right = unary()
+
+        def compare(ctx):
+            a, b = left(ctx), right(ctx)
+            if isinstance(a, str) and isinstance(b, str):
+                a, b = a.lower(), b.lower()
+            return (a == b) == equal
+
+        return compare
+
+    def chain(operand, op, stop_when):
+        parts = [operand()]
+        while peek() == ("op", op):
+            take(op)
+            parts.append(operand())
+
+        def run(ctx):
+            value = None
+            for part in parts:
+                value = part(ctx)
+                if stop_when(value):
+                    break
+            return value
+
+        return run
+
+    def conjunction():
+        return chain(comparison, "&&", lambda value: not _truthy(value))
+
+    def disjunction():
+        return chain(conjunction, "||", _truthy)
+
+    expression = disjunction()
+    assert at[0] == len(tokens), f"unread: {tokens[at[0]:]}"
+    return expression
+
+
+def _job_starts(job, contexts, needs, cancelled=False):
+    """Whether GitHub starts a job: an if: with no status function is read
+    as success() && (if:), and success() is false once a job it needs did
+    not succeed, a skipped one included."""
+    condition = _job_condition(job)
+    needed = {name: needs[name] for name in _job_needs(job)}
+    succeeded = not cancelled and all(n["result"] == "success" for n in needed.values())
+    ctx = dict(contexts)
+    ctx.update(
+        {
+            "success()": lambda: succeeded,
+            "failure()": lambda: any(n["result"] == "failure" for n in needed.values()),
+            "cancelled()": lambda: cancelled,
+            "always()": lambda: True,
+            "startsWith()": lambda text, prefix: str(text or "")
+            .lower()
+            .startswith(str(prefix).lower()),
+        }
+    )
+    for name, need in needed.items():
+        ctx["needs.%s.result" % name] = need["result"]
+        for key, value in need["outputs"].items():
+            ctx["needs.%s.outputs.%s" % (name, key)] = value
+    explicit = re.search(r"\b(?:success|failure|always|cancelled)\(", condition)
+    return bool(explicit or succeeded) and _truthy(_expression(condition)(ctx))
+
+
+DISPATCH = "workflow_dispatch"
+
+
+# Value: protects=when the DC job and its gate start, evaluated as GitHub does: an if: with no status function needs every job it needs to succeed; fails_when=!cancelled() goes (a dispatch never runs the DC job), the build-msi check goes, || and && swap, or the gate runs on a tag or a dispatch; why_new=the existing test finds the clauses as substrings and evaluates none; seam=none; no_claim=GitHub's whole expression language, only the operators these two conditions use
+@pytest.mark.parametrize(
+    "event, ref, asked, msi, cancelled, diff, gate_runs, dc_runs",
+    [
+        ("push", "refs/heads/fix/x", None, "success", False, "true", True, True),
+        ("push", "refs/heads/fix/x", None, "success", False, "false", True, False),
+        ("push", "refs/heads/main", None, "success", False, "true", True, True),
+        # build-release.yml's call on a tag: the caller's event and ref.
+        ("push", "refs/tags/v1.23.0", None, "success", False, "true", False, False),
+        # build-release.yml dispatched on a tag: windows.yml declares no
+        # workflow_call input, so inputs.domain_controller is null.
+        (DISPATCH, "refs/tags/v1.23.0", None, "success", False, "true", False, False),
+        (DISPATCH, "refs/heads/fix/x", True, "success", False, "true", False, True),
+        (DISPATCH, "refs/heads/fix/x", False, "success", False, "true", False, False),
+        ("push", "refs/heads/fix/x", None, "failure", False, "true", True, False),
+        (DISPATCH, "refs/heads/fix/x", True, "failure", False, "true", False, False),
+        ("push", "refs/heads/fix/x", None, "cancelled", True, "true", True, False),
+        # The run cancelled while build-msi had succeeded: only !cancelled()
+        # keeps the hour-long job from starting (always() would not).
+        ("push", "refs/heads/fix/x", None, "success", True, "true", True, False),
+    ],
+    ids=[
+        "push-changing-the-installer",
+        "push-changing-nothing-it-tests",
+        "push-to-main-changing-the-installer",
+        "release-call-on-a-tag",
+        "release-dispatch-on-a-tag",
+        "dispatch-asking-for-it",
+        "dispatch-not-asking",
+        "push-msi-build-failed",
+        "dispatch-msi-build-failed",
+        "push-run-cancelled",
+        "push-run-cancelled-after-the-msi",
+    ],
+)
+def test_dc_job_starts_on_an_installer_push_or_a_request_only(
+    event, ref, asked, msi, cancelled, diff, gate_runs, dc_runs
+):
+    workflow = _read(WINDOWS_WORKFLOW)
+    contexts = {
+        "github.event_name": event,
+        "github.ref": ref,
+        "github.ref_type": "tag" if ref.startswith("refs/tags/") else "branch",
+        "github.ref_name": ref.split("/", 2)[2],
+        "inputs.domain_controller": asked,
+    }
+    gate = _job(workflow, "installer-changed")
+    assert _job_starts(gate, contexts, needs={}) == gate_runs
+    needs = {
+        "build-msi": {"result": msi, "outputs": {}},
+        "installer-changed": {
+            "result": "success" if gate_runs else "skipped",
+            "outputs": {"changed": diff if gate_runs else None},
+        },
+    }
+    dc = _job(workflow, "smoke-msi-domain-controller")
+    assert _job_starts(dc, contexts, needs, cancelled=cancelled) == dc_runs
+
+
+def _step(job, step_id):
+    for block in re.split(r"(?m)^      - ", job)[1:]:
+        if re.search(r"(?m)^        id: %s$" % re.escape(step_id), block):
+            return block
+    raise AssertionError(f"no step with id {step_id}")
+
+
+def _step_script(step):
+    """A step's run: | block, as the runner writes it to its script file."""
+    match = re.search(r"(?m)^        run: \|\n", step)
+    assert match, "the step has no run block"
+    lines = []
+    for line in step.split(match.group(0), 1)[1].splitlines():
+        if line.strip() and not line.startswith(" " * 10):
+            break
+        lines.append(line[10:])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+# The DC job's path filter, file by file: what a push changing it decides.
+DC_WATCHED = (
+    "windows/installer/Product.wxs",
+    "windows/winsw/fivenines-agent.xml",
+    "ci/windows-dc/run-vm.sh",
+    SETUP,
+    UPDATE,
+    UNINSTALL,
+    WINDOWS_WORKFLOW,
+)
+DC_NOT_WATCHED = (
+    "windows/installer/README.md",
+    "ci/windows-dc/README.md",
+    "fivenines_agent/agent.py",
+    RELEASE_WORKFLOW,
+    "docs/windows/installer/notes.ps1",
+)
+
+
+# Value: protects=a release published only after the Windows E2E succeeded on the tagged commit; fails_when=the release job's if: gains always() or !cancelled(), or windows-e2e leaves its needs; why_new=the existing test checks needs membership only, and an explicit status function overrides it; seam=none; no_claim=GitHub's own evaluation (the test's evaluator stands in for it)
+@pytest.mark.parametrize(
+    "e2e, publishes",
+    [("success", True), ("failure", False), ("cancelled", False), ("skipped", False)],
+)
+def test_release_publishes_only_after_the_windows_e2e(e2e, publishes):
+    release = _job(_read(RELEASE_WORKFLOW), "release")
+    needs = {name: {"result": "success", "outputs": {}} for name in _job_needs(release)}
+    assert "windows-e2e" in needs
+    needs["windows-e2e"]["result"] = e2e
+    contexts = {"github.event_name": "push", "github.ref": "refs/tags/v1.23.0"}
+    assert (
+        _job_starts(release, contexts, needs, cancelled=e2e == "cancelled") == publishes
+    )
+
+
+# Value: protects=which pushes run the hour-long DC job: the gate's own bash step, run on real git history as a push would; fails_when=the base is not cumulative (a run a newer push cancelled is never made up), main is not compared with its latest v* tag, or the path, Markdown or rename filter misreads a file; why_new=the existing test matches the step's text and never runs it; seam=none; no_claim=GitHub's runner git or its checkout's tags; skipped on Windows (no known bash there)
+@pytest.mark.skipif(
+    sys.platform == "win32" or not (shutil.which("git") and shutil.which("bash")),
+    reason="runs the step's bash script against git",
+)
+def test_installer_changed_compares_cumulatively(tmp_path):
+    gate = _job(_read(WINDOWS_WORKFLOW), "installer-changed")
+    output = re.search(
+        r"(?m)^      changed: \$\{\{ steps\.([\w-]+)\.outputs\.changed \}\}$", gate
+    )
+    assert output, "installer-changed does not publish its step's answer"
+    step = _step(gate, output.group(1))
+    script_file = tmp_path / "step.sh"
+    script = _step_script(step)
+    assert "${{" not in script  # what runs here is what the runner runs
+    script_file.write_text(script)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": str(tmp_path),
+        "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_AUTHOR_NAME": "ci",
+        "GIT_AUTHOR_EMAIL": "ci@example.invalid",
+        "GIT_COMMITTER_NAME": "ci",
+        "GIT_COMMITTER_EMAIL": "ci@example.invalid",
+    }
+
+    def git(*args):
+        return subprocess.run(
+            ["git", *args],
+            cwd=repo,
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    def commit(*paths, delete=(), move=None):
+        for path in paths:
+            (repo / path).parent.mkdir(parents=True, exist_ok=True)
+            with open(repo / path, "a") as f:
+                f.write("x\n")
+        for path in delete:
+            (repo / path).unlink()
+        if move:
+            (repo / move[1]).parent.mkdir(parents=True, exist_ok=True)
+            git("mv", *move)
+        git("add", "-A")
+        git("commit", "-q", "-m", "change")
+        return git("rev-parse", "HEAD")
+
+    def push(ref):
+        """The step's answer and the base it compared HEAD with."""
+        github_output = tmp_path / "github_output"
+        github_output.write_text("")
+        run = subprocess.run(
+            ["bash", "-e", str(script_file)],
+            cwd=repo,
+            env=dict(env, GITHUB_REF=ref, GITHUB_OUTPUT=str(github_output)),
+            capture_output=True,
+            text=True,
+        )
+        assert run.returncode == 0, run.stderr
+        answers = re.findall(r"(?m)^changed=(.*)$", github_output.read_text())
+        assert len(answers) == 1, answers
+        compared = re.search(r"(?m)^Comparing (\w+) with (\w+)$", run.stdout)
+        assert compared and compared.group(2) == git("rev-parse", "HEAD"), run.stdout
+        return answers[0], compared.group(1)
+
+    branch = "refs/heads/fix/x"
+    git("init", "-q")
+    root = commit(*DC_WATCHED, *DC_NOT_WATCHED, "windows/installer/Old.ps1")
+    git("update-ref", "refs/remotes/origin/main", root)
+
+    # A branch is compared with where it left main, file by file.
+    for path, changed in [(p, "true") for p in DC_WATCHED] + [
+        (p, "false") for p in DC_NOT_WATCHED
+    ]:
+        git("checkout", "-q", "-B", "topic", root)
+        commit(path)
+        assert push(branch) == (changed, root), path
+    # Cumulatively: the push that replaced an installer push (whose run it
+    # cancelled) still runs the job, and so does every later one.
+    git("checkout", "-q", "-B", "topic", root)
+    commit("windows/installer/Product.wxs")
+    commit("fivenines_agent/agent.py")
+    assert push(branch) == ("true", root)
+    commit("README.md")
+    assert push(branch) == ("true", root)
+    # Markdown under a watched directory is not tested; a deletion and a file
+    # moved out of a watched directory are.
+    git("checkout", "-q", "-B", "topic", root)
+    commit("windows/installer/README.md")
+    assert push(branch) == ("false", root)
+    commit(move=("windows/installer/Old.ps1", "attic/Old.ps1"))
+    assert push(branch) == ("true", root)
+    git("checkout", "-q", "-B", "topic", root)
+    commit(delete=["windows/installer/Old.ps1"])
+    assert push(branch) == ("true", root)
+    # Where it left main moves with main: an installer change main made
+    # since is not this branch's.
+    git("checkout", "-q", "-B", "main", root)
+    main = commit("windows/installer/Product.wxs")
+    git("update-ref", "refs/remotes/origin/main", main)
+    git("checkout", "-q", "-B", "topic", main)
+    commit("fivenines_agent/agent.py")
+    assert push(branch) == ("false", main)
+    # A branch at main's tip is its own base: compared with the commit before.
+    git("checkout", "-q", "-B", "topic", main)
+    assert push(branch) == ("true", root)
+
+    # main is compared with its latest v* tag: every push until the next
+    # release runs the job for an installer change since the last one.
+    git("checkout", "-q", "main")
+    git("tag", "v1.0.0", root)
+    git("tag", "nightly", main)  # not a release tag
+    assert push("refs/heads/main") == ("true", root)
+    after = commit("fivenines_agent/agent.py")
+    assert push("refs/heads/main") == ("true", root)
+    git("tag", "v1.1.0", after)
+    commit("fivenines_agent/agent.py")
+    assert push("refs/heads/main") == ("false", after)
+    # A main commit that is the tag itself: compared with the commit before.
+    git("checkout", "-q", "main")
+    git("reset", "-q", "--hard", after)
+    assert push("refs/heads/main") == ("false", main)
+
+
+# Value: protects=the DC VM's install finishing on a runner slow to fsync, and its logs read from a complete disk; fails_when=cache=unsafe leaves the system disk, QEMU is stopped by a signal it cannot handle, or the disk is read before QEMU exits; why_new=a slow runner fails the DC job only sometimes, an hour in, and logs lost to a SIGKILL show only on a timeout; seam=none; no_claim=that QEMU writes its cache out on SIGTERM (run-vm.sh's comment says it does), or that cache=unsafe is enough on every runner
+def test_dc_vm_disk_ignores_flushes_and_is_complete_once_read():
+    code = _code(DC_RUNNER)
+    system = re.search(r'(?m)-drive file="\$work/disk\.qcow2",(\S+) \\$', code)
+    assert system, "run-vm.sh lost the VM's system disk"
+    assert "cache=unsafe" in system.group(1).split(",")
+    # Its unsafe cache is complete on disk only once QEMU has exited, by
+    # itself or on SIGTERM: a SIGKILL would leave the qcow2 the logs are read
+    # from without what QEMU still held.
+    kills = [k.strip() for k in re.findall(r'\bkill((?: +-\S+)*) +"\$qemu"', code)]
+    assert "" in kills, "the timeout no longer stops the VM"
+    assert set(kills) <= {"", "-0", "-TERM", "-15", "-s TERM"}, kills
+    assert code.index('wait "$qemu"') < code.index("qemu-nbd --connect")
 
 
 # Value: protects=the agent directories' ACLs; fails_when=an icacls call comes back (it resolves the path again, and /T walks what the account planted), one of the two directories stops going through Grant-AgentDirectory, or -PlanOnly stops refusing before its exit; why_new=only the Windows unit step exercises the function, and it cannot see a call site that bypasses it; seam=none; no_claim=that the function behaves, which windows.yml's "Verify the agent directory grant" step runs for real
