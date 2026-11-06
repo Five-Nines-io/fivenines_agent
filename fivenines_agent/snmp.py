@@ -31,6 +31,8 @@ No shared mutable state between threads.
 
 import hashlib
 import json
+import math
+import re
 import shutil
 import subprocess
 import threading
@@ -39,6 +41,7 @@ from concurrent.futures import ThreadPoolExecutor, wait
 
 from fivenines_agent.debug import log
 from fivenines_agent.env import dry_run
+from fivenines_agent.scrub import log_safe, scrub_message
 from fivenines_agent.subprocess_utils import get_clean_env
 
 
@@ -80,6 +83,35 @@ IFXTABLE_COLUMNS = {
     "15": ("meta", "if_speed", lambda v: int(v) * 1000000),
     "18": ("meta", "if_alias", str),
 }
+
+# What net-snmp prints before the value when a device answers with another
+# type than the MIB declares (snmplib/mib.c).
+_WRONG_TYPE = re.compile(r"^Wrong Type \(should be [^)]*\): ")
+
+# net-snmp types whose value is a number (Float, Int64 and UInt64 come
+# wrapped in "Opaque: ").
+_NUMERIC_TYPES = frozenset(
+    (
+        "INTEGER",
+        "Gauge32",
+        "Counter32",
+        "Counter64",
+        "Timeticks",
+        "Float",
+        "Int64",
+        "UInt64",
+    )
+)
+
+# How much of a custom OID value that is not a number, or of a refused OID,
+# its error quotes.
+_VALUE_IN_ERROR_CHARS = 64
+
+# A custom OID as the agent polls it: numeric, a leading dot allowed (#279),
+# and only what net-snmp reads as written: it parses each sub-id with
+# strtoul(base 0), so a leading zero is octal ("08" is refused, "010" asks
+# for 8 and is never matched), and takes at most MAX_OID_LEN (128) of them.
+_NUMERIC_OID = re.compile(r"\.?(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){0,127}")
 
 # Settings
 SNMP_TIMEOUT = 5  # seconds per SNMP request (-t flag)
@@ -157,9 +189,12 @@ def _print_diagnostics(devices):
             sys_info = dev.get("system", {})
             sys_name = sys_info.get("sys_name", "-") or "-"
             ifaces = dev.get("interfaces", [])
+            # log_safe: the device names itself, and since the output is
+            # decoded as UTF-8 a U+FFFD or CJK name made print() raise on a
+            # Windows (cp1252) stdout, losing the dry run's SNMP result.
             print(
                 "  {}  {}  {} interfaces  OK".format(
-                    device_id[:20], sys_name[:20], len(ifaces)
+                    device_id[:20], log_safe(sys_name)[:20], len(ifaces)
                 )
             )
     print("")
@@ -170,16 +205,21 @@ def _parse_snmp_line(line):
 
     Handles formats like:
       .1.3.6.1.2.1.1.5.0 = STRING: "EPSONCD1062"
+      .1.3.6.1.2.1.31.1.1.1.18.1 = STRING:          (empty, with a hint)
       .1.3.6.1.2.1.2.2.1.10.1 = Counter32: 7010736
       .1.3.6.1.2.1.1.3.0 = Timeticks: (1491600) 4:08:36.00
       .1.3.6.1.2.1.2.2.1.8.1 = INTEGER: up(1)
+      .1.3.6.1.4.1.2021.4.5.0 = INTEGER: 16313768 kB
+      .1.3.6.1.4.1.2021.10.1.6.1 = Opaque: Float: 0.080000
+      .1.3.6.1.2.1.31.1.1.1.6.1 = Wrong Type (should be Counter64): Counter32: 7
       .1.3.6.1.2.1.31.1.1.1.1 = No Such Object available ...
       .1.3.6.1.2.1.31.1.1.1.18.2 = No more variables left in this MIB View ...
 
     Returns:
         tuple (oid_str, value_str) or None.
-        value_str is None for "No Such" responses. None (no tuple) for the
-        end of the MIB view, which carries no value.
+        value_str is None for "No Such" responses, and only the number for a
+        numeric type. None (no tuple) for the end of the MIB view, which
+        carries no value.
     """
     line = line.strip()
     if not line or " = " not in line:
@@ -201,11 +241,35 @@ def _parse_snmp_line(line):
     if value_part.startswith("No more variables"):
         return None
 
-    # Strip type prefix: "STRING: val", "Counter32: val", etc.
-    if ": " in value_part:
-        type_str, val = value_part.split(": ", 1)
-        type_str = type_str.strip()
+    # A device that answered with another type than its MIB declares: net-snmp
+    # prints the value as the type it has after this. Kept rather than dropped
+    # (#278): an ifTable counter that int() could not read shipped as 0.
+    value_part = _WRONG_TYPE.sub("", value_part, count=1)
 
+    # Strip the type prefix: "STRING: val", "Counter32: val", etc. An empty
+    # string with a DISPLAY-HINT (a DisplayString on a host that loads MIBs)
+    # prints as "STRING: ", which is "STRING:" once the line is stripped, and
+    # shipped as the text "STRING:" (#277). Without a hint it prints '""'.
+    type_str, sep, val = value_part.partition(": ")
+    if not sep:
+        if not value_part.endswith(":"):
+            return (oid_str, value_part.strip('"'))
+        type_str, val = value_part[:-1], ""
+
+    # Opaque-wrapped numbers: "Opaque: Float: 0.080000" (UCD-SNMP-MIB's
+    # laLoadFloat), "Opaque: Counter64: 7".
+    if type_str == "Opaque":
+        inner_type, sep, inner_val = val.partition(": ")
+        if sep:
+            type_str, val = inner_type, inner_val
+
+    if type_str in _NUMERIC_TYPES:
+        # The number is the first word: on a host that loads MIBs the MIB's
+        # UNITS follow it ("16313768 kB"), which the int() and float()
+        # readers dropped (#278). -OU turns them off, but like -Oe below it
+        # is a toggle snmp.conf overrides ("dontPrintUnits no").
+        words = val.split(None, 1)
+        val = words[0] if words else ""
         # Timeticks: (1491600) 4:08:36.00 -> extract raw value
         # INTEGER: up(1) -> "1". A host that loads MIBs (RHEL family,
         # snmp-mibs-downloader) labels enumerations, and the int() converters
@@ -215,11 +279,28 @@ def _parse_snmp_line(line):
         if type_str in ("Timeticks", "INTEGER"):
             if "(" in val and ")" in val:
                 val = val[val.index("(") + 1 : val.index(")")]
-
-        val = val.strip().strip('"')
         return (oid_str, val)
 
-    return (oid_str, value_part.strip().strip('"'))
+    return (oid_str, val.strip().strip('"'))
+
+
+def _to_number(val):
+    """A custom OID's value as an int, else a finite float, else None.
+
+    inf and nan are refused: json.dumps writes them as Infinity and NaN,
+    which a strict JSON parser rejects, and with them the WHOLE tick's
+    payload (the mysql _to_float rule). net-snmp prints them for an Opaque
+    float, and a device can return them as a string.
+    """
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        pass
+    try:
+        number = float(val)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _polling_key(target):
@@ -307,6 +388,28 @@ def _stuck(device_id):
     }
 
 
+def _decode_output(data):
+    """The CLI's output bytes as text, each line UTF-8 when it is, else cp1252.
+
+    Never the agent's locale codec, strictly: with a DISPLAY-HINT (a host
+    that loads MIBs) net-snmp copies a DisplayString's bytes as they are, so
+    one latin-1 sysDescr byte raised UnicodeDecodeError and failed the
+    device's poll, and one in an ifAlias dropped the ifXTable walk without a
+    word. Line by line, not UTF-8 with replacement: on Windows the locale
+    codec was the ANSI code page, which read a latin-1 or cp1252 name right,
+    and a U+FFFD there would rename the port once and lose its characters.
+    errors="replace" only for the five bytes cp1252 leaves undefined.
+    """
+    return "".join(_decode_line(line) for line in data.splitlines(keepends=True))
+
+
+def _decode_line(line):
+    try:
+        return line.decode("utf-8")
+    except UnicodeDecodeError:
+        return line.decode("cp1252", errors="replace")
+
+
 def _run_snmp_cmd(cmd, args, timeout):
     """Run an SNMP CLI command and return (stdout, error_dict_or_None).
 
@@ -316,19 +419,18 @@ def _run_snmp_cmd(cmd, args, timeout):
         result = subprocess.run(
             [cmd] + args,
             capture_output=True,
-            text=True,
             timeout=timeout,
             env=get_clean_env(),
         )
         if result.returncode != 0:
-            stderr = result.stderr.strip()
+            stderr = _decode_output(result.stderr).strip()
             lower = stderr.lower()
             if "timeout" in lower or "no response" in lower:
                 return None, {"type": "timeout", "message": stderr}
             if "auth" in lower or "usm" in lower or "unknown user" in lower:
                 return None, {"type": "auth_error", "message": stderr}
             return None, {"type": "snmp_error", "message": stderr}
-        return result.stdout, None
+        return _decode_output(result.stdout), None
     except subprocess.TimeoutExpired:
         return None, {
             "type": "timeout",
@@ -590,12 +692,21 @@ class SNMPCollector:
         version = target.get("version", "v2c")
         ip = target.get("ip", "127.0.0.1")
         port = target.get("port", 161)
+        # The server refuses such an address only when it changes, and the
+        # agent does not rely on it (the qemu URI allowlist posture, #142).
+        if isinstance(ip, str) and ip.startswith("-"):
+            return None, {
+                "type": "unknown",
+                "message": "Refused SNMP address starting with '-'",
+            }
         host = "{}:{}".format(ip, port) if port != 161 else ip
 
-        # -On: numeric OIDs. -Oe: enumerations as bare integers, not "up(1)"
-        # (_parse_snmp_line accepts both; snmp.conf can override -Oe).
+        # -On: numeric OIDs. -Oe: enumerations as bare integers, not "up(1)".
+        # -OU: no MIB UNITS after a number, not "16313768 kB". snmp.conf can
+        # override both, so _parse_snmp_line accepts either form.
         args = [
-            "-t", str(SNMP_TIMEOUT), "-r", str(SNMP_RETRIES), "-On", "-Oe",
+            "-t", str(SNMP_TIMEOUT), "-r", str(SNMP_RETRIES),
+            "-On", "-Oe", "-OU",
         ]
 
         if version == "v2c":
@@ -645,7 +756,13 @@ class SNMPCollector:
                 "message": "Unsupported SNMP version: {}".format(version),
             }
 
-        args.append(host)
+        # "--": everything after it is an operand. glibc's getopt reads
+        # options anywhere on the line, so without it a server-pushed host or
+        # OID starting with "-" was an snmpget option ("-Lf <file>" appends
+        # to a file as the agent's user). Every getopt net-snmp can use
+        # (glibc, musl, Cygwin, its own snmplib/getopt.c) stops at "--", and
+        # snmp_parse_args then reads the host as argv[optind].
+        args.extend(["--", host])
         return args, None
 
     def _poll_device(self, target):
@@ -691,13 +808,14 @@ class SNMPCollector:
             if error:
                 log(
                     "SNMP custom OID poll failed for {}: {}".format(
-                        device_id, error.get("message", "")
+                        device_id, log_safe(error.get("message", ""))
                     ),
                     "error",
                 )
-                # Non-fatal: include partial result with custom error
+                # Non-fatal: the device's other data still ships, and so do
+                # the custom OIDs read when only some values were not numbers.
                 result["custom_metrics_error"] = error
-            else:
+            if custom is not None:
                 result["custom_metrics"] = custom
 
         return result
@@ -711,40 +829,64 @@ class SNMPCollector:
                 type is "gauge", "counter", or "string"
 
         Returns:
-            tuple: (metrics_list, error_dict_or_None)
+            tuple: (metrics_list, error_dict_or_None). Both are set when
+            some gauge or counter values were not numbers: the others are
+            still read, and the error names the ones left out (the server
+            drops a value that is not a number without a word, #278).
         """
-        oids = [entry["oid"] for entry in custom_oids]
-        args = base_args + oids
-        stdout, error = _run_snmp_cmd("snmpget", args, SNMP_TIMEOUT + 5)
-        if error:
-            return None, error
-
-        # Build OID -> entry lookup
-        oid_map = {entry["oid"]: entry for entry in custom_oids}
+        # Numeric OIDs only: a symbolic one ("sysName.0") never matches the
+        # -On output, and anything else fails the whole snmpget. Behind "--"
+        # (_build_base_args) none can be read as an option either way.
+        polled, refused = [], []
+        for entry in custom_oids:
+            oid = entry.get("oid")
+            if isinstance(oid, str) and _NUMERIC_OID.fullmatch(oid):
+                polled.append(entry)
+            else:
+                quoted = str(oid)[:_VALUE_IN_ERROR_CHARS]
+                refused.append("{}={!r}".format(entry.get("name"), quoted))
 
         metrics = []
-        for line in stdout.splitlines():
-            parsed = _parse_snmp_line(line)
-            if not parsed or parsed[1] is None:
-                continue
-            oid, val = parsed
-            entry = oid_map.get(oid)
-            if not entry:
-                continue
-            metric = {"name": entry["name"], "oid": oid}
-            oid_type = entry.get("type", "gauge")
-            if oid_type == "string":
-                metric["value"] = val
-            else:
-                try:
-                    metric["value"] = int(val)
-                except (ValueError, TypeError):
-                    try:
-                        metric["value"] = float(val)
-                    except (ValueError, TypeError):
-                        metric["value"] = val
-            metrics.append(metric)
+        not_numbers = []
+        if polled:
+            args = base_args + [entry["oid"] for entry in polled]
+            stdout, error = _run_snmp_cmd("snmpget", args, SNMP_TIMEOUT + 5)
+            if error:
+                return None, error
 
+            # OID -> the entries that ask for it, keyed without the leading
+            # dot a template may spell (#279): -On prints every OID with one,
+            # and _parse_snmp_line strips it. Two entries may ask for one
+            # OID, and snmpget then answers it twice.
+            entries_by_oid = {}
+            for entry in polled:
+                entries_by_oid.setdefault(entry["oid"].lstrip("."), []).append(entry)
+
+            for line in stdout.splitlines():
+                parsed = _parse_snmp_line(line)
+                if not parsed or parsed[1] is None:
+                    continue
+                oid, val = parsed
+                for entry in entries_by_oid.pop(oid, ()):
+                    if entry.get("type", "gauge") == "string":
+                        value = val
+                    else:
+                        value = _to_number(val)
+                        if value is None:
+                            quoted = val[:_VALUE_IN_ERROR_CHARS]
+                            not_numbers.append("{}={!r}".format(entry["name"], quoted))
+                            continue
+                    metrics.append({"name": entry["name"], "oid": oid, "value": value})
+
+        problems = []
+        if refused:
+            problems.append("not a numeric OID: {}".format(", ".join(refused)))
+        if not_numbers:
+            problems.append("not a number: {}".format(", ".join(not_numbers)))
+        if problems:
+            error_type = "config_error" if refused else "parse_error"
+            message = scrub_message("; ".join(problems))
+            return metrics, {"type": error_type, "message": message}
         return metrics, None
 
     def _poll_system(self, base_args):

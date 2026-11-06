@@ -1905,7 +1905,7 @@ Verified with SNMPv2c against Net-SNMP 5.9.5.2 on Windows Server 2022.
 
 **Per interface:** name, type, admin/oper status, speed, traffic (bytes/packets in/out), errors, discards, broadcast counts. Prefers 64-bit high-capacity counters when available, falls back to 32-bit.
 
-**Custom OIDs:** The server can send vendor-specific OIDs (CPU, memory, temperature, etc.) based on the device model detected via `sysDescr`. No agent-side configuration needed.
+**Custom OIDs:** The server can send vendor-specific OIDs (CPU, memory, temperature, etc.) based on the device model detected via `sysDescr`. No agent-side configuration needed. A gauge or counter OID whose value is not a number is left out, and the agent logs it and reports it to the server as a custom OID error.
 
 ### How It Works
 
