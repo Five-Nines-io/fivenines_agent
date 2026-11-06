@@ -3,6 +3,7 @@ the run() queue drain, the send_* endpoints, get_config and get_conn."""
 
 import gzip
 import http.client
+import io
 import json
 import os
 import re
@@ -255,6 +256,65 @@ def test_run_sends_each_payload_and_skips_the_wakeup_sentinel(mock_send, mock_fe
     assert sync.queue.get.call_count == 3
     assert sync.queue.task_done.call_count == 2
     assert sync._stop_event.is_set()
+
+
+# Value: protects=the synchronizer thread, the agent's only sender, outlives a
+# send that raises; ended, it left a live process collecting into a queue
+# nobody drained, which no supervisor restarts; fails_when=run() lets an
+# exception from send_metrics or the startup fetch out, stops marking payloads
+# done, or drops the error without a line; why_new=every run() test had sends
+# that returned; seam=send_metrics and _fetch_config_once raise;
+# no_claim=which exceptions a send can raise (any is caught).
+@patch.object(Synchronizer, "_fetch_config_once")
+@patch.object(Synchronizer, "send_metrics")
+def test_run_outlives_a_send_that_raises(mock_send, mock_fetch):
+    sync = make_synchronizer()
+    first, second = serialize_payload({"tick": 1}), serialize_payload({"tick": 2})
+    sync.queue.get.side_effect = [first, second]
+    mock_fetch.side_effect = KeyError("request_options")
+
+    def send(data):
+        if data == first:
+            raise RuntimeError("boom \u63a5\nforged")
+        sync.stop()
+
+    mock_send.side_effect = send
+
+    with patch.object(synchronizer_module, "log") as mock_log:
+        sync.run()
+
+    assert mock_send.call_args_list == [call(first), call(second)]
+    assert sync.queue.task_done.call_count == 2
+    assert mock_log.call_args_list == [
+        call("Synchronizer Error: KeyError: 'request_options'", "error"),
+        call("Synchronizer Error: RuntimeError: boom \\u63a5 forged", "error"),
+    ]
+
+
+# Value: protects=issue #273's path end to end: a connect refused with a
+# Windows error message in a language the service's code page lacks is logged
+# by the retry loop, and the send returns instead of raising out of the
+# except block; fails_when=log() raises UnicodeEncodeError on a strict
+# stdout; why_new=no synchronizer test logged to a stream that cannot encode
+# its line; seam=sys.stdout is a cp1252 strict TextIOWrapper, get_conn
+# raises; no_claim=the stream WinSW gives the agent on a real host.
+def test_send_with_a_localized_os_error_on_a_strict_stdout(monkeypatch):
+    monkeypatch.delenv("LOG_LEVEL", raising=False)
+    stream = io.TextIOWrapper(
+        io.BytesIO(), encoding="cp1252", errors="strict", newline="\n"
+    )
+    monkeypatch.setattr(sys, "stdout", stream)
+    sync = make_synchronizer()
+    sync.config["request_options"]["retry"] = 1
+    winerror = OSError("[WinError 10060] \u63a5\u7d9a\u6e08\u307f")
+
+    with patch.object(Synchronizer, "get_conn", side_effect=winerror):
+        assert sync.send_metrics(serialize_payload({"tick": 1})) is None
+
+    stream.flush()
+    assert b"Synchronizer Error: [WinError 10060] \\u63a5\\u7d9a" in (
+        stream.buffer.getvalue()
+    )
 
 
 # --- send_packages ---

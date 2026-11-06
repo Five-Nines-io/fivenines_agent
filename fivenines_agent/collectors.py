@@ -352,11 +352,12 @@ def _collect_with_telemetry(name, fn, telemetry, /, *args, **kwargs):
             errors.append(str(e))
             duration_ms = round((time.monotonic() - start) * 1000, 2)
             telemetry[name] = {"duration_ms": duration_ms, "errors": errors}
-        # log_safe, not the raw message: an OS error text (a localized
-        # pywintypes.error or OSError strerror) can hold a character a Windows
-        # service's strict ANSI-code-page stdout cannot encode, and a print()
-        # raising here would escape this handler and end the collection loop.
-        # The telemetry entry above keeps the message as raised.
+        # log_safe, not the raw message: it redacts, and a newline in an OS
+        # error text cannot forge journal lines. It also escapes non-ASCII: a
+        # print() raising here on a Windows service's strict ANSI-code-page
+        # stdout would escape this handler and end the collection loop (log()
+        # itself no longer raises on encoding since #273). The telemetry
+        # entry above keeps the message as raised.
         log(f"Error collecting {name}: {log_safe(e)}", "error")
         return None
 

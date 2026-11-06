@@ -14,6 +14,7 @@ import certifi
 from fivenines_agent.debug import debug, debug_enabled, log
 from fivenines_agent.dns_resolver import DNSResolver
 from fivenines_agent.env import api_url, config_dir, restrict_to_owner
+from fivenines_agent.scrub import log_safe
 
 # gzip level for every POST body. The library default (9) is the slowest
 # setting for a ~2-5% size win on JSON; level 6 is the standard speed/ratio
@@ -116,13 +117,28 @@ class Synchronizer(Thread):
 
     def run(self):
         # We fetch the config from the server before starting to collect metrics
-        self._fetch_config_once()
+        self._isolated(self._fetch_config_once)
 
         while not self._stop_event.is_set():
             data = self.queue.get()
             if data is not None:
-                self.send_metrics(data)
+                self._isolated(self.send_metrics, data)
                 self.queue.task_done()
+
+    def _isolated(self, fn, *args):
+        """Run fn, logging what it raises instead of letting it end run().
+
+        This thread is the agent's only sender. An exception escaping run()
+        ended it while the process stayed up: the agent kept collecting into a
+        queue nobody drained (dropping its oldest payloads), the host stopped
+        reporting, and no supervisor restarts a process that is still running
+        (#273). A payload whose send raised is dropped; a failed startup fetch
+        is retried by the main loop's get_config().
+        """
+        try:
+            fn(*args)
+        except Exception as e:
+            log(f"Synchronizer Error: {type(e).__name__}: {log_safe(e)}", "error")
 
     def stop(self):
         self._stop_event.set()

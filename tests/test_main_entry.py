@@ -10,12 +10,15 @@ agent.
 """
 
 import importlib.util
+import io
+import os
 import re
 import runpy
 import subprocess
 import sys
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -97,12 +100,21 @@ def test_parse_args_unknown_flag_exits_with_usage_error(monkeypatch, capsys):
 def test_start_parses_args_before_building_and_running_the_agent(monkeypatch):
     calls = MagicMock()
     calls.parse_args.return_value = Namespace(dry_run=False, check_imports=None)
+    monkeypatch.setattr(
+        main_module, "escape_unencodable_output", calls.escape_unencodable_output
+    )
     monkeypatch.setattr(main_module, "parse_args", calls.parse_args)
     monkeypatch.setattr("fivenines_agent.agent.Agent", calls.Agent)
 
     main_module.start()
 
-    assert calls.mock_calls == [call.parse_args(), call.Agent(), call.Agent().run()]
+    # The output is made safe before anything can print (#273).
+    assert calls.mock_calls == [
+        call.escape_unencodable_output(),
+        call.parse_args(),
+        call.Agent(),
+        call.Agent().run(),
+    ]
 
 
 def test_start_version_exits_before_the_agent_is_built(monkeypatch, capsys):
@@ -393,6 +405,89 @@ def test_start_dry_run_flag_is_visible_to_the_agent(monkeypatch):
     main_module.start()
 
     assert seen == [True]
+
+
+# --- __main__.escape_unencodable_output (#273) --------------------------------
+
+
+def _stream(encoding, errors):
+    return io.TextIOWrapper(
+        io.BytesIO(), encoding=encoding, errors=errors, newline="\n"
+    )
+
+
+def test_escape_unencodable_output_makes_a_strict_stream_escape(monkeypatch):
+    """A Windows service's stdout encodes in the ANSI code page with
+    errors="strict": a localized OS error message made print() raise inside
+    the except block logging it. The stream now escapes what its code page
+    lacks and still writes what it has (the e-acute) in that code page."""
+    out, err = _stream("cp1252", "strict"), _stream("cp1252", "strict")
+    # In the test body: pytest re-installs its capture streams after setup.
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+
+    main_module.escape_unencodable_output()
+    print("\u63a5\u7d9a caf\u00e9")
+    print("\u63a5", file=sys.stderr)
+
+    out.flush()
+    err.flush()
+    assert out.buffer.getvalue() == b"\\u63a5\\u7d9a caf\xe9\n"
+    assert err.buffer.getvalue() == b"\\u63a5\n"
+
+
+def test_escape_unencodable_output_keeps_a_stream_that_does_not_raise(monkeypatch):
+    """Under the C locale CPython gives stdout surrogateescape, which writes
+    the original bytes back: replacing it would change what is written."""
+    out = _stream("utf-8", "surrogateescape")
+    err = _stream("utf-8", "backslashreplace")
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+
+    main_module.escape_unencodable_output()
+
+    assert (out.errors, err.errors) == ("surrogateescape", "backslashreplace")
+
+
+def test_escape_unencodable_output_skips_a_stream_it_cannot_reconfigure(monkeypatch):
+    """No stdout at all (None: a frozen build without a console), or a
+    replacement stream that is not a TextIOWrapper: left alone, no error."""
+    stand_in = SimpleNamespace(errors="strict")
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", stand_in)
+
+    main_module.escape_unencodable_output()
+
+    assert stand_in.errors == "strict"
+
+
+# Value: protects=the real stdout CPython builds for a redirected stream (a
+# Windows service's, under WinSW) stops raising on a character its encoding
+# lacks; fails_when=escape_unencodable_output no longer reaches sys.stdout, or
+# reconfigures something CPython does not build; why_new=the in-process tests
+# use hand-built TextIOWrappers; seam=PYTHONIOENCODING stands for the ANSI
+# code page; no_claim=that WinSW's stdout is cp1252 strict on a given host.
+@pytest.mark.parametrize("escaped", [False, True], ids=["as_built", "escaped"])
+def test_redirected_strict_stdout_in_a_fresh_interpreter(escaped):
+    probe = (
+        "from fivenines_agent.__main__ import escape_unencodable_output\n"
+        + ("escape_unencodable_output()\n" if escaped else "")
+        + "print('\\u63a5 caf\\u00e9')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        timeout=60,
+        cwd=REPO_ROOT,
+        env={**os.environ, "PYTHONIOENCODING": "cp1252:strict"},
+    )
+    if escaped:
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.splitlines() == [b"\\u63a5 caf\xe9"]
+    else:
+        # The premise: as CPython builds it, the stream raises.
+        assert result.returncode == 1
+        assert b"UnicodeEncodeError" in result.stderr
 
 
 # --- python -m fivenines_agent ----------------------------------------------

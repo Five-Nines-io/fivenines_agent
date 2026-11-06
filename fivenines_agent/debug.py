@@ -97,7 +97,19 @@ def debug_enabled():
 
 def log(message, level='info'):
     if LOG_LEVELS[log_level()] <= LOG_LEVELS[level]:
-        print(f"[{level.upper()}][thread#{threading.get_native_id()}] {message}")
+        line = f"[{level.upper()}][thread#{threading.get_native_id()}] {message}"
+        try:
+            print(line)
+        except UnicodeEncodeError:
+            # A Windows service's stdout encodes in the ANSI code page with
+            # errors="strict", and a localized OS error message can hold a
+            # character that code page lacks (#273). log() runs inside the
+            # except blocks of every thread, so raising here would end the
+            # thread (the synchronizer's) or the collection loop. start()
+            # already makes stdout escape what it cannot encode; this holds
+            # wherever start() did not run. print() encodes the whole line
+            # before writing it, so nothing was written.
+            print(line.encode("ascii", "backslashreplace").decode("ascii"))
     # Buffer error messages when capture is active (thread-local).
     # Intentionally outside the log-level check: errors are always
     # captured for backend telemetry regardless of configured log level.

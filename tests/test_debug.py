@@ -6,7 +6,9 @@ at debug level, which dry-run always enables. The clock is replaced with a
 scripted one so the printed millisecond figure is exact.
 """
 
+import io
 import re
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -163,3 +165,58 @@ def test_context_manager_dry_run_does_not_swallow_exceptions(
             raise RuntimeError("gzip failed")
     # The timing line is still written on the way out.
     assert _messages(capsys) == ["gzip_compress (2 ms): None"]
+
+
+# --- log() on a stdout that cannot encode the line (#273) ---
+
+
+def _strict_cp1252_stdout(monkeypatch):
+    """Make sys.stdout what a Windows service's is when start() did not run:
+    the ANSI code page with errors="strict" (WinSW redirects it to the log
+    file). Return a reader of the bytes written. Called from the test body:
+    pytest re-installs its own capture stream after fixture setup."""
+    monkeypatch.delenv("LOG_LEVEL", raising=False)
+    stream = io.TextIOWrapper(
+        io.BytesIO(), encoding="cp1252", errors="strict", newline="\n"
+    )
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    def written():
+        stream.flush()
+        return stream.buffer.getvalue()
+
+    return written
+
+
+# Value: protects=a log line quoting a localized OS error never raises, so the
+# except block logging it (the synchronizer's retry loop, Agent.run's last
+# handler) completes and its thread lives on; fails_when=log() prints the line
+# as is to a strict stdout and lets UnicodeEncodeError out, or swallows the
+# line instead of writing it escaped, or the escape skips the telemetry
+# capture; why_new=no test fed log() a stream that cannot encode its line;
+# seam=none; no_claim=what start() does to the real stdout (test_main_entry).
+def test_log_escapes_a_line_its_strict_stdout_cannot_encode(monkeypatch):
+    written = _strict_cp1252_stdout(monkeypatch)
+    message = "Synchronizer Error: [WinError 10060] \u63a5\u7d9a caf\u00e9"
+    debug_module.start_log_capture()
+    try:
+        debug_module.log(message, "error")
+    finally:
+        captured = debug_module.stop_log_capture()
+
+    # The whole line is escaped to ASCII, the e-acute cp1252 has included.
+    assert re.fullmatch(
+        rb"\[ERROR\]\[thread#\d+\] Synchronizer Error: \[WinError 10060\] "
+        rb"\\u63a5\\u7d9a caf\\xe9\n",
+        written(),
+    )
+    # Telemetry keeps the message as logged.
+    assert captured == [message]
+
+
+def test_log_writes_a_line_its_stdout_can_encode_unchanged(monkeypatch):
+    written = _strict_cp1252_stdout(monkeypatch)
+
+    debug_module.log("caf\u00e9", "error")
+
+    assert re.fullmatch(rb"\[ERROR\]\[thread#\d+\] caf\xe9\n", written())
