@@ -1,6 +1,7 @@
 """Tests for SNMP network device polling collector (subprocess-based)."""
 
 import subprocess
+import sys
 import time
 from concurrent.futures import Future
 from io import StringIO
@@ -9,6 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from fivenines_agent.snmp import (
+    _VALUE_IN_ERROR_CHARS,
     EXECUTOR_TIMEOUT,
     IF_TABLE_PREFIX,
     IF_XTABLE_PREFIX,
@@ -21,6 +23,7 @@ from fivenines_agent.snmp import (
     SNMP_RETRIES,
     SNMP_TIMEOUT,
     SNMPCollector,
+    _decode_output,
     _parse_snmp_line,
     _polling_key,
     _print_diagnostics,
@@ -258,8 +261,9 @@ def _outcome(devices):
 def _mock_run(stdout="", stderr="", returncode=0):
     """Create a mock subprocess.CompletedProcess."""
     result = MagicMock(spec=subprocess.CompletedProcess)
-    result.stdout = stdout
-    result.stderr = stderr
+    # subprocess.run hands back bytes: _run_snmp_cmd decodes them itself.
+    result.stdout = stdout.encode() if isinstance(stdout, str) else stdout
+    result.stderr = stderr.encode() if isinstance(stderr, str) else stderr
     result.returncode = returncode
     return result
 
@@ -378,6 +382,91 @@ class TestParseSnmpLine:
         assert oid == "1.3.6.1.2.1.2.2.1.6.1"
         assert val == "64 C6 D2 CD 10 62"
 
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "STRING: ",  # a DisplayString with its hint (a MIB-loading host)
+            "STRING:",
+            '""',  # without a hint: net-snmp prints no type for ""
+            'STRING: ""',
+        ],
+    )
+    def test_empty_string_is_empty(self, value):
+        """REGRESSION (#277): with a DISPLAY-HINT net-snmp prints an empty
+        string as "STRING: ", which the stripped line turned into the value
+        "STRING:" -- every port without a description reported the alias
+        "STRING:" on a host that loads MIBs."""
+        line = ".1.3.6.1.2.1.31.1.1.1.18.1 = " + value
+        assert _parse_snmp_line(line) == ("1.3.6.1.2.1.31.1.1.1.18.1", "")
+
+    @pytest.mark.parametrize(
+        "value, number",
+        [
+            ("INTEGER: 16313768 kB", "16313768"),
+            ("Gauge32: 42 percent", "42"),
+            ("Counter32: 7010736 packets", "7010736"),
+            ("Counter64: 9000000000 octets", "9000000000"),
+            ("Timeticks: (1491600) 4:08:36.00 centi-seconds", "1491600"),
+            ("INTEGER: up(1) units", "1"),
+            ("INTEGER: 12.34 degrees", "12.34"),  # a "d-2" DISPLAY-HINT
+            ("INTEGER: 5 seconds (s)", "5"),
+        ],
+    )
+    def test_numeric_value_drops_its_units(self, value, number):
+        """REGRESSION (#278): a host that loads MIBs prints the MIB's UNITS
+        after a number (UCD-SNMP-MIB's memTotalReal: "kB"), which int() and
+        float() then failed on. The number is the first word, read before
+        any parenthesis (a UNITS with one is not an enumeration)."""
+        line = ".1.3.6.1.4.1.2021.4.5.0 = " + value
+        assert _parse_snmp_line(line) == ("1.3.6.1.4.1.2021.4.5.0", number)
+
+    def test_a_string_keeps_its_words(self):
+        """Only a numeric type is cut to its first word."""
+        line = '.1.3.6.1.2.1.31.1.1.1.18.1 = STRING: "Uplink to core 2"'
+        assert _parse_snmp_line(line) == (
+            "1.3.6.1.2.1.31.1.1.1.18.1",
+            "Uplink to core 2",
+        )
+
+    @pytest.mark.parametrize(
+        "value, number",
+        [
+            ("Opaque: Float: 0.080000", "0.080000"),
+            ("Opaque: Float: 1.500000 load", "1.500000"),
+            ("Opaque: Counter64: 7", "7"),
+            ("Opaque: UInt64: 18446744073709551615", "18446744073709551615"),
+            ("Opaque: Int64: -5", "-5"),
+        ],
+    )
+    def test_opaque_number_is_unwrapped(self, value, number):
+        """REGRESSION (#278): UCD-SNMP-MIB's laLoadFloat and other Opaque
+        floats print as "Opaque: Float: <v>", read as "Float: <v>"."""
+        line = ".1.3.6.1.4.1.2021.10.1.6.1 = " + value
+        assert _parse_snmp_line(line) == ("1.3.6.1.4.1.2021.10.1.6.1", number)
+
+    def test_raw_opaque_stays_hex(self):
+        """A plain Opaque (no special type inside) is net-snmp's OPAQUE:
+        hex dump, a string."""
+        line = ".1.3.6.1.4.1.9.1.0 = OPAQUE: 9F 78 04 3D A3 D7 0A"
+        assert _parse_snmp_line(line) == ("1.3.6.1.4.1.9.1.0", "9F 78 04 3D A3 D7 0A")
+
+    @pytest.mark.parametrize(
+        "value, parsed",
+        [
+            ("Wrong Type (should be Counter64): Counter32: 7010736", "7010736"),
+            ("Wrong Type (should be Gauge32 or Unsigned32): INTEGER: up(1)", "1"),
+            ("Wrong Type (should be Timeticks): Gauge32: 12 ticks", "12"),
+            ("Wrong Type (should be Opaque): Counter64: 5", "5"),
+            ('Wrong Type (should be INTEGER): STRING: "eth0"', "eth0"),
+        ],
+    )
+    def test_wrong_type_reads_the_type_the_device_sent(self, value, parsed):
+        """REGRESSION (#278): a device answering with another type than its
+        MIB declares is printed "Wrong Type (should be X): <TYPE>: <v>",
+        and the value was the whole "<TYPE>: <v>" text."""
+        line = ".1.3.6.1.2.1.31.1.1.1.6.1 = " + value
+        assert _parse_snmp_line(line) == ("1.3.6.1.2.1.31.1.1.1.6.1", parsed)
+
 
 # ================================================================
 # Tests for _run_snmp_cmd()
@@ -385,6 +474,66 @@ class TestParseSnmpLine:
 
 
 class TestRunSnmpCmd:
+    def test_a_byte_that_is_not_utf8_does_not_fail_the_read(self):
+        """REGRESSION: with a DISPLAY-HINT net-snmp copies a DisplayString's
+        bytes as they are, and a strict decode with the locale codec raised
+        UnicodeDecodeError on a latin-1 sysDescr, failing the device's poll.
+        Each line is UTF-8 when it is, else cp1252: a latin-1 name keeps its
+        characters (as the Windows ANSI decode read it before) instead of a
+        U+FFFD that would rename the port. A real child process, so the
+        bytes are what subprocess.run hands back."""
+        code = (
+            "import sys; sys.stdout.buffer.write("
+            "b'.1.3.6.1.2.1.1.1.0 = STRING: caf@xe9@n"
+            ".1.3.6.1.2.1.1.5.0 = STRING: caf@xc3@xa9@n"
+            ".1.3.6.1.2.1.1.6.0 = STRING: x@x81y@n')"
+        ).replace("@", "\\")
+        stdout, error = _run_snmp_cmd(sys.executable, ["-c", code], 30)
+        assert error is None
+        assert stdout.splitlines() == [
+            ".1.3.6.1.2.1.1.1.0 = STRING: caf\u00e9",  # latin-1 / cp1252
+            ".1.3.6.1.2.1.1.5.0 = STRING: caf\u00e9",  # UTF-8
+            ".1.3.6.1.2.1.1.6.0 = STRING: x\ufffdy",  # undefined in cp1252
+        ]
+
+    def test_a_line_that_is_not_utf8_uses_the_windows_ansi_code_page(self):
+        """On Windows the agent decoded with the ANSI code page: a cp1251
+        (Cyrillic) device name keeps its characters, not cp1252 mojibake."""
+        with patch("fivenines_agent.snmp._FALLBACK_CODEC", "cp1251"):
+            text = _decode_output(b"name = STRING: \xd1\xe2\xe8\xf2\n")
+        assert text == "name = STRING: \u0421\u0432\u0438\u0442\n"
+
+    @pytest.mark.parametrize(
+        "platform, preferred, codec",
+        [
+            ("win32", "cp1251", "cp1251"),
+            ("win32", "cp932", "cp932"),
+            ("win32", "UTF-8", "cp1252"),  # UTF-8 mode: the line just failed it
+            ("win32", "no-such-codec", "cp1252"),
+            ("linux", "cp1251", "cp1252"),
+        ],
+    )
+    def test_fallback_codec(self, platform, preferred, codec):
+        from fivenines_agent import snmp
+
+        with patch.object(snmp.sys, "platform", platform), patch.object(
+            snmp.locale, "getpreferredencoding", return_value=preferred
+        ):
+            assert snmp._ansi_codec() == codec
+
+    @patch("fivenines_agent.snmp.get_clean_env")
+    @patch("fivenines_agent.snmp.subprocess.run")
+    def test_stderr_is_decoded_the_same_way(self, mock_run, mock_env):
+        mock_env.return_value = {}
+        mock_run.return_value = _mock_run(
+            returncode=1, stderr=b"snmpget: Unknown host (sw-\xfcro)"
+        )
+        _, error = _run_snmp_cmd("snmpget", [], 10)
+        assert error == {
+            "type": "snmp_error",
+            "message": "snmpget: Unknown host (sw-\u00fcro)",
+        }
+
     @patch("fivenines_agent.snmp.get_clean_env")
     @patch("fivenines_agent.snmp.subprocess.run")
     def test_success(self, mock_run, mock_env):
@@ -561,6 +710,117 @@ class TestBuildBaseArgs:
         assert "192.168.1.10" in args
         assert "-On" in args
         assert "-Oe" in args  # numeric enums (#162)
+        assert "-OU" in args  # no MIB UNITS after a number (#278)
+        # "--" ends the options: the host and the OIDs after it are operands
+        assert args[-2:] == ["--", "192.168.1.10"]
+        assert args.count("--") == 1
+
+    # Value: protects=only an address the server's format rule accepts
+    # reaches snmpget: never an option ("-...") or a net-snmp transport
+    # ("tcp:", "unix:/..."); fails_when=the address check is dropped or
+    # loosened; why_new=the server checks the format only when the address
+    # changes (legacy rows); seam=none; no_claim=a real net-snmp run
+    @pytest.mark.parametrize(
+        "ip",
+        [
+            "-Lf/tmp/x",
+            "-v1",
+            "tcp:192.0.2.1",
+            "unix:/run/x.sock",
+            "udp6:[2001:db8::1]:161",
+            "1.2.3.999",
+            "sw1:0",
+            "sw1:01161",
+            "sw1:65536",
+            "[2001:db8::1]:99999",
+            "[sw1]:161",
+            "fe80::1%-Lf/tmp/x",
+            "fe80::1%en0.5",
+            "fe80::1%",
+            "2001:db8::1%eth0",
+            "a" * 64 + ".lan",
+            "sw_1.lan",
+            "sw1.lan.",
+            "sw1.lan\n",
+            "",
+            None,
+            1234,
+        ],
+    )
+    def test_address_outside_the_server_format_is_refused(self, ip):
+        target = _make_target(ip=ip)
+        args, error = SNMPCollector([target])._build_base_args(target)
+        assert args is None
+        assert error == {
+            "type": "unknown",
+            "message": "Refused SNMP address: not an IP address or host name",
+        }
+
+    # Value: protects=the port field cannot turn a checked address back into a
+    # net-snmp transport or a second port; fails_when=only the ip field is
+    # checked and the port appended unchecked ("unix" + "/run/x.sock");
+    # why_new=found by the docs audit after the address check landed;
+    # seam=none; no_claim=a real net-snmp run
+    @pytest.mark.parametrize(
+        "ip, port",
+        [
+            ("unix", "/run/x.sock"),
+            ("tcp", 1161),
+            ("Alias", 1161),
+            ("tcp:1161", 161),
+            ("udp6:161", 161),
+            ("192.0.2.1:5", 6),
+            ("[2001:db8::1]:1161", 1162),
+            ("192.0.2.1", True),
+            ("192.0.2.1", 0),
+            ("192.0.2.1", 65536),
+            ("192.0.2.1", "1161"),
+        ],
+    )
+    def test_operand_that_reads_as_a_transport_is_refused(self, ip, port):
+        target = _make_target(ip=ip, port=port)
+        args, error = SNMPCollector([target])._build_base_args(target)
+        assert args is None
+        assert error["message"] == (
+            "Refused SNMP address: not an IP address or host name"
+        )
+
+    @pytest.mark.parametrize(
+        "ip, port, operand",
+        [
+            ("tcp", 161, "tcp"),  # a host name, polled bare
+            ("192.0.2.1", 1161, "192.0.2.1:1161"),
+            ("2001:db8::1", 1161, "[2001:db8::1]:1161"),
+            ("sw1.lan:16100", 161, "sw1.lan:16100"),
+        ],
+    )
+    def test_operand_composed_from_address_and_port(self, ip, port, operand):
+        target = _make_target(ip=ip, port=port)
+        args, error = SNMPCollector([target])._build_base_args(target)
+        assert error is None
+        assert args[-2:] == ["--", operand]
+
+    @pytest.mark.parametrize(
+        "ip",
+        [
+            "192.0.2.10",
+            "192.0.2.10:1161",
+            "sw1",
+            "sw1.example.lan:16100",
+            "a" * 63 + ".lan",
+            "2001:db8::1",
+            "::1",
+            "[2001:db8::1]:1161",
+            "fe80::1%eth0",
+            "FE80::1%en0",
+            "[fe80::1%eth0]:1161",
+        ],
+    )
+    def test_address_in_the_server_format_is_polled(self, ip):
+        target = _make_target(ip=ip)
+        args, error = SNMPCollector([target])._build_base_args(target)
+        assert error is None
+        assert args[-2:] == ["--", ip]
 
     def test_v2c_custom_community(self):
         target = _make_target(community="secret")
@@ -686,6 +946,20 @@ class TestPollSystem:
         system, error = collector._poll_system([])
         assert error is None
         assert system == {}
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_empty_sys_name_on_a_mib_loading_host(self, mock_cmd):
+        """REGRESSION (#277): an empty hinted DisplayString is "STRING: ",
+        and sysName shipped as the text "STRING:"."""
+        output = (
+            ".1.3.6.1.2.1.1.5.0 = STRING: \n"
+            ".1.3.6.1.2.1.1.1.0 = STRING: Linux edge 6.1.0\n"
+        )
+        mock_cmd.return_value = (output, None)
+        collector = SNMPCollector([_make_target()])
+        system, error = collector._poll_system([])
+        assert error is None
+        assert system == {"sys_name": "", "sys_descr": "Linux edge 6.1.0"}
 
     @patch("fivenines_agent.snmp._run_snmp_cmd")
     def test_invalid_uptime(self, mock_cmd):
@@ -1891,6 +2165,25 @@ class TestPrintDiagnostics:
         assert "2 interfaces" in out
         assert "OK" in out
 
+    # Value: protects=the dry-run table prints a device-supplied sysName as
+    # ASCII escapes; fails_when=log_safe is dropped: a control character
+    # reaches the terminal, and wherever start() did not make stdout escape
+    # (#273) a U+FFFD or CJK name makes print() raise on a cp1252 stdout;
+    # why_new=only ASCII names were tested; seam=none;
+    # no_claim=a real Windows console
+    def test_device_name_is_printed_log_safe(self, capsys):
+        devices = [
+            {
+                "device_id": "dev-1",
+                "system": {"sys_name": "sw-B\u00fcro\ufffd\x1b"},
+                "interfaces": [],
+            }
+        ]
+        _print_diagnostics(devices)
+        out = capsys.readouterr().out
+        assert out.isascii()
+        assert "sw-B\\xfcro\\ufffd " in out
+
     def test_timeout_device(self, capsys):
         devices = [
             {
@@ -2000,6 +2293,40 @@ class TestParseTable:
         assert hc_supported is True
         assert list(counters) == [1]
         assert counters[1]["bytes_in"] == 1000
+
+    def test_mib_loading_host_reads_an_empty_alias_as_empty(self):
+        """REGRESSION (#277): with a DISPLAY-HINT, net-snmp prints strings
+        unquoted and an empty one as "STRING: " (trailing space): a port
+        without a description reported the alias "STRING:"."""
+        output = (
+            ".1.3.6.1.2.1.31.1.1.1.1.1 = STRING: Gi0/1\n"
+            ".1.3.6.1.2.1.31.1.1.1.1.2 = STRING: Gi0/2\n"
+            ".1.3.6.1.2.1.31.1.1.1.18.1 = STRING: \n"
+            ".1.3.6.1.2.1.31.1.1.1.18.2 = STRING: Uplink to core\n"
+        )
+        collector = SNMPCollector([_make_target()])
+        interfaces = {}
+        collector._parse_table(
+            output, IF_XTABLE_PREFIX, IFXTABLE_COLUMNS, interfaces, {}, {}
+        )
+        assert interfaces[1]["if_name"] == "Gi0/1"
+        assert interfaces[1]["if_alias"] == ""
+        assert interfaces[2]["if_alias"] == "Uplink to core"
+
+    def test_wrong_type_counter_is_read(self):
+        """REGRESSION (#278): a counter the device answered with another
+        type than the MIB declares is read; int() failed on the "Wrong
+        Type" text and the interface shipped bytes_in 0."""
+        output = (
+            ".1.3.6.1.2.1.2.2.1.10.1 = Wrong Type (should be Counter32): "
+            "Counter64: 5000000000\n"
+        )
+        collector = SNMPCollector([_make_target()])
+        counters = {}
+        collector._parse_table(
+            output, IF_TABLE_PREFIX, IFTABLE_COLUMNS, {}, counters, None
+        )
+        assert counters[1]["bytes_in"] == 5000000000
 
     def test_unknown_column_skipped(self):
         output = ".1.3.6.1.2.1.2.2.1.99.1 = INTEGER: 42\n"
@@ -2258,6 +2585,11 @@ class TestEdgeCases:
         assert error is None
         assert metrics[0]["value"] == "IOS 15.2"
 
+    # Value: protects=a failed snmpget ships custom_metrics_error alone, with
+    # no custom_metrics key; fails_when=the `if custom is not None` guard is
+    # dropped or becomes `custom or []`, shipping null or [] beside the error;
+    # why_new=the guard replaced an else (#278) and no test asserted the key
+    # absent (mutant survived); seam=none; no_claim=how the server reads it
     @patch("fivenines_agent.snmp._run_snmp_cmd")
     def test_custom_oids_error_nonfatal(self, mock_cmd):
         """Custom OID errors don't fail the whole device poll."""
@@ -2278,6 +2610,7 @@ class TestEdgeCases:
         assert "error" not in result  # device poll succeeds
         assert "custom_metrics_error" in result
         assert result["custom_metrics_error"]["type"] == "timeout"
+        assert "custom_metrics" not in result  # nothing was read
         assert "system" in result  # other data still present
 
     @patch("fivenines_agent.snmp._run_snmp_cmd")
@@ -2361,18 +2694,345 @@ class TestEdgeCases:
         )
         assert metrics[0]["value"] == 77
 
+    # Value: protects=every gauge/counter value left out is named in the one
+    # error, in answer order; fails_when=the loop keeps only the last (or
+    # first) not-a-number, or stops joining the names; why_new=every test had
+    # one bad value, so an overwrite survived (mutant run); seam=none;
+    # no_claim=how the server displays the message
+    @pytest.mark.parametrize("oid_type", ["gauge", "counter"])
     @patch("fivenines_agent.snmp._run_snmp_cmd")
-    def test_custom_oids_unparseable_value(self, mock_cmd):
-        """Non-numeric gauge values fall back to string."""
-        custom_output = '.1.3.6.1.4.1.9.1.0 = STRING: "not_a_number"\n'
+    def test_custom_oids_unparseable_value(self, mock_cmd, oid_type):
+        """REGRESSION (#278): a gauge or counter value that is not a number
+        is left out and named in custom_metrics_error. It used to ship as a
+        string, which the server drops without a word; the other custom
+        OIDs of the device are still read, and every value left out is
+        named."""
+        custom_output = (
+            '.1.3.6.1.4.1.9.1.0 = STRING: "not_a_number"\n'
+            ".1.3.6.1.4.1.9.2.0 = Gauge32: 7\n"
+            '.1.3.6.1.4.1.9.3.0 = STRING: "N/A"\n'
+        )
         mock_cmd.return_value = (custom_output, None)
         collector = SNMPCollector([_make_target()])
         metrics, error = collector._poll_custom_oids(
             [],
-            [{"name": "val", "oid": "1.3.6.1.4.1.9.1.0",
-              "type": "gauge"}],
+            [
+                {"name": "val", "oid": "1.3.6.1.4.1.9.1.0", "type": oid_type},
+                {"name": "ok", "oid": "1.3.6.1.4.1.9.2.0", "type": oid_type},
+                {"name": "fan", "oid": "1.3.6.1.4.1.9.3.0", "type": oid_type},
+            ],
         )
-        assert metrics[0]["value"] == "not_a_number"
+        assert metrics == [{"name": "ok", "oid": "1.3.6.1.4.1.9.2.0", "value": 7}]
+        assert error == {
+            "type": "parse_error",
+            "message": "not a number: val='not_a_number', fan='N/A'",
+        }
+
+    # Value: protects=a non-finite number never reaches the payload;
+    # fails_when=_to_number takes float() alone again, and json.dumps writes
+    # NaN or Infinity, which a strict JSON parser rejects with the whole
+    # tick; why_new=the old fallback shipped float("nan") from a STRING;
+    # seam=none; no_claim=what the server's parser does (the mysql rule)
+    @pytest.mark.parametrize(
+        "line",
+        [
+            ".1.3.6.1.4.1.9.1.0 = Opaque: Float: inf",
+            ".1.3.6.1.4.1.9.1.0 = Opaque: Float: -nan",
+            '.1.3.6.1.4.1.9.1.0 = STRING: "nan"',
+            '.1.3.6.1.4.1.9.1.0 = STRING: "Infinity"',
+            '.1.3.6.1.4.1.9.1.0 = STRING: "1e999"',
+        ],
+    )
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_custom_oids_non_finite_value_is_not_a_number(self, mock_cmd, line):
+        mock_cmd.return_value = (line + "\n", None)
+        collector = SNMPCollector([_make_target()])
+        metrics, error = collector._poll_custom_oids(
+            [],
+            [{"name": "val", "oid": "1.3.6.1.4.1.9.1.0", "type": "gauge"}],
+        )
+        assert metrics == []
+        assert error["type"] == "parse_error"
+        assert error["message"].startswith("not a number: val=")
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_custom_oids_error_quotes_a_bounded_value(self, mock_cmd):
+        """The device controls the value the error quotes: it is cut to
+        _VALUE_IN_ERROR_CHARS and repr()-quoted, so a control character
+        stays an escape. The server gets it through scrub_message (non-ASCII
+        kept); the log line goes through log_safe (ASCII, control characters
+        collapsed), defence in depth since log() stopped raising (#273)."""
+        value = "caf\u00e9\x1b[31m" + " ab" * 100
+        mock_cmd.return_value = (
+            '.1.3.6.1.4.1.9.1.0 = STRING: "{}"\n'.format(value),
+            None,
+        )
+        target = _make_target(
+            capabilities=["custom"],
+            custom_oids=[{"name": "val", "oid": "1.3.6.1.4.1.9.1.0", "type": "gauge"}],
+        )
+        with patch("fivenines_agent.snmp.log") as mock_log:
+            result = SNMPCollector([target])._poll_device(target)
+        assert _VALUE_IN_ERROR_CHARS == 64  # 9 characters, then 55 of " ab"
+        quoted = "'caf\u00e9\\x1b[31m" + " ab" * 18 + " '"
+        assert result["custom_metrics_error"] == {
+            "type": "parse_error",
+            "message": "not a number: val=" + quoted,
+        }
+        logged = mock_log.call_args[0][0]
+        assert logged.isascii()
+        assert logged == (
+            "SNMP custom OID poll failed for dev-1: not a number: val="
+            + quoted.replace("\u00e9", "\\xe9")
+        )
+
+    # Value: protects=only numeric custom OIDs reach snmpget, the others are
+    # named in a config_error while the valid ones are still read;
+    # fails_when=the OID check is dropped (a "-L..." OID is an snmpget operand
+    # that fails the whole request); why_new=OIDs were passed as configured;
+    # seam=none; no_claim=a real net-snmp run
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_custom_oids_not_numeric_are_refused(self, mock_cmd):
+        mock_cmd.return_value = (".1.3.6.1.4.1.9.1.0 = Gauge32: 5\n", None)
+        metrics, error = SNMPCollector([_make_target()])._poll_custom_oids(
+            ["--", "host"],
+            [
+                {"name": "ok", "oid": ".1.3.6.1.4.1.9.1.0", "type": "gauge"},
+                {"name": "opt", "oid": "-Lf/tmp/x", "type": "gauge"},
+                {"name": "sym", "oid": "sysName.0", "type": "string"},
+                {"name": "num", "oid": 7, "type": "gauge"},
+            ],
+        )
+        assert mock_cmd.call_args[0][1] == ["--", "host", ".1.3.6.1.4.1.9.1.0"]
+        assert metrics == [{"name": "ok", "oid": "1.3.6.1.4.1.9.1.0", "value": 5}]
+        assert error == {
+            "type": "config_error",
+            "message": "not a numeric OID: opt='-Lf/tmp/x', sym='sysName.0', "
+            "num='7'",
+        }
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_custom_oids_all_refused_runs_no_snmpget(self, mock_cmd):
+        metrics, error = SNMPCollector([_make_target()])._poll_custom_oids(
+            [],
+            [
+                {"name": "bad", "oid": "1..3", "type": "gauge"},
+                {"name": "octal", "oid": "1.3.6.1.4.1.9.08", "type": "gauge"},
+                {"name": "eight", "oid": "1.3.6.1.4.1.9.010", "type": "gauge"},
+                {"name": "long", "oid": ".".join(["1"] * 129), "type": "gauge"},
+            ],
+        )
+        mock_cmd.assert_not_called()
+        assert metrics == []
+        assert error["type"] == "config_error"
+        assert error["message"].startswith(
+            "not a numeric OID: bad='1..3', octal='1.3.6.1.4.1.9.08', "
+            "eight='1.3.6.1.4.1.9.010', long='1.1.1"
+        )
+
+    @pytest.mark.parametrize(
+        "oid", ["0", "1.3.6.1.4.1.0", ".1.3.6.1.4.1.9.10", ".".join(["1"] * 128)]
+    )
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_custom_oids_numeric_spellings_are_polled(self, mock_cmd, oid):
+        mock_cmd.return_value = ("", None)
+        _, error = SNMPCollector([_make_target()])._poll_custom_oids(
+            [], [{"name": "v", "oid": oid, "type": "gauge"}]
+        )
+        assert error is None
+        assert mock_cmd.call_args[0][1] == [oid]
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_custom_oids_refused_and_not_a_number_share_one_error(self, mock_cmd):
+        mock_cmd.return_value = ('.1.3.6.1.4.1.9.1.0 = STRING: "N/A"\n', None)
+        metrics, error = SNMPCollector([_make_target()])._poll_custom_oids(
+            [],
+            [
+                {"name": "temp", "oid": "1.3.6.1.4.1.9.1.0", "type": "gauge"},
+                {"name": "bad", "oid": "1.3.6.1.4.1.9.1.0\n", "type": "gauge"},
+            ],
+        )
+        assert metrics == []
+        assert error == {
+            "type": "config_error",
+            "message": "not a numeric OID: bad='1.3.6.1.4.1.9.1.0\\n'; "
+            "not a number: temp='N/A'",
+        }
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_poll_device_logs_a_failure_log_safe(self, mock_cmd):
+        """stderr is decoded text now: before log() stopped raising (#273),
+        a CJK host name or a U+FFFD in it made print() raise on a Windows
+        service's cp1252 stdout, and the poll's real error (a timeout) came
+        back as "unknown". log_safe stays: ASCII, control characters
+        collapsed, secrets redacted."""
+        mock_cmd.return_value = (
+            None,
+            {"type": "timeout", "message": "Timeout: No Response from sw-\u4e2d"},
+        )
+        target = _make_target()
+        with patch("fivenines_agent.snmp.log") as mock_log:
+            result = SNMPCollector([target])._poll_device(target)
+        assert result["error"]["type"] == "timeout"
+        logged = mock_log.call_args[0][0]
+        assert logged.isascii()
+        assert logged.endswith("Timeout: No Response from sw-\\u4e2d")
+
+    # Value: protects=a custom OID answered more times than asked is left out
+    # and named, never read from a line a multi-line string value injected;
+    # fails_when=the answer count check is dropped and the first line wins;
+    # why_new=the pop() dedupe made the first line authoritative; seam=none;
+    # no_claim=a real device returning a multi-line hinted string
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_custom_oids_answered_more_than_asked_is_left_out(self, mock_cmd):
+        mock_cmd.return_value = (
+            ".1.3.6.1.4.1.9.9.1.0 = STRING: uplink\n"
+            ".1.3.6.1.4.1.9.9.2.0 = Gauge32: 0\n"
+            ".1.3.6.1.4.1.9.9.2.0 = Gauge32: 95\n",
+            None,
+        )
+        metrics, error = SNMPCollector([_make_target()])._poll_custom_oids(
+            [],
+            [
+                {"name": "label", "oid": "1.3.6.1.4.1.9.9.1.0", "type": "string"},
+                {"name": "cpu", "oid": "1.3.6.1.4.1.9.9.2.0", "type": "gauge"},
+            ],
+        )
+        assert metrics == [
+            {"name": "label", "oid": "1.3.6.1.4.1.9.9.1.0", "value": "uplink"}
+        ]
+        assert error == {
+            "type": "parse_error",
+            "message": "answered more than once: cpu",
+        }
+
+    # Value: protects=custom_metrics ships as [] (not absent) when every
+    # custom value was left out; fails_when=the guard becomes `if custom:`
+    # and the key vanishes beside the parse_error; why_new=only the None
+    # (snmpget failed) side of the guard was tested; seam=none;
+    # no_claim=what the server does with an empty list
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_poll_device_every_custom_value_left_out(self, mock_cmd):
+        mock_cmd.return_value = ('.1.3.6.1.4.1.9.1.0 = STRING: "N/A"\n', None)
+        target = _make_target(
+            capabilities=["custom"],
+            custom_oids=[{"name": "temp", "oid": "1.3.6.1.4.1.9.1.0", "type": "gauge"}],
+        )
+        with patch("fivenines_agent.snmp.log"):
+            result = SNMPCollector([target])._poll_device(target)
+        assert result["custom_metrics"] == []
+        assert result["custom_metrics_error"]["type"] == "parse_error"
+
+    # Value: protects=a Counter64 custom counter keeps every digit (int read
+    # before float); fails_when=_to_number is cut to float() alone, which
+    # rounds 2**64-1 to 1.8446744073709552e19; why_new=every custom value was
+    # under 2**53, where 1234 == 1234.0, so that mutant survived; seam=none;
+    # no_claim=what the server stores for a counter over 2**63
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_custom_oids_numeric_shapes_of_a_mib_loading_host(self, mock_cmd):
+        """REGRESSION (#278): UNITS after a number, an Opaque float and a
+        device's wrong type all read as the number, where each used to
+        ship as a string the server drops. A 64-bit counter keeps every
+        digit: it is read as an int, never through a float."""
+        custom_output = "\n".join(
+            [
+                ".1.3.6.1.4.1.2021.4.5.0 = INTEGER: 16313768 kB",
+                ".1.3.6.1.4.1.2021.10.1.6.1 = Opaque: Float: 0.080000",
+                ".1.3.6.1.4.1.9.3.0 = Wrong Type (should be Counter64): "
+                "Counter32: 1234",
+                ".1.3.6.1.4.1.9.4.0 = Counter64: 18446744073709551615 octets",
+            ]
+        )
+        mock_cmd.return_value = (custom_output, None)
+        collector = SNMPCollector([_make_target()])
+        metrics, error = collector._poll_custom_oids(
+            [],
+            [
+                {"name": "mem_total", "oid": "1.3.6.1.4.1.2021.4.5.0"},
+                {"name": "load_1", "oid": "1.3.6.1.4.1.2021.10.1.6.1"},
+                {"name": "octets", "oid": "1.3.6.1.4.1.9.3.0", "type": "counter"},
+                {"name": "hc_octets", "oid": "1.3.6.1.4.1.9.4.0", "type": "counter"},
+            ],
+        )
+        assert error is None
+        assert {m["name"]: m["value"] for m in metrics} == {
+            "mem_total": 16313768,
+            "load_1": 0.08,
+            "octets": 1234,
+            "hc_octets": 18446744073709551615,
+        }
+
+    @pytest.mark.parametrize("configured", [".1.3.6.1.4.1.9.1.0", "1.3.6.1.4.1.9.1.0"])
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_custom_oids_leading_dot_matches(self, mock_cmd, configured):
+        """REGRESSION (#279): the server accepts an OID spelled with a
+        leading dot, and -On prints every OID with one, which
+        _parse_snmp_line strips: a dotted entry never matched and its
+        metric was dropped on every tick without an error."""
+        mock_cmd.return_value = (".1.3.6.1.4.1.9.1.0 = Gauge32: 5\n", None)
+        collector = SNMPCollector([_make_target()])
+        metrics, error = collector._poll_custom_oids(
+            ["host"],
+            [{"name": "val", "oid": configured, "type": "gauge"}],
+        )
+        assert error is None
+        assert metrics == [{"name": "val", "oid": "1.3.6.1.4.1.9.1.0", "value": 5}]
+        # snmpget is asked for the OID as the template spells it
+        assert mock_cmd.call_args[0][1] == ["host", configured]
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_custom_oids_one_oid_asked_for_twice(self, mock_cmd):
+        """Two entries for one OID (here spelled both ways, which #279 now
+        matches alike) each get their metric, once, although snmpget
+        answers the OID twice."""
+        mock_cmd.return_value = (".1.3.6.1.4.1.9.1.0 = Gauge32: 5\n" * 2, None)
+        collector = SNMPCollector([_make_target()])
+        metrics, error = collector._poll_custom_oids(
+            [],
+            [
+                {"name": "a", "oid": ".1.3.6.1.4.1.9.1.0", "type": "gauge"},
+                {"name": "b", "oid": "1.3.6.1.4.1.9.1.0", "type": "string"},
+            ],
+        )
+        assert error is None
+        assert metrics == [
+            {"name": "a", "oid": "1.3.6.1.4.1.9.1.0", "value": 5},
+            {"name": "b", "oid": "1.3.6.1.4.1.9.1.0", "value": "5"},
+        ]
+
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_poll_device_ships_custom_metrics_with_their_error(self, mock_cmd):
+        """A value that is not a number does not cost the device the custom
+        OIDs that were: custom_metrics and custom_metrics_error both ship."""
+        mock_cmd.side_effect = [
+            (SYSTEM_OUTPUT, None),
+            (IFTABLE_OUTPUT, None),
+            (IFXTABLE_OUTPUT, None),
+            (
+                '.1.3.6.1.4.1.9.1.0 = STRING: "N/A"\n'
+                ".1.3.6.1.4.1.9.2.0 = Gauge32: 42\n",
+                None,
+            ),
+        ]
+        target = _make_target(
+            custom_oids=[
+                {"name": "temp", "oid": "1.3.6.1.4.1.9.1.0", "type": "gauge"},
+                {"name": "cpu", "oid": "1.3.6.1.4.1.9.2.0", "type": "gauge"},
+            ]
+        )
+        collector = SNMPCollector([target])
+        with patch("fivenines_agent.snmp.log") as mock_log:
+            result = collector._poll_device(target)
+        assert "error" not in result
+        assert result["custom_metrics"] == [
+            {"name": "cpu", "oid": "1.3.6.1.4.1.9.2.0", "value": 42}
+        ]
+        assert result["custom_metrics_error"] == {
+            "type": "parse_error",
+            "message": "not a number: temp='N/A'",
+        }
+        mock_log.assert_called_once()
+        assert "not a number: temp='N/A'" in mock_log.call_args[0][0]
 
     def test_parse_table_nosuch_in_middle(self):
         """noSuch in middle of walk should disable HC but keep parsing."""
