@@ -179,6 +179,53 @@ def test_send_metrics_no_update_on_none(mock_post):
     assert sync.config == original_config
 
 
+# Value: protects=issue #247 on every path: a 200 /collect answer that is not
+# an object with a config object is logged and ignored, the current config
+# and token kept, never raised; fails_when=send_metrics indexes the answer
+# unchecked, or applies a token or a non-dict config from it; why_new=the
+# run() test only proves the sender survives, and the startup fetch from the
+# collection loop (get_config) has no _isolated around it; seam=_post mocked;
+# no_claim=the answer of a real proxy.
+@pytest.mark.parametrize(
+    "answer",
+    [{"status": "ok"}, [], "maintenance", {"config": "x"}, {"token": "t"}],
+    ids=["no_config", "list", "string", "config_not_dict", "token_only"],
+)
+@patch.object(Synchronizer, "_swap_token")
+@patch.object(Synchronizer, "_post")
+def test_send_metrics_ignores_a_200_that_is_not_a_config(mock_post, mock_swap, answer):
+    sync = make_synchronizer()
+    original_config = sync.config.copy()
+    mock_post.return_value = answer
+
+    with patch.object(synchronizer_module, "log") as mock_log:
+        sync.send_metrics({"test": True})
+
+    assert sync.config == original_config
+    mock_swap.assert_not_called()
+    mock_log.assert_called_once_with(
+        "Synchronizer Error: /collect answered 200 without a config; "
+        "keeping the current one",
+        "error",
+    )
+
+
+@patch.object(Synchronizer, "get_conn")
+def test_get_config_at_startup_survives_a_200_that_is_not_a_config(mock_get_conn):
+    """The collection loop's startup fetch (get_config while enabled is still
+    None) reaches send_metrics with no _isolated around it: a proxy answering
+    200 {"status": "ok"} must leave enabled at None (the loop retries), not
+    raise KeyError out of Agent.run (#247)."""
+    sync = make_synchronizer()
+    sync.config["enabled"] = None
+    mock_get_conn.return_value = _ok_conn({"status": "ok"})
+
+    config = sync.get_config()
+
+    assert config["enabled"] is None
+    assert not sync._config_fetch_lock.locked()
+
+
 @patch("fivenines_agent.synchronizer.config_dir")
 @patch.object(Synchronizer, "get_conn")
 def test_collect_response_token_is_persisted_and_used_next(

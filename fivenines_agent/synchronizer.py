@@ -278,12 +278,26 @@ class Synchronizer(Thread):
         if isinstance(data, QueuedPayload):
             data, waiting_since = data.body, data.waiting_since
         response = self._post("/collect", data, waiting_since=waiting_since)
-        if response is not None:
-            if "token" in response:
-                self._swap_token(response["token"])
-            config = response["config"]
-            with self.config_lock:
-                self.config = config
+        if response is None:
+            return
+        if not isinstance(response, dict) or not isinstance(
+            response.get("config"), dict
+        ):
+            # A 200 whose body is not a config (a proxy or maintenance page
+            # answering {"status": "ok"}, a JSON list): keep the current
+            # config, and its token, rather than raise (#247). The startup
+            # fetch also runs on the collection loop (get_config), where no
+            # _isolated catches it.
+            log(
+                "Synchronizer Error: /collect answered 200 without a config; "
+                "keeping the current one",
+                "error",
+            )
+            return
+        if "token" in response:
+            self._swap_token(response["token"])
+        with self.config_lock:
+            self.config = response["config"]
 
     def _swap_token(self, new_token):
         """Persist the per-host token received after enrollment."""
