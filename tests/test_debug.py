@@ -6,7 +6,9 @@ at debug level, which dry-run always enables. The clock is replaced with a
 scripted one so the printed millisecond figure is exact.
 """
 
+import io
 import re
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -163,3 +165,102 @@ def test_context_manager_dry_run_does_not_swallow_exceptions(
             raise RuntimeError("gzip failed")
     # The timing line is still written on the way out.
     assert _messages(capsys) == ["gzip_compress (2 ms): None"]
+
+
+# --- log() on a stdout that cannot encode the line (#273) ---
+
+
+def _strict_cp1252_stdout(monkeypatch):
+    """Make sys.stdout what a Windows service's is when start() did not run:
+    the ANSI code page with errors="strict" (WinSW redirects it to the log
+    file). Return a reader of the bytes written. Called from the test body:
+    pytest re-installs its own capture stream after fixture setup."""
+    monkeypatch.delenv("LOG_LEVEL", raising=False)
+    stream = io.TextIOWrapper(
+        io.BytesIO(), encoding="cp1252", errors="strict", newline="\n"
+    )
+    monkeypatch.setattr(sys, "stdout", stream)
+
+    def written():
+        stream.flush()
+        return stream.buffer.getvalue()
+
+    return written
+
+
+# Value: protects=a log line quoting a localized OS error never raises, so the
+# except block logging it (the synchronizer's retry loop, Agent.run's last
+# handler) completes and its thread lives on; fails_when=log() prints the line
+# as is to a strict stdout and lets UnicodeEncodeError out, or swallows the
+# line instead of writing it escaped, or the escape skips the telemetry
+# capture; why_new=no test fed log() a stream that cannot encode its line;
+# seam=none; no_claim=what start() does to the real stdout (test_main_entry).
+def test_log_escapes_a_line_its_strict_stdout_cannot_encode(monkeypatch):
+    written = _strict_cp1252_stdout(monkeypatch)
+    message = "Synchronizer Error: [WinError 10060] \u63a5\u7d9a caf\u00e9"
+    debug_module.start_log_capture()
+    try:
+        debug_module.log(message, "error")
+    finally:
+        captured = debug_module.stop_log_capture()
+
+    # The whole line is escaped to ASCII, the e-acute cp1252 has included.
+    assert re.fullmatch(
+        rb"\[ERROR\]\[thread#\d+\] Synchronizer Error: \[WinError 10060\] "
+        rb"\\u63a5\\u7d9a caf\\xe9\n",
+        written(),
+    )
+    # Telemetry keeps the message as logged.
+    assert captured == [message]
+
+
+def test_log_writes_a_line_its_stdout_can_encode_unchanged(monkeypatch):
+    written = _strict_cp1252_stdout(monkeypatch)
+
+    debug_module.log("caf\u00e9", "error")
+
+    assert re.fullmatch(rb"\[ERROR\]\[thread#\d+\] caf\xe9\n", written())
+
+
+class _FailingStdout:
+    """A stdout whose every write fails like a full disk (ENOSPC on OpenRC's
+    log file) or a closed pipe; with unencodable=True it first refuses what
+    a cp1252 stream cannot encode, as a Windows service's stdout does."""
+
+    errors = "strict"
+
+    def __init__(self, unencodable=False):
+        self.unencodable = unencodable
+        self.attempts = []
+
+    def write(self, text):
+        self.attempts.append(text)
+        if self.unencodable:
+            text.encode("cp1252")
+        raise OSError(28, "No space left on device")
+
+    def flush(self):
+        pass
+
+
+# Value: protects=log() never raises, whatever print() raises, so a line
+# logged in an except block can no longer end the synchronizer thread or skip
+# _cleanup (adversarial review: ENOSPC on OpenRC's output_log, EPIPE);
+# fails_when=log() catches only UnicodeEncodeError, or its ASCII retry is
+# left unguarded, or the dropped line also skips the telemetry capture;
+# why_new=the strict-stdout tests only raise UnicodeEncodeError; seam=none;
+# no_claim=what a real full disk does to buffered output at exit.
+@pytest.mark.parametrize("unencodable", [False, True], ids=["oserror", "retry_oserror"])
+def test_log_drops_a_line_its_stdout_cannot_write(monkeypatch, unencodable):
+    monkeypatch.delenv("LOG_LEVEL", raising=False)
+    stream = _FailingStdout(unencodable=unencodable)
+    monkeypatch.setattr(sys, "stdout", stream)
+    debug_module.start_log_capture()
+    try:
+        debug_module.log("Synchronizer Error: \u63a5\u7d9a", "error")
+    finally:
+        captured = debug_module.stop_log_capture()
+
+    # The ASCII retry happens only after an encoding failure.
+    assert len(stream.attempts) == (2 if unencodable else 1)
+    assert captured == ["Synchronizer Error: \u63a5\u7d9a"]

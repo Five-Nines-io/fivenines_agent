@@ -2166,9 +2166,10 @@ class TestPrintDiagnostics:
         assert "OK" in out
 
     # Value: protects=the dry-run table prints a device-supplied sysName as
-    # ASCII escapes; fails_when=log_safe is dropped and a U+FFFD or CJK name
-    # makes print() raise on a Windows (cp1252) stdout, losing the dry run's
-    # SNMP result; why_new=only ASCII names were tested; seam=none;
+    # ASCII escapes; fails_when=log_safe is dropped: a control character
+    # reaches the terminal, and wherever start() did not make stdout escape
+    # (#273) a U+FFFD or CJK name makes print() raise on a cp1252 stdout;
+    # why_new=only ASCII names were tested; seam=none;
     # no_claim=a real Windows console
     def test_device_name_is_printed_log_safe(self, capsys):
         devices = [
@@ -2759,8 +2760,8 @@ class TestEdgeCases:
         """The device controls the value the error quotes: it is cut to
         _VALUE_IN_ERROR_CHARS and repr()-quoted, so a control character
         stays an escape. The server gets it through scrub_message (non-ASCII
-        kept); the log line goes through log_safe, so print() cannot raise
-        on a Windows service's ANSI code page stdout."""
+        kept); the log line goes through log_safe (ASCII, control characters
+        collapsed), defence in depth since log() stopped raising (#273)."""
         value = "caf\u00e9\x1b[31m" + " ab" * 100
         mock_cmd.return_value = (
             '.1.3.6.1.4.1.9.1.0 = STRING: "{}"\n'.format(value),
@@ -2860,9 +2861,11 @@ class TestEdgeCases:
 
     @patch("fivenines_agent.snmp._run_snmp_cmd")
     def test_poll_device_logs_a_failure_log_safe(self, mock_cmd):
-        """stderr is decoded text now: a CJK host name or a U+FFFD in it made
-        print() raise on a Windows service's cp1252 stdout, and the poll's
-        real error (a timeout) came back as "unknown"."""
+        """stderr is decoded text now: before log() stopped raising (#273),
+        a CJK host name or a U+FFFD in it made print() raise on a Windows
+        service's cp1252 stdout, and the poll's real error (a timeout) came
+        back as "unknown". log_safe stays: ASCII, control characters
+        collapsed, secrets redacted."""
         mock_cmd.return_value = (
             None,
             {"type": "timeout", "message": "Timeout: No Response from sw-\u4e2d"},

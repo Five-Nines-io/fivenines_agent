@@ -75,7 +75,9 @@ def log_safe(value):
     line = redact(bounded).translate(_LOG_CONTROL_TO_SPACE)
     # print() raises on a character its stdout cannot encode -- a lone
     # surrogate (a JSON "\udc80" escape) on UTF-8, a U+FFFD or any CJK text
-    # on a Windows service's cp1252 -- inside the collector, sinking its tick.
+    # on a Windows service's cp1252 -- which sank the collector's tick until
+    # start() and log() stopped letting it raise (#273). ASCII here is
+    # defence in depth.
     line = line.encode("ascii", errors="backslashreplace").decode("ascii")
     return line[:ERROR_MAX_LEN]
 

@@ -239,9 +239,10 @@ def _print_diagnostics(devices):
             sys_info = dev.get("system", {})
             sys_name = sys_info.get("sys_name", "-") or "-"
             ifaces = dev.get("interfaces", [])
-            # log_safe: the device names itself, and since the output is
-            # decoded as UTF-8 a U+FFFD or CJK name made print() raise on a
-            # Windows (cp1252) stdout, losing the dry run's SNMP result.
+            # log_safe: the device names itself, so a control character
+            # could forge a line; and before start() made stdout escape what
+            # it cannot encode (#273), a U+FFFD or CJK name made print()
+            # raise on a Windows (cp1252) stdout, losing the dry run's result.
             print(
                 "  {}  {}  {} interfaces  OK".format(
                     device_id[:20], log_safe(sys_name)[:20], len(ifaces)
