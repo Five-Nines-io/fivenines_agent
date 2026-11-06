@@ -239,8 +239,10 @@ def _service_config(win32service, scm, name):
             return None
         # A service whose security descriptor grants the agent's account its
         # status but not its configuration: listed, configuration unknown.
-        # log_safe: a name or OS message outside the code page of a Windows
-        # service's stdout would make print() raise and sink the whole read.
+        # log_safe: a name or OS message is redacted and kept ASCII. A
+        # character outside the code page of a Windows service's stdout made
+        # print() raise and sink the whole read until log() stopped raising
+        # on encoding (#273); the escape stays as defence in depth.
         log(f"windows_services: cannot open {log_safe(name)}: {log_safe(e)}", "debug")
         return None, None, None
     try:

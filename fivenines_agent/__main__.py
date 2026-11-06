@@ -1,6 +1,29 @@
 import importlib
+import sys
 
 from fivenines_agent.cli import VERSION, parse_args
+
+
+def escape_unencodable_output():
+    """Make stdout and stderr write a backslash escape for a character their
+    encoding lacks instead of raising (#273).
+
+    A Windows service's stdout (WinSW redirects it to the log file) encodes in
+    the ANSI code page with errors="strict", so a print() of a localized OS
+    error message raised UnicodeEncodeError -- inside the except blocks that
+    log it, ending the synchronizer thread or the collection loop. Only a
+    "strict" stream is changed: CPython's stderr already escapes, and under
+    the C locale stdout uses surrogateescape, which writes undecodable bytes
+    (U+DC80..U+DCFF) back as they were read; it still raises on any other
+    character its encoding lacks, which debug.log() then writes escaped. The
+    encoding itself is kept, so nothing that encoded before is written
+    differently.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if getattr(stream, "errors", None) == "strict" and hasattr(
+            stream, "reconfigure"
+        ):
+            stream.reconfigure(errors="backslashreplace")
 
 
 def check_imports(optional):
@@ -15,6 +38,9 @@ def check_imports(optional):
 
 
 def start():
+    # Before anything prints: every print() of the process, the agent's log
+    # lines, its capabilities banner and its threads' included.
+    escape_unencodable_output()
     # Parse args first: --version prints and exits here, BEFORE the agent is
     # imported. fivenines_agent.agent pulls in the whole collector graph
     # (requests, docker, pg8000, psutil, libvirt, ...): about 70% of the frozen
