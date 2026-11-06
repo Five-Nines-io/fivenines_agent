@@ -24,7 +24,10 @@ def make_agent():
     agent.permissions = MagicMock()
     agent.permissions.get_all.return_value = {}
     agent.permissions.refresh_due.return_value = False
+    # Everything landing in the payload must be JSON-serializable.
+    agent.permissions.get_reasons.return_value = {}
     agent._last_recheck_token = agent_module._RECHECK_UNSET
+    agent._systemd_force_resend = False
     agent.queue = MagicMock()
     agent.static_data = {"version": "test"}
     agent._telemetry = {}
@@ -211,3 +214,65 @@ def test_run_survives_unserializable_payload(mock_ps, mock_cm, mock_dr, mock_sis
 
     payload_calls = [c for c in agent.queue.put.call_args_list if c.args[0] is not None]
     assert payload_calls == []  # tick dropped, nothing enqueued
+
+
+# --- the exit code after an unexpected error (#272) ---
+
+
+def _run_until_exit(agent):
+    """Run the loop with no watchdog; return the SystemExit code and every
+    log() call."""
+    original = agent_module.systemd_watchdog
+    try:
+        agent_module.systemd_watchdog = None
+        agent_module.exit_event.clear()
+        with patch.object(agent_module, "log") as mock_log:
+            with pytest.raises(SystemExit) as exc_info:
+                agent.run()
+    finally:
+        agent_module.systemd_watchdog = original
+    return exc_info.value.code, mock_log.call_args_list
+
+
+# Value: protects=an agent ended by an unexpected error exits non-zero, which
+# is what makes WinSW leave the restart to the SCM's failure actions; with
+# exit code 0 WinSW reports the service stopped and a Windows host stayed
+# silent until someone started it; fails_when=Agent.run exits 0 after an
+# exception, skips _cleanup, or logs the raw message (unredacted, and with a
+# character the stdout may not encode); why_new=every run() test ended the
+# loop through exit_event; seam=collect_metrics raises; no_claim=that WinSW
+# and the SCM restart the service (the Windows E2E kills the agent for that).
+@patch("fivenines_agent.agent.dry_run", return_value=False)
+@patch("fivenines_agent.agent.collect_metrics")
+def test_run_exits_non_zero_after_an_unexpected_error(mock_cm, mock_dr):
+    agent = make_agent()
+    agent.synchronizer.get_config.return_value = agent.config
+    mock_cm.side_effect = RuntimeError("boom \u63a5 password=hunter2hunter2\nforged")
+
+    code, logged = _run_until_exit(agent)
+
+    assert code == 1
+    errors = [c.args[0] for c in logged if c.args[1:] == ("error",)]
+    assert errors == ["Error: RuntimeError: boom \\u63a5 password=[REDACTED] forged"]
+    # _cleanup still ran: the synchronizer was stopped and woken.
+    agent.synchronizer.stop.assert_called_once_with()
+    agent.queue.put.assert_called_with(None)
+
+
+@patch("fivenines_agent.agent.dry_run", return_value=False)
+@patch("fivenines_agent.agent.collect_metrics")
+def test_run_exits_non_zero_when_a_base_exception_ends_the_loop(mock_cm, mock_dr):
+    """Not an Exception, so no "Error:" line, but still a crash: _cleanup's
+    sys.exit replaces it with a non-zero code, never 0."""
+
+    class _NotAnException(BaseException):
+        pass
+
+    agent = make_agent()
+    agent.synchronizer.get_config.return_value = agent.config
+    mock_cm.side_effect = _NotAnException()
+
+    code, logged = _run_until_exit(agent)
+
+    assert code == 1
+    assert [c for c in logged if c.args[1:] == ("error",)] == []

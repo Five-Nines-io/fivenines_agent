@@ -51,6 +51,7 @@ from fivenines_agent.packages import packages_sync
 from fivenines_agent.pbs import reset_timeout_holds as reset_pbs_timeout_holds
 from fivenines_agent.permissions import get_permissions, print_capabilities_banner
 from fivenines_agent.ping import tcp_ping
+from fivenines_agent.scrub import log_safe
 from fivenines_agent.synchronization_queue import SynchronizationQueue
 from fivenines_agent.synchronizer import QueuedPayload, Synchronizer, serialize_payload
 from fivenines_agent.systemd import (
@@ -339,6 +340,13 @@ class Agent:
         else:
             wd = None
 
+        # Non-zero unless the loop ends because exit_event was set (SIGTERM,
+        # SIGINT, or dry-run's single tick). An unexpected exception must not
+        # exit 0 (#272): when the agent exits 0, WinSW reports the service
+        # STOPPED and the SCM's failure actions never run, so a Windows host
+        # stayed silent until someone started the service. systemd's
+        # Restart=always and OpenRC's supervise-daemon restart either way.
+        exit_code = 1
         try:
             while not exit_event.is_set():
                 if wd is not None:
@@ -432,12 +440,15 @@ class Agent:
                         # cannot measure).
                         self.queue.put(QueuedPayload(blob, start))
                     self._wait_interval(running_time)
+            exit_code = 0
 
         except Exception as e:
-            # Log unexpected errors before exiting
-            log(f"Error: {e}", "error")
+            # Log unexpected errors before exiting. log_safe: the message can
+            # quote a config value or an API body (redacted), and a newline in
+            # it cannot forge journal lines.
+            log(f"Error: {type(e).__name__}: {log_safe(e)}", "error")
         finally:
-            self._cleanup()
+            self._cleanup(exit_code)
 
     def _collect_metrics(self, data, tick_started=None):
         # Core metrics (always enabled). load_average is Linux-only - psutil's
@@ -807,7 +818,7 @@ class Agent:
         log(f"Sleeping time: {sleep_time * 1000:.0f} ms", "debug")
         exit_event.wait(sleep_time)
 
-    def _cleanup(self):
+    def _cleanup(self, exit_code=0):
         log("fivenines agent shutting down. Please wait...")
         self.queue.clear()
         if self.synchronizer is not None:
@@ -837,4 +848,4 @@ class Agent:
         # paho network threads leak past shutdown. No-op when MQTT was never
         # configured (the manager singleton is still None).
         shutdown_mqtt()
-        sys.exit(0)
+        sys.exit(exit_code)
