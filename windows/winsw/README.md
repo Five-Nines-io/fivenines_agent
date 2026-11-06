@@ -15,6 +15,11 @@ the Windows Service Control Manager (SCM) and handles:
 - **Automatic start at boot** with a short delay so the network and WMI
   service are up before the agent's first capability probe runs.
 
+WinSW applies those last two (`<onfailure>`, `<resetfailure>`, `<startmode>`,
+`<delayedAutoStart>`) only when its own `install` command registers the
+service. The MSI never runs it (below), so it sets the same delayed start and
+restart schedule itself; keep the two in step.
+
 ## What this directory contains
 
 - `fivenines-agent.xml` - the WinSW service definition.
@@ -37,19 +42,26 @@ Download URL pattern (used by the build / installer):
 
 The MSI's `Component` for the service:
 
-1. Copies `WinSW.NET4.exe` to `Program Files\fivenines-agent\fivenines-agent.exe`
+1. Copies `WinSW.NET4.exe` to `Program Files\fivenines-agent\fivenines-agent-service.exe`
    (renamed so the registered service binary path is stable - WinSW reads its
    config from the XML next to itself).
-2. Copies `fivenines-agent.xml` next to the renamed WinSW exe.
+2. Copies `fivenines-agent.xml` next to the renamed WinSW exe, as
+   `fivenines-agent-service.xml`.
 3. Copies the actual agent binary (`fivenines-agent-windows-amd64.exe`)
    alongside, because `%BASE%\fivenines-agent-windows-amd64.exe` in the XML
    resolves relative to the WinSW exe's directory.
-4. Runs `fivenines-agent.exe install` (WinSW's install command) as part of
-   the install sequence to register the service with SCM.
+4. Registers the service with the SCM through its own `ServiceInstall`
+   (`windows/installer/Product.wxs`), not WinSW's `install` command, then
+   sets the delayed start and the restart schedule (10s, 30s, 60s, the count
+   reset after an hour) with `sc.exe config` and `sc.exe failure` custom
+   actions (Windows Installer's own `MsiServiceConfigFailureActions` is
+   documented as not working):
+   up to 1.23.0 neither existed, so MSI installs started with the plain
+   automatic services and a crashed agent stayed stopped.
 5. Configures the service account (D12 - dedicated low-priv +
    `Performance Monitor Users`) and delegates WMI Storage namespace access
    (D19) via custom actions.
-6. On uninstall, runs `fivenines-agent.exe uninstall` to deregister cleanly.
+6. On uninstall, removes the service through its `ServiceControl`.
 
 ## Local install / debug (manual, without MSI)
 

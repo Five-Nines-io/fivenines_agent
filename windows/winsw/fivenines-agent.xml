@@ -30,7 +30,12 @@
   <executable>%BASE%\fivenines-agent-windows-amd64.exe</executable>
 
   <!-- Start at boot, delayed so the network stack and WMI service are up
-       before the first probe runs. Auto-reprobe (D9) catches up after. -->
+       before the first probe runs. Auto-reprobe (D9) catches up after.
+       WinSW reads these two only when it installs the service itself
+       ("fivenines-agent-service.exe install"). The MSI registers the
+       service through its own ServiceInstall and sets the delayed start
+       with an sc.exe custom action (ConfigureServiceStart in
+       windows/installer/Product.wxs): keep the two in step. -->
   <startmode>Automatic</startmode>
   <delayedAutoStart>true</delayedAutoStart>
 
@@ -44,7 +49,12 @@
   <logpath>%ProgramData%\fivenines_agent\logs</logpath>
 
   <!-- Restart-on-failure with backoff. After 1 hour of clean running the
-       failure counter resets so transient blips don't exhaust the schedule. -->
+       failure counter resets so transient blips don't exhaust the schedule.
+       Like the delayed start, WinSW applies these only when it installs the
+       service itself: the MSI sets the same schedule as SCM failure actions
+       (the sc.exe custom action ConfigureServiceRecovery in
+       windows/installer/Product.wxs, kept equal by
+       tests/test_windows_installer.py). -->
   <onfailure action="restart" delay="10 sec"/>
   <onfailure action="restart" delay="30 sec"/>
   <onfailure action="restart" delay="60 sec"/>

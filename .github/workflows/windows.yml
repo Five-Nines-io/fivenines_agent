@@ -1537,6 +1537,66 @@ jobs:
             Write-Error "Service did not reach Running state"
             exit 1
           }
+          # Automatic (Delayed Start), from the MSI's sc.exe config: Start 2
+          # is automatic, DelayedAutostart 1 the delay. Started with the
+          # plain automatic services, the agent can run its first DNS lookup
+          # before DHCP has given the machine a DNS server.
+          $key = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\fivenines-agent"
+          Write-Host "Start=$($key.Start) DelayedAutostart=$($key.DelayedAutostart)"
+          if ($key.Start -ne 2 -or $key.DelayedAutostart -ne 1) {
+            Write-Error "the service is not Automatic (Delayed Start)"
+            exit 1
+          }
+          # Restart on failure, from the MSI's sc.exe failure.
+          # FailureActions is SERVICE_FAILURE_ACTIONS as the SCM stores it:
+          # five DWORDs (reset period in seconds, two pointer slots, the
+          # action count, a pointer slot), then one SC_ACTION per action
+          # (type, delay in ms); type 1 is restart. Read from the registry,
+          # since sc.exe qfailure prints localized labels.
+          $bin = $key.FailureActions
+          $actions = if (-not $bin) { "none" } else {
+            "reset={0} {1}" -f [BitConverter]::ToUInt32($bin, 0), ((0..([BitConverter]::ToUInt32($bin, 12) - 1) |
+              ForEach-Object { "{0}/{1}" -f [BitConverter]::ToUInt32($bin, 20 + 8 * $_), [BitConverter]::ToUInt32($bin, 24 + 8 * $_) }) -join " ")
+          }
+          Write-Host "FailureActions: $actions"
+          if ($actions -ne "reset=3600 1/10000 1/30000 1/60000") {
+            Write-Error "the service does not restart on failure as fivenines-agent.xml describes"
+            exit 1
+          }
+          # Running is no proof of health now that the SCM restarts the
+          # service: an agent crashing at start would be Running between
+          # restarts. It must run 30s on one process, with no unexpected
+          # termination of the service (SCM events 7031/7034, whose first
+          # parameter names it) on this fresh runner.
+          function Get-UnexpectedStops {
+            @(Get-WinEvent -FilterHashtable @{ LogName = "System"; ProviderName = "Service Control Manager"; Id = 7031, 7034 } -ErrorAction SilentlyContinue |
+              Where-Object { @("Fivenines Monitoring Agent", "fivenines-agent") -contains $_.Properties[0].Value })
+          }
+          $first = (Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'").ProcessId
+          Start-Sleep -Seconds 30
+          $now = Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'"
+          $stops = Get-UnexpectedStops
+          if ($now.State -ne "Running" -or $now.ProcessId -ne $first -or $stops.Count -ne 0) {
+            $stops | Format-List TimeCreated, Id, Message
+            Write-Error "the agent did not keep running on one process: it crashed and the SCM restarted it?"
+            exit 1
+          }
+          # Restart on failure, end to end: the agent killed (a non-zero
+          # exit), WinSW exits without reporting the stop and the SCM starts
+          # the service again after the first failure action's 10s.
+          Get-Process -Name "fivenines-agent-windows-amd64" | Stop-Process -Force
+          $restarted = $false
+          for ($i = 0; $i -lt 30 -and -not $restarted; $i++) {
+            Start-Sleep -Seconds 2
+            $now = Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'"
+            $restarted = $now.State -eq "Running" -and $now.ProcessId -ne $first
+          }
+          if (-not $restarted -or (Get-UnexpectedStops).Count -ne 1) {
+            Get-UnexpectedStops | Format-List TimeCreated, Id, Message
+            Write-Error "killing the agent did not restart the service through its failure actions"
+            exit 1
+          }
+          Write-Host "Killed the agent: the SCM restarted the service (WinSW PID $first -> $($now.ProcessId))."
 
       - name: Verify TOKEN file ACL is restrictive (F1)
         shell: pwsh
@@ -1811,6 +1871,79 @@ jobs:
           if ((Get-StorageAceSids) -contains $sid) { throw "fivenines_uninstall.ps1 left the WMI grant for $sid" }
           Write-Host "fivenines_uninstall.ps1 deleted the account and its WMI grant."
 
+      # An existing install gets the delayed start and the restart on failure
+      # through an upgrade: v1.22.1's MSI registered the service plain
+      # Automatic with no failure actions (checksum from that release's
+      # SHA256SUMS), and this MSI, a major upgrade over it, must leave the
+      # service Automatic (Delayed Start), restarted after a failure.
+      - name: Upgrade from v1.22.1 sets the delayed start and the restart on failure
+        shell: powershell
+        timeout-minutes: 15
+        env:
+          OLD_MSI_URL: https://github.com/Five-Nines-io/fivenines_agent/releases/download/v1.22.1/fivenines-agent-windows-amd64.msi
+          OLD_MSI_SHA256: 537e913d5f5149ec1d01a52c573b81a0fde97626c627861fda3772fbe62bdf36
+        run: |
+          $ErrorActionPreference = "Stop"
+          & curl.exe -fsSL --retry 3 -o old.msi $env:OLD_MSI_URL
+          if ($LASTEXITCODE -ne 0) { throw "downloading v1.22.1's MSI failed: $LASTEXITCODE" }
+          $hash = (Get-FileHash old.msi -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $env:OLD_MSI_SHA256) { throw "old.msi has SHA-256 $hash, expected $env:OLD_MSI_SHA256" }
+          function Install-Msi($Msi, $Log) {
+            $p = Start-Process msiexec -ArgumentList "/i $Msi TOKEN=ci-upgrade-$(Get-Random) /qn /l*v $Log" -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "msiexec /i $Msi ($Log) failed: $($p.ExitCode)" }
+          }
+          function Get-StartType {
+            $key = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\fivenines-agent"
+            # FailureActions decoded as in "Verify service is registered and running".
+            $bin = $key.FailureActions
+            $actions = if (-not $bin) { "none" } else {
+              "reset={0} {1}" -f [BitConverter]::ToUInt32($bin, 0), ((0..([BitConverter]::ToUInt32($bin, 12) - 1) |
+                ForEach-Object { "{0}/{1}" -f [BitConverter]::ToUInt32($bin, 20 + 8 * $_), [BitConverter]::ToUInt32($bin, 24 + 8 * $_) }) -join " ")
+            }
+            # [int]$null is 0: a service never set delayed has no such value.
+            return [pscustomobject]@{ Start = [int]$key.Start; Delayed = [int]$key.DelayedAutostart; Failure = $actions }
+          }
+          # The upgrade removes the older product first: a service still
+          # starting then can hang its stop, as an uninstall a second after an
+          # install did on a domain controller.
+          function Wait-Running($Label) {
+            for ($i = 0; $i -lt 30 -and (Get-Service -Name "fivenines-agent").Status -ne "Running"; $i++) { Start-Sleep -Seconds 2 }
+            if ((Get-Service -Name "fivenines-agent").Status -ne "Running") { throw "the service did not reach Running after $Label" }
+          }
+
+          Install-Msi old.msi upgrade-old.log
+          Wait-Running "v1.22.1's install"
+          $before = Get-StartType
+          Write-Host "v1.22.1: Start=$($before.Start) DelayedAutostart=$($before.Delayed) FailureActions: $($before.Failure)"
+          # Without this precondition the step would pass whatever the upgrade did.
+          if ($before.Start -ne 2 -or $before.Delayed -ne 0 -or $before.Failure -ne "none") {
+            throw "v1.22.1 was expected to register the service plain Automatic, with no failure actions"
+          }
+
+          $since = Get-Date
+          Install-Msi fivenines-agent.msi upgrade.log
+          $products = @(Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
+                        Where-Object { $_.DisplayName -eq "Fivenines Monitoring Agent" })
+          if ($products.Count -ne 1 -or $products[0].DisplayVersion -eq "1.22.1") {
+            throw ("expected the upgrade to replace v1.22.1, installed: {0}" -f (($products | ForEach-Object { $_.DisplayVersion }) -join ", "))
+          }
+          $after = Get-StartType
+          Write-Host "after the upgrade to $($products[0].DisplayVersion): Start=$($after.Start) DelayedAutostart=$($after.Delayed) FailureActions: $($after.Failure)"
+          if ($after.Start -ne 2 -or $after.Delayed -ne 1) { throw "the upgrade left the service without the delayed start" }
+          if ($after.Failure -ne "reset=3600 1/10000 1/30000 1/60000") { throw "the upgrade left the service without its restart on failure" }
+          Wait-Running "the upgrade"
+          # As after the fresh install: Running between SCM restarts is no
+          # proof, so the upgraded agent must keep one process for 20s, with
+          # no unexpected termination of the service since the upgrade began.
+          $first = (Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'").ProcessId
+          Start-Sleep -Seconds 20
+          $stops = @(Get-WinEvent -FilterHashtable @{ LogName = "System"; ProviderName = "Service Control Manager"; Id = 7031, 7034; StartTime = $since } -ErrorAction SilentlyContinue |
+                     Where-Object { @("Fivenines Monitoring Agent", "fivenines-agent") -contains $_.Properties[0].Value })
+          if ((Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'").ProcessId -ne $first -or $stops.Count -ne 0) {
+            throw "the upgraded agent did not keep running on one process: it crashed and the SCM restarted it?"
+          }
+          Start-Process msiexec -ArgumentList "/x fivenines-agent.msi /qn /l*v uninstall-upgrade.log" -Wait | Out-Null
+
       - name: Cleanup service account
         if: always()
         shell: pwsh
@@ -1828,6 +1961,9 @@ jobs:
             uninstall-rotate.log
             reinstall.log
             uninstall2.log
+            upgrade-old.log
+            upgrade.log
+            uninstall-upgrade.log
           retention-days: 7
           if-no-files-found: ignore
 

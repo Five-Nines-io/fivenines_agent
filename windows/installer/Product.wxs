@@ -5,7 +5,11 @@
     - Install to %ProgramFiles%\fivenines-agent (admin-write-only by default).
     - Create config dir at %ProgramData%\fivenines_agent with a restrictive ACL.
     - Bundle the agent binary, the WinSW wrapper (renamed), and WinSW XML.
-    - Register the Windows Service via the bundled WinSW exe.
+    - Register the Windows Service, whose executable is the bundled WinSW
+      exe, through ServiceInstall: WinSW's own install command never runs,
+      so the delayed start and the restart on failure its XML describes are
+      set here (sc.exe custom actions ConfigureServiceStart and
+      ConfigureServiceRecovery).
     - Accept the enrollment token via the TOKEN MSI property (hidden, D21);
       a deferred custom action writes it to the config dir with a tight ACL
       (F1) and runs the WMI Storage-namespace delegation (D19).
@@ -159,6 +163,12 @@
                         Start="auto"
                         ErrorControl="normal"
                         Vital="yes" />
+        <!-- The delayed start and the restart on failure are set by the
+             ConfigureServiceStart and ConfigureServiceRecovery custom actions
+             below, not by WiX's ServiceConfig / ServiceConfigFailureActions:
+             Microsoft documents MsiConfigureServices' recovery actions as
+             "not working as expected" and recommends a custom action running
+             sc.exe, and WiX warns (WIX1149) on both elements. -->
 
         <!-- Intentionally NO Start="install": the deferred custom actions
              (WriteTokenAcl, DelegateWmi) run AFTER InstallServices, so if
@@ -167,7 +177,8 @@
              it has been written and exit immediately - WinSW would then
              restart-loop and the MSI would hang waiting for Running. The
              StartAgentService custom action below is sequenced after
-             DelegateWmi (TOKEN written, WMI delegated) and uses sc.exe
+             DelegateWmi (TOKEN written, WMI delegated) and the service's
+             start and recovery configuration, and uses sc.exe
              which is fire-and-forget so the MSI never hangs. -->
         <ServiceControl Id="ControlAgentService"
                         Name="fivenines-agent"
@@ -308,6 +319,47 @@
                   Return="check"
                   BinaryRef="Wix4UtilCA_X64" />
 
+    <!-- Automatic (Delayed Start): the SCM starts the agent about two minutes
+         after the other automatic services, once the network is usually up.
+         WinSW's own <delayedAutoStart> applies only to a service WinSW
+         installs itself, so until 1.23.0 every MSI install started at boot
+         with the plain automatic services, and one reached the agent's first
+         DNS lookup before DHCP had given the machine a DNS server. The agent
+         now re-reads the servers after a failed lookup (dns_resolver.py), so
+         the delay is not what keeps it reporting, but it spares every boot
+         that race. Return="check": a service left without it is the bug this
+         fixes, so the install fails rather than ship it silently. -->
+    <SetProperty Id="ConfigureServiceStart"
+                 Value="&quot;sc.exe&quot; config fivenines-agent start= delayed-auto"
+                 Before="ConfigureServiceStart"
+                 Sequence="execute" />
+    <CustomAction Id="ConfigureServiceStart"
+                  DllEntry="WixQuietExec"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check"
+                  BinaryRef="Wix4UtilCA_X64" />
+
+    <!-- Restart on failure, the schedule fivenines-agent.xml describes: 10s,
+         30s, then 60s (sc.exe takes milliseconds), the count reset after an
+         hour of clean running (seconds). WinSW applies its <onfailure> only
+         when it installs the service itself, so until 1.23.0 no MSI install
+         had failure actions. When the agent exits non-zero, WinSW exits
+         without reporting the service stopped and leaves the restart to these
+         SCM actions: without them a crashed agent stayed stopped until the
+         next boot. An exit with code 0 is reported as a stop and restarts
+         nothing (#272). -->
+    <SetProperty Id="ConfigureServiceRecovery"
+                 Value="&quot;sc.exe&quot; failure fivenines-agent reset= 3600 actions= restart/10000/restart/30000/restart/60000"
+                 Before="ConfigureServiceRecovery"
+                 Sequence="execute" />
+    <CustomAction Id="ConfigureServiceRecovery"
+                  DllEntry="WixQuietExec"
+                  Execute="deferred"
+                  Impersonate="no"
+                  Return="check"
+                  BinaryRef="Wix4UtilCA_X64" />
+
     <!-- Start the service after TOKEN write and WMI delegation are done.
          sc.exe start returns as soon as the SCM accepts the start request
          (fire-and-forget), so a crash-looping agent cannot hang the MSI.
@@ -335,14 +387,18 @@
                 + SYSTEM.
              3. DelegateWmi: grant the service account read on the WMI Storage
                 namespace so the disk-health collector works without admin.
-             4. StartAgentService: now that the service account, TOKEN, and
+             4. ConfigureServiceStart, ConfigureServiceRecovery: the delayed
+                start and the restart on failure (sc.exe, see above).
+             5. StartAgentService: now that the service account, TOKEN, and
                 WMI delegation are all in place, kick the service. Bootstraps
                 (fivenines_setup.ps1, fivenines_update.ps1) still call
                 Start-Service afterwards for idempotency. -->
       <Custom Action="CreateServiceAccount" After="InstallServices" Condition="NOT Installed" />
       <Custom Action="WriteTokenAcl" After="CreateServiceAccount" Condition="NOT Installed" />
       <Custom Action="DelegateWmi" After="WriteTokenAcl" Condition="NOT Installed" />
-      <Custom Action="StartAgentService" After="DelegateWmi" Condition="NOT Installed" />
+      <Custom Action="ConfigureServiceStart" After="DelegateWmi" Condition="NOT Installed" />
+      <Custom Action="ConfigureServiceRecovery" After="ConfigureServiceStart" Condition="NOT Installed" />
+      <Custom Action="StartAgentService" After="ConfigureServiceRecovery" Condition="NOT Installed" />
     </InstallExecuteSequence>
 
     <Feature Id="MainFeature" Title="Fivenines Agent" Level="1">

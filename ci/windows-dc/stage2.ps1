@@ -45,6 +45,7 @@ function Invoke-Msi {
     # (another installation is running) are the service settling after the
     # previous run, not a result: retry them.
     $log = "C:\fn\logs\$Name.log"
+    $script:InstallStartedAt = Get-Date
     for ($attempt = 1; $attempt -le 4; $attempt++) {
         $p = Start-Process msiexec.exe -ArgumentList ($Arguments + @("/qn", "/l*v", "`"$log`"")) -Wait -PassThru
         Log ("msiexec {0}: exit {1}" -f $Name, $p.ExitCode)
@@ -188,6 +189,7 @@ function Wait-AgentRunning {
 function Invoke-Bootstrap {
     param([scriptblock]$Script, [object[]]$Arguments = @(), [int]$TimeoutSeconds = 600)
 
+    $script:InstallStartedAt = Get-Date
     $job = Start-Job -ScriptBlock $Script -ArgumentList $Arguments
     if (-not (Wait-Job $job -Timeout $TimeoutSeconds)) {
         Stop-Job $job
@@ -218,6 +220,26 @@ function Test-Installed {
     $svc = Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'"
     Check ($svc.StartName -eq "$Domain\$Account") "$Label service logs on as $Domain\$Account (is '$($svc.StartName)')"
     Check (Wait-AgentRunning) "$Label service reaches Running"
+    # Running is no proof of health now that the SCM restarts the service: the
+    # agent must keep one process for 20s, with no unexpected termination of
+    # the service (SCM events 7031/7034) since the last msiexec or bootstrap.
+    $first = (Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'").ProcessId
+    Start-Sleep -Seconds 20
+    $stops = @(Get-WinEvent -FilterHashtable @{ LogName = "System"; ProviderName = "Service Control Manager"; Id = 7031, 7034; StartTime = $script:InstallStartedAt } -ErrorAction SilentlyContinue |
+               Where-Object { @("Fivenines Monitoring Agent", "fivenines-agent") -contains $_.Properties[0].Value })
+    $same = (Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'").ProcessId -eq $first
+    Check ($same -and $stops.Count -eq 0) "$Label agent keeps running on one process (unexpected stops since the install: $($stops.Count))"
+    $key = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\fivenines-agent"
+    Check ($key.Start -eq 2 -and $key.DelayedAutostart -eq 1) "$Label service is Automatic (Delayed Start) (Start=$($key.Start) DelayedAutostart=$($key.DelayedAutostart))"
+    # SERVICE_FAILURE_ACTIONS as the SCM stores it: five DWORDs (reset period,
+    # two pointer slots, the action count, a pointer slot), then (type, delay
+    # in ms) per action, type 1 = restart; sc.exe qfailure is localized.
+    $bin = $key.FailureActions
+    $actions = if (-not $bin) { "none" } else {
+        "reset={0} {1}" -f [BitConverter]::ToUInt32($bin, 0), ((0..([BitConverter]::ToUInt32($bin, 12) - 1) |
+            ForEach-Object { "{0}/{1}" -f [BitConverter]::ToUInt32($bin, 20 + 8 * $_), [BitConverter]::ToUInt32($bin, 24 + 8 * $_) }) -join " ")
+    }
+    Check ($actions -eq "reset=3600 1/10000 1/30000 1/60000") "$Label service restarts on failure (FailureActions: $actions)"
 
     foreach ($group in @("S-1-5-32-558", "S-1-5-32-545")) {
         $members = @(Get-ADGroupMember -Identity $group | ForEach-Object { $_.SID.Value })
