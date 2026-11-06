@@ -174,10 +174,12 @@ def _parse_snmp_line(line):
       .1.3.6.1.2.1.1.3.0 = Timeticks: (1491600) 4:08:36.00
       .1.3.6.1.2.1.2.2.1.8.1 = INTEGER: up(1)
       .1.3.6.1.2.1.31.1.1.1.1 = No Such Object available ...
+      .1.3.6.1.2.1.31.1.1.1.18.2 = No more variables left in this MIB View ...
 
     Returns:
         tuple (oid_str, value_str) or None.
-        value_str is None for "No Such" responses.
+        value_str is None for "No Such" responses. None (no tuple) for the
+        end of the MIB view, which carries no value.
     """
     line = line.strip()
     if not line or " = " not in line:
@@ -185,9 +187,19 @@ def _parse_snmp_line(line):
 
     oid_part, value_part = line.split(" = ", 1)
     oid_str = oid_part.strip().lstrip(".")
+    value_part = value_part.strip()
 
-    if "No Such" in value_part or "No more" in value_part:
+    # net-snmp prints these in place of a typed value, so they START the value:
+    # a STRING that merely mentions them (an ifAlias "No Such Port") is a value.
+    if value_part.startswith("No Such"):
         return (oid_str, None)
+    # endOfMibView: the line snmpbulkwalk prints when a walk reaches the end of
+    # the device's MIB view. It only ends the walk. Read as "No Such", it made
+    # _parse_table drop the 64-bit counters of every device whose view ends
+    # with ifXTable (a restricted SNMPv3 view, typically), whose octet counters
+    # then wrapped at 2^32 (#275).
+    if value_part.startswith("No more variables"):
+        return None
 
     # Strip type prefix: "STRING: val", "Counter32: val", etc.
     if ": " in value_part:
