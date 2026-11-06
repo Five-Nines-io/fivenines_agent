@@ -4,7 +4,8 @@ This directory builds the Windows MSI installer for the fivenines agent.
 
 - Install location: `%ProgramFiles%\fivenines-agent\` (admin-write-only).
 - Config dir: `%ProgramData%\fivenines_agent\` with a restrictive ACL.
-- Service: registered as `fivenines-agent` (Automatic Delayed Start) running
+- Service: registered as `fivenines-agent` (Automatic Delayed Start, restarted
+  after a failure 10s, 30s then 60s later, the count reset after an hour) running
   as a dedicated low-privilege local account (a domain account on a domain
   controller, see "Domain controllers" below) in the Performance Monitor Users
   group (D12). WMI Storage-namespace read access is delegated to that account

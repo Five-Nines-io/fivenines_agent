@@ -34,6 +34,7 @@ CREATE_ACCOUNT = "windows/installer/CreateServiceAccount.ps1"
 TOKEN_ACL = "windows/installer/SetTokenFileAcl.ps1"
 DELEGATE_WMI = "windows/installer/DelegateWmiStorageNamespace.ps1"
 PRODUCT_WXS = "windows/installer/Product.wxs"
+WINSW_XML = "windows/winsw/fivenines-agent.xml"
 SETUP = "fivenines_setup.ps1"
 UPDATE = "fivenines_update.ps1"
 UNINSTALL = "fivenines_uninstall.ps1"
@@ -1128,3 +1129,90 @@ def test_preflight_stops_on_a_busy_windows_installer(path):
         r"\s*exit 1\n",
         code,
     )
+
+
+# Value: protects=the agent starting after the network on every boot of an MSI install; fails_when=the MSI stops making the service Automatic (Delayed Start) with its deferred sc.exe custom action, runs it without checking its result, after StartAgentService or only on a repair, goes back to WiX's ServiceConfig (MsiConfigureServices: WIX1149, documented as not working), or the WinSW definition stops asking for the delay (WinSW applies its <delayedAutoStart> only to a service it installs itself, so every MSI install up to 1.23.0 started with the plain automatic services, and one ran its first DNS lookup before DHCP had given the machine a DNS server); why_new=only the Windows E2E reads the service's start type, after a build; seam=none; no_claim=that sc.exe applies it, which the E2E checks on install and on an upgrade from v1.22.1
+def test_msi_registers_the_service_with_a_delayed_start():
+    wxs = _xml_without_comments(PRODUCT_WXS)
+    assert not re.search(
+        r"<ServiceConfig(FailureActions)?\s", wxs
+    ), "WiX's ServiceConfig elements go through MsiConfigureServices (WIX1149)"
+    assert re.search(r'<ServiceInstall Id="FivninesAgentService"[^>]*Start="auto"', wxs)
+    assert (
+        _set_property(wxs, "ConfigureServiceStart")
+        == "&quot;sc.exe&quot; config fivenines-agent start= delayed-auto"
+    )
+    _assert_checked_deferred_before_start(wxs, "ConfigureServiceStart")
+    assert "<delayedAutoStart>true</delayedAutoStart>" in _xml_without_comments(
+        WINSW_XML
+    )
+
+
+# Value: protects=a crashed agent restarted on every MSI install, on the schedule the WinSW definition and the README describe; fails_when=the MSI loses its deferred sc.exe failure custom action, runs it unchecked, after StartAgentService or only on a repair, or its delays or reset period drift from fivenines-agent.xml's (WinSW applies <onfailure> only to a service it installs itself, so no MSI install up to 1.23.0 had failure actions and a crashed agent stayed stopped until the next boot); why_new=only the Windows E2E reads the service's failure actions, after a build; seam=none; no_claim=that sc.exe applies them or that the SCM restarts the agent, which the E2E checks (registry, and a killed agent restarted)
+def test_msi_restarts_the_service_on_failure_as_winsw_describes():
+    wxs = _xml_without_comments(PRODUCT_WXS)
+    command = re.fullmatch(
+        r"&quot;sc\.exe&quot; failure fivenines-agent reset= (\d+) actions= (\S+)",
+        _set_property(wxs, "ConfigureServiceRecovery"),
+    )
+    assert command, "ConfigureServiceRecovery is not an sc.exe failure command"
+    _assert_checked_deferred_before_start(wxs, "ConfigureServiceRecovery")
+    fields = command.group(2).split("/")
+    assert len(fields) % 2 == 0
+    assert set(fields[0::2]) == {"restart"}, "every failure action restarts"
+    msi_delays = [int(delay) for delay in fields[1::2]]
+
+    winsw = _xml_without_comments(WINSW_XML)
+    seconds = {"sec": 1, "min": 60, "hour": 3600}
+    winsw_delays = [
+        int(value) * seconds[unit] * 1000
+        for value, unit in re.findall(
+            r'<onfailure action="restart" delay="(\d+) (sec|min|hour)"/>', winsw
+        )
+    ]
+    assert len(winsw_delays) == winsw.count("<onfailure ")
+    winsw_reset = re.search(r"<resetfailure>(\d+) (sec|min|hour)</resetfailure>", winsw)
+    assert winsw_reset, "fivenines-agent.xml has no resetfailure"
+    assert msi_delays == winsw_delays == [10000, 30000, 60000]
+    assert (
+        int(command.group(1))
+        == int(winsw_reset.group(1)) * seconds[winsw_reset.group(2)]
+    )
+
+
+def _xml_without_comments(path):
+    # A commented-out element is not one.
+    return re.sub(r"<!--.*?-->", "", _read(path), flags=re.S)
+
+
+def _set_property(wxs, action):
+    found = re.findall(r'<SetProperty Id="%s"\s+Value="([^"]*)"' % action, wxs)
+    assert len(found) == 1, f"expected one SetProperty for {action}"
+    return found[0]
+
+
+def _assert_checked_deferred_before_start(wxs, action):
+    """A deferred, elevated, checked WixQuietExec custom action, run on a fresh
+    install or major upgrade (NOT Installed) before StartAgentService."""
+    custom = re.search(r'<CustomAction Id="%s"([^>]*)/>' % action, wxs)
+    assert custom, f"no CustomAction {action}"
+    for attribute in (
+        'DllEntry="WixQuietExec"',
+        'Execute="deferred"',
+        'Impersonate="no"',
+        'Return="check"',
+    ):
+        assert attribute in custom.group(1), f"{action} lacks {attribute}"
+    after = dict(
+        re.findall(
+            r'<Custom Action="([^"]+)" After="([^"]+)" Condition="NOT Installed" />',
+            wxs,
+        )
+    )
+    assert action in after, f"{action} is not scheduled on NOT Installed"
+    step, chain = "StartAgentService", []
+    while step in after and step not in chain:
+        chain.append(step)
+        step = after[step]
+    assert action in chain[1:], f"{action} does not run before StartAgentService"
+    assert step == "InstallServices", "the chain does not start after InstallServices"

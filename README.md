@@ -381,8 +381,9 @@ Restart-Service fivenines-agent
 Lifecycle events (started / stopped / failed) go to the Windows Event Log, so
 the agent is visible in `services.msc` and Event Viewer with no extra setup.
 Captured stdout/stderr lands in `%ProgramData%\fivenines_agent\logs\`, rotated at
-10 MB with 5 generations kept. On failure the wrapper restarts the agent after
-10s, 30s and 60s, resetting the counter after an hour of clean running.
+10 MB with 5 generations kept. On failure the service is restarted after 10s,
+30s and 60s (failure actions the MSI sets), resetting the counter after an hour
+of clean running.
 
 ### Alpine Linux (OpenRC)
 
