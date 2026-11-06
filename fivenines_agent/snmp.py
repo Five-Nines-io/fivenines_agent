@@ -124,11 +124,43 @@ _NUMERIC_OID = re.compile(r"\.?(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){0,127}")
 # net-snmp picks its transport from the address itself ("tcp:", "unix:/...",
 # "alias:"), and the server checks the format only when the address changes.
 _HOSTNAME_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+_ZONE_ID = re.compile(r"[A-Za-z0-9_]+")
 _HOSTNAME = re.compile(
     r"(?=.{1,253}\Z)" + _HOSTNAME_LABEL + r"(?:\." + _HOSTNAME_LABEL + r")*"
 )
 _PORT = r"(?P<port>[1-9][0-9]{0,4})"
 _WITH_PORT = re.compile(r"(?P<address>[^:\[\]]+):" + _PORT)
+# net-snmp's transport prefixes (each domain's prefix[] in 5.9.4's
+# snmplib/transports, matched case-insensitively by find_tdomain): an operand
+# "<prefix>:<rest>" selects that transport whatever <rest> is, so a host name
+# such as "tcp" may be polled bare but never with a port.
+_NETSNMP_TRANSPORTS = frozenset(
+    (
+        "aal5pvc",
+        "alias",
+        "dtls",
+        "dtls6",
+        "dtlsudp",
+        "dtlsudp6",
+        "ipv6",
+        "ipx",
+        "pvc",
+        "ssh",
+        "std",
+        "tcp",
+        "tcp6",
+        "tcpipv6",
+        "tcpv6",
+        "tls",
+        "tlstcp",
+        "udp",
+        "udp6",
+        "udpipv6",
+        "udpshared",
+        "udpv6",
+        "unix",
+    )
+)
 _BRACKETED_IPV6_WITH_PORT = re.compile(r"\[(?P<address>[^\[\]]+)\]:" + _PORT)
 
 # Settings
@@ -303,11 +335,14 @@ def _parse_snmp_line(line):
 
 
 def _is_ipv6(value):
-    # No zone id ("fe80::1%eth0"): the server's rule has none either.
-    if "%" in value:
+    address, zoned, zone = value.partition("%")
+    # A zone id ("fe80::1%eth0", which net-snmp reads with if_nametoindex)
+    # only on a link-local address and in word characters: what the server's
+    # rule (Resolv::IPv6 and IPAddr) accepts.
+    if zoned and not (address.lower().startswith("fe80:") and _ZONE_ID.fullmatch(zone)):
         return False
     try:
-        ipaddress.IPv6Address(value)
+        ipaddress.IPv6Address(address)
     except ValueError:
         return False
     return True
@@ -337,6 +372,31 @@ def _poll_address_ok(value):
         pass
     last_label = address.rsplit(".", 1)[-1]
     return bool(_HOSTNAME.fullmatch(address)) and not last_label.isdigit()
+
+
+def _snmp_operand(ip, port):
+    """The device as snmpget's operand, or None. The address must be one the
+    server's format rule accepts, a port other than 161 an integer the
+    address does not already carry (a bare IPv6 address gets brackets, or
+    its port would read as one more group), and the operand must not read
+    as a net-snmp transport ("tcp:1161", "unix:/run/x.sock")."""
+    if not _poll_address_ok(ip):
+        return None
+    operand = ip
+    if port != 161:
+        if isinstance(port, bool) or not isinstance(port, int):
+            return None
+        if not 1 <= port <= 65535:
+            return None
+        if _is_ipv6(ip):
+            operand = "[{}]:{}".format(ip, port)
+        elif ":" in ip:
+            return None
+        else:
+            operand = "{}:{}".format(ip, port)
+    if ":" in operand and operand.split(":", 1)[0].lower() in _NETSNMP_TRANSPORTS:
+        return None
+    return operand
 
 
 def _to_number(val):
@@ -767,12 +827,12 @@ class SNMPCollector:
         version = target.get("version", "v2c")
         ip = target.get("ip", "127.0.0.1")
         port = target.get("port", 161)
-        if not _poll_address_ok(ip):
+        host = _snmp_operand(ip, port)
+        if host is None:
             return None, {
                 "type": "unknown",
                 "message": "Refused SNMP address: not an IP address or host name",
             }
-        host = "{}:{}".format(ip, port) if port != 161 else ip
 
         # -On: numeric OIDs. -Oe: enumerations as bare integers, not "up(1)".
         # -OU: no MIB UNITS after a number, not "16313768 kB". snmp.conf can

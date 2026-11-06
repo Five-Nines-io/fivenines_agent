@@ -734,7 +734,10 @@ class TestBuildBaseArgs:
             "sw1:65536",
             "[2001:db8::1]:99999",
             "[sw1]:161",
-            "fe80::1%eth0",
+            "fe80::1%-Lf/tmp/x",
+            "fe80::1%en0.5",
+            "fe80::1%",
+            "2001:db8::1%eth0",
             "a" * 64 + ".lan",
             "sw_1.lan",
             "sw1.lan.",
@@ -753,6 +756,50 @@ class TestBuildBaseArgs:
             "message": "Refused SNMP address: not an IP address or host name",
         }
 
+    # Value: protects=the port field cannot turn a checked address back into a
+    # net-snmp transport or a second port; fails_when=only the ip field is
+    # checked and the port appended unchecked ("unix" + "/run/x.sock");
+    # why_new=found by the docs audit after the address check landed;
+    # seam=none; no_claim=a real net-snmp run
+    @pytest.mark.parametrize(
+        "ip, port",
+        [
+            ("unix", "/run/x.sock"),
+            ("tcp", 1161),
+            ("Alias", 1161),
+            ("tcp:1161", 161),
+            ("udp6:161", 161),
+            ("192.0.2.1:5", 6),
+            ("[2001:db8::1]:1161", 1162),
+            ("192.0.2.1", True),
+            ("192.0.2.1", 0),
+            ("192.0.2.1", 65536),
+            ("192.0.2.1", "1161"),
+        ],
+    )
+    def test_operand_that_reads_as_a_transport_is_refused(self, ip, port):
+        target = _make_target(ip=ip, port=port)
+        args, error = SNMPCollector([target])._build_base_args(target)
+        assert args is None
+        assert error["message"] == (
+            "Refused SNMP address: not an IP address or host name"
+        )
+
+    @pytest.mark.parametrize(
+        "ip, port, operand",
+        [
+            ("tcp", 161, "tcp"),  # a host name, polled bare
+            ("192.0.2.1", 1161, "192.0.2.1:1161"),
+            ("2001:db8::1", 1161, "[2001:db8::1]:1161"),
+            ("sw1.lan:16100", 161, "sw1.lan:16100"),
+        ],
+    )
+    def test_operand_composed_from_address_and_port(self, ip, port, operand):
+        target = _make_target(ip=ip, port=port)
+        args, error = SNMPCollector([target])._build_base_args(target)
+        assert error is None
+        assert args[-2:] == ["--", operand]
+
     @pytest.mark.parametrize(
         "ip",
         [
@@ -764,6 +811,9 @@ class TestBuildBaseArgs:
             "2001:db8::1",
             "::1",
             "[2001:db8::1]:1161",
+            "fe80::1%eth0",
+            "FE80::1%en0",
+            "[fe80::1%eth0]:1161",
         ],
     )
     def test_address_in_the_server_format_is_polled(self, ip):
