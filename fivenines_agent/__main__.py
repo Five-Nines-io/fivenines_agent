@@ -13,9 +13,11 @@ def escape_unencodable_output():
     error message raised UnicodeEncodeError -- inside the except blocks that
     log it, ending the synchronizer thread or the collection loop. Only a
     "strict" stream is changed: CPython's stderr already escapes, and under
-    the C locale stdout uses surrogateescape, which writes the original
-    bytes back. The encoding itself is kept, so nothing that encoded before
-    is written differently.
+    the C locale stdout uses surrogateescape, which writes undecodable bytes
+    (U+DC80..U+DCFF) back as they were read; it still raises on any other
+    character its encoding lacks, which debug.log() then writes escaped. The
+    encoding itself is kept, so nothing that encoded before is written
+    differently.
     """
     for stream in (sys.stdout, sys.stderr):
         if getattr(stream, "errors", None) == "strict" and hasattr(

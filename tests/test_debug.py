@@ -220,3 +220,47 @@ def test_log_writes_a_line_its_stdout_can_encode_unchanged(monkeypatch):
     debug_module.log("caf\u00e9", "error")
 
     assert re.fullmatch(rb"\[ERROR\]\[thread#\d+\] caf\xe9\n", written())
+
+
+class _FailingStdout:
+    """A stdout whose every write fails like a full disk (ENOSPC on OpenRC's
+    log file) or a closed pipe; with unencodable=True it first refuses what
+    a cp1252 stream cannot encode, as a Windows service's stdout does."""
+
+    errors = "strict"
+
+    def __init__(self, unencodable=False):
+        self.unencodable = unencodable
+        self.attempts = []
+
+    def write(self, text):
+        self.attempts.append(text)
+        if self.unencodable:
+            text.encode("cp1252")
+        raise OSError(28, "No space left on device")
+
+    def flush(self):
+        pass
+
+
+# Value: protects=log() never raises, whatever print() raises, so a line
+# logged in an except block can no longer end the synchronizer thread or skip
+# _cleanup (adversarial review: ENOSPC on OpenRC's output_log, EPIPE);
+# fails_when=log() catches only UnicodeEncodeError, or its ASCII retry is
+# left unguarded, or the dropped line also skips the telemetry capture;
+# why_new=the strict-stdout tests only raise UnicodeEncodeError; seam=none;
+# no_claim=what a real full disk does to buffered output at exit.
+@pytest.mark.parametrize("unencodable", [False, True], ids=["oserror", "retry_oserror"])
+def test_log_drops_a_line_its_stdout_cannot_write(monkeypatch, unencodable):
+    monkeypatch.delenv("LOG_LEVEL", raising=False)
+    stream = _FailingStdout(unencodable=unencodable)
+    monkeypatch.setattr(sys, "stdout", stream)
+    debug_module.start_log_capture()
+    try:
+        debug_module.log("Synchronizer Error: \u63a5\u7d9a", "error")
+    finally:
+        captured = debug_module.stop_log_capture()
+
+    # The ASCII retry happens only after an encoding failure.
+    assert len(stream.attempts) == (2 if unencodable else 1)
+    assert captured == ["Synchronizer Error: \u63a5\u7d9a"]

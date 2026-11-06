@@ -253,7 +253,16 @@ def test_run_exits_non_zero_after_an_unexpected_error(mock_cm, mock_dr):
 
     assert code == 1
     errors = [c.args[0] for c in logged if c.args[1:] == ("error",)]
-    assert errors == ["Error: RuntimeError: boom \\u63a5 password=[REDACTED] forged"]
+    assert errors[0] == "Error: RuntimeError: boom \\u63a5 password=[REDACTED] forged"
+    # Then the stack frames, line by line through log_safe: they name where
+    # the loop died. The message is not repeated there: split at its newline
+    # it would ship "forged" as a line of its own, and a secret split across
+    # two lines would escape the redaction.
+    assert errors[1] == "Traceback (most recent call last):"
+    assert any("in run" in line for line in errors[2:])
+    assert any("mock" in line for line in errors[2:])
+    assert "forged" not in errors[1:]
+    assert not any("hunter2" in line for line in errors)
     # _cleanup still ran: the synchronizer was stopped and woken.
     agent.synchronizer.stop.assert_called_once_with()
     agent.queue.put.assert_called_with(None)
@@ -262,17 +271,62 @@ def test_run_exits_non_zero_after_an_unexpected_error(mock_cm, mock_dr):
 @patch("fivenines_agent.agent.dry_run", return_value=False)
 @patch("fivenines_agent.agent.collect_metrics")
 def test_run_exits_non_zero_when_a_base_exception_ends_the_loop(mock_cm, mock_dr):
-    """Not an Exception, so no "Error:" line, but still a crash: _cleanup's
-    sys.exit replaces it with a non-zero code, never 0."""
+    """Not an Exception, still a crash: logged with its traceback (_cleanup's
+    SystemExit replaces it, and Python prints nothing for a SystemExit), and
+    the exit code is non-zero, never 0."""
 
     class _NotAnException(BaseException):
         pass
 
     agent = make_agent()
     agent.synchronizer.get_config.return_value = agent.config
-    mock_cm.side_effect = _NotAnException()
+    mock_cm.side_effect = _NotAnException("leaked")
 
     code, logged = _run_until_exit(agent)
 
     assert code == 1
-    assert [c for c in logged if c.args[1:] == ("error",)] == []
+    errors = [c.args[0] for c in logged if c.args[1:] == ("error",)]
+    assert errors[0] == "Error: _NotAnException: leaked"
+    assert errors[1] == "Traceback (most recent call last):"
+
+
+# Value: protects=a crash still reaches _cleanup's stop of the worker threads
+# and the non-zero exit when stdout itself fails (adversarial review,
+# reproduced: with stdout on /dev/full the Error line raised, _cleanup's first
+# line raised again, the non-daemon synchronizer was never stopped and the
+# process hung with no exit code); fails_when=log() lets an OSError out;
+# why_new=the other run() tests replace log() itself; seam=none;
+# no_claim=a real full disk (a stub stdout raises OSError on every write).
+@patch("fivenines_agent.agent.dry_run", return_value=False)
+@patch("fivenines_agent.agent.collect_metrics")
+def test_run_exits_non_zero_when_stdout_fails_during_the_crash(
+    mock_cm, mock_dr, monkeypatch
+):
+    class _FullDisk:
+        errors = "strict"
+
+        def write(self, text):
+            raise OSError(28, "No space left on device")
+
+        def flush(self):
+            pass
+
+    agent = make_agent()
+    agent.synchronizer.get_config.return_value = agent.config
+    mock_cm.side_effect = RuntimeError("boom")
+    monkeypatch.delenv("LOG_LEVEL", raising=False)
+    monkeypatch.setattr(sys, "stdout", _FullDisk())
+
+    original = agent_module.systemd_watchdog
+    try:
+        agent_module.systemd_watchdog = None
+        agent_module.exit_event.clear()
+        with pytest.raises(SystemExit) as exc_info:
+            agent.run()
+    finally:
+        agent_module.systemd_watchdog = original
+
+    assert exc_info.value.code == 1
+    agent.synchronizer.stop.assert_called_once_with()
+    agent.synchronizer.join.assert_called_once_with()
+    agent.queue.put.assert_called_with(None)

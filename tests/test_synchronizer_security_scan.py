@@ -317,6 +317,84 @@ def test_send_with_a_localized_os_error_on_a_strict_stdout(monkeypatch):
     )
 
 
+# Value: protects=the sender outlives a failed send whose error line cannot be
+# written at all (stdout on a full disk or a closed pipe), not only one it
+# cannot encode (adversarial review: _isolated logs outside its try);
+# fails_when=log() lets an OSError out of _isolated's except; why_new=the
+# other run() tests replace log() or only raise UnicodeEncodeError;
+# seam=none; no_claim=a real full disk (a stub stdout raises OSError).
+@patch.object(Synchronizer, "_fetch_config_once")
+@patch.object(Synchronizer, "send_metrics")
+def test_run_outlives_a_send_that_raises_on_an_unwritable_stdout(
+    mock_send, mock_fetch, monkeypatch
+):
+    class _FullDisk:
+        errors = "strict"
+
+        def write(self, text):
+            raise OSError(28, "No space left on device")
+
+        def flush(self):
+            pass
+
+    monkeypatch.delenv("LOG_LEVEL", raising=False)
+    monkeypatch.setattr(sys, "stdout", _FullDisk())
+    sync = make_synchronizer()
+    first, second = serialize_payload({"tick": 1}), serialize_payload({"tick": 2})
+    sync.queue.get.side_effect = [first, second]
+
+    def send(data):
+        if data == first:
+            raise RuntimeError("boom")
+        sync.stop()
+
+    mock_send.side_effect = send
+
+    sync.run()
+
+    assert mock_send.call_args_list == [call(first), call(second)]
+    assert sync.queue.task_done.call_count == 2
+
+
+# Value: protects=issue #247: a 200 /collect answer that is not a config
+# (a proxy or maintenance page answering {"status": "ok"}, or a JSON list)
+# costs that payload, not the sender, and the current config is kept;
+# fails_when=send_metrics' KeyError/TypeError leaves run(), or the config is
+# replaced by the bad answer; why_new=every other run() test mocks
+# send_metrics; seam=get_conn returns a stub connection; no_claim=a real
+# proxy's answer.
+@pytest.mark.parametrize("body", [{"status": "ok"}, []], ids=["no_config", "list"])
+@patch.object(Synchronizer, "_fetch_config_once")
+def test_run_outlives_a_collect_answer_without_config(mock_fetch, body):
+    sync = make_synchronizer()
+    first, second = serialize_payload({"tick": 1}), serialize_payload({"tick": 2})
+    sync.queue.get.side_effect = [first, second]
+    good = {
+        "config": {
+            "enabled": True,
+            "interval": 30,
+            "request_options": {"timeout": 5, "retry": 3, "retry_interval": 0},
+        }
+    }
+    conn = _ok_conn(body, good)
+    original = dict(sync.config)
+
+    def stop_after_second(*args, **kwargs):
+        if conn.request.call_count == 2:
+            sync.stop()
+
+    conn.request.side_effect = stop_after_second
+
+    with patch.object(Synchronizer, "get_conn", return_value=conn):
+        sync.run()
+
+    assert conn.request.call_count == 2
+    assert sync.queue.task_done.call_count == 2
+    # The bad answer left the config alone; the next good one replaced it.
+    assert original != good["config"]
+    assert sync.config == good["config"]
+
+
 # --- send_packages ---
 
 

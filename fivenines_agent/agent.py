@@ -6,6 +6,7 @@ import platform
 import signal
 import sys
 import time
+import traceback
 from threading import Event
 
 import psutil
@@ -442,11 +443,23 @@ class Agent:
                     self._wait_interval(running_time)
             exit_code = 0
 
-        except Exception as e:
-            # Log unexpected errors before exiting. log_safe: the message can
-            # quote a config value or an API body (redacted), and a newline in
-            # it cannot forge journal lines.
+        except BaseException as e:
+            # Log unexpected errors before exiting, with the traceback: the
+            # service manager restarts the agent, so a crash can repeat, and
+            # this is all that is left to find where. BaseException too: a
+            # KeyboardInterrupt or a BaseException a collector leaked would
+            # otherwise be replaced by _cleanup's SystemExit without a line.
+            # log_safe: the message can quote a config value or an API body
+            # (redacted), and a newline in it cannot forge journal lines. The
+            # traceback is the stack frames only (file, line, function and
+            # source line, never a runtime value): format_exc() would repeat
+            # the message split at its newlines, and a secret split across
+            # two lines escapes the redaction.
             log(f"Error: {type(e).__name__}: {log_safe(e)}", "error")
+            log("Traceback (most recent call last):", "error")
+            for frame in traceback.format_tb(e.__traceback__):
+                for line in frame.splitlines():
+                    log(log_safe(line), "error")
         finally:
             self._cleanup(exit_code)
 

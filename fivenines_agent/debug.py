@@ -98,18 +98,28 @@ def debug_enabled():
 def log(message, level='info'):
     if LOG_LEVELS[log_level()] <= LOG_LEVELS[level]:
         line = f"[{level.upper()}][thread#{threading.get_native_id()}] {message}"
+        # log() runs inside the except blocks of every thread, so writing
+        # the line must never raise (#273): raising there ended the
+        # synchronizer thread, or skipped _cleanup's stop of the worker
+        # threads, leaving a live process that never exits. A line is best
+        # effort. (An unknown LOG_LEVEL still raises above: #239.)
         try:
-            print(line)
-        except UnicodeEncodeError:
-            # A Windows service's stdout encodes in the ANSI code page with
-            # errors="strict", and a localized OS error message can hold a
-            # character that code page lacks (#273). log() runs inside the
-            # except blocks of every thread, so raising here would end the
-            # thread (the synchronizer's) or the collection loop. start()
-            # already makes stdout escape what it cannot encode; this holds
-            # wherever start() did not run. print() encodes the whole line
-            # before writing it, so nothing was written.
-            print(line.encode("ascii", "backslashreplace").decode("ascii"))
+            try:
+                print(line)
+            except UnicodeEncodeError:
+                # A Windows service's stdout encodes in the ANSI code page
+                # with errors="strict", and a localized OS error message can
+                # hold a character that code page lacks. start() already
+                # makes stdout escape what it cannot encode; this holds
+                # wherever start() did not run, and on a surrogateescape
+                # stdout. print() encodes the whole line before writing it,
+                # so nothing was written.
+                print(line.encode("ascii", "backslashreplace").decode("ascii"))
+        except Exception:
+            # Any other write failure (ENOSPC on OpenRC's log file, a closed
+            # pipe or stream) loses the line, never the agent: on a full
+            # disk it must keep reporting, since that is the alert.
+            pass  # nosec B110  # a log line that cannot be written is dropped; there is nowhere to report it
     # Buffer error messages when capture is active (thread-local).
     # Intentionally outside the log-level check: errors are always
     # captured for backend telemetry regardless of configured log level.
