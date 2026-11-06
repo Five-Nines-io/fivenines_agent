@@ -29,12 +29,16 @@ Thread safety: each worker thread runs its own subprocess.
 No shared mutable state between threads.
 """
 
+import codecs
 import hashlib
+import ipaddress
 import json
+import locale
 import math
 import re
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -112,6 +116,20 @@ _VALUE_IN_ERROR_CHARS = 64
 # strtoul(base 0), so a leading zero is octal ("08" is refused, "010" asks
 # for 8 and is never matched), and takes at most MAX_OID_LEN (128) of them.
 _NUMERIC_OID = re.compile(r"\.?(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){0,127}")
+
+# The device address forms the server's format rule accepts
+# (NetworkDevice.parse_poll_address): an IPv4 address or an RFC 1123 host
+# name, either with an optional ":port", a bare IPv6 address, or a bracketed
+# one with a port. Anything else is refused before snmpget sees it, because
+# net-snmp picks its transport from the address itself ("tcp:", "unix:/...",
+# "alias:"), and the server checks the format only when the address changes.
+_HOSTNAME_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+_HOSTNAME = re.compile(
+    r"(?=.{1,253}\Z)" + _HOSTNAME_LABEL + r"(?:\." + _HOSTNAME_LABEL + r")*"
+)
+_PORT = r"(?P<port>[1-9][0-9]{0,4})"
+_WITH_PORT = re.compile(r"(?P<address>[^:\[\]]+):" + _PORT)
+_BRACKETED_IPV6_WITH_PORT = re.compile(r"\[(?P<address>[^\[\]]+)\]:" + _PORT)
 
 # Settings
 SNMP_TIMEOUT = 5  # seconds per SNMP request (-t flag)
@@ -284,6 +302,43 @@ def _parse_snmp_line(line):
     return (oid_str, val.strip().strip('"'))
 
 
+def _is_ipv6(value):
+    # No zone id ("fe80::1%eth0"): the server's rule has none either.
+    if "%" in value:
+        return False
+    try:
+        ipaddress.IPv6Address(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _poll_address_ok(value):
+    """Whether `value` is a device address the server's format rule accepts
+    (see _HOSTNAME): what reaches snmpget is then an address, never a
+    transport ("tcp:", "unix:/run/x.sock") or an option."""
+    if not isinstance(value, str):
+        return False
+    bracketed = _BRACKETED_IPV6_WITH_PORT.fullmatch(value)
+    if bracketed:
+        return _is_ipv6(bracketed["address"]) and int(bracketed["port"]) <= 65535
+    if _is_ipv6(value):
+        return True
+    with_port = _WITH_PORT.fullmatch(value)
+    address, port = (
+        (with_port["address"], with_port["port"]) if with_port else (value, None)
+    )
+    if port is not None and int(port) > 65535:
+        return False
+    try:
+        ipaddress.IPv4Address(address)
+        return True
+    except ValueError:
+        pass
+    last_label = address.rsplit(".", 1)[-1]
+    return bool(_HOSTNAME.fullmatch(address)) and not last_label.isdigit()
+
+
 def _to_number(val):
     """A custom OID's value as an int, else a finite float, else None.
 
@@ -388,8 +443,28 @@ def _stuck(device_id):
     }
 
 
+def _ansi_codec():
+    """The codec a line that is not UTF-8 is read with: on Windows the ANSI
+    code page the agent decoded everything with before (cp1250, cp1251,
+    cp932... not only cp1252), elsewhere cp1252, the common superset of
+    latin-1 for printable text. A UTF-8 or unknown preferred codec falls
+    back to cp1252: it is what the line just failed to be."""
+    if sys.platform == "win32":
+        preferred = locale.getpreferredencoding(False)
+        try:
+            if codecs.lookup(preferred).name != "utf-8":
+                return preferred
+        except LookupError:
+            pass
+    return "cp1252"
+
+
+_FALLBACK_CODEC = _ansi_codec()
+
+
 def _decode_output(data):
-    """The CLI's output bytes as text, each line UTF-8 when it is, else cp1252.
+    """The CLI's output bytes as text, each line UTF-8 when it is, else the
+    Windows ANSI code page (cp1252 elsewhere, see _ansi_codec).
 
     Never the agent's locale codec, strictly: with a DISPLAY-HINT (a host
     that loads MIBs) net-snmp copies a DisplayString's bytes as they are, so
@@ -398,7 +473,7 @@ def _decode_output(data):
     word. Line by line, not UTF-8 with replacement: on Windows the locale
     codec was the ANSI code page, which read a latin-1 or cp1252 name right,
     and a U+FFFD there would rename the port once and lose its characters.
-    errors="replace" only for the five bytes cp1252 leaves undefined.
+    errors="replace" only for the bytes that codec leaves undefined.
     """
     return "".join(_decode_line(line) for line in data.splitlines(keepends=True))
 
@@ -407,7 +482,7 @@ def _decode_line(line):
     try:
         return line.decode("utf-8")
     except UnicodeDecodeError:
-        return line.decode("cp1252", errors="replace")
+        return line.decode(_FALLBACK_CODEC, errors="replace")
 
 
 def _run_snmp_cmd(cmd, args, timeout):
@@ -692,12 +767,10 @@ class SNMPCollector:
         version = target.get("version", "v2c")
         ip = target.get("ip", "127.0.0.1")
         port = target.get("port", 161)
-        # The server refuses such an address only when it changes, and the
-        # agent does not rely on it (the qemu URI allowlist posture, #142).
-        if isinstance(ip, str) and ip.startswith("-"):
+        if not _poll_address_ok(ip):
             return None, {
                 "type": "unknown",
-                "message": "Refused SNMP address starting with '-'",
+                "message": "Refused SNMP address: not an IP address or host name",
             }
         host = "{}:{}".format(ip, port) if port != 161 else ip
 
@@ -781,7 +854,7 @@ class SNMPCollector:
             if error:
                 log(
                     "SNMP system poll failed for {}: {}".format(
-                        device_id, error.get("message", "")
+                        device_id, log_safe(error.get("message", ""))
                     ),
                     "error",
                 )
@@ -793,7 +866,7 @@ class SNMPCollector:
             if error:
                 log(
                     "SNMP interface poll failed for {}: {}".format(
-                        device_id, error.get("message", "")
+                        device_id, log_safe(error.get("message", ""))
                     ),
                     "error",
                 )
@@ -848,6 +921,7 @@ class SNMPCollector:
 
         metrics = []
         not_numbers = []
+        ambiguous = []
         if polled:
             args = base_args + [entry["oid"] for entry in polled]
             stdout, error = _run_snmp_cmd("snmpget", args, SNMP_TIMEOUT + 5)
@@ -862,12 +936,22 @@ class SNMPCollector:
             for entry in polled:
                 entries_by_oid.setdefault(entry["oid"].lstrip("."), []).append(entry)
 
-            for line in stdout.splitlines():
-                parsed = _parse_snmp_line(line)
-                if not parsed or parsed[1] is None:
+            answers = [p for p in map(_parse_snmp_line, stdout.splitlines()) if p]
+            answered = {}
+            for oid, _ in answers:
+                answered[oid] = answered.get(oid, 0) + 1
+            for oid, val in answers:
+                if val is None:
                     continue
-                oid, val = parsed
-                for entry in entries_by_oid.pop(oid, ()):
+                entries = entries_by_oid.pop(oid, ())
+                # snmpget answers an OID once per time it was asked. More
+                # lines than that: a multi-line string value (net-snmp prints
+                # a hinted string's newlines as they are) carried a line that
+                # reads as this OID's answer, and nothing tells which is real.
+                if entries and answered[oid] > len(entries):
+                    ambiguous.extend(str(entry.get("name")) for entry in entries)
+                    continue
+                for entry in entries:
                     if entry.get("type", "gauge") == "string":
                         value = val
                     else:
@@ -881,6 +965,8 @@ class SNMPCollector:
         problems = []
         if refused:
             problems.append("not a numeric OID: {}".format(", ".join(refused)))
+        if ambiguous:
+            problems.append("answered more than once: {}".format(", ".join(ambiguous)))
         if not_numbers:
             problems.append("not a number: {}".format(", ".join(not_numbers)))
         if problems:

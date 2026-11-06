@@ -23,6 +23,7 @@ from fivenines_agent.snmp import (
     SNMP_RETRIES,
     SNMP_TIMEOUT,
     SNMPCollector,
+    _decode_output,
     _parse_snmp_line,
     _polling_key,
     _print_diagnostics,
@@ -495,6 +496,31 @@ class TestRunSnmpCmd:
             ".1.3.6.1.2.1.1.6.0 = STRING: x\ufffdy",  # undefined in cp1252
         ]
 
+    def test_a_line_that_is_not_utf8_uses_the_windows_ansi_code_page(self):
+        """On Windows the agent decoded with the ANSI code page: a cp1251
+        (Cyrillic) device name keeps its characters, not cp1252 mojibake."""
+        with patch("fivenines_agent.snmp._FALLBACK_CODEC", "cp1251"):
+            text = _decode_output(b"name = STRING: \xd1\xe2\xe8\xf2\n")
+        assert text == "name = STRING: \u0421\u0432\u0438\u0442\n"
+
+    @pytest.mark.parametrize(
+        "platform, preferred, codec",
+        [
+            ("win32", "cp1251", "cp1251"),
+            ("win32", "cp932", "cp932"),
+            ("win32", "UTF-8", "cp1252"),  # UTF-8 mode: the line just failed it
+            ("win32", "no-such-codec", "cp1252"),
+            ("linux", "cp1251", "cp1252"),
+        ],
+    )
+    def test_fallback_codec(self, platform, preferred, codec):
+        from fivenines_agent import snmp
+
+        with patch.object(snmp.sys, "platform", platform), patch.object(
+            snmp.locale, "getpreferredencoding", return_value=preferred
+        ):
+            assert snmp._ansi_codec() == codec
+
     @patch("fivenines_agent.snmp.get_clean_env")
     @patch("fivenines_agent.snmp.subprocess.run")
     def test_stderr_is_decoded_the_same_way(self, mock_run, mock_env):
@@ -689,19 +715,62 @@ class TestBuildBaseArgs:
         assert args[-2:] == ["--", "192.168.1.10"]
         assert args.count("--") == 1
 
-    # Value: protects=a server-pushed address starting with "-" is refused,
-    # never handed to snmpget; fails_when=the guard is dropped and the
-    # address only lands behind "--"; why_new=the server checks it only when
-    # it changes (legacy rows); seam=none; no_claim=a real net-snmp run
-    @pytest.mark.parametrize("ip", ["-Lf/tmp/x", "-v1"])
-    def test_address_starting_with_a_dash_is_refused(self, ip):
+    # Value: protects=only an address the server's format rule accepts
+    # reaches snmpget: never an option ("-...") or a net-snmp transport
+    # ("tcp:", "unix:/..."); fails_when=the address check is dropped or
+    # loosened; why_new=the server checks the format only when the address
+    # changes (legacy rows); seam=none; no_claim=a real net-snmp run
+    @pytest.mark.parametrize(
+        "ip",
+        [
+            "-Lf/tmp/x",
+            "-v1",
+            "tcp:192.0.2.1",
+            "unix:/run/x.sock",
+            "udp6:[2001:db8::1]:161",
+            "1.2.3.999",
+            "sw1:0",
+            "sw1:01161",
+            "sw1:65536",
+            "[2001:db8::1]:99999",
+            "[sw1]:161",
+            "fe80::1%eth0",
+            "a" * 64 + ".lan",
+            "sw_1.lan",
+            "sw1.lan.",
+            "sw1.lan\n",
+            "",
+            None,
+            1234,
+        ],
+    )
+    def test_address_outside_the_server_format_is_refused(self, ip):
         target = _make_target(ip=ip)
         args, error = SNMPCollector([target])._build_base_args(target)
         assert args is None
         assert error == {
             "type": "unknown",
-            "message": "Refused SNMP address starting with '-'",
+            "message": "Refused SNMP address: not an IP address or host name",
         }
+
+    @pytest.mark.parametrize(
+        "ip",
+        [
+            "192.0.2.10",
+            "192.0.2.10:1161",
+            "sw1",
+            "sw1.example.lan:16100",
+            "a" * 63 + ".lan",
+            "2001:db8::1",
+            "::1",
+            "[2001:db8::1]:1161",
+        ],
+    )
+    def test_address_in_the_server_format_is_polled(self, ip):
+        target = _make_target(ip=ip)
+        args, error = SNMPCollector([target])._build_base_args(target)
+        assert error is None
+        assert args[-2:] == ["--", ip]
 
     def test_v2c_custom_community(self):
         target = _make_target(community="secret")
@@ -2649,9 +2718,7 @@ class TestEdgeCases:
         )
         target = _make_target(
             capabilities=["custom"],
-            custom_oids=[
-                {"name": "val", "oid": "1.3.6.1.4.1.9.1.0", "type": "gauge"}
-            ],
+            custom_oids=[{"name": "val", "oid": "1.3.6.1.4.1.9.1.0", "type": "gauge"}],
         )
         with patch("fivenines_agent.snmp.log") as mock_log:
             result = SNMPCollector([target])._poll_device(target)
@@ -2741,6 +2808,51 @@ class TestEdgeCases:
             "not a number: temp='N/A'",
         }
 
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_poll_device_logs_a_failure_log_safe(self, mock_cmd):
+        """stderr is decoded text now: a CJK host name or a U+FFFD in it made
+        print() raise on a Windows service's cp1252 stdout, and the poll's
+        real error (a timeout) came back as "unknown"."""
+        mock_cmd.return_value = (
+            None,
+            {"type": "timeout", "message": "Timeout: No Response from sw-\u4e2d"},
+        )
+        target = _make_target()
+        with patch("fivenines_agent.snmp.log") as mock_log:
+            result = SNMPCollector([target])._poll_device(target)
+        assert result["error"]["type"] == "timeout"
+        logged = mock_log.call_args[0][0]
+        assert logged.isascii()
+        assert logged.endswith("Timeout: No Response from sw-\\u4e2d")
+
+    # Value: protects=a custom OID answered more times than asked is left out
+    # and named, never read from a line a multi-line string value injected;
+    # fails_when=the answer count check is dropped and the first line wins;
+    # why_new=the pop() dedupe made the first line authoritative; seam=none;
+    # no_claim=a real device returning a multi-line hinted string
+    @patch("fivenines_agent.snmp._run_snmp_cmd")
+    def test_custom_oids_answered_more_than_asked_is_left_out(self, mock_cmd):
+        mock_cmd.return_value = (
+            ".1.3.6.1.4.1.9.9.1.0 = STRING: uplink\n"
+            ".1.3.6.1.4.1.9.9.2.0 = Gauge32: 0\n"
+            ".1.3.6.1.4.1.9.9.2.0 = Gauge32: 95\n",
+            None,
+        )
+        metrics, error = SNMPCollector([_make_target()])._poll_custom_oids(
+            [],
+            [
+                {"name": "label", "oid": "1.3.6.1.4.1.9.9.1.0", "type": "string"},
+                {"name": "cpu", "oid": "1.3.6.1.4.1.9.9.2.0", "type": "gauge"},
+            ],
+        )
+        assert metrics == [
+            {"name": "label", "oid": "1.3.6.1.4.1.9.9.1.0", "value": "uplink"}
+        ]
+        assert error == {
+            "type": "parse_error",
+            "message": "answered more than once: cpu",
+        }
+
     # Value: protects=custom_metrics ships as [] (not absent) when every
     # custom value was left out; fails_when=the guard becomes `if custom:`
     # and the key vanishes beside the parse_error; why_new=only the None
@@ -2751,9 +2863,7 @@ class TestEdgeCases:
         mock_cmd.return_value = ('.1.3.6.1.4.1.9.1.0 = STRING: "N/A"\n', None)
         target = _make_target(
             capabilities=["custom"],
-            custom_oids=[
-                {"name": "temp", "oid": "1.3.6.1.4.1.9.1.0", "type": "gauge"}
-            ],
+            custom_oids=[{"name": "temp", "oid": "1.3.6.1.4.1.9.1.0", "type": "gauge"}],
         )
         with patch("fivenines_agent.snmp.log"):
             result = SNMPCollector([target])._poll_device(target)
