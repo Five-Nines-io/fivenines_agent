@@ -1939,7 +1939,22 @@ jobs:
           Start-Sleep -Seconds 20
           $stops = @(Get-WinEvent -FilterHashtable @{ LogName = "System"; ProviderName = "Service Control Manager"; Id = 7031, 7034; StartTime = $since } -ErrorAction SilentlyContinue |
                      Where-Object { @("Fivenines Monitoring Agent", "fivenines-agent") -contains $_.Properties[0].Value })
-          if ((Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'").ProcessId -ne $first -or $stops.Count -ne 0) {
+          # Every SCM event about the service since the upgrade began, passing
+          # or not: which service instance stopped, and when, is what tells an
+          # old v1.22.1 agent dying during the upgrade from the new one
+          # crashing after it (this check failed intermittently, unexplained).
+          Get-WinEvent -FilterHashtable @{ LogName = "System"; ProviderName = "Service Control Manager"; StartTime = $since } -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -match "Fivenines Monitoring Agent|fivenines-agent" } | Sort-Object TimeCreated |
+            ForEach-Object { Write-Host ("{0:HH:mm:ss.fff} {1} {2}" -f $_.TimeCreated, $_.Id, ($_.Message -replace "\s+", " ")) }
+          $svc = Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'"
+          if ($svc.ProcessId -ne $first -or $stops.Count -ne 0) {
+            Write-Host "service: State=$($svc.State) WinSW PID $first -> $($svc.ProcessId); unexpected stops: $($stops.Count)"
+            # WinSW's own log and the agent's captured stdout/stderr: v1.22.1's
+            # lines first, then the upgraded agent's (the files are appended).
+            Get-ChildItem "$env:ProgramData\fivenines_agent\logs" -File -ErrorAction SilentlyContinue | ForEach-Object {
+              Write-Host "===== $($_.Name) (last 60 lines)"
+              Get-Content $_.FullName -Tail 60 | ForEach-Object { Write-Host $_ }
+            }
             throw "the upgraded agent did not keep running on one process: it crashed and the SCM restarted it?"
           }
           Start-Process msiexec -ArgumentList "/x fivenines-agent.msi /qn /l*v uninstall-upgrade.log" -Wait | Out-Null
