@@ -1338,12 +1338,28 @@ jobs:
             -d "WinSwConfigSource=..\winsw\fivenines-agent.xml" `
             -arch x64 `
             -o fivenines-agent.msi
+          if ($LASTEXITCODE -ne 0) { throw "wix build fivenines-agent.msi failed: $LASTEXITCODE" }
+          # The same package one patch version above (#293): the E2E upgrades
+          # this release to it, the path every upgrade takes once both
+          # packages run without the Restart Manager.
+          $v = [version]"${{ steps.version.outputs.version }}"
+          wix build .\Product.wxs `
+            -ext WixToolset.Util.wixext `
+            -d ("Version={0}.{1}.{2}" -f $v.Major, $v.Minor, ($v.Build + 1)) `
+            -d "AgentBinarySource=..\..\dist\windows\fivenines-agent-windows-amd64" `
+            -d "WinSwSource=..\..\dist\windows\WinSW.NET4.exe" `
+            -d "WinSwConfigSource=..\winsw\fivenines-agent.xml" `
+            -arch x64 `
+            -o fivenines-agent-next.msi
+          if ($LASTEXITCODE -ne 0) { throw "wix build fivenines-agent-next.msi failed: $LASTEXITCODE" }
 
       - name: Upload MSI
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-ci-msi
-          path: windows/installer/fivenines-agent.msi
+          path: |
+            windows/installer/fivenines-agent.msi
+            windows/installer/fivenines-agent-next.msi
           retention-days: 30
 
   smoke-msi:
@@ -1775,6 +1791,45 @@ jobs:
           }
           Write-Host "No secret in any log."
 
+      # A repair (Programs and Features > Repair, msiexec /f) stops the agent
+      # through the package's ServiceControl, and without the Restart Manager
+      # (#293) only StartAgentService, run on every install but an uninstall,
+      # starts it again. The repair must leave the account, the delayed start
+      # and the restart on failure as the install set them.
+      - name: Repair restarts the agent with its account and start configuration
+        shell: powershell
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = "Stop"
+          function Get-ServiceState {
+            $key = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\fivenines-agent"
+            return [pscustomobject]@{
+              Account = (Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'").StartName
+              Start = [int]$key.Start; Delayed = [int]$key.DelayedAutostart
+              Failure = [BitConverter]::ToString([byte[]]$key.FailureActions)
+            }
+          }
+          $before = Get-ServiceState
+          Write-Host "before the repair: $before"
+          $since = Get-Date
+          $p = Start-Process msiexec -ArgumentList "/fa fivenines-agent.msi /qn /l*v repair.log" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "msiexec /fa failed: $($p.ExitCode)" }
+          for ($i = 0; $i -lt 30 -and (Get-Service -Name "fivenines-agent").Status -ne "Running"; $i++) { Start-Sleep -Seconds 2 }
+          $after = Get-ServiceState
+          Write-Host "after the repair: $after"
+          if ((Get-Service -Name "fivenines-agent").Status -ne "Running") { throw "the repair left the agent stopped" }
+          if ($after.Account -ne $before.Account) { throw "the repair moved the service from $($before.Account) to $($after.Account)" }
+          if ($after.Start -ne $before.Start -or $after.Delayed -ne $before.Delayed) { throw "the repair changed the service's start type" }
+          if ($after.Failure -ne $before.Failure) { throw "the repair changed the service's failure actions" }
+          $first = (Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'").ProcessId
+          Start-Sleep -Seconds 20
+          $stops = @(Get-WinEvent -FilterHashtable @{ LogName = "System"; ProviderName = "Service Control Manager"; Id = 7031, 7034; StartTime = $since } -ErrorAction SilentlyContinue |
+                     Where-Object { @("Fivenines Monitoring Agent", "fivenines-agent") -contains $_.Properties[0].Value })
+          if ((Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'").ProcessId -ne $first -or $stops.Count -ne 0) {
+            throw "the repaired agent did not keep running on one process"
+          }
+          Write-Host "Repaired: the agent runs as $($after.Account) on one process, its start type and failure actions unchanged."
+
       - name: Uninstall MSI silently
         shell: pwsh
         run: |
@@ -1985,7 +2040,7 @@ jobs:
           }
           $svc = Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'"
           if ($svc.ProcessId -ne $first -or ($stops.Count -ne 0 -and -not $bootstrapDeath)) {
-            Write-Host "service: State=$($svc.State) WinSW PID $first -> $($svc.ProcessId); unexpected stops: $($stops.Count)"
+            Write-Host "service: State=$($svc.State) WinSW PID $first -> $($svc.ProcessId); unexpected stops: $($stops.Count)$(if ($bootstrapDeath) { ' (that one tolerated, #293)' })"
             # WinSW's own log and the agent's captured stdout/stderr: v1.22.1's
             # lines first, then the upgraded agent's (the files are appended).
             Get-ChildItem "$env:ProgramData\fivenines_agent\logs" -File -ErrorAction SilentlyContinue | ForEach-Object {
@@ -1995,6 +2050,51 @@ jobs:
             throw "the upgraded agent did not keep running on one process: it crashed and the SCM restarted it?"
           }
           Start-Process msiexec -ArgumentList "/x fivenines-agent.msi /qn /l*v uninstall-upgrade.log" -Wait | Out-Null
+
+      # The upgrade every install takes once it runs this release (#293): both
+      # the upgrading package and the one it uninstalls run without the
+      # Restart Manager, so no session opens, nothing refuses the new agent's
+      # reads, and its first start must survive with no tolerance at all.
+      - name: Upgrade from this release opens no Restart Manager session
+        shell: powershell
+        timeout-minutes: 10
+        run: |
+          $ErrorActionPreference = "Stop"
+          function Install-Msi($Msi, $Log) {
+            $p = Start-Process msiexec -ArgumentList "/i $Msi TOKEN=ci-steady-$(Get-Random) /qn /l*v $Log" -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "msiexec /i $Msi ($Log) failed: $($p.ExitCode)" }
+          }
+          function Wait-Running($Label) {
+            for ($i = 0; $i -lt 30 -and (Get-Service -Name "fivenines-agent").Status -ne "Running"; $i++) { Start-Sleep -Seconds 2 }
+            if ((Get-Service -Name "fivenines-agent").Status -ne "Running") { throw "the service did not reach Running after $Label" }
+          }
+          Install-Msi fivenines-agent.msi steady-old.log
+          Wait-Running "this release's install"
+          $old = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" | Where-Object { $_.DisplayName -eq "Fivenines Monitoring Agent" }).DisplayVersion
+          $since = Get-Date
+          Install-Msi fivenines-agent-next.msi steady.log
+          $new = @(Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" | Where-Object { $_.DisplayName -eq "Fivenines Monitoring Agent" })
+          if ($new.Count -ne 1 -or $new[0].DisplayVersion -eq $old) { throw "expected the upgrade to replace $old, installed: $(($new | ForEach-Object { $_.DisplayVersion }) -join ', ')" }
+          $log = Get-Content steady.log
+          $disabled = @($log | Select-String -SimpleMatch "RESTART MANAGER: Disabled by MSIRESTARTMANAGERCONTROL property").Count
+          $sessions = @($log | Select-String -SimpleMatch "RESTART MANAGER: Session opened").Count
+          Write-Host "$old -> $($new[0].DisplayVersion): Restart Manager disabled $disabled time(s), $sessions session(s) opened"
+          # Twice: the upgrade's own session and the uninstall it runs.
+          if ($disabled -lt 2 -or $sessions -ne 0) { throw "the upgrade from this release still used the Restart Manager" }
+          Wait-Running "the upgrade"
+          $first = (Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'").ProcessId
+          Start-Sleep -Seconds 20
+          $stops = @(Get-WinEvent -FilterHashtable @{ LogName = "System"; ProviderName = "Service Control Manager"; Id = 7031, 7034; StartTime = $since } -ErrorAction SilentlyContinue |
+                     Where-Object { @("Fivenines Monitoring Agent", "fivenines-agent") -contains $_.Properties[0].Value })
+          if ((Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'").ProcessId -ne $first -or $stops.Count -ne 0) {
+            Get-ChildItem "$env:ProgramData\fivenines_agent\logs" -File -ErrorAction SilentlyContinue | ForEach-Object {
+              Write-Host "===== $($_.Name) (last 60 lines)"
+              Get-Content $_.FullName -Tail 60 | ForEach-Object { Write-Host $_ }
+            }
+            throw "the agent upgraded from this release did not keep running on one process"
+          }
+          Write-Host "Upgraded from this release with no Restart Manager session and no stop."
+          Start-Process msiexec -ArgumentList "/x fivenines-agent-next.msi /qn /l*v uninstall-steady.log" -Wait | Out-Null
 
       - name: Cleanup service account
         if: always()
@@ -2016,6 +2116,10 @@ jobs:
             upgrade-old.log
             upgrade.log
             uninstall-upgrade.log
+            repair.log
+            steady-old.log
+            steady.log
+            uninstall-steady.log
           retention-days: 7
           if-no-files-found: ignore
 

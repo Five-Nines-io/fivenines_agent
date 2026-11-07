@@ -67,7 +67,8 @@
          and the SCM restarted it: on 4 of the 13 Windows E2E runs of
          2026-11-06. The service needs none of the Restart Manager:
          ServiceControl stops it before any file is replaced and
-         StartAgentService starts it again. Disabled, Windows Installer falls
+         StartAgentService starts it again, on a repair too (without the
+         Restart Manager, nothing else would). Disabled, Windows Installer falls
          back to its FilesInUse handling, which a silent install never shows
          and which lists only windowed applications. Not DisableShutdown: it
          still ends a session (2 refusals in 9 upgrades). A release up to
@@ -75,8 +76,9 @@
          this package cannot turn off: it still refused a read in 7 upgrades
          of 27 (no agent died in them), so an upgrade from those releases can
          still lose a first start, which the SCM restarts. An upgrade from
-         this release on should open none, both packages carrying the
-         property (not measurable before it ships). -->
+         this release on opens none, both packages carrying the property: the
+         E2E upgrades this package to itself one patch version above, with
+         no Restart Manager session and no stop allowed. -->
     <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
 
     <!-- Enrollment token: Hidden="yes" keeps it out of installer logs;
@@ -389,7 +391,11 @@
          (fire-and-forget), so a crash-looping agent cannot hang the MSI.
          Return="ignore" so a transient start failure does not roll back a
          successful install - the operator can Start-Service manually and
-         see WinSW logs. -->
+         see WinSW logs. It runs on every install but an uninstall: a repair
+         stops the service through ServiceControl, and with the Restart
+         Manager disabled (#293) nothing else starts it again; on a
+         maintenance run that stopped nothing, starting a running service
+         fails and is ignored. -->
     <SetProperty Id="StartAgentService"
                  Value="&quot;sc.exe&quot; start fivenines-agent"
                  Before="StartAgentService"
@@ -416,13 +422,15 @@
              5. StartAgentService: now that the service account, TOKEN, and
                 WMI delegation are all in place, kick the service. Bootstraps
                 (fivenines_setup.ps1, fivenines_update.ps1) still call
-                Start-Service afterwards for idempotency. -->
+                Start-Service afterwards for idempotency. The only one also
+                run on a repair, which ServiceControl stops the service for;
+                the other four run on a first install or an upgrade only. -->
       <Custom Action="CreateServiceAccount" After="InstallServices" Condition="NOT Installed" />
       <Custom Action="WriteTokenAcl" After="CreateServiceAccount" Condition="NOT Installed" />
       <Custom Action="DelegateWmi" After="WriteTokenAcl" Condition="NOT Installed" />
       <Custom Action="ConfigureServiceStart" After="DelegateWmi" Condition="NOT Installed" />
       <Custom Action="ConfigureServiceRecovery" After="ConfigureServiceStart" Condition="NOT Installed" />
-      <Custom Action="StartAgentService" After="ConfigureServiceRecovery" Condition="NOT Installed" />
+      <Custom Action="StartAgentService" After="ConfigureServiceRecovery" Condition="NOT REMOVE~=&quot;ALL&quot;" />
     </InstallExecuteSequence>
 
     <Feature Id="MainFeature" Title="Fivenines Agent" Level="1">

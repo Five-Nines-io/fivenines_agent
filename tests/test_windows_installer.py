@@ -1186,29 +1186,94 @@ def test_msi_runs_without_the_restart_manager():
     assert re.findall(r"<Property Id=\"MSIRESTARTMANAGERCONTROL\"[^>]*>", wxs) == [
         '<Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />'
     ]
-    assert (
-        "RESTART MANAGER: Disabled by MSIRESTARTMANAGERCONTROL property"
-        in _strip_comments(_read(WINDOWS_WORKFLOW))
+    assert re.search(
+        r"if \(-not \(Get-Content upgrade\.log \| Select-String -SimpleMatch -Quiet "
+        r'"RESTART MANAGER: Disabled by MSIRESTARTMANAGERCONTROL property"\)\) \{\n'
+        r"\s*throw ",
+        _upgrade_e2e_step(),
     )
 
 
 # Value: protects=the release gate's upgrade check; fails_when=its tolerance for #293's residual widens: more than one stop, a death other than PyInstaller's bootstrap refused base_library.zip (another file, a second traceback, agent code), or no longer requiring the restarted service to keep one process for 20s; why_new=the tolerance lives in a workflow step only a Windows runner executes, and a wider one would hide an upgraded agent that crashes; seam=none; no_claim=that the patterns match a real trace, checked against the three traces CI runs captured
 def test_upgrade_e2e_tolerates_only_the_old_packages_restart_manager_race():
-    workflow = _read(WINDOWS_WORKFLOW)
-    start = workflow.index("- name: Upgrade from v1.22.1 sets the delayed start")
-    end = workflow.index("- name: Cleanup service account", start)
-    step = _strip_comments(workflow[start:end])
+    step = _upgrade_e2e_step()
+    assert "$bootstrapDeath = $false\n" in step
     assert "if ($stops.Count -eq 1 -and (Test-Path -LiteralPath $errLog))" in step
-    for pattern in (
-        r"""Traceback \(most recent call last\)").Count -eq 1""",
-        r"""\\\\_internal\\\\base_library\.zip'\r?$").Count -eq 1""",
-        r"""Failed to execute script 'pyi[^']*' due to unhandled exception").Count -eq 1""",
-    ):
-        assert pattern in step, pattern
+    # All three marks, each exactly once: joined by -and, never -or.
+    marks = re.search(
+        r"\$bootstrapDeath = \((.*)\) -and\n\s*\((.*)\) -and\n\s*\((.*)\)\n", step
+    )
+    assert marks, "the tolerance is not a conjunction of three counts"
+    assert [mark.split(", ", 1)[1] for mark in marks.groups()] == [
+        r""""Traceback \(most recent call last\)").Count -eq 1""",
+        r""""(?m)^PermissionError: \[Errno 13\] Permission denied: '[^'\r\n]*\\\\_internal\\\\base_library\.zip'\r?$").Count -eq 1""",
+        r""""\[PYI-\d+:ERROR\] Failed to execute script 'pyi[^']*' due to unhandled exception").Count -eq 1""",
+    ]
+    # The restarted service must still keep one process for 20s.
+    assert re.search(
+        r"\$first = \(Get-CimInstance [^\n]*\n\s*Start-Sleep -Seconds 20\n\s*\$stops = ",
+        step,
+    )
     assert (
         "if ($svc.ProcessId -ne $first -or ($stops.Count -ne 0 -and -not $bootstrapDeath))"
         in step
     )
+
+
+# Value: protects=the agent running again after a repair (Programs and Features > Repair, msiexec /f); fails_when=StartAgentService goes back to NOT Installed (ServiceControl stops the service on a repair and, the Restart Manager disabled, nothing starts it until the next boot), runs on an uninstall, or the E2E stops repairing and checking the account, start type and a running agent; why_new=no run repaired the MSI before; seam=none; no_claim=that a repair keeps the account and start type, which only the Windows E2E step measures
+def test_msi_starts_the_agent_again_after_a_repair():
+    wxs = _xml_without_comments(PRODUCT_WXS)
+    assert re.findall(r'<Custom Action="StartAgentService"[^>]*/>', wxs) == [
+        '<Custom Action="StartAgentService" After="ConfigureServiceRecovery" '
+        'Condition="NOT REMOVE~=&quot;ALL&quot;" />'
+    ]
+    step = _workflow_step(
+        "Repair restarts the agent with its account and start configuration"
+    )
+    assert '"/fa fivenines-agent.msi /qn /l*v repair.log"' in step
+    for check in (
+        '-ne "Running") { throw "the repair left the agent stopped" }',
+        "if ($after.Account -ne $before.Account) {",
+        "if ($after.Start -ne $before.Start -or $after.Delayed -ne $before.Delayed) {",
+        "if ($after.Failure -ne $before.Failure) {",
+        "-ne $first -or $stops.Count -ne 0) {",
+    ):
+        assert check in step, check
+
+
+# Value: protects=the upgrade every install takes from this release on; fails_when=the next-version MSI stops being built one patch version above, or the E2E step that upgrades to it starts tolerating a Restart Manager session or a stop; why_new=the v1.22.1 upgrade step tolerates the old package's residual, so nothing else checks the steady state with no tolerance; seam=none; no_claim=that Windows Installer opens no session there, which the E2E reads in steady.log
+def test_upgrade_from_this_release_is_checked_with_no_tolerance():
+    workflow = _strip_comments(_read(WINDOWS_WORKFLOW))
+    assert (
+        '-d ("Version={0}.{1}.{2}" -f $v.Major, $v.Minor, ($v.Build + 1))' in workflow
+    )
+    assert "-o fivenines-agent-next.msi" in workflow
+    assert "windows/installer/fivenines-agent-next.msi" in workflow
+    step = _workflow_step("Upgrade from this release opens no Restart Manager session")
+    assert "Install-Msi fivenines-agent-next.msi steady.log" in step
+    assert "if ($disabled -lt 2 -or $sessions -ne 0) { throw " in step
+    assert re.search(
+        r"\$first = \(Get-CimInstance [^\n]*\n\s*Start-Sleep -Seconds 20\n\s*\$stops = ",
+        step,
+    )
+    assert "-ne $first -or $stops.Count -ne 0) {" in step
+    assert "bootstrapDeath" not in step
+
+
+def _workflow_step(name):
+    """windows.yml's step `name`, up to the next step, without its comments."""
+    workflow = _read(WINDOWS_WORKFLOW)
+    start = workflow.index("- name: " + name + "\n")
+    end = workflow.index("\n      - name: ", start)
+    return _strip_comments(workflow[start:end])
+
+
+def _upgrade_e2e_step():
+    """windows.yml's upgrade-from-v1.22.1 step, without its comments."""
+    workflow = _read(WINDOWS_WORKFLOW)
+    start = workflow.index("- name: Upgrade from v1.22.1 sets the delayed start")
+    end = workflow.index("- name: Cleanup service account", start)
+    return _strip_comments(workflow[start:end])
 
 
 def _xml_without_comments(path):
@@ -1234,13 +1299,15 @@ def _assert_checked_deferred_before_start(wxs, action):
         'Return="check"',
     ):
         assert attribute in custom.group(1), f"{action} lacks {attribute}"
-    after = dict(
-        re.findall(
-            r'<Custom Action="([^"]+)" After="([^"]+)" Condition="NOT Installed" />',
-            wxs,
+    scheduled = {
+        name: (previous, condition)
+        for name, previous, condition in re.findall(
+            r'<Custom Action="([^"]+)" After="([^"]+)" Condition="([^"]*)" />', wxs
         )
-    )
-    assert action in after, f"{action} is not scheduled on NOT Installed"
+    }
+    assert action in scheduled, f"{action} is not scheduled"
+    assert scheduled[action][1] == "NOT Installed", f"{action} is not on NOT Installed"
+    after = {name: previous for name, (previous, _) in scheduled.items()}
     step, chain = "StartAgentService", []
     while step in after and step not in chain:
         chain.append(step)

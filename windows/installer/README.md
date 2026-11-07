@@ -23,7 +23,10 @@ This directory builds the Windows MSI installer for the fivenines agent.
   still opens its own session while the upgrade uninstalls it, which no newer
   package can turn off, so an upgrade from one of those can still lose the
   first start (the SCM restarts it); the upgrade E2E tolerates exactly that,
-  once.
+  once. An upgrade from this release on opens no session at all, which the E2E
+  checks with no tolerance by upgrading the MSI to itself built one patch
+  version above. A repair stops the service through `ServiceControl` too, so
+  `StartAgentService` runs on every install but an uninstall.
 
 ## Files
 
