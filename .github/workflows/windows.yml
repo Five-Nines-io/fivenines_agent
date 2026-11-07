@@ -36,7 +36,7 @@ on:
 # CALLER, and sharing build-release.yml's group would make the call wait for
 # its own caller.
 concurrency:
-  group: windows-build-${{ github.ref }}
+  group: windows-build-${{ github.ref }}-${{ github.run_id }}
   cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
 
 # Nothing here writes to the repository, whatever the default token allows.
@@ -60,6 +60,7 @@ env:
 
 jobs:
   test-windows:
+    if: false
     name: Tests (windows-latest)
     runs-on: windows-latest
     steps:
@@ -1245,7 +1246,7 @@ jobs:
 
   build-windows-binary:
     name: Build frozen agent (PyInstaller)
-    needs: test-windows
+    if: false
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1281,7 +1282,7 @@ jobs:
 
   build-msi:
     name: Build MSI installer
-    needs: build-windows-binary
+    if: false
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1348,7 +1349,9 @@ jobs:
 
   smoke-msi:
     name: E2E smoke (install -> service -> report -> uninstall)
-    needs: build-msi
+    permissions:
+      contents: read
+      actions: read
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -1360,6 +1363,8 @@ jobs:
         with:
           name: windows-ci-msi
           path: .
+          run-id: 42298028387
+          github-token: ${{ github.token }}
 
       # A non-English Windows, simulated: its built-in group names are
       # translated (German here), which is what failed the install with 1603
@@ -1878,7 +1883,7 @@ jobs:
       # service Automatic (Delayed Start), restarted after a failure.
       - name: Upgrade from v1.22.1 sets the delayed start and the restart on failure
         shell: powershell
-        timeout-minutes: 15
+        timeout-minutes: 40
         env:
           OLD_MSI_URL: https://github.com/Five-Nines-io/fivenines_agent/releases/download/v1.22.1/fivenines-agent-windows-amd64.msi
           OLD_MSI_SHA256: 537e913d5f5149ec1d01a52c573b81a0fde97626c627861fda3772fbe62bdf36
@@ -1911,39 +1916,45 @@ jobs:
             if ((Get-Service -Name "fivenines-agent").Status -ne "Running") { throw "the service did not reach Running after $Label" }
           }
 
-          Install-Msi old.msi upgrade-old.log
-          Wait-Running "v1.22.1's install"
-          $before = Get-StartType
-          Write-Host "v1.22.1: Start=$($before.Start) DelayedAutostart=$($before.Delayed) FailureActions: $($before.Failure)"
-          # Without this precondition the step would pass whatever the upgrade did.
-          if ($before.Start -ne 2 -or $before.Delayed -ne 0 -or $before.Failure -ne "none") {
-            throw "v1.22.1 was expected to register the service plain Automatic, with no failure actions"
+          . .\ci\diag-293\probe2.ps1
+          $zip = "C:\Program Files\fivenines-agent\_internal\base_library.zip"
+          Show-RunnerHelpers
+          $failed = @()
+          for ($n = 0; $n -le 8; $n++) {
+            if ($n -gt 0) {
+              Start-Process msiexec -ArgumentList "/x fivenines-agent.msi /qn /l*v uninstall-upgrade-$n.log" -Wait | Out-Null
+            }
+            Install-Msi old.msi "upgrade-old-$n.log"
+            Wait-Running "v1.22.1's install"
+            if ($n -eq 0) {
+              $before = Get-StartType
+              Write-Host "v1.22.1: Start=$($before.Start) DelayedAutostart=$($before.Delayed) FailureActions: $($before.Failure)"
+              if ($before.Start -ne 2 -or $before.Delayed -ne 0 -or $before.Failure -ne "none") {
+                throw "v1.22.1 was expected to register the service plain Automatic, with no failure actions"
+              }
+            }
+            $sizes = Get-LogSizes
+            $since = Get-Date
+            [LockProbe2]::Start($zip)
+            Install-Msi fivenines-agent.msi "upgrade-$n.log"
+            Wait-Running "the upgrade"
+            $first = (Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'").ProcessId
+            Start-Sleep -Seconds 20
+            $probe = [LockProbe2]::Stop()
+            $stops = @(Get-WinEvent -FilterHashtable @{ LogName = "System"; ProviderName = "Service Control Manager"; Id = 7031, 7034; StartTime = $since } -ErrorAction SilentlyContinue |
+                       Where-Object { @("Fivenines Monitoring Agent", "fivenines-agent") -contains $_.Properties[0].Value })
+            $now = (Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'").ProcessId
+            $bad = $now -ne $first -or $stops.Count -ne 0
+            if ($bad) { $failed += $n }
+            Write-Host "::group::upgrade ${n}: unexpected stops $($stops.Count), WinSW PID $first -> $now$(if ($bad) { ' FAILED' })"
+            Show-Iteration "upgrade $n" $since $probe $sizes "upgrade-$n.log"
+            Write-Host "::endgroup::"
+            if ($bad) { Write-Host "FAILED upgrade $n (expanded above)" }
           }
-
-          $since = Get-Date
-          Install-Msi fivenines-agent.msi upgrade.log
-          $products = @(Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
-                        Where-Object { $_.DisplayName -eq "Fivenines Monitoring Agent" })
-          if ($products.Count -ne 1 -or $products[0].DisplayVersion -eq "1.22.1") {
-            throw ("expected the upgrade to replace v1.22.1, installed: {0}" -f (($products | ForEach-Object { $_.DisplayVersion }) -join ", "))
-          }
-          $after = Get-StartType
-          Write-Host "after the upgrade to $($products[0].DisplayVersion): Start=$($after.Start) DelayedAutostart=$($after.Delayed) FailureActions: $($after.Failure)"
-          if ($after.Start -ne 2 -or $after.Delayed -ne 1) { throw "the upgrade left the service without the delayed start" }
-          if ($after.Failure -ne "reset=3600 1/10000 1/30000 1/60000") { throw "the upgrade left the service without its restart on failure" }
-          Wait-Running "the upgrade"
-          # As after the fresh install: Running between SCM restarts is no
-          # proof, so the upgraded agent must keep one process for 20s, with
-          # no unexpected termination of the service since the upgrade began.
-          $first = (Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'").ProcessId
-          Start-Sleep -Seconds 20
-          $stops = @(Get-WinEvent -FilterHashtable @{ LogName = "System"; ProviderName = "Service Control Manager"; Id = 7031, 7034; StartTime = $since } -ErrorAction SilentlyContinue |
-                     Where-Object { @("Fivenines Monitoring Agent", "fivenines-agent") -contains $_.Properties[0].Value })
-          if ((Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'").ProcessId -ne $first -or $stops.Count -ne 0) {
-            throw "the upgraded agent did not keep running on one process: it crashed and the SCM restarted it?"
-          }
+          Show-RunnerHelpers
+          Write-Host "failed upgrades: $($failed -join ', ') (of 9)"
           Start-Process msiexec -ArgumentList "/x fivenines-agent.msi /qn /l*v uninstall-upgrade.log" -Wait | Out-Null
-
+          if ($failed.Count -ne 0) { throw "reproduced on upgrades $($failed -join ', ')" }
       - name: Cleanup service account
         if: always()
         shell: pwsh
@@ -1961,9 +1972,9 @@ jobs:
             uninstall-rotate.log
             reinstall.log
             uninstall2.log
-            upgrade-old.log
-            upgrade.log
-            uninstall-upgrade.log
+            upgrade-old-*.log
+            upgrade-*.log
+            uninstall-upgrade*.log
           retention-days: 7
           if-no-files-found: ignore
 
@@ -1977,7 +1988,7 @@ jobs:
   # since the last release.
   installer-changed:
     name: Installer changed?
-    if: github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')
+    if: false
     runs-on: ubuntu-latest
     outputs:
       changed: ${{ steps.diff.outputs.changed }}
@@ -2030,7 +2041,7 @@ jobs:
   smoke-msi-domain-controller:
     name: E2E on a domain controller (Server 2019 ${{ matrix.lang }})
     needs: [build-msi, installer-changed]
-    if: >-
+    if: false && >-
       ${{ !cancelled() && needs.build-msi.result == 'success' &&
       ((github.event_name == 'workflow_dispatch' && inputs.domain_controller) ||
       (github.event_name == 'push' && needs.installer-changed.outputs.changed == 'true')) }}
