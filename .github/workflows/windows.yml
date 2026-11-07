@@ -1812,6 +1812,15 @@ jobs:
           $before = Get-ServiceState
           Write-Host "before the repair: $before"
           $since = Get-Date
+          # A maintenance run first (fivenines_update.ps1 on an up-to-date host
+          # runs one): it stops nothing, so StartAgentService's sc start fails
+          # on the running agent, and only its Return="ignore" keeps the run
+          # successful. The agent must be the same process afterwards.
+          $running = (Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'").ProcessId
+          $p = Start-Process msiexec -ArgumentList "/i fivenines-agent.msi /qn /l*v maintenance.log" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "the maintenance run failed: $($p.ExitCode)" }
+          if ((Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'").ProcessId -ne $running) { throw "the maintenance run restarted the agent" }
+          if ("$(Get-ServiceState)" -ne "$before") { throw "the maintenance run changed the service: $(Get-ServiceState)" }
           $p = Start-Process msiexec -ArgumentList "/fa fivenines-agent.msi /qn /l*v repair.log" -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "msiexec /fa failed: $($p.ExitCode)" }
           for ($i = 0; $i -lt 30 -and (Get-Service -Name "fivenines-agent").Status -ne "Running"; $i++) { Start-Sleep -Seconds 2 }
@@ -1822,6 +1831,9 @@ jobs:
           if ($after.Start -ne $before.Start -or $after.Delayed -ne $before.Delayed) { throw "the repair changed the service's start type" }
           if ($after.Failure -ne $before.Failure) { throw "the repair changed the service's failure actions" }
           $first = (Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'").ProcessId
+          # Without this precondition the step would pass without the repair
+          # ever reaching StartAgentService.
+          if ($first -eq $running) { throw "the repair did not stop the agent: nothing exercised StartAgentService" }
           Start-Sleep -Seconds 20
           $stops = @(Get-WinEvent -FilterHashtable @{ LogName = "System"; ProviderName = "Service Control Manager"; Id = 7031, 7034; StartTime = $since } -ErrorAction SilentlyContinue |
                      Where-Object { @("Fivenines Monitoring Agent", "fivenines-agent") -contains $_.Properties[0].Value })
@@ -2116,6 +2128,7 @@ jobs:
             upgrade-old.log
             upgrade.log
             uninstall-upgrade.log
+            maintenance.log
             repair.log
             steady-old.log
             steady.log

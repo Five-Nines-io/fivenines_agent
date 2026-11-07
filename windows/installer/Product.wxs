@@ -424,7 +424,7 @@
                 (fivenines_setup.ps1, fivenines_update.ps1) still call
                 Start-Service afterwards for idempotency. The only one also
                 run on a repair, which ServiceControl stops the service for;
-                the other four run on a first install or an upgrade only. -->
+                the other five run on a first install or an upgrade only. -->
       <Custom Action="CreateServiceAccount" After="InstallServices" Condition="NOT Installed" />
       <Custom Action="WriteTokenAcl" After="CreateServiceAccount" Condition="NOT Installed" />
       <Custom Action="DelegateWmi" After="WriteTokenAcl" Condition="NOT Installed" />

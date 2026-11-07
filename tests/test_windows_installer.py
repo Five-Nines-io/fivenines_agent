@@ -1223,15 +1223,35 @@ def test_upgrade_e2e_tolerates_only_the_old_packages_restart_manager_race():
 # Value: protects=the agent running again after a repair (Programs and Features > Repair, msiexec /f); fails_when=StartAgentService goes back to NOT Installed (ServiceControl stops the service on a repair and, the Restart Manager disabled, nothing starts it until the next boot), runs on an uninstall, or the E2E stops repairing and checking the account, start type and a running agent; why_new=no run repaired the MSI before; seam=none; no_claim=that a repair keeps the account and start type, which only the Windows E2E step measures
 def test_msi_starts_the_agent_again_after_a_repair():
     wxs = _xml_without_comments(PRODUCT_WXS)
-    assert re.findall(r'<Custom Action="StartAgentService"[^>]*/>', wxs) == [
-        '<Custom Action="StartAgentService" After="ConfigureServiceRecovery" '
-        'Condition="NOT REMOVE~=&quot;ALL&quot;" />'
-    ]
+    # Only StartAgentService runs on a repair or a maintenance run: the
+    # account step would rotate the password, WriteTokenAcl would get an empty
+    # TOKEN under Return="check", and the start configuration is already set.
+    conditions = dict(
+        re.findall(
+            r'<Custom Action="([^"]+)" After="[^"]+" Condition="([^"]*)" />', wxs
+        )
+    )
+    assert conditions == {
+        "CreateServiceAccount": "NOT Installed",
+        "WriteTokenAcl": "NOT Installed",
+        "DelegateWmi": "NOT Installed",
+        "ConfigureServiceStart": "NOT Installed",
+        "ConfigureServiceRecovery": "NOT Installed",
+        "StartAgentService": "NOT REMOVE~=&quot;ALL&quot;",
+    }
+    # On a maintenance run that stopped nothing, sc start fails (1056) on the
+    # running agent: only Return="ignore" keeps that run successful.
+    start = re.search(r'<CustomAction Id="StartAgentService"([^>]*)/>', wxs)
+    assert start and 'Return="ignore"' in start.group(1)
     step = _workflow_step(
         "Repair restarts the agent with its account and start configuration"
     )
+    assert '"/i fivenines-agent.msi /qn /l*v maintenance.log"' in step
     assert '"/fa fivenines-agent.msi /qn /l*v repair.log"' in step
     for check in (
+        '-ne $running) { throw "the maintenance run restarted the agent" }',
+        'if ("$(Get-ServiceState)" -ne "$before") { throw "the maintenance run changed',
+        'if ($first -eq $running) { throw "the repair did not stop the agent',
         '-ne "Running") { throw "the repair left the agent stopped" }',
         "if ($after.Account -ne $before.Account) {",
         "if ($after.Start -ne $before.Start -or $after.Delayed -ne $before.Delayed) {",
@@ -1270,10 +1290,9 @@ def _workflow_step(name):
 
 def _upgrade_e2e_step():
     """windows.yml's upgrade-from-v1.22.1 step, without its comments."""
-    workflow = _read(WINDOWS_WORKFLOW)
-    start = workflow.index("- name: Upgrade from v1.22.1 sets the delayed start")
-    end = workflow.index("- name: Cleanup service account", start)
-    return _strip_comments(workflow[start:end])
+    return _workflow_step(
+        "Upgrade from v1.22.1 sets the delayed start and the restart on failure"
+    )
 
 
 def _xml_without_comments(path):
