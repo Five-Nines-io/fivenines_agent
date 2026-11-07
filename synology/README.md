@@ -27,6 +27,7 @@ Key differences from the standard build:
 - libvirt-python is excluded via Poetry dependency groups (not available on NAS hardware)
 - systemd-watchdog is excluded (DSM does not use systemd)
 - proxmoxer is excluded (not applicable on NAS hardware)
+- pynvml is excluded, so the NAS build has no NVIDIA GPU metrics
 - libtirpc is not bundled (only needed for libvirt)
 
 ### 2. Assemble the SPK
@@ -69,8 +70,8 @@ synology/
 
 - The agent runs as `sc-fivenines-agent` (a custom low-privilege internal user).
   Because it does not run as `root`, some deep system telemetry (e.g., SMART data, hardware sensors) may be inaccessible depending on your NAS model's file permissions. This is gracefully handled and ignored.
-- QEMU/libvirt and Proxmox monitoring are gracefully disabled (the libraries
-  are not available on NAS hardware).
+- QEMU/libvirt, Proxmox and NVIDIA GPU monitoring are gracefully disabled (the
+  libraries are not bundled in the NAS build).
 - synopkg is supported for package security scanning.
 - Log file: `/var/packages/fivenines-agent/var/agent.log` (rotated via logrotate: 3 files, 10MB max)
 - PID file: `/var/packages/fivenines-agent/var/agent.pid`
