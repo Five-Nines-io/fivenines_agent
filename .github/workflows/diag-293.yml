@@ -1,0 +1,60 @@
+name: Diag 293 (throwaway)
+
+# Issue #293 diagnostic, on a throwaway branch only: repeats the v1.22.1 ->
+# current MSI upgrade with the MSI of run 42298028387 (the one whose upgrade
+# step failed), and samples what holds _internal\base_library.zip.
+
+on:
+  push:
+    branches:
+      - 'diag/windows-upgrade-293'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  upgrade:
+    name: Upgrade loop (${{ matrix.variant }})
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [default, rm-disabled, default-noprobe]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the MSI of run 42298028387
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-ci-msi
+          path: .
+          run-id: 42298028387
+          github-token: ${{ github.token }}
+
+      - name: Download v1.22.1's MSI
+        shell: powershell
+        env:
+          OLD_MSI_URL: https://github.com/Five-Nines-io/fivenines_agent/releases/download/v1.22.1/fivenines-agent-windows-amd64.msi
+          OLD_MSI_SHA256: 537e913d5f5149ec1d01a52c573b81a0fde97626c627861fda3772fbe62bdf36
+        run: |
+          $ErrorActionPreference = "Stop"
+          & curl.exe -fsSL --retry 3 -o old.msi $env:OLD_MSI_URL
+          if ($LASTEXITCODE -ne 0) { throw "downloading v1.22.1's MSI failed: $LASTEXITCODE" }
+          $hash = (Get-FileHash old.msi -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $env:OLD_MSI_SHA256) { throw "old.msi has SHA-256 $hash, expected $env:OLD_MSI_SHA256" }
+
+      - name: Upgrade loop
+        shell: powershell
+        run: .\ci\diag-293\upgrade-probe.ps1 -Variant ${{ matrix.variant }} -Iterations 10
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: diag-293-${{ matrix.variant }}
+          path: diag/
+          retention-days: 7
