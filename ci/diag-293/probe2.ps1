@@ -74,6 +74,49 @@ public static class LockProbe2 {
         }
     }
 
+    static string Clock(DateTime t) { return t.ToString("HH:mm:ss.fff"); }
+
+    static void Burst(string path) {
+        DateTime t0 = DateTime.Now;
+        Stopwatch sw = Stopwatch.StartNew();
+        double agentAt = -1;
+        long opens = 0, failCount = 0;
+        bool inFail = false;
+        double failStart = 0;
+        int failErr = 0;
+        string failHolders = null, error;
+        Note("burst started");
+        while (!stop && sw.Elapsed.TotalSeconds < 12 && (agentAt < 0 || sw.Elapsed.TotalMilliseconds < agentAt + 3000)) {
+            opens++;
+            int err = 0;
+            using (SafeFileHandle fh = CreateFile(path, 0x80000000, 0x3, IntPtr.Zero, 3, 0, IntPtr.Zero)) {
+                if (fh.IsInvalid) err = Marshal.GetLastWin32Error();
+            }
+            double now = sw.Elapsed.TotalMilliseconds;
+            if (err != 0) {
+                if (!inFail) {
+                    inFail = true; failStart = now; failErr = err; failCount = 0;
+                    failHolders = Holders(path, out error) ?? ("unknown: " + error);
+                }
+                failCount++;
+            } else if (inFail) {
+                Note(string.Format("BLOCKED from {0} for {1:F2}ms ({2} opens failed, error {3}), holders when it began: [{4}]",
+                    Clock(t0.AddMilliseconds(failStart)), now - failStart, failCount, failErr, failHolders));
+                inFail = false;
+            }
+            if (agentAt < 0 && (opens % 64) == 0) {
+                string h = Holders(path, out error);
+                if (h != null && h.Contains("fivenines-agent-windows-amd64")) {
+                    agentAt = now;
+                    Note("burst: agent first holds the file at " + Clock(t0.AddMilliseconds(now)));
+                }
+            }
+        }
+        if (inFail) Note(string.Format("BLOCKED from {0} until the burst ended ({1} opens failed, error {2}), holders when it began: [{3}]",
+            Clock(t0.AddMilliseconds(failStart)), failCount, failErr, failHolders));
+        Note(string.Format("burst ended: {0} opens in {1:F0}ms", opens, sw.Elapsed.TotalMilliseconds));
+    }
+
     public static void Start(string path) {
         stop = false;
         lock (lines) { lines.Clear(); }
@@ -93,9 +136,10 @@ public static class LockProbe2 {
         long samples = 0;
         DateTime started = DateTime.UtcNow;
         try {
-            bool removed = false, agentSeen = false;
+            bool removed = false, agentSeen = false, burstDone = false;
             string lastHolders = null, lastFailure = null;
             int lastErr = -1;
+            DateTime? quietSince = null;
             while (!stop) {
                 bool exists = File.Exists(path);
                 if (!removed) {
@@ -111,6 +155,15 @@ public static class LockProbe2 {
                     string shown = holders ?? ("unknown: " + error);
                     if (shown != lastHolders) { Note("holders: [" + shown + "]"); lastHolders = shown; }
                     if (holders != null && holders.Contains("fivenines-agent-windows-amd64")) agentSeen = true;
+                    // The burst: once the installer has finished writing the
+                    // file (no holder for 500ms), open it as Python does in a
+                    // tight loop until 3s after the new agent first holds it.
+                    if (!burstDone && holders == "") {
+                        if (quietSince == null) quietSince = DateTime.UtcNow;
+                        if ((DateTime.UtcNow - quietSince.Value).TotalMilliseconds > 500) { Burst(path); burstDone = true; agentSeen = true; }
+                    } else if (!burstDone) {
+                        quietSince = null;
+                    }
                     if (agentSeen) {
                         int err = 0;
                         using (SafeFileHandle fh = CreateFile(path, 0x80000000, 0x3, IntPtr.Zero, 3, 0, IntPtr.Zero)) {

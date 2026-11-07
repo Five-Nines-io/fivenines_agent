@@ -1935,8 +1935,11 @@ jobs:
             }
             $sizes = Get-LogSizes
             $since = Get-Date
+            $variant = @("default", "Disable", "DisableShutdown")[$n % 3]
+            $rm = if ($variant -eq "default") { "" } else { "MSIRESTARTMANAGERCONTROL=$variant" }
             [LockProbe2]::Start($zip)
-            Install-Msi fivenines-agent.msi "upgrade-$n.log"
+            $p = Start-Process msiexec -ArgumentList "/i fivenines-agent.msi TOKEN=ci-upgrade-$(Get-Random) $rm /qn /l*v upgrade-$n.log" -Wait -PassThru
+            Write-Host "upgrade $n ($variant): msiexec exit $($p.ExitCode)"
             Wait-Running "the upgrade"
             $first = (Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'").ProcessId
             Start-Sleep -Seconds 20
@@ -1946,7 +1949,7 @@ jobs:
             $now = (Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'").ProcessId
             $bad = $now -ne $first -or $stops.Count -ne 0
             if ($bad) { $failed += $n }
-            Write-Host "::group::upgrade ${n}: unexpected stops $($stops.Count), WinSW PID $first -> $now$(if ($bad) { ' FAILED' })"
+            Write-Host "::group::upgrade ${n} ($variant): unexpected stops $($stops.Count), WinSW PID $first -> $now$(if ($bad) { ' FAILED' })"
             Show-Iteration "upgrade $n" $since $probe $sizes "upgrade-$n.log"
             Write-Host "::endgroup::"
             if ($bad) { Write-Host "FAILED upgrade $n (expanded above)" }
