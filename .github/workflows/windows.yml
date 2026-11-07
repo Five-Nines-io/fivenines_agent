@@ -1920,8 +1920,20 @@ jobs:
             throw "v1.22.1 was expected to register the service plain Automatic, with no failure actions"
           }
 
+          # The agent's stderr from here on: what a first start that died wrote.
+          $errLog = "$env:ProgramData\fivenines_agent\logs\fivenines-agent-service.err.log"
+          $errFrom = 0
+          if (Test-Path -LiteralPath $errLog) { $errFrom = (Get-Item -LiteralPath $errLog).Length }
           $since = Get-Date
           Install-Msi fivenines-agent.msi upgrade.log
+          # Without the installer's Restart Manager (#293): its session ended
+          # after StartAgentService, refusing the new agent's reads of its
+          # files for a few ms, and the agent died at its first start on about
+          # one upgrade in four. v1.22.1's own session, in the uninstall the
+          # upgrade runs, still shows in the log; this line is the upgrade's.
+          if (-not (Get-Content upgrade.log | Select-String -SimpleMatch -Quiet "RESTART MANAGER: Disabled by MSIRESTARTMANAGERCONTROL property")) {
+            throw "the upgrade ran with the Restart Manager: MSIRESTARTMANAGERCONTROL is not Disable"
+          }
           $products = @(Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*" -ErrorAction SilentlyContinue |
                         Where-Object { $_.DisplayName -eq "Fivenines Monitoring Agent" })
           if ($products.Count -ne 1 -or $products[0].DisplayVersion -eq "1.22.1") {
@@ -1942,12 +1954,37 @@ jobs:
           # Every SCM event about the service since the upgrade began, passing
           # or not: which service instance stopped, and when, is what tells an
           # old v1.22.1 agent dying during the upgrade from the new one
-          # crashing after it (this check failed intermittently, unexplained).
+          # crashing after it.
           Get-WinEvent -FilterHashtable @{ LogName = "System"; ProviderName = "Service Control Manager"; StartTime = $since } -ErrorAction SilentlyContinue |
             Where-Object { $_.Message -match "Fivenines Monitoring Agent|fivenines-agent" } | Sort-Object TimeCreated |
             ForEach-Object { Write-Host ("{0:HH:mm:ss.fff} {1} {2}" -f $_.TimeCreated, $_.Id, ($_.Message -replace "\s+", " ")) }
+          # One stop is tolerated, and only this one (#293). v1.22.1's own
+          # Restart Manager session, in the uninstall the upgrade runs, ends
+          # after StartAgentService and still refuses reads of the installed
+          # files for a few ms (measured in 7 upgrades of 27; the upgraded
+          # package's own session, now disabled, in 6 of 9): a first start
+          # caught then dies in PyInstaller's bootstrap, before any agent code,
+          # on base_library.zip, and the SCM restarts it. An upgrade from a
+          # release that disables the Restart Manager has no such session.
+          $bootstrapDeath = $false
+          if ($stops.Count -eq 1 -and (Test-Path -LiteralPath $errLog)) {
+            $fs = New-Object IO.FileStream($errLog, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            try {
+              $fs.Position = [Math]::Min($errFrom, $fs.Length)
+              $newErr = (New-Object IO.StreamReader($fs)).ReadToEnd()
+            } finally {
+              $fs.Dispose()
+            }
+            $bootstrapDeath = ([regex]::Matches($newErr, "Traceback \(most recent call last\)").Count -eq 1) -and
+              ([regex]::Matches($newErr, "(?m)^PermissionError: \[Errno 13\] Permission denied: '[^'\r\n]*\\\\_internal\\\\base_library\.zip'\r?$").Count -eq 1) -and
+              ([regex]::Matches($newErr, "\[PYI-\d+:ERROR\] Failed to execute script 'pyi[^']*' due to unhandled exception").Count -eq 1)
+            if ($bootstrapDeath) {
+              Write-Host "Tolerated (#293): the first start died in PyInstaller's bootstrap, refused base_library.zip by v1.22.1's Restart Manager session:"
+              $newErr -split "\r?\n" | Where-Object { $_ } | ForEach-Object { Write-Host "  $_" }
+            }
+          }
           $svc = Get-CimInstance Win32_Service -Filter "Name='fivenines-agent'"
-          if ($svc.ProcessId -ne $first -or $stops.Count -ne 0) {
+          if ($svc.ProcessId -ne $first -or ($stops.Count -ne 0 -and -not $bootstrapDeath)) {
             Write-Host "service: State=$($svc.State) WinSW PID $first -> $($svc.ProcessId); unexpected stops: $($stops.Count)"
             # WinSW's own log and the agent's captured stdout/stderr: v1.22.1's
             # lines first, then the upgraded agent's (the files are appended).

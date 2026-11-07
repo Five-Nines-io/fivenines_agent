@@ -1180,6 +1180,37 @@ def test_msi_restarts_the_service_on_failure_as_winsw_describes():
     )
 
 
+# Value: protects=the agent's first start after an MSI upgrade; fails_when=the MSI drops MSIRESTARTMANAGERCONTROL or sets it to anything but Disable (DisableShutdown still ends a Restart Manager session after StartAgentService: a reader opening base_library.zip as Python does was refused in 2 upgrades of 9, against 6 of 9 with the default and none with Disable), or the upgrade E2E stops reading the property's effect from the upgrade's log; why_new=only the Windows E2E upgrades, and the new agent lost the race on about one upgrade in four, so one E2E run proves nothing; seam=none; no_claim=that Windows Installer honours the property, which the E2E reads in the upgrade's log
+def test_msi_runs_without_the_restart_manager():
+    wxs = _xml_without_comments(PRODUCT_WXS)
+    assert re.findall(r"<Property Id=\"MSIRESTARTMANAGERCONTROL\"[^>]*>", wxs) == [
+        '<Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />'
+    ]
+    assert (
+        "RESTART MANAGER: Disabled by MSIRESTARTMANAGERCONTROL property"
+        in _strip_comments(_read(WINDOWS_WORKFLOW))
+    )
+
+
+# Value: protects=the release gate's upgrade check; fails_when=its tolerance for #293's residual widens: more than one stop, a death other than PyInstaller's bootstrap refused base_library.zip (another file, a second traceback, agent code), or no longer requiring the restarted service to keep one process for 20s; why_new=the tolerance lives in a workflow step only a Windows runner executes, and a wider one would hide an upgraded agent that crashes; seam=none; no_claim=that the patterns match a real trace, checked against the three traces CI runs captured
+def test_upgrade_e2e_tolerates_only_the_old_packages_restart_manager_race():
+    workflow = _read(WINDOWS_WORKFLOW)
+    start = workflow.index("- name: Upgrade from v1.22.1 sets the delayed start")
+    end = workflow.index("- name: Cleanup service account", start)
+    step = _strip_comments(workflow[start:end])
+    assert "if ($stops.Count -eq 1 -and (Test-Path -LiteralPath $errLog))" in step
+    for pattern in (
+        r"""Traceback \(most recent call last\)").Count -eq 1""",
+        r"""\\\\_internal\\\\base_library\.zip'\r?$").Count -eq 1""",
+        r"""Failed to execute script 'pyi[^']*' due to unhandled exception").Count -eq 1""",
+    ):
+        assert pattern in step, pattern
+    assert (
+        "if ($svc.ProcessId -ne $first -or ($stops.Count -ne 0 -and -not $bootstrapDeath))"
+        in step
+    )
+
+
 def _xml_without_comments(path):
     # A commented-out element is not one.
     return re.sub(r"<!--.*?-->", "", _read(path), flags=re.S)

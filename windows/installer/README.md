@@ -13,6 +13,17 @@ This directory builds the Windows MSI installer for the fivenines agent.
 - Token: passed via the **hidden** `TOKEN` MSI property (D21). Written to
   `%ProgramData%\fivenines_agent\TOKEN` with `SetTokenFileAcl.ps1` so only
   the service account, Administrators, and SYSTEM have access (F1).
+- Upgrades: a major upgrade stops the running agent through the package's
+  `ServiceControl` and starts the new one with `StartAgentService`, without
+  Windows Installer's Restart Manager (`MSIRESTARTMANAGERCONTROL=Disable`,
+  #293). Ending its session, after `StartAgentService`, msiexec refused other
+  processes' reads of the installed files for a few ms, and the new agent,
+  still importing from `_internal\base_library.zip`, died at its first start
+  (`PermissionError`) on about one upgrade in four. A release up to 1.23.1
+  still opens its own session while the upgrade uninstalls it, which no newer
+  package can turn off, so an upgrade from one of those can still lose the
+  first start (the SCM restarts it); the upgrade E2E tolerates exactly that,
+  once.
 
 ## Files
 
