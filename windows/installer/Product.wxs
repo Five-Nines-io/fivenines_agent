@@ -55,6 +55,25 @@
 
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
+    <!-- No Restart Manager (#293). On an upgrade the running agent holds the
+         files being replaced, so InstallValidate opens a Restart Manager
+         session, which Windows Installer ends after InstallFinalize, about
+         300ms after StartAgentService has started the new agent. Ending it,
+         msiexec opens the installed files in a way that refuses other readers
+         for 2 to 5ms (ERROR_SHARING_VIOLATION, measured by a reader opening
+         _internal\base_library.zip as Python does, through the upgrade from
+         v1.22.1: in 6 upgrades of 9). The new agent, still importing from
+         that zip, then died in PyInstaller's bootstrap with PermissionError,
+         and the SCM restarted it: about one upgrade in four on the Windows
+         CI runners. The service needs none of the Restart Manager:
+         ServiceControl stops it before any file is replaced and
+         StartAgentService starts it again. Disabled, Windows Installer falls
+         back to its FilesInUse handling, which a silent install never shows
+         and which lists only windowed applications. A release up to 1.23.1
+         still opens its own session while the upgrade uninstalls it; with
+         this one off, the reader saw no refusal in 9 upgrades. -->
+    <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
+
     <!-- Enrollment token: Hidden="yes" keeps it out of installer logs;
          Secure="yes" lets it be passed through to deferred custom actions
          (D21 / Section 3 F1). -->
