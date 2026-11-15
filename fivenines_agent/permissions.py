@@ -573,9 +573,10 @@ class PermissionProbe:
         Uses sudo -n which fails immediately if password is required.
 
         Through sudo_refusals.run_checked: the command is run only once
-        `sudo -n -l` lists it as allowed, and a call sudo refused is not sent
-        again until the sudo policy files change, a recheck (force_refresh),
-        or -- for a capability whose feature is enabled --
+        `sudo -n -l` lets the account use sudo without a password and lists
+        the command, and a call sudo refused is not sent again -- not even
+        after a restart -- until the sudo policy files change, a recheck
+        (force_refresh), or -- for a capability whose feature is enabled --
         REFUSAL_RETRY_INTERVAL. On Debian/Ubuntu (stock `Defaults
         mail_badpass`) every refusal mails root, and these probes run every
         one to five minutes. A refusal recalled without a call keeps its

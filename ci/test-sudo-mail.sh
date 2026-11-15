@@ -5,10 +5,11 @@
 # refuses for a user it knows mails root a "SECURITY information" message. The
 # probes repeated each refused call every one to five minutes, up to ~1150
 # mails a day per command. The fix (fivenines_agent/sudo_refusals.py) asks
-# `sudo -n -l` before running a command, and never repeats a refusal until the
-# sudo policy changes. Its premise -- that listing needs no password, hence
-# mails nothing, for a user with a NOPASSWD rule -- is sudo behaviour read from
-# its source, so this checks it against the real sudo of each image.
+# `sudo -n -l` (no command: may this account use sudo without a password at
+# all?) and then `sudo -n -l <command>` before running a command, and keeps
+# every refusal, across restarts, until the sudo policy changes. What each
+# question costs in mail is sudo behaviour, so this checks it against the real
+# sudo of each image.
 #
 # Each case runs the agent's own sudo_refusals.run_checked (it imports only the
 # standard library, so the image's python3 runs it) as an unprivileged user,
@@ -18,10 +19,12 @@
 #     smartctl only) and for a member of the admin group;
 #   - the README's user: five probes each of smartctl (allowed), fail2ban-client
 #     and nvme (no rule) mail nothing, and smartctl still runs every time;
-#   - the admin-group member, whose rules all need a password: five probes of
-#     smartctl are refused and mail at most once (a refused `sudo -n -l
-#     <command>` mails too, on every sudo measured; the memory stops the
-#     repeats).
+#   - an account sudoers does not know (the default install): every probe is
+#     refused and nothing mails;
+#   - the admin-group member, whose rules all need a password: two agent runs
+#     (a restart) of five probes each of three commands are refused and mail
+#     nothing on sudo >= 1.9.16p1 and sudo-rs, at most once on an older sudo
+#     (its refused `sudo -n -l` mails, and nothing else asks).
 #
 # Needs docker. Usage: sh ci/test-sudo-mail.sh
 
@@ -114,6 +117,13 @@ admin_group=sudo
 getent group sudo >/dev/null 2>&1 || admin_group=wheel
 useradd -m -G "$admin_group" admin
 echo 'admin:Fivenines-ci-1' | chpasswd
+# An account sudoers does not know: the default system install.
+useradd -m norule
+# Each one's config dir, where the agent keeps the refusals across restarts.
+for user in fivenines admin norule; do
+  mkdir -m 700 "/var/tmp/cfg-$user"
+  chown "$user" "/var/tmp/cfg-$user"
+done
 
 badpass=0
 if [ "$flavor" = sudo ] && grep -Eq '^[[:space:]]*Defaults[[:space:]]+mail_badpass' /etc/sudoers; then
@@ -121,7 +131,18 @@ if [ "$flavor" = sudo ] && grep -Eq '^[[:space:]]*Defaults[[:space:]]+mail_badpa
 fi
 echo "  stock mail_badpass: $badpass"
 
-as() { user=$1; shift; runuser -u "$user" -- env PYTHONDONTWRITEBYTECODE=1 "$@"; }
+# Mails a refused bare `sudo -n -l` may cost: none since 1.9.16p1, nor ever
+# under sudo-rs; one (the refusal is then kept) on an older sudo.
+gate_mails=0
+if [ "$badpass" = 1 ]; then
+  version=$(sudo -V 2>/dev/null | sed -n 's/^Sudo version //p' | head -1)
+  [ "$(printf '%s\n%s\n' 1.9.16p1 "$version" | sort -V | head -1)" = 1.9.16p1 ] || gate_mails=1
+fi
+
+as() {
+  user=$1; shift
+  runuser -u "$user" -- env PYTHONDONTWRITEBYTECODE=1 CONFIG_DIR="/var/tmp/cfg-$user" "$@"
+}
 
 if [ "$badpass" = 1 ]; then
   as fivenines sudo -n /usr/bin/fail2ban-client status >/dev/null 2>&1
@@ -139,10 +160,16 @@ n=$(mails); clear_mails
 if [ "$n" -eq 0 ]; then echo "    ok   README user: 15 probes, no mail"
 else echo "    FAIL README user: 15 probes, $n mails"; fail=1; fi
 
-as admin python3 /work/probe.py smartctl=refused || fail=1
+as norule python3 /work/probe.py smartctl=refused fail2ban-client=refused nvme=refused || fail=1
 n=$(mails); clear_mails
-if [ "$n" -le 1 ]; then echo "    ok   admin-group user: 5 probes, $n mail(s)"
-else echo "    FAIL admin-group user: 5 probes, $n mails"; fail=1; fi
+if [ "$n" -eq 0 ]; then echo "    ok   no-rule user: 15 probes, no mail"
+else echo "    FAIL no-rule user: 15 probes, $n mails"; fail=1; fi
+
+as admin python3 /work/probe.py smartctl=refused fail2ban-client=refused nvme=refused || fail=1
+as admin python3 /work/probe.py smartctl=refused fail2ban-client=refused nvme=refused || fail=1
+n=$(mails); clear_mails
+if [ "$n" -le "$gate_mails" ]; then echo "    ok   admin-group user: 2 runs of 15 probes, $n mail(s) (at most $gate_mails)"
+else echo "    FAIL admin-group user: 2 runs of 15 probes, $n mails (at most $gate_mails)"; fail=1; fi
 
 exit "$fail"
 EOF
@@ -169,7 +196,7 @@ run_case ubuntu:20.04 sudo      # sudo 1.8.31
 run_case ubuntu:22.04 sudo      # 1.9.9: -n tried PAM authentication
 run_case ubuntu:24.04 sudo      # 1.9.15
 run_case debian:bookworm sudo   # 1.9.13
-run_case debian:trixie sudo     # 1.9.16p2: a bare -nl no longer mails, -l <command> still does
+run_case debian:trixie sudo     # 1.9.16p2: a bare -nl no longer mails
 run_case rockylinux:9 sudo      # 1.9.5, no mail_badpass by default
 run_case ubuntu:26.04 sudo-rs   # Ubuntu's default sudo since 25.10
 

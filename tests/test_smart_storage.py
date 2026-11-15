@@ -1472,7 +1472,7 @@ def test_nvme_probe_refused_once_is_not_asked_every_tick(monkeypatch, tmp_path):
     for _ in range(5):
         assert smart_storage.nvme_cli_available() is False
     assert run.call_count == 1
-    assert run.call_args.args[0] == ["sudo", "-n", "-l", "nvme", "version"]
+    assert run.call_args.args[0] == ["sudo", "-n", "-l"]
 
 
 @pytest.mark.parametrize(
@@ -1503,9 +1503,15 @@ def test_sudo_probe_none_when_the_listed_tool_fails(monkeypatch):
     """sudoers allows it, the tool itself exits non-zero: unusable, and not
     a refusal (the next tick runs it again)."""
     run = mock.Mock(
-        side_effect=[_bproc(0), _bproc(2, "", "nvme: error"), _bproc(0), _bproc(2)]
+        side_effect=[
+            _bproc(0),  # the account's listing, once
+            _bproc(0),  # nvme version listed
+            _bproc(2, "", "nvme: error"),
+            _bproc(0),
+            _bproc(2),
+        ]
     )
     monkeypatch.setattr(smart_storage.subprocess, "run", run)
     assert smart_storage.nvme_cli_available() is False
     assert smart_storage.nvme_cli_available() is False
-    assert run.call_count == 4
+    assert run.call_count == 5

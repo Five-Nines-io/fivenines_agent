@@ -9,17 +9,22 @@ one to five minutes, so a host missing one sudoers rule mailed its
 administrator 288 to ~1150 times a day per command, whether or not the feature
 was enabled.
 
-run_checked() does two things about it:
+run_checked() asks sudo only what costs no mail where anything can, and never
+asks twice:
 
-- It asks `sudo -n -l <command>` first, and runs the command only when sudo
-  lists it as allowed. Listing needs no password when the user has at least
-  one NOPASSWD rule (sudoers' default `listpw=any`), the README's setup, so a
-  command without a rule costs no authentication failure and no mail. A user
+- `sudo -n -l` with no command first, once per policy: may this account use
+  sudo without a password at all? Refused, no command is tried. It mails
+  nothing for an account sudoers does not know, nor since sudo 1.9.16p1 (and
+  never under sudo-rs); an older sudo mails a refusal once, for an account
   whose rules all need a password (an install run by a member of the sudo
-  group) still fails the listing, and sudo mails that too (measured on
-  1.8.31 to 1.9.16p2: 1.9.16p1 stopped mailing a bare `-nl`, not
-  `-l <command>`), so the memory below is what bounds it.
-- It remembers what sudo refused, and does not ask again until one of these
+  group). Nothing an unprivileged process can ask sudo avoids that one:
+  /etc/sudoers is root-only, and every other question is refused the same way.
+- `sudo -n -l <command>` next: the command runs only once sudo lists it.
+  Listing needs no password when the account has at least one NOPASSWD rule
+  (sudoers' default `listpw=any`, the README setup), so a command without a
+  rule mails nothing.
+- every refusal is remembered, in the config directory so a restart (an
+  update, a reboot) does not ask again, and asked again only when one of these
   happens:
     * a file a sudoers rule or a group membership is read from changes
       (/etc/sudoers, /etc/sudoers.d and its entries, /etc/group): an operator
@@ -27,19 +32,22 @@ run_checked() does two things about it:
     * reset() (SIGHUP, or the dashboard's permission recheck);
     * retry_interval has passed (REFUSAL_RETRY_INTERVAL for an enabled
       feature, None -- never -- for one that is not), for rules this cannot see
-      change (LDAP, sssd, a group managed outside /etc/group);
-    * the agent restarts (the memory is per process).
+      change (LDAP, sssd, a group managed outside /etc/group).
 
 A command that sudo allowed and that then failed on its own (fail2ban-client
 while fail2ban is stopped) is not a refusal and is retried as before: sudo
 mails nothing about it.
 """
 
+import json
 import os
+import stat
 import subprocess
 import threading
 import time
 
+from fivenines_agent.debug import log
+from fivenines_agent.env import config_dir, restrict_to_owner
 from fivenines_agent.subprocess_utils import get_clean_env, run_privileged
 
 # Retry a refusal once a day anyway, for the rules no file here reflects.
@@ -59,6 +67,16 @@ POLICY_DIR = "/etc/sudoers.d"
 REFUSAL_MESSAGE = "a password is required"
 
 _SUDO_PREFIX = "sudo:"
+
+# The refusals, in the config directory, written owner-only.
+STATE_FILE = "sudo_refusals"
+
+# The file holds a handful of entries, far under this: a larger one is not
+# the agent's, and is ignored rather than read.
+MAX_STATE_BYTES = 64 * 1024
+
+# The key of `sudo -n -l` with no command.
+GATE = ()
 
 
 def _decode(output):
@@ -100,81 +118,151 @@ def policy_fingerprint():
     return tuple(keys)
 
 
-class SudoRefusals:
-    """The calls sudo refused in this process, keyed by the argv after `sudo -n`."""
+def _state_path():
+    return os.path.join(config_dir(), STATE_FILE)
 
-    def __init__(self, clock=time.monotonic):
+
+def _load_state():
+    """The refusals an earlier run left: {key: (fingerprint, refused at, detail)}.
+
+    {} when there are none, or when the file cannot be read as the agent wrote
+    it: the worst a lost refusal costs is one more question to sudo.
+    """
+    path = _state_path()
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    except FileNotFoundError:
+        return {}
+    except OSError as e:
+        log(f"sudo_refusals: cannot open {path}: {e}", "debug")
+        return {}
+    try:
+        # open() did not block on a FIFO (O_NONBLOCK), read() would.
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            log(f"sudo_refusals: {path} is not a regular file", "debug")
+            return {}
+        raw = os.read(fd, MAX_STATE_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(raw) > MAX_STATE_BYTES:
+        log(f"sudo_refusals: {path} is over {MAX_STATE_BYTES} bytes", "debug")
+        return {}
+    try:
+        return {
+            tuple(entry["argv"]): (
+                tuple(tuple(part) for part in entry["fingerprint"]),
+                float(entry["refused_at"]),
+                str(entry["detail"]),
+            )
+            for entry in json.loads(raw)
+        }
+    except (ValueError, TypeError, KeyError) as e:
+        log(f"sudo_refusals: ignoring {path}: {e}", "debug")
+        return {}
+
+
+def _save_state(entries):
+    """Write the refusals owner-only: a temp file, then os.replace (no torn file)."""
+    path = _state_path()
+    tmp_path = path + ".tmp"
+    data = json.dumps(
+        [
+            {
+                "argv": list(key),
+                "fingerprint": [list(part) for part in fingerprint],
+                "refused_at": refused_at,
+                "detail": detail,
+            }
+            for key, (fingerprint, refused_at, detail) in entries.items()
+        ]
+    )
+    try:
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        restrict_to_owner(fd)
+        with os.fdopen(fd, "w") as f:
+            f.write(data)
+        os.replace(tmp_path, path)
+    except OSError as e:
+        log(f"sudo_refusals: cannot save {path}: {e}", "debug")
+
+
+class SudoRefusals:
+    """What sudo refused, keyed by the argv after `sudo -n` (GATE for none).
+
+    The refusals are read from the state file on first use and written back
+    whenever they change. Wall-clock times, since they outlive the process.
+    """
+
+    def __init__(self, clock=time.time):
         self._clock = clock
         self._lock = threading.Lock()
-        # key -> (policy fingerprint, refused at, reason)
-        self._refused = {}
-        # key -> policy fingerprint read just before the call recall() allowed
-        self._before_call = {}
+        # key -> (policy fingerprint, refused at, what sudo said); None until read
+        self._refused = None
+        # key -> the policy fingerprint sudo last allowed it under (this process)
+        self._passed = {}
 
-    def recall(self, key, retry_interval):
-        """The reason sudo refused *key*, while that refusal still holds.
+    def _entries(self):
+        if self._refused is None:
+            self._refused = _load_state()
+        return self._refused
 
-        None means: make the call, then report it with remember(). The policy
-        is read BEFORE the call, so a rule saved while it runs is still seen as
-        a change by the next recall(). retry_interval None never retries on
-        time alone.
+    def recall(self, key, retry_interval, fingerprint):
+        """What sudo said when it refused *key*, while that refusal holds.
+
+        None: no refusal holds, ask sudo. One made under another policy, or
+        longer ago than retry_interval (None: never on time alone; a clock that
+        went back counts as passed), is dropped.
         """
-        fingerprint = policy_fingerprint()
         with self._lock:
-            entry = self._refused.pop(key, None)
-            if entry is not None:
-                refused_fingerprint, refused_at, reason = entry
-                expired = (
-                    retry_interval is not None
-                    and self._clock() - refused_at >= retry_interval
-                )
-                if refused_fingerprint == fingerprint and not expired:
-                    self._refused[key] = entry
-                    return reason
-            self._before_call[key] = fingerprint
+            entries = self._entries()
+            entry = entries.get(key)
+            if entry is None:
+                return None
+            refused_fingerprint, refused_at, detail = entry
+            elapsed = self._clock() - refused_at
+            expired = retry_interval is not None and not 0 <= elapsed < retry_interval
+            if refused_fingerprint == fingerprint and not expired:
+                return detail
+            del entries[key]
+            _save_state(entries)
             return None
 
-    def remember(self, key, reason):
-        """Report the call recall() allowed: *reason* if sudo refused it, else None."""
+    def remember(self, key, detail, fingerprint):
+        """Record what sudo answered under *fingerprint*: *detail* if it refused, else None."""
         with self._lock:
-            fingerprint = self._before_call.pop(key, None)
-            if reason is None:
+            entries = self._entries()
+            if detail is None:
+                self._passed[key] = fingerprint
+                if entries.pop(key, None) is not None:
+                    _save_state(entries)
                 return
-            if fingerprint is None:
-                fingerprint = policy_fingerprint()
-            self._refused[key] = (fingerprint, self._clock(), reason)
+            self._passed.pop(key, None)
+            entries[key] = (fingerprint, self._clock(), detail)
+            _save_state(entries)
+
+    def passed(self, key, fingerprint):
+        """Whether sudo allowed *key* under this same policy, in this process."""
+        with self._lock:
+            return self._passed.get(key) == fingerprint
 
     def reset(self):
-        """Forget every refusal: the next call of each is sent again."""
+        """Forget every answer: each call is asked again."""
         with self._lock:
-            self._refused.clear()
-            self._before_call.clear()
+            self._passed.clear()
+            self._refused = {}
+            _save_state(self._refused)
 
 
 _refusals = SudoRefusals()
 
 
 def reset():
-    """Forget every refusal of this process (SIGHUP, the dashboard's recheck)."""
+    """Forget every refusal (SIGHUP, the dashboard's recheck)."""
     _refusals.reset()
 
 
-def run_checked(args, timeout, retry_interval=REFUSAL_RETRY_INTERVAL, stdout=None):
-    """Run `sudo -n *args` unless sudo refuses it, without asking twice.
-
-    Returns (result, refusal). When sudo refuses the call -- its listing now,
-    or an earlier refusal nothing has changed since -- result is None and
-    refusal says why, in the `sudo -n <command>: <detail>` form the capability
-    reasons use. Otherwise refusal is None and result is the command's
-    CompletedProcess (bytes; stdout piped unless *stdout* says otherwise), which
-    may have failed on its own; a run sudo itself refused (a rule that needs a
-    password) is remembered too. Raises what run_privileged raises; nothing is
-    remembered then.
-    """
-    key = tuple(args)
-    refusal = _refusals.recall(key, retry_interval)
-    if refusal is not None:
-        return None, refusal
+def _listing_refusal(args, timeout):
+    """None when `sudo -n -l [args]` lists it, else what sudo said."""
     listed = run_privileged(
         ["sudo", "-n", "-l", *args],
         timeout=timeout,
@@ -182,14 +270,41 @@ def run_checked(args, timeout, retry_interval=REFUSAL_RETRY_INTERVAL, stdout=Non
         stderr=subprocess.PIPE,
         env=get_clean_env(),
     )
-    if listed.returncode != 0:
-        # The last line: a warning sudo prints first (unable to resolve host)
-        # is not why it said no.
-        lines = _decode(listed.stderr).splitlines()
-        detail = lines[-1].strip() if lines else "not allowed by sudoers"
-        refusal = f"sudo -n {args[0]}: {detail}"
-        _refusals.remember(key, refusal)
-        return None, refusal
+    if listed.returncode == 0:
+        return None
+    # The last line: a warning sudo prints first (unable to resolve host) is
+    # not why it said no.
+    lines = _decode(listed.stderr).splitlines()
+    return lines[-1].strip() if lines else "not allowed by sudoers"
+
+
+def run_checked(args, timeout, retry_interval=REFUSAL_RETRY_INTERVAL, stdout=None):
+    """Run `sudo -n *args` unless sudo refuses it, without asking twice.
+
+    Returns (result, refusal). When sudo refuses the call -- the account
+    (`sudo -n -l`), the command (`sudo -n -l *args`) or the run itself (a rule
+    that needs a password), now or earlier under the same policy -- result is
+    None and refusal says why, in the `sudo -n <command>: <detail>` form the
+    capability reasons use. Otherwise refusal is None and result is the
+    command's CompletedProcess (bytes; stdout piped unless *stdout* says
+    otherwise), which may have failed on its own. Raises what run_privileged
+    raises; nothing is remembered then.
+    """
+    key = tuple(args)
+    fingerprint = policy_fingerprint()
+    for asked in (GATE, key):
+        detail = _refusals.recall(asked, retry_interval, fingerprint)
+        if detail is not None:
+            return None, f"sudo -n {args[0]}: {detail}"
+    if not _refusals.passed(GATE, fingerprint):
+        detail = _listing_refusal([], timeout)
+        _refusals.remember(GATE, detail, fingerprint)
+        if detail is not None:
+            return None, f"sudo -n {args[0]}: {detail}"
+    detail = _listing_refusal(args, timeout)
+    if detail is not None:
+        _refusals.remember(key, detail, fingerprint)
+        return None, f"sudo -n {args[0]}: {detail}"
     result = run_privileged(
         ["sudo", "-n", *args],
         timeout=timeout,
@@ -197,6 +312,7 @@ def run_checked(args, timeout, retry_interval=REFUSAL_RETRY_INTERVAL, stdout=Non
         stderr=subprocess.PIPE,
         env=get_clean_env(),
     )
-    line = refusal_line(result.returncode, _decode(result.stderr))
-    _refusals.remember(key, None if line is None else f"sudo -n {args[0]}: {line}")
+    _refusals.remember(
+        key, refusal_line(result.returncode, _decode(result.stderr)), fingerprint
+    )
     return result, None

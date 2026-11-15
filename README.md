@@ -868,15 +868,20 @@ does not ship it by default.
 
 > **Mail to root.** The stock `/etc/sudoers` of Debian and Ubuntu sets
 > `Defaults mail_badpass`: every `sudo` call that sudo refuses for an account
-> it knows mails root a "SECURITY information" message. The agent checks each
-> command with `sudo -n -l <command>` before running it (with at least one
-> NOPASSWD rule, as above, that check needs no password and mails nothing),
-> and does not repeat a refused call until `/etc/sudoers`, `/etc/sudoers.d` or
-> `/etc/group` changes, the permissions are rechecked (`SIGHUP` or the
-> dashboard), the agent restarts, or -- for a feature you enabled -- a day has
-> passed. Earlier agents repeated a refused call every one to five minutes; on
-> those, stop the mails with `sudo visudo -f /etc/sudoers.d/fivenines-nomail`
-> and the line `Defaults:fivenines !mail_badpass`.
+> it knows mails root a "SECURITY information" message. The agent first asks
+> `sudo -n -l` whether the account may use sudo without a password at all,
+> then `sudo -n -l <command>` before running a command: with at least one
+> NOPASSWD rule, as above, neither needs a password and nothing mails. It
+> remembers every refusal, across restarts, and asks again only once
+> `/etc/sudoers`, `/etc/sudoers.d` or `/etc/group` changes, the permissions are
+> rechecked (`SIGHUP` or the dashboard), or -- for a feature you enabled -- a
+> day has passed. The one mail left: an account whose sudo rules all need a
+> password (a user installation run by a member of the `sudo` group), on a
+> sudo older than 1.9.16p1 (Ubuntu 24.04 and older, Debian 12), gets one
+> when the agent first asks, as sudo mails every refusal there. To stop that
+> one too, or the repeated mails of agents before this change, run
+> `sudo visudo -f /etc/sudoers.d/fivenines-nomail` and add the line
+> `Defaults:fivenines !mail_badpass` (naming the account the agent runs as).
 
 > **Upgrading from an agent older than 1.17.6?** The WireGuard rule is new in
 > **1.17.6**. Before that release the packaged systemd unit granted

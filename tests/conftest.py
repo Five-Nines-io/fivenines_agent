@@ -53,8 +53,9 @@ def _reset_process_caches():
     qemu_module._stalled_worker = None
     qemu_module._reset_backoff()
     journal_policy.reset_cache()
-    # The sudo calls refused in an earlier test must not be skipped in this one.
-    sudo_refusals.reset()
+    # The sudo calls refused in an earlier test must not be skipped in this
+    # one: a fresh memory, read from this test's CONFIG_DIR on first use.
+    sudo_refusals._refusals = sudo_refusals.SudoRefusals()
     yield
 
 
