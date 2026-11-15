@@ -20,8 +20,10 @@ import pytest
 
 from fivenines_agent import sudo_refusals
 from fivenines_agent.sudo_refusals import GATE, SudoRefusals
+from fivenines_agent.sudo_refusals import _in_admin_group as real_in_admin_group
 
 REFUSED = "sudo: a password is required"
+NOT_KNOWN = "Sorry, user norule may not run sudo on box."
 FP = (("/etc/sudoers", 1, 2, 3, 4),)
 OTHER_FP = (("/etc/sudoers", 1, 2, 3, 5),)
 
@@ -359,7 +361,7 @@ def test_run_checked_asks_the_account_then_the_command_then_runs(policy):
     assert refusal is None
     assert result.stdout == b"smartctl 7.4\n"
     assert [argv for argv, _ in calls] == [
-        ["sudo", "-n", "-l"],
+        ["sudo", "-n", "-v"],
         ["sudo", "-n", "-l", "smartctl", "--version"],
         ["sudo", "-n", "smartctl", "--version"],
     ]
@@ -381,13 +383,14 @@ def test_run_checked_asks_the_account_once_per_policy(policy):
         (policy / "sudoers.d" / "fivenines").write_text("rule\n")
         sudo_refusals.run_checked(["mdadm", "--version"], timeout=5)
     asked = [call.args[0] for call in run.call_args_list]
-    assert asked.count(["sudo", "-n", "-l"]) == 2
+    assert asked.count(["sudo", "-n", "-v"]) == 2
     assert len(asked) == 3 + 2 + 3
 
 
-def test_run_checked_an_account_refused_asks_no_command(policy):
-    """An account whose rules all need a password, or one sudoers does not
-    know: one question to sudo, for every command, until the policy changes."""
+def test_run_checked_an_account_with_password_rules_asks_no_command(policy):
+    """Rules that all need a password: -v is refused for a password, so the
+    listing decides; refused too, no command is asked, until the policy
+    changes."""
     refused = _completed(1, stderr=REFUSED.encode())
     with patch.object(sudo_refusals, "run_privileged", return_value=refused) as run:
         first = sudo_refusals.run_checked(["smartctl", "--version"], timeout=5)
@@ -401,8 +404,39 @@ def test_run_checked_an_account_refused_asks_no_command(policy):
         (None, "sudo -n mdadm: " + REFUSED),
         (None, "sudo -n fail2ban-client: " + REFUSED),
     ]
-    assert run.call_count == 1
-    assert run.call_args.args[0] == ["sudo", "-n", "-l"]
+    assert [call.args[0] for call in run.call_args_list] == [
+        ["sudo", "-n", "-v"],
+        ["sudo", "-n", "-l"],
+    ]
+
+
+def test_run_checked_an_account_sudoers_does_not_know_asks_only_v(policy):
+    """The default install: `sudo -n -v` mails nothing for it and names it,
+    while `sudo -n -l` would mail on a sudo older than 1.9.16p1."""
+    not_known = _completed(1, stderr=NOT_KNOWN.encode())
+    with patch.object(sudo_refusals, "run_privileged", return_value=not_known) as run:
+        assert sudo_refusals.run_checked(["smartctl", "--version"], timeout=5) == (
+            None,
+            "sudo -n smartctl: " + NOT_KNOWN,
+        )
+        sudo_refusals.run_checked(["mdadm", "--version"], timeout=5)
+    assert [call.args[0] for call in run.call_args_list] == [["sudo", "-n", "-v"]]
+
+
+def test_run_checked_an_admin_group_member_is_asked_l_first(policy, monkeypatch):
+    """A member of sudo or wheel has a rule that needs a password: -v would
+    mail; the listing is free once one of its rules is NOPASSWD (the README's
+    user installation)."""
+    monkeypatch.setattr(sudo_refusals, "_in_admin_group", lambda: True)
+    with patch.object(
+        sudo_refusals, "run_privileged", return_value=_completed(0)
+    ) as run:
+        sudo_refusals.run_checked(["smartctl", "--version"], timeout=5)
+    assert [call.args[0] for call in run.call_args_list] == [
+        ["sudo", "-n", "-l"],
+        ["sudo", "-n", "-l", "smartctl", "--version"],
+        ["sudo", "-n", "smartctl", "--version"],
+    ]
 
 
 def test_run_checked_never_runs_what_sudoers_does_not_list(policy):
@@ -498,3 +532,37 @@ def test_run_checked_remembers_nothing_when_sudo_times_out(policy):
     ) as run:
         sudo_refusals.run_checked(["smartctl"], 5)
     assert run.call_count == 3
+
+
+# --- _in_admin_group ---
+
+
+class _Group:
+    def __init__(self, name):
+        self.gr_name = name
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="grp is Unix-only")
+@pytest.mark.parametrize(
+    "groups, expected",
+    [
+        ({1000: "paseo", 27: "sudo"}, True),
+        ({1000: "paseo", 10: "wheel"}, True),
+        ({1000: "paseo", 4: "adm"}, False),
+        ({1000: "paseo"}, False),
+    ],
+)
+def test_in_admin_group_reads_the_process_groups(groups, expected):
+    import grp
+
+    def getgrgid(gid):
+        if gid not in groups:
+            raise KeyError(gid)
+        return _Group(groups[gid])
+
+    with patch.object(
+        sudo_refusals.os, "getgroups", return_value=[*groups, 999]
+    ), patch.object(sudo_refusals.os, "getegid", return_value=1000), patch.object(
+        grp, "getgrgid", side_effect=getgrgid
+    ):
+        assert real_in_admin_group() is expected

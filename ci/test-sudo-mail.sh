@@ -21,6 +21,9 @@
 #     and nvme (no rule) mail nothing, and smartctl still runs every time;
 #   - an account sudoers does not know (the default install): every probe is
 #     refused and nothing mails;
+#   - a member of the admin group with a NOPASSWD rule for smartctl (the
+#     README's user installation): smartctl runs, the others are refused, and
+#     nothing mails;
 #   - the admin-group member, whose rules all need a password: two agent runs
 #     (a restart) of five probes each of three commands are refused and mail
 #     nothing on sudo >= 1.9.16p1 and sudo-rs, at most once on an older sudo
@@ -119,8 +122,13 @@ useradd -m -G "$admin_group" admin
 echo 'admin:Fivenines-ci-1' | chpasswd
 # An account sudoers does not know: the default system install.
 useradd -m norule
+# The README's user installation: an admin-group member with a NOPASSWD rule.
+useradd -m -G "$admin_group" alice
+echo 'alice:Fivenines-ci-2' | chpasswd
+echo 'alice ALL=(ALL) NOPASSWD: /usr/sbin/smartctl' > /etc/sudoers.d/alice
+chmod 440 /etc/sudoers.d/alice
 # Each one's config dir, where the agent keeps the refusals across restarts.
-for user in fivenines admin norule; do
+for user in fivenines admin norule alice; do
   mkdir -m 700 "/var/tmp/cfg-$user"
   chown "$user" "/var/tmp/cfg-$user"
 done
@@ -146,7 +154,7 @@ as() {
 
 # What each question to sudo costs in mail, per account, each asked once on
 # its own (informational: the probes' design rests on this table).
-for user in fivenines norule admin; do
+for user in fivenines norule alice admin; do
   costs=""
   for question in "run" "list" "check" "validate"; do
     case $question in
@@ -156,7 +164,8 @@ for user in fivenines norule admin; do
       validate) set -- -v ;;
     esac
     as "$user" sudo -n "$@" >/dev/null 2>&1
-    costs="$costs $question=$(mails)"
+    rc=$?
+    costs="$costs $question=$(mails)/rc$rc"
     clear_mails
   done
   echo "    info mails per question, $user:$costs"
@@ -182,6 +191,11 @@ as norule python3 /work/probe.py smartctl=refused fail2ban-client=refused nvme=r
 n=$(mails); clear_mails
 if [ "$n" -eq 0 ]; then echo "    ok   no-rule user: 15 probes, no mail"
 else echo "    FAIL no-rule user: 15 probes, $n mails"; fail=1; fi
+
+as alice python3 /work/probe.py smartctl=ran fail2ban-client=refused nvme=refused || fail=1
+n=$(mails); clear_mails
+if [ "$n" -eq 0 ]; then echo "    ok   admin-group user with a NOPASSWD rule: 15 probes, no mail"
+else echo "    FAIL admin-group user with a NOPASSWD rule: 15 probes, $n mails"; fail=1; fi
 
 as admin python3 /work/probe.py smartctl=refused fail2ban-client=refused nvme=refused || fail=1
 as admin python3 /work/probe.py smartctl=refused fail2ban-client=refused nvme=refused || fail=1

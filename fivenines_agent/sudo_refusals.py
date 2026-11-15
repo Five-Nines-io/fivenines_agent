@@ -10,15 +10,25 @@ administrator 288 to ~1150 times a day per command, whether or not the feature
 was enabled.
 
 run_checked() asks sudo only what costs no mail where anything can, and never
-asks twice:
+asks twice. What each question costs, per kind of account, is measured on the
+real sudo of each CI image (ci/test-sudo-mail.sh); on a sudo older than
+1.9.16p1 with mail_badpass, in mails:
 
-- `sudo -n -l` with no command first, once per policy: may this account use
-  sudo without a password at all? Refused, no command is tried. It mails
-  nothing for an account sudoers does not know, nor since sudo 1.9.16p1 (and
-  never under sudo-rs); an older sudo mails a refusal once, for an account
-  whose rules all need a password (an install run by a member of the sudo
-  group). Nothing an unprivileged process can ask sudo avoids that one:
-  /etc/sudoers is root-only, and every other question is refused the same way.
+    account                          run  -l  -l <command>  -v
+    a NOPASSWD rule (README)          1    0       0         0
+    no sudoers rule (default)         0    1       1         0
+    every rule needs a password       1    1       1         1
+
+- once per policy, whether the account may use sudo without a password at
+  all, by the question that is free for the account it most likely is (see
+  _account_refusal): `sudo -n -v` (free unless a rule needs a password; sudo
+  then names an account it does not know, "may not run sudo"), or for a
+  member of an admin group `sudo -n -l` (free once any rule is NOPASSWD, the
+  README's user installation). Refused, no command is tried. An account whose
+  rules all need a password costs that one mail on a sudo older than 1.9.16p1;
+  nothing an unprivileged process can ask sudo avoids it: /etc/sudoers is
+  root-only, and every question is refused the same way. From 1.9.16p1 on,
+  and under sudo-rs, nothing mails.
 - `sudo -n -l <command>` next: the command runs only once sudo lists it.
   Listing needs no password when the account has at least one NOPASSWD rule
   (sudoers' default `listpw=any`, the README setup), so a command without a
@@ -75,8 +85,15 @@ STATE_FILE = "sudo_refusals"
 # the agent's, and is ignored rather than read.
 MAX_STATE_BYTES = 64 * 1024
 
-# The key of `sudo -n -l` with no command.
+# The key of the question about the account itself (_account_refusal).
 GATE = ()
+
+# Groups the stock sudoers lets use sudo with a password: sudo (Debian,
+# Ubuntu), admin (Ubuntu before 12.04), wheel (RHEL family).
+ADMIN_GROUPS = frozenset({"sudo", "admin", "wheel"})
+
+# How classic sudo refuses an account sudoers does not know (LC_ALL=C).
+NOT_IN_SUDOERS = ("may not run sudo", "is not in the sudoers file")
 
 
 def _decode(output):
@@ -261,28 +278,65 @@ def reset():
     _refusals.reset()
 
 
-def _listing_refusal(args, timeout):
-    """None when `sudo -n -l [args]` lists it, else what sudo said."""
-    listed = run_privileged(
-        ["sudo", "-n", "-l", *args],
+def _sudo_answer(options, timeout):
+    """None when `sudo -n *options` exits 0, else the last line sudo wrote."""
+    answer = run_privileged(
+        ["sudo", "-n", *options],
         timeout=timeout,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
         env=get_clean_env(),
     )
-    if listed.returncode == 0:
+    if answer.returncode == 0:
         return None
     # The last line: a warning sudo prints first (unable to resolve host) is
     # not why it said no.
-    lines = _decode(listed.stderr).splitlines()
+    lines = _decode(answer.stderr).splitlines()
     return lines[-1].strip() if lines else "not allowed by sudoers"
+
+
+def _in_admin_group():
+    """Whether this process belongs to a group the stock sudoers names."""
+    import grp  # Unix only, like every caller of run_checked
+
+    for gid in set(os.getgroups()) | {os.getegid()}:
+        try:
+            if grp.getgrgid(gid).gr_name in ADMIN_GROUPS:
+                return True
+        except KeyError:
+            continue
+    return False
+
+
+def _account_refusal(timeout):
+    """None when this account may use sudo without a password for something.
+
+    Else what sudo said. The first question is the one that mails nothing for
+    the account it most likely is (the table in the module docstring):
+
+    - a member of an admin group has a rule that needs a password: `sudo -n
+      -l`, free once any of its rules is NOPASSWD (the README's user
+      installation), where `-v` would mail;
+    - any other account: `sudo -n -v`, free for one whose rules are all
+      NOPASSWD (the README's system installation) and for one sudoers does not
+      know (the default installation), which sudo then names. Refused for
+      another reason (a rule of its own that needs a password, or sudo-rs's
+      wording), `sudo -n -l` decides.
+    """
+    if not _in_admin_group():
+        detail = _sudo_answer(["-v"], timeout)
+        if detail is None:
+            return None
+        if any(marker in detail for marker in NOT_IN_SUDOERS):
+            return detail
+    return _sudo_answer(["-l"], timeout)
 
 
 def run_checked(args, timeout, retry_interval=REFUSAL_RETRY_INTERVAL, stdout=None):
     """Run `sudo -n *args` unless sudo refuses it, without asking twice.
 
     Returns (result, refusal). When sudo refuses the call -- the account
-    (`sudo -n -l`), the command (`sudo -n -l *args`) or the run itself (a rule
+    (_account_refusal), the command (`sudo -n -l *args`) or the run itself (a rule
     that needs a password), now or earlier under the same policy -- result is
     None and refusal says why, in the `sudo -n <command>: <detail>` form the
     capability reasons use. Otherwise refusal is None and result is the
@@ -297,11 +351,11 @@ def run_checked(args, timeout, retry_interval=REFUSAL_RETRY_INTERVAL, stdout=Non
         if detail is not None:
             return None, f"sudo -n {args[0]}: {detail}"
     if not _refusals.passed(GATE, fingerprint):
-        detail = _listing_refusal([], timeout)
+        detail = _account_refusal(timeout)
         _refusals.remember(GATE, detail, fingerprint)
         if detail is not None:
             return None, f"sudo -n {args[0]}: {detail}"
-    detail = _listing_refusal(args, timeout)
+    detail = _sudo_answer(["-l", *args], timeout)
     if detail is not None:
         _refusals.remember(key, detail, fingerprint)
         return None, f"sudo -n {args[0]}: {detail}"

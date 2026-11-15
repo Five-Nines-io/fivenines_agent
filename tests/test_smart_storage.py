@@ -1471,8 +1471,10 @@ def test_nvme_probe_refused_once_is_not_asked_every_tick(monkeypatch, tmp_path):
     monkeypatch.setattr(smart_storage.subprocess, "run", run)
     for _ in range(5):
         assert smart_storage.nvme_cli_available() is False
-    assert run.call_count == 1
-    assert run.call_args.args[0] == ["sudo", "-n", "-l"]
+    assert [call.args[0] for call in run.call_args_list] == [
+        ["sudo", "-n", "-v"],
+        ["sudo", "-n", "-l"],
+    ]
 
 
 @pytest.mark.parametrize(

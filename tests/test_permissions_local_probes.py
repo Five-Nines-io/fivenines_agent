@@ -122,8 +122,8 @@ def test_can_run_sudo_timeout_is_false_with_reason():
         "fivenines_agent.permissions.log"
     ):
         assert p._can_run_sudo("mdadm", "--version", timeout=7) is False
-    # The first call is the account's listing (sudo_refusals.run_checked).
-    assert seen == {"cmd": ["sudo", "-n", "-l"], "timeout": 7}
+    # The first call is the question about the account (run_checked).
+    assert seen == {"cmd": ["sudo", "-n", "-v"], "timeout": 7}
     assert p._current_reason == "sudo -n mdadm timed out after 7s"
 
 
@@ -173,8 +173,10 @@ def test_refused_sudo_probe_is_asked_once_across_probes(own_policy):
                 p._probe("fail2ban", p._can_run_sudo, "fail2ban-client", "status")
                 is False
             )
-    assert run.call_count == 1
-    assert run.call_args.args[0] == ["sudo", "-n", "-l"]
+    assert [call.args[0] for call in run.call_args_list] == [
+        ["sudo", "-n", "-v"],
+        ["sudo", "-n", "-l"],
+    ]
     assert p._capability_reasons["fail2ban"] == (
         "sudo -n fail2ban-client: sudo: a password is required"
     )
@@ -198,9 +200,9 @@ def test_refused_sudo_probe_is_asked_again_once_a_rule_is_added(own_policy):
         assert (
             p._probe("smart_storage", p._can_run_sudo, "smartctl", "--version") is True
         )
-    # The account's refused listing; once the rule is added, the account's
-    # listing, the command's and the run.
-    assert run.call_count == 4
+    # The account refused (-v, then -l); once the rule is added, -v, the
+    # command's listing and the run.
+    assert run.call_count == 5
     assert "smart_storage" not in p._capability_reasons
 
 

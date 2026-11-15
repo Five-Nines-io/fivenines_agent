@@ -60,6 +60,13 @@ def _reset_process_caches():
 
 
 @pytest.fixture(autouse=True)
+def _not_in_an_admin_group(monkeypatch):
+    """sudo_refusals picks its first question by the process's groups: pin
+    them, so a suite run by a member of sudo or wheel asks what CI asks."""
+    monkeypatch.setattr(sudo_refusals, "_in_admin_group", lambda: False)
+
+
+@pytest.fixture(autouse=True)
 def _no_host_journal_policy(tmp_path_factory, monkeypatch):
     """Keep the suite off the real host's journal allowlist.
 

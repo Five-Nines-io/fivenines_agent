@@ -869,9 +869,11 @@ does not ship it by default.
 > **Mail to root.** The stock `/etc/sudoers` of Debian and Ubuntu sets
 > `Defaults mail_badpass`: every `sudo` call that sudo refuses for an account
 > it knows mails root a "SECURITY information" message. The agent first asks
-> `sudo -n -l` whether the account may use sudo without a password at all,
-> then `sudo -n -l <command>` before running a command: with at least one
-> NOPASSWD rule, as above, neither needs a password and nothing mails. It
+> whether the account may use sudo without a password at all (`sudo -n -v`,
+> or `sudo -n -l` for a member of the `sudo` or `wheel` group), then
+> `sudo -n -l <command>` before running a command: for an account with a
+> NOPASSWD rule, as above, or with no sudo rule at all, none of these needs a
+> password and nothing mails. It
 > remembers every refusal, across restarts, and asks again only once
 > `/etc/sudoers`, `/etc/sudoers.d` or `/etc/group` changes, the permissions are
 > rechecked (`SIGHUP` or the dashboard), or -- for a feature you enabled -- a
