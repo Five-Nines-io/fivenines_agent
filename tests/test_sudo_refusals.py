@@ -926,6 +926,7 @@ def test_an_account_whose_v_needs_a_password_is_asked_l_after_a_restart(policy, 
 # --- who asks, and the state file's own limits ---
 
 
+@posix_only
 def test_fingerprint_counts_who_asks(policy):
     """sudo matches %group rules against the process's groups, which change
     only at a restart: a restart with a new group asks again."""
@@ -1006,6 +1007,7 @@ def test_run_checked_questions_keep_a_shorter_caller_timeout(policy):
     assert [call.kwargs["timeout"] for call in run.call_args_list] == [2, 2, 2]
 
 
+@posix_only
 def test_fingerprint_counts_the_effective_uid(policy):
     # Value: protects=euid in _identity; fails_when=_identity drops geteuid
     # and two accounts share refusals; why_new=only groups were varied;
@@ -1014,3 +1016,37 @@ def test_fingerprint_counts_the_effective_uid(policy):
         before = sudo_refusals.policy_fingerprint()
     with patch.object(sudo_refusals.os, "geteuid", return_value=0):
         assert sudo_refusals.policy_fingerprint() != before
+
+
+def test_run_checked_root_runs_its_tools_beside_a_specific_nopasswd_rule(
+    policy, tools, monkeypatch
+):
+    """Root in wheel, whose listing also shows a NOPASSWD rule for one command
+    (`%wheel ALL=(ALL) NOPASSWD: /sbin/reboot`): sudo never asks root a
+    password, so the listing is not read for one."""
+    # Value: protects=root never refused by the NOPASSWD heuristic;
+    # fails_when=_is_root() is dropped from run_checked; why_new=the other
+    # root test has no NOPASSWD entry at all; seam=none; no_claim=real sudo
+    monkeypatch.setattr(sudo_refusals, "_in_admin_group", lambda: True)
+    monkeypatch.setattr(sudo_refusals, "_is_root", lambda: True)
+    root = (
+        "User root may run the following commands on box:\n"
+        "    (ALL : ALL) ALL\n"
+        "    (ALL) NOPASSWD: /sbin/reboot\n"
+    )
+    with patch.object(sudo_refusals, "run_privileged", side_effect=_sudo_for(root)):
+        result, refusal = sudo_refusals.run_checked(["smartctl", "--version"], 5)
+    assert refusal is None
+    assert result.returncode == 0
+
+
+@posix_only
+@pytest.mark.parametrize("euid, root", [(0, True), (1000, False)])
+def test_is_root_reads_the_effective_uid(euid, root):
+    with patch.object(sudo_refusals.os, "geteuid", return_value=euid):
+        assert sudo_refusals._is_root() is root
+
+
+def test_is_root_is_false_without_uids(monkeypatch):
+    monkeypatch.delattr(sudo_refusals.os, "geteuid", raising=False)
+    assert sudo_refusals._is_root() is False

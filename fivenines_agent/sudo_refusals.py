@@ -186,6 +186,11 @@ def _identity():
     return (os.geteuid(), tuple(sorted(os.getgroups())))
 
 
+def _is_root():
+    """Whether the agent runs as root, whom sudo never asks a password."""
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
 def policy_fingerprint():
     """A digest of the sudo policy and of who asks: changes when either does.
 
@@ -543,6 +548,7 @@ def run_checked(args, timeout, retry_interval=REFUSAL_RETRY_INTERVAL, stdout=Non
         if (
             detail is None
             and listing
+            and not _is_root()
             and _needs_a_password(_resolved(listed, args[0]), listing)
         ):
             detail = NEEDS_AUTHENTICATION
