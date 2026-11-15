@@ -28,6 +28,7 @@ import fivenines_agent.mysql as mysql_module
 import fivenines_agent.packages as packages_module
 import fivenines_agent.qemu as qemu_module
 import fivenines_agent.raid_storage as raid_module
+import fivenines_agent.sudo_refusals as sudo_refusals
 import fivenines_agent.synchronizer as synchronizer_module
 from fivenines_agent import cli
 from fivenines_agent.cache import TTLCache
@@ -52,6 +53,8 @@ def _reset_process_caches():
     qemu_module._stalled_worker = None
     qemu_module._reset_backoff()
     journal_policy.reset_cache()
+    # The sudo calls refused in an earlier test must not be skipped in this one.
+    sudo_refusals.reset()
     yield
 
 

@@ -694,6 +694,9 @@ class Agent:
         self.permissions.set_docker_socket_url(
             docker_cfg.get("socket_url") if isinstance(docker_cfg, dict) else None
         )
+        # Also before any (re)probe: a refused sudo probe is retried on time
+        # alone only for an enabled feature (PermissionProbe._can_run_sudo).
+        self.permissions.set_enabled_capabilities(self._enabled_capability_keys(config))
         if self._recheck_token_changed(config.get("permissions_recheck_token")):
             self.permissions.force_refresh()
             pending = self._pending_capabilities(config)
@@ -789,6 +792,16 @@ class Agent:
             return 0
         return max(interval, min(raw, 3600))
 
+    def _enabled_capability_keys(self, config):
+        """Capability keys of the COLLECTORS the config enables, in registry
+        order (smart_storage_health -> smart_storage via the same override
+        the gate uses)."""
+        return [
+            _capability_key_for(config_key)
+            for config_key, _collectors in COLLECTORS
+            if config.get(config_key)
+        ]
+
     def _pending_capabilities(self, config):
         """Capabilities the operator enabled (config flag truthy) that are
         currently probed False. Drives the selective gap re-probe and is sent in
@@ -796,13 +809,11 @@ class Agent:
         collectors config-key <-> capability-key mapping so the override
         (smart_storage_health -> smart_storage) lives in one place."""
         caps = self.permissions.get_all()
-        pending = []
-        for config_key, _collectors in COLLECTORS:
-            if not config.get(config_key):
-                continue
-            cap_key = _capability_key_for(config_key)
-            if cap_key in caps and not caps[cap_key]:
-                pending.append(cap_key)
+        pending = [
+            cap_key
+            for cap_key in self._enabled_capability_keys(config)
+            if cap_key in caps and not caps[cap_key]
+        ]
         # snmp and packages live outside COLLECTORS; use the same
         # present-and-falsy test as the COLLECTORS loop above (an absent cap on
         # this OS is not pending).

@@ -1,6 +1,8 @@
 import json
+import shutil
 import subprocess
 
+from fivenines_agent import sudo_refusals
 from fivenines_agent.cache import TTLCache
 from fivenines_agent.debug import debug, log
 from fivenines_agent.subprocess_utils import get_clean_env, run_privileged
@@ -297,22 +299,33 @@ NVME_ATTRIBUTE_NAMES = {
 }
 
 def _sudo_probe(args, timeout=5):
-    """Run `sudo -n <args>` and return the CompletedProcess, or None.
+    """Run `sudo -n <args>` and return its stdout, or None.
 
-    Returns None when the command could not run, exited non-zero, timed out, or
-    raised -- i.e. the tool is not usable via passwordless sudo. Centralizes the
-    one `sudo -n` probe shape shared by the *_available() gates and the
-    get_*_version() fetchers, so the invocation, timeout, and env handling
-    cannot drift between them. Uses sudo -n (non-interactive) to detect whether
-    sudoers is configured without ever prompting for a password.
+    Returns None when the command is not installed, could not run, exited
+    non-zero, timed out, or raised -- i.e. the tool is not usable via
+    passwordless sudo. Centralizes the one `sudo -n` probe shape shared by the
+    *_available() gates and the get_*_version() fetchers, so the invocation,
+    timeout, and env handling cannot drift between them. Uses sudo -n
+    (non-interactive) to detect whether sudoers is configured without ever
+    prompting for a password.
+
+    It runs every tick (`nvme version`, on any host with an NVMe drive), so it
+    goes through sudo_refusals.run_checked: a command not installed never
+    reaches sudo (which authenticates BEFORE it reports "command not found"),
+    one sudoers does not list is never run, and a refusal is not repeated
+    until the sudo policy changes. On Debian/Ubuntu each refusal mails root.
     """
+    if shutil.which(args[0]) is None:
+        log(f"{args[0]} not found in PATH", 'debug')
+        return None
     try:
-        result = run_privileged(
-            ["sudo", "-n", *args],
-            capture_output=True, text=True, timeout=timeout,
-            env=get_clean_env()
-        )
-        return result if result.returncode == 0 else None
+        result, refusal = sudo_refusals.run_checked(args, timeout=timeout)
+        if refusal is not None:
+            log(refusal, 'debug')
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout.decode("utf-8", errors="replace")
     except subprocess.TimeoutExpired:
         log(f"sudo -n {args[0]} probe timed out", 'error')
         return None
@@ -339,7 +352,7 @@ def list_storage_devices():
     devices = []
     try:
         result = run_privileged(
-            ['sudo', 'smartctl', '--scan'],
+            ['sudo', '-n', 'smartctl', '--scan'],
             capture_output=True, timeout=_DATA_SUBPROCESS_TIMEOUT,
             env=get_clean_env()
         )
@@ -361,7 +374,7 @@ def get_nvme_enhanced_info(device):
     """Get additional NVMe-specific information using nvme-cli."""
     try:
         result = run_privileged(
-            ["sudo", "nvme", "smart-log", device, "-o", "json"],
+            ["sudo", "-n", "nvme", "smart-log", device, "-o", "json"],
             capture_output=True, text=True, check=True,
             timeout=_DATA_SUBPROCESS_TIMEOUT,
             env=get_clean_env()
@@ -403,7 +416,7 @@ def get_storage_info(device, nvme_available=lambda: False):
             "device": device.split('/')[-1]
         }
         proc_result = run_privileged(
-            ['sudo', 'smartctl', *HEALTH_SMARTCTL_ARGS, device],
+            ['sudo', '-n', 'smartctl', *HEALTH_SMARTCTL_ARGS, device],
             capture_output=True, text=True,
             timeout=_DATA_SUBPROCESS_TIMEOUT,
             env=get_clean_env()
@@ -558,25 +571,25 @@ def get_smartctl_version():
     unusable smartctl (absent, no passwordless sudo) -- or empty version output
     -- returns None quietly, letting the caller skip a separate probe.
     """
-    proc = _sudo_probe(["smartctl", "--version"])
-    if proc is None:
+    out = _sudo_probe(["smartctl", "--version"])
+    if out is None:
         return None
     # First line, or None if the tool printed nothing parseable.
-    return proc.stdout.split('\n')[0].strip() or None
+    return out.split('\n')[0].strip() or None
 
 def get_nvme_cli_version():
     """Return the nvme-cli version string, or None if nvme-cli is unavailable."""
-    proc = _sudo_probe(["nvme", "version"])
-    if proc is None:
+    out = _sudo_probe(["nvme", "version"])
+    if out is None:
         return None
     # First line, or None if the tool printed nothing parseable.
-    return proc.stdout.split('\n')[0].strip() or None
+    return out.split('\n')[0].strip() or None
 
 def get_storage_identification(device):
     """Get storage device identification using smartctl."""
     try:
         result = run_privileged(
-            ["sudo", "smartctl", "-i", device],
+            ["sudo", "-n", "smartctl", "-i", device],
             capture_output=True, text=True, check=True,
             timeout=_DATA_SUBPROCESS_TIMEOUT,
             env=get_clean_env()

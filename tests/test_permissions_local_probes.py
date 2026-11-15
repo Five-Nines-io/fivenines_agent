@@ -12,7 +12,9 @@ import os
 import subprocess
 from unittest.mock import MagicMock, patch
 
-from fivenines_agent import permissions
+import pytest
+
+from fivenines_agent import permissions, sudo_refusals
 from fivenines_agent.permissions import PermissionProbe
 
 HWMON = "/sys/class/hwmon"
@@ -96,7 +98,7 @@ def test_can_read_reason_reaches_capability_reasons():
 def test_can_run_sudo_command_missing_never_runs_sudo():
     p = _probe()
     with patch.object(permissions.shutil, "which", return_value=None), patch(
-        "fivenines_agent.permissions.run_privileged"
+        "fivenines_agent.sudo_refusals.run_privileged"
     ) as run_privileged:
         assert p._can_run_sudo("smartctl", "--version") is False
     run_privileged.assert_not_called()
@@ -120,7 +122,8 @@ def test_can_run_sudo_timeout_is_false_with_reason():
         "fivenines_agent.permissions.log"
     ):
         assert p._can_run_sudo("mdadm", "--version", timeout=7) is False
-    assert seen == {"cmd": ["sudo", "-n", "mdadm", "--version"], "timeout": 7}
+    # The first call is the listing (sudo_refusals.run_checked); it times out.
+    assert seen == {"cmd": ["sudo", "-n", "-l", "mdadm", "--version"], "timeout": 7}
     assert p._current_reason == "sudo -n mdadm timed out after 7s"
 
 
@@ -129,7 +132,7 @@ def test_can_run_sudo_default_timeout_in_reason():
     with patch.object(
         permissions.shutil, "which", return_value="/usr/bin/fail2ban-client"
     ), patch(
-        "fivenines_agent.permissions.run_privileged",
+        "fivenines_agent.sudo_refusals.run_privileged",
         side_effect=subprocess.TimeoutExpired(["sudo"], 5),
     ) as run_privileged:
         assert p._can_run_sudo("fail2ban-client", "status") is False
@@ -137,6 +140,106 @@ def test_can_run_sudo_default_timeout_in_reason():
     assert p._current_reason == (
         f"sudo -n fail2ban-client timed out after " f"{permissions.SUDO_PROBE_TIMEOUT}s"
     )
+
+
+@pytest.fixture
+def own_policy(tmp_path, monkeypatch):
+    """sudo_refusals reads policy files of our own, not the host's."""
+    sudoers_d = tmp_path / "sudoers.d"
+    sudoers_d.mkdir()
+    monkeypatch.setattr(sudo_refusals, "POLICY_FILES", (str(tmp_path / "sudoers"),))
+    monkeypatch.setattr(sudo_refusals, "POLICY_DIR", str(sudoers_d))
+    return sudoers_d
+
+
+_PASSWORD_REQUIRED = b"sudo: a password is required"
+
+
+def test_refused_sudo_probe_is_asked_once_across_probes(own_policy):
+    """The mail storm: on Debian/Ubuntu every refused sudo mails root, and the
+    full probe (5 min) plus the gap probes (60-120s) repeated it. Five probes
+    now ask sudo once, and the reason stays on the capability."""
+    p = _probe()
+    with patch.object(
+        permissions.shutil, "which", return_value="/usr/bin/fail2ban-client"
+    ), patch(
+        "fivenines_agent.sudo_refusals.run_privileged",
+        return_value=_completed(1, stderr=_PASSWORD_REQUIRED),
+    ) as run, patch(
+        "fivenines_agent.permissions.log"
+    ):
+        for _ in range(5):
+            assert (
+                p._probe("fail2ban", p._can_run_sudo, "fail2ban-client", "status")
+                is False
+            )
+    assert run.call_count == 1
+    assert run.call_args.args[0] == ["sudo", "-n", "-l", "fail2ban-client", "status"]
+    assert p._capability_reasons["fail2ban"] == (
+        "sudo -n fail2ban-client: sudo: a password is required"
+    )
+
+
+def test_refused_sudo_probe_is_asked_again_once_a_rule_is_added(own_policy):
+    p = _probe()
+    with patch.object(
+        permissions.shutil, "which", return_value="/usr/sbin/smartctl"
+    ), patch("fivenines_agent.sudo_refusals.run_privileged") as run, patch(
+        "fivenines_agent.permissions.log"
+    ):
+        run.return_value = _completed(1, stderr=_PASSWORD_REQUIRED)
+        assert (
+            p._probe("smart_storage", p._can_run_sudo, "smartctl", "--version") is False
+        )
+        (own_policy / "fivenines").write_text(
+            "fivenines ALL=(ALL) NOPASSWD: /usr/sbin/smartctl\n"
+        )
+        run.return_value = _completed(0, stdout=b"smartctl 7.4")
+        assert (
+            p._probe("smart_storage", p._can_run_sudo, "smartctl", "--version") is True
+        )
+    assert run.call_count == 3  # the refused listing, then listing + run
+    assert "smart_storage" not in p._capability_reasons
+
+
+def test_force_refresh_asks_sudo_again():
+    """SIGHUP and the dashboard's recheck: the operator wants a real answer."""
+    p = _probe()
+    with patch.object(sudo_refusals, "reset") as reset, patch.object(
+        PermissionProbe, "_probe_all"
+    ) as probe_all, patch("fivenines_agent.permissions.log"):
+        p.force_refresh()
+    reset.assert_called_once_with()
+    probe_all.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "enabled, retry_interval",
+    [
+        (["smart_storage", "docker"], sudo_refusals.REFUSAL_RETRY_INTERVAL),
+        (["docker"], None),
+        ([], None),
+    ],
+)
+def test_refusal_retried_daily_only_for_an_enabled_feature(enabled, retry_interval):
+    """An enabled feature without its rule is retried once a day (rules from
+    LDAP/sssd change no local file); one the operator has not enabled is
+    retried only when the policy files change or on a recheck."""
+    p = _probe()
+    p.set_enabled_capabilities(enabled)
+    assert p._enabled_capabilities == frozenset(enabled)
+    with patch.object(
+        permissions.shutil, "which", return_value="/usr/sbin/smartctl"
+    ), patch.object(
+        sudo_refusals, "run_checked", return_value=(None, "refused")
+    ) as run_checked, patch(
+        "fivenines_agent.permissions.log"
+    ):
+        assert (
+            p._probe("smart_storage", p._can_run_sudo, "smartctl", "--version") is False
+        )
+    assert run_checked.call_args.kwargs["retry_interval"] == retry_interval
+    assert p._capability_reasons["smart_storage"] == "refused"
 
 
 def test_can_run_sudo_unexpected_exception_is_false_with_reason():

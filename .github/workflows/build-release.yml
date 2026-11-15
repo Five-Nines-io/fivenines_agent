@@ -671,6 +671,7 @@ jobs:
             ci/test-selinux-vm.sh \
             ci/test-signing.sh \
             ci/test-32bit-userland.sh \
+            ci/test-sudo-mail.sh \
             ci/check-nosec.sh \
             ci/requirements/compile.sh
 
@@ -686,11 +687,22 @@ jobs:
       # refusal (#170) rests on the real one printing 32 under a 64-bit kernel.
       # i386 images run natively on this x86_64 runner, so this checks the
       # premise itself, on glibc and on musl, with amd64 controls. Last in the
-      # job, and time-boxed: it is the only step that pulls from Docker Hub,
-      # and a failed or hung pull must not skip the checks above.
+      # job with the sudo check below, and time-boxed: they are the only steps
+      # that pull from Docker Hub, and a failed or hung pull must not skip the
+      # checks above.
       - name: Verify the 32-bit userland refusal on real userlands
         timeout-minutes: 10
         run: sh ci/test-32bit-userland.sh
+
+      # The capability probes' sudo calls against the real sudo of each
+      # distribution, with a sendmail stub: on Debian/Ubuntu (stock
+      # mail_badpass) every refused sudo mails root, and the probes repeated
+      # them every few minutes. Runs even when the step above failed: a Docker
+      # Hub hiccup there must not hide this one.
+      - name: Verify the sudo probes do not mail root
+        if: ${{ !cancelled() }}
+        timeout-minutes: 15
+        run: sh ci/test-sudo-mail.sh
 
   # Distro regression testing
   test-distro-matrix:

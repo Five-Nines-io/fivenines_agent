@@ -11,13 +11,14 @@ from functools import partial
 
 import psutil
 
+from fivenines_agent import sudo_refusals
 from fivenines_agent.bounded import WorkerTimeout, call_bounded
 from fivenines_agent.debug import log
 from fivenines_agent.env import is_windows
 from fivenines_agent.openvpn import probe_management_access
 from fivenines_agent.qemu import DEFAULT_LIBVIRT_URI
 from fivenines_agent.scrub import log_safe
-from fivenines_agent.subprocess_utils import get_clean_env, run_privileged
+from fivenines_agent.subprocess_utils import get_clean_env
 from fivenines_agent.windows_services import probe_access as probe_services_access
 from fivenines_agent.wireguard import (
     WG_DUMP_ARGV,
@@ -170,6 +171,16 @@ class PermissionProbe:
     Automatically re-probes periodically to detect permission changes.
     """
 
+    # Capability keys whose feature the config enables, pushed by the agent
+    # every tick (set_enabled_capabilities). Every capability is probed either
+    # way -- the server's auto-detection reads a True probe of a feature the
+    # operator has not enabled yet -- but a sudo probe sudo refused is retried
+    # after REFUSAL_RETRY_INTERVAL only for an enabled feature (_can_run_sudo).
+    # Class defaults so probes built with __new__ (tests) have them too.
+    _enabled_capabilities: frozenset[str] = frozenset()
+    # The capability _probe() is running, for the probe method to read.
+    _current_capability: str | None = None
+
     def __init__(self):
         self.capabilities = {}
         # Maps capability name -> short reason string for the most recent
@@ -207,6 +218,7 @@ class PermissionProbe:
         _current_reason register is safe.
         """
         self._current_reason = None
+        self._current_capability = cap_name
         result = probe_callable(*args)
         if result:
             self._capability_reasons.pop(cap_name, None)
@@ -513,10 +525,23 @@ class PermissionProbe:
         return False
 
     def force_refresh(self):
-        """Force an immediate re-probe of capabilities."""
+        """Force an immediate re-probe of capabilities.
+
+        SIGHUP and the dashboard's recheck are the operator asking for a real
+        answer, so the sudo calls sudo refused earlier are sent again too.
+        """
         log("Force re-probing capabilities...", "info")
+        sudo_refusals.reset()
         self._probe_all()
         return self.capabilities
+
+    def set_enabled_capabilities(self, names):
+        """Record the capability keys whose feature the config enables.
+
+        Decides only how a refused sudo probe is retried (see
+        _enabled_capabilities): probing itself never depends on it.
+        """
+        self._enabled_capabilities = frozenset(names)
 
     def _can_read(self, path):
         """Check if a file/directory is readable."""
@@ -547,6 +572,15 @@ class PermissionProbe:
         Check if we can run a command with sudo non-interactively.
         Uses sudo -n which fails immediately if password is required.
 
+        Through sudo_refusals.run_checked: the command is run only once
+        `sudo -n -l` lists it as allowed, and a call sudo refused is not sent
+        again until the sudo policy files change, a recheck (force_refresh),
+        or -- for a capability whose feature is enabled --
+        REFUSAL_RETRY_INTERVAL. On Debian/Ubuntu (stock `Defaults
+        mail_badpass`) every refusal mails root, and these probes run every
+        one to five minutes. A refusal recalled without a call keeps its
+        reason, so the dashboard still names the missing rule.
+
         secret_output=True is for a command whose STDOUT is key material (today
         only `wg show all dump`, see SECRET_OUTPUT_PROBES). It changes two
         things, both for the same reason -- the probe needs a verdict, not the
@@ -569,8 +603,7 @@ class PermissionProbe:
           using the collector's own classifier so the two cannot disagree.
         """
         cmd_path = shutil.which(cmd)
-        full_cmd = ["sudo", "-n", cmd, *args]
-        full_cmd_str = " ".join(full_cmd)
+        full_cmd_str = " ".join(["sudo", "-n", cmd, *args])
 
         if not cmd_path:
             log(f"_can_run_sudo: '{cmd}' not found in PATH", "debug")
@@ -580,14 +613,22 @@ class PermissionProbe:
         log(f"_can_run_sudo: '{cmd}' found at {cmd_path}", "debug")
         log(f"_can_run_sudo: running '{full_cmd_str}'", "debug")
 
+        retry_interval = (
+            sudo_refusals.REFUSAL_RETRY_INTERVAL
+            if self._current_capability in self._enabled_capabilities
+            else None
+        )
         try:
-            result = run_privileged(
-                full_cmd,
+            result, refusal = sudo_refusals.run_checked(
+                [cmd, *args],
                 timeout=timeout,
+                retry_interval=retry_interval,
                 stdout=subprocess.DEVNULL if secret_output else subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=get_clean_env(),
             )
+            if refusal is not None:
+                log(f"_can_run_sudo: '{cmd}' -> UNAVAILABLE ({refusal})", "debug")
+                self._set_reason(refusal)
+                return False
             stdout = (
                 ""
                 if secret_output
