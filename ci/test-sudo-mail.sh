@@ -144,6 +144,24 @@ as() {
   runuser -u "$user" -- env PYTHONDONTWRITEBYTECODE=1 CONFIG_DIR="/var/tmp/cfg-$user" "$@"
 }
 
+# What each question to sudo costs in mail, per account, each asked once on
+# its own (informational: the probes' design rests on this table).
+for user in fivenines norule admin; do
+  costs=""
+  for question in "run" "list" "check" "validate"; do
+    case $question in
+      run) set -- /usr/bin/fail2ban-client status ;;
+      list) set -- -l ;;
+      check) set -- -l /usr/bin/fail2ban-client status ;;
+      validate) set -- -v ;;
+    esac
+    as "$user" sudo -n "$@" >/dev/null 2>&1
+    costs="$costs $question=$(mails)"
+    clear_mails
+  done
+  echo "    info mails per question, $user:$costs"
+done
+
 if [ "$badpass" = 1 ]; then
   as fivenines sudo -n /usr/bin/fail2ban-client status >/dev/null 2>&1
   n=$(mails); clear_mails
