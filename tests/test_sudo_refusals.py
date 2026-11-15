@@ -972,3 +972,45 @@ def test_a_failed_save_leaves_no_temp_file(monkeypatch):
     )
     SudoRefusals().remember(("smartctl",), REFUSED, FP)
     assert os.listdir(os.environ["CONFIG_DIR"]) == []
+
+
+def test_run_checked_compares_the_path_sudo_lists(policy, tools, monkeypatch):
+    """The agent's PATH can name another smartctl than sudo's secure_path:
+    the NOPASSWD rule is checked against the program sudo would run."""
+    # Value: protects=_resolved wiring in run_checked; fails_when=run_checked
+    # reverts to shutil.which(args[0]) and refuses a working tool;
+    # why_new=the tools fixture maps both paths to one file; seam=none;
+    # no_claim=real secure_path (fake sudo)
+    other = tools["smartctl"] + "-local"
+    open(other, "w").close()
+    monkeypatch.setattr(
+        sudo_refusals.shutil,
+        "which",
+        lambda name: other if name == "smartctl" else None,
+    )
+    monkeypatch.setattr(sudo_refusals, "_in_admin_group", lambda: True)
+    with patch.object(sudo_refusals, "run_privileged", side_effect=_sudo_for(ALICE)):
+        result, refusal = sudo_refusals.run_checked(["smartctl", "--version"], 5)
+    assert refusal is None
+    assert result.returncode == 0
+
+
+def test_run_checked_questions_keep_a_shorter_caller_timeout(policy):
+    # Value: protects=min() in question_timeout; fails_when=QUESTION_TIMEOUT
+    # replaces min() and lengthens a short caller's questions; why_new=only a
+    # timeout above 5 was tested; seam=none; no_claim=watchdog budget
+    with patch.object(
+        sudo_refusals, "run_privileged", return_value=_completed(0)
+    ) as run:
+        sudo_refusals.run_checked(["smartctl", "--version"], timeout=2)
+    assert [call.kwargs["timeout"] for call in run.call_args_list] == [2, 2, 2]
+
+
+def test_fingerprint_counts_the_effective_uid(policy):
+    # Value: protects=euid in _identity; fails_when=_identity drops geteuid
+    # and two accounts share refusals; why_new=only groups were varied;
+    # seam=none; no_claim=sudo's own uid matching
+    with patch.object(sudo_refusals.os, "geteuid", return_value=1000):
+        before = sudo_refusals.policy_fingerprint()
+    with patch.object(sudo_refusals.os, "geteuid", return_value=0):
+        assert sudo_refusals.policy_fingerprint() != before
