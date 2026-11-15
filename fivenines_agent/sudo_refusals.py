@@ -16,7 +16,9 @@ run_checked() does two things about it:
   one NOPASSWD rule (sudoers' default `listpw=any`), the README's setup, so a
   command without a rule costs no authentication failure and no mail. A user
   whose rules all need a password (an install run by a member of the sudo
-  group) still fails the listing; sudo before 1.9.16p1 mails that too.
+  group) still fails the listing, and sudo mails that too (measured on
+  1.8.31 to 1.9.16p2: 1.9.16p1 stopped mailing a bare `-nl`, not
+  `-l <command>`), so the memory below is what bounds it.
 - It remembers what sudo refused, and does not ask again until one of these
   happens:
     * a file a sudoers rule or a group membership is read from changes

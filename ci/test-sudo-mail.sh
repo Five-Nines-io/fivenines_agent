@@ -19,8 +19,9 @@
 #   - the README's user: five probes each of smartctl (allowed), fail2ban-client
 #     and nvme (no rule) mail nothing, and smartctl still runs every time;
 #   - the admin-group member, whose rules all need a password: five probes of
-#     smartctl are refused and mail at most once (sudo < 1.9.16p1 mails a
-#     refused `sudo -n -l`; the memory stops the repeats).
+#     smartctl are refused and mail at most once (a refused `sudo -n -l
+#     <command>` mails too, on every sudo measured; the memory stops the
+#     repeats).
 #
 # Needs docker. Usage: sh ci/test-sudo-mail.sh
 
@@ -146,6 +147,10 @@ else echo "    FAIL admin-group user: 5 probes, $n mails"; fail=1; fi
 exit "$fail"
 EOF
 
+# mktemp -d makes it 0700: the container's users read it under their own uids.
+chmod 755 "$WORK"
+chmod 644 "$WORK/probe.py" "$WORK/case.sh"
+
 FAIL=0
 
 # $1 image, $2 sudo flavor (sudo or sudo-rs)
@@ -164,7 +169,7 @@ run_case ubuntu:20.04 sudo      # sudo 1.8.31
 run_case ubuntu:22.04 sudo      # 1.9.9: -n tried PAM authentication
 run_case ubuntu:24.04 sudo      # 1.9.15
 run_case debian:bookworm sudo   # 1.9.13
-run_case debian:trixie sudo     # 1.9.16: -nl no longer mails
+run_case debian:trixie sudo     # 1.9.16p2: a bare -nl no longer mails, -l <command> still does
 run_case rockylinux:9 sudo      # 1.9.5, no mail_badpass by default
 run_case ubuntu:26.04 sudo-rs   # Ubuntu's default sudo since 25.10
 
