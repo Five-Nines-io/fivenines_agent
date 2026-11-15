@@ -2,11 +2,12 @@
 
 On Debian/Ubuntu (stock `Defaults mail_badpass`) every `sudo -n` that sudo
 refuses mails root, and the capability probes used to repeat each refused call
-every one to five minutes. These tests pin the fix: `sudo -n -l` with no
-command decides first whether the account can use sudo without a password at
-all, a command sudoers does not list is never run, and a refusal -- kept in
-the config directory across restarts -- is asked again only once the sudo
-policy files change, a recheck resets it, or its retry interval has passed.
+every one to five minutes. These tests pin the fix: a question about the
+account (`sudo -n -v`, or `sudo -n -l` for an admin-group member) decides first
+whether it can use sudo without a password at all, a command sudoers does not
+list (or lists only with a password) is never run, and a refusal -- kept in the
+config directory across restarts -- is asked again only once the sudo policy
+fingerprint changes, a recheck resets it, or its retry interval has passed.
 """
 
 import json
@@ -24,8 +25,8 @@ from fivenines_agent.sudo_refusals import _in_admin_group as real_in_admin_group
 
 REFUSED = "sudo: a password is required"
 NOT_KNOWN = "Sorry, user norule may not run sudo on box."
-FP = (("/etc/sudoers", 1, 2, 3, 4),)
-OTHER_FP = (("/etc/sudoers", 1, 2, 3, 5),)
+FP = "fingerprint-1"
+OTHER_FP = "fingerprint-2"
 
 posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX modes/FIFOs")
 
@@ -146,18 +147,17 @@ def test_fingerprint_unreadable_directory_still_fingerprints(monkeypatch, tmp_pa
     monkeypatch.setattr(sudo_refusals, "POLICY_FILES", ())
     monkeypatch.setattr(sudo_refusals, "POLICY_DIR", str(sudoers_d))
     with patch.object(sudo_refusals.os, "listdir", side_effect=PermissionError):
-        fingerprint = sudo_refusals.policy_fingerprint()
-    assert len(fingerprint) == 1
-    assert fingerprint[0][0] == str(sudoers_d)
-    assert len(fingerprint[0]) == 5
+        stats = sudo_refusals._policy_stats()
+    assert len(stats) == 1
+    assert stats[0][0] == str(sudoers_d)
+    assert len(stats[0]) == 5
 
 
 def test_fingerprint_missing_file_is_its_errno(monkeypatch, tmp_path):
     missing = str(tmp_path / "nope")
     monkeypatch.setattr(sudo_refusals, "POLICY_FILES", (missing,))
     monkeypatch.setattr(sudo_refusals, "POLICY_DIR", str(tmp_path / "nodir"))
-    fingerprint = sudo_refusals.policy_fingerprint()
-    assert fingerprint[0] == (missing, 2)
+    assert sudo_refusals._policy_stats()[0] == (missing, 2)
 
 
 # --- SudoRefusals ---
@@ -301,8 +301,9 @@ def test_the_state_file_is_owner_only():
         b'[{"argv": ["smartctl"]}]',
         b'[{"argv": 5, "fingerprint": [], "refused_at": 1, "detail": "x"}]',
         b'[{"argv": ["x"], "fingerprint": [], "refused_at": "soon", "detail": "x"}]',
+        b"[" * 5000,
     ],
-    ids=["not-json", "not-a-list", "missing-keys", "bad-argv", "bad-time"],
+    ids=["not-json", "not-a-list", "missing-keys", "bad-argv", "bad-time", "nested"],
 )
 def test_an_unreadable_state_file_is_no_refusal(content):
     with open(_state_file(), "wb") as f:
@@ -367,8 +368,9 @@ def test_run_checked_asks_the_account_then_the_command_then_runs(policy):
         ["sudo", "-n", "-l", "smartctl", "--version"],
         ["sudo", "-n", "smartctl", "--version"],
     ]
+    # The questions are capped at QUESTION_TIMEOUT; the command keeps its own.
+    assert [kwargs["timeout"] for _, kwargs in calls] == [5, 5, 7]
     for _, kwargs in calls:
-        assert kwargs["timeout"] == 7
         assert kwargs["stderr"] == subprocess.PIPE
         assert kwargs["env"]["LC_ALL"] == "C"
     assert calls[0][1]["stdout"] == subprocess.PIPE
@@ -498,13 +500,19 @@ def test_run_checked_remembers_a_run_sudo_rs_refused(policy):
 def test_run_checked_retries_a_command_that_failed_on_its_own(policy):
     """fail2ban stopped: sudo ran the command, so the next probe runs it again."""
     failed = _completed(255, stderr=b"Failed to access socket path")
-    responses = [_completed(0), _completed(0), failed, _completed(0), failed]
+    responses = [_completed(0), _completed(0), failed, failed]
     with patch.object(sudo_refusals, "run_privileged", side_effect=responses) as run:
         sudo_refusals.run_checked(["fail2ban-client", "status"], 5)
         result, refusal = sudo_refusals.run_checked(["fail2ban-client", "status"], 5)
     assert refusal is None
     assert result is failed
-    assert run.call_count == 5
+    # The second call is not listed again: sudo allowed it under this policy.
+    assert [call.args[0][-2:] for call in run.call_args_list] == [
+        ["-n", "-v"],
+        ["fail2ban-client", "status"],
+        ["fail2ban-client", "status"],
+        ["fail2ban-client", "status"],
+    ]
 
 
 def test_run_checked_passes_stdout_through(policy):
@@ -592,9 +600,18 @@ User alice may run the following commands on box:
 """
 
 
+LISTED = {
+    "smartctl": "/usr/sbin/smartctl",
+    "mdadm": "/sbin/mdadm",
+    "fail2ban-client": "/usr/bin/fail2ban-client",
+    "nvme": "/usr/sbin/nvme",
+}
+
+
 @pytest.fixture
 def tools(monkeypatch, tmp_path):
-    """Each probed tool at a path of its own; /sbin/mdadm resolves to one."""
+    """Each probed tool a file of its own, behind the paths a listing names;
+    /sbin/mdadm and /usr/sbin/mdadm are one file (merged /usr)."""
     paths = {}
     for name in ("smartctl", "mdadm", "wg", "fail2ban-client", "nvme", "uptime", "id"):
         path = tmp_path / name
@@ -603,7 +620,10 @@ def tools(monkeypatch, tmp_path):
     real = {
         "/usr/sbin/smartctl": paths["smartctl"],
         "/sbin/mdadm": paths["mdadm"],
+        "/usr/sbin/mdadm": paths["mdadm"],
         "/usr/bin/wg": paths["wg"],
+        "/usr/bin/fail2ban-client": paths["fail2ban-client"],
+        "/usr/sbin/nvme": paths["nvme"],
         "/usr/bin/uptime": paths["uptime"],
         "/usr/bin/id": paths["id"],
     }
@@ -615,6 +635,31 @@ def tools(monkeypatch, tmp_path):
     return paths
 
 
+def _sudo_for(listing, runs=("smartctl",), validate=0):
+    """A fake run_privileged: `-v` exits *validate*, `-l` prints *listing*,
+    `-l <command>` lists every command at its path (an admin group's ALL),
+    and only the commands in *runs* run without a password."""
+
+    def fake(argv, **_kwargs):
+        options = argv[2:]
+        if options == ["-v"]:
+            stderr = b"" if validate == 0 else REFUSED.encode()
+            return _completed(validate, stderr=stderr)
+        if options == ["-l"]:
+            return _completed(0, listing.encode())
+        if options[0] == "-l":
+            return _completed(0, (LISTED[options[1]] + " ...\n").encode())
+        if options[0] in runs:
+            return _completed(0)
+        return _completed(1, stderr=REFUSED.encode())
+
+    return fake
+
+
+def _asked(run):
+    return [call.args[0][2:] for call in run.call_args_list]
+
+
 def test_nopasswd_commands_reads_tags_per_item():
     assert sudo_refusals._nopasswd_commands(ALICE) == [
         "/usr/sbin/smartctl",
@@ -622,6 +667,17 @@ def test_nopasswd_commands_reads_tags_per_item():
         "/usr/bin/wg show all dump",
         "/usr/bin/uptime",
     ]
+
+
+def test_nopasswd_commands_skips_options_before_tags():
+    """sudo prints an entry's options before its tags: a NOPASSWD rule with a
+    CWD or TIMEOUT is still NOPASSWD."""
+    listing = (
+        "User alice may run the following commands on box:\n"
+        "    (ALL : ALL) ALL\n"
+        "    (root) CWD=/ TIMEOUT=60 NOPASSWD: /usr/sbin/smartctl\n"
+    )
+    assert sudo_refusals._nopasswd_commands(listing) == ["/usr/sbin/smartctl"]
 
 
 @pytest.mark.parametrize(
@@ -637,19 +693,19 @@ def test_nopasswd_commands_none_when_it_cannot_tell(listing):
 
 
 @pytest.mark.parametrize(
-    "command, needs",
+    "path, needs",
     [
-        ("smartctl", False),
-        ("mdadm", False),  # /sbin/mdadm resolves to the same file
-        ("wg", False),
-        ("uptime", False),
-        ("fail2ban-client", True),
-        ("nvme", True),
-        ("id", True),  # PASSWD: undoes the NOPASSWD before it
+        ("/usr/sbin/smartctl", False),
+        ("/usr/sbin/mdadm", False),  # the rule names /sbin/mdadm, the same file
+        ("/usr/bin/wg", False),
+        ("/usr/bin/uptime", False),
+        ("/usr/bin/fail2ban-client", True),
+        ("/usr/sbin/nvme", True),
+        ("/usr/bin/id", True),  # PASSWD: undoes the NOPASSWD before it
     ],
 )
-def test_needs_a_password_only_when_no_nopasswd_rule_names_it(tools, command, needs):
-    assert sudo_refusals._needs_a_password(command, ALICE) is needs
+def test_needs_a_password_only_when_no_nopasswd_rule_names_it(tools, path, needs):
+    assert sudo_refusals._needs_a_password(path, ALICE) is needs
 
 
 @pytest.mark.parametrize(
@@ -659,19 +715,32 @@ def test_needs_a_password_only_when_no_nopasswd_rule_names_it(tools, command, ne
         "(ALL) NOPASSWD: SMART_TOOLS",
         "(ALL) NOPASSWD: /usr/sbin/*",
         "(ALL) NOPASSWD: !/usr/bin/su",
+        "(ALL : ALL) ALL",
     ],
-    ids=["all", "alias", "wildcard", "negation"],
+    ids=["all", "alias", "wildcard", "negation", "no-nopasswd-entry"],
 )
 def test_needs_a_password_never_guesses(tools, rule):
-    """ALL, an alias, a wildcard or a negation could cover the command: run
-    it, as before, rather than call a working tool unavailable."""
+    """ALL, an alias, a wildcard or a negation could cover the command, and an
+    account whose listing passed with no NOPASSWD entry at all is one sudo
+    does not authenticate (root, an exempt group): run it, as before, rather
+    than call a working tool unavailable."""
     listing = "User alice may run the following commands on box:\n    " + rule + "\n"
-    assert sudo_refusals._needs_a_password("fail2ban-client", listing) is False
+    assert sudo_refusals._needs_a_password("/usr/bin/fail2ban-client", listing) is False
 
 
-def test_needs_a_password_never_guesses_a_command_not_on_path(tools, monkeypatch):
-    monkeypatch.setattr(sudo_refusals.shutil, "which", lambda _name: None)
-    assert sudo_refusals._needs_a_password("fail2ban-client", ALICE) is False
+def test_needs_a_password_never_guesses_a_program_not_found(tools):
+    assert sudo_refusals._needs_a_password(None, ALICE) is False
+
+
+def test_resolved_is_the_path_sudo_lists(tools):
+    """sudo resolves the command with its own secure_path, which the agent's
+    PATH may not match."""
+    resolved = sudo_refusals._resolved
+    assert (
+        resolved("/usr/sbin/smartctl --version\n", "smartctl") == "/usr/sbin/smartctl"
+    )
+    assert resolved("", "smartctl") == tools["smartctl"]
+    assert resolved("ALL", "smartctl") == tools["smartctl"]
 
 
 def test_run_checked_an_admin_group_member_with_a_nopasswd_rule(
@@ -680,10 +749,10 @@ def test_run_checked_an_admin_group_member_with_a_nopasswd_rule(
     """The README's user installation: a sudo-group member with a NOPASSWD
     rule for smartctl. `sudo -n -l fail2ban-client status` says yes (the
     group's ALL, with a password), and running it would mail: the listing
-    shows no NOPASSWD rule for it, so it is refused without asking."""
+    shows no NOPASSWD rule for it, so it is refused without running."""
     monkeypatch.setattr(sudo_refusals, "_in_admin_group", lambda: True)
     with patch.object(
-        sudo_refusals, "run_privileged", return_value=_completed(0, ALICE.encode())
+        sudo_refusals, "run_privileged", side_effect=_sudo_for(ALICE)
     ) as run:
         assert sudo_refusals.run_checked(["fail2ban-client", "status"], timeout=5) == (
             None,
@@ -698,8 +767,208 @@ def test_run_checked_an_admin_group_member_with_a_nopasswd_rule(
         )
 
     assert refusal is None
-    assert [call.args[0] for call in run.call_args_list] == [
-        ["sudo", "-n", "-l"],
-        ["sudo", "-n", "-l", "smartctl", "--version"],
-        ["sudo", "-n", "smartctl", "--version"],
+    assert _asked(run) == [
+        ["-l"],
+        ["-l", "fail2ban-client", "status"],
+        ["-l", "smartctl", "--version"],
+        ["smartctl", "--version"],
     ]
+
+
+def test_run_checked_root_in_an_admin_group_runs_its_tools(policy, tools, monkeypatch):
+    """Root is in wheel on Alpine: its listing has no NOPASSWD entry, as sudo
+    never authenticates it. Its tools run, as before."""
+    monkeypatch.setattr(sudo_refusals, "_in_admin_group", lambda: True)
+    root = "User root may run the following commands on box:\n    (ALL : ALL) ALL\n"
+    with patch.object(
+        sudo_refusals,
+        "run_privileged",
+        side_effect=_sudo_for(root, runs=("smartctl", "fail2ban-client")),
+    ):
+        result, refusal = sudo_refusals.run_checked(["fail2ban-client", "status"], 5)
+    assert refusal is None
+    assert result.returncode == 0
+
+
+def test_run_checked_a_listing_that_asks_a_password_leaves_it_to_the_run(policy):
+    """Under a listpw other than the default, listing a NOPASSWD command asks a
+    password: the run decides."""
+    responses = [
+        _completed(0),  # -v: every rule is NOPASSWD
+        _completed(1, stderr=REFUSED.encode()),  # -l smartctl: listpw=always
+        _completed(0, b"smartctl 7.4"),
+    ]
+    with patch.object(sudo_refusals, "run_privileged", side_effect=responses):
+        result, refusal = sudo_refusals.run_checked(["smartctl", "--version"], 5)
+    assert refusal is None
+    assert result.stdout == b"smartctl 7.4"
+
+
+def test_run_checked_an_allowed_command_is_listed_again_once_a_day(policy):
+    clock = _Clock()
+    sudo_refusals._refusals = SudoRefusals(clock=clock)
+    with patch.object(
+        sudo_refusals, "run_privileged", return_value=_completed(0)
+    ) as run:
+        sudo_refusals.run_checked(["smartctl", "--version"], 5)
+        sudo_refusals.run_checked(["smartctl", "--version"], 5)
+        clock.now += sudo_refusals.REFUSAL_RETRY_INTERVAL
+        sudo_refusals.run_checked(["smartctl", "--version"], 5)
+    assert _asked(run) == [
+        ["-v"],
+        ["-l", "smartctl", "--version"],
+        ["smartctl", "--version"],
+        ["smartctl", "--version"],
+        ["-v"],
+        ["-l", "smartctl", "--version"],
+        ["smartctl", "--version"],
+    ]
+
+
+# --- what ends a refusal, through run_checked ---
+
+
+def _alice_refused(monkeypatch):
+    """An admin-group member refused fail2ban-client for a password rule."""
+    monkeypatch.setattr(sudo_refusals, "_in_admin_group", lambda: True)
+    with patch.object(sudo_refusals, "run_privileged", side_effect=_sudo_for(ALICE)):
+        assert sudo_refusals.run_checked(["fail2ban-client", "status"], 5)[0] is None
+
+
+ALICE_WITH_FAIL2BAN = ALICE.replace(
+    "/sbin/mdadm", "/sbin/mdadm, /usr/bin/fail2ban-client"
+)
+
+
+def test_a_needs_password_refusal_is_held_across_a_restart(policy, tools, monkeypatch):
+    _alice_refused(monkeypatch)
+    sudo_refusals._refusals = SudoRefusals()
+    with patch.object(sudo_refusals, "run_privileged") as run:
+        result, refusal = sudo_refusals.run_checked(["fail2ban-client", "status"], 5)
+    assert result is None
+    assert refusal.endswith(sudo_refusals.NEEDS_AUTHENTICATION)
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize("ends", ["policy-change", "reset", "a-day-later"])
+def test_a_needs_password_refusal_ends_with_a_fresh_listing(
+    policy, tools, monkeypatch, ends
+):
+    """The rule is given in the meantime: in a file (the policy changes), or
+    where no file shows it, LDAP or sssd (a reset, or the daily retry of an
+    enabled feature): the account's listing is read again, not reused."""
+    clock = _Clock()
+    sudo_refusals._refusals = SudoRefusals(clock=clock)
+    _alice_refused(monkeypatch)
+    if ends == "policy-change":
+        (policy / "sudoers.d" / "alice").write_text("rule\n")
+    elif ends == "reset":
+        sudo_refusals.reset()
+    else:
+        clock.now += sudo_refusals.REFUSAL_RETRY_INTERVAL
+    with patch.object(
+        sudo_refusals,
+        "run_privileged",
+        side_effect=_sudo_for(ALICE_WITH_FAIL2BAN, runs=("fail2ban-client",)),
+    ) as run:
+        result, refusal = sudo_refusals.run_checked(["fail2ban-client", "status"], 5)
+    assert refusal is None
+    assert _asked(run)[0] == ["-l"]
+
+
+@pytest.mark.parametrize(
+    "retry_interval, asked",
+    [(sudo_refusals.REFUSAL_RETRY_INTERVAL, [["-v"]]), (None, [])],
+    ids=["enabled-feature", "disabled-feature"],
+)
+def test_an_account_refusal_is_retried_daily_only_for_an_enabled_feature(
+    policy, retry_interval, asked
+):
+    clock = _Clock()
+    sudo_refusals._refusals = SudoRefusals(clock=clock)
+    not_known = _completed(1, stderr=NOT_KNOWN.encode())
+    with patch.object(sudo_refusals, "run_privileged", return_value=not_known):
+        sudo_refusals.run_checked(["smartctl"], 5, retry_interval=retry_interval)
+    clock.now += sudo_refusals.REFUSAL_RETRY_INTERVAL
+    with patch.object(sudo_refusals, "run_privileged", return_value=not_known) as run:
+        sudo_refusals.run_checked(["smartctl"], 5, retry_interval=retry_interval)
+    assert _asked(run) == asked
+
+
+def test_an_account_refusal_is_asked_again_after_a_reset(policy):
+    not_known = _completed(1, stderr=NOT_KNOWN.encode())
+    with patch.object(sudo_refusals, "run_privileged", return_value=not_known):
+        sudo_refusals.run_checked(["smartctl"], 5)
+    sudo_refusals.reset()
+    with patch.object(sudo_refusals, "run_privileged", return_value=not_known) as run:
+        sudo_refusals.run_checked(["smartctl"], 5)
+    assert _asked(run) == [["-v"]]
+
+
+def test_an_account_whose_v_needs_a_password_is_asked_l_after_a_restart(policy, tools):
+    """Outside an admin group, with a NOPASSWD rule and a rule that needs a
+    password (a custom group's ALL): -v mails, so it is asked once, not at
+    every start."""
+    with patch.object(
+        sudo_refusals, "run_privileged", side_effect=_sudo_for(ALICE, validate=1)
+    ) as run:
+        sudo_refusals.run_checked(["smartctl", "--version"], 5)
+    assert _asked(run)[:2] == [["-v"], ["-l"]]
+    sudo_refusals._refusals = SudoRefusals()
+    with patch.object(
+        sudo_refusals, "run_privileged", side_effect=_sudo_for(ALICE, validate=1)
+    ) as run:
+        result, refusal = sudo_refusals.run_checked(["smartctl", "--version"], 5)
+    assert refusal is None
+    assert _asked(run)[0] == ["-l"]
+
+
+# --- who asks, and the state file's own limits ---
+
+
+def test_fingerprint_counts_who_asks(policy):
+    """sudo matches %group rules against the process's groups, which change
+    only at a restart: a restart with a new group asks again."""
+    with patch.object(sudo_refusals.os, "getgroups", return_value=[1000]):
+        before = sudo_refusals.policy_fingerprint()
+    with patch.object(sudo_refusals.os, "getgroups", return_value=[1000, 27]):
+        assert sudo_refusals.policy_fingerprint() != before
+
+
+def test_identity_is_empty_without_groups(monkeypatch):
+    monkeypatch.delattr(sudo_refusals.os, "getgroups", raising=False)
+    assert sudo_refusals._identity() == ()
+
+
+def test_many_sudoers_d_files_keep_the_state_file_small(policy):
+    for i in range(300):
+        (policy / "sudoers.d" / f"rule{i:03}").write_text("x\n")
+    fingerprint = sudo_refusals.policy_fingerprint()
+    refusals = SudoRefusals()
+    for name in ("smartctl", "mdadm", "fail2ban-client", "wg", "nvme"):
+        refusals.remember((name,), REFUSED, fingerprint)
+    assert os.path.getsize(_state_file()) < 4096
+    assert SudoRefusals().recall(("nvme",), None, fingerprint) == REFUSED
+
+
+def test_a_dry_run_neither_reads_nor_writes_the_state_file(monkeypatch):
+    """`--dry-run` is the operator checking a rule: it asks sudo afresh, and
+    leaves the service's refusals alone."""
+    SudoRefusals().remember(("smartctl",), REFUSED, FP)
+    with open(_state_file()) as f:
+        saved = f.read()
+    monkeypatch.setattr(sudo_refusals, "dry_run", lambda: True)
+    dry = SudoRefusals()
+    assert dry.recall(("smartctl",), None, FP) is None
+    dry.remember(("mdadm",), REFUSED, FP)
+    dry.reset()
+    with open(_state_file()) as f:
+        assert f.read() == saved
+
+
+def test_a_failed_save_leaves_no_temp_file(monkeypatch):
+    monkeypatch.setattr(
+        sudo_refusals.os, "replace", MagicMock(side_effect=OSError("read-only"))
+    )
+    SudoRefusals().remember(("smartctl",), REFUSED, FP)
+    assert os.listdir(os.environ["CONFIG_DIR"]) == []

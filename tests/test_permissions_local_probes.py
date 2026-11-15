@@ -122,9 +122,10 @@ def test_can_run_sudo_timeout_is_false_with_reason():
         "fivenines_agent.permissions.log"
     ):
         assert p._can_run_sudo("mdadm", "--version", timeout=7) is False
-    # The first call is the question about the account (run_checked).
-    assert seen == {"cmd": ["sudo", "-n", "-v"], "timeout": 7}
-    assert p._current_reason == "sudo -n mdadm timed out after 7s"
+    # The first call is the question about the account (run_checked), whose
+    # deadline is capped at QUESTION_TIMEOUT; the reason names that one.
+    assert seen == {"cmd": ["sudo", "-n", "-v"], "timeout": 5}
+    assert p._current_reason == "sudo -n mdadm timed out after 5s"
 
 
 def test_can_run_sudo_default_timeout_in_reason():

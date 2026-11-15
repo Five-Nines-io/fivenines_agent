@@ -5,11 +5,12 @@
 # refuses for a user it knows mails root a "SECURITY information" message. The
 # probes repeated each refused call every one to five minutes, up to ~1150
 # mails a day per command. The fix (fivenines_agent/sudo_refusals.py) asks
-# `sudo -n -l` (no command: may this account use sudo without a password at
-# all?) and then `sudo -n -l <command>` before running a command, and keeps
-# every refusal, across restarts, until the sudo policy changes. What each
-# question costs in mail is sudo behaviour, so this checks it against the real
-# sudo of each image.
+# whether the account may use sudo without a password at all (`sudo -n -v`,
+# or `sudo -n -l` for an admin-group member), then `sudo -n -l <command>`
+# before running a command, and keeps every refusal, across restarts, until
+# the sudo policy changes. What each question costs in mail is sudo
+# behaviour, so this checks it against the real sudo of each image (and
+# prints the per-question table the choice of question rests on).
 #
 # Each case runs the agent's own sudo_refusals.run_checked (it imports only the
 # standard library, so the image's python3 runs it) as an unprivileged user,
@@ -24,6 +25,7 @@
 #   - a member of the admin group with a NOPASSWD rule for smartctl (the
 #     README's user installation): smartctl runs, the others are refused, and
 #     nothing mails;
+#   - root: every tool runs (sudo never authenticates it) and nothing mails;
 #   - the admin-group member, whose rules all need a password: two agent runs
 #     (a restart) of five probes each of three commands are refused and mail
 #     nothing on sudo >= 1.9.16p1 and sudo-rs, at most once on an older sudo
@@ -128,7 +130,7 @@ echo 'alice:Fivenines-ci-2' | chpasswd
 echo 'alice ALL=(ALL) NOPASSWD: /usr/sbin/smartctl' > /etc/sudoers.d/alice
 chmod 440 /etc/sudoers.d/alice
 # Each one's config dir, where the agent keeps the refusals across restarts.
-for user in fivenines admin norule alice; do
+for user in fivenines admin norule alice root; do
   mkdir -m 700 "/var/tmp/cfg-$user"
   chown "$user" "/var/tmp/cfg-$user"
 done
@@ -191,6 +193,11 @@ as norule python3 /work/probe.py smartctl=refused fail2ban-client=refused nvme=r
 n=$(mails); clear_mails
 if [ "$n" -eq 0 ]; then echo "    ok   no-rule user: 15 probes, no mail"
 else echo "    FAIL no-rule user: 15 probes, $n mails"; fail=1; fi
+
+as root python3 /work/probe.py smartctl=ran fail2ban-client=ran nvme=ran || fail=1
+n=$(mails); clear_mails
+if [ "$n" -eq 0 ]; then echo "    ok   root: 15 probes, no mail"
+else echo "    FAIL root: 15 probes, $n mails"; fail=1; fi
 
 as alice python3 /work/probe.py smartctl=ran fail2ban-client=refused nvme=refused || fail=1
 n=$(mails); clear_mails

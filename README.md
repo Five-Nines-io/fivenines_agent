@@ -873,17 +873,27 @@ does not ship it by default.
 > or `sudo -n -l` for a member of the `sudo` or `wheel` group), then
 > `sudo -n -l <command>` before running a command: for an account with a
 > NOPASSWD rule, as above, or with no sudo rule at all, none of these needs a
-> password and nothing mails. It
-> remembers every refusal, across restarts, and asks again only once
-> `/etc/sudoers`, `/etc/sudoers.d` or `/etc/group` changes, the permissions are
-> rechecked (`SIGHUP` or the dashboard), or -- for a feature you enabled -- a
-> day has passed. The one mail left: an account whose sudo rules all need a
-> password (a user installation run by a member of the `sudo` group), on a
-> sudo older than 1.9.16p1 (Ubuntu 24.04 and older, Debian 12), gets one
-> when the agent first asks, as sudo mails every refusal there. To stop that
-> one too, or the repeated mails of agents before this change, run
-> `sudo visudo -f /etc/sudoers.d/fivenines-nomail` and add the line
-> `Defaults:fivenines !mail_badpass` (naming the account the agent runs as).
+> password and nothing mails. It remembers every refusal, across restarts, and
+> asks again only once `/etc/sudoers`, `/etc/sudoers.d` or `/etc/group`
+> changes (on RHEL, whose `/etc/sudoers.d` the agent cannot list, editing an
+> existing file in place does not count: save it with `visudo` or recheck),
+> the agent restarts with other groups, the permissions are rechecked
+> (`SIGHUP` or the dashboard), or -- for a feature you enabled -- a day has
+> passed. Rules that come from LDAP or sssd show only at a recheck or that
+> daily retry, so an agent that asked before sssd answered at boot waits for
+> one of them.
+>
+> The one mail left: an account whose sudo rules all need a password (a user
+> installation run by a member of the `sudo` group), on a sudo older than
+> 1.9.16p1 (Ubuntu 24.04 and older, Debian 12), gets one when the agent first
+> asks -- and again once a day while one of the SMART, RAID, fail2ban or
+> WireGuard features is enabled -- as sudo mails every refusal there. The
+> cure is the NOPASSWD rules above, after which nothing mails. Short of that,
+> `sudo visudo -f /etc/sudoers.d/fivenines-nomail` with the line
+> `Defaults:fivenines !mail_badpass` (naming the account the agent runs as)
+> stops those mails, and those of agents before this change, but also every
+> mail about a mistyped password for that account: keep it to a dedicated
+> service account, never a person's.
 
 > **Upgrading from an agent older than 1.17.6?** The WireGuard rule is new in
 > **1.17.6**. Before that release the packaged systemd unit granted

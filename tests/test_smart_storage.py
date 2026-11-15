@@ -1506,14 +1506,13 @@ def test_sudo_probe_none_when_the_listed_tool_fails(monkeypatch):
     a refusal (the next tick runs it again)."""
     run = mock.Mock(
         side_effect=[
-            _bproc(0),  # the account's listing, once
-            _bproc(0),  # nvme version listed
+            _bproc(0),  # the account question, once
+            _bproc(0),  # nvme version listed, once (sudo allowed it)
             _bproc(2, "", "nvme: error"),
-            _bproc(0),
             _bproc(2),
         ]
     )
     monkeypatch.setattr(smart_storage.subprocess, "run", run)
     assert smart_storage.nvme_cli_available() is False
     assert smart_storage.nvme_cli_available() is False
-    assert run.call_count == 5
+    assert run.call_count == 4

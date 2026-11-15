@@ -572,10 +572,11 @@ class PermissionProbe:
         Check if we can run a command with sudo non-interactively.
         Uses sudo -n which fails immediately if password is required.
 
-        Through sudo_refusals.run_checked: the command is run only once
-        `sudo -n -l` lets the account use sudo without a password and lists
-        the command, and a call sudo refused is not sent again -- not even
-        after a restart -- until the sudo policy files change, a recheck
+        Through sudo_refusals.run_checked: the command is run only once the
+        account question (`sudo -n -v`, or `sudo -n -l` for an admin-group
+        member) lets it use sudo without a password and `sudo -n -l <command>`
+        lists it, and a call sudo refused is not sent again -- not even after
+        a restart -- until the sudo policy fingerprint changes, a recheck
         (force_refresh), or -- for a capability whose feature is enabled --
         REFUSAL_RETRY_INTERVAL. On Debian/Ubuntu (stock `Defaults
         mail_badpass`) every refusal mails root, and these probes run every
@@ -612,7 +613,8 @@ class PermissionProbe:
             return False
 
         log(f"_can_run_sudo: '{cmd}' found at {cmd_path}", "debug")
-        log(f"_can_run_sudo: running '{full_cmd_str}'", "debug")
+        # run_checked may answer from a remembered refusal, asking sudo nothing.
+        log(f"_can_run_sudo: checking '{full_cmd_str}'", "debug")
 
         retry_interval = (
             sudo_refusals.REFUSAL_RETRY_INTERVAL
@@ -671,9 +673,11 @@ class PermissionProbe:
                 )
                 self._set_reason(f"sudo -n {cmd}: {detail}")
             return success
-        except subprocess.TimeoutExpired:
-            log(f"_can_run_sudo: '{cmd}' timed out after {timeout}s", "debug")
-            self._set_reason(f"sudo -n {cmd} timed out after {timeout}s")
+        except subprocess.TimeoutExpired as e:
+            # The deadline that expired: a question to sudo gets a shorter one
+            # than the command (sudo_refusals.QUESTION_TIMEOUT).
+            log(f"_can_run_sudo: '{cmd}' timed out after {e.timeout}s", "debug")
+            self._set_reason(f"sudo -n {cmd} timed out after {e.timeout}s")
             return False
         except Exception as e:
             log(f"_can_run_sudo: '{cmd}' exception: {type(e).__name__}: {e}", "debug")
