@@ -32,7 +32,10 @@ real sudo of each CI image (ci/test-sudo-mail.sh); on a sudo older than
 - `sudo -n -l <command>` next: the command runs only once sudo lists it.
   Listing needs no password when the account has at least one NOPASSWD rule
   (sudoers' default `listpw=any`, the README setup), so a command without a
-  rule mails nothing.
+  rule mails nothing. It also lists a command a rule allows WITH a password
+  (an admin group's `ALL`), whose run would then mail: for an account with
+  such a rule, a command the account's own `sudo -n -l` shows under no
+  NOPASSWD rule is not run (_needs_a_password, which never guesses).
 - every refusal is remembered, in the config directory so a restart (an
   update, a reboot) does not ask again, and asked again only when one of these
   happens:
@@ -51,6 +54,8 @@ mails nothing about it.
 
 import json
 import os
+import re
+import shutil
 import stat
 import subprocess
 import threading
@@ -72,9 +77,9 @@ POLICY_FILES = ("/etc/sudoers", "/etc/group")
 # file is added, removed or saved by visudo (which renames a temp file).
 POLICY_DIR = "/etc/sudoers.d"
 
-# sudo's own words for a call it refuses under -n. get_clean_env() pins
-# LC_ALL=C, so they are never translated.
-REFUSAL_MESSAGE = "a password is required"
+# sudo's own words for a call it refuses under -n (sudo-rs has its own).
+# get_clean_env() pins LC_ALL=C, so they are never translated.
+REFUSAL_MESSAGES = ("a password is required", "interactive authentication is required")
 
 _SUDO_PREFIX = "sudo:"
 
@@ -95,6 +100,14 @@ ADMIN_GROUPS = frozenset({"sudo", "admin", "wheel"})
 # How classic sudo refuses an account sudoers does not know (LC_ALL=C).
 NOT_IN_SUDOERS = ("may not run sudo", "is not in the sudoers file")
 
+# The header `sudo -l` prints before an account's rules, and the tags it
+# prints before an entry's commands ("NOPASSWD: NOLOG_OUTPUT: /usr/bin/wg").
+_RULES_HEADER = "may run the following commands"
+_TAGS = re.compile(r"(?:[A-Z_]+:\s*)+")
+
+# Why a listed command is not run (see _needs_a_password).
+NEEDS_AUTHENTICATION = "needs a password (sudo -l shows no NOPASSWD rule for it)"
+
 
 def _decode(output):
     return (output or b"").decode("utf-8", errors="replace").strip()
@@ -111,7 +124,9 @@ def refusal_line(returncode, stderr):
         return None
     for line in stderr.splitlines():
         line = line.strip()
-        if line.startswith(_SUDO_PREFIX) and REFUSAL_MESSAGE in line:
+        if line.startswith(_SUDO_PREFIX) and any(
+            message in line for message in REFUSAL_MESSAGES
+        ):
             return line
     return None
 
@@ -244,12 +259,15 @@ class SudoRefusals:
             _save_state(entries)
             return None
 
-    def remember(self, key, detail, fingerprint):
-        """Record what sudo answered under *fingerprint*: *detail* if it refused, else None."""
+    def remember(self, key, detail, fingerprint, listing=""):
+        """Record what sudo answered under *fingerprint*: *detail* if it refused, else None.
+
+        *listing* is what an allowed call printed, kept for passed().
+        """
         with self._lock:
             entries = self._entries()
             if detail is None:
-                self._passed[key] = fingerprint
+                self._passed[key] = (fingerprint, listing)
                 if entries.pop(key, None) is not None:
                     _save_state(entries)
                 return
@@ -258,9 +276,13 @@ class SudoRefusals:
             _save_state(entries)
 
     def passed(self, key, fingerprint):
-        """Whether sudo allowed *key* under this same policy, in this process."""
+        """What sudo printed when it allowed *key* under this same policy, in
+        this process ("" for nothing), or None if it did not."""
         with self._lock:
-            return self._passed.get(key) == fingerprint
+            entry = self._passed.get(key)
+            if entry is None or entry[0] != fingerprint:
+                return None
+            return entry[1]
 
     def reset(self):
         """Forget every answer: each call is asked again."""
@@ -278,21 +300,22 @@ def reset():
     _refusals.reset()
 
 
-def _sudo_answer(options, timeout):
-    """None when `sudo -n *options` exits 0, else the last line sudo wrote."""
+def _ask(options, timeout):
+    """Ask `sudo -n *options`: (None, what it printed) when it exits 0, else
+    (the last line sudo wrote, "")."""
     answer = run_privileged(
         ["sudo", "-n", *options],
         timeout=timeout,
-        stdout=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=get_clean_env(),
     )
     if answer.returncode == 0:
-        return None
+        return None, _decode(answer.stdout)
     # The last line: a warning sudo prints first (unable to resolve host) is
     # not why it said no.
     lines = _decode(answer.stderr).splitlines()
-    return lines[-1].strip() if lines else "not allowed by sudoers"
+    return (lines[-1].strip() if lines else "not allowed by sudoers"), ""
 
 
 def _in_admin_group():
@@ -309,10 +332,13 @@ def _in_admin_group():
 
 
 def _account_refusal(timeout):
-    """None when this account may use sudo without a password for something.
+    """Whether this account may use sudo without a password for something.
 
-    Else what sudo said. The first question is the one that mails nothing for
-    the account it most likely is (the table in the module docstring):
+    (None, listing) when it may, else (what sudo said, ""). *listing* is the
+    account's `sudo -n -l` when that answered, i.e. when some rule of the
+    account needs a password ("" when none does). The first question is the
+    one that mails nothing for the account it most likely is (the table in the
+    module docstring):
 
     - a member of an admin group has a rule that needs a password: `sudo -n
       -l`, free once any of its rules is NOPASSWD (the README's user
@@ -324,19 +350,80 @@ def _account_refusal(timeout):
       wording), `sudo -n -l` decides.
     """
     if not _in_admin_group():
-        detail = _sudo_answer(["-v"], timeout)
+        detail, _ = _ask(["-v"], timeout)
         if detail is None:
-            return None
+            return None, ""
         if any(marker in detail for marker in NOT_IN_SUDOERS):
-            return detail
-    return _sudo_answer(["-l"], timeout)
+            return detail, ""
+    return _ask(["-l"], timeout)
+
+
+def _nopasswd_commands(listing):
+    """The commands an account's `sudo -l` shows under NOPASSWD.
+
+    None when it cannot tell: no rules header (another format), or
+    `!authenticate` (no rule needs a password).
+    """
+    if "!authenticate" in listing:
+        return None
+    lines = listing.splitlines()
+    for start, line in enumerate(lines):
+        if _RULES_HEADER in line:
+            break
+    else:
+        return None
+    commands = []
+    first = start + 1
+    for line in lines[first:]:
+        entry = line.strip()
+        if entry.startswith("("):
+            entry = entry.partition(")")[2]
+        nopasswd = False
+        for item in entry.split(","):
+            item = item.strip()
+            tags = _TAGS.match(item)
+            if tags:
+                for tag in tags.group(0).split(":"):
+                    if tag.strip() == "NOPASSWD":
+                        nopasswd = True
+                    elif tag.strip() == "PASSWD":
+                        nopasswd = False
+                end = tags.end()
+                item = item[end:]
+            if nopasswd and item:
+                commands.append(item)
+    return commands
+
+
+def _needs_a_password(command, listing):
+    """Whether the account's listing proves sudo would ask a password for it.
+
+    `sudo -n -l <command>` lists a command a rule allows WITH a password too
+    (an admin group's `ALL`), and running it then mails. True only when that
+    is certain: every NOPASSWD entry is an absolute path, and none is
+    *command*. `ALL`, an alias, a wildcard or a negation (which this does not
+    expand), or a listing it cannot read: False, the command is run as before.
+    """
+    commands = _nopasswd_commands(listing)
+    path = shutil.which(command)
+    if commands is None or path is None:
+        return False
+    target = os.path.realpath(path)
+    for item in commands:
+        word = item.split()[0]
+        if not word.startswith("/") or any(ch in word for ch in "*?[\\"):
+            return False
+        if os.path.realpath(word) == target:
+            return False
+    return True
 
 
 def run_checked(args, timeout, retry_interval=REFUSAL_RETRY_INTERVAL, stdout=None):
     """Run `sudo -n *args` unless sudo refuses it, without asking twice.
 
     Returns (result, refusal). When sudo refuses the call -- the account
-    (_account_refusal), the command (`sudo -n -l *args`) or the run itself (a rule
+    (_account_refusal), the command (`sudo -n -l *args`, or a listing that
+    shows it needs a password, _needs_a_password) or the run itself (a rule
     that needs a password), now or earlier under the same policy -- result is
     None and refusal says why, in the `sudo -n <command>: <detail>` form the
     capability reasons use. Otherwise refusal is None and result is the
@@ -350,23 +437,26 @@ def run_checked(args, timeout, retry_interval=REFUSAL_RETRY_INTERVAL, stdout=Non
         detail = _refusals.recall(asked, retry_interval, fingerprint)
         if detail is not None:
             return None, f"sudo -n {args[0]}: {detail}"
-    if not _refusals.passed(GATE, fingerprint):
-        detail = _account_refusal(timeout)
-        _refusals.remember(GATE, detail, fingerprint)
+    listing = _refusals.passed(GATE, fingerprint)
+    if listing is None:
+        detail, listing = _account_refusal(timeout)
+        _refusals.remember(GATE, detail, fingerprint, listing)
         if detail is not None:
             return None, f"sudo -n {args[0]}: {detail}"
-    detail = _sudo_answer(["-l", *args], timeout)
+    if listing and _needs_a_password(args[0], listing):
+        detail = NEEDS_AUTHENTICATION
+    else:
+        detail, _ = _ask(["-l", *args], timeout)
+    if detail is None:
+        result = run_privileged(
+            ["sudo", "-n", *args],
+            timeout=timeout,
+            stdout=subprocess.PIPE if stdout is None else stdout,
+            stderr=subprocess.PIPE,
+            env=get_clean_env(),
+        )
+        detail = refusal_line(result.returncode, _decode(result.stderr))
+    _refusals.remember(key, detail, fingerprint)
     if detail is not None:
-        _refusals.remember(key, detail, fingerprint)
         return None, f"sudo -n {args[0]}: {detail}"
-    result = run_privileged(
-        ["sudo", "-n", *args],
-        timeout=timeout,
-        stdout=subprocess.PIPE if stdout is None else stdout,
-        stderr=subprocess.PIPE,
-        env=get_clean_env(),
-    )
-    _refusals.remember(
-        key, refusal_line(result.returncode, _decode(result.stderr)), fingerprint
-    )
     return result, None

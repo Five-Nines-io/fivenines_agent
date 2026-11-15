@@ -218,13 +218,15 @@ def test_a_refusal_ends_when_the_policy_changes():
 
 def test_passed_holds_under_the_same_policy_only():
     refusals = SudoRefusals(clock=_Clock())
-    assert refusals.passed(GATE, FP) is False
+    assert refusals.passed(GATE, FP) is None
     refusals.remember(GATE, None, FP)
-    assert refusals.passed(GATE, FP) is True
-    assert refusals.passed(GATE, OTHER_FP) is False
+    assert refusals.passed(GATE, FP) == ""
+    refusals.remember(GATE, None, FP, "User x may run the following commands")
+    assert refusals.passed(GATE, FP) == "User x may run the following commands"
+    assert refusals.passed(GATE, OTHER_FP) is None
     # A refusal ends the pass.
     refusals.remember(GATE, REFUSED, FP)
-    assert refusals.passed(GATE, FP) is False
+    assert refusals.passed(GATE, FP) is None
 
 
 def test_allowed_after_a_refusal_drops_it():
@@ -242,7 +244,7 @@ def test_reset_forgets_every_answer():
     refusals.remember(GATE, None, FP)
     refusals.reset()
     assert refusals.recall(("smartctl",), None, FP) is None
-    assert refusals.passed(GATE, FP) is False
+    assert refusals.passed(GATE, FP) is None
     # Persisted too: a restart after a recheck does not bring it back.
     assert SudoRefusals().recall(("smartctl",), None, FP) is None
 
@@ -272,7 +274,7 @@ def test_a_restart_remembers_the_refusals():
 
 def test_a_pass_is_not_persisted():
     SudoRefusals().remember(GATE, None, FP)
-    assert SudoRefusals().passed(GATE, FP) is False
+    assert SudoRefusals().passed(GATE, FP) is None
 
 
 def test_the_state_file_round_trips_a_real_fingerprint(policy):
@@ -369,8 +371,8 @@ def test_run_checked_asks_the_account_then_the_command_then_runs(policy):
         assert kwargs["timeout"] == 7
         assert kwargs["stderr"] == subprocess.PIPE
         assert kwargs["env"]["LC_ALL"] == "C"
-    assert calls[0][1]["stdout"] == subprocess.DEVNULL
-    assert calls[1][1]["stdout"] == subprocess.DEVNULL
+    assert calls[0][1]["stdout"] == subprocess.PIPE
+    assert calls[1][1]["stdout"] == subprocess.PIPE
     assert calls[2][1]["stdout"] == subprocess.PIPE
 
 
@@ -472,16 +474,25 @@ def test_run_checked_silent_listing_refusal_has_a_reason(policy):
 
 def test_run_checked_remembers_a_run_sudo_refused(policy):
     """Listed, but the rule needs a password: the run itself is refused (and
-    mails on Debian). It is not sent again."""
+    mails on Debian). It is a refusal, and it is not sent again."""
     responses = [_completed(0), _completed(0), _completed(1, stderr=REFUSED.encode())]
     with patch.object(sudo_refusals, "run_privileged", side_effect=responses) as run:
-        result, refusal = sudo_refusals.run_checked(["fail2ban-client", "status"], 5)
+        first = sudo_refusals.run_checked(["fail2ban-client", "status"], 5)
         again = sudo_refusals.run_checked(["fail2ban-client", "status"], 5)
 
-    assert refusal is None
-    assert result.returncode == 1
-    assert again == (None, "sudo -n fail2ban-client: " + REFUSED)
+    assert first == again == (None, "sudo -n fail2ban-client: " + REFUSED)
     assert run.call_count == 3
+
+
+def test_run_checked_remembers_a_run_sudo_rs_refused(policy):
+    """sudo-rs words it its own way."""
+    refused = b"sudo: interactive authentication is required"
+    responses = [_completed(0), _completed(0), _completed(1, stderr=refused)]
+    with patch.object(sudo_refusals, "run_privileged", side_effect=responses):
+        assert sudo_refusals.run_checked(["fail2ban-client", "status"], 5) == (
+            None,
+            "sudo -n fail2ban-client: sudo: interactive authentication is required",
+        )
 
 
 def test_run_checked_retries_a_command_that_failed_on_its_own(policy):
@@ -566,3 +577,129 @@ def test_in_admin_group_reads_the_process_groups(groups, expected):
         grp, "getgrgid", side_effect=getgrgid
     ):
         assert real_in_admin_group() is expected
+
+
+# --- an account with rules that need a password (_needs_a_password) ---
+
+ALICE = """Matching Defaults entries for alice on box:
+    env_reset, mail_badpass, secure_path=/usr/sbin\\:/usr/bin, use_pty
+
+User alice may run the following commands on box:
+    (ALL : ALL) ALL
+    (ALL) NOPASSWD: /usr/sbin/smartctl, /sbin/mdadm
+    (root) NOPASSWD: NOLOG_OUTPUT: /usr/bin/wg show all dump
+    (root) /usr/bin/journalctl, NOPASSWD: /usr/bin/uptime, PASSWD: /usr/bin/id
+"""
+
+
+@pytest.fixture
+def tools(monkeypatch, tmp_path):
+    """Each probed tool at a path of its own; /sbin/mdadm resolves to one."""
+    paths = {}
+    for name in ("smartctl", "mdadm", "wg", "fail2ban-client", "nvme", "uptime", "id"):
+        path = tmp_path / name
+        path.write_text("")
+        paths[name] = str(path)
+    real = {
+        "/usr/sbin/smartctl": paths["smartctl"],
+        "/sbin/mdadm": paths["mdadm"],
+        "/usr/bin/wg": paths["wg"],
+        "/usr/bin/uptime": paths["uptime"],
+        "/usr/bin/id": paths["id"],
+    }
+    monkeypatch.setattr(sudo_refusals.shutil, "which", paths.get)
+    real_realpath = os.path.realpath
+    monkeypatch.setattr(
+        sudo_refusals.os.path, "realpath", lambda p: real_realpath(real.get(p, p))
+    )
+    return paths
+
+
+def test_nopasswd_commands_reads_tags_per_item():
+    assert sudo_refusals._nopasswd_commands(ALICE) == [
+        "/usr/sbin/smartctl",
+        "/sbin/mdadm",
+        "/usr/bin/wg show all dump",
+        "/usr/bin/uptime",
+    ]
+
+
+@pytest.mark.parametrize(
+    "listing",
+    [
+        "Matching Defaults entries for alice on box:\n    !authenticate\n" + ALICE,
+        "alice may do things:\n    NOPASSWD: /usr/sbin/smartctl\n",
+    ],
+    ids=["no-authenticate", "unknown-format"],
+)
+def test_nopasswd_commands_none_when_it_cannot_tell(listing):
+    assert sudo_refusals._nopasswd_commands(listing) is None
+
+
+@pytest.mark.parametrize(
+    "command, needs",
+    [
+        ("smartctl", False),
+        ("mdadm", False),  # /sbin/mdadm resolves to the same file
+        ("wg", False),
+        ("uptime", False),
+        ("fail2ban-client", True),
+        ("nvme", True),
+        ("id", True),  # PASSWD: undoes the NOPASSWD before it
+    ],
+)
+def test_needs_a_password_only_when_no_nopasswd_rule_names_it(tools, command, needs):
+    assert sudo_refusals._needs_a_password(command, ALICE) is needs
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
+        "(ALL) NOPASSWD: ALL",
+        "(ALL) NOPASSWD: SMART_TOOLS",
+        "(ALL) NOPASSWD: /usr/sbin/*",
+        "(ALL) NOPASSWD: !/usr/bin/su",
+    ],
+    ids=["all", "alias", "wildcard", "negation"],
+)
+def test_needs_a_password_never_guesses(tools, rule):
+    """ALL, an alias, a wildcard or a negation could cover the command: run
+    it, as before, rather than call a working tool unavailable."""
+    listing = "User alice may run the following commands on box:\n    " + rule + "\n"
+    assert sudo_refusals._needs_a_password("fail2ban-client", listing) is False
+
+
+def test_needs_a_password_never_guesses_a_command_not_on_path(tools, monkeypatch):
+    monkeypatch.setattr(sudo_refusals.shutil, "which", lambda _name: None)
+    assert sudo_refusals._needs_a_password("fail2ban-client", ALICE) is False
+
+
+def test_run_checked_an_admin_group_member_with_a_nopasswd_rule(
+    policy, tools, monkeypatch
+):
+    """The README's user installation: a sudo-group member with a NOPASSWD
+    rule for smartctl. `sudo -n -l fail2ban-client status` says yes (the
+    group's ALL, with a password), and running it would mail: the listing
+    shows no NOPASSWD rule for it, so it is refused without asking."""
+    monkeypatch.setattr(sudo_refusals, "_in_admin_group", lambda: True)
+    with patch.object(
+        sudo_refusals, "run_privileged", return_value=_completed(0, ALICE.encode())
+    ) as run:
+        assert sudo_refusals.run_checked(["fail2ban-client", "status"], timeout=5) == (
+            None,
+            "sudo -n fail2ban-client: " + sudo_refusals.NEEDS_AUTHENTICATION,
+        )
+        result, refusal = sudo_refusals.run_checked(
+            ["smartctl", "--version"], timeout=5
+        )
+        assert (
+            sudo_refusals.run_checked(["fail2ban-client", "status"], timeout=5)[0]
+            is None
+        )
+
+    assert refusal is None
+    assert [call.args[0] for call in run.call_args_list] == [
+        ["sudo", "-n", "-l"],
+        ["sudo", "-n", "-l", "smartctl", "--version"],
+        ["sudo", "-n", "smartctl", "--version"],
+    ]
