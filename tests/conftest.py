@@ -28,6 +28,7 @@ import fivenines_agent.mysql as mysql_module
 import fivenines_agent.packages as packages_module
 import fivenines_agent.qemu as qemu_module
 import fivenines_agent.raid_storage as raid_module
+import fivenines_agent.sudo_refusals as sudo_refusals
 import fivenines_agent.synchronizer as synchronizer_module
 from fivenines_agent import cli
 from fivenines_agent.cache import TTLCache
@@ -52,7 +53,17 @@ def _reset_process_caches():
     qemu_module._stalled_worker = None
     qemu_module._reset_backoff()
     journal_policy.reset_cache()
+    # The sudo calls refused in an earlier test must not be skipped in this
+    # one: a fresh memory, read from this test's CONFIG_DIR on first use.
+    sudo_refusals._refusals = sudo_refusals.SudoRefusals()
     yield
+
+
+@pytest.fixture(autouse=True)
+def _not_in_an_admin_group(monkeypatch):
+    """sudo_refusals picks its first question by the process's groups: pin
+    them, so a suite run by a member of sudo or wheel asks what CI asks."""
+    monkeypatch.setattr(sudo_refusals, "_in_admin_group", lambda: False)
 
 
 @pytest.fixture(autouse=True)

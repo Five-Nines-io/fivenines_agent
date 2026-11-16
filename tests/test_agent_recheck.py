@@ -307,3 +307,37 @@ def test_wait_interval_floors_sleep_at_minimum():
     with patch.object(agent_module, "exit_event") as fake_event:
         agent._wait_interval(10.0)
     assert fake_event.wait.call_args[0][0] == 0.1
+
+
+# --- enabled features reach the probe (sudo refusal retry policy) ---
+
+
+def test_enabled_capability_keys_map_config_keys_to_capabilities():
+    agent = _agent()
+    config = {
+        "smart_storage_health": True,
+        "raid_storage_health": False,
+        "fail2ban": True,
+        "wireguard": None,
+        "cpu": True,
+    }
+    keys = agent._enabled_capability_keys(config)
+    assert "smart_storage" in keys
+    assert "fail2ban" in keys
+    assert "cpu" in keys
+    assert "raid_storage" not in keys
+    assert "wireguard" not in keys
+
+
+def test_config_refresh_tells_the_probe_what_is_enabled_before_probing():
+    """A refused sudo probe is retried daily only for an enabled feature, so
+    the probe must know the enabled set before this tick's refresh runs."""
+    agent = _agent()
+    order = []
+    agent.permissions.set_enabled_capabilities.side_effect = lambda keys: order.append(
+        ("enabled", list(keys))
+    )
+    agent.permissions.refresh_due.side_effect = lambda *_a: order.append(("refresh",))
+    agent._apply_config_driven_refresh({"fail2ban": True, "wireguard": True})
+    assert [step[0] for step in order] == ["enabled", "refresh"]
+    assert set(order[0][1]) == {"fail2ban", "wireguard"}

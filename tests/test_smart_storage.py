@@ -21,6 +21,12 @@ def _reset_cache():
     smart_storage._cache._entries.clear()
 
 
+@pytest.fixture(autouse=True)
+def _tools_installed(monkeypatch):
+    """smartctl and nvme-cli on PATH: _sudo_probe skips a command that is not."""
+    monkeypatch.setattr(smart_storage.shutil, "which", lambda name: f"/usr/sbin/{name}")
+
+
 class _FakeClock:
     def __init__(self):
         self.t = 1000.0
@@ -41,6 +47,15 @@ def _proc(returncode=0, stdout=""):
     proc = mock.Mock()
     proc.returncode = returncode
     proc.stdout = stdout
+    return proc
+
+
+def _bproc(returncode=0, stdout="", stderr=""):
+    """A sudo call as sudo_refusals.run_checked makes it: bytes, not text."""
+    proc = mock.Mock()
+    proc.returncode = returncode
+    proc.stdout = stdout.encode()
+    proc.stderr = stderr.encode()
     return proc
 
 
@@ -99,14 +114,16 @@ def test_get_smartctl_version_parses_first_line(monkeypatch):
     monkeypatch.setattr(
         smart_storage.subprocess,
         "run",
-        lambda *_a, **_k: _proc(0, "smartctl 7.2 2020-12-30 r5155\nCopyright\n"),
+        lambda *_a, **_k: _bproc(0, "smartctl 7.2 2020-12-30 r5155\nCopyright\n"),
     )
     assert smart_storage.get_smartctl_version() == "smartctl 7.2 2020-12-30 r5155"
 
 
 def test_get_smartctl_version_none_when_unavailable(monkeypatch):
     """Non-zero exit (no smartctl / no passwordless sudo) -> None, quietly."""
-    monkeypatch.setattr(smart_storage.subprocess, "run", lambda *_a, **_k: _proc(1, ""))
+    monkeypatch.setattr(
+        smart_storage.subprocess, "run", lambda *_a, **_k: _bproc(1, "")
+    )
     assert smart_storage.get_smartctl_version() is None
 
 
@@ -114,20 +131,22 @@ def test_get_nvme_cli_version_parses_first_line(monkeypatch):
     monkeypatch.setattr(
         smart_storage.subprocess,
         "run",
-        lambda *_a, **_k: _proc(0, "nvme version 2.1\n"),
+        lambda *_a, **_k: _bproc(0, "nvme version 2.1\n"),
     )
     assert smart_storage.get_nvme_cli_version() == "nvme version 2.1"
 
 
 def test_get_nvme_cli_version_none_when_unavailable(monkeypatch):
-    monkeypatch.setattr(smart_storage.subprocess, "run", lambda *_a, **_k: _proc(1, ""))
+    monkeypatch.setattr(
+        smart_storage.subprocess, "run", lambda *_a, **_k: _bproc(1, "")
+    )
     assert smart_storage.get_nvme_cli_version() is None
 
 
 def test_version_fetchers_none_on_empty_stdout(monkeypatch):
     """rc=0 but empty stdout -> None (honors the 'unreadable -> emit nothing' contract)."""
     monkeypatch.setattr(
-        smart_storage.subprocess, "run", lambda *_a, **_k: _proc(0, "\n")
+        smart_storage.subprocess, "run", lambda *_a, **_k: _bproc(0, "\n")
     )
     assert smart_storage.get_smartctl_version() is None
     assert smart_storage.get_nvme_cli_version() is None
@@ -136,10 +155,12 @@ def test_version_fetchers_none_on_empty_stdout(monkeypatch):
 def test_nvme_cli_available_reflects_probe(monkeypatch):
     """nvme_cli_available is True only when the sudo -n probe exits 0."""
     monkeypatch.setattr(
-        smart_storage.subprocess, "run", lambda *_a, **_k: _proc(0, "nvme 2.1\n")
+        smart_storage.subprocess, "run", lambda *_a, **_k: _bproc(0, "nvme 2.1\n")
     )
     assert smart_storage.nvme_cli_available() is True
-    monkeypatch.setattr(smart_storage.subprocess, "run", lambda *_a, **_k: _proc(1, ""))
+    monkeypatch.setattr(
+        smart_storage.subprocess, "run", lambda *_a, **_k: _bproc(1, "")
+    )
     assert smart_storage.nvme_cli_available() is False
 
 
@@ -612,7 +633,7 @@ def test_sudo_probe_passes_timeout(monkeypatch):
 
     def spy(cmd, *_a, **kwargs):
         seen.append(kwargs.get("timeout"))
-        return _proc(0, "smartctl 7.2\n")
+        return _bproc(0, "smartctl 7.2\n")
 
     monkeypatch.setattr(smart_storage.subprocess, "run", spy)
 
@@ -1209,7 +1230,7 @@ def _run_health(monkeypatch, *parts):
 def test_worn_ssd_reports_its_real_wear(monkeypatch, parts, expected):
     info, cmd = _run_health(monkeypatch, *parts)
 
-    assert cmd == ["sudo", "smartctl", "-i", "-A", "-H", "-l", "ssd", "/dev/sdb"]
+    assert cmd == ["sudo", "-n", "smartctl", "-i", "-A", "-H", "-l", "ssd", "/dev/sdb"]
     assert info["percentage_used"] == expected
 
 
@@ -1423,3 +1444,75 @@ def test_unknown_rotation_rate_is_not_a_spinning_disk():
     ssd = {"device_type": "ata", "rotation_rate": "Unknown (0x0005)"}
     assert calc(ssd, endurance_used=12) == 12
     assert calc({**ssd, "media_wearout_indicator_pct": 90}) == 10
+
+
+# --- the sudo -n probes on every tick (Debian/Ubuntu mail each refusal) ---
+
+
+def test_sudo_probe_never_reaches_sudo_for_a_missing_tool(monkeypatch):
+    """sudo authenticates before it reports "command not found", so `sudo -n
+    nvme version` on an NVMe host without nvme-cli was a refusal every tick."""
+    monkeypatch.setattr(smart_storage.shutil, "which", lambda _name: None)
+    run = mock.Mock()
+    monkeypatch.setattr(smart_storage.subprocess, "run", run)
+    assert smart_storage.nvme_cli_available() is False
+    assert smart_storage.get_nvme_cli_version() is None
+    run.assert_not_called()
+
+
+def test_nvme_probe_refused_once_is_not_asked_every_tick(monkeypatch, tmp_path):
+    """nvme-cli installed, no sudoers rule for it: the listing is refused once,
+    and the next ticks do not ask sudo again."""
+    from fivenines_agent import sudo_refusals
+
+    monkeypatch.setattr(sudo_refusals, "POLICY_FILES", ())
+    monkeypatch.setattr(sudo_refusals, "POLICY_DIR", str(tmp_path))
+    run = mock.Mock(return_value=_bproc(1, stderr="sudo: a password is required"))
+    monkeypatch.setattr(smart_storage.subprocess, "run", run)
+    for _ in range(5):
+        assert smart_storage.nvme_cli_available() is False
+    assert [call.args[0] for call in run.call_args_list] == [
+        ["sudo", "-n", "-v"],
+        ["sudo", "-n", "-l"],
+    ]
+
+
+@pytest.mark.parametrize(
+    "collect, argv",
+    [
+        (smart_storage.list_storage_devices, ["sudo", "-n", "smartctl", "--scan"]),
+        (
+            lambda: smart_storage.get_nvme_enhanced_info("/dev/nvme0"),
+            ["sudo", "-n", "nvme", "smart-log", "/dev/nvme0", "-o", "json"],
+        ),
+        (
+            lambda: smart_storage.get_storage_identification("/dev/sda"),
+            ["sudo", "-n", "smartctl", "-i", "/dev/sda"],
+        ),
+    ],
+    ids=["scan", "nvme-smart-log", "identification"],
+)
+def test_data_reads_never_prompt(monkeypatch, collect, argv):
+    """Every data read passes -n: without it a refusal goes through sudo's
+    password path, which mails root even for a user absent from sudoers."""
+    run = mock.Mock(return_value=_proc(0, "{}"))
+    monkeypatch.setattr(smart_storage, "run_privileged", run)
+    collect()
+    assert run.call_args.args[0] == argv
+
+
+def test_sudo_probe_none_when_the_listed_tool_fails(monkeypatch):
+    """sudoers allows it, the tool itself exits non-zero: unusable, and not
+    a refusal (the next tick runs it again)."""
+    run = mock.Mock(
+        side_effect=[
+            _bproc(0),  # the account question, once
+            _bproc(0),  # nvme version listed, once (sudo allowed it)
+            _bproc(2, "", "nvme: error"),
+            _bproc(2),
+        ]
+    )
+    monkeypatch.setattr(smart_storage.subprocess, "run", run)
+    assert smart_storage.nvme_cli_available() is False
+    assert smart_storage.nvme_cli_available() is False
+    assert run.call_count == 4
