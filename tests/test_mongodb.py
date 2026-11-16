@@ -45,7 +45,13 @@ ENVELOPE_KEYS = {
     "replica_set",
     "sharding",
 }
-FLAGS = ("server_status_ok", "repl_status_ok", "repl_config_ok", "oplog_ok")
+FLAGS = (
+    "server_status_ok",
+    "repl_status_ok",
+    "repl_config_ok",
+    "oplog_ok",
+    "storage_ok",
+)
 
 # The collector refuses a unix socket host where the OS has none (Windows,
 # where windows.yml runs this suite too).
@@ -71,6 +77,7 @@ CONFIG = {
 def _reset_module_state(monkeypatch):
     monkeypatch.setattr(mongodb, "_last_logged", {})
     monkeypatch.setattr(mongodb, "_stalled_worker", None)
+    monkeypatch.setattr(mongodb, "_storage_state", {})
     yield
     # A real client's threads end shortly after close(): let them, or the
     # next test's driver-thread single flight sees them (an agent tick is a
@@ -81,10 +88,16 @@ def _reset_module_state(monkeypatch):
 
 
 def resolve(name):
-    """A scenario's mongo map with its mongo_base applied."""
+    """A scenario's mongo map: its mongo_base's, then its mongo_storage's
+    (the storage_replies entry it names), then its own."""
     scenario = SCENARIOS[name]
     base = resolve(scenario["mongo_base"]) if "mongo_base" in scenario else {}
-    return {**base, **scenario["mongo"]}
+    storage = (
+        FIXTURE["storage_replies"][scenario["mongo_storage"]]["mongo"]
+        if "mongo_storage" in scenario
+        else {}
+    )
+    return {**base, **storage, **scenario["mongo"]}
 
 
 def collect(monkeypatch, mongo, **config):
@@ -96,7 +109,7 @@ def collect(monkeypatch, mongo, **config):
 def calls_as_keys(client):
     keys = set()
     for call in client.calls:
-        keys.add("oplog" if call.startswith("oplog.") else call)
+        keys.add(call.split(".", 1)[0] if "." in call else call)
     return keys
 
 
@@ -125,6 +138,11 @@ def test_contract_fixture_round_trip(monkeypatch, name):
         (client,) = clients
         # Everything listed was sent, nothing else was.
         assert calls_as_keys(client) == set(mongo) - {"monitor"}
+        assert {
+            call.split(".", 1)[1]
+            for call in client.calls
+            if call.startswith("dbStats.")
+        } == set(mongo.get("dbStats", {}))
         assert client.closed
         options = client.options
         assert options["directConnection"] is True
@@ -156,13 +174,16 @@ def test_fixture_payloads_keep_the_envelope_shape():
 def test_fixture_collection_flags_follow_the_role_rules():
     expected_null = {
         "standalone": {"repl_status_ok", "repl_config_ok", "oplog_ok"},
-        "mongos": {"repl_status_ok", "repl_config_ok", "oplog_ok"},
-        "uninitiated": {"repl_config_ok", "oplog_ok"},
-        "removed": {"repl_status_ok", "oplog_ok"},
+        "mongos": {"repl_status_ok", "repl_config_ok", "oplog_ok", "storage_ok"},
+        "uninitiated": {"repl_config_ok", "oplog_ok", "storage_ok"},
+        "removed": {"repl_status_ok", "oplog_ok", "storage_ok"},
+        # storage_ok too, unless the member serves no reads or belongs to a
+        # sharded cluster (below).
         "replica_set_member": set(),
         "arbiter": set(FLAGS),
     }
     seen = set()
+    no_storage = []
     for name, scenario in SCENARIOS.items():
         payload = scenario["payload"]["mongodb"]
         if not payload["reachable"]:
@@ -170,12 +191,25 @@ def test_fixture_collection_flags_follow_the_role_rules():
         role = payload["role"]
         seen.add(role)
         collection = payload["collection"]
+        mongo = resolve(name)
+        # 4.4.0/4.4.1 answer isMaster when hello does not exist.
+        hello = mongo.get("isMaster") if "raises" in mongo["hello"] else mongo["hello"]
         if role == "uninitiated" and collection["repl_status_ok"] is None:
             # NotYetInitialized answered: the status section does not apply.
             assert "repl_status" not in collection["errors"], name
         for flag in FLAGS:
+            if flag == "storage_ok" and collection["server_status_ok"] is False:
+                # Outside a sharded cluster? serverStatus says; not read, storage
+                # does not apply.
+                assert collection[flag] is None, name
+                continue
             if role == "uninitiated" and flag == "repl_status_ok":
                 if collection[flag] is None:
+                    continue
+            if role == "replica_set_member" and flag == "storage_ok":
+                if not mongodb._serves_reads(hello) or payload["sharding"]:
+                    assert collection[flag] is None, name
+                    no_storage.append(name)
                     continue
             if flag in expected_null[role]:
                 assert collection[flag] is None, (name, flag)
@@ -189,6 +223,11 @@ def test_fixture_collection_flags_follow_the_role_rules():
             role in ("replica_set_member", "removed")
         ), name
     assert seen == set(expected_null)
+    assert no_storage == [
+        "member_not_serving_reads",
+        "shard_member_8_0",
+        "config_server_member",
+    ]
 
 
 def test_member_down_is_the_issue_example():
@@ -1399,6 +1438,89 @@ def test_a_zero_or_missing_optime_has_no_lag_and_no_member_has_one_without_a_ref
     assert [m["lag_s"] for m in members] == [None, None]
 
 
+def w_member(mid, name, wall, state=2, **extra):
+    """A status member whose optimeDate is the WHOLE second of its wall time,
+    as MongoDB builds it from the optime Timestamp."""
+    return s_member(
+        mid,
+        name,
+        state=state,
+        optime=wall.replace(microsecond=0),
+        lastAppliedWallTime=ejson_date(wall),
+        **extra,
+    )
+
+
+def lags_of(monkeypatch, members):
+    result = member(
+        monkeypatch, status=status_reply(members), config={"raises": op_failure(13)}
+    )
+    return {
+        m["name"]: (m["lag_s"], m["lag_ms"]) for m in result["replica_set"]["members"]
+    }
+
+
+def test_lag_ms_reads_what_whole_seconds_cannot(monkeypatch):
+    """A secondary 250 ms behind: lag_s says 0, or 1 when a second boundary
+    falls between the two optimes; lag_ms says 250 both times."""
+    primary = T + timedelta(milliseconds=100)
+    assert lags_of(
+        monkeypatch,
+        [
+            w_member(0, "p:1", primary, state=1),
+            w_member(1, "same:1", primary - timedelta(milliseconds=50)),
+            w_member(2, "across:1", primary - timedelta(milliseconds=250)),
+            # Fresher than the primary (a stale view): clamped like lag_s.
+            w_member(3, "fresh:1", primary + timedelta(seconds=2)),
+        ],
+    ) == {
+        "p:1": (0, 0),
+        "same:1": (0, 50),
+        "across:1": (1, 250),
+        "fresh:1": (0, 0),
+    }
+
+
+def test_lag_ms_takes_the_freshest_primary_or_member_like_lag_s(monkeypatch):
+    old, new = T - timedelta(seconds=30), T - timedelta(milliseconds=1500)
+    assert lags_of(
+        monkeypatch,
+        [
+            w_member(0, "old:1", old, state=1),
+            w_member(1, "new:1", new, state=1),
+            w_member(2, "s:1", new - timedelta(milliseconds=320)),
+        ],
+    ) == {"old:1": (28, 28500), "new:1": (0, 0), "s:1": (0, 320)}
+    assert lags_of(
+        monkeypatch,
+        [
+            w_member(0, "a:1", T - timedelta(milliseconds=900)),
+            w_member(1, "b:1", T + timedelta(milliseconds=10)),
+            # Not eligible, so never the reference, however fresh.
+            w_member(2, "c:1", T + timedelta(seconds=9), state=5),
+        ],
+    ) == {"a:1": (1, 910), "b:1": (0, 0), "c:1": (None, None)}
+
+
+def test_lag_ms_is_null_without_wall_times(monkeypatch):
+    """4.4.1's members carry no lastAppliedWallTime (ismaster_fallback): lag_s
+    still reads. A member without one has no lag_ms; a primary without one
+    leaves every member without, rather than measuring from a secondary."""
+    secondary = w_member(1, "s:1", T - timedelta(milliseconds=40))
+    assert lags_of(monkeypatch, [s_member(0, "p:1", state=1), secondary]) == {
+        "p:1": (0, None),
+        "s:1": (1, None),
+    }
+    assert lags_of(
+        monkeypatch, [w_member(0, "p:1", T, state=1), s_member(1, "s:1")]
+    ) == {"p:1": (0, 0), "s:1": (0, None)}
+    zero = s_member(1, "z:1", lastAppliedWallTime={"$date": "1970-01-01T00:00:00Z"})
+    assert lags_of(monkeypatch, [w_member(0, "p:1", T, state=1), zero]) == {
+        "p:1": (0, 0),
+        "z:1": (0, None),
+    }
+
+
 def test_heartbeat_ages_use_the_reply_date(monkeypatch):
     status = status_reply(
         [
@@ -1618,6 +1740,1119 @@ def test_sharding_needs_a_set_name():
     }
 
 
+# --- storage --------------------------------------------------------------------
+
+STANDALONE_HELLO = {"isWritablePrimary": True, "ok": 1.0}
+STORAGE_KEYS = {"age_s", "databases_total", "complete", "databases"}
+ROW_KEYS = {
+    "name",
+    "system",
+    "error",
+    "collections",
+    "views",
+    "objects",
+    "indexes",
+    "data_size",
+    "storage_size",
+    "index_size",
+    "total_size",
+}
+
+
+def db_stats(name, size=1000, **extra):
+    return {
+        "db": name,
+        "collections": 2,
+        "views": 0,
+        "objects": 10,
+        "dataSize": size,
+        "storageSize": size // 2,
+        "indexes": 3,
+        "indexSize": 300,
+        "totalSize": size // 2 + 300,
+        "ok": 1.0,
+        **extra,
+    }
+
+
+def listing(*names):
+    return {"databases": [{"name": n} for n in names], "ok": 1.0}
+
+
+def standalone(monkeypatch, listed, stats=None, hello=STANDALONE_HELLO, **config):
+    """One collection of a standalone whose listDatabases answers `listed`
+    (a reply, or the names) and whose dbStats answer `stats` (default: a
+    reply per name)."""
+    if isinstance(listed, (list, tuple)):
+        stats = stats if stats is not None else {n: db_stats(n) for n in listed}
+        listed = listing(*listed)
+    mongo = {
+        "hello": hello,
+        "serverStatus": {"version": "7.0.1", "ok": 1.0},
+        "listDatabases": listed,
+        "dbStats": stats or {},
+    }
+    result, clients = collect(monkeypatch, mongo, **config)
+    return result, (clients[0].calls if clients else [])
+
+
+def read_databases(calls):
+    return [c.split(".", 1)[1] for c in calls if c.startswith("dbStats.")]
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """mongodb's monotonic clock, moved by hand (the budgets never run out)."""
+    now = [1000.0]
+    monkeypatch.setattr(mongodb, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(mongodb, "_driver_thread_alive", lambda: False)
+    return now
+
+
+def test_storage_reports_every_database_dbstats_read(monkeypatch):
+    result, calls = standalone(
+        monkeypatch,
+        listing("local", "app", "admin", "config"),
+        {
+            "admin": db_stats("admin", 100),
+            "app": db_stats("app", 4096, views=1, dataSize=4096.0),
+            "config": db_stats("config", 200),
+            "local": db_stats("local", 300),
+        },
+    )
+    assert calls[:3] == ["hello", "serverStatus", "listDatabases"]
+    # In name order, each once.
+    assert read_databases(calls) == ["admin", "app", "config", "local"]
+    assert result["collection"]["storage_ok"] is True
+    storage = result["node"]["storage"]
+    assert set(storage) == STORAGE_KEYS
+    assert (storage["age_s"], storage["databases_total"], storage["complete"]) == (
+        0,
+        4,
+        True,
+    )
+    assert [r["name"] for r in storage["databases"]] == [
+        "admin",
+        "app",
+        "config",
+        "local",
+    ]
+    app = storage["databases"][1]
+    assert set(app) == ROW_KEYS
+    assert app == {
+        "name": "app",
+        "system": False,
+        "error": None,
+        "collections": 2,
+        "views": 1,
+        "objects": 10,
+        "indexes": 3,
+        "data_size": 4096,
+        "storage_size": 2048,
+        "index_size": 300,
+        "total_size": 2348,
+    }
+    assert [r["system"] for r in storage["databases"]] == [True, False, True, True]
+
+
+def test_storage_values_ship_as_reported(monkeypatch):
+    stats = {
+        "a": {"collections": 1.0, "dataSize": 12.5, "storageSize": "big", "ok": 1.0},
+        "b": {"ok": 1.0},
+    }
+    result, _ = standalone(monkeypatch, ["a", "b"], stats)
+    a, b = result["node"]["storage"]["databases"]
+    assert (a["collections"], a["data_size"], a["storage_size"]) == (1, 12.5, None)
+    # A field this version lacks (totalSize before 4.4) is null, never 0.
+    assert all(b[k] is None for k in ROW_KEYS - {"name", "system", "error"})
+    assert result["node"]["storage"]["complete"] is True
+
+
+def test_the_listing_asks_for_names_only_and_a_refusal_not_a_short_list(monkeypatch):
+    """The fake fails on any other form: nameOnly (no per-database sizes) and
+    authorizedDatabases false (a user without the listDatabases privilege is
+    refused instead of being shown only the databases it can read)."""
+    assert mongodb_fake.LIST_DATABASES_FIELDS == {
+        "nameOnly": True,
+        "authorizedDatabases": False,
+    }
+    result, calls = standalone(monkeypatch, ["a"])
+    assert "listDatabases" in calls and result["collection"]["storage_ok"] is True
+
+
+def test_database_names_are_read_once_each_and_in_order(monkeypatch):
+    result, calls = standalone(
+        monkeypatch, listing("b", "a", "b"), {"a": db_stats("a"), "b": db_stats("b")}
+    )
+    assert read_databases(calls) == ["a", "b"]
+    assert result["node"]["storage"]["databases_total"] == 2
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        {"ok": 1.0},
+        {"databases": "admin", "ok": 1.0},
+        {"databases": [{"name": 3}], "ok": 1.0},
+        {"databases": [{"name": ""}], "ok": 1.0},
+        {"databases": ["admin"], "ok": 1.0},
+        # A mongod always lists local: empty would read as every database gone.
+        {"databases": [], "ok": 1.0},
+    ],
+)
+def test_a_listing_that_is_not_a_list_of_named_databases_fails_the_section(
+    monkeypatch, reply
+):
+    """Never a partial list: one that cannot be read whole reads as databases
+    gone."""
+    result, calls = standalone(monkeypatch, reply)
+    assert read_databases(calls) == []
+    assert result["collection"]["storage_ok"] is False
+    assert result["collection"]["errors"] == {"storage": "error"}
+    assert result["node"]["storage"] is None
+
+
+def test_storage_is_built_at_most_once_per_ttl(monkeypatch, clock):
+    first, calls = standalone(monkeypatch, ["a"])
+    assert "listDatabases" in calls and first["node"]["storage"]["age_s"] == 0
+
+    clock[0] += 125.9
+    cached, calls = standalone(monkeypatch, ["a"])
+    assert calls == ["hello", "serverStatus"]
+    assert cached["collection"]["storage_ok"] is True
+    assert cached["node"]["storage"] == {**first["node"]["storage"], "age_s": 125}
+
+    clock[0] = 1000.0 + mongodb.STORAGE_CACHE_TTL
+    rebuilt, calls = standalone(monkeypatch, ["a", "b"])
+    assert read_databases(calls) == ["a", "b"]
+    assert rebuilt["node"]["storage"]["age_s"] == 0
+
+
+def test_the_storage_age_counts_from_the_end_of_its_build(monkeypatch, clock):
+    original = mongodb_fake.FakeClient._db_command
+
+    def slow(self, database, name):
+        clock[0] += 3
+        return original(self, database, name)
+
+    monkeypatch.setattr(mongodb_fake.FakeClient, "_db_command", slow)
+    first, _ = standalone(monkeypatch, ["a"])
+    assert first["node"]["storage"]["age_s"] == 0
+    clock[0] += 10
+    cached, calls = standalone(monkeypatch, ["a"])
+    # 10s after the build ended, 13s after it started.
+    assert "listDatabases" not in calls
+    assert cached["node"]["storage"]["age_s"] == 10
+
+
+def test_another_target_or_user_starts_a_new_build(monkeypatch, clock):
+    standalone(monkeypatch, ["a"])
+    _, calls = standalone(monkeypatch, ["a"], username="other")
+    assert "listDatabases" in calls
+    _, calls = standalone(monkeypatch, ["a"], port=27018, username="other")
+    assert "listDatabases" in calls
+    # A new password for the same user changes nothing it can list.
+    _, calls = standalone(
+        monkeypatch, ["a"], port=27018, username="other", password="x"
+    )
+    assert "listDatabases" not in calls
+
+
+# Value: protects=a new host, auth source, mechanism or client certificate
+# rebuilds storage within the TTL, from the first database; fails_when=a field
+# leaves _storage_key, or a rebuild keeps the other target's resume;
+# why_new=the test above varies only port and username, never under the cap;
+# seam=none; no_claim=which identity the server lists, or a password change
+@pytest.mark.parametrize(
+    "before, after",
+    [
+        ({}, {"host": "db.internal"}),
+        ({}, {"auth_source": "users"}),
+        ({}, {"auth_mechanism": "SCRAM-SHA-256"}),
+        (
+            {"tls": True, "tls_certificate_key_file": "/etc/mongo/a.pem"},
+            {"tls": True, "tls_certificate_key_file": "/etc/mongo/b.pem"},
+        ),
+    ],
+)
+def test_each_identity_field_starts_a_fresh_build(monkeypatch, clock, before, after):
+    # The certificate paths are not read: their check has its own tests.
+    monkeypatch.setattr(mongodb, "_unusable_tls_file", lambda config: None)
+    monkeypatch.setattr(mongodb, "MAX_DATABASES", 1)
+    _, calls = standalone(monkeypatch, ["a", "b"], **before)
+    assert read_databases(calls) == ["a"]
+    _, calls = standalone(monkeypatch, ["a", "b"], **after)
+    # Within the TTL, rebuilt from the first database: neither the other
+    # identity's block nor its place in the rotation (b).
+    assert read_databases(calls) == ["a"]
+
+
+@pytest.mark.parametrize(
+    "raises, reason",
+    [
+        (op_failure(13, "not authorized on admin"), "not_authorized"),
+        # Sent, then timed out: it reached the mongod, so it is kept too.
+        ({"type": "NetworkTimeout", "message": "timed out"}, "timeout"),
+    ],
+)
+def test_a_refused_listing_fails_the_section_and_is_kept_for_the_ttl(
+    monkeypatch, clock, capsys, raises, reason
+):
+    monkeypatch.setenv("LOG_LEVEL", "debug")
+    refused = {"raises": raises}
+    result, calls = standalone(monkeypatch, refused)
+    assert "listDatabases" in calls
+    assert result["collection"]["storage_ok"] is False
+    assert result["collection"]["errors"] == {"storage": reason}
+    assert result["node"]["storage"] is None
+
+    clock[0] += 60
+    again, calls = standalone(monkeypatch, refused)
+    assert "listDatabases" not in calls
+    assert again["collection"]["errors"] == {"storage": reason}
+    out = capsys.readouterr().out
+    assert "[ERROR" in out and f"storage ({reason})" in out
+    # No database line: the section line already names it.
+    assert "databases not read" not in out
+
+
+def test_a_failed_listing_keeps_the_rotation_for_the_next_build(monkeypatch, clock):
+    monkeypatch.setattr(mongodb, "MAX_DATABASES", 1)
+    standalone(monkeypatch, ["a", "b"])
+    clock[0] += mongodb.STORAGE_CACHE_TTL
+    standalone(monkeypatch, {"raises": op_failure(13)})
+    clock[0] += mongodb.STORAGE_CACHE_TTL
+    _, calls = standalone(monkeypatch, ["a", "b"])
+    assert read_databases(calls) == ["b"]
+
+
+def test_a_user_fixed_after_a_refusal_reads_storage_at_once(monkeypatch, clock):
+    standalone(monkeypatch, {"raises": op_failure(13)})
+    result, calls = standalone(monkeypatch, ["a"], username="monitoring")
+    assert read_databases(calls) == ["a"]
+    assert result["collection"]["storage_ok"] is True
+
+
+def test_an_abandoned_build_that_finishes_late_is_reshipped(monkeypatch, clock):
+    release = threading.Event()
+    original = mongodb_fake.FakeClient._db_command
+
+    def stuck(self, database, name):
+        release.wait(10)
+        return original(self, database, name)
+
+    monkeypatch.setattr(mongodb, "COLLECT_DEADLINE", 0.2)
+    monkeypatch.setattr(mongodb_fake.FakeClient, "_db_command", stuck)
+    first, _ = standalone(monkeypatch, ["a"])
+    assert first["error_type"] == "timeout"
+    worker = mongodb._stalled_worker
+    release.set()
+    worker.join(10)
+    clock[0] += 60
+    result, calls = standalone(monkeypatch, ["a"])
+    # The late build is the one shipped, aged from when it ended.
+    assert "listDatabases" not in calls
+    assert result["node"]["storage"]["age_s"] == 60
+
+
+def other_sections_take(monkeypatch, clock, seconds):
+    """serverStatus takes `seconds` of the command budget."""
+    original = mongodb_fake.FakeClient._command
+
+    def slow(self, name, **fields):
+        reply = original(self, name, **fields)
+        if name == "serverStatus":
+            clock[0] += seconds
+        return reply
+
+    monkeypatch.setattr(mongodb_fake.FakeClient, "_command", slow)
+    return original
+
+
+def test_a_build_the_command_budget_cannot_fit_waits_for_the_next_tick(
+    monkeypatch, clock
+):
+    """Given a sliver, the listing would time out (or pymongo would refuse to
+    send it) and be kept for the TTL; not started, nothing is kept."""
+    short = mongodb.COMMAND_BUDGET - mongodb.STORAGE_BUDGET + 0.5
+    original = other_sections_take(monkeypatch, clock, short)
+    result, calls = standalone(monkeypatch, ["a"])
+    assert "listDatabases" not in calls
+    assert result["collection"]["errors"] == {"storage": "timeout"}
+    assert result["node"]["storage"] is None
+    assert mongodb._storage_state == {}
+
+    # Exactly the whole budget left is enough.
+    monkeypatch.setattr(mongodb_fake.FakeClient, "_command", original)
+    other_sections_take(monkeypatch, clock, short - 0.5)
+    result, calls = standalone(monkeypatch, ["a"])
+    assert read_databases(calls) == ["a"]
+    assert result["collection"]["storage_ok"] is True
+
+
+def test_an_unstarted_rebuild_keeps_the_last_build_and_its_place(monkeypatch, clock):
+    monkeypatch.setattr(mongodb, "MAX_DATABASES", 1)
+    standalone(monkeypatch, ["a", "b"])
+    clock[0] += mongodb.STORAGE_CACHE_TTL
+    original = other_sections_take(monkeypatch, clock, mongodb.COMMAND_BUDGET)
+    result, calls = standalone(monkeypatch, ["a", "b"])
+    assert "listDatabases" not in calls and result["node"]["storage"] is None
+    monkeypatch.setattr(mongodb_fake.FakeClient, "_command", original)
+    _, calls = standalone(monkeypatch, ["a", "b"])
+    # Where the last build stopped: b.
+    assert read_databases(calls) == ["b"]
+
+
+def test_storage_waits_for_every_other_section(monkeypatch):
+    """Last, so a slow storage read costs only itself."""
+    hello = {**MEMBER_HELLO, "secondary": True}
+    mongo = {
+        "hello": hello,
+        "serverStatus": {"version": "7.0.1", "ok": 1.0},
+        "replSetGetStatus": status_reply([s_member(0, "a:1", self=True)]),
+        "replSetGetConfig": config_reply([c_member(0, "a:1")]),
+        "oplog": OPLOG,
+        "listDatabases": listing("local"),
+        "dbStats": {"local": db_stats("local")},
+    }
+    result, clients = collect(monkeypatch, mongo)
+    assert clients[0].calls == [
+        "hello",
+        "serverStatus",
+        "replSetGetStatus",
+        "replSetGetConfig",
+        "oplog.first",
+        "oplog.last",
+        "listDatabases",
+        "dbStats.local",
+    ]
+    assert result["collection"]["storage_ok"] is True
+
+
+# Value: protects=a node that stops serving reads ships no storage, not even
+# the block cached while it served them; fails_when=the serves-reads gate moves
+# behind the cache lookup; why_new=the unprimed case starts with no cached
+# block; seam=none; no_claim=what the cached block holds once reads resume
+@pytest.mark.parametrize("primed", [None, "block", "failure"])
+@pytest.mark.parametrize(
+    "hello",
+    [
+        # A member in initial sync, recovery or rollback.
+        {**MEMBER_HELLO, "isWritablePrimary": False, "secondary": False},
+        # mongos: its dbStats would fan out to every shard.
+        {"msg": "isdbgrid", "isWritablePrimary": True, "ok": 1.0},
+    ],
+)
+def test_storage_does_not_apply_where_reads_are_not_served(monkeypatch, hello, primed):
+    if primed == "block":
+        # The tick before, the same target served reads: its block is cached.
+        storage = standalone(monkeypatch, ["a"])[0]["node"]["storage"]
+        assert storage is not None
+    elif primed == "failure":
+        refused = standalone(monkeypatch, {"raises": op_failure(13)})[0]
+        assert refused["collection"]["errors"] == {"storage": "not_authorized"}
+    mongo = {
+        "hello": hello,
+        "serverStatus": {"version": "7.0.1", "ok": 1.0},
+        "replSetGetStatus": status_reply([s_member(0, "a:1", self=True)]),
+        "replSetGetConfig": config_reply([c_member(0, "a:1")]),
+        "oplog": OPLOG,
+    }
+    if hello.get("msg") == "isdbgrid":
+        mongo = {k: mongo[k] for k in ("hello", "serverStatus")}
+    result, clients = collect(monkeypatch, mongo)
+    assert "listDatabases" not in clients[0].calls
+    assert result["collection"]["storage_ok"] is None
+    assert "storage" not in result["collection"]["errors"]
+    assert result["node"]["storage"] is None
+
+
+@pytest.mark.parametrize(
+    "hello, expected",
+    [
+        ({"isWritablePrimary": True}, True),
+        ({"ismaster": True}, True),  # 4.4.0 / 4.4.1 isMaster
+        ({"secondary": True, "isWritablePrimary": False}, True),
+        ({"isWritablePrimary": False, "secondary": False}, False),
+        ({"isreplicaset": True}, False),
+        ({"secondary": 1}, False),
+        ({}, False),
+    ],
+)
+def test_serves_reads(hello, expected):
+    assert mongodb._serves_reads(hello) is expected
+
+
+@pytest.mark.parametrize(
+    "raises, reason, stops",
+    [
+        (op_failure(13, "not authorized on local"), "not_authorized", False),
+        (
+            op_failure(13436, "node is not in primary or recovering state"),
+            "refused",
+            False,
+        ),
+        # A lost connection stops the build like a timeout: the next send
+        # would reconnect within what is left of the budget.
+        ({"type": "AutoReconnect", "message": "connection closed"}, "error", True),
+        ({"type": "InvalidName", "message": "bad database name"}, "error", False),
+    ],
+)
+def test_a_database_dbstats_did_not_read_is_listed_with_its_reason(
+    monkeypatch, raises, reason, stops
+):
+    result, calls = standalone(
+        monkeypatch,
+        ["a", "b", "c"],
+        {"a": db_stats("a"), "b": {"raises": raises}, "c": db_stats("c")},
+    )
+    assert read_databases(calls) == (["a", "b"] if stops else ["a", "b", "c"])
+    rows = {r["name"]: r["error"] for r in result["node"]["storage"]["databases"]}
+    assert rows["c"] == ("not_read" if stops else None)
+    assert result["collection"]["storage_ok"] is True
+    assert "storage" not in result["collection"]["errors"]
+    storage = result["node"]["storage"]
+    assert storage["complete"] is False
+    b = storage["databases"][1]
+    assert (b["name"], b["error"]) == ("b", reason)
+    assert all(b[k] is None for k in ROW_KEYS - {"name", "system", "error"})
+    assert mongodb._storage_state["resume"] == ("c" if stops else None)
+
+
+def test_a_dbstats_reply_that_is_not_a_document_is_an_error(monkeypatch):
+    result, _ = standalone(monkeypatch, ["a"], {"a": []})
+    (a,) = result["node"]["storage"]["databases"]
+    assert a["error"] == "error"
+
+
+def test_past_the_cap_each_build_carries_on_by_name(monkeypatch, clock):
+    monkeypatch.setattr(mongodb, "MAX_DATABASES", 2)
+    names = ["a", "b", "c", "d", "e"]
+    reads = []
+    for _ in range(4):
+        result, calls = standalone(monkeypatch, names)
+        storage = result["node"]["storage"]
+        assert (storage["databases_total"], storage["complete"]) == (5, False)
+        # Every listed database has a row: read, or not_read past the window.
+        assert {r["name"]: r["error"] for r in storage["databases"]} == {
+            n: None if n in read_databases(calls) else "not_read" for n in names
+        }
+        reads.append(read_databases(calls))
+        clock[0] += mongodb.STORAGE_CACHE_TTL
+    assert reads == [["a", "b"], ["c", "d"], ["e", "a"], ["b", "c"]]
+
+
+def test_the_listing_is_shipped_whole_up_to_its_cap(monkeypatch, clock, capsys):
+    """A database absent from a whole listing is gone: every listed one gets a
+    row, read or not_read, up to MAX_LISTED_DATABASES (the read ones always
+    included)."""
+    monkeypatch.setenv("LOG_LEVEL", "debug")
+    monkeypatch.setattr(mongodb, "MAX_DATABASES", 2)
+    monkeypatch.setattr(mongodb, "MAX_LISTED_DATABASES", 3)
+    result, calls = standalone(monkeypatch, ["a", "b", "c", "d", "e"])
+    storage = result["node"]["storage"]
+    assert read_databases(calls) == ["a", "b"]
+    assert [(r["name"], r["error"]) for r in storage["databases"]] == [
+        ("a", None),
+        ("b", None),
+        ("c", "not_read"),
+    ]
+    assert (storage["databases_total"], storage["complete"]) == (5, False)
+    # Not reading past the window is no failure: nothing logged.
+    assert "databases not read" not in capsys.readouterr().out
+
+
+SHARD_STATUS = {
+    "version": "8.0.34",
+    "sharding": {"configsvrConnectionString": "cfg/cfg1.internal:27019"},
+    "ok": 1.0,
+}
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        # A shard member: 8.0 refuses dbStats on an application database over
+        # a direct connection and logs it at error level every time.
+        config_reply([c_member(0, "a:1")]),
+        # A config server member: 8.0 can turn it into a config shard holding
+        # application databases, and nothing tells the two apart (measured).
+        config_reply([c_member(0, "a:1")], configsvr=True),
+        # Its config not readable.
+        {"raises": op_failure(13)},
+    ],
+)
+def test_storage_does_not_apply_in_a_sharded_cluster(monkeypatch, config):
+    mongo = {
+        "hello": {**MEMBER_HELLO, "isWritablePrimary": True},
+        "serverStatus": SHARD_STATUS,
+        "replSetGetStatus": status_reply([s_member(0, "a:1", self=True, state=1)]),
+        "replSetGetConfig": config,
+        "oplog": OPLOG,
+    }
+    result, clients = collect(monkeypatch, mongo)
+    assert "listDatabases" not in clients[0].calls
+    assert result["collection"]["storage_ok"] is None
+    assert "storage" not in result["collection"]["errors"]
+    assert result["node"]["storage"] is None
+    assert result["sharding"] == {"config_server_set": "cfg"}
+
+
+def test_a_database_gone_since_the_last_build_resumes_at_the_next_one(
+    monkeypatch, clock
+):
+    monkeypatch.setattr(mongodb, "MAX_DATABASES", 1)
+    _, calls = standalone(monkeypatch, ["a", "b", "c"])
+    assert read_databases(calls) == ["a"] and mongodb._storage_state["resume"] == "b"
+    clock[0] += mongodb.STORAGE_CACHE_TTL
+    _, calls = standalone(monkeypatch, ["a", "c"])
+    assert read_databases(calls) == ["c"] and mongodb._storage_state["resume"] == "a"
+
+
+def time_out_on(monkeypatch, clock, slow):
+    """dbStats on a database in `slow` times out and spends the build's
+    budget, as pymongo.timeout() does with what is left of it."""
+    original = mongodb_fake.FakeClient._db_command
+
+    def answer(self, database, name):
+        if database in slow:
+            clock[0] += mongodb.STORAGE_BUDGET
+            self.calls.append(f"{name}.{database}")
+            raise errors.ExecutionTimeout("operation exceeded time limit", 50, {})
+        return original(self, database, name)
+
+    monkeypatch.setattr(mongodb_fake.FakeClient, "_db_command", answer)
+
+
+def test_a_timeout_ends_the_build_and_the_next_one_starts_there(monkeypatch, clock):
+    time_out_on(monkeypatch, clock, {"b"})
+    result, calls = standalone(monkeypatch, ["a", "b", "c"])
+    # c is not sent: the budget is spent. Not a timeout of its own: not_read.
+    assert read_databases(calls) == ["a", "b"]
+    storage = result["node"]["storage"]
+    assert storage["complete"] is False
+    assert [(r["name"], r["error"]) for r in storage["databases"]] == [
+        ("a", None),
+        ("b", "timeout"),
+        ("c", "not_read"),
+    ]
+    assert result["collection"]["storage_ok"] is True
+    assert mongodb._storage_state["resume"] == "b"
+
+    # b first, with the whole budget, and still too slow: it is slow now, and
+    # the next build starts past it.
+    clock[0] += mongodb.STORAGE_CACHE_TTL
+    _, calls = standalone(monkeypatch, ["a", "b", "c"])
+    assert read_databases(calls) == ["b"]
+    assert mongodb._storage_state["resume"] == "c"
+    assert set(mongodb._storage_state["slow"]) == {"b"}
+
+    # Read last until it is due again (an hour on): every other database is
+    # read on every build (b re-sent first after each cut blanked every other
+    # build).
+    for expected in (["c", "a", "b"], ["a", "c", "b"], ["a", "c", "b"]):
+        clock[0] += mongodb.STORAGE_CACHE_TTL
+        result, calls = standalone(monkeypatch, ["a", "b", "c"])
+        assert read_databases(calls) == expected
+        rows = result["node"]["storage"]["databases"]
+        assert [(r["name"], r["error"]) for r in rows] == [
+            ("a", None),
+            ("b", "timeout"),
+            ("c", None),
+        ]
+
+
+def test_a_slow_database_that_answers_is_read_in_order_again(monkeypatch, clock):
+    slow = {"b"}
+    time_out_on(monkeypatch, clock, slow)
+    standalone(monkeypatch, ["b", "c"])  # b first, with the whole budget
+    assert set(mongodb._storage_state["slow"]) == {"b"}
+    slow.clear()
+    clock[0] += mongodb.STORAGE_CACHE_TTL
+    _, calls = standalone(monkeypatch, ["a", "b", "c"])
+    assert read_databases(calls) == ["c", "a", "b"]  # b still last, answers
+    assert mongodb._storage_state["slow"] == {}
+    clock[0] += mongodb.STORAGE_CACHE_TTL
+    _, calls = standalone(monkeypatch, ["a", "b", "c"])
+    assert read_databases(calls) == ["a", "b", "c"]
+
+
+def test_a_first_database_after_a_slow_listing_does_not_stop_every_build(
+    monkeypatch, clock
+):
+    """It had everything the build could give (a slow listing took the
+    rest): read last like any slow database, never restarted at."""
+    original = mongodb_fake.FakeClient._command
+
+    def slow_listing(self, name, **fields):
+        reply = original(self, name, **fields)
+        if name == "listDatabases":
+            clock[0] += mongodb.STORAGE_BUDGET * 0.6
+        return reply
+
+    monkeypatch.setattr(mongodb_fake.FakeClient, "_command", slow_listing)
+    time_out_on(monkeypatch, clock, {"a"})
+    standalone(monkeypatch, ["a", "b"])
+    assert set(mongodb._storage_state["slow"]) == {"a"}
+    assert mongodb._storage_state["resume"] == "b"
+    clock[0] += mongodb.STORAGE_CACHE_TTL
+    result, calls = standalone(monkeypatch, ["a", "b"])
+    assert read_databases(calls) == ["b", "a"]
+    assert result["node"]["storage"]["databases"][1]["error"] is None
+
+
+class BudgetMongo:
+    """A mongod whose dbStats costs `costs[name]` seconds (a number, or a list
+    consumed one call at a time, its last value kept) of the build's budget on
+    the clock fixture, timing out at the deadline as pymongo.timeout() does."""
+
+    import pymongo
+
+    deadline = float("inf")
+
+    def __init__(self, clock, names, costs):
+        self.clock, self.names, self.costs = clock, names, costs
+
+    def command(self, name, deadline=None, **fields):
+        return listing(*self.names)
+
+    def database_command(self, database, name, deadline):
+        if self.clock[0] >= deadline:
+            raise mongodb._BudgetSpent()
+        cost = self.costs[database]
+        if isinstance(cost, list):
+            cost = cost.pop(0) if len(cost) > 1 else cost[0]
+        if self.clock[0] + cost > deadline:
+            self.clock[0] = deadline
+            raise errors.ExecutionTimeout("operation exceeded time limit", 50, {})
+        self.clock[0] += cost
+        return db_stats(database)
+
+
+# Value: protects=a database that stalled once is read again within STORAGE_SLOW_RETRY even behind databases that fill every budget; fails_when=a slow database is only ever read last; why_new=the slow tests have room left for the last database; seam=none; no_claim=real dbStats timing (budget simulated on the clock)
+def test_a_database_that_stalled_once_gets_the_first_place_again(clock):
+    costs = {"a": [6, 0.1], "b": 2, "c": 2, "d": 2}
+    mongo = BudgetMongo(clock, ["a", "b", "c", "d"], costs)
+    resume, slow, reads = None, {}, []
+    for _ in range(7):
+        (block, _), resume, slow = mongodb._build_storage(mongo, resume, slow)
+        reads.append([r["name"] for r in block["databases"] if r["error"] is None])
+        clock[0] += mongodb.STORAGE_CACHE_TTL
+    # Stalled on the first build; b, c, d fill every budget after it, so read
+    # last it would wait for good. Due again an hour later, it is read first.
+    assert all("a" not in read for read in reads[:6])
+    assert "a" in reads[6] and slow == {}
+
+
+# Value: protects=a database that never fits the budget costs one build per growing delay, never every build, even several of them; fails_when=the retry delay stays fixed or is not re-armed when a due retry times out again; why_new=the stall-once test lets it answer; seam=none; no_claim=real dbStats timing (budget simulated on the clock)
+@pytest.mark.parametrize("never_fit", [1, 6])
+def test_databases_that_never_fit_cost_ever_rarer_builds(clock, never_fit):
+    big = ["big%d" % i for i in range(never_fit)]
+    small = ["admin", "app", "config", "local"]
+    costs = {**{n: 10 for n in big}, **{n: 0.2 for n in small}}
+    mongo = BudgetMongo(clock, sorted(big + small), costs)
+    resume, slow, blank = None, {}, 0
+    builds = 3 * 24 * 6  # three days of builds: the delay reaches its cap
+    for _ in range(builds):
+        (block, _), resume, slow = mongodb._build_storage(mongo, resume, slow)
+        read = {r["name"] for r in block["databases"] if r["error"] is None}
+        blank += not (set(small) <= read)
+        clock[0] += mongodb.STORAGE_CACHE_TTL
+    # A fixed hourly delay blanked one build in six per database (with six,
+    # every build); doubling up to a day leaves seven or so in three days.
+    assert blank <= never_fit * 8
+    assert {name: delay for name, (_, delay) in slow.items()} == {
+        name: mongodb.STORAGE_SLOW_RETRY_MAX for name in big
+    }
+
+
+# Value: protects=only a database that fails the build's first place has its delay doubled, never one read last with the leftovers; fails_when=any sent slow database that times out is re-armed; why_new=in the other slow tests the last database is never sent; seam=none; no_claim=real dbStats timing (budget simulated on the clock)
+def test_a_slow_database_read_last_is_not_pushed_back(clock):
+    costs = {"a": [6, 4.5], "b": 0.3, "c": 0.3, "d": 0.3}
+    mongo = BudgetMongo(clock, ["a", "b", "c", "d"], costs)
+    resume, slow, reads, delays = None, {}, [], set()
+    for _ in range(8):
+        (block, _), resume, slow = mongodb._build_storage(mongo, resume, slow)
+        reads.append({r["name"] for r in block["databases"] if r["error"] is None})
+        delays |= {delay for _, delay in slow.values()}
+        clock[0] += mongodb.STORAGE_CACHE_TTL
+    # Read last, a times out with 4.1s left on every build, but only its own
+    # first place (due an hour later) decides: it fits there.
+    assert delays == {mongodb.STORAGE_SLOW_RETRY}
+    assert "a" in reads[6] and slow == {}
+
+
+# Value: protects=a due slow database that fails otherwise than by a timeout gives up the first place; fails_when=only a timeout re-arms it; why_new=the slow tests only time out; seam=none; no_claim=real dbStats errors (simulated)
+def test_a_due_slow_database_failing_otherwise_gives_up_the_first_place(clock):
+    costs = {"a": 6, "b": 0.2, "c": 0.2}
+    mongo = BudgetMongo(clock, ["a", "b", "c"], costs)
+    (block, _), resume, slow = mongodb._build_storage(mongo, None, {})
+    assert set(slow) == {"a"}
+    clock[0] += mongodb.STORAGE_SLOW_RETRY
+
+    sent = []
+
+    def refused(database, name, deadline):
+        sent.append(database)
+        if database == "a":
+            raise errors.OperationFailure("lock timeout", 24, {"code": 24})
+        return BudgetMongo.database_command(mongo, database, name, deadline)
+
+    mongo.database_command = refused
+    started = clock[0]
+    (block, _), resume, slow = mongodb._build_storage(mongo, resume, slow)
+    # Pushed back, but not doubled: only a timeout says it still does not fit.
+    retry_at, delay = slow["a"]
+    assert delay == mongodb.STORAGE_SLOW_RETRY
+    assert retry_at >= started + mongodb.STORAGE_SLOW_RETRY
+    clock[0] += mongodb.STORAGE_CACHE_TTL
+    sent.clear()
+    (block, _), resume, slow = mongodb._build_storage(mongo, resume, slow)
+    rows = {r["name"]: r["error"] for r in block["databases"]}
+    # Not due any more: b and c come first and are read, a last.
+    assert sent[-1] == "a" and set(sent[:2]) == {"b", "c"}
+    assert (rows["b"], rows["c"]) == (None, None)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"me": "db2.internal:27017"},
+        {"topologyVersion": {"processId": {"$oid": "6ae8ab2b403bb84fe81f3570"}}},
+    ],
+)
+def test_another_mongod_behind_the_same_address_starts_a_new_build(
+    monkeypatch, clock, change
+):
+    """The address alone does not name the mongod: a host name now resolving to
+    another member, or a mongod restarted behind it, never gets the previous
+    node's inventory."""
+    hello = {
+        **STANDALONE_HELLO,
+        "me": "db1.internal:27017",
+        "topologyVersion": {"processId": {"$oid": "6ae8ab2b403bb84fe81f3569"}},
+    }
+    _, calls = standalone(monkeypatch, ["only_on_a"], hello=hello)
+    assert "listDatabases" in calls
+    _, calls = standalone(monkeypatch, ["only_on_a"], hello=hello)
+    assert "listDatabases" not in calls  # the same mongod: cached
+    result, calls = standalone(monkeypatch, ["b"], hello={**hello, **change})
+    assert read_databases(calls) == ["b"]
+    assert [r["name"] for r in result["node"]["storage"]["databases"]] == ["b"]
+
+
+def test_a_first_database_failing_otherwise_is_not_slow(clock):
+    """Only a timeout says a database does not fit the budget."""
+    mongo = BudgetMongo(clock, ["a", "b"], {"a": 0.2, "b": 0.2})
+
+    def refused(database, name, deadline):
+        if database == "a":
+            raise errors.OperationFailure("lock timeout", 24, {"code": 24})
+        return BudgetMongo.database_command(mongo, database, name, deadline)
+
+    mongo.database_command = refused
+    (block, _), resume, slow = mongodb._build_storage(mongo, None, {})
+    assert slow == {}
+    assert {r["name"]: r["error"] for r in block["databases"]} == {
+        "a": "refused",
+        "b": None,
+    }
+
+
+def test_a_lost_connection_ends_the_build_and_the_next_one_starts_after_it(clock):
+    """A database whose dbStats lost the connection is not slow, and nothing
+    more is sent: the next build starts at the first one not sent."""
+    mongo = BudgetMongo(clock, ["a", "b", "c"], {"a": 0.2, "b": 0.2, "c": 0.2})
+    sent = []
+
+    def reset(database, name, deadline):
+        sent.append(database)
+        if database == "a":
+            raise errors.AutoReconnect("connection reset")
+        return BudgetMongo.database_command(mongo, database, name, deadline)
+
+    mongo.database_command = reset
+    (block, _), resume, slow = mongodb._build_storage(mongo, None, {})
+    assert sent == ["a"] and slow == {} and resume == "b"
+    assert [r["error"] for r in block["databases"]] == ["error", "not_read", "not_read"]
+
+
+def test_a_stall_past_the_deadline_before_the_send_is_not_a_timeout(clock):
+    """The worker stalled between reading what was left and sending: never
+    sent, the due slow database proved nothing and keeps its place."""
+    mongo = BudgetMongo(clock, ["a", "b"], {"a": 0.2, "b": 0.2})
+
+    def stalled(database, name, deadline):
+        raise mongodb._BudgetSpent()
+
+    mongo.database_command = stalled
+    due = (clock[0] - 1, mongodb.STORAGE_SLOW_RETRY)
+    (block, _), resume, slow = mongodb._build_storage(mongo, None, {"a": due})
+    assert slow == {"a": due}
+    assert [r["error"] for r in block["databases"]] == ["not_read", "not_read"]
+
+
+def test_a_due_slow_database_the_budget_never_reached_keeps_its_place(clock):
+    """Not sent (the listing took the budget), it proved nothing: it stays
+    due, not pushed back."""
+    mongo = BudgetMongo(clock, ["a", "b"], {"a": 0.2, "b": 0.2})
+    listing_only = mongo.command
+
+    def slow_listing(name, deadline=None, **fields):
+        clock[0] += mongodb.STORAGE_BUDGET
+        return listing_only(name, deadline=deadline, **fields)
+
+    mongo.command = slow_listing
+    due = (clock[0] - 1, mongodb.STORAGE_SLOW_RETRY)
+    (block, _), resume, slow = mongodb._build_storage(mongo, None, {"a": due})
+    assert slow == {"a": due}
+    assert [r["error"] for r in block["databases"]] == ["not_read", "not_read"]
+
+
+# Value: protects=after a timeout, or with under STORAGE_MIN_SEND left, nothing more is sent and those databases read not_read; fails_when=mongod's early timeout reply (pymongo truncates maxTimeMS) lets the next dbStats go out with a sliver and read timeout; why_new=the other fakes always land on the deadline; seam=none; no_claim=pymongo's own refusal (simulated by the early reply)
+@pytest.mark.parametrize("early", [0.0005, 1.0])
+def test_after_a_timeout_nothing_more_is_sent(clock, early):
+    class EarlyReply(BudgetMongo):
+        sent = []
+
+        def database_command(self, database, name, deadline):
+            self.sent.append(database)
+            if database == "a":
+                # mongod gave up a little before the agent's own deadline.
+                self.clock[0] = deadline - early
+                raise errors.ExecutionTimeout("operation exceeded time limit", 50, {})
+            return db_stats(database)
+
+    mongo = EarlyReply(clock, ["a", "b", "c"], {})
+    (block, _), resume, slow = mongodb._build_storage(mongo, None, {"b": (0, 1)})
+    assert mongo.sent == ["b", "a"]  # b due first, then a: nothing after it
+    rows = {r["name"]: r["error"] for r in block["databases"]}
+    assert rows == {"a": "timeout", "b": None, "c": "not_read"}
+    assert slow == {} and resume == "a"
+
+
+def test_no_database_is_sent_with_a_sliver_of_the_budget(clock):
+    """A listing that left less than STORAGE_MIN_SEND: the first database is
+    not sent, so it is neither a timeout nor slow."""
+    mongo = BudgetMongo(clock, ["a", "b"], {"a": 0.01, "b": 0.01})
+    listing_only = mongo.command
+
+    def slow_listing(name, deadline=None, **fields):
+        clock[0] += mongodb.STORAGE_BUDGET - mongodb.STORAGE_MIN_SEND / 2
+        return listing_only(name, deadline=deadline, **fields)
+
+    mongo.command = slow_listing
+    (block, _), resume, slow = mongodb._build_storage(mongo, None, {})
+    assert [r["error"] for r in block["databases"]] == ["not_read", "not_read"]
+    assert slow == {} and resume == "a"
+
+
+def test_a_mongod_whose_server_status_was_not_read_gets_no_storage(monkeypatch):
+    """Whether it is a member of a sharded cluster (where 8.0 refuses dbStats
+    and logs it) is unknown: storage does not apply."""
+    mongo = {
+        "hello": STANDALONE_HELLO,
+        "serverStatus": {"raises": op_failure(13, "not authorized on admin")},
+    }
+    result, clients = collect(monkeypatch, mongo)
+    assert "listDatabases" not in clients[0].calls
+    assert result["collection"]["storage_ok"] is None
+    assert result["collection"]["errors"] == {"server_status": "not_authorized"}
+
+
+def test_another_identity_forgets_the_slow_databases(monkeypatch, clock):
+    time_out_on(monkeypatch, clock, {"a"})
+    standalone(monkeypatch, ["a", "b"])
+    assert set(mongodb._storage_state["slow"]) == {"a"}
+    _, calls = standalone(monkeypatch, ["a", "b"], username="other")
+    # Carried over, a would be read last (after b); forgotten, it is first.
+    assert read_databases(calls) == ["a"]
+
+
+# Value: protects=under the cap, a build cut by a timeout resumes at the cut,
+# so the databases it never reached are read next; fails_when=the cap's resume
+# (past the window) wins over the cut's; why_new=the timeout tests list fewer
+# databases than the cap; seam=none; no_claim=the order inside a window
+def test_a_timeout_under_the_cap_resumes_at_the_cut_not_past_the_window(
+    monkeypatch, clock
+):
+    monkeypatch.setattr(mongodb, "MAX_DATABASES", 3)
+    slow = {"b"}
+    time_out_on(monkeypatch, clock, slow)
+    names = ["a", "b", "c", "d", "e"]
+    result, calls = standalone(monkeypatch, names)
+    assert read_databases(calls) == ["a", "b"]
+    rows = result["node"]["storage"]["databases"]
+    assert [(r["name"], r["error"]) for r in rows] == [
+        ("a", None),
+        ("b", "timeout"),
+        ("c", "not_read"),
+        ("d", "not_read"),
+        ("e", "not_read"),
+    ]
+
+    slow.clear()
+    clock[0] += mongodb.STORAGE_CACHE_TTL
+    _, calls = standalone(monkeypatch, names)
+    # b and c, never read, come first: not d, past the last build's window.
+    assert read_databases(calls) == ["b", "c", "d"]
+
+
+def test_a_build_whose_first_database_was_not_sent_starts_there_again(
+    monkeypatch, clock
+):
+    """Not sent (the listing took the budget) is not 'took the budget by
+    itself': no database is passed over."""
+    original = mongodb_fake.FakeClient._command
+
+    def slow_listing(self, name, **fields):
+        reply = original(self, name, **fields)
+        if name == "listDatabases":
+            clock[0] += mongodb.STORAGE_BUDGET
+        return reply
+
+    monkeypatch.setattr(mongodb_fake.FakeClient, "_command", slow_listing)
+    result, calls = standalone(monkeypatch, ["a", "b"])
+    assert read_databases(calls) == []
+    assert [r["error"] for r in result["node"]["storage"]["databases"]] == [
+        "not_read",
+        "not_read",
+    ]
+    assert mongodb._storage_state["resume"] == "a"
+
+
+def test_a_lone_database_that_times_out_is_read_again(monkeypatch, clock):
+    time_out_on(monkeypatch, clock, {"a"})
+    standalone(monkeypatch, ["a"])
+    assert mongodb._storage_state["resume"] is None
+    clock[0] += mongodb.STORAGE_CACHE_TTL
+    _, calls = standalone(monkeypatch, ["a"])
+    assert read_databases(calls) == ["a"]
+
+
+def test_the_storage_build_has_its_own_budget_inside_the_command_budget(monkeypatch):
+    seen = []
+
+    class Timeout:
+        def __init__(self, seconds):
+            seen.append(seconds)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    databases = []
+
+    class Client:
+        admin = SimpleNamespace(command=lambda name, **fields: fields)
+
+        def __getitem__(self, database):
+            databases.append(database)
+            return SimpleNamespace(command=lambda name: {"db": database, "cmd": name})
+
+    now = [100.0]
+    monkeypatch.setattr(mongodb, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    mongo = mongodb._Mongo(SimpleNamespace(timeout=Timeout), Client())  # budget: 115
+    # The tighter of the two deadlines, whichever it is.
+    assert mongo.command("listDatabases", deadline=103.0, nameOnly=True) == {
+        "nameOnly": True
+    }
+    now[0] = 112.0
+    assert mongo.database_command("a", "dbStats", deadline=120.0) == {
+        "db": "a",
+        "cmd": "dbStats",
+    }
+    assert seen == [3.0, 3.0] and databases == ["a"]
+    now[0] = 115.0
+    with pytest.raises(mongodb._BudgetSpent):
+        mongo.database_command("b", "dbStats", deadline=130.0)
+    assert databases == ["a"]
+
+
+def test_a_failed_listing_resets_the_database_streak(monkeypatch, clock, capsys):
+    monkeypatch.setenv("LOG_LEVEL", "debug")
+    refused = {"a": {"raises": op_failure(13)}}
+    standalone(monkeypatch, ["a"], refused)
+    clock[0] += mongodb.STORAGE_CACHE_TTL
+    standalone(monkeypatch, {"raises": op_failure(8)})
+    clock[0] += mongodb.STORAGE_CACHE_TTL
+    capsys.readouterr()
+    standalone(monkeypatch, ["a"], refused)
+    lines = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if "databases not read" in line
+    ]
+    assert len(lines) == 1 and lines[0].startswith("[ERROR")
+
+
+def test_storage_failures_log_at_error_once_per_change_of_reasons(
+    monkeypatch, clock, capsys
+):
+    monkeypatch.setenv("LOG_LEVEL", "debug")
+    names = [f"db{i:02d}" for i in range(12)]
+    refused = {n: {"raises": op_failure(13)} for n in names}
+
+    def build(stats):
+        standalone(monkeypatch, names, stats)
+        clock[0] += mongodb.STORAGE_CACHE_TTL
+        return [
+            line
+            for line in capsys.readouterr().out.splitlines()
+            if "databases not read" in line
+        ]
+
+    first = build(refused)
+    assert len(first) == 1 and first[0].startswith("[ERROR")
+    assert first[0].endswith(
+        "MongoDB databases not read: "
+        + ", ".join(f"db{i:02d} (not_authorized)" for i in range(10))
+        + " and 2 more"
+    )
+    # Same reasons (whichever databases): debug.
+    assert build({**refused, "db00": db_stats("db00")})[0].startswith("[DEBUG")
+    assert build({n: db_stats(n) for n in names}) == []
+    assert build(refused)[0].startswith("[ERROR")
+    timed_out = {
+        **refused,
+        "db03": {"raises": {"type": "NetworkTimeout", "message": "t"}},
+    }
+    assert build(timed_out)[0].startswith("[ERROR")
+
+
+def test_fixture_storage_follows_its_contract():
+    seen = set()
+    for name, scenario in SCENARIOS.items():
+        payload = scenario["payload"]["mongodb"]
+        collection = payload["collection"]
+        storage = (payload["node"] or {}).get("storage")
+        if collection is None:
+            continue
+        flag = collection["storage_ok"]
+        assert (flag is False) == ("storage" in collection["errors"]), name
+        assert (storage is not None) == (flag is True), name
+        if storage is None:
+            continue
+        seen.add(storage["complete"])
+        assert set(storage) == STORAGE_KEYS, name
+        rows = storage["databases"]
+        assert [r["name"] for r in rows] == sorted(r["name"] for r in rows), name
+        for row in rows:
+            assert set(row) == ROW_KEYS, name
+            assert row["system"] == (row["name"] in ("admin", "config", "local"))
+            if row["error"] is not None:
+                assert all(
+                    row[k] is None for k in ROW_KEYS - {"name", "system", "error"}
+                )
+        assert storage["complete"] == (
+            len(rows) == storage["databases_total"]
+            and all(r["error"] is None for r in rows)
+        ), name
+    assert seen == {True, False}
+
+
 # --- budget, close, bounds, logging -----------------------------------------------
 
 
@@ -1649,6 +2884,10 @@ def test_the_shipped_bounds_nest():
     unit = Path(__file__).resolve().parent.parent / "fivenines-agent.service"
     watchdog = re.search(r"^WatchdogSec=(\d+)$", unit.read_text(), re.M)
     assert mongodb.HELLO_TIMEOUT_S <= mongodb.COMMAND_BUDGET
+    # The storage build fits in what the other sections leave of the budget,
+    # and is spaced well past the 60s tick.
+    assert mongodb.STORAGE_BUDGET < mongodb.COMMAND_BUDGET - mongodb.HELLO_TIMEOUT_S
+    assert mongodb.STORAGE_CACHE_TTL >= 10 * 60
     assert (
         mongodb.COMMAND_BUDGET + mongodb.CLOSE_TIMEOUT
         < mongodb.COLLECT_DEADLINE

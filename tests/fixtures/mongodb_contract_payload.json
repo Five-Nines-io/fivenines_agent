@@ -1,5 +1,5 @@
 {
-  "description": "Shared MongoDB contract fixture between fivenines-agent and fivenines-server (agent #258, server #493). Source of truth: fivenines-agent tests/fixtures/mongodb_contract_payload.json, asserted end-to-end by tests/test_mongodb.py::test_contract_fixture_round_trip: only the pymongo client is replaced (command in, reply or exception out, see mock_contract) and mongodb_metrics(**config['mongodb']) must equal payload['mongodb']. The server keeps a BYTE-IDENTICAL copy and posts each scenario's payload under data['mongodb']; the Rust port uses it as its parity source. Change the payload shape only in lockstep. Replies marked CAPTURED were recorded on 2026-11-02 from official MongoDB builds (4.2.25, 4.4.1, 4.4.31, 6.0.29, 7.0.45, 8.0.34) by the agent itself, see lab; they are trimmed to the fields the agent reads (serverStatus) and stripped of $clusterTime, operationTime and the election metrics, host names rewritten (db1.internal...). Each CAPTURED payload equals what the agent produced live against that mongod. SYNTHETIC replies say so; member_down's payload is issue #258's example, verbatim.",
+  "description": "Shared MongoDB contract fixture between fivenines-agent and fivenines-server (agent #258, server #493). Source of truth: fivenines-agent tests/fixtures/mongodb_contract_payload.json, asserted end-to-end by tests/test_mongodb.py::test_contract_fixture_round_trip: only the pymongo client is replaced (command in, reply or exception out, see mock_contract) and mongodb_metrics(**config['mongodb']) must equal payload['mongodb']. The server keeps a BYTE-IDENTICAL copy and posts each scenario's payload under data['mongodb']; the Rust port uses it as its parity source. Change the payload shape only in lockstep. Replies marked CAPTURED were recorded on 2026-11-02 from official MongoDB builds (4.2.25, 4.4.1, 4.4.31, 6.0.29, 7.0.45, 8.0.34) by the agent itself, see lab; they are trimmed to the fields the agent reads (serverStatus) and stripped of $clusterTime, operationTime and the election metrics, host names rewritten (db1.internal...). Each CAPTURED payload equals what the agent produced live against that mongod, save for what agent 1.24.0 added (lag_contract.value_ms, storage_contract): lag_ms is computed from the same CAPTURED replSetGetStatus replies, node.storage from storage_replies, CAPTURED on 2026-11-15 (lab.storage). SYNTHETIC replies say so; member_down's payload is issue #258's example, verbatim.",
   "agent_min_version": "1.22.0",
   "_agent_min_version_note": "First agent release carrying the mongodb collector. Purely config-driven: an older agent ignores the top-level 'mongodb' key entirely (the key is absent from its payload), so the server may send it before the fleet upgrades. config['mongodb'] defaults to false server-side.",
   "config_contract": {
@@ -15,10 +15,10 @@
     "tls_certificate_key_file": "PEM client certificate + key (MONGODB-X509, or a mongod with net.tls.allowConnectionsWithoutCertificates false). A file that does not load is config_error. An encrypted (passphrase-protected) key is not supported: the agent passes an explicit empty passphrase, so OpenSSL never prompts on a terminal and such a key fails to load (config_error). A path that is not a regular file is config_error, as for tls_ca_file.",
     "tls_allow_invalid_certificates": "Only an explicit true disables certificate verification (and the CA set is then not loaded). Default false. The mongod certificate must otherwise name `host`: with host 127.0.0.1, a certificate issued for db1.internal fails with tls_error -- configure the name the certificate carries.",
     "connection": "One client per tick, closed in a finally: MongoClient(host, port, directConnection=True, appname='fivenines-agent', serverSelectionTimeoutMS=5000, connectTimeoutMS=5000, socketTimeoutMS=10000, maxPoolSize=1, retryReads=False, retryWrites=False, serverMonitoringMode='poll', + auth/tls). Never SRV, never a seed list, never directConnection=False: the agent never connects to another member. Each tick opens two connections (the driver's monitor + one for the commands), each logged by mongod.",
-    "bounds": "The hello gate (server selection + connection + authentication + hello) is bounded at 5s; each later command at min(10s, what is left of a 15s budget), via pymongo.timeout(); a section the budget no longer covers reads timeout. The whole collection runs on a worker abandoned after 20s (what no driver timeout covers): that tick reports timeout, and so does every later one until that worker returns (no second collection starts behind it). The driver's own monitor thread resolves and dials the host outside both bounds and outlives a closed client while blocked (a resolver that never answers): no client is built while such a thread from an earlier tick is still alive once given 1s to end (close() does not join them: one merely exiting is waited for, one still connecting is not), so a stuck resolver costs one thread, and every tick reports timeout ('a previous MongoDB connection attempt is still blocked ...') until it ends."
+    "bounds": "The hello gate (server selection + connection + authentication + hello) is bounded at 5s; each later command at min(10s, what is left of a 15s budget), via pymongo.timeout(); a section the budget no longer covers reads timeout. The whole collection runs on a worker abandoned after 20s (what no driver timeout covers): that tick reports timeout, and so does every later one until that worker returns (no second collection starts behind it). The driver's own monitor thread resolves and dials the host outside both bounds and outlives a closed client while blocked (a resolver that never answers): no client is built while such a thread from an earlier tick is still alive once given 1s to end (close() does not join them: one merely exiting is waited for, one still connecting is not), so a stuck resolver costs one thread, and every tick reports timeout ('a previous MongoDB connection attempt is still blocked ...') until it ends. node.storage (agent 1.24.0+) is read after every other section, within its own 5s budget, started only when that whole budget fits in what is left of the 15s, and at most once per 600s (storage_contract.spacing)."
   },
   "privilege_contract": {
-    "_note": "clusterMonitor on admin covers hello, serverStatus, replSetGetStatus and replSetGetConfig on every role; read on local adds the oplog read. read on local is OPTIONAL and broad: it lets the account read the oplog's contents (every recent write to every database), although the agent only asks for the first and last entries' ts. Without it only the oplog section reads not_authorized. Every command is read-only: never dbStats, listDatabases, collStats, currentOp, the profiler, or anything that writes.",
+    "_note": "clusterMonitor on admin covers hello, serverStatus, replSetGetStatus, replSetGetConfig, listDatabases and dbStats on every role (MEASURED: dbStats on local too, without read on local); read on local adds the oplog read. read on local is OPTIONAL and broad: it lets the account read the oplog's contents (every recent write to every database), although the agent only asks for the first and last entries' ts. Without it only the oplog section reads not_authorized. Every command is read-only: never collStats, currentOp, the profiler, or anything that writes; listDatabases asks for the names only (nameOnly), never the per-database sizes (one dbStats per database, at most once per 600s, see storage_contract).",
     "setup": "db.getSiblingDB('admin').createUser({user: 'fivenines', pwd: passwordPrompt(), roles: [{role: 'clusterMonitor', db: 'admin'}, {role: 'read', db: 'local'}]}) -- on a replica set, on the primary (the user replicates to every member); on a sharded cluster, once through mongos for the routers and once on each shard's and the config server set's primary for their members (shard-local users).",
     "missing_privilege": "A user without one of them is NOT an error envelope: hello needs no privilege, so the agent is connected and authenticated (reachable true) and each refused command drops only its section (collection.errors[section] = 'not_authorized').",
     "arbiter": "An arbiter stores no users: with credentials configured, its authentication fails. The agent recognises the arbiter from the driver's unauthenticated monitor hello and reports role arbiter (scenario arbiter_self_auth_on), never auth_failed."
@@ -40,24 +40,24 @@
     "unknown": "Anything else, including a hello answered with another server error. Server status: unreachable. A peer that does not speak the MongoDB wire protocol reads unknown with a fixed message."
   },
   "collection_contract": {
-    "_note": "collection = {server_status_ok, repl_status_ok, repl_config_ok, oplog_ok, errors}. A flag is true when its section was read, false when it was refused or failed (and errors[section] says why), null when the section does not apply to the role. errors keys: server_status, repl_status, repl_config, oplog; values: not_authorized (Unauthorized, 13), refused (any other server error), timeout (a driver or server timeout, or the 15s budget spent before the command could be sent), error (anything else: the connection dropped mid-tick, an unexpected reply).",
-    "required_sections": "The server decides which sections it requires: serverStatus everywhere, plus replSetGetStatus and replSetGetConfig on a member. A refused oplog read is a warning only.",
+    "_note": "collection = {server_status_ok, repl_status_ok, repl_config_ok, oplog_ok, storage_ok, errors}. A flag is true when its section was read, false when it was refused or failed (and errors[section] says why), null when the section does not apply to the role. errors keys: server_status, repl_status, repl_config, oplog, storage; values: not_authorized (Unauthorized, 13), refused (any other server error), timeout (a driver or server timeout, or the 15s budget spent before the command could be sent), error (anything else: the connection dropped mid-tick, an unexpected reply). storage_ok (agent 1.24.0+; absent before) is listDatabases' outcome only, from the build node.storage reports, up to 600s old: the databases dbStats did not read are listed in node.storage.databases with their own error (storage_contract).",
+    "required_sections": "The server decides which sections it requires: serverStatus everywhere, plus replSetGetStatus and replSetGetConfig on a member. A refused oplog read is a warning only, and so is a refused storage read.",
     "by_role": {
-      "standalone": "server_status_ok set; repl_*, oplog_ok null.",
-      "mongos": "server_status_ok set; repl_*, oplog_ok null.",
-      "replica_set_member": "all four set.",
-      "arbiter": "all four null, node null (hello only).",
-      "uninitiated": "server_status_ok set; repl_config_ok and oplog_ok null; repl_status_ok null when replSetGetStatus answered NotYetInitialized (94), false with errors.repl_status when it could not be read (refused, timed out, failed): the role then rests on hello alone, where an uninitiated and a removed node look alike.",
-      "removed": "server_status_ok set; repl_status_ok null (a removed node has no view of the set: replSetGetStatus answers InvalidReplicaSetConfig and nothing else), repl_config_ok set; oplog_ok null."
+      "standalone": "server_status_ok and storage_ok set; repl_*, oplog_ok null. storage_ok is null whenever serverStatus was not read (server_status_ok false).",
+      "mongos": "server_status_ok set; repl_*, oplog_ok, storage_ok null.",
+      "replica_set_member": "all five set, except storage_ok: null on a member that serves no reads (initial sync, recovery, rollback: hello says neither isWritablePrimary nor secondary) and on any member of a sharded cluster (storage_contract.applies). storage_ok is null whenever serverStatus was not read (server_status_ok false).",
+      "arbiter": "all five null, node null (hello only).",
+      "uninitiated": "server_status_ok set; repl_config_ok, oplog_ok and storage_ok null; repl_status_ok null when replSetGetStatus answered NotYetInitialized (94), false with errors.repl_status when it could not be read (refused, timed out, failed): the role then rests on hello alone, where an uninitiated and a removed node look alike.",
+      "removed": "server_status_ok set; repl_status_ok null (a removed node has no view of the set: replSetGetStatus answers InvalidReplicaSetConfig and nothing else), repl_config_ok set; oplog_ok and storage_ok null."
     },
-    "direct_shard_connection": "MEASURED on 8.0.34 and 7.0.45 with two shards: a direct connection to a shard member refuses none of the agent's commands (all target admin and local) and logs no direct-connection warning, so a shard member reports like any replica set member."
+    "direct_shard_connection": "MEASURED on 8.0.34 and 7.0.45 with two shards: a direct connection to a shard member refuses none of the agent's commands (all target admin and local) and logs no direct-connection warning, so a shard member reports like any replica set member. Not so for storage (dbStats on application databases), which is why it does not apply in a sharded cluster: storage_contract.applies."
   },
   "field_contract": {
     "process": "'mongos' when hello's msg is 'isdbgrid', else 'mongod'.",
     "role": "From hello, then replSetGetStatus: mongos (hello msg isdbgrid); arbiter (arbiterOnly: stop after hello); otherwise, when hello has setName or isreplicaset, replSetGetStatus decides: NotYetInitialized (94) = uninitiated (rs.initiate() never run), InvalidReplicaSetConfig (93) = removed (MEASURED on 4.4 to 8.0: a removed node answers hello exactly like an uninitiated one, isreplicaset without setName), any other answer = replica_set_member (when hello names no set and replSetGetStatus could not be read, uninitiated, with errors.repl_status saying why). No setName nor isreplicaset: standalone.",
     "version": "serverStatus().version; null when serverStatus was not read, and on an arbiter.",
     "me": "hello's me (host:port as the set's config spells it); null off replica set members.",
-    "node": "An object on every role except the arbiter (null there). Values as MongoDB reports them, renamed to snake_case; cumulative counters stay cumulative (the server rate()s them; the agent never diffs). A field this version, engine or process does not have is null, never 0; when serverStatus was not read every field but oplog is null (node keeps its shape).",
+    "node": "An object on every role except the arbiter (null there). Values as MongoDB reports them, renamed to snake_case; cumulative counters stay cumulative (the server rate()s them; the agent never diffs). A field this version, engine or process does not have is null, never 0; when serverStatus was not read every field but oplog and storage is null (node keeps its shape).",
     "node.uptime_s": "serverStatus.uptime, whole seconds.",
     "node.connections": "connections.{current, available, totalCreated, active}.",
     "node.opcounters / node.opcounters_repl": "opcounters / opcountersRepl, {insert, query, update, delete, getmore, command}. opcounters_repl null where MongoDB omits it (mongos).",
@@ -72,6 +72,7 @@
     "node.documents": "metrics.document.{inserted, returned, updated, deleted}.",
     "node.op_latencies": "opLatencies.{reads,writes,commands}.{latency (cumulative microseconds), ops}: the server derives the average latency as a ratio of rates.",
     "node.oplog": "{window_s}: the first and last local.oplog.rs entries ($natural 1 then -1, limit 1, projection {ts: 1}), window_s = last.ts.time - first.ts.time. null off data-bearing replica set members, or when the read was refused (oplog_ok false).",
+    "node.storage": "Agent 1.24.0+ (absent key = an older agent): the sizes of this mongod's databases, see storage_contract. null where it does not apply (collection.storage_ok null: mongos, arbiter, uninitiated, removed, a member serving no reads) and when listDatabases failed (collection.storage_ok false).",
     "replica_set": "An object for role replica_set_member and removed, null otherwise. Fields from a command that failed are null (its collection flag is false); set_name falls back to the config's _id, then hello's setName.",
     "replica_set.set_name": "replSetGetStatus.set, else replSetGetConfig._id, else hello.setName.",
     "replica_set.replica_set_id": "replSetGetConfig settings.replicaSetId as 24 lowercase hex characters: THE key the server merges the members' views on. null when absent (sets initiated before MongoDB 3.2: group by set_name) or when the config was not read.",
@@ -93,16 +94,32 @@
     "sharding": "{config_server_set}: the set name before the / of serverStatus().sharding.configsvrConnectionString -- on a shard member the cluster's config server set (how the server groups the sets of one sharded cluster), on a config server member its own set, on a mongos the cluster it routes to. null when serverStatus carries none (not sharded, or not read)."
   },
   "lag_contract": {
-    "_note": "lag_s is computed inside ONE replSetGetStatus reply, never against a clock.",
+    "_note": "lag_s and lag_ms are computed inside ONE replSetGetStatus reply, never against a clock.",
     "reference": "The PRIMARY's optimeDate in this reply (the freshest, should the reply list more than one). With no primary, the freshest optimeDate among the members that have a lag (below) -- the mongosh algorithm.",
     "value": "lag_s = reference - member.optimeDate, whole seconds, clamped at 0. The primary is 0.",
     "null_for": "an arbiter (no optime); a member whose health is not 1 (MongoDB resets its optime to Timestamp(0, 0): a naive lag reads 56 years); a member in STARTUP (0), STARTUP2 (5, initial sync), UNKNOWN (6), ARBITER (7), DOWN (8) or REMOVED (10); a zero or missing optimeDate; and every member when no reference exists.",
-    "delayed_members": "A delayed member's lag_s includes its secondary_delay_s by design: compare the two before calling it lagging."
+    "delayed_members": "A delayed member's lag_s includes its secondary_delay_s by design: compare the two before calling it lagging.",
+    "value_ms": "Agent 1.24.0+ (absent key = an older agent). lag_ms = the reference's lastAppliedWallTime - member.lastAppliedWallTime, whole milliseconds, clamped at 0, the reference member chosen as for lag_s (the primary, else the freshest member that has a lag). lastAppliedWallTime is the wall clock of the PRIMARY that wrote the last operation the member applied, to the millisecond (CAPTURED on 4.4.31, 6.0, 7.0 and 8.0; 4.4.1's members carry none, so lag_ms is null there: scenario ismaster_fallback): every value in the reply was stamped by a primary, so no member's own clock is involved (across a failover, two primaries' clocks may differ by their skew). null wherever lag_s is null, when the member has no lastAppliedWallTime, and for every member when the primary has none (no fallback to a secondary's).",
+    "precision": "lag_s comes from optimeDate, which MongoDB builds from the optime Timestamp's WHOLE second (member optimeDate '...:32Z' beside lastAppliedWallTime '...:32.714Z' in the CAPTURED replies): a member 250 ms behind reads lag_s 0, or 1 when a second boundary falls between the two optimes. Prefer lag_ms; lag_s stays for the servers that read it. Both measure write activity: on a primary writing once every 5s, a secondary that has not yet applied the last write reads up to 5s behind (mongosh's rs.printSecondaryReplicationInfo reads it so too); an idle primary still writes a no-op every 10s.",
+    "views": "Each member reports its own view, and only a primary's is fresh to the millisecond: the secondaries send it their positions as they apply (replSetUpdatePosition), while a secondary knows the other members' lastAppliedWallTime and optimes from heartbeats, every 2s (heartbeatIntervalMillis). In a secondary's view the others' values are up to ~2s old, so its own lag_ms can read 0 while it is behind, and the other members' lag_ms can be off by up to ~2s either way. MEASURED on 7.0.45 (lab.storage): in a primary's view each member's lastAppliedWallTime follows the writes at once (it moves with the majority commit point) while its optimeDate stays heartbeat-old, so there lag_s can read the heartbeat age where lag_ms reads 0 (18s against 0 right after the lab's bulk load); in a secondary's view both are heartbeat-old for the other members. Take lag_ms from the primary's view when the set has one."
+  },
+  "storage_contract": {
+    "_note": "Agent 1.24.0+ (absent node.storage key = an older agent). node.storage = the sizes of this mongod's databases: listDatabases {nameOnly: true, authorizedDatabases: false}, then one dbStats per database. {age_s, databases_total, complete, databases}. Every listed database has a row, read or not (up to 1000).",
+    "applies": "On a mongod that serves reads, from its hello: a standalone, a PRIMARY or a SECONDARY (hidden and delayed included), outside a sharded cluster, which serverStatus tells: when serverStatus was not read (collection.server_status_ok false) storage does not apply either, since it may be a member of one. null, with collection.storage_ok null, on mongos (its dbStats fans out to every shard), an arbiter (node null), an uninitiated or removed node, a member in initial sync, recovery or rollback (MEASURED in RECOVERING: dbStats refused, NotPrimaryOrSecondary 13436), and any member of a sharded cluster (serverStatus.sharding present: a shard member, or a config server member). MEASURED on 8.0.34: over a direct connection a shard member refuses dbStats on an application database (Unauthorized, 'connecting to a sharded cluster improperly') and logs it at error level every time; a config server set turned into a config shard (transitionFromDedicatedConfigServer) holds application databases, refuses the same, and reads exactly like a dedicated one (same serverStatus.sharding, configsvr true, same hello), so no config server member is read either. 7.0.45 answers dbStats on a shard member, but one rule keeps an upgrade to 8.0 from starting those errors. A sharded cluster's databases would be read through mongos, which this collector does not query.",
+    "spacing": "dbStats walks every collection and index of its database, and sizes move slowly: a build runs at most once per 600s per mongod (the configured address, user and identity, and the hello's me and topologyVersion.processId: a host name that now reaches another member, or a mongod restarted behind it, starts afresh rather than inherit the previous node's inventory), after every other section, within its own 5s budget, and the block is re-shipped unchanged in between. A database whose dbStats outlived the budget when it was the build's first (it had everything the build could give) is slow: read last, with what the others leave, until it answers, and given the build's first place again an hour later, then twice as long after each retry that still times out (the same delay again after a retry that failed otherwise), at most 24h (a fixed delay let a few such databases take the first place, and with it the whole build, in turn on every build) (re-sent first after each cut, it took every other build's budget and that build read nothing else; read last only, one that stalled once could wait for good behind databases that fill the budget). age_s = whole seconds since that build ENDED, on the agent's monotonic clock: anchor the sizes at received_at - age_s - X-Fivenines-Queued-Ms (the request header carrying how long the tick waited to be sent). A build starts only when its whole 5s budget fits in what is left of the 15s command budget (given a sliver, its listing would time out and that failure would be kept): otherwise storage reads timeout for that tick, nothing is kept, and the next tick tries again. A build whose listDatabases was sent is kept for the 600s whatever came of it, a refusal or a timeout too.",
+    "failure": "listDatabases refused or failed: node.storage null, collection.storage_ok false and collection.errors.storage the reason (not_authorized, refused, timeout, error), for the 600s too. A reply that is not a list of named databases, or an empty list (a mongod always lists local), is error. MEASURED (4.4 to 8.0): a user without the listDatabases privilege gets Unauthorized with authorizedDatabases false, and the short list of its own databases without it. authorizedDatabases false makes a user without the listDatabases privilege get Unauthorized (not_authorized, scenario storage_not_authorized) instead of the short list of the databases it can read, which would read as databases gone.",
+    "databases_total": "How many databases listDatabases named.",
+    "databases": "One row per listed database, sorted by name: {name, system, error, collections, views, objects, indexes, data_size, storage_size, index_size, total_size}. A build reads at most 100 (dbStats), the others are listed with error not_read; past 1000 listed databases the rows stop (the ones read always included, then the first names by sort order, so a database further down shows only in the build that reads it) and databases_total says how many were listed. system: the name is admin, config or local (local holds the oplog: on a replica set member it is often most of data_size). error null = read; not_read = listed but not read in this build (outside its 100, or not sent: after a timeout or a lost connection nothing more is sent, nor with less than 0.1s of the budget left; read in a later build); timeout = sent and outlived the budget; else not_authorized / refused / error. Every value is null unless error is null. Values are dbStats' own, in bytes (scale 1): data_size the uncompressed size of the documents, storage_size the space allocated to the collections on disk (compressed, reusable free space included), index_size the indexes' on disk, total_size = storage_size + index_size. A database dropped between the listing and its dbStats reads as MongoDB answers for a database that does not exist until the next build.",
+    "complete": "true when every listed database was read in this build without error: only then do the rows add up to the node -- sum data_size for the logical size (with or without system), total_size for the space on disk, index_size for the indexes. A row whose error is not null keeps whatever the server last stored for it. Pruning does NOT depend on complete: when the rows count databases_total (the listing was shipped whole), a database without a row is gone and may be pruned; with fewer rows (past 1000) never prune. A build stops at its 5s budget (each database it did not reach is listed not_read), and the next build starts where this one stopped, by name (a slow database aside, see spacing), so every database is read within a few builds (scenario storage_database_timed_out). A null node.storage, whatever the reason (storage_ok null or false), is no listing at all: never prune on it.",
+    "limits": "A database whose dbStats needs longer than the 5s budget (less the listing's own time) is never read: its row reads timeout when it gets the build's first place (an hour after it first failed there, then twice as long each time, at most a day) and not_read or timeout otherwise, and keeps whatever the server last stored. On a host with more than 100 databases, a slow database is given its first place only once the rotation brings it into the build's window. An expired block that no build could replace (the command budget left less than 5s) is not re-shipped: storage reads timeout for that tick."
   },
   "mock_contract": {
-    "_note": "Agent-side inputs; the server ignores 'config' and 'mongo'. Each scenario's 'mongo' maps what the agent sends to what it gets back, in MongoDB Extended JSON (relaxed), decoded as MongoClient decodes BSON (naive UTC datetimes). The test fails if the agent sends anything a scenario does not list, or does not send something it lists.",
+    "_note": "Agent-side inputs; the server ignores 'config', 'mongo', 'mongo_base', 'mongo_storage' and the top-level 'storage_replies'. Each scenario's 'mongo' maps what the agent sends to what it gets back, in MongoDB Extended JSON (relaxed), decoded as MongoClient decodes BSON (naive UTC datetimes). The test fails if the agent sends anything a scenario does not list, or does not send something it lists.",
     "hello / isMaster / serverStatus / replSetGetStatus / replSetGetConfig": "The command's reply, or {raises: <exception>}.",
     "oplog": "{first, last}: the two find_one reads of local.oplog.rs, or {raises: <exception>}.",
+    "listDatabases": "The reply to {listDatabases: 1, nameOnly: true, authorizedDatabases: false} (the fake fails the test on any other form), or {raises: <exception>}.",
+    "dbStats": "{<database>: the reply to dbStats on it, or {raises: <exception>}}: every database listed must be asked, and nothing else.",
+    "mongo_storage": "Names the storage_replies entry whose mongo map (listDatabases, dbStats) is merged into the scenario's: mongo_base's map first, then that entry's, then the scenario's own.",
     "monitor": "What the driver's own monitor saw: hello (its unauthenticated reply, delivered through the heartbeat listener; the server description carries its maxWireVersion) and error (the error the monitor recorded for the server: what a ServerSelectionTimeoutError hides). Kept for the scenarios whose hello fails, and for arbiter_self_auth_on.",
     "exception": "{type: a pymongo.errors class name (or SSLCertVerificationError), reply: the server's ok:0 reply for OperationFailure and its subclasses and for NotPrimaryError, message: the text for the others}."
   },
@@ -111,7 +128,664 @@
     "replica_set": "3 members, priority 2 on db1, settings heartbeatTimeoutSecs 2 / electionTimeoutMillis 3000. member_down: SIGKILL db3. no_primary: SIGKILL db2 too. isolated_primary: electionTimeoutMillis 60000, SIGSTOP db2 and db3 (from db1, a partition). new_primary_after_failover: SIGKILL the primary. delayed_hidden_member: reconfig db3 to priority 0, hidden, secondaryDelaySecs (slaveDelay on 4.4) 3600. psa_with_arbiter: setDefaultRWConcern w:1 (5.0+ refuses the reconfig otherwise), then add an arbiter. initial_sync: a new member started with the initialSyncHangBeforeCopyingDatabases failpoint. removed_self: reconfig without db3.",
     "sharded": "8.0 (and 7.0, same results): a 1-member config server set, two 1-member shard sets, one mongos; cluster users created through mongos, shard-local users on the shard.",
     "tls": "7.0 with --tlsMode requireTLS, a server certificate from a private CA naming DNS:localhost only, --tlsAllowConnectionsWithoutCertificates, and an X.509 client certificate from the same CA.",
-    "all_versions": "Every replica set scenario ran on 4.4.31, 6.0.29, 7.0.45 and 8.0.34 with the same outcome; the fixture keeps the 7.0 captures, plus the version-specific ones."
+    "all_versions": "Every replica set scenario ran on 4.4.31, 6.0.29, 7.0.45 and 8.0.34 with the same outcome; the fixture keeps the 7.0 captures, plus the version-specific ones.",
+    "storage": "2026-11-15, the same method (official tarballs on Debian 12, 4.4/6.0 with Debian 11's libssl1.1, the real collector recording every reply): a 7.0.45 standalone and 3-member set, 4.4.31, 6.0.29 and 8.0.34 standalones, an 8.0.34 and a 7.0.45 sharded cluster. MEASURED: clusterMonitor alone covers listDatabases and dbStats on every database, local included; a user without the listDatabases privilege gets Unauthorized with authorizedDatabases false and the short list of its own databases without it (4.4 to 8.0 alike); dbStats has the same fields on 4.4 to 8.0; a SECONDARY answers dbStats, a member in RECOVERING (replSetMaintenance) answers hello with secondary false and refuses dbStats (NotPrimaryOrSecondary, 13436); on 8.0.34 a direct connection to a shard member refuses dbStats on an application database (Unauthorized, 'You are connecting to a sharded cluster improperly by connecting directly to a shard') and logs it at error level (id 8679600) every time, while admin, config and local answer; 7.0.45 answers it, with no log line and unauthorizedDirectShardOps unchanged; an 8.0.34 config server set turned into a config shard (transitionFromDedicatedConfigServer) keeps the same serverStatus.sharding, configsvr true and hello, and refuses dbStats on the application database it then holds; in a PRIMARY's view each member's lastAppliedWallTime follows the writes at once while its optimeDate is heartbeat-old (lag_s 18 where lag_ms read 0 right after the lab's bulk load), in a SECONDARY's view the other members' values are both heartbeat-old."
+  },
+  "storage_replies": {
+    "_note": "CAPTURED on 2026-11-15 from official builds by the agent itself (lab.storage), except the one timeout standalone_slow_database injects: the mongo maps (listDatabases, dbStats) the scenarios name in mongo_storage, stripped of $clusterTime and operationTime; fsUsedSize/fsTotalSize are the lab machine's.",
+    "standalone": {
+      "description": "CAPTURED from a real MongoDB 7.0.45 standalone with --auth and the privilege_contract user: admin, app (3 collections, 1 view), config, local, tenants (20 collections).",
+      "mongo": {
+        "listDatabases": {
+          "databases": [
+            {
+              "name": "admin"
+            },
+            {
+              "name": "app"
+            },
+            {
+              "name": "config"
+            },
+            {
+              "name": "local"
+            },
+            {
+              "name": "tenants"
+            }
+          ],
+          "ok": 1.0
+        },
+        "dbStats": {
+          "admin": {
+            "db": "admin",
+            "collections": 2,
+            "views": 0,
+            "objects": 6,
+            "avgObjSize": 378.5,
+            "dataSize": 2271.0,
+            "storageSize": 8192.0,
+            "indexes": 3,
+            "indexSize": 12288.0,
+            "totalSize": 20480.0,
+            "scaleFactor": 1,
+            "fsUsedSize": 249450110976.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          },
+          "app": {
+            "db": "app",
+            "collections": 3,
+            "views": 1,
+            "objects": 5098,
+            "avgObjSize": 148.80011769321302,
+            "dataSize": 758583.0,
+            "storageSize": 12288.0,
+            "indexes": 5,
+            "indexSize": 126976.0,
+            "totalSize": 139264.0,
+            "scaleFactor": 1,
+            "fsUsedSize": 249450110976.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          },
+          "config": {
+            "db": "config",
+            "collections": 1,
+            "views": 0,
+            "objects": 0,
+            "avgObjSize": 0.0,
+            "dataSize": 0.0,
+            "storageSize": 4096.0,
+            "indexes": 2,
+            "indexSize": 8192.0,
+            "totalSize": 12288.0,
+            "scaleFactor": 1,
+            "fsUsedSize": 249450110976.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          },
+          "local": {
+            "db": "local",
+            "collections": 1,
+            "views": 0,
+            "objects": 1,
+            "avgObjSize": 2538.0,
+            "dataSize": 2538.0,
+            "storageSize": 4096.0,
+            "indexes": 1,
+            "indexSize": 4096.0,
+            "totalSize": 8192.0,
+            "scaleFactor": 1,
+            "fsUsedSize": 249450110976.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          },
+          "tenants": {
+            "db": "tenants",
+            "collections": 20,
+            "views": 0,
+            "objects": 20,
+            "avgObjSize": 29.0,
+            "dataSize": 580.0,
+            "storageSize": 81920.0,
+            "indexes": 20,
+            "indexSize": 81920.0,
+            "totalSize": 163840.0,
+            "scaleFactor": 1,
+            "fsUsedSize": 249450110976.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          }
+        }
+      }
+    },
+    "standalone_8_0": {
+      "description": "CAPTURED from a real MongoDB 8.0.34 standalone (same lab data and user).",
+      "mongo": {
+        "listDatabases": {
+          "databases": [
+            {
+              "name": "admin"
+            },
+            {
+              "name": "app"
+            },
+            {
+              "name": "config"
+            },
+            {
+              "name": "local"
+            },
+            {
+              "name": "tenants"
+            }
+          ],
+          "ok": 1.0
+        },
+        "dbStats": {
+          "admin": {
+            "db": "admin",
+            "collections": 2,
+            "views": 0,
+            "objects": 6,
+            "avgObjSize": 378.5,
+            "dataSize": 2271.0,
+            "storageSize": 8192.0,
+            "indexes": 3,
+            "indexSize": 12288.0,
+            "totalSize": 20480.0,
+            "scaleFactor": 1,
+            "fsUsedSize": 252580003840.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          },
+          "app": {
+            "db": "app",
+            "collections": 3,
+            "views": 1,
+            "objects": 5098,
+            "avgObjSize": 148.80011769321302,
+            "dataSize": 758583.0,
+            "storageSize": 12288.0,
+            "indexes": 5,
+            "indexSize": 126976.0,
+            "totalSize": 139264.0,
+            "scaleFactor": 1,
+            "fsUsedSize": 252580003840.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          },
+          "config": {
+            "db": "config",
+            "collections": 1,
+            "views": 0,
+            "objects": 0,
+            "avgObjSize": 0.0,
+            "dataSize": 0.0,
+            "storageSize": 4096.0,
+            "indexes": 2,
+            "indexSize": 8192.0,
+            "totalSize": 12288.0,
+            "scaleFactor": 1,
+            "fsUsedSize": 252580003840.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          },
+          "local": {
+            "db": "local",
+            "collections": 1,
+            "views": 0,
+            "objects": 1,
+            "avgObjSize": 6822.0,
+            "dataSize": 6822.0,
+            "storageSize": 4096.0,
+            "indexes": 1,
+            "indexSize": 4096.0,
+            "totalSize": 8192.0,
+            "scaleFactor": 1,
+            "fsUsedSize": 252580003840.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          },
+          "tenants": {
+            "db": "tenants",
+            "collections": 20,
+            "views": 0,
+            "objects": 20,
+            "avgObjSize": 29.0,
+            "dataSize": 580.0,
+            "storageSize": 81920.0,
+            "indexes": 20,
+            "indexSize": 81920.0,
+            "totalSize": 163840.0,
+            "scaleFactor": 1,
+            "fsUsedSize": 252580003840.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          }
+        }
+      }
+    },
+    "standalone_6_0": {
+      "description": "CAPTURED from a real MongoDB 6.0.29 standalone (same lab data and user).",
+      "mongo": {
+        "listDatabases": {
+          "databases": [
+            {
+              "name": "admin"
+            },
+            {
+              "name": "app"
+            },
+            {
+              "name": "config"
+            },
+            {
+              "name": "local"
+            },
+            {
+              "name": "tenants"
+            }
+          ],
+          "ok": 1.0
+        },
+        "dbStats": {
+          "admin": {
+            "db": "admin",
+            "collections": 2,
+            "views": 0,
+            "objects": 6,
+            "avgObjSize": 378.5,
+            "dataSize": 2271.0,
+            "storageSize": 8192.0,
+            "indexes": 3,
+            "indexSize": 12288.0,
+            "totalSize": 20480.0,
+            "scaleFactor": 1.0,
+            "fsUsedSize": 252580167680.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          },
+          "app": {
+            "db": "app",
+            "collections": 3,
+            "views": 1,
+            "objects": 5098,
+            "avgObjSize": 148.80011769321302,
+            "dataSize": 758583.0,
+            "storageSize": 12288.0,
+            "indexes": 5,
+            "indexSize": 126976.0,
+            "totalSize": 139264.0,
+            "scaleFactor": 1.0,
+            "fsUsedSize": 252580167680.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          },
+          "config": {
+            "db": "config",
+            "collections": 1,
+            "views": 0,
+            "objects": 0,
+            "avgObjSize": 0.0,
+            "dataSize": 0.0,
+            "storageSize": 4096.0,
+            "indexes": 2,
+            "indexSize": 8192.0,
+            "totalSize": 12288.0,
+            "scaleFactor": 1.0,
+            "fsUsedSize": 252580167680.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          },
+          "local": {
+            "db": "local",
+            "collections": 1,
+            "views": 0,
+            "objects": 1,
+            "avgObjSize": 2458.0,
+            "dataSize": 2458.0,
+            "storageSize": 4096.0,
+            "indexes": 1,
+            "indexSize": 4096.0,
+            "totalSize": 8192.0,
+            "scaleFactor": 1.0,
+            "fsUsedSize": 252580167680.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          },
+          "tenants": {
+            "db": "tenants",
+            "collections": 20,
+            "views": 0,
+            "objects": 20,
+            "avgObjSize": 29.0,
+            "dataSize": 580.0,
+            "storageSize": 81920.0,
+            "indexes": 20,
+            "indexSize": 81920.0,
+            "totalSize": 163840.0,
+            "scaleFactor": 1.0,
+            "fsUsedSize": 252580167680.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          }
+        }
+      }
+    },
+    "standalone_4_4": {
+      "description": "CAPTURED from a real MongoDB 4.4.31 standalone (same lab data and user); also stands for 4.4.1, whose dbStats has the same fields.",
+      "mongo": {
+        "listDatabases": {
+          "databases": [
+            {
+              "name": "admin"
+            },
+            {
+              "name": "app"
+            },
+            {
+              "name": "config"
+            },
+            {
+              "name": "local"
+            },
+            {
+              "name": "tenants"
+            }
+          ],
+          "ok": 1.0
+        },
+        "dbStats": {
+          "admin": {
+            "db": "admin",
+            "collections": 2,
+            "views": 0,
+            "objects": 6,
+            "avgObjSize": 378.5,
+            "dataSize": 2271.0,
+            "storageSize": 8192.0,
+            "indexes": 3,
+            "indexSize": 12288.0,
+            "totalSize": 20480.0,
+            "scaleFactor": 1.0,
+            "fsUsedSize": 252580270080.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          },
+          "app": {
+            "db": "app",
+            "collections": 3,
+            "views": 1,
+            "objects": 5098,
+            "avgObjSize": 148.80011769321302,
+            "dataSize": 758583.0,
+            "storageSize": 12288.0,
+            "indexes": 5,
+            "indexSize": 126976.0,
+            "totalSize": 139264.0,
+            "scaleFactor": 1.0,
+            "fsUsedSize": 252580270080.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          },
+          "config": {
+            "db": "config",
+            "collections": 1,
+            "views": 0,
+            "objects": 0,
+            "avgObjSize": 0.0,
+            "dataSize": 0.0,
+            "storageSize": 4096.0,
+            "indexes": 2,
+            "indexSize": 8192.0,
+            "totalSize": 12288.0,
+            "scaleFactor": 1.0,
+            "fsUsedSize": 252580270080.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          },
+          "local": {
+            "db": "local",
+            "collections": 1,
+            "views": 0,
+            "objects": 1,
+            "avgObjSize": 2288.0,
+            "dataSize": 2288.0,
+            "storageSize": 4096.0,
+            "indexes": 1,
+            "indexSize": 4096.0,
+            "totalSize": 8192.0,
+            "scaleFactor": 1.0,
+            "fsUsedSize": 252580270080.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          },
+          "tenants": {
+            "db": "tenants",
+            "collections": 20,
+            "views": 0,
+            "objects": 20,
+            "avgObjSize": 29.0,
+            "dataSize": 580.0,
+            "storageSize": 81920.0,
+            "indexes": 20,
+            "indexSize": 81920.0,
+            "totalSize": 163840.0,
+            "scaleFactor": 1.0,
+            "fsUsedSize": 252580270080.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          }
+        }
+      }
+    },
+    "replica_set_member": {
+      "description": "CAPTURED from a real MongoDB 7.0.45 PRIMARY of a 3-member set (same lab data and user): local holds the oplog (9 collections, 1 view).",
+      "mongo": {
+        "listDatabases": {
+          "databases": [
+            {
+              "name": "admin"
+            },
+            {
+              "name": "app"
+            },
+            {
+              "name": "config"
+            },
+            {
+              "name": "local"
+            },
+            {
+              "name": "tenants"
+            }
+          ],
+          "ok": 1.0
+        },
+        "dbStats": {
+          "admin": {
+            "db": "admin",
+            "collections": 3,
+            "views": 0,
+            "objects": 8,
+            "avgObjSize": 305.125,
+            "dataSize": 2441.0,
+            "storageSize": 28672.0,
+            "indexes": 4,
+            "indexSize": 32768.0,
+            "totalSize": 61440.0,
+            "scaleFactor": 1,
+            "fsUsedSize": 250409840640.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          },
+          "app": {
+            "db": "app",
+            "collections": 3,
+            "views": 1,
+            "objects": 5098,
+            "avgObjSize": 148.80011769321302,
+            "dataSize": 758583.0,
+            "storageSize": 12288.0,
+            "indexes": 5,
+            "indexSize": 126976.0,
+            "totalSize": 139264.0,
+            "scaleFactor": 1,
+            "fsUsedSize": 250409840640.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          },
+          "config": {
+            "db": "config",
+            "collections": 10,
+            "views": 0,
+            "objects": 1,
+            "avgObjSize": 166.0,
+            "dataSize": 166.0,
+            "storageSize": 40960.0,
+            "indexes": 16,
+            "indexSize": 65536.0,
+            "totalSize": 106496.0,
+            "scaleFactor": 1,
+            "fsUsedSize": 250409840640.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          },
+          "local": {
+            "db": "local",
+            "collections": 9,
+            "views": 1,
+            "objects": 5193,
+            "avgObjSize": 430.8567302137493,
+            "dataSize": 2237439.0,
+            "storageSize": 151552.0,
+            "indexes": 8,
+            "indexSize": 131072.0,
+            "totalSize": 282624.0,
+            "scaleFactor": 1,
+            "fsUsedSize": 250409840640.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          },
+          "tenants": {
+            "db": "tenants",
+            "collections": 20,
+            "views": 0,
+            "objects": 20,
+            "avgObjSize": 29.0,
+            "dataSize": 580.0,
+            "storageSize": 81920.0,
+            "indexes": 20,
+            "indexSize": 81920.0,
+            "totalSize": 163840.0,
+            "scaleFactor": 1,
+            "fsUsedSize": 250409840640.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          }
+        }
+      }
+    },
+    "standalone_slow_database": {
+      "description": "The 7.0.45 standalone's CAPTURED replies, with one SYNTHETIC timeout injected on tenants (a database whose dbStats outlives the build's budget: MaxTimeMSExpired, since pymongo sends what is left of the budget as maxTimeMS).",
+      "mongo": {
+        "listDatabases": {
+          "databases": [
+            {
+              "name": "admin"
+            },
+            {
+              "name": "app"
+            },
+            {
+              "name": "config"
+            },
+            {
+              "name": "local"
+            },
+            {
+              "name": "tenants"
+            }
+          ],
+          "ok": 1.0
+        },
+        "dbStats": {
+          "admin": {
+            "db": "admin",
+            "collections": 2,
+            "views": 0,
+            "objects": 6,
+            "avgObjSize": 378.5,
+            "dataSize": 2271.0,
+            "storageSize": 8192.0,
+            "indexes": 3,
+            "indexSize": 12288.0,
+            "totalSize": 20480.0,
+            "scaleFactor": 1,
+            "fsUsedSize": 249450110976.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          },
+          "app": {
+            "db": "app",
+            "collections": 3,
+            "views": 1,
+            "objects": 5098,
+            "avgObjSize": 148.80011769321302,
+            "dataSize": 758583.0,
+            "storageSize": 12288.0,
+            "indexes": 5,
+            "indexSize": 126976.0,
+            "totalSize": 139264.0,
+            "scaleFactor": 1,
+            "fsUsedSize": 249450110976.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          },
+          "config": {
+            "db": "config",
+            "collections": 1,
+            "views": 0,
+            "objects": 0,
+            "avgObjSize": 0.0,
+            "dataSize": 0.0,
+            "storageSize": 4096.0,
+            "indexes": 2,
+            "indexSize": 8192.0,
+            "totalSize": 12288.0,
+            "scaleFactor": 1,
+            "fsUsedSize": 249450110976.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          },
+          "local": {
+            "db": "local",
+            "collections": 1,
+            "views": 0,
+            "objects": 1,
+            "avgObjSize": 2538.0,
+            "dataSize": 2538.0,
+            "storageSize": 4096.0,
+            "indexes": 1,
+            "indexSize": 4096.0,
+            "totalSize": 8192.0,
+            "scaleFactor": 1,
+            "fsUsedSize": 249450110976.0,
+            "fsTotalSize": 302134525952.0,
+            "ok": 1.0
+          },
+          "tenants": {
+            "raises": {
+              "type": "ExecutionTimeout",
+              "reply": {
+                "ok": 0.0,
+                "errmsg": "operation exceeded time limit",
+                "code": 50,
+                "codeName": "MaxTimeMSExpired"
+              }
+            }
+          }
+        }
+      }
+    },
+    "not_authorized": {
+      "description": "CAPTURED from a real MongoDB 7.0.45 SECONDARY with a user holding only read on app: with authorizedDatabases false MongoDB refuses (Unauthorized, 13, 'Insufficient permissions to list all databases'); without it, MEASURED, it answers the short list [app]. The same refusal on 4.4.31, 6.0.29 and 8.0.34.",
+      "mongo": {
+        "listDatabases": {
+          "raises": {
+            "type": "OperationFailure",
+            "reply": {
+              "ok": 0.0,
+              "errmsg": "Insufficient permissions to list all databases",
+              "code": 13,
+              "codeName": "Unauthorized"
+            }
+          }
+        }
+      }
+    }
   },
   "scenarios": {
     "standalone": {
@@ -130,6 +804,7 @@
           "tls_allow_invalid_certificates": false
         }
       },
+      "mongo_storage": "standalone",
       "mongo": {
         "hello": {
           "isWritablePrimary": true,
@@ -332,6 +1007,7 @@
             "repl_status_ok": null,
             "repl_config_ok": null,
             "oplog_ok": null,
+            "storage_ok": true,
             "errors": {}
           },
           "node": {
@@ -412,7 +1088,79 @@
               "commands_us": 40746,
               "commands_ops": 16
             },
-            "oplog": null
+            "oplog": null,
+            "storage": {
+              "age_s": 0,
+              "databases_total": 5,
+              "complete": true,
+              "databases": [
+                {
+                  "name": "admin",
+                  "system": true,
+                  "error": null,
+                  "collections": 2,
+                  "views": 0,
+                  "objects": 6,
+                  "indexes": 3,
+                  "data_size": 2271,
+                  "storage_size": 8192,
+                  "index_size": 12288,
+                  "total_size": 20480
+                },
+                {
+                  "name": "app",
+                  "system": false,
+                  "error": null,
+                  "collections": 3,
+                  "views": 1,
+                  "objects": 5098,
+                  "indexes": 5,
+                  "data_size": 758583,
+                  "storage_size": 12288,
+                  "index_size": 126976,
+                  "total_size": 139264
+                },
+                {
+                  "name": "config",
+                  "system": true,
+                  "error": null,
+                  "collections": 1,
+                  "views": 0,
+                  "objects": 0,
+                  "indexes": 2,
+                  "data_size": 0,
+                  "storage_size": 4096,
+                  "index_size": 8192,
+                  "total_size": 12288
+                },
+                {
+                  "name": "local",
+                  "system": true,
+                  "error": null,
+                  "collections": 1,
+                  "views": 0,
+                  "objects": 1,
+                  "indexes": 1,
+                  "data_size": 2538,
+                  "storage_size": 4096,
+                  "index_size": 4096,
+                  "total_size": 8192
+                },
+                {
+                  "name": "tenants",
+                  "system": false,
+                  "error": null,
+                  "collections": 20,
+                  "views": 0,
+                  "objects": 20,
+                  "indexes": 20,
+                  "data_size": 580,
+                  "storage_size": 81920,
+                  "index_size": 81920,
+                  "total_size": 163840
+                }
+              ]
+            }
           },
           "replica_set": null,
           "sharding": null
@@ -435,6 +1183,7 @@
           "tls_allow_invalid_certificates": false
         }
       },
+      "mongo_storage": "replica_set_member",
       "mongo": {
         "hello": {
           "topologyVersion": {
@@ -970,6 +1719,7 @@
             "repl_status_ok": true,
             "repl_config_ok": true,
             "oplog_ok": true,
+            "storage_ok": true,
             "errors": {}
           },
           "node": {
@@ -1052,6 +1802,78 @@
             },
             "oplog": {
               "window_s": 4
+            },
+            "storage": {
+              "age_s": 0,
+              "databases_total": 5,
+              "complete": true,
+              "databases": [
+                {
+                  "name": "admin",
+                  "system": true,
+                  "error": null,
+                  "collections": 3,
+                  "views": 0,
+                  "objects": 8,
+                  "indexes": 4,
+                  "data_size": 2441,
+                  "storage_size": 28672,
+                  "index_size": 32768,
+                  "total_size": 61440
+                },
+                {
+                  "name": "app",
+                  "system": false,
+                  "error": null,
+                  "collections": 3,
+                  "views": 1,
+                  "objects": 5098,
+                  "indexes": 5,
+                  "data_size": 758583,
+                  "storage_size": 12288,
+                  "index_size": 126976,
+                  "total_size": 139264
+                },
+                {
+                  "name": "config",
+                  "system": true,
+                  "error": null,
+                  "collections": 10,
+                  "views": 0,
+                  "objects": 1,
+                  "indexes": 16,
+                  "data_size": 166,
+                  "storage_size": 40960,
+                  "index_size": 65536,
+                  "total_size": 106496
+                },
+                {
+                  "name": "local",
+                  "system": true,
+                  "error": null,
+                  "collections": 9,
+                  "views": 1,
+                  "objects": 5193,
+                  "indexes": 8,
+                  "data_size": 2237439,
+                  "storage_size": 151552,
+                  "index_size": 131072,
+                  "total_size": 282624
+                },
+                {
+                  "name": "tenants",
+                  "system": false,
+                  "error": null,
+                  "collections": 20,
+                  "views": 0,
+                  "objects": 20,
+                  "indexes": 20,
+                  "data_size": 580,
+                  "storage_size": 81920,
+                  "index_size": 81920,
+                  "total_size": 163840
+                }
+              ]
             }
           },
           "replica_set": {
@@ -1077,6 +1899,7 @@
                 "state_str": "PRIMARY",
                 "uptime_s": 8,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": null,
                 "last_heartbeat_age_s": null,
                 "last_heartbeat_recv_age_s": null,
@@ -1098,6 +1921,7 @@
                 "state_str": "SECONDARY",
                 "uptime_s": 7,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": 0,
                 "last_heartbeat_age_s": 1,
                 "last_heartbeat_recv_age_s": 0,
@@ -1119,6 +1943,7 @@
                 "state_str": "SECONDARY",
                 "uptime_s": 7,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": 0,
                 "last_heartbeat_age_s": 1,
                 "last_heartbeat_recv_age_s": 0,
@@ -1153,6 +1978,7 @@
           "tls_allow_invalid_certificates": false
         }
       },
+      "mongo_storage": "replica_set_member",
       "mongo": {
         "hello": {
           "topologyVersion": {
@@ -1685,6 +2511,7 @@
             "repl_status_ok": true,
             "repl_config_ok": true,
             "oplog_ok": true,
+            "storage_ok": true,
             "errors": {}
           },
           "node": {
@@ -1767,6 +2594,78 @@
             },
             "oplog": {
               "window_s": 4
+            },
+            "storage": {
+              "age_s": 0,
+              "databases_total": 5,
+              "complete": true,
+              "databases": [
+                {
+                  "name": "admin",
+                  "system": true,
+                  "error": null,
+                  "collections": 3,
+                  "views": 0,
+                  "objects": 8,
+                  "indexes": 4,
+                  "data_size": 2441,
+                  "storage_size": 28672,
+                  "index_size": 32768,
+                  "total_size": 61440
+                },
+                {
+                  "name": "app",
+                  "system": false,
+                  "error": null,
+                  "collections": 3,
+                  "views": 1,
+                  "objects": 5098,
+                  "indexes": 5,
+                  "data_size": 758583,
+                  "storage_size": 12288,
+                  "index_size": 126976,
+                  "total_size": 139264
+                },
+                {
+                  "name": "config",
+                  "system": true,
+                  "error": null,
+                  "collections": 10,
+                  "views": 0,
+                  "objects": 1,
+                  "indexes": 16,
+                  "data_size": 166,
+                  "storage_size": 40960,
+                  "index_size": 65536,
+                  "total_size": 106496
+                },
+                {
+                  "name": "local",
+                  "system": true,
+                  "error": null,
+                  "collections": 9,
+                  "views": 1,
+                  "objects": 5193,
+                  "indexes": 8,
+                  "data_size": 2237439,
+                  "storage_size": 151552,
+                  "index_size": 131072,
+                  "total_size": 282624
+                },
+                {
+                  "name": "tenants",
+                  "system": false,
+                  "error": null,
+                  "collections": 20,
+                  "views": 0,
+                  "objects": 20,
+                  "indexes": 20,
+                  "data_size": 580,
+                  "storage_size": 81920,
+                  "index_size": 81920,
+                  "total_size": 163840
+                }
+              ]
             }
           },
           "replica_set": {
@@ -1792,6 +2691,7 @@
                 "state_str": "PRIMARY",
                 "uptime_s": 6,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": 0,
                 "last_heartbeat_age_s": 0,
                 "last_heartbeat_recv_age_s": 1,
@@ -1813,6 +2713,7 @@
                 "state_str": "SECONDARY",
                 "uptime_s": 8,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": null,
                 "last_heartbeat_age_s": null,
                 "last_heartbeat_recv_age_s": null,
@@ -1834,6 +2735,727 @@
                 "state_str": "SECONDARY",
                 "uptime_s": 6,
                 "lag_s": 0,
+                "lag_ms": 0,
+                "ping_ms": 0,
+                "last_heartbeat_age_s": 1,
+                "last_heartbeat_recv_age_s": 0,
+                "sync_source": "db1.internal:27017",
+                "config_version": 1,
+                "priority": 1,
+                "votes": 1,
+                "hidden": false,
+                "arbiter_only": false,
+                "secondary_delay_s": 0,
+                "build_indexes": true
+              }
+            ]
+          },
+          "sharding": null
+        }
+      }
+    },
+    "member_not_serving_reads": {
+      "description": "DERIVED from replset_secondary_view (CAPTURED, 7.0.45): the same member in RECOVERING (hello secondary false, myState 3), a state that serves no reads, so storage does not apply: no listDatabases is sent, node.storage and collection.storage_ok are null and errors has no storage key (storage_contract.applies). Every other section reads as for a SECONDARY. MEASURED on 7.0.45 with replSetMaintenance: a RECOVERING member answers hello with secondary false and refuses dbStats (NotPrimaryOrSecondary, 13436).",
+      "config": {
+        "mongodb": {
+          "host": "127.0.0.1",
+          "port": 27017,
+          "username": "fivenines",
+          "password": "CHANGE-ME",
+          "auth_source": "admin",
+          "auth_mechanism": null,
+          "tls": false,
+          "tls_ca_file": null,
+          "tls_certificate_key_file": null,
+          "tls_allow_invalid_certificates": false
+        }
+      },
+      "mongo": {
+        "hello": {
+          "topologyVersion": {
+            "processId": {
+              "$oid": "6ae8ab2b200c814a03fe236d"
+            },
+            "counter": 4
+          },
+          "hosts": [
+            "db1.internal:27017",
+            "db2.internal:27017",
+            "db3.internal:27017"
+          ],
+          "setName": "rs0",
+          "setVersion": 1,
+          "isWritablePrimary": false,
+          "secondary": false,
+          "primary": "db1.internal:27017",
+          "me": "db2.internal:27017",
+          "lastWrite": {
+            "opTime": {
+              "ts": {
+                "$timestamp": {
+                  "t": 1793633072,
+                  "i": 33
+                }
+              },
+              "t": 1
+            },
+            "lastWriteDate": {
+              "$date": "2026-11-02T15:24:32Z"
+            },
+            "majorityOpTime": {
+              "ts": {
+                "$timestamp": {
+                  "t": 1793633072,
+                  "i": 33
+                }
+              },
+              "t": 1
+            },
+            "majorityWriteDate": {
+              "$date": "2026-11-02T15:24:32Z"
+            }
+          },
+          "maxBsonObjectSize": 16777216,
+          "maxMessageSizeBytes": 48000000,
+          "maxWriteBatchSize": 100000,
+          "localTime": {
+            "$date": "2026-11-02T15:24:35.781Z"
+          },
+          "logicalSessionTimeoutMinutes": 30,
+          "connectionId": 20,
+          "minWireVersion": 0,
+          "maxWireVersion": 21,
+          "readOnly": false,
+          "ok": 1.0
+        },
+        "serverStatus": {
+          "version": "7.0.45",
+          "process": "mongod",
+          "uptime": 8.0,
+          "uptimeMillis": 8195,
+          "asserts": {
+            "regular": 0,
+            "warning": 0,
+            "msg": 0,
+            "user": 18,
+            "tripwire": 0,
+            "rollovers": 0
+          },
+          "connections": {
+            "current": 7,
+            "available": 209708,
+            "totalCreated": 10,
+            "rejected": 0,
+            "active": 1,
+            "queuedForEstablishment": 0,
+            "establishmentRateLimit": {
+              "rejected": 0,
+              "exempted": 0,
+              "interruptedDueToClientDisconnect": 0
+            },
+            "threaded": 7,
+            "exhaustIsMaster": 0,
+            "exhaustHello": 0,
+            "awaitingTopologyChanges": 0
+          },
+          "mem": {
+            "bits": 64,
+            "resident": 158,
+            "virtual": 989,
+            "supported": true
+          },
+          "opLatencies": {
+            "reads": {
+              "latency": 2465,
+              "ops": 11,
+              "queryableEncryptionLatencyMicros": 0
+            },
+            "writes": {
+              "latency": 0,
+              "ops": 0,
+              "queryableEncryptionLatencyMicros": 0
+            },
+            "commands": {
+              "latency": 18650,
+              "ops": 77,
+              "queryableEncryptionLatencyMicros": 0
+            },
+            "transactions": {
+              "latency": 0,
+              "ops": 0,
+              "queryableEncryptionLatencyMicros": 0
+            }
+          },
+          "opcounters": {
+            "insert": 1,
+            "query": 30,
+            "update": 0,
+            "delete": 0,
+            "getmore": 2,
+            "command": 80
+          },
+          "opcountersRepl": {
+            "insert": 34,
+            "query": 0,
+            "update": 1,
+            "delete": 0,
+            "getmore": 0,
+            "command": 21
+          },
+          "extra_info": {
+            "note": "fields vary by platform",
+            "page_faults": 0
+          },
+          "globalLock": {
+            "totalTime": 8210000,
+            "currentQueue": {
+              "total": 0,
+              "readers": 0,
+              "writers": 0
+            },
+            "activeClients": {
+              "total": 0,
+              "readers": 0,
+              "writers": 0
+            }
+          },
+          "metrics": {
+            "cursor": {
+              "timedOut": 0,
+              "open": {
+                "noTimeout": 0,
+                "pinned": 0,
+                "total": 0
+              }
+            },
+            "document": {
+              "deleted": 0,
+              "inserted": 0,
+              "returned": 9,
+              "updated": 0
+            }
+          },
+          "network": {
+            "bytesIn": 21015,
+            "bytesOut": 77072,
+            "physicalBytesIn": 20417,
+            "physicalBytesOut": 40156,
+            "numRequests": 88
+          },
+          "wiredTiger": {
+            "cache": {
+              "bytes currently in the cache": 240822,
+              "maximum bytes configured": 268435456,
+              "tracked dirty bytes in the cache": 208698,
+              "pages read into cache": 3,
+              "pages written from cache": 54
+            },
+            "concurrentTransactions": {
+              "write": {
+                "out": 0,
+                "available": 16,
+                "totalTickets": 16,
+                "immediatePriorityAdmissionsCount": 143,
+                "addedToQueue": 0,
+                "removedFromQueue": 0,
+                "queueLength": 0,
+                "startedProcessing": 21,
+                "processing": 0,
+                "finishedProcessing": 21,
+                "totalTimeProcessingMicros": 46109,
+                "canceled": 0,
+                "newAdmissions": 12,
+                "totalTimeQueuedMicros": 0
+              },
+              "read": {
+                "out": 0,
+                "available": 16,
+                "totalTickets": 16,
+                "immediatePriorityAdmissionsCount": 117,
+                "addedToQueue": 0,
+                "removedFromQueue": 0,
+                "queueLength": 0,
+                "startedProcessing": 201,
+                "processing": 0,
+                "finishedProcessing": 201,
+                "totalTimeProcessingMicros": 6701,
+                "canceled": 0,
+                "newAdmissions": 95,
+                "totalTimeQueuedMicros": 0
+              },
+              "monitor": {
+                "timesDecreased": 0,
+                "timesIncreased": 0,
+                "totalAmountDecreased": 0,
+                "totalAmountIncreased": 0
+              }
+            }
+          },
+          "ok": 1.0
+        },
+        "replSetGetStatus": {
+          "set": "rs0",
+          "date": {
+            "$date": "2026-11-02T15:24:35.785Z"
+          },
+          "myState": 3,
+          "term": 1,
+          "syncSourceHost": "db1.internal:27017",
+          "syncSourceId": 0,
+          "heartbeatIntervalMillis": 2000,
+          "majorityVoteCount": 2,
+          "writeMajorityCount": 2,
+          "votingMembersCount": 3,
+          "writableVotingMembersCount": 3,
+          "optimes": {
+            "lastCommittedOpTime": {
+              "ts": {
+                "$timestamp": {
+                  "t": 1793633072,
+                  "i": 33
+                }
+              },
+              "t": 1
+            },
+            "lastCommittedWallTime": {
+              "$date": "2026-11-02T15:24:32.714Z"
+            },
+            "readConcernMajorityOpTime": {
+              "ts": {
+                "$timestamp": {
+                  "t": 1793633072,
+                  "i": 33
+                }
+              },
+              "t": 1
+            },
+            "appliedOpTime": {
+              "ts": {
+                "$timestamp": {
+                  "t": 1793633072,
+                  "i": 33
+                }
+              },
+              "t": 1
+            },
+            "durableOpTime": {
+              "ts": {
+                "$timestamp": {
+                  "t": 1793633072,
+                  "i": 33
+                }
+              },
+              "t": 1
+            },
+            "lastAppliedWallTime": {
+              "$date": "2026-11-02T15:24:32.714Z"
+            },
+            "lastDurableWallTime": {
+              "$date": "2026-11-02T15:24:32.714Z"
+            }
+          },
+          "lastStableRecoveryTimestamp": {
+            "$timestamp": {
+              "t": 1793633068,
+              "i": 1
+            }
+          },
+          "members": [
+            {
+              "_id": 0,
+              "name": "db1.internal:27017",
+              "health": 1.0,
+              "state": 1,
+              "stateStr": "PRIMARY",
+              "uptime": 6,
+              "optime": {
+                "ts": {
+                  "$timestamp": {
+                    "t": 1793633072,
+                    "i": 33
+                  }
+                },
+                "t": 1
+              },
+              "optimeDurable": {
+                "ts": {
+                  "$timestamp": {
+                    "t": 1793633072,
+                    "i": 33
+                  }
+                },
+                "t": 1
+              },
+              "optimeDate": {
+                "$date": "2026-11-02T15:24:32Z"
+              },
+              "optimeDurableDate": {
+                "$date": "2026-11-02T15:24:32Z"
+              },
+              "lastAppliedWallTime": {
+                "$date": "2026-11-02T15:24:32.714Z"
+              },
+              "lastDurableWallTime": {
+                "$date": "2026-11-02T15:24:32.714Z"
+              },
+              "lastHeartbeat": {
+                "$date": "2026-11-02T15:24:34.848Z"
+              },
+              "lastHeartbeatRecv": {
+                "$date": "2026-11-02T15:24:33.847Z"
+              },
+              "pingMs": 0,
+              "lastHeartbeatMessage": "",
+              "syncSourceHost": "",
+              "syncSourceId": -1,
+              "infoMessage": "",
+              "electionTime": {
+                "$timestamp": {
+                  "t": 1793633071,
+                  "i": 1
+                }
+              },
+              "electionDate": {
+                "$date": "2026-11-02T15:24:31Z"
+              },
+              "configVersion": 1,
+              "configTerm": 1
+            },
+            {
+              "_id": 1,
+              "name": "db2.internal:27017",
+              "health": 1.0,
+              "state": 3,
+              "stateStr": "RECOVERING",
+              "uptime": 8,
+              "optime": {
+                "ts": {
+                  "$timestamp": {
+                    "t": 1793633072,
+                    "i": 33
+                  }
+                },
+                "t": 1
+              },
+              "optimeDate": {
+                "$date": "2026-11-02T15:24:32Z"
+              },
+              "lastAppliedWallTime": {
+                "$date": "2026-11-02T15:24:32.714Z"
+              },
+              "lastDurableWallTime": {
+                "$date": "2026-11-02T15:24:32.714Z"
+              },
+              "syncSourceHost": "db1.internal:27017",
+              "syncSourceId": 0,
+              "infoMessage": "",
+              "configVersion": 1,
+              "configTerm": 1,
+              "self": true,
+              "lastHeartbeatMessage": ""
+            },
+            {
+              "_id": 2,
+              "name": "db3.internal:27017",
+              "health": 1.0,
+              "state": 2,
+              "stateStr": "SECONDARY",
+              "uptime": 6,
+              "optime": {
+                "ts": {
+                  "$timestamp": {
+                    "t": 1793633072,
+                    "i": 33
+                  }
+                },
+                "t": 1
+              },
+              "optimeDurable": {
+                "ts": {
+                  "$timestamp": {
+                    "t": 1793633072,
+                    "i": 33
+                  }
+                },
+                "t": 1
+              },
+              "optimeDate": {
+                "$date": "2026-11-02T15:24:32Z"
+              },
+              "optimeDurableDate": {
+                "$date": "2026-11-02T15:24:32Z"
+              },
+              "lastAppliedWallTime": {
+                "$date": "2026-11-02T15:24:32.714Z"
+              },
+              "lastDurableWallTime": {
+                "$date": "2026-11-02T15:24:32.714Z"
+              },
+              "lastHeartbeat": {
+                "$date": "2026-11-02T15:24:34.350Z"
+              },
+              "lastHeartbeatRecv": {
+                "$date": "2026-11-02T15:24:34.848Z"
+              },
+              "pingMs": 0,
+              "lastHeartbeatMessage": "",
+              "syncSourceHost": "db1.internal:27017",
+              "syncSourceId": 0,
+              "infoMessage": "",
+              "configVersion": 1,
+              "configTerm": 1
+            }
+          ],
+          "ok": 1.0
+        },
+        "replSetGetConfig": {
+          "config": {
+            "_id": "rs0",
+            "version": 1,
+            "term": 1,
+            "members": [
+              {
+                "_id": 0,
+                "host": "db1.internal:27017",
+                "arbiterOnly": false,
+                "buildIndexes": true,
+                "hidden": false,
+                "priority": 2.0,
+                "tags": {},
+                "secondaryDelaySecs": 0,
+                "votes": 1
+              },
+              {
+                "_id": 1,
+                "host": "db2.internal:27017",
+                "arbiterOnly": false,
+                "buildIndexes": true,
+                "hidden": false,
+                "priority": 1.0,
+                "tags": {},
+                "secondaryDelaySecs": 0,
+                "votes": 1
+              },
+              {
+                "_id": 2,
+                "host": "db3.internal:27017",
+                "arbiterOnly": false,
+                "buildIndexes": true,
+                "hidden": false,
+                "priority": 1.0,
+                "tags": {},
+                "secondaryDelaySecs": 0,
+                "votes": 1
+              }
+            ],
+            "protocolVersion": 1,
+            "writeConcernMajorityJournalDefault": true,
+            "settings": {
+              "chainingAllowed": true,
+              "heartbeatIntervalMillis": 2000,
+              "heartbeatTimeoutSecs": 2,
+              "electionTimeoutMillis": 3000,
+              "catchUpTimeoutMillis": -1,
+              "catchUpTakeoverDelayMillis": 30000,
+              "getLastErrorModes": {},
+              "getLastErrorDefaults": {
+                "w": 1,
+                "wtimeout": 0
+              },
+              "replicaSetId": {
+                "$oid": "6ae8ab2c403bb84fe81f357c"
+              }
+            }
+          },
+          "ok": 1.0
+        },
+        "oplog": {
+          "first": {
+            "ts": {
+              "$timestamp": {
+                "t": 1793633068,
+                "i": 1
+              }
+            }
+          },
+          "last": {
+            "ts": {
+              "$timestamp": {
+                "t": 1793633072,
+                "i": 33
+              }
+            }
+          }
+        }
+      },
+      "payload": {
+        "mongodb": {
+          "reachable": true,
+          "error_type": null,
+          "error_message": null,
+          "process": "mongod",
+          "role": "replica_set_member",
+          "version": "7.0.45",
+          "me": "db2.internal:27017",
+          "collection": {
+            "server_status_ok": true,
+            "repl_status_ok": true,
+            "repl_config_ok": true,
+            "oplog_ok": true,
+            "storage_ok": null,
+            "errors": {}
+          },
+          "node": {
+            "uptime_s": 8,
+            "connections": {
+              "current": 7,
+              "available": 209708,
+              "total_created": 10,
+              "active": 1
+            },
+            "opcounters": {
+              "insert": 1,
+              "query": 30,
+              "update": 0,
+              "delete": 0,
+              "getmore": 2,
+              "command": 80
+            },
+            "opcounters_repl": {
+              "insert": 34,
+              "query": 0,
+              "update": 1,
+              "delete": 0,
+              "getmore": 0,
+              "command": 21
+            },
+            "network": {
+              "bytes_in": 21015,
+              "bytes_out": 77072,
+              "num_requests": 88
+            },
+            "memory": {
+              "resident_mb": 158,
+              "virtual_mb": 989
+            },
+            "wiredtiger": {
+              "cache_bytes": 240822,
+              "cache_max_bytes": 268435456,
+              "cache_dirty_bytes": 208698,
+              "pages_read_into_cache": 3,
+              "pages_written_from_cache": 54
+            },
+            "tickets": {
+              "read_out": 0,
+              "read_available": 16,
+              "write_out": 0,
+              "write_available": 16
+            },
+            "global_lock": {
+              "queue_readers": 0,
+              "queue_writers": 0,
+              "active_readers": 0,
+              "active_writers": 0
+            },
+            "asserts": {
+              "regular": 0,
+              "msg": 0,
+              "user": 18,
+              "rollovers": 0
+            },
+            "page_faults": 0,
+            "cursors": {
+              "open_total": 0,
+              "open_no_timeout": 0,
+              "timed_out": 0
+            },
+            "documents": {
+              "inserted": 0,
+              "returned": 9,
+              "updated": 0,
+              "deleted": 0
+            },
+            "op_latencies": {
+              "reads_us": 2465,
+              "reads_ops": 11,
+              "writes_us": 0,
+              "writes_ops": 0,
+              "commands_us": 18650,
+              "commands_ops": 77
+            },
+            "oplog": {
+              "window_s": 4
+            },
+            "storage": null
+          },
+          "replica_set": {
+            "set_name": "rs0",
+            "replica_set_id": "6ae8ab2c403bb84fe81f357c",
+            "configsvr": false,
+            "config_version": 1,
+            "config_term": 1,
+            "term": 1,
+            "my_state": 3,
+            "my_state_str": "RECOVERING",
+            "majority_vote_count": 2,
+            "write_majority_count": 2,
+            "voting_members_count": 3,
+            "writable_voting_members_count": 3,
+            "members": [
+              {
+                "id": 0,
+                "name": "db1.internal:27017",
+                "self": false,
+                "health": 1,
+                "state": 1,
+                "state_str": "PRIMARY",
+                "uptime_s": 6,
+                "lag_s": 0,
+                "lag_ms": 0,
+                "ping_ms": 0,
+                "last_heartbeat_age_s": 0,
+                "last_heartbeat_recv_age_s": 1,
+                "sync_source": null,
+                "config_version": 1,
+                "priority": 2,
+                "votes": 1,
+                "hidden": false,
+                "arbiter_only": false,
+                "secondary_delay_s": 0,
+                "build_indexes": true
+              },
+              {
+                "id": 1,
+                "name": "db2.internal:27017",
+                "self": true,
+                "health": 1,
+                "state": 3,
+                "state_str": "RECOVERING",
+                "uptime_s": 8,
+                "lag_s": 0,
+                "lag_ms": 0,
+                "ping_ms": null,
+                "last_heartbeat_age_s": null,
+                "last_heartbeat_recv_age_s": null,
+                "sync_source": "db1.internal:27017",
+                "config_version": 1,
+                "priority": 1,
+                "votes": 1,
+                "hidden": false,
+                "arbiter_only": false,
+                "secondary_delay_s": 0,
+                "build_indexes": true
+              },
+              {
+                "id": 2,
+                "name": "db3.internal:27017",
+                "self": false,
+                "health": 1,
+                "state": 2,
+                "state_str": "SECONDARY",
+                "uptime_s": 6,
+                "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": 0,
                 "last_heartbeat_age_s": 1,
                 "last_heartbeat_recv_age_s": 0,
@@ -1853,7 +3475,7 @@
       }
     },
     "member_down": {
-      "description": "SYNTHETIC (shaped like member_down_captured): db2's view with db3 down -- issue #258's example payload, verbatim. MongoDB resets a health-0 member's optime to Timestamp(0, 0) (optimeDate 1970), so its lag_s is null rather than 56 years; it keeps a stale pingMs 0, so ping_ms is null; last_heartbeat_age_s is the last ATTEMPT (MongoDB stamps lastHeartbeat on a failed heartbeat too), last_heartbeat_recv_age_s the last heartbeat db3 sent before it went down; configVersion -1 is what a member not heard from since this node started reports.",
+      "description": "SYNTHETIC (shaped like member_down_captured): db2's view with db3 down -- issue #258's example payload, verbatim, plus the keys agents added since (lag_ms, storage_ok, node.storage). MongoDB resets a health-0 member's optime to Timestamp(0, 0) (optimeDate 1970), so its lag_s is null rather than 56 years; it keeps a stale pingMs 0, so ping_ms is null; last_heartbeat_age_s is the last ATTEMPT (MongoDB stamps lastHeartbeat on a failed heartbeat too), last_heartbeat_recv_age_s the last heartbeat db3 sent before it went down; configVersion -1 is what a member not heard from since this node started reports.",
       "config": {
         "mongodb": {
           "host": "127.0.0.1",
@@ -1868,6 +3490,7 @@
           "tls_allow_invalid_certificates": false
         }
       },
+      "mongo_storage": "replica_set_member",
       "mongo": {
         "hello": {
           "topologyVersion": {
@@ -2348,6 +3971,7 @@
             "repl_status_ok": true,
             "repl_config_ok": true,
             "oplog_ok": true,
+            "storage_ok": true,
             "errors": {}
           },
           "node": {
@@ -2430,6 +4054,78 @@
             },
             "oplog": {
               "window_s": 172800
+            },
+            "storage": {
+              "age_s": 0,
+              "databases_total": 5,
+              "complete": true,
+              "databases": [
+                {
+                  "name": "admin",
+                  "system": true,
+                  "error": null,
+                  "collections": 3,
+                  "views": 0,
+                  "objects": 8,
+                  "indexes": 4,
+                  "data_size": 2441,
+                  "storage_size": 28672,
+                  "index_size": 32768,
+                  "total_size": 61440
+                },
+                {
+                  "name": "app",
+                  "system": false,
+                  "error": null,
+                  "collections": 3,
+                  "views": 1,
+                  "objects": 5098,
+                  "indexes": 5,
+                  "data_size": 758583,
+                  "storage_size": 12288,
+                  "index_size": 126976,
+                  "total_size": 139264
+                },
+                {
+                  "name": "config",
+                  "system": true,
+                  "error": null,
+                  "collections": 10,
+                  "views": 0,
+                  "objects": 1,
+                  "indexes": 16,
+                  "data_size": 166,
+                  "storage_size": 40960,
+                  "index_size": 65536,
+                  "total_size": 106496
+                },
+                {
+                  "name": "local",
+                  "system": true,
+                  "error": null,
+                  "collections": 9,
+                  "views": 1,
+                  "objects": 5193,
+                  "indexes": 8,
+                  "data_size": 2237439,
+                  "storage_size": 151552,
+                  "index_size": 131072,
+                  "total_size": 282624
+                },
+                {
+                  "name": "tenants",
+                  "system": false,
+                  "error": null,
+                  "collections": 20,
+                  "views": 0,
+                  "objects": 20,
+                  "indexes": 20,
+                  "data_size": 580,
+                  "storage_size": 81920,
+                  "index_size": 81920,
+                  "total_size": 163840
+                }
+              ]
             }
           },
           "replica_set": {
@@ -2455,6 +4151,7 @@
                 "state_str": "PRIMARY",
                 "uptime_s": 864100,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": 1,
                 "last_heartbeat_age_s": 1,
                 "last_heartbeat_recv_age_s": 1,
@@ -2476,6 +4173,7 @@
                 "state_str": "SECONDARY",
                 "uptime_s": 864000,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": null,
                 "last_heartbeat_age_s": null,
                 "last_heartbeat_recv_age_s": null,
@@ -2497,6 +4195,7 @@
                 "state_str": "(not reachable/healthy)",
                 "uptime_s": 0,
                 "lag_s": null,
+                "lag_ms": null,
                 "ping_ms": null,
                 "last_heartbeat_age_s": 2,
                 "last_heartbeat_recv_age_s": 340,
@@ -2531,6 +4230,7 @@
           "tls_allow_invalid_certificates": false
         }
       },
+      "mongo_storage": "replica_set_member",
       "mongo": {
         "hello": {
           "topologyVersion": {
@@ -3063,6 +4763,7 @@
             "repl_status_ok": true,
             "repl_config_ok": true,
             "oplog_ok": true,
+            "storage_ok": true,
             "errors": {}
           },
           "node": {
@@ -3145,6 +4846,78 @@
             },
             "oplog": {
               "window_s": 4
+            },
+            "storage": {
+              "age_s": 0,
+              "databases_total": 5,
+              "complete": true,
+              "databases": [
+                {
+                  "name": "admin",
+                  "system": true,
+                  "error": null,
+                  "collections": 3,
+                  "views": 0,
+                  "objects": 8,
+                  "indexes": 4,
+                  "data_size": 2441,
+                  "storage_size": 28672,
+                  "index_size": 32768,
+                  "total_size": 61440
+                },
+                {
+                  "name": "app",
+                  "system": false,
+                  "error": null,
+                  "collections": 3,
+                  "views": 1,
+                  "objects": 5098,
+                  "indexes": 5,
+                  "data_size": 758583,
+                  "storage_size": 12288,
+                  "index_size": 126976,
+                  "total_size": 139264
+                },
+                {
+                  "name": "config",
+                  "system": true,
+                  "error": null,
+                  "collections": 10,
+                  "views": 0,
+                  "objects": 1,
+                  "indexes": 16,
+                  "data_size": 166,
+                  "storage_size": 40960,
+                  "index_size": 65536,
+                  "total_size": 106496
+                },
+                {
+                  "name": "local",
+                  "system": true,
+                  "error": null,
+                  "collections": 9,
+                  "views": 1,
+                  "objects": 5193,
+                  "indexes": 8,
+                  "data_size": 2237439,
+                  "storage_size": 151552,
+                  "index_size": 131072,
+                  "total_size": 282624
+                },
+                {
+                  "name": "tenants",
+                  "system": false,
+                  "error": null,
+                  "collections": 20,
+                  "views": 0,
+                  "objects": 20,
+                  "indexes": 20,
+                  "data_size": 580,
+                  "storage_size": 81920,
+                  "index_size": 81920,
+                  "total_size": 163840
+                }
+              ]
             }
           },
           "replica_set": {
@@ -3170,6 +4943,7 @@
                 "state_str": "PRIMARY",
                 "uptime_s": 9,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": 0,
                 "last_heartbeat_age_s": 0,
                 "last_heartbeat_recv_age_s": 0,
@@ -3191,6 +4965,7 @@
                 "state_str": "SECONDARY",
                 "uptime_s": 11,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": null,
                 "last_heartbeat_age_s": null,
                 "last_heartbeat_recv_age_s": null,
@@ -3212,6 +4987,7 @@
                 "state_str": "(not reachable/healthy)",
                 "uptime_s": 0,
                 "lag_s": null,
+                "lag_ms": null,
                 "ping_ms": null,
                 "last_heartbeat_age_s": 0,
                 "last_heartbeat_recv_age_s": 3,
@@ -3246,6 +5022,7 @@
           "tls_allow_invalid_certificates": false
         }
       },
+      "mongo_storage": "replica_set_member",
       "mongo": {
         "hello": {
           "topologyVersion": {
@@ -3768,6 +5545,7 @@
             "repl_status_ok": true,
             "repl_config_ok": true,
             "oplog_ok": true,
+            "storage_ok": true,
             "errors": {}
           },
           "node": {
@@ -3850,6 +5628,78 @@
             },
             "oplog": {
               "window_s": 4
+            },
+            "storage": {
+              "age_s": 0,
+              "databases_total": 5,
+              "complete": true,
+              "databases": [
+                {
+                  "name": "admin",
+                  "system": true,
+                  "error": null,
+                  "collections": 3,
+                  "views": 0,
+                  "objects": 8,
+                  "indexes": 4,
+                  "data_size": 2441,
+                  "storage_size": 28672,
+                  "index_size": 32768,
+                  "total_size": 61440
+                },
+                {
+                  "name": "app",
+                  "system": false,
+                  "error": null,
+                  "collections": 3,
+                  "views": 1,
+                  "objects": 5098,
+                  "indexes": 5,
+                  "data_size": 758583,
+                  "storage_size": 12288,
+                  "index_size": 126976,
+                  "total_size": 139264
+                },
+                {
+                  "name": "config",
+                  "system": true,
+                  "error": null,
+                  "collections": 10,
+                  "views": 0,
+                  "objects": 1,
+                  "indexes": 16,
+                  "data_size": 166,
+                  "storage_size": 40960,
+                  "index_size": 65536,
+                  "total_size": 106496
+                },
+                {
+                  "name": "local",
+                  "system": true,
+                  "error": null,
+                  "collections": 9,
+                  "views": 1,
+                  "objects": 5193,
+                  "indexes": 8,
+                  "data_size": 2237439,
+                  "storage_size": 151552,
+                  "index_size": 131072,
+                  "total_size": 282624
+                },
+                {
+                  "name": "tenants",
+                  "system": false,
+                  "error": null,
+                  "collections": 20,
+                  "views": 0,
+                  "objects": 20,
+                  "indexes": 20,
+                  "data_size": 580,
+                  "storage_size": 81920,
+                  "index_size": 81920,
+                  "total_size": 163840
+                }
+              ]
             }
           },
           "replica_set": {
@@ -3875,6 +5725,7 @@
                 "state_str": "SECONDARY",
                 "uptime_s": 13,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": null,
                 "last_heartbeat_age_s": null,
                 "last_heartbeat_recv_age_s": null,
@@ -3896,6 +5747,7 @@
                 "state_str": "(not reachable/healthy)",
                 "uptime_s": 0,
                 "lag_s": null,
+                "lag_ms": null,
                 "ping_ms": null,
                 "last_heartbeat_age_s": 0,
                 "last_heartbeat_recv_age_s": 2,
@@ -3917,6 +5769,7 @@
                 "state_str": "(not reachable/healthy)",
                 "uptime_s": 0,
                 "lag_s": null,
+                "lag_ms": null,
                 "ping_ms": null,
                 "last_heartbeat_age_s": 0,
                 "last_heartbeat_recv_age_s": 5,
@@ -3951,6 +5804,7 @@
           "tls_allow_invalid_certificates": false
         }
       },
+      "mongo_storage": "replica_set_member",
       "mongo": {
         "hello": {
           "topologyVersion": {
@@ -4486,6 +6340,7 @@
             "repl_status_ok": true,
             "repl_config_ok": true,
             "oplog_ok": true,
+            "storage_ok": true,
             "errors": {}
           },
           "node": {
@@ -4568,6 +6423,78 @@
             },
             "oplog": {
               "window_s": 16
+            },
+            "storage": {
+              "age_s": 0,
+              "databases_total": 5,
+              "complete": true,
+              "databases": [
+                {
+                  "name": "admin",
+                  "system": true,
+                  "error": null,
+                  "collections": 3,
+                  "views": 0,
+                  "objects": 8,
+                  "indexes": 4,
+                  "data_size": 2441,
+                  "storage_size": 28672,
+                  "index_size": 32768,
+                  "total_size": 61440
+                },
+                {
+                  "name": "app",
+                  "system": false,
+                  "error": null,
+                  "collections": 3,
+                  "views": 1,
+                  "objects": 5098,
+                  "indexes": 5,
+                  "data_size": 758583,
+                  "storage_size": 12288,
+                  "index_size": 126976,
+                  "total_size": 139264
+                },
+                {
+                  "name": "config",
+                  "system": true,
+                  "error": null,
+                  "collections": 10,
+                  "views": 0,
+                  "objects": 1,
+                  "indexes": 16,
+                  "data_size": 166,
+                  "storage_size": 40960,
+                  "index_size": 65536,
+                  "total_size": 106496
+                },
+                {
+                  "name": "local",
+                  "system": true,
+                  "error": null,
+                  "collections": 9,
+                  "views": 1,
+                  "objects": 5193,
+                  "indexes": 8,
+                  "data_size": 2237439,
+                  "storage_size": 151552,
+                  "index_size": 131072,
+                  "total_size": 282624
+                },
+                {
+                  "name": "tenants",
+                  "system": false,
+                  "error": null,
+                  "collections": 20,
+                  "views": 0,
+                  "objects": 20,
+                  "indexes": 20,
+                  "data_size": 580,
+                  "storage_size": 81920,
+                  "index_size": 81920,
+                  "total_size": 163840
+                }
+              ]
             }
           },
           "replica_set": {
@@ -4593,6 +6520,7 @@
                 "state_str": "PRIMARY",
                 "uptime_s": 23,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": null,
                 "last_heartbeat_age_s": null,
                 "last_heartbeat_recv_age_s": null,
@@ -4614,6 +6542,7 @@
                 "state_str": "(not reachable/healthy)",
                 "uptime_s": 0,
                 "lag_s": null,
+                "lag_ms": null,
                 "ping_ms": null,
                 "last_heartbeat_age_s": 0,
                 "last_heartbeat_recv_age_s": 4,
@@ -4635,6 +6564,7 @@
                 "state_str": "(not reachable/healthy)",
                 "uptime_s": 0,
                 "lag_s": null,
+                "lag_ms": null,
                 "ping_ms": null,
                 "last_heartbeat_age_s": 0,
                 "last_heartbeat_recv_age_s": 4,
@@ -4669,6 +6599,7 @@
           "tls_allow_invalid_certificates": false
         }
       },
+      "mongo_storage": "replica_set_member",
       "mongo": {
         "hello": {
           "topologyVersion": {
@@ -5204,6 +7135,7 @@
             "repl_status_ok": true,
             "repl_config_ok": true,
             "oplog_ok": true,
+            "storage_ok": true,
             "errors": {}
           },
           "node": {
@@ -5286,6 +7218,78 @@
             },
             "oplog": {
               "window_s": 28
+            },
+            "storage": {
+              "age_s": 0,
+              "databases_total": 5,
+              "complete": true,
+              "databases": [
+                {
+                  "name": "admin",
+                  "system": true,
+                  "error": null,
+                  "collections": 3,
+                  "views": 0,
+                  "objects": 8,
+                  "indexes": 4,
+                  "data_size": 2441,
+                  "storage_size": 28672,
+                  "index_size": 32768,
+                  "total_size": 61440
+                },
+                {
+                  "name": "app",
+                  "system": false,
+                  "error": null,
+                  "collections": 3,
+                  "views": 1,
+                  "objects": 5098,
+                  "indexes": 5,
+                  "data_size": 758583,
+                  "storage_size": 12288,
+                  "index_size": 126976,
+                  "total_size": 139264
+                },
+                {
+                  "name": "config",
+                  "system": true,
+                  "error": null,
+                  "collections": 10,
+                  "views": 0,
+                  "objects": 1,
+                  "indexes": 16,
+                  "data_size": 166,
+                  "storage_size": 40960,
+                  "index_size": 65536,
+                  "total_size": 106496
+                },
+                {
+                  "name": "local",
+                  "system": true,
+                  "error": null,
+                  "collections": 9,
+                  "views": 1,
+                  "objects": 5193,
+                  "indexes": 8,
+                  "data_size": 2237439,
+                  "storage_size": 151552,
+                  "index_size": 131072,
+                  "total_size": 282624
+                },
+                {
+                  "name": "tenants",
+                  "system": false,
+                  "error": null,
+                  "collections": 20,
+                  "views": 0,
+                  "objects": 20,
+                  "indexes": 20,
+                  "data_size": 580,
+                  "storage_size": 81920,
+                  "index_size": 81920,
+                  "total_size": 163840
+                }
+              ]
             }
           },
           "replica_set": {
@@ -5311,6 +7315,7 @@
                 "state_str": "(not reachable/healthy)",
                 "uptime_s": 0,
                 "lag_s": null,
+                "lag_ms": null,
                 "ping_ms": null,
                 "last_heartbeat_age_s": 1,
                 "last_heartbeat_recv_age_s": 6,
@@ -5332,6 +7337,7 @@
                 "state_str": "SECONDARY",
                 "uptime_s": 6,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": 0,
                 "last_heartbeat_age_s": 1,
                 "last_heartbeat_recv_age_s": 0,
@@ -5353,6 +7359,7 @@
                 "state_str": "PRIMARY",
                 "uptime_s": 17,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": null,
                 "last_heartbeat_age_s": null,
                 "last_heartbeat_recv_age_s": null,
@@ -5387,6 +7394,7 @@
           "tls_allow_invalid_certificates": false
         }
       },
+      "mongo_storage": "replica_set_member",
       "mongo": {
         "hello": {
           "topologyVersion": {
@@ -5921,6 +7929,7 @@
             "repl_status_ok": true,
             "repl_config_ok": true,
             "oplog_ok": true,
+            "storage_ok": true,
             "errors": {}
           },
           "node": {
@@ -6003,6 +8012,78 @@
             },
             "oplog": {
               "window_s": 34
+            },
+            "storage": {
+              "age_s": 0,
+              "databases_total": 5,
+              "complete": true,
+              "databases": [
+                {
+                  "name": "admin",
+                  "system": true,
+                  "error": null,
+                  "collections": 3,
+                  "views": 0,
+                  "objects": 8,
+                  "indexes": 4,
+                  "data_size": 2441,
+                  "storage_size": 28672,
+                  "index_size": 32768,
+                  "total_size": 61440
+                },
+                {
+                  "name": "app",
+                  "system": false,
+                  "error": null,
+                  "collections": 3,
+                  "views": 1,
+                  "objects": 5098,
+                  "indexes": 5,
+                  "data_size": 758583,
+                  "storage_size": 12288,
+                  "index_size": 126976,
+                  "total_size": 139264
+                },
+                {
+                  "name": "config",
+                  "system": true,
+                  "error": null,
+                  "collections": 10,
+                  "views": 0,
+                  "objects": 1,
+                  "indexes": 16,
+                  "data_size": 166,
+                  "storage_size": 40960,
+                  "index_size": 65536,
+                  "total_size": 106496
+                },
+                {
+                  "name": "local",
+                  "system": true,
+                  "error": null,
+                  "collections": 9,
+                  "views": 1,
+                  "objects": 5193,
+                  "indexes": 8,
+                  "data_size": 2237439,
+                  "storage_size": 151552,
+                  "index_size": 131072,
+                  "total_size": 282624
+                },
+                {
+                  "name": "tenants",
+                  "system": false,
+                  "error": null,
+                  "collections": 20,
+                  "views": 0,
+                  "objects": 20,
+                  "indexes": 20,
+                  "data_size": 580,
+                  "storage_size": 81920,
+                  "index_size": 81920,
+                  "total_size": 163840
+                }
+              ]
             }
           },
           "replica_set": {
@@ -6028,6 +8109,7 @@
                 "state_str": "PRIMARY",
                 "uptime_s": 13,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": 0,
                 "last_heartbeat_age_s": 0,
                 "last_heartbeat_recv_age_s": 0,
@@ -6049,6 +8131,7 @@
                 "state_str": "SECONDARY",
                 "uptime_s": 20,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": 0,
                 "last_heartbeat_age_s": 0,
                 "last_heartbeat_recv_age_s": 0,
@@ -6070,6 +8153,7 @@
                 "state_str": "SECONDARY",
                 "uptime_s": 31,
                 "lag_s": 4,
+                "lag_ms": 4022,
                 "ping_ms": null,
                 "last_heartbeat_age_s": null,
                 "last_heartbeat_recv_age_s": null,
@@ -6104,6 +8188,7 @@
           "tls_allow_invalid_certificates": false
         }
       },
+      "mongo_storage": "replica_set_member",
       "mongo": {
         "hello": {
           "topologyVersion": {
@@ -6674,6 +8759,7 @@
             "repl_status_ok": true,
             "repl_config_ok": true,
             "oplog_ok": true,
+            "storage_ok": true,
             "errors": {}
           },
           "node": {
@@ -6756,6 +8842,78 @@
             },
             "oplog": {
               "window_s": 44
+            },
+            "storage": {
+              "age_s": 0,
+              "databases_total": 5,
+              "complete": true,
+              "databases": [
+                {
+                  "name": "admin",
+                  "system": true,
+                  "error": null,
+                  "collections": 3,
+                  "views": 0,
+                  "objects": 8,
+                  "indexes": 4,
+                  "data_size": 2441,
+                  "storage_size": 28672,
+                  "index_size": 32768,
+                  "total_size": 61440
+                },
+                {
+                  "name": "app",
+                  "system": false,
+                  "error": null,
+                  "collections": 3,
+                  "views": 1,
+                  "objects": 5098,
+                  "indexes": 5,
+                  "data_size": 758583,
+                  "storage_size": 12288,
+                  "index_size": 126976,
+                  "total_size": 139264
+                },
+                {
+                  "name": "config",
+                  "system": true,
+                  "error": null,
+                  "collections": 10,
+                  "views": 0,
+                  "objects": 1,
+                  "indexes": 16,
+                  "data_size": 166,
+                  "storage_size": 40960,
+                  "index_size": 65536,
+                  "total_size": 106496
+                },
+                {
+                  "name": "local",
+                  "system": true,
+                  "error": null,
+                  "collections": 9,
+                  "views": 1,
+                  "objects": 5193,
+                  "indexes": 8,
+                  "data_size": 2237439,
+                  "storage_size": 151552,
+                  "index_size": 131072,
+                  "total_size": 282624
+                },
+                {
+                  "name": "tenants",
+                  "system": false,
+                  "error": null,
+                  "collections": 20,
+                  "views": 0,
+                  "objects": 20,
+                  "indexes": 20,
+                  "data_size": 580,
+                  "storage_size": 81920,
+                  "index_size": 81920,
+                  "total_size": 163840
+                }
+              ]
             }
           },
           "replica_set": {
@@ -6781,6 +8939,7 @@
                 "state_str": "ARBITER",
                 "uptime_s": 2,
                 "lag_s": null,
+                "lag_ms": null,
                 "ping_ms": 0,
                 "last_heartbeat_age_s": 0,
                 "last_heartbeat_recv_age_s": 1,
@@ -6802,6 +8961,7 @@
                 "state_str": "PRIMARY",
                 "uptime_s": 17,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": null,
                 "last_heartbeat_age_s": null,
                 "last_heartbeat_recv_age_s": null,
@@ -6823,6 +8983,7 @@
                 "state_str": "SECONDARY",
                 "uptime_s": 16,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": 0,
                 "last_heartbeat_age_s": 0,
                 "last_heartbeat_recv_age_s": 0,
@@ -6844,6 +9005,7 @@
                 "state_str": "SECONDARY",
                 "uptime_s": 16,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": 0,
                 "last_heartbeat_age_s": 0,
                 "last_heartbeat_recv_age_s": 0,
@@ -6955,6 +9117,7 @@
             "repl_status_ok": null,
             "repl_config_ok": null,
             "oplog_ok": null,
+            "storage_ok": null,
             "errors": {}
           },
           "node": null,
@@ -7079,6 +9242,7 @@
             "repl_status_ok": null,
             "repl_config_ok": null,
             "oplog_ok": null,
+            "storage_ok": null,
             "errors": {}
           },
           "node": null,
@@ -7103,6 +9267,7 @@
           "tls_allow_invalid_certificates": false
         }
       },
+      "mongo_storage": "replica_set_member",
       "mongo": {
         "hello": {
           "topologyVersion": {
@@ -7738,6 +9903,7 @@
             "repl_status_ok": true,
             "repl_config_ok": true,
             "oplog_ok": true,
+            "storage_ok": true,
             "errors": {}
           },
           "node": {
@@ -7820,6 +9986,78 @@
             },
             "oplog": {
               "window_s": 47
+            },
+            "storage": {
+              "age_s": 0,
+              "databases_total": 5,
+              "complete": true,
+              "databases": [
+                {
+                  "name": "admin",
+                  "system": true,
+                  "error": null,
+                  "collections": 3,
+                  "views": 0,
+                  "objects": 8,
+                  "indexes": 4,
+                  "data_size": 2441,
+                  "storage_size": 28672,
+                  "index_size": 32768,
+                  "total_size": 61440
+                },
+                {
+                  "name": "app",
+                  "system": false,
+                  "error": null,
+                  "collections": 3,
+                  "views": 1,
+                  "objects": 5098,
+                  "indexes": 5,
+                  "data_size": 758583,
+                  "storage_size": 12288,
+                  "index_size": 126976,
+                  "total_size": 139264
+                },
+                {
+                  "name": "config",
+                  "system": true,
+                  "error": null,
+                  "collections": 10,
+                  "views": 0,
+                  "objects": 1,
+                  "indexes": 16,
+                  "data_size": 166,
+                  "storage_size": 40960,
+                  "index_size": 65536,
+                  "total_size": 106496
+                },
+                {
+                  "name": "local",
+                  "system": true,
+                  "error": null,
+                  "collections": 9,
+                  "views": 1,
+                  "objects": 5193,
+                  "indexes": 8,
+                  "data_size": 2237439,
+                  "storage_size": 151552,
+                  "index_size": 131072,
+                  "total_size": 282624
+                },
+                {
+                  "name": "tenants",
+                  "system": false,
+                  "error": null,
+                  "collections": 20,
+                  "views": 0,
+                  "objects": 20,
+                  "indexes": 20,
+                  "data_size": 580,
+                  "storage_size": 81920,
+                  "index_size": 81920,
+                  "total_size": 163840
+                }
+              ]
             }
           },
           "replica_set": {
@@ -7845,6 +10083,7 @@
                 "state_str": "ARBITER",
                 "uptime_s": 5,
                 "lag_s": null,
+                "lag_ms": null,
                 "ping_ms": 0,
                 "last_heartbeat_age_s": 0,
                 "last_heartbeat_recv_age_s": 1,
@@ -7866,6 +10105,7 @@
                 "state_str": "PRIMARY",
                 "uptime_s": 20,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": null,
                 "last_heartbeat_age_s": null,
                 "last_heartbeat_recv_age_s": null,
@@ -7887,6 +10127,7 @@
                 "state_str": "SECONDARY",
                 "uptime_s": 19,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": 0,
                 "last_heartbeat_age_s": 0,
                 "last_heartbeat_recv_age_s": 0,
@@ -7908,6 +10149,7 @@
                 "state_str": "SECONDARY",
                 "uptime_s": 19,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": 0,
                 "last_heartbeat_age_s": 0,
                 "last_heartbeat_recv_age_s": 0,
@@ -7929,6 +10171,7 @@
                 "state_str": "STARTUP2",
                 "uptime_s": 2,
                 "lag_s": null,
+                "lag_ms": null,
                 "ping_ms": 0,
                 "last_heartbeat_age_s": 0,
                 "last_heartbeat_recv_age_s": 1,
@@ -8240,6 +10483,7 @@
             "repl_status_ok": null,
             "repl_config_ok": true,
             "oplog_ok": null,
+            "storage_ok": null,
             "errors": {}
           },
           "node": {
@@ -8320,7 +10564,8 @@
               "commands_us": 66447,
               "commands_ops": 381
             },
-            "oplog": null
+            "oplog": null,
+            "storage": null
           },
           "replica_set": {
             "set_name": "rs0",
@@ -8573,6 +10818,7 @@
             "repl_status_ok": null,
             "repl_config_ok": null,
             "oplog_ok": null,
+            "storage_ok": null,
             "errors": {}
           },
           "node": {
@@ -8653,7 +10899,8 @@
               "commands_us": 187,
               "commands_ops": 3
             },
-            "oplog": null
+            "oplog": null,
+            "storage": null
           },
           "replica_set": null,
           "sharding": null
@@ -8704,6 +10951,7 @@
             "repl_status_ok": false,
             "repl_config_ok": null,
             "oplog_ok": null,
+            "storage_ok": null,
             "errors": {
               "repl_status": "not_authorized"
             }
@@ -8786,7 +11034,8 @@
               "commands_us": 187,
               "commands_ops": 3
             },
-            "oplog": null
+            "oplog": null,
+            "storage": null
           },
           "replica_set": null,
           "sharding": null
@@ -8809,6 +11058,7 @@
           "tls_allow_invalid_certificates": false
         }
       },
+      "mongo_storage": "standalone_4_4",
       "mongo": {
         "hello": {
           "topologyVersion": {
@@ -9305,6 +11555,7 @@
             "repl_status_ok": true,
             "repl_config_ok": true,
             "oplog_ok": true,
+            "storage_ok": true,
             "errors": {}
           },
           "node": {
@@ -9387,6 +11638,78 @@
             },
             "oplog": {
               "window_s": 40
+            },
+            "storage": {
+              "age_s": 0,
+              "databases_total": 5,
+              "complete": true,
+              "databases": [
+                {
+                  "name": "admin",
+                  "system": true,
+                  "error": null,
+                  "collections": 2,
+                  "views": 0,
+                  "objects": 6,
+                  "indexes": 3,
+                  "data_size": 2271,
+                  "storage_size": 8192,
+                  "index_size": 12288,
+                  "total_size": 20480
+                },
+                {
+                  "name": "app",
+                  "system": false,
+                  "error": null,
+                  "collections": 3,
+                  "views": 1,
+                  "objects": 5098,
+                  "indexes": 5,
+                  "data_size": 758583,
+                  "storage_size": 12288,
+                  "index_size": 126976,
+                  "total_size": 139264
+                },
+                {
+                  "name": "config",
+                  "system": true,
+                  "error": null,
+                  "collections": 1,
+                  "views": 0,
+                  "objects": 0,
+                  "indexes": 2,
+                  "data_size": 0,
+                  "storage_size": 4096,
+                  "index_size": 8192,
+                  "total_size": 12288
+                },
+                {
+                  "name": "local",
+                  "system": true,
+                  "error": null,
+                  "collections": 1,
+                  "views": 0,
+                  "objects": 1,
+                  "indexes": 1,
+                  "data_size": 2288,
+                  "storage_size": 4096,
+                  "index_size": 4096,
+                  "total_size": 8192
+                },
+                {
+                  "name": "tenants",
+                  "system": false,
+                  "error": null,
+                  "collections": 20,
+                  "views": 0,
+                  "objects": 20,
+                  "indexes": 20,
+                  "data_size": 580,
+                  "storage_size": 81920,
+                  "index_size": 81920,
+                  "total_size": 163840
+                }
+              ]
             }
           },
           "replica_set": {
@@ -9412,6 +11735,7 @@
                 "state_str": "PRIMARY",
                 "uptime_s": 13,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": 0,
                 "last_heartbeat_age_s": 0,
                 "last_heartbeat_recv_age_s": 0,
@@ -9433,6 +11757,7 @@
                 "state_str": "SECONDARY",
                 "uptime_s": 36,
                 "lag_s": 6,
+                "lag_ms": 6008,
                 "ping_ms": 0,
                 "last_heartbeat_age_s": 0,
                 "last_heartbeat_recv_age_s": 0,
@@ -9454,6 +11779,7 @@
                 "state_str": "SECONDARY",
                 "uptime_s": 37,
                 "lag_s": 6,
+                "lag_ms": 6008,
                 "ping_ms": null,
                 "last_heartbeat_age_s": null,
                 "last_heartbeat_recv_age_s": null,
@@ -9488,6 +11814,7 @@
           "tls_allow_invalid_certificates": false
         }
       },
+      "mongo_storage": "standalone_4_4",
       "mongo": {
         "hello": {
           "raises": {
@@ -10004,6 +12331,7 @@
             "repl_status_ok": true,
             "repl_config_ok": true,
             "oplog_ok": true,
+            "storage_ok": true,
             "errors": {}
           },
           "node": {
@@ -10086,6 +12414,78 @@
             },
             "oplog": {
               "window_s": 23
+            },
+            "storage": {
+              "age_s": 0,
+              "databases_total": 5,
+              "complete": true,
+              "databases": [
+                {
+                  "name": "admin",
+                  "system": true,
+                  "error": null,
+                  "collections": 2,
+                  "views": 0,
+                  "objects": 6,
+                  "indexes": 3,
+                  "data_size": 2271,
+                  "storage_size": 8192,
+                  "index_size": 12288,
+                  "total_size": 20480
+                },
+                {
+                  "name": "app",
+                  "system": false,
+                  "error": null,
+                  "collections": 3,
+                  "views": 1,
+                  "objects": 5098,
+                  "indexes": 5,
+                  "data_size": 758583,
+                  "storage_size": 12288,
+                  "index_size": 126976,
+                  "total_size": 139264
+                },
+                {
+                  "name": "config",
+                  "system": true,
+                  "error": null,
+                  "collections": 1,
+                  "views": 0,
+                  "objects": 0,
+                  "indexes": 2,
+                  "data_size": 0,
+                  "storage_size": 4096,
+                  "index_size": 8192,
+                  "total_size": 12288
+                },
+                {
+                  "name": "local",
+                  "system": true,
+                  "error": null,
+                  "collections": 1,
+                  "views": 0,
+                  "objects": 1,
+                  "indexes": 1,
+                  "data_size": 2288,
+                  "storage_size": 4096,
+                  "index_size": 4096,
+                  "total_size": 8192
+                },
+                {
+                  "name": "tenants",
+                  "system": false,
+                  "error": null,
+                  "collections": 20,
+                  "views": 0,
+                  "objects": 20,
+                  "indexes": 20,
+                  "data_size": 580,
+                  "storage_size": 81920,
+                  "index_size": 81920,
+                  "total_size": 163840
+                }
+              ]
             }
           },
           "replica_set": {
@@ -10111,6 +12511,7 @@
                 "state_str": "PRIMARY",
                 "uptime_s": 25,
                 "lag_s": 0,
+                "lag_ms": null,
                 "ping_ms": null,
                 "last_heartbeat_age_s": null,
                 "last_heartbeat_recv_age_s": null,
@@ -10132,6 +12533,7 @@
                 "state_str": "SECONDARY",
                 "uptime_s": 24,
                 "lag_s": 0,
+                "lag_ms": null,
                 "ping_ms": 0,
                 "last_heartbeat_age_s": 0,
                 "last_heartbeat_recv_age_s": 1,
@@ -10166,6 +12568,7 @@
           "tls_allow_invalid_certificates": false
         }
       },
+      "mongo_storage": "replica_set_member",
       "mongo": {
         "hello": {
           "topologyVersion": {
@@ -10695,6 +13098,7 @@
             "repl_status_ok": true,
             "repl_config_ok": true,
             "oplog_ok": true,
+            "storage_ok": true,
             "errors": {}
           },
           "node": {
@@ -10777,6 +13181,78 @@
             },
             "oplog": {
               "window_s": 4
+            },
+            "storage": {
+              "age_s": 0,
+              "databases_total": 5,
+              "complete": true,
+              "databases": [
+                {
+                  "name": "admin",
+                  "system": true,
+                  "error": null,
+                  "collections": 3,
+                  "views": 0,
+                  "objects": 8,
+                  "indexes": 4,
+                  "data_size": 2441,
+                  "storage_size": 28672,
+                  "index_size": 32768,
+                  "total_size": 61440
+                },
+                {
+                  "name": "app",
+                  "system": false,
+                  "error": null,
+                  "collections": 3,
+                  "views": 1,
+                  "objects": 5098,
+                  "indexes": 5,
+                  "data_size": 758583,
+                  "storage_size": 12288,
+                  "index_size": 126976,
+                  "total_size": 139264
+                },
+                {
+                  "name": "config",
+                  "system": true,
+                  "error": null,
+                  "collections": 10,
+                  "views": 0,
+                  "objects": 1,
+                  "indexes": 16,
+                  "data_size": 166,
+                  "storage_size": 40960,
+                  "index_size": 65536,
+                  "total_size": 106496
+                },
+                {
+                  "name": "local",
+                  "system": true,
+                  "error": null,
+                  "collections": 9,
+                  "views": 1,
+                  "objects": 5193,
+                  "indexes": 8,
+                  "data_size": 2237439,
+                  "storage_size": 151552,
+                  "index_size": 131072,
+                  "total_size": 282624
+                },
+                {
+                  "name": "tenants",
+                  "system": false,
+                  "error": null,
+                  "collections": 20,
+                  "views": 0,
+                  "objects": 20,
+                  "indexes": 20,
+                  "data_size": 580,
+                  "storage_size": 81920,
+                  "index_size": 81920,
+                  "total_size": 163840
+                }
+              ]
             }
           },
           "replica_set": {
@@ -10802,6 +13278,7 @@
                 "state_str": "PRIMARY",
                 "uptime_s": 6,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": 0,
                 "last_heartbeat_age_s": 0,
                 "last_heartbeat_recv_age_s": 1,
@@ -10823,6 +13300,7 @@
                 "state_str": "SECONDARY",
                 "uptime_s": 8,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": null,
                 "last_heartbeat_age_s": null,
                 "last_heartbeat_recv_age_s": null,
@@ -10844,6 +13322,7 @@
                 "state_str": "SECONDARY",
                 "uptime_s": 6,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": 0,
                 "last_heartbeat_age_s": 1,
                 "last_heartbeat_recv_age_s": 0,
@@ -10863,7 +13342,7 @@
       }
     },
     "shard_member_8_0": {
-      "description": "CAPTURED from a real MongoDB 8.0.34 (a member of shard1, in a 2-shard cluster, over a DIRECT connection with a shard-local user). MEASURED: 8.0 refuses none of the agent's commands on a direct connection to a shard member (they all target admin and local) and logs no direct-connection warning -- nor does 7.0. sharding.config_server_set names the config server set before the / of serverStatus().sharding.configsvrConnectionString: how the server groups the sets of one sharded cluster.",
+      "description": "CAPTURED from a real MongoDB 8.0.34 (a member of shard1, in a 2-shard cluster, over a DIRECT connection with a shard-local user). MEASURED: 8.0 refuses none of the agent's commands on a direct connection to a shard member (they all target admin and local) and logs no direct-connection warning -- nor does 7.0. sharding.config_server_set names the config server set before the / of serverStatus().sharding.configsvrConnectionString: how the server groups the sets of one sharded cluster. Storage does not apply in a sharded cluster (storage_contract.applies): no listDatabases is sent, node.storage and storage_ok are null.",
       "config": {
         "mongodb": {
           "host": "127.0.0.1",
@@ -11373,6 +13852,7 @@
             "repl_status_ok": true,
             "repl_config_ok": true,
             "oplog_ok": true,
+            "storage_ok": null,
             "errors": {}
           },
           "node": {
@@ -11455,7 +13935,8 @@
             },
             "oplog": {
               "window_s": 3
-            }
+            },
+            "storage": null
           },
           "replica_set": {
             "set_name": "shard1",
@@ -11480,6 +13961,7 @@
                 "state_str": "PRIMARY",
                 "uptime_s": 7,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": null,
                 "last_heartbeat_age_s": null,
                 "last_heartbeat_recv_age_s": null,
@@ -11501,7 +13983,7 @@
       }
     },
     "config_server_member": {
-      "description": "CAPTURED from a real MongoDB 8.0.34 (the config server set's member). configsvr true comes from its config; its sharding.config_server_set is its own set.",
+      "description": "CAPTURED from a real MongoDB 8.0.34 (the config server set's member). configsvr true comes from its config; its sharding.config_server_set is its own set. Storage does not apply in a sharded cluster, the config server set included (storage_contract.applies).",
       "config": {
         "mongodb": {
           "host": "127.0.0.1",
@@ -12014,6 +14496,7 @@
             "repl_status_ok": true,
             "repl_config_ok": true,
             "oplog_ok": true,
+            "storage_ok": null,
             "errors": {}
           },
           "node": {
@@ -12096,7 +14579,8 @@
             },
             "oplog": {
               "window_s": 5
-            }
+            },
+            "storage": null
           },
           "replica_set": {
             "set_name": "cfgrs",
@@ -12121,6 +14605,7 @@
                 "state_str": "PRIMARY",
                 "uptime_s": 7,
                 "lag_s": 0,
+                "lag_ms": 0,
                 "ping_ms": null,
                 "last_heartbeat_age_s": null,
                 "last_heartbeat_recv_age_s": null,
@@ -12324,6 +14809,7 @@
             "repl_status_ok": null,
             "repl_config_ok": null,
             "oplog_ok": null,
+            "storage_ok": null,
             "errors": {}
           },
           "node": {
@@ -12381,7 +14867,8 @@
               "commands_us": 246361,
               "commands_ops": 25
             },
-            "oplog": null
+            "oplog": null,
+            "storage": null
           },
           "replica_set": null,
           "sharding": {
@@ -12406,6 +14893,7 @@
           "tls_allow_invalid_certificates": false
         }
       },
+      "mongo_storage": "standalone_8_0",
       "mongo": {
         "hello": {
           "isWritablePrimary": true,
@@ -12643,6 +15131,7 @@
             "repl_status_ok": null,
             "repl_config_ok": null,
             "oplog_ok": null,
+            "storage_ok": true,
             "errors": {}
           },
           "node": {
@@ -12723,7 +15212,79 @@
               "commands_us": 45285,
               "commands_ops": 16
             },
-            "oplog": null
+            "oplog": null,
+            "storage": {
+              "age_s": 0,
+              "databases_total": 5,
+              "complete": true,
+              "databases": [
+                {
+                  "name": "admin",
+                  "system": true,
+                  "error": null,
+                  "collections": 2,
+                  "views": 0,
+                  "objects": 6,
+                  "indexes": 3,
+                  "data_size": 2271,
+                  "storage_size": 8192,
+                  "index_size": 12288,
+                  "total_size": 20480
+                },
+                {
+                  "name": "app",
+                  "system": false,
+                  "error": null,
+                  "collections": 3,
+                  "views": 1,
+                  "objects": 5098,
+                  "indexes": 5,
+                  "data_size": 758583,
+                  "storage_size": 12288,
+                  "index_size": 126976,
+                  "total_size": 139264
+                },
+                {
+                  "name": "config",
+                  "system": true,
+                  "error": null,
+                  "collections": 1,
+                  "views": 0,
+                  "objects": 0,
+                  "indexes": 2,
+                  "data_size": 0,
+                  "storage_size": 4096,
+                  "index_size": 8192,
+                  "total_size": 12288
+                },
+                {
+                  "name": "local",
+                  "system": true,
+                  "error": null,
+                  "collections": 1,
+                  "views": 0,
+                  "objects": 1,
+                  "indexes": 1,
+                  "data_size": 6822,
+                  "storage_size": 4096,
+                  "index_size": 4096,
+                  "total_size": 8192
+                },
+                {
+                  "name": "tenants",
+                  "system": false,
+                  "error": null,
+                  "collections": 20,
+                  "views": 0,
+                  "objects": 20,
+                  "indexes": 20,
+                  "data_size": 580,
+                  "storage_size": 81920,
+                  "index_size": 81920,
+                  "total_size": 163840
+                }
+              ]
+            }
           },
           "replica_set": null,
           "sharding": null
@@ -12746,6 +15307,7 @@
           "tls_allow_invalid_certificates": false
         }
       },
+      "mongo_storage": "standalone_6_0",
       "mongo": {
         "hello": {
           "isWritablePrimary": true,
@@ -12909,6 +15471,7 @@
             "repl_status_ok": null,
             "repl_config_ok": null,
             "oplog_ok": null,
+            "storage_ok": true,
             "errors": {}
           },
           "node": {
@@ -12989,7 +15552,582 @@
               "commands_us": 46152,
               "commands_ops": 16
             },
-            "oplog": null
+            "oplog": null,
+            "storage": {
+              "age_s": 0,
+              "databases_total": 5,
+              "complete": true,
+              "databases": [
+                {
+                  "name": "admin",
+                  "system": true,
+                  "error": null,
+                  "collections": 2,
+                  "views": 0,
+                  "objects": 6,
+                  "indexes": 3,
+                  "data_size": 2271,
+                  "storage_size": 8192,
+                  "index_size": 12288,
+                  "total_size": 20480
+                },
+                {
+                  "name": "app",
+                  "system": false,
+                  "error": null,
+                  "collections": 3,
+                  "views": 1,
+                  "objects": 5098,
+                  "indexes": 5,
+                  "data_size": 758583,
+                  "storage_size": 12288,
+                  "index_size": 126976,
+                  "total_size": 139264
+                },
+                {
+                  "name": "config",
+                  "system": true,
+                  "error": null,
+                  "collections": 1,
+                  "views": 0,
+                  "objects": 0,
+                  "indexes": 2,
+                  "data_size": 0,
+                  "storage_size": 4096,
+                  "index_size": 8192,
+                  "total_size": 12288
+                },
+                {
+                  "name": "local",
+                  "system": true,
+                  "error": null,
+                  "collections": 1,
+                  "views": 0,
+                  "objects": 1,
+                  "indexes": 1,
+                  "data_size": 2458,
+                  "storage_size": 4096,
+                  "index_size": 4096,
+                  "total_size": 8192
+                },
+                {
+                  "name": "tenants",
+                  "system": false,
+                  "error": null,
+                  "collections": 20,
+                  "views": 0,
+                  "objects": 20,
+                  "indexes": 20,
+                  "data_size": 580,
+                  "storage_size": 81920,
+                  "index_size": 81920,
+                  "total_size": 163840
+                }
+              ]
+            }
+          },
+          "replica_set": null,
+          "sharding": null
+        }
+      }
+    },
+    "storage_database_timed_out": {
+      "description": "The standalone scenario's CAPTURED hello and serverStatus, and its CAPTURED storage replies with one SYNTHETIC timeout injected (storage_replies.standalone_slow_database): dbStats on tenants (very many collections) outlives the build's budget. Its entry reads error timeout with every value null, complete is false (the entries no longer add up to the node), storage_ok stays true (listDatabases answered), and the next build starts at tenants.",
+      "mongo_base": "standalone",
+      "config": {
+        "mongodb": {
+          "host": "127.0.0.1",
+          "port": 27017,
+          "username": "fivenines",
+          "password": "CHANGE-ME",
+          "auth_source": "admin",
+          "auth_mechanism": null,
+          "tls": false,
+          "tls_ca_file": null,
+          "tls_certificate_key_file": null,
+          "tls_allow_invalid_certificates": false
+        }
+      },
+      "mongo_storage": "standalone_slow_database",
+      "mongo": {},
+      "payload": {
+        "mongodb": {
+          "reachable": true,
+          "error_type": null,
+          "error_message": null,
+          "process": "mongod",
+          "role": "standalone",
+          "version": "7.0.45",
+          "me": null,
+          "collection": {
+            "server_status_ok": true,
+            "repl_status_ok": null,
+            "repl_config_ok": null,
+            "oplog_ok": null,
+            "storage_ok": true,
+            "errors": {}
+          },
+          "node": {
+            "uptime_s": 0,
+            "connections": {
+              "current": 4,
+              "available": 209711,
+              "total_created": 9,
+              "active": 3
+            },
+            "opcounters": {
+              "insert": 3,
+              "query": 0,
+              "update": 3,
+              "delete": 0,
+              "getmore": 0,
+              "command": 21
+            },
+            "opcounters_repl": {
+              "insert": 0,
+              "query": 0,
+              "update": 0,
+              "delete": 0,
+              "getmore": 0,
+              "command": 0
+            },
+            "network": {
+              "bytes_in": 4966,
+              "bytes_out": 3888,
+              "num_requests": 19
+            },
+            "memory": {
+              "resident_mb": 146,
+              "virtual_mb": 559
+            },
+            "wiredtiger": {
+              "cache_bytes": 47391,
+              "cache_max_bytes": 268435456,
+              "cache_dirty_bytes": 44611,
+              "pages_read_into_cache": 0,
+              "pages_written_from_cache": 0
+            },
+            "tickets": {
+              "read_out": 0,
+              "read_available": 16,
+              "write_out": 0,
+              "write_available": 16
+            },
+            "global_lock": {
+              "queue_readers": 0,
+              "queue_writers": 0,
+              "active_readers": 0,
+              "active_writers": 0
+            },
+            "asserts": {
+              "regular": 0,
+              "msg": 0,
+              "user": 18,
+              "rollovers": 0
+            },
+            "page_faults": 0,
+            "cursors": {
+              "open_total": 0,
+              "open_no_timeout": 0,
+              "timed_out": 0
+            },
+            "documents": {
+              "inserted": 3,
+              "returned": 0,
+              "updated": 2,
+              "deleted": 0
+            },
+            "op_latencies": {
+              "reads_us": 0,
+              "reads_ops": 0,
+              "writes_us": 0,
+              "writes_ops": 0,
+              "commands_us": 40746,
+              "commands_ops": 16
+            },
+            "oplog": null,
+            "storage": {
+              "age_s": 0,
+              "databases_total": 5,
+              "complete": false,
+              "databases": [
+                {
+                  "name": "admin",
+                  "system": true,
+                  "error": null,
+                  "collections": 2,
+                  "views": 0,
+                  "objects": 6,
+                  "indexes": 3,
+                  "data_size": 2271,
+                  "storage_size": 8192,
+                  "index_size": 12288,
+                  "total_size": 20480
+                },
+                {
+                  "name": "app",
+                  "system": false,
+                  "error": null,
+                  "collections": 3,
+                  "views": 1,
+                  "objects": 5098,
+                  "indexes": 5,
+                  "data_size": 758583,
+                  "storage_size": 12288,
+                  "index_size": 126976,
+                  "total_size": 139264
+                },
+                {
+                  "name": "config",
+                  "system": true,
+                  "error": null,
+                  "collections": 1,
+                  "views": 0,
+                  "objects": 0,
+                  "indexes": 2,
+                  "data_size": 0,
+                  "storage_size": 4096,
+                  "index_size": 8192,
+                  "total_size": 12288
+                },
+                {
+                  "name": "local",
+                  "system": true,
+                  "error": null,
+                  "collections": 1,
+                  "views": 0,
+                  "objects": 1,
+                  "indexes": 1,
+                  "data_size": 2538,
+                  "storage_size": 4096,
+                  "index_size": 4096,
+                  "total_size": 8192
+                },
+                {
+                  "name": "tenants",
+                  "system": false,
+                  "error": "timeout",
+                  "collections": null,
+                  "views": null,
+                  "objects": null,
+                  "indexes": null,
+                  "data_size": null,
+                  "storage_size": null,
+                  "index_size": null,
+                  "total_size": null
+                }
+              ]
+            }
+          },
+          "replica_set": null,
+          "sharding": null
+        }
+      }
+    },
+    "storage_not_authorized": {
+      "description": "DERIVED from CAPTURED replies: the standalone scenario's hello and serverStatus (7.0.45), with the listDatabases refusal CAPTURED from a user without the listDatabases privilege (storage_replies.not_authorized), as a custom role granting serverStatus but not listDatabases answers. listDatabases refused: storage_ok false, errors.storage not_authorized, node.storage null, every other section read (storage_contract.failure).",
+      "config": {
+        "mongodb": {
+          "host": "127.0.0.1",
+          "port": 27017,
+          "username": "fivenines",
+          "password": "CHANGE-ME",
+          "auth_source": "admin",
+          "auth_mechanism": null,
+          "tls": false,
+          "tls_ca_file": null,
+          "tls_certificate_key_file": null,
+          "tls_allow_invalid_certificates": false
+        }
+      },
+      "mongo_storage": "not_authorized",
+      "mongo": {
+        "hello": {
+          "isWritablePrimary": true,
+          "topologyVersion": {
+            "processId": {
+              "$oid": "6ae8a68b8b53d42079b0a9c4"
+            },
+            "counter": 0
+          },
+          "maxBsonObjectSize": 16777216,
+          "maxMessageSizeBytes": 48000000,
+          "maxWriteBatchSize": 100000,
+          "localTime": {
+            "$date": "2026-11-02T15:04:43.309Z"
+          },
+          "logicalSessionTimeoutMinutes": 30,
+          "connectionId": 9,
+          "minWireVersion": 0,
+          "maxWireVersion": 21,
+          "readOnly": false,
+          "ok": 1.0
+        },
+        "serverStatus": {
+          "version": "7.0.45",
+          "process": "mongod",
+          "uptime": 0.0,
+          "uptimeMillis": 227,
+          "asserts": {
+            "regular": 0,
+            "warning": 0,
+            "msg": 0,
+            "user": 18,
+            "tripwire": 0,
+            "rollovers": 0
+          },
+          "connections": {
+            "current": 4,
+            "available": 209711,
+            "totalCreated": 9,
+            "rejected": 0,
+            "active": 3,
+            "queuedForEstablishment": 0,
+            "establishmentRateLimit": {
+              "rejected": 0,
+              "exempted": 0,
+              "interruptedDueToClientDisconnect": 0
+            },
+            "threaded": 4,
+            "exhaustIsMaster": 0,
+            "exhaustHello": 0,
+            "awaitingTopologyChanges": 2
+          },
+          "mem": {
+            "bits": 64,
+            "resident": 146,
+            "virtual": 559,
+            "supported": true
+          },
+          "opLatencies": {
+            "reads": {
+              "latency": 0,
+              "ops": 0,
+              "queryableEncryptionLatencyMicros": 0
+            },
+            "writes": {
+              "latency": 0,
+              "ops": 0,
+              "queryableEncryptionLatencyMicros": 0
+            },
+            "commands": {
+              "latency": 40746,
+              "ops": 16,
+              "queryableEncryptionLatencyMicros": 0
+            },
+            "transactions": {
+              "latency": 0,
+              "ops": 0,
+              "queryableEncryptionLatencyMicros": 0
+            }
+          },
+          "opcounters": {
+            "insert": 3,
+            "query": 0,
+            "update": 3,
+            "delete": 0,
+            "getmore": 0,
+            "command": 21
+          },
+          "opcountersRepl": {
+            "insert": 0,
+            "query": 0,
+            "update": 0,
+            "delete": 0,
+            "getmore": 0,
+            "command": 0
+          },
+          "extra_info": {
+            "note": "fields vary by platform",
+            "page_faults": 0
+          },
+          "globalLock": {
+            "totalTime": 239000,
+            "currentQueue": {
+              "total": 0,
+              "readers": 0,
+              "writers": 0
+            },
+            "activeClients": {
+              "total": 0,
+              "readers": 0,
+              "writers": 0
+            }
+          },
+          "metrics": {
+            "cursor": {
+              "timedOut": 0,
+              "open": {
+                "noTimeout": 0,
+                "pinned": 0,
+                "total": 0
+              }
+            },
+            "document": {
+              "deleted": 0,
+              "inserted": 3,
+              "returned": 0,
+              "updated": 2
+            }
+          },
+          "network": {
+            "bytesIn": 4966,
+            "bytesOut": 3888,
+            "physicalBytesIn": 4966,
+            "physicalBytesOut": 3888,
+            "numRequests": 19
+          },
+          "wiredTiger": {
+            "cache": {
+              "bytes currently in the cache": 47391,
+              "maximum bytes configured": 268435456,
+              "tracked dirty bytes in the cache": 44611,
+              "pages read into cache": 0,
+              "pages written from cache": 0
+            },
+            "concurrentTransactions": {
+              "write": {
+                "out": 0,
+                "available": 16,
+                "totalTickets": 16,
+                "immediatePriorityAdmissionsCount": 1,
+                "addedToQueue": 0,
+                "removedFromQueue": 0,
+                "queueLength": 0,
+                "startedProcessing": 8,
+                "processing": 0,
+                "finishedProcessing": 8,
+                "totalTimeProcessingMicros": 10031,
+                "canceled": 0,
+                "newAdmissions": 2,
+                "totalTimeQueuedMicros": 0
+              },
+              "read": {
+                "out": 0,
+                "available": 16,
+                "totalTickets": 16,
+                "immediatePriorityAdmissionsCount": 4,
+                "addedToQueue": 0,
+                "removedFromQueue": 0,
+                "queueLength": 0,
+                "startedProcessing": 17,
+                "processing": 0,
+                "finishedProcessing": 17,
+                "totalTimeProcessingMicros": 1065,
+                "canceled": 0,
+                "newAdmissions": 12,
+                "totalTimeQueuedMicros": 0
+              },
+              "monitor": {
+                "timesDecreased": 0,
+                "timesIncreased": 0,
+                "totalAmountDecreased": 0,
+                "totalAmountIncreased": 0
+              }
+            }
+          },
+          "ok": 1.0
+        }
+      },
+      "payload": {
+        "mongodb": {
+          "reachable": true,
+          "error_type": null,
+          "error_message": null,
+          "process": "mongod",
+          "role": "standalone",
+          "version": "7.0.45",
+          "me": null,
+          "collection": {
+            "server_status_ok": true,
+            "repl_status_ok": null,
+            "repl_config_ok": null,
+            "oplog_ok": null,
+            "storage_ok": false,
+            "errors": {
+              "storage": "not_authorized"
+            }
+          },
+          "node": {
+            "uptime_s": 0,
+            "connections": {
+              "current": 4,
+              "available": 209711,
+              "total_created": 9,
+              "active": 3
+            },
+            "opcounters": {
+              "insert": 3,
+              "query": 0,
+              "update": 3,
+              "delete": 0,
+              "getmore": 0,
+              "command": 21
+            },
+            "opcounters_repl": {
+              "insert": 0,
+              "query": 0,
+              "update": 0,
+              "delete": 0,
+              "getmore": 0,
+              "command": 0
+            },
+            "network": {
+              "bytes_in": 4966,
+              "bytes_out": 3888,
+              "num_requests": 19
+            },
+            "memory": {
+              "resident_mb": 146,
+              "virtual_mb": 559
+            },
+            "wiredtiger": {
+              "cache_bytes": 47391,
+              "cache_max_bytes": 268435456,
+              "cache_dirty_bytes": 44611,
+              "pages_read_into_cache": 0,
+              "pages_written_from_cache": 0
+            },
+            "tickets": {
+              "read_out": 0,
+              "read_available": 16,
+              "write_out": 0,
+              "write_available": 16
+            },
+            "global_lock": {
+              "queue_readers": 0,
+              "queue_writers": 0,
+              "active_readers": 0,
+              "active_writers": 0
+            },
+            "asserts": {
+              "regular": 0,
+              "msg": 0,
+              "user": 18,
+              "rollovers": 0
+            },
+            "page_faults": 0,
+            "cursors": {
+              "open_total": 0,
+              "open_no_timeout": 0,
+              "timed_out": 0
+            },
+            "documents": {
+              "inserted": 3,
+              "returned": 0,
+              "updated": 2,
+              "deleted": 0
+            },
+            "op_latencies": {
+              "reads_us": 0,
+              "reads_ops": 0,
+              "writes_us": 0,
+              "writes_ops": 0,
+              "commands_us": 40746,
+              "commands_ops": 16
+            },
+            "oplog": null,
+            "storage": null
           },
           "replica_set": null,
           "sharding": null
@@ -13129,6 +16267,7 @@
             "repl_status_ok": false,
             "repl_config_ok": false,
             "oplog_ok": false,
+            "storage_ok": null,
             "errors": {
               "oplog": "not_authorized",
               "repl_config": "not_authorized",
@@ -13151,7 +16290,8 @@
             "cursors": null,
             "documents": null,
             "op_latencies": null,
-            "oplog": null
+            "oplog": null,
+            "storage": null
           },
           "replica_set": {
             "set_name": "rs0",
@@ -13236,6 +16376,7 @@
             "repl_status_ok": null,
             "repl_config_ok": null,
             "oplog_ok": null,
+            "storage_ok": null,
             "errors": {
               "server_status": "not_authorized"
             }
@@ -13255,7 +16396,8 @@
             "cursors": null,
             "documents": null,
             "op_latencies": null,
-            "oplog": null
+            "oplog": null,
+            "storage": null
           },
           "replica_set": null,
           "sharding": null
@@ -13278,6 +16420,7 @@
           "tls_allow_invalid_certificates": false
         }
       },
+      "mongo_storage": "standalone",
       "mongo": {
         "hello": {
           "isWritablePrimary": true,
@@ -13480,6 +16623,7 @@
             "repl_status_ok": null,
             "repl_config_ok": null,
             "oplog_ok": null,
+            "storage_ok": true,
             "errors": {}
           },
           "node": {
@@ -13560,7 +16704,79 @@
               "commands_us": 42490,
               "commands_ops": 36
             },
-            "oplog": null
+            "oplog": null,
+            "storage": {
+              "age_s": 0,
+              "databases_total": 5,
+              "complete": true,
+              "databases": [
+                {
+                  "name": "admin",
+                  "system": true,
+                  "error": null,
+                  "collections": 2,
+                  "views": 0,
+                  "objects": 6,
+                  "indexes": 3,
+                  "data_size": 2271,
+                  "storage_size": 8192,
+                  "index_size": 12288,
+                  "total_size": 20480
+                },
+                {
+                  "name": "app",
+                  "system": false,
+                  "error": null,
+                  "collections": 3,
+                  "views": 1,
+                  "objects": 5098,
+                  "indexes": 5,
+                  "data_size": 758583,
+                  "storage_size": 12288,
+                  "index_size": 126976,
+                  "total_size": 139264
+                },
+                {
+                  "name": "config",
+                  "system": true,
+                  "error": null,
+                  "collections": 1,
+                  "views": 0,
+                  "objects": 0,
+                  "indexes": 2,
+                  "data_size": 0,
+                  "storage_size": 4096,
+                  "index_size": 8192,
+                  "total_size": 12288
+                },
+                {
+                  "name": "local",
+                  "system": true,
+                  "error": null,
+                  "collections": 1,
+                  "views": 0,
+                  "objects": 1,
+                  "indexes": 1,
+                  "data_size": 2538,
+                  "storage_size": 4096,
+                  "index_size": 4096,
+                  "total_size": 8192
+                },
+                {
+                  "name": "tenants",
+                  "system": false,
+                  "error": null,
+                  "collections": 20,
+                  "views": 0,
+                  "objects": 20,
+                  "indexes": 20,
+                  "data_size": 580,
+                  "storage_size": 81920,
+                  "index_size": 81920,
+                  "total_size": 163840
+                }
+              ]
+            }
           },
           "replica_set": null,
           "sharding": null
@@ -13739,6 +16955,7 @@
           "tls_allow_invalid_certificates": false
         }
       },
+      "mongo_storage": "standalone",
       "mongo": {
         "hello": {
           "isWritablePrimary": true,
@@ -13941,6 +17158,7 @@
             "repl_status_ok": null,
             "repl_config_ok": null,
             "oplog_ok": null,
+            "storage_ok": true,
             "errors": {}
           },
           "node": {
@@ -14021,7 +17239,79 @@
               "commands_us": 57343,
               "commands_ops": 30
             },
-            "oplog": null
+            "oplog": null,
+            "storage": {
+              "age_s": 0,
+              "databases_total": 5,
+              "complete": true,
+              "databases": [
+                {
+                  "name": "admin",
+                  "system": true,
+                  "error": null,
+                  "collections": 2,
+                  "views": 0,
+                  "objects": 6,
+                  "indexes": 3,
+                  "data_size": 2271,
+                  "storage_size": 8192,
+                  "index_size": 12288,
+                  "total_size": 20480
+                },
+                {
+                  "name": "app",
+                  "system": false,
+                  "error": null,
+                  "collections": 3,
+                  "views": 1,
+                  "objects": 5098,
+                  "indexes": 5,
+                  "data_size": 758583,
+                  "storage_size": 12288,
+                  "index_size": 126976,
+                  "total_size": 139264
+                },
+                {
+                  "name": "config",
+                  "system": true,
+                  "error": null,
+                  "collections": 1,
+                  "views": 0,
+                  "objects": 0,
+                  "indexes": 2,
+                  "data_size": 0,
+                  "storage_size": 4096,
+                  "index_size": 8192,
+                  "total_size": 12288
+                },
+                {
+                  "name": "local",
+                  "system": true,
+                  "error": null,
+                  "collections": 1,
+                  "views": 0,
+                  "objects": 1,
+                  "indexes": 1,
+                  "data_size": 2538,
+                  "storage_size": 4096,
+                  "index_size": 4096,
+                  "total_size": 8192
+                },
+                {
+                  "name": "tenants",
+                  "system": false,
+                  "error": null,
+                  "collections": 20,
+                  "views": 0,
+                  "objects": 20,
+                  "indexes": 20,
+                  "data_size": 580,
+                  "storage_size": 81920,
+                  "index_size": 81920,
+                  "total_size": 163840
+                }
+              ]
+            }
           },
           "replica_set": null,
           "sharding": null

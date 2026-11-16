@@ -13,6 +13,11 @@ with their real types.
   oplog
       {"first": <entry>, "last": <entry>} for the two find_one reads, or
       {"raises": <exception spec>}
+  listDatabases
+      the reply to listDatabases {nameOnly: true, authorizedDatabases: false}
+      (any other form fails the test), or {"raises": <exception spec>}
+  dbStats
+      {<database>: the reply to dbStats on it, or {"raises": ...}}
   monitor
       what the driver's own monitor saw: {"hello": <its unauthenticated
       reply, whose maxWireVersion the server description carries>,
@@ -33,7 +38,19 @@ from pymongo import errors
 
 JSON_OPTIONS = JSONOptions(json_mode=JSONMode.RELAXED, tz_aware=False)
 
-COMMANDS = ("hello", "isMaster", "serverStatus", "replSetGetStatus", "replSetGetConfig")
+COMMANDS = (
+    "hello",
+    "isMaster",
+    "serverStatus",
+    "replSetGetStatus",
+    "replSetGetConfig",
+    "listDatabases",
+)
+
+# The one form the collector may send: names only (no per-database sizes,
+# which cost like a dbStats each), and a refusal rather than a short list
+# when the user lacks the listDatabases privilege.
+LIST_DATABASES_FIELDS = {"nameOnly": True, "authorizedDatabases": False}
 
 
 class UnexpectedCall(BaseException):
@@ -101,16 +118,33 @@ class FakeClient:
         self.admin = SimpleNamespace(command=self._command)
         self.local = {"oplog.rs": SimpleNamespace(find_one=self._find_one)}
 
+    def __getitem__(self, database):
+        return SimpleNamespace(command=lambda name: self._db_command(database, name))
+
     def _answer(self, value):
         if isinstance(value, dict) and "raises" in value:
             raise exception(value["raises"])
         return ext(value)
 
-    def _command(self, name):
+    def _command(self, name, **fields):
         self.calls.append(name)
         if name not in COMMANDS or name not in self.mongo:
             raise UnexpectedCall(f"unexpected command {name!r}")
+        expected = LIST_DATABASES_FIELDS if name == "listDatabases" else {}
+        if fields != expected:
+            raise UnexpectedCall(f"unexpected fields {fields!r} for {name!r}")
         return self._answer(self.mongo[name])
+
+    def _db_command(self, database, name):
+        self.calls.append(f"{name}.{database}")
+        replies = self.mongo.get(name)
+        if (
+            name != "dbStats"
+            or not isinstance(replies, dict)
+            or database not in replies
+        ):
+            raise UnexpectedCall(f"unexpected command {name!r} on {database!r}")
+        return self._answer(replies[database])
 
     def _find_one(self, filter, projection, sort):
         assert filter == {} and projection == {"ts": 1}
