@@ -89,7 +89,7 @@ platform-specific notes.
 
 On systemd hosts the bundled unit is sandbox-hardened (agent version
 **1.17.4+**): `UMask=0077` (state files the agent writes -- the per-host
-token, capture and inventory state -- are owner-only, `0600`), `PrivateTmp=true`
+token, capture, inventory and sudo-refusal state -- are owner-only, `0600`), `PrivateTmp=true`
 and `ProtectHome=read-only`. Heavier directives (`NoNewPrivileges`, seccomp
 filters, `ProtectSystem`) are deliberately absent: they would silently break
 the sudo-based collectors (SMART, RAID, fail2ban, and WireGuard since
@@ -886,7 +886,8 @@ does not ship it by default.
 > The one mail left: an account whose sudo rules all need a password (a user
 > installation run by a member of the `sudo` group), on a sudo older than
 > 1.9.16p1 (Ubuntu 24.04 and older, Debian 12), gets one when the agent first
-> asks -- and again once a day while one of the SMART, RAID, fail2ban or
+> asks (two if the account is in neither the `sudo` nor the `wheel` group)
+> -- and again once a day while one of the SMART, RAID, fail2ban or
 > WireGuard features is enabled -- as sudo mails every refusal there. The
 > cure is the NOPASSWD rules above, after which nothing mails. Short of that,
 > `sudo visudo -f /etc/sudoers.d/fivenines-nomail` with the line
@@ -1059,6 +1060,12 @@ sudo systemctl restart fivenines-agent
 Either one also releases the Proxmox Backup Server reads the agent holds after
 a timeout (see Proxmox Backup Server Monitoring): if a datastore on that PBS is
 still broken, repair it first, or each release sends the stuck request again.
+
+A restart alone does not make the agent ask sudo again about a command sudo
+refused: it keeps those refusals across restarts (see **Mail to root** under
+[Full Monitoring](#full-monitoring-recommended)). After a sudo change the agent
+cannot see -- a rule from LDAP or sssd, or on RHEL a file in `/etc/sudoers.d`
+edited in place rather than saved with `visudo` -- send `SIGHUP` instead.
 
 ### Viewing Available Capabilities
 
