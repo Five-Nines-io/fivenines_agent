@@ -17,6 +17,8 @@ read@local for the oplog):
                                     uninitiated or removed node apart)
   replSetGetConfig                  replica_set: identity + member config
   local.oplog.rs first/last ts      node.oplog.window_s (a member)
+  listDatabases + dbStats per db    node.storage (a mongod, at most once per
+                                    STORAGE_CACHE_TTL)
 
 Contract: tests/fixtures/mongodb_contract_payload.json, which the server
 vendors byte-identical. In short:
@@ -30,8 +32,23 @@ vendors byte-identical. In short:
 - Values ship as MongoDB reports them; cumulative counters stay cumulative
   (the server rates them); a field this version or engine lacks is None, never
   0. Replication lag and heartbeat ages are computed inside ONE
-  replSetGetStatus reply, against its own optimes and `date`: no agent clock
-  value appears anywhere in the payload.
+  replSetGetStatus reply, against its own optimes, wall times and `date`: no
+  agent clock reading appears in the payload, only storage's age_s (an
+  interval on the agent's monotonic clock). lag_ms comes from the members'
+  lastAppliedWallTime (milliseconds, fresh only in a primary's view: a
+  secondary knows the others' from heartbeats); lag_s, from optimeDate, only
+  has whole seconds: a member 250 ms behind reads 0, or 1 across a second
+  boundary.
+- node.storage costs more than the rest together (dbStats walks every
+  collection and index of its database), and sizes move slowly: it is built
+  at most once per STORAGE_CACHE_TTL, within its own STORAGE_BUDGET after
+  every other section, reading at most MAX_DATABASES databases (the next
+  build carries on from where this one stopped; one that never fits the
+  budget is read last) but listing every one, and re-shipped with its age_s
+  in between. Never on mongos (its dbStats fans out to every shard), an
+  arbiter (no data), a member that serves no reads, nor a member of a
+  sharded cluster (8.0 refuses dbStats there over a direct connection, and
+  logs it).
 
 Bounded twice, because the collection loop shares one systemd watchdog
 window: every command runs under pymongo.timeout() with what is left of
@@ -48,6 +65,7 @@ pymongo is imported lazily, on the first tick that carries a mongodb config:
 it costs ~110 ms and ~11 MB of RSS, which hosts without MongoDB never pay.
 """
 
+import bisect
 import ipaddress
 import math
 import os
@@ -58,7 +76,7 @@ import stat
 import threading
 import time
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 from fivenines_agent.bounded import WorkerTimeout, call_bounded
@@ -98,6 +116,32 @@ CLOSE_TIMEOUT = 2
 # MongoDB's own maximum number of members in a replica set.
 MAX_MEMBERS = 50
 
+# node.storage (listDatabases + one dbStats per database): sizes move slowly
+# and dbStats walks every collection and index of its database, so it is read
+# at most once per STORAGE_CACHE_TTL and re-shipped with its age in between.
+STORAGE_CACHE_TTL = 600
+# One storage build's own budget, inside what is left of COMMAND_BUDGET: it
+# runs after every other section, so a slow one costs only itself.
+STORAGE_BUDGET = 5
+# Databases read per build; past it, the next build carries on from where this
+# one stopped (by name), so every database is read within a few builds.
+MAX_DATABASES = 100
+# Databases listed per build (one row each, read or not): the listing is what
+# tells the server a database is gone, so it is shipped whole up to this cap.
+MAX_LISTED_DATABASES = 1000
+# A database whose dbStats did not fit the whole budget is read last; it gets
+# the build's first place (the whole budget) again this long after, twice as
+# long after each retry that still does not fit, at most STORAGE_SLOW_RETRY_MAX.
+STORAGE_SLOW_RETRY = 3600
+STORAGE_SLOW_RETRY_MAX = 86400
+# No dbStats is sent with less of the build's budget left: pymongo would
+# refuse it (ExecutionTimeout) or send maxTimeMS 0, which mongod reads as no
+# limit (measured on 7.0.45), and either reads as a timeout of its own.
+STORAGE_MIN_SEND = 0.1
+# MongoDB's own databases: `local` holds the oplog (often most of the data on
+# a replica set member), `config` the sessions and the sharding metadata.
+SYSTEM_DATABASES = frozenset({"admin", "config", "local"})
+
 # A host name (RFC 1123 labels) or an IPv4 literal. Anything else -- a scheme,
 # a path, a port, userinfo, a comma (a seed list), a query -- is refused: the
 # value reaches MongoClient(host=...), which parses URIs and host lists.
@@ -136,6 +180,9 @@ NOT_AUTHORIZED = "not_authorized"
 REFUSED = "refused"
 TIMEOUT = "timeout"
 ERROR = "error"
+# node.storage only: a database listed but not read in this build (outside its
+# MAX_DATABASES, or the budget ran out before it was sent).
+NOT_READ = "not_read"
 
 _EPOCH = datetime(1970, 1, 1)
 
@@ -188,6 +235,10 @@ _stalled_worker = None
 # Last failure logged at error, per kind: a steady failure logs once, then at
 # debug, so a mongod down for a day does not write 1440 error lines.
 _last_logged: dict = {}
+
+# The last storage build (see _storage): {"key", "built_at", "outcome",
+# "resume", "slow"}. Only the collection worker reads or writes it.
+_storage_state: dict = {}
 
 
 class ConfigError(ValueError):
@@ -443,15 +494,26 @@ class _Mongo:
         self.client = client
         self.deadline = time.monotonic() + COMMAND_BUDGET
 
-    def _bounded(self, call, cap=SOCKET_TIMEOUT_S):
-        left = self.deadline - time.monotonic()
+    def _bounded(self, call, cap=SOCKET_TIMEOUT_S, deadline=None):
+        """call() under pymongo.timeout(): at most `cap`, and never past the
+        command budget nor `deadline` (a section's own, tighter one)."""
+        end = self.deadline if deadline is None else min(deadline, self.deadline)
+        left = end - time.monotonic()
         if left <= 0:
             raise _BudgetSpent()
         with self.pymongo.timeout(min(left, cap)):
             return call()
 
-    def command(self, name, cap=SOCKET_TIMEOUT_S):
-        return self._bounded(lambda: self.client.admin.command(name), cap)
+    def command(self, name, cap=SOCKET_TIMEOUT_S, deadline=None, **fields):
+        return self._bounded(
+            lambda: self.client.admin.command(name, **fields), cap, deadline
+        )
+
+    def database_command(self, database, name, deadline):
+        """`name` run against `database` (dbStats)."""
+        return self._bounded(
+            lambda: self.client[database].command(name), deadline=deadline
+        )
 
     def oplog_entry(self, direction):
         """The first (1) or last (-1) oplog entry, projected to its ts."""
@@ -529,6 +591,14 @@ def _seconds_between(later, earlier):
     return max(int((later - earlier).total_seconds()), 0)
 
 
+def _milliseconds_between(later, earlier):
+    """Whole milliseconds from earlier to later (BSON dates carry no more),
+    clamped at 0; None if either is unknown."""
+    if later is None or earlier is None:
+        return None
+    return max((later - earlier) // timedelta(milliseconds=1), 0)
+
+
 def _object_id(value):
     """A replicaSetId as 24 lowercase hex characters, or None."""
     text = str(value) if value is not None else ""
@@ -592,6 +662,7 @@ def _arbiter_payload(hello):
         "repl_status_ok": None,
         "repl_config_ok": None,
         "oplog_ok": None,
+        "storage_ok": None,
         "errors": {},
     }
     return _payload("mongod", "arbiter", _str(hello.get("me")), collection, None)
@@ -649,9 +720,9 @@ def _op_latencies(status):
     return result
 
 
-def _node(status, oplog):
+def _node(status, oplog, storage):
     """The node block: serverStatus fields (None when it was not read) plus
-    the oplog window."""
+    the oplog window and the storage block."""
     status = status if isinstance(status, Mapping) else {}
     global_lock = _get(status, "globalLock")
     return {
@@ -722,6 +793,7 @@ def _node(status, oplog):
         ),
         "op_latencies": _op_latencies(status),
         "oplog": oplog,
+        "storage": storage,
     }
 
 
@@ -759,21 +831,36 @@ def _lag_eligible(member):
     )
 
 
-def _lag_reference(members):
-    """The PRIMARY's optimeDate in this reply, else (no primary) the freshest
-    among healthy data-bearing members: the mongosh algorithm."""
-    primaries = [
-        _date(m.get("optimeDate"))
-        for m in members
-        if _int(m.get("state")) == _PRIMARY and _lag_eligible(m)
-    ]
-    if primaries:
-        return max(primaries)
-    fresh = [_date(m.get("optimeDate")) for m in members if _lag_eligible(m)]
-    return max(fresh) if fresh else None
+def _optime_date(member):
+    """optimeDate: the optime Timestamp's WHOLE second (MongoDB builds it from
+    the Timestamp's seconds alone)."""
+    return _date(member.get("optimeDate"))
 
 
-def _member(status_member, config_member, now, reference):
+def _wall_time(member):
+    """lastAppliedWallTime: the wall clock of the primary that wrote the last
+    operation this member applied, to the millisecond (measured on 4.4.31 to
+    8.0; 4.4.1's members carry none). Every member's value was stamped by a
+    primary, so comparing two of them involves no clock of the members. The
+    reporting member knows the others' values from heartbeats (2s apart)
+    unless it is the primary, which the secondaries keep up to date: only a
+    primary's view is millisecond-fresh."""
+    return _date(member.get("lastAppliedWallTime"))
+
+
+def _lag_reference(members, moment=_optime_date):
+    """The PRIMARY's moment in this reply (the freshest, should the reply list
+    more than one), else (no primary) the freshest among healthy data-bearing
+    members: the mongosh algorithm. A primary without that moment leaves no
+    reference rather than falling back to a secondary's."""
+    eligible = [m for m in members if _lag_eligible(m)]
+    primaries = [m for m in eligible if _int(m.get("state")) == _PRIMARY]
+    moments = [moment(m) for m in primaries or eligible]
+    moments = [t for t in moments if t is not None]
+    return max(moments) if moments else None
+
+
+def _member(status_member, config_member, now, reference, wall_reference):
     """One members[] entry: replSetGetStatus fields merged with the member's
     replSetGetConfig fields (each side None when its command failed)."""
     s = status_member if isinstance(status_member, Mapping) else None
@@ -792,6 +879,7 @@ def _member(status_member, config_member, now, reference):
         "state_str": None,
         "uptime_s": None,
         "lag_s": None,
+        "lag_ms": None,
         "ping_ms": None,
         "last_heartbeat_age_s": None,
         "last_heartbeat_recv_age_s": None,
@@ -810,7 +898,8 @@ def _member(status_member, config_member, now, reference):
         entry["state_str"] = _str(s.get("stateStr"))
         entry["uptime_s"] = _int(s.get("uptime"))
         if _lag_eligible(s):
-            entry["lag_s"] = _seconds_between(reference, _date(s.get("optimeDate")))
+            entry["lag_s"] = _seconds_between(reference, _optime_date(s))
+            entry["lag_ms"] = _milliseconds_between(wall_reference, _wall_time(s))
         if not is_self:
             # An unhealthy member keeps its last pingMs (0 once it is down):
             # stale, so null.
@@ -868,6 +957,7 @@ def _members(status, config):
         return None
     now = _date(_get(status, "date"))
     reference = _lag_reference(status_members or [])
+    wall_reference = _lag_reference(status_members or [], _wall_time)
     by_id = {}
     for m in status_members or []:
         by_id.setdefault(_int(m.get("_id")), m)
@@ -875,7 +965,7 @@ def _members(status, config):
         pairs = [(_status_for(by_id, c), c) for c in config_members]
     else:
         pairs = [(s, None) for s in status_members or []]
-    entries = [_member(s, c, now, reference) for s, c in pairs]
+    entries = [_member(s, c, now, reference, wall_reference) for s, c in pairs]
     entries.sort(key=lambda e: (e["name"] is None, e["name"] or "", e["id"] or 0))
     return entries[:MAX_MEMBERS]
 
@@ -1074,6 +1164,7 @@ class _Sections:
             "repl_status_ok": None,
             "repl_config_ok": None,
             "oplog_ok": None,
+            "storage_ok": None,
         }
         self.errors = {}
 
@@ -1088,8 +1179,13 @@ class _Sections:
         return result
 
     def fail(self, name, exc):
-        self.flags[f"{name}_ok"] = False
-        self.errors[name] = _section_reason(exc, self.mongo.pymongo)
+        self.mark(name, _section_reason(exc, self.mongo.pymongo))
+
+    def mark(self, name, reason):
+        """The section's outcome: read when reason is None, else failed."""
+        self.flags[f"{name}_ok"] = reason is None
+        if reason is not None:
+            self.errors[name] = reason
 
     def collection(self):
         return {**self.flags, "errors": dict(sorted(self.errors.items()))}
@@ -1143,15 +1239,44 @@ def _read(mongo, recorder, config):
     else:
         role = "standalone"
 
+    # Last, so a slow storage read can only cost itself. Not on mongos: its
+    # dbStats fans out to every shard, and each agent reads its own mongod.
+    # Nor on a member of a sharded cluster (a shard, or the config server set,
+    # which 8.0 can turn into a config shard holding application databases,
+    # indistinguishably): measured on 8.0.34, dbStats on an application
+    # database over a direct connection is refused there (Unauthorized,
+    # "connecting to a sharded cluster improperly") and logged at error level
+    # each time (7.0.45 answers it). Its databases are mongos' to report.
+    # serverStatus not read, whether it is one is unknown: not read either.
+    storage = None
+    sharding = _sharding(status)
+    if (
+        process == "mongod"
+        and _serves_reads(hello)
+        and status is not None
+        and sharding is None
+    ):
+        storage = _storage(mongo, sections, _storage_key(config, hello))
+
     return _payload(
         process,
         role,
         _str(hello.get("me")),
         sections.collection(),
-        _node(status, oplog),
+        _node(status, oplog, storage),
         version=_str(_get(status, "version")),
         replica_set=replica_set,
-        sharding=_sharding(status),
+        sharding=sharding,
+    )
+
+
+def _serves_reads(hello):
+    """A standalone, a PRIMARY or a SECONDARY (hidden and delayed ones
+    included), from hello: the states that serve reads. An uninitiated or
+    removed node, or a member in initial sync, recovery or rollback, would
+    refuse dbStats on every attempt (storage then does not apply)."""
+    return any(
+        hello.get(key) is True for key in ("isWritablePrimary", "ismaster", "secondary")
     )
 
 
@@ -1203,6 +1328,234 @@ def _read_replica_set(mongo, sections, hello):
 def _repl_config(mongo):
     """replSetGetConfig's config document."""
     return _checked(_get(mongo.command("replSetGetConfig"), "config"))
+
+
+# --- storage --------------------------------------------------------------------
+
+
+def _storage_key(config, hello):
+    """What a storage build depends on: the mongod, and the identity whose
+    privileges decide what it lists. Any other value starts afresh. The
+    configured address alone does not name the mongod (a host name that
+    now resolves to another member, a container replaced behind the same
+    address): its hello's `me` and topologyVersion.processId (new at every
+    start) do, so another node's inventory is never shipped as this one's."""
+    process_id = _get(hello, "topologyVersion", "processId")
+    return (
+        config.host,
+        config.port,
+        config.username,
+        config.auth_source,
+        config.auth_mechanism,
+        config.tls_certificate_key_file,
+        _str(hello.get("me")),
+        None if process_id is None else str(process_id),
+    )
+
+
+def _storage(mongo, sections, key):
+    """node.storage, built at most once per STORAGE_CACHE_TTL and re-shipped
+    with its age_s in between.
+
+    A build starts only with its whole STORAGE_BUDGET left of the command
+    budget: given a sliver, its listing would time out (or pymongo would
+    refuse to send it) and that failure would be kept for the TTL. Not
+    started, it cost the mongod nothing and keeps nothing, so the next tick
+    tries again. A build whose listDatabases was sent is kept for the TTL
+    whatever came of it (a refusal too: asking every tick would only repeat
+    it).
+    """
+    state = _storage_state
+    same = state.get("key") == key
+    if not same or time.monotonic() - state["built_at"] >= STORAGE_CACHE_TTL:
+        if mongo.deadline - time.monotonic() < STORAGE_BUDGET:
+            sections.mark("storage", TIMEOUT)
+            return None
+        resume = state.get("resume") if same else None
+        slow = state.get("slow", {}) if same else {}
+        try:
+            outcome, resume, slow = _build_storage(mongo, resume, slow)
+        except Exception as e:
+            outcome = (None, _section_reason(e, mongo.pymongo))
+        state.clear()
+        state.update(
+            key=key,
+            built_at=time.monotonic(),
+            outcome=outcome,
+            resume=resume,
+            slow=slow,
+        )
+        _log_storage(outcome[0])
+    block, reason = state["outcome"]
+    sections.mark("storage", reason)
+    if block is None:
+        return None
+    return {"age_s": int(time.monotonic() - state["built_at"]), **block}
+
+
+def _build_storage(mongo, resume, slow):
+    """((block, None), next resume, next slow) for one build: listDatabases,
+    then one dbStats per database for at most MAX_DATABASES of them, from
+    `resume` (a name) on, within STORAGE_BUDGET. A failed listDatabases
+    raises.
+
+    `slow` maps the databases whose dbStats outlived the budget when sent
+    first (with everything the build could give) to (when they get the first
+    place again, the delay that set it): until then they are read last, with
+    what the others leave, so one that never fits cannot take every other
+    build's budget (re-sent first after each cut, it would, and that build
+    would read nothing else); one that stalled once is read first again
+    within STORAGE_SLOW_RETRY (read last only, it could wait for good behind
+    databases that fill the budget); and each retry that still does not fit
+    doubles the delay, up to STORAGE_SLOW_RETRY_MAX (a fixed delay let a few
+    such databases take the first place, and with it the whole build, in
+    turn on every build). One that answers leaves `slow`."""
+    deadline = time.monotonic() + STORAGE_BUDGET
+    # authorizedDatabases false: without the listDatabases privilege MongoDB
+    # would otherwise answer with only the databases the user can read, a
+    # short list that reads as databases gone. Now it refuses (Unauthorized).
+    names = _database_names(
+        mongo.command(
+            "listDatabases",
+            deadline=deadline,
+            nameOnly=True,
+            authorizedDatabases=False,
+        )
+    )
+    now = time.monotonic()
+    listed = set(names)
+    slow = {name: entry for name, entry in slow.items() if name in listed}
+    start = bisect.bisect_left(names, resume) % len(names) if resume else 0
+    window = (names[start:] + names[:start])[:MAX_DATABASES]
+    due = [n for n in window if n in slow and slow[n][0] <= now]
+    later = [n for n in window if n in slow and slow[n][0] > now]
+    order = due + [n for n in window if n not in slow] + later
+    rows = []
+    cut = None
+    spent = False
+    for index, name in enumerate(order):
+        stats, error, sent = None, None, False
+        # Each dbStats gets all that is left of the budget: after a timeout
+        # (mongod answers it up to a millisecond early: pymongo truncates
+        # maxTimeMS), after a lost connection (the next send would reconnect
+        # within what is left), or with a sliver left, nothing more is sent.
+        left = min(deadline, mongo.deadline) - time.monotonic()
+        if spent or left < STORAGE_MIN_SEND:
+            error = NOT_READ
+        else:
+            try:
+                sent = True
+                stats = _checked(mongo.database_command(name, "dbStats", deadline))
+            except _BudgetSpent:
+                # The worker stalled past the deadline since `left` was read.
+                error, sent = NOT_READ, False
+            except Exception as e:
+                error = _section_reason(e, mongo.pymongo)
+                lost = isinstance(e, mongo.pymongo.errors.ConnectionFailure)
+                spent = spent or lost
+        spent = spent or error == TIMEOUT
+        if error is None:
+            slow.pop(name, None)
+        elif index == 0 and sent and (error == TIMEOUT or name in slow):
+            # It had everything this build could give and did not fit (or,
+            # due again, failed otherwise: it must not keep the first place,
+            # but only a timeout doubles its delay).
+            delay = STORAGE_SLOW_RETRY
+            if name in slow:
+                delay = slow[name][1]
+                if error == TIMEOUT:
+                    delay = min(delay * 2, STORAGE_SLOW_RETRY_MAX)
+            slow[name] = (time.monotonic() + delay, delay)
+        if error in (TIMEOUT, NOT_READ) and cut is None and name not in slow:
+            # The next build starts here, giving this database the budget it
+            # lacked.
+            cut = index
+        rows.append(_database_row(name, stats, error))
+    if cut is not None:
+        resume = order[cut]
+    elif len(window) < len(names):
+        resume = names[(start + len(window)) % len(names)]
+    else:
+        resume = None
+    # Every listed database gets a row (up to MAX_LISTED_DATABASES), read or
+    # not: a database absent from a whole listing is gone.
+    read = set(window)
+    unread = [n for n in names if n not in read]
+    unread = unread[: max(MAX_LISTED_DATABASES - len(window), 0)]
+    rows += [_database_row(name, None, NOT_READ) for name in unread]
+    block = {
+        "databases_total": len(names),
+        "complete": len(rows) == len(names)
+        and all(row["error"] is None for row in rows),
+        "databases": sorted(rows, key=lambda row: row["name"]),
+    }
+    return (block, None), resume, slow
+
+
+def _database_names(reply):
+    """The sorted, distinct names of a listDatabases reply. Raises on a reply
+    that is not a list of named databases: the section then fails, where a
+    list read in part would read as databases gone."""
+    entries = _get(reply, "databases")
+    if not isinstance(entries, list):
+        raise ValueError("listDatabases returned no database list")
+    names = set()
+    for entry in entries:
+        name = _get(entry, "name")
+        if not isinstance(name, str) or not name:
+            raise ValueError("listDatabases returned a database without a name")
+        names.add(name)
+    if not names:
+        # A mongod always lists local: an empty list would read as every
+        # database gone.
+        raise ValueError("listDatabases returned no database")
+    return sorted(names)
+
+
+def _database_row(name, stats, error):
+    """One databases[] entry: dbStats as MongoDB reports it (bytes, scale 1),
+    every value null when the database was not read (error says why)."""
+    stats = stats if stats is not None else {}
+    return {
+        "name": _str(name),
+        "system": name in SYSTEM_DATABASES,
+        "error": error,
+        "collections": _int(stats.get("collections")),
+        "views": _int(stats.get("views")),
+        "objects": _int(stats.get("objects")),
+        "indexes": _int(stats.get("indexes")),
+        "data_size": _num(stats.get("dataSize")),
+        "storage_size": _num(stats.get("storageSize")),
+        "index_size": _num(stats.get("indexSize")),
+        "total_size": _num(stats.get("totalSize")),
+    }
+
+
+_STORAGE_LOG_NAMES = 10
+
+
+def _log_storage(block):
+    """The databases a build could not read: at error once per change of the
+    reasons, then at debug (the names move with the rotation)."""
+    failed = [
+        row
+        for row in (block or {}).get("databases", [])
+        if row["error"] not in (None, NOT_READ)
+    ]
+    if not failed:
+        _last_logged.pop("storage", None)
+        return
+    names = ", ".join(
+        f"{log_safe(row['name'])} ({row['error']})"
+        for row in failed[:_STORAGE_LOG_NAMES]
+    )
+    more = len(failed) - _STORAGE_LOG_NAMES
+    _log_streak(
+        "storage",
+        tuple(sorted({row["error"] for row in failed})),
+        f"MongoDB databases not read: {names}"
+        + (f" and {more} more" if more > 0 else ""),
+    )
 
 
 def _unusable_tls_file(config):

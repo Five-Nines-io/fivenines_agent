@@ -2477,13 +2477,25 @@ a direct, read-only connection (agent **1.22.0+**; MongoDB 4.4 to 8.x). No
 client binary is needed: the driver (pymongo) ships inside the agent.
 
 - Every process: uptime, connections, operation and document counters,
-  network traffic, memory, WiredTiger cache and read/write tickets, global
-  lock queues, asserts, cursors and cumulative operation latencies (raw
-  counters; the dashboard derives rates)
+  network traffic, memory (resident and virtual), page faults, WiredTiger
+  cache and read/write tickets, global lock queues, asserts, cursors and
+  cumulative operation latencies (raw counters; the dashboard derives rates)
 - On a replica set member: the member's whole view of its set -- set name and
   `replicaSetId`, term, and for every member its state, health, replication
-  lag, heartbeat ages, sync source and configuration (priority, votes,
-  hidden, arbiter, delay) -- plus the oplog window
+  lag (to the millisecond from agent **1.24.0**; in whole seconds before, and
+  on MongoDB 4.4.1, whose reply has no millisecond time), heartbeat ages, sync
+  source and configuration (priority, votes, hidden, arbiter, delay) -- plus
+  the oplog window
+- Storage (agent **1.24.0+**), on a standalone, primary or secondary outside
+  a sharded cluster: per database, the logical data size, the size on disk
+  (compressed) and the index size, with MongoDB's own databases (`admin`,
+  `config`, `local`, where the oplog lives) marked as such. `dbStats` walks
+  every collection, so the sizes are read at most every 10 minutes, at most
+  100 databases at a time (a larger host is read over several rounds), within
+  5 seconds: a database whose `dbStats` takes longer is not read. Not
+  in a sharded cluster (`mongos`, shard and config server members): MongoDB
+  8.0 refuses `dbStats` on an application database over a direct connection
+  to a shard, and logs an error each time
 - Arbiters, uninitiated and removed nodes, config servers, shard members and
   `mongos` routers are recognised; a shard member, config server or `mongos`
   reports which config server set (which sharded cluster) it belongs to
@@ -2496,7 +2508,8 @@ its agent goes down. Replication lag and heartbeat ages are computed from the
 `mongod`'s own reply, never from the host clock.
 
 **Create a dedicated user.** `clusterMonitor` covers every command the agent
-sends but the oplog read; `read` on `local` adds the oplog window. That second
+sends but the oplog read (`listDatabases` and `dbStats` included); `read` on
+`local` adds the oplog window. That second
 role is optional and broad: it lets the account read the oplog's contents
 (every recent write to every database), although the agent only asks for the
 first and last entries' timestamps. Without it, only the oplog window reads as
