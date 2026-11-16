@@ -684,9 +684,10 @@ def test_nopasswd_commands_skips_options_before_tags():
     "listing",
     [
         "Matching Defaults entries for alice on box:\n    !authenticate\n" + ALICE,
+        "Matching Defaults entries for alice on box:\n    exempt_group=ops\n" + ALICE,
         "alice may do things:\n    NOPASSWD: /usr/sbin/smartctl\n",
     ],
-    ids=["no-authenticate", "unknown-format"],
+    ids=["no-authenticate", "exempt-group", "unknown-format"],
 )
 def test_nopasswd_commands_none_when_it_cannot_tell(listing):
     assert sudo_refusals._nopasswd_commands(listing) is None
@@ -715,9 +716,10 @@ def test_needs_a_password_only_when_no_nopasswd_rule_names_it(tools, path, needs
         "(ALL) NOPASSWD: SMART_TOOLS",
         "(ALL) NOPASSWD: /usr/sbin/*",
         "(ALL) NOPASSWD: !/usr/bin/su",
+        "(ALL) NOPASSWD: /usr/bin/",
         "(ALL : ALL) ALL",
     ],
-    ids=["all", "alias", "wildcard", "negation", "no-nopasswd-entry"],
+    ids=["all", "alias", "wildcard", "negation", "directory", "no-nopasswd-entry"],
 )
 def test_needs_a_password_never_guesses(tools, rule):
     """ALL, an alias, a wildcard or a negation could cover the command, and an
@@ -805,24 +807,37 @@ def test_run_checked_a_listing_that_asks_a_password_leaves_it_to_the_run(policy)
 
 
 def test_run_checked_an_allowed_command_is_listed_again_once_a_day(policy):
+    """Probed every hour, a command is listed once a day, not once ever: its
+    runs reuse the pass without renewing it."""
+    # Value: protects=the daily re-listing of a command that keeps running;
+    # fails_when=every allowed run renews the pass; why_new=the clock never
+    # moved between runs before; seam=none; no_claim=real sudo
     clock = _Clock()
     sudo_refusals._refusals = SudoRefusals(clock=clock)
     with patch.object(
         sudo_refusals, "run_privileged", return_value=_completed(0)
     ) as run:
-        sudo_refusals.run_checked(["smartctl", "--version"], 5)
-        sudo_refusals.run_checked(["smartctl", "--version"], 5)
-        clock.now += sudo_refusals.REFUSAL_RETRY_INTERVAL
-        sudo_refusals.run_checked(["smartctl", "--version"], 5)
-    assert _asked(run) == [
-        ["-v"],
-        ["-l", "smartctl", "--version"],
-        ["smartctl", "--version"],
-        ["smartctl", "--version"],
-        ["-v"],
-        ["-l", "smartctl", "--version"],
-        ["smartctl", "--version"],
-    ]
+        for _ in range(25):
+            sudo_refusals.run_checked(["smartctl", "--version"], 5)
+            clock.now += 3600
+    listed = [i for i, argv in enumerate(_asked(run)) if argv[0] == "-l"]
+    assert len(listed) == 2
+    assert _asked(run).count(["-v"]) == 2
+
+
+def test_run_checked_a_run_refused_after_a_pass_is_remembered(policy):
+    """A rule withdrawn where no file shows it: the run reusing the pass is
+    refused, and that refusal is kept like any other."""
+    responses = [_completed(0), _completed(0), _completed(0)]
+    responses.append(_completed(1, stderr=REFUSED.encode()))
+    with patch.object(sudo_refusals, "run_privileged", side_effect=responses) as run:
+        assert sudo_refusals.run_checked(["smartctl"], 5)[1] is None
+        assert sudo_refusals.run_checked(["smartctl"], 5) == (
+            None,
+            "sudo -n smartctl: " + REFUSED,
+        )
+        assert sudo_refusals.run_checked(["smartctl"], 5)[0] is None
+    assert run.call_count == 4
 
 
 # --- what ends a refusal, through run_checked ---

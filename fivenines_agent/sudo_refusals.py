@@ -442,10 +442,11 @@ def _account_refusal(timeout, fingerprint):
 def _nopasswd_commands(listing):
     """The commands an account's `sudo -l` shows under NOPASSWD.
 
-    None when it cannot tell: no rules header (another format), or
-    `!authenticate` (no rule needs a password).
+    None when it cannot tell: no rules header (another format),
+    `!authenticate` (no rule needs a password) or `exempt_group` (sudo never
+    authenticates that group's members) among its Defaults.
     """
-    if "!authenticate" in listing:
+    if "!authenticate" in listing or "exempt_group" in listing:
         return None
     lines = listing.splitlines()
     for start, line in enumerate(lines):
@@ -493,9 +494,10 @@ def _needs_a_password(path, listing):
 
     `sudo -n -l <command>` lists a command a rule allows WITH a password too
     (an admin group's `ALL`), and running it then mails. True only when that
-    is certain: the listing shows NOPASSWD entries, every one an absolute path,
-    and none is *path*. `ALL`, an alias, a wildcard or a negation (which this
-    does not expand), no NOPASSWD entry at all (an account sudo does not
+    is certain: the listing shows NOPASSWD entries, every one an absolute path
+    to a program, and none is *path*. `ALL`, an alias, a wildcard, a negation
+    or a directory (`/usr/sbin/` allows every program in it), which this does
+    not expand, no NOPASSWD entry at all (an account sudo does not
     authenticate: root, an exempt group), or a listing it cannot read: False,
     the command is run as before.
     """
@@ -505,7 +507,11 @@ def _needs_a_password(path, listing):
     target = os.path.realpath(path)
     for item in commands:
         word = item.split()[0]
-        if not word.startswith("/") or any(ch in word for ch in "*?[\\"):
+        if (
+            not word.startswith("/")
+            or word.endswith("/")
+            or any(ch in word for ch in "*?[\\")
+        ):
             return False
         if os.path.realpath(word) == target:
             return False
@@ -539,7 +545,10 @@ def run_checked(args, timeout, retry_interval=REFUSAL_RETRY_INTERVAL, stdout=Non
         if detail is not None:
             return None, f"sudo -n {args[0]}: {detail}"
     detail = None
-    if _refusals.passed(key, fingerprint, retry_interval) is None:
+    # A pass is reused until it is due again; only a listing renews it, so a
+    # command run every few minutes is still listed again once a day.
+    listing_due = _refusals.passed(key, fingerprint, retry_interval) is None
+    if listing_due:
         detail, listed = _ask(["-l", *args], question_timeout)
         if detail is not None and any(m in detail for m in REFUSAL_MESSAGES):
             # A listpw other than the default: listing asks a password even for
@@ -561,7 +570,8 @@ def run_checked(args, timeout, retry_interval=REFUSAL_RETRY_INTERVAL, stdout=Non
             env=get_clean_env(),
         )
         detail = refusal_line(result.returncode, _decode(result.stderr))
-    _refusals.remember(key, detail, fingerprint)
+    if listing_due or detail is not None:
+        _refusals.remember(key, detail, fingerprint)
     if detail is not None:
         return None, f"sudo -n {args[0]}: {detail}"
     return result, None
