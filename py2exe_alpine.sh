@@ -155,6 +155,7 @@ PYINSTALLER_ARGS="--strip \
     --hidden-import=scramp \
     --hidden-import=dateutil.parser \
     --hidden-import=paho.mqtt.client \
+    --hidden-import=pymysql \
     --collect-submodules pymongo \
     --collect-submodules bson \
     --copy-metadata pg8000 \
@@ -185,13 +186,14 @@ ldd ./build/$BINARY_NAME/$BINARY_NAME | head -10 || echo "ldd check failed"
 # Quick test. --check-imports imports the agent and every collector (incl.
 # pg8000, which reads its package metadata at import), plus each optional module
 # named below -- the ones the agent imports under try/except ImportError or only
-# inside a collector (pymongo), and would otherwise silently go without -- so a
+# inside a collector (pymongo, pymysql and the cryptography module its RSA
+# authentication imports under try/except), and would otherwise silently go without -- so a
 # failure here means a missing
 # hidden import, dependency or metadata: fail the build rather than ship it.
 # Keep the list in step with the hidden imports above and with the alpine-*
 # list in ci/test-distro.sh (systemd_watchdog is excluded on Alpine).
 # --version no longer does: it exits before the agent is imported, to stay fast.
-CHECK_IMPORTS="pymongo libvirt pynvml proxmoxer.backends.https"
+CHECK_IMPORTS="pymongo pymysql cryptography.hazmat.primitives.asymmetric.padding libvirt pynvml proxmoxer.backends.https"
 echo "=== Testing Built Binary ==="
 # shellcheck disable=SC2086 # CHECK_IMPORTS is a word list
 if ! ./build/$BINARY_NAME/$BINARY_NAME --check-imports $CHECK_IMPORTS; then

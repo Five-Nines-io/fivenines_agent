@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "fivenines_agent"
-version = "1.24.0"
+version = "1.24.1"
 description = ""
 authors = ["Sebastien Puyet <sebastien@fivenines.io>"]
 license = "WTFPL"
@@ -19,6 +19,15 @@ requests = "^2.33.0"
 # on both glibc and musl with no shared-library handling. Pulls scramp +
 # python-dateutil transitively (locked in poetry.lock, no security floor).
 pg8000 = "^1.31.5"
+# Pure-Python MySQL / MariaDB driver for the mysql collector, the pg8000
+# choice again: no `mysql` client is needed on the host (a MySQL in a Docker
+# container is reached on its published port), and it bundles with no shared
+# library of its own. The `rsa` extra (cryptography) runs caching_sha2_password
+# -- MySQL 8's default -- over TCP without TLS; cryptography was already in
+# every Linux binary (pymongo's submodules import it), so it costs nothing, and
+# naming it keeps it there if that import ever goes. The `ed25519` extra
+# (PyNaCl, for MariaDB accounts using that plugin) is not installed.
+pymysql = { version = "^1.2.4", extras = ["rsa"] }
 # Pure-Python MQTT client for the mqtt collector (the agent's first long-lived
 # connection). Chosen over a mosquitto_sub subprocess because a persistent
 # subscription is a poor fit for subprocess supervision, and paho exposes

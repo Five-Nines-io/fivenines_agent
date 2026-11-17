@@ -123,8 +123,8 @@ def _bindings(fn):
     """{name: True if EVERY binding of it in fn's own scope is get_clean_env()}.
 
     Parameters, for/with/comprehension targets and tuple unpacking are not
-    provably clean. Item assignment (env["MYSQL_PWD"] = ...) does not rebind
-    the name and is allowed: that is how mysql adds its password."""
+    provably clean. Item assignment (env["LC_ALL"] = ...) does not rebind
+    the name and is allowed: that is how packages re-pins dpkg/rpm's locale."""
     bound = {}
 
     def bind(name, clean):
@@ -287,7 +287,7 @@ def test_the_spawn_guard_refuses_what_it_claims_to(tmp_path, source, refused):
 def test_every_spawn_site_passes_the_clean_env():
     """#172: the C locale lives in get_clean_env(), so "every child runs in C"
     holds only while every spawn site passes that env -- or a name every
-    binding in its scope sets to it, like mysql's copy that adds MYSQL_PWD. A
+    binding in its scope sets to it, like packages' copy that re-pins LC_ALL. A
     hand-built env, or a dropped env=, silently puts that command back in the
     host's language (and drops the PyInstaller library-path strip with it).
     Before this test, mutating raid_storage, fail2ban, systemd, snmp,
@@ -305,9 +305,10 @@ def test_every_spawn_site_passes_the_clean_env():
         offenders += found
         checked += count
     assert offenders == [], offenders
-    # Not vacuous: 30 spawn sites when this test was written. A lower count
+    # Not vacuous: 30 spawn sites when this test was written, 29 since the
+    # mysql collector moved from the `mysql` CLI to PyMySQL. A lower count
     # means sites went missing from the walk, not that the agent spawns less.
-    assert checked >= 30, checked
+    assert checked >= 29, checked
 
 
 def test_clean_env_pins_every_child_to_the_c_locale(monkeypatch):
