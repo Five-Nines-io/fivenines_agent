@@ -180,7 +180,9 @@ copied as `.env.system`, which the agent does not read: `/etc/fivenines_agent`
 belongs to the `fivenines` account, so review it, and rename it to `.env` if you
 need it. If the system agent's token is still there afterwards, or the move is
 interrupted before the uninstaller removed it, the move is undone and the
-system agent restarted; interrupted after, the script keeps the agent's identity
+system agent restarted (if the uninstaller had already removed its service,
+the script says so, and to run `--from-system` again to finish the move);
+interrupted after, the script keeps the agent's identity
 in your config directory and says how to start it. An `@reboot` line is added
 to your crontab, since the system agent started at boot. The
 sudoers rules `--with-sudoers` wrote go with the system installation; rules you
@@ -188,7 +190,9 @@ wrote yourself in `/etc/sudoers.d/fivenines` stay, naming a user that no longer
 exists, so remove them.
 
 Neither move runs on UNRAID. Both refuse, before changing anything, when the
-destination already has an installation: remove that one first.
+destination already has an installation, or a state file (`TOKEN`,
+`MACHINE_ID`...) an earlier one left there: remove that installation first,
+or move the file aside.
 
 ### Windows Installation
 
@@ -745,7 +749,8 @@ Releases older than v1.19.1 have no attestation, and `gh` reports
 
 The digest and signature layers apply to the same set of files: the agent
 tarball **and** the systemd unit, OpenRC init script and UNRAID boot script the
-installer puts in place as root.
+installer puts in place as root, plus the release's `fivenines_uninstall.sh`
+that `fivenines_setup_user.sh --from-system` runs as root.
 
 #### Installing a custom or pre-release build
 
@@ -775,7 +780,9 @@ startup definitions still come from the release and are still checked against
 the signed `SHA256SUMS`, so a pinned digest does not exempt that host from
 needing `openssl` -- pair it with `FIVENINES_ALLOW_UNSIGNED=1` on a minimal
 image. A user-level install has no startup definition to fetch, so a pinned
-digest is enough there.
+digest is enough there -- except `fivenines_setup_user.sh --from-system`,
+which also fetches the release's `fivenines_uninstall.sh` and checks it
+against the signed `SHA256SUMS` before running it as root.
 
 | Variable | Effect |
 |----------|--------|
@@ -960,7 +967,9 @@ or the agent's read of it is refused, which on Debian and Ubuntu mails root.
 Each rule is checked with the host's `visudo` on its own, and one this sudo
 rejects is left out with a warning rather than written. A `/etc/sudoers.d/fivenines` you wrote
 yourself is never touched: the installer marks its own with a first comment
-line, and `fivenines_uninstall.sh` removes only a marked one. smartctl is the
+line, and `fivenines_uninstall.sh` removes only a marked one. Each
+`--with-sudoers` run rewrites a marked file, and removes it when none of the
+four tools may get a rule any more. smartctl is the
 one tool left without an argument list: the agent's options and devices vary
 by drive. It runs no command and writes no file, but the rule lets the account
 change a drive's settings (`smartctl -s`, `--set`, or start a self-test with
