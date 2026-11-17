@@ -1,4 +1,5 @@
 import json
+import re
 import shutil
 import subprocess
 
@@ -298,6 +299,14 @@ NVME_ATTRIBUTE_NAMES = {
     'Critical Composite Temperature Time': 'critical_comp_time'
 }
 
+# The NVMe controllers `smartctl --scan` lists (it looks for /dev/nvme[0-9] and
+# /dev/nvme[1-9][0-9]): the only devices nvme-cli is given, and the shape the
+# --with-sudoers rule allows. A USB enclosure is /dev/sdX even when smartctl
+# reads its drive as NVMe through the bridge: nvme-cli cannot reach it, and sudo
+# would refuse the argv, which on Debian and Ubuntu mails root every collection.
+_NVME_CONTROLLER = re.compile(r"/dev/nvme(?:[0-9]|[1-9][0-9])")
+
+
 def _sudo_probe(args, timeout=5):
     """Run `sudo -n <args>` and return its stdout, or None.
 
@@ -498,7 +507,11 @@ def get_storage_info(device, nvme_available=lambda: False):
         # If it's an NVMe device and nvme-cli is available, get enhanced info.
         # The probe is memoized by the caller, so this runs `nvme version` at
         # most once per tick no matter how many NVMe devices are present.
-        if current_section == "nvme" and nvme_available():
+        if (
+            current_section == "nvme"
+            and _NVME_CONTROLLER.fullmatch(device)
+            and nvme_available()
+        ):
             nvme_info = get_nvme_enhanced_info(device)
             results.update(nvme_info)
 

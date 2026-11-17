@@ -902,15 +902,28 @@ For full monitoring capabilities, add the following to `/etc/sudoers.d/fivenines
 ```
 Defaults:fivenines always_set_home
 fivenines ALL=(ALL) NOPASSWD: /usr/sbin/smartctl
-fivenines ALL=(ALL) NOPASSWD: /sbin/mdadm --version, /sbin/mdadm --detail /dev/md[0-9], /sbin/mdadm --detail /dev/md[0-9][0-9], /sbin/mdadm --detail /dev/md[0-9][0-9][0-9]
+fivenines ALL=(ALL) NOPASSWD: /usr/sbin/nvme version
+fivenines ALL=(ALL) NOPASSWD: /usr/sbin/nvme smart-log /dev/nvme[0-9] -o json, /usr/sbin/nvme smart-log /dev/nvme[1-9][0-9] -o json
+fivenines ALL=(ALL) NOPASSWD: /sbin/mdadm --version
+fivenines ALL=(ALL) NOPASSWD: /sbin/mdadm --detail /dev/md[0-9], /sbin/mdadm --detail /dev/md[0-9][0-9], /sbin/mdadm --detail /dev/md[0-9][0-9][0-9]
 ```
 
-Two optional rules, only if you monitor these features:
+Optional, only if you monitor these features (fail2ban takes two lines, WireGuard one):
 
 ```
-fivenines ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client version, /usr/bin/fail2ban-client status, /usr/bin/fail2ban-client status *
+fivenines ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client version, /usr/bin/fail2ban-client status
+fivenines ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client status *
 fivenines ALL=(root) NOPASSWD:NOLOG_OUTPUT: /usr/bin/wg show all dump
 ```
+
+Every entry with a pattern (`[0-9]`, `*`) is on a line of its own. sudo-rs
+(the default sudo from Ubuntu 25.10) matches no `[0-9]` class, and its
+releases after 0.2.15 refuse a pattern in a command's arguments altogether,
+which makes its `visudo` reject the whole line. With sudo-rs, leave those
+lines out and list each device instead: `/sbin/mdadm --detail /dev/md0`,
+`/usr/sbin/nvme smart-log /dev/nvme0 -o json`, one more when a device
+appears. Without `fail2ban-client status *`, the agent reads the fail2ban
+summary but no jail.
 
 The `Defaults` line gives the commands the account runs through sudo root's
 `HOME`: `fail2ban-client` is a Python script, and where sudo keeps the
@@ -924,15 +937,22 @@ matches a `*` across argument boundaries, which is why the mdadm rule spells
 `/dev/md[0-9]` out three times instead of `--detail *`: that would also match
 `--detail /dev/md0 --stop /dev/md1`. It covers `md0` to `md999`, the kernel's
 names; an array the kernel names otherwise (`CREATE names=yes` in
-`mdadm.conf`) needs its own `--detail /dev/<name>` entry. sudo-rs (the
-default sudo from Ubuntu 25.10) matches no `[0-9]` class: there, list each
-array as `--detail /dev/md0` and so on, and add one when you create an array
-(`--with-sudoers` writes an exact entry for every array `/proc/mdstat` lists).
+`mdadm.conf`) needs its own `--detail /dev/<name>` entry.
+
+The nvme rule matters on a host with NVMe drives and `nvme-cli` installed:
+smartctl gives the agent each drive's identity and health verdict, while the
+wear, temperature, spare capacity, media errors and data written come from
+`nvme smart-log`. It names the two commands the agent runs, and nothing else:
+a rule for the bare command would let the account format, erase or reflash a
+drive. It covers `/dev/nvme0` to `/dev/nvme99`, the controllers smartctl
+lists. A drive in a USB enclosure is read through smartctl only: nvme-cli
+cannot reach it behind the bridge, so the agent never runs it there.
 
 An earlier version of this README gave the bare `/sbin/mdadm` and
-`/usr/bin/fail2ban-client` rules: if your sudoers files still have one,
-replace it with the rules above. The setup and update scripts warn while sudo
-still lists one for the `fivenines` account.
+`/usr/bin/fail2ban-client` rules, and the fivenines settings page
+`mdadm *`, `fail2ban-client *` and `nvme *`: if your sudoers files still have
+one, replace it with the rules above. The setup and update scripts warn while
+sudo still lists one for the `fivenines` account.
 
 The WireGuard rule pins the **exact command**, on purpose: `sudo` matches the
 full argument list, so this grants one read-only dump and denies `wg set` and
@@ -958,23 +978,25 @@ wget -T 3 -q -O fivenines_update.sh https://releases.fivenines.io/latest/fivenin
 ```
 
 It writes `/etc/sudoers.d/fivenines` with the rules above for each of
-smartctl, mdadm, fail2ban-client and wg installed on the host, naming the path
+smartctl, nvme, mdadm, fail2ban-client and wg installed on the host, naming the path
 sudo's usual `secure_path` finds (`/usr/local/sbin`, `/usr/local/bin`,
 `/usr/sbin`, `/usr/bin`, `/sbin`, `/bin`), and only for a tool that only root
 can change: the file, every directory above it, and every symbolic link on
-the way and its target, root's and writable by no one else. The mdadm rule
-also gets one exact `--detail /dev/<name>` entry for each array
-`/proc/mdstat` lists, whatever its name (`md0`, `md_d0`, `CREATE names=yes`).
-An array created later needs the command run again when its name is not
-`md0`-`md999`, and under sudo-rs whatever its name (sudo-rs matches no `[0-9]`
-class); otherwise the agent's read of it is refused, which on Debian and
-Ubuntu mails root.
-Each rule is checked with the host's `visudo` on its own, and one this sudo
-rejects is left out with a warning rather than written. A `/etc/sudoers.d/fivenines` you wrote
+the way and its target, root's and writable by no one else. The mdadm and
+nvme rules also get one exact entry for each array `/proc/mdstat` lists,
+whatever its name (`md0`, `md_d0`, `CREATE names=yes`), and for each
+controller `/sys/class/nvme` lists, on the line without patterns. An array
+created later needs the command run again when its name is not
+`md0`-`md999`, and under sudo-rs whatever its name, as does a controller
+under sudo-rs; otherwise the agent's read of it is refused, which on Debian
+and Ubuntu mails root.
+Each line is checked with the host's `visudo` on its own, and one this sudo
+rejects (a pattern line, under sudo-rs) is left out with a warning rather
+than written. A `/etc/sudoers.d/fivenines` you wrote
 yourself is never touched: the installer marks its own with a first comment
 line, and `fivenines_uninstall.sh` removes only a marked one. Each
 `--with-sudoers` run rewrites a marked file, and removes it when none of the
-four tools may get a rule any more. smartctl is the
+five tools may get a rule any more. smartctl is the
 one tool left without an argument list: the agent's options and devices vary
 by drive. It runs no command and writes no file, but the rule lets the account
 change a drive's settings (`smartctl -s`, `--set`, or start a self-test with

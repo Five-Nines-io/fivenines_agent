@@ -652,12 +652,17 @@ write_sudoers_rules() {
         print_warning "This host's visudo rejects '${sudoers_defaults}': not written."
     fi
     sudoers_rules=0
-    for sudoers_tool in smartctl mdadm fail2ban-client wg; do
+    for sudoers_tool in smartctl nvme mdadm fail2ban-client wg; do
         sudoers_path=$(sudoers_tool_path "$sudoers_tool") || continue
         # Each tool that can run code or change the host given other
         # arguments is held to the argv the agent runs. sudo matches a
         # wildcard across argument boundaries, so a pattern that must not
-        # reach a further argument has no '*'.
+        # reach a further argument has no '*'. Entries with a pattern ([0-9],
+        # *) go on a line of their own ($sudoers_patterns), checked alone:
+        # sudo-rs matches no [0-9] class, and refuses any pattern in a
+        # command's arguments since ad74f0a (after 0.2.15), so its visudo
+        # rejects that line, never the exact entries beside it.
+        sudoers_patterns=""
         case "$sudoers_tool" in
             mdadm)
                 # raid_storage.py: --version, and --detail on /dev/<name> for
@@ -672,7 +677,8 @@ write_sudoers_rules() {
                 # again. Every array listed gets its exact entry, md0 too:
                 # sudo-rs (Ubuntu 25.10 on) matches no [0-9] class, so there
                 # only the arrays listed now can be read.
-                sudoers_rule="fivenines ALL=(ALL) NOPASSWD: ${sudoers_path} --version, ${sudoers_path} --detail /dev/md[0-9], ${sudoers_path} --detail /dev/md[0-9][0-9], ${sudoers_path} --detail /dev/md[0-9][0-9][0-9]"
+                sudoers_rule="fivenines ALL=(ALL) NOPASSWD: ${sudoers_path} --version"
+                sudoers_patterns="fivenines ALL=(ALL) NOPASSWD: ${sudoers_path} --detail /dev/md[0-9], ${sudoers_path} --detail /dev/md[0-9][0-9], ${sudoers_path} --detail /dev/md[0-9][0-9][0-9]"
                 # One array name per line, never a space (awk prints the first
                 # field), so the words are the names.
                 # shellcheck disable=SC2013
@@ -686,11 +692,31 @@ write_sudoers_rules() {
                     esac
                 done
                 ;;
+            nvme)
+                # smart_storage.py: version (its probe), and smart-log as JSON
+                # on each NVMe controller smartctl --scan lists, which it looks
+                # for as /dev/nvme[0-9] and /dev/nvme[1-9][0-9]. A bare rule
+                # allows format, sanitize and firmware commands, which erase or
+                # reflash a drive. Every controller the kernel lists gets its
+                # exact entry too: sudo-rs matches no [0-9] class, so there one
+                # added later needs this run again.
+                sudoers_rule="fivenines ALL=(ALL) NOPASSWD: ${sudoers_path} version"
+                sudoers_patterns="fivenines ALL=(ALL) NOPASSWD: ${sudoers_path} smart-log /dev/nvme[0-9] -o json, ${sudoers_path} smart-log /dev/nvme[1-9][0-9] -o json"
+                for sudoers_nvme in /sys/class/nvme/nvme*; do
+                    sudoers_nvme=${sudoers_nvme##*/}
+                    case "$sudoers_nvme" in
+                        nvme[0-9] | nvme[1-9][0-9])
+                            sudoers_rule="${sudoers_rule}, ${sudoers_path} smart-log /dev/${sudoers_nvme} -o json"
+                            ;;
+                    esac
+                done
+                ;;
             fail2ban-client)
                 # fail2ban.py: version, status, status JAIL. A bare rule allows
                 # "set JAIL action ... actionban CMD", which runs CMD as root;
                 # anything after status only reaches the read-only status.
-                sudoers_rule="fivenines ALL=(ALL) NOPASSWD: ${sudoers_path} version, ${sudoers_path} status, ${sudoers_path} status *"
+                sudoers_rule="fivenines ALL=(ALL) NOPASSWD: ${sudoers_path} version, ${sudoers_path} status"
+                sudoers_patterns="fivenines ALL=(ALL) NOPASSWD: ${sudoers_path} status *"
                 ;;
             wg)
                 # The exact argv wireguard.py runs, never wg alone, which would
@@ -706,20 +732,23 @@ write_sudoers_rules() {
                 sudoers_rule="fivenines ALL=(ALL) NOPASSWD: ${sudoers_path}"
                 ;;
         esac
-        rm -f "$sudoers_one"
-        printf '%s\n' "$sudoers_rule" > "$sudoers_one" && chmod 440 "$sudoers_one"
-        if visudo -cf "$sudoers_one" > /dev/null 2>&1; then
-            printf '%s\n' "$sudoers_rule" >> "$sudoers_staged"
-            sudoers_rules=$((sudoers_rules + 1))
-            print_success "sudoers rule: ${sudoers_rule}"
-        else
-            print_warning "This host's visudo rejects '${sudoers_rule}': not written."
-        fi
+        for sudoers_line in "$sudoers_rule" "$sudoers_patterns"; do
+            [ -n "$sudoers_line" ] || continue
+            rm -f "$sudoers_one"
+            printf '%s\n' "$sudoers_line" > "$sudoers_one" && chmod 440 "$sudoers_one"
+            if visudo -cf "$sudoers_one" > /dev/null 2>&1; then
+                printf '%s\n' "$sudoers_line" >> "$sudoers_staged"
+                sudoers_rules=$((sudoers_rules + 1))
+                print_success "sudoers rule: ${sudoers_line}"
+            else
+                print_warning "This host's visudo rejects '${sudoers_line}': not written."
+            fi
+        done
     done
     rm -f "$sudoers_one"
 
     if [ "$sudoers_rules" -eq 0 ]; then
-        print_warning "--with-sudoers: none of smartctl, mdadm, fail2ban-client or wg is usable here, so no rule was written."
+        print_warning "--with-sudoers: none of smartctl, nvme, mdadm, fail2ban-client or wg is usable here, so no rule was written."
         rm -f "$sudoers_staged"
         # An earlier run's file would keep granting a tool this run refused
         # (one that anyone but root can now change): it goes too.
@@ -767,26 +796,29 @@ write_sudoers_rules() {
 }
 
 # An earlier README gave the fivenines account bare mdadm and fail2ban-client
-# rules, which let it run code as root (mdadm --monitor --program,
-# fail2ban-client set JAIL action ...). Said at every install and update while
-# sudo still lists one; the operator's sudoers files are never edited.
+# rules, and the fivenines settings page gave "mdadm *", "fail2ban-client *"
+# and "nvme *": the first two let it run code as root (mdadm --monitor
+# --program, fail2ban-client set JAIL action ...), nvme format, erase or
+# reflash a drive. Said at every install and update while sudo still lists
+# one; the operator's sudoers files are never edited.
 warn_unpinned_sudoers_rules() {
     command -v sudo > /dev/null 2>&1 || return 0
     id fivenines > /dev/null 2>&1 || return 0
     # sudo -l -U lists each rule's commands after its tags, comma-separated:
-    # one item per line, a bare one is a path with nothing after it. Run once
-    # the agent is back: a sudoers backend that hangs (sssd, LDAP) delays only
-    # the end of the script, and timeout bounds it where there is one.
+    # one item per line, an unpinned one is a path with nothing or a lone "*"
+    # after it (sudo's "*" matches any arguments). Run once the agent is back:
+    # a sudoers backend that hangs (sssd, LDAP) delays only the end of the
+    # script, and timeout bounds it where there is one.
     unpinned_rules=$( { if command -v timeout > /dev/null 2>&1; then
             timeout 10 sudo -n -l -U fivenines
         else
             sudo -n -l -U fivenines
         fi; } 2>/dev/null \
         | awk '{ n = split($0, item, ", "); for (i = 1; i <= n; i++) print item[i] }' \
-        | grep -oE '(^|: )/[^ ,]*/(mdadm|fail2ban-client)[[:space:]]*$' \
-        | sed 's/^: //; s/[[:space:]]*$//' | sort -u | tr '\n' ' ')
+        | grep -oE '(^|: )/[^ ,]*/(mdadm|fail2ban-client|nvme)( \*)?[[:space:]]*$' \
+        | sed 's/^: //; s/[[:space:]]*$//; s/ \*$//' | sort -u | tr '\n' ' ')
     if [ -n "$unpinned_rules" ]; then
-        print_warning "sudo lets the fivenines account run ${unpinned_rules}with any arguments (a rule from an earlier version of the README): that lets it run code as root. Replace it with the rules of the README's Full Monitoring section, which name the commands the agent runs, or remove it and re-run with --with-sudoers."
+        print_warning "sudo lets the fivenines account run ${unpinned_rules}with any arguments (a rule from an earlier version of the README or of the fivenines settings page): with mdadm or fail2ban-client that is running code as root, with nvme formatting, erasing or reflashing a drive. Replace it with the rules of the README's Full Monitoring section, which name the commands the agent runs, or remove it and re-run with --with-sudoers."
     fi
     return 0
 }

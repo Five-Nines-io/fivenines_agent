@@ -364,9 +364,9 @@ def test_health_probes_nvme_availability_once_for_multi_nvme(monkeypatch):
 def test_health_no_nvme_section_never_probes(monkeypatch):
     """REGRESSION: devices whose PARSED output is ATA never probe nvme-cli.
 
-    This is the exact-equivalence guard: gating is by parsed current_section,
-    not the device path, so an NVMe device under an exotic name would still be
-    enriched (and an ATA device never triggers a probe).
+    Gating needs the parsed current_section to be NVMe (and, since the nvme
+    sudoers rule, the device to be an NVMe controller): an ATA device never
+    triggers a probe.
     """
     monkeypatch.setattr(
         smart_storage, "list_storage_devices", lambda: ["/dev/sda", "/dev/sdb"]
@@ -527,6 +527,62 @@ def test_get_storage_info_honors_nvme_available_flag(monkeypatch):
     assert res2["critical_warning"] == 12
 
 
+def test_get_storage_info_needs_an_nvme_section_on_an_nvme_controller(monkeypatch):
+    """Both conditions hold the nvme-cli read: a /dev/nvmeN whose smartctl
+    output is not NVMe (ATA, or no SMART section) is never enriched."""
+    monkeypatch.setattr(
+        smart_storage.subprocess, "run", lambda *_a, **_k: _ata_smartctl_proc()
+    )
+    monkeypatch.setattr(
+        smart_storage, "calculate_percentage_used", lambda *_a, **_k: None
+    )
+    enhanced = mock.Mock(return_value={"percent_used": 5})
+    monkeypatch.setattr(smart_storage, "get_nvme_enhanced_info", enhanced)
+    nvme_available = mock.Mock(return_value=True)
+
+    res = smart_storage.get_storage_info("/dev/nvme0", nvme_available=nvme_available)
+
+    assert res["device_type"] == "ata"
+    enhanced.assert_not_called()
+    nvme_available.assert_not_called()
+
+
+def test_get_storage_info_never_runs_nvme_cli_on_a_usb_enclosure(monkeypatch):
+    """A USB enclosure smartctl reads as NVMe through its bridge is /dev/sdX:
+    nvme-cli is neither probed nor run on it (it cannot reach the drive, and
+    the sudoers rule names only /dev/nvmeN, so sudo would refuse the argv and
+    mail root every collection); smartctl's fields are still reported."""
+    monkeypatch.setattr(
+        smart_storage.subprocess,
+        "run",
+        lambda *_a, **_k: _proc(
+            stdout=(
+                "=== START OF SMART DATA SECTION ===\n"
+                "SMART overall-health self-assessment test result: PASSED\n"
+                "Critical Warning: 0x00\n"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        smart_storage, "calculate_percentage_used", lambda *_a, **_k: None
+    )
+    enhanced = mock.Mock(return_value={"percent_used": 5})
+    monkeypatch.setattr(smart_storage, "get_nvme_enhanced_info", enhanced)
+    nvme_available = mock.Mock(return_value=True)
+
+    for device in ("/dev/sdb", "/dev/nvme0n1", "/dev/nvme100"):
+        res = smart_storage.get_storage_info(device, nvme_available=nvme_available)
+        assert res["device_type"] == "nvme"
+        assert res["smart_overall_health"] == "PASSED"
+        assert "percent_used" not in res
+    enhanced.assert_not_called()
+    nvme_available.assert_not_called()
+
+    res = smart_storage.get_storage_info("/dev/nvme12", nvme_available=nvme_available)
+    enhanced.assert_called_once_with("/dev/nvme12")
+    assert res["percent_used"] == 5
+
+
 # --- data-path timeouts (a wedged drive must not stall the loop) ----------
 
 
@@ -599,31 +655,6 @@ def test_data_path_degrades_on_timeout(monkeypatch):
     assert smart_storage.get_storage_info("/dev/sda") is None
     assert smart_storage.get_storage_identification("/dev/sda") is None
     assert smart_storage.get_nvme_enhanced_info("/dev/nvme0") == {}
-
-
-def test_get_storage_info_gates_on_parsed_section_not_device_path(monkeypatch):
-    """Enrichment is gated on PARSED output (current_section), NOT the device path.
-
-    A device whose path is not /dev/nvme* but whose smartctl output parses as
-    NVMe must still be enriched. This pins the exact-equivalence choice: the
-    health path deliberately does NOT use the is_nvme_device path heuristic here
-    (only identification does, because `smartctl -i` has no SMART section).
-    """
-    monkeypatch.setattr(
-        smart_storage.subprocess, "run", lambda *_a, **_k: _nvme_smartctl_proc()
-    )
-    monkeypatch.setattr(
-        smart_storage, "calculate_percentage_used", lambda *_a, **_k: None
-    )
-    enhanced = mock.Mock(return_value={"percent_used": 9})
-    monkeypatch.setattr(smart_storage, "get_nvme_enhanced_info", enhanced)
-
-    # Non-/dev/nvme path, but the parsed SMART section is NVMe.
-    res = smart_storage.get_storage_info("/dev/sda", nvme_available=lambda: True)
-
-    enhanced.assert_called_once_with("/dev/sda")  # gated on section, not path
-    assert res["device_type"] == "nvme"
-    assert res["percent_used"] == 9
 
 
 def test_sudo_probe_passes_timeout(monkeypatch):
