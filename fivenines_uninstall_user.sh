@@ -115,14 +115,10 @@ if printf '%s\n' "$CRON_ENTRIES" | grep -qF -e "$START_SPELLING_1" -e "$START_SP
     print_success "Crontab entry removed"
 fi
 
-# Remove installation directory
-if [ -d "$INSTALL_DIR" ]; then
-    echo "Removing installation directory..."
-    rm -rf "$INSTALL_DIR"
-    print_success "Removed $INSTALL_DIR"
-else
-    print_warning "Installation directory not found: $INSTALL_DIR"
-fi
+# Remove installation directory (it holds start.sh, checked above)
+echo "Removing installation directory..."
+rm -rf "$INSTALL_DIR"
+print_success "Removed $INSTALL_DIR"
 
 # Remove config directory
 if [ -d "$CONFIG_DIR" ]; then

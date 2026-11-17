@@ -585,9 +585,10 @@ done
 # fivenines_uninstall.sh (Test 8) removes /etc/fivenines_agent and the
 # fivenines user through sudo, so on an image where sudo could not be
 # installed (an EOL image whose mirrors are gone) they are still there, and
-# --from-user would rightly refuse to replace an existing system install. This
-# container is thrown away: clear what Test 8 could not.
-if [ -e "$SYSTEM_CONFIG_DIR/TOKEN" ] && [ "$(id -u)" = "0" ]; then
+# --from-user would rightly refuse to replace an existing system install (or
+# any state file it left). This container is thrown away: clear what Test 8
+# could not.
+if [ -e "$SYSTEM_CONFIG_DIR" ] && [ "$(id -u)" = "0" ]; then
   rm -rf "${SYSTEM_CONFIG_DIR:?}" /opt/fivenines
   userdel -r fivenines > /dev/null 2>&1 || deluser fivenines > /dev/null 2>&1 || true
 fi

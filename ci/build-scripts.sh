@@ -44,7 +44,7 @@ verification_preflight verify_from_manifest verify_agent_tarball"
 # have no business installing a service at all. The --with-sudoers helpers
 # are system-only for the same reason: they write a root-read sudoers file.
 SYSTEM_FUNCTIONS="install_verified_release_file root_only_path root_only_chain sudoers_tool_path \
-write_sudoers_rules"
+write_sudoers_rules warn_unpinned_sudoers_rules"
 
 ALL_SCRIPTS="$SCRIPT_DIR/fivenines_setup.sh \
 $SCRIPT_DIR/fivenines_update.sh \

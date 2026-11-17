@@ -412,7 +412,9 @@ verify_from_manifest() {
 # shellcheck disable=SC2120
 verification_preflight() {
     # "$1" is "with-startup-files" when the caller also installs a startup
-    # definition (the two SYSTEM scripts). Those always go through the signed
+    # definition (the two SYSTEM scripts), or runs one of the release's
+    # scripts as root (fivenines_setup_user.sh --from-system and its
+    # fivenines_uninstall.sh). Those always go through the signed
     # manifest -- install_verified_release_file ignores FIVENINES_AGENT_SHA256,
     # which pins the TARBALL only -- so a pinned digest does not exempt them,
     # or the preflight would pass and the refusal would land after the agent
@@ -681,11 +683,14 @@ agent_pattern() {
 # these scripts so an existing installation gets them; never start.sh, which
 # carries the config directory the installation was made with.
 write_control_scripts() {
-    control_log="$INSTALL_DIR/agent.log"
-    control_pattern=$(agent_pattern "$INSTALL_DIR")
+    # Every path goes into the scripts single-quoted, its own single quotes
+    # written as '\'', so a directory name of any spelling stays one word.
+    control_dir="'$(printf '%s' "$INSTALL_DIR" | sed "s/'/'\\\\''/g")'"
+    control_log="'$(printf '%s' "$INSTALL_DIR/agent.log" | sed "s/'/'\\\\''/g")'"
+    control_pattern="'$(agent_pattern "$INSTALL_DIR" | sed "s/'/'\\\\''/g")'"
     control_find=$(cat << EOF
-PIDS=\$(pgrep -f '$control_pattern' 2>/dev/null)
-AGENT_PID=\$(cat "$INSTALL_DIR/agent.pid" 2>/dev/null)
+PIDS=\$(pgrep -f $control_pattern 2>/dev/null)
+AGENT_PID=\$(cat $control_dir/agent.pid 2>/dev/null)
 case "\$AGENT_PID" in
     ''|*[!0-9]*) ;;
     *)
@@ -704,7 +709,7 @@ EOF
 #!/bin/bash
 # Stop the Fivenines agent: every process running this installation's agent.
 $control_find
-rm -f "$INSTALL_DIR/agent.pid"
+rm -f $control_dir/agent.pid
 if [ -n "\$PIDS" ] && kill \$PIDS 2>/dev/null; then
     echo "Agent stopped (PID: \$PIDS)"
 else
@@ -720,10 +725,10 @@ EOF
 $control_find
 if [ -n "\$PIDS" ]; then
     echo "Agent is running (PID: \$PIDS)"
-    echo "Log file: $control_log"
+    echo "Log file: "$control_log
     echo ""
     echo "Last 10 log lines:"
-    tail -10 "$control_log" 2>/dev/null || echo "(no log yet)"
+    tail -10 $control_log 2>/dev/null || echo "(no log yet)"
 else
     echo "Agent is not running"
 fi
@@ -734,7 +739,7 @@ EOF
     cat > "$INSTALL_DIR/logs.sh" << EOF
 #!/bin/bash
 # View Fivenines agent logs
-tail -f "$control_log"
+tail -f $control_log
 EOF
     chmod +x "$INSTALL_DIR/logs.sh"
     print_success "Created logs.sh"
@@ -875,7 +880,8 @@ STATE_FILES="TOKEN MACHINE_ID last_capture_id journal_units.allow"
 # each image is scanned once again.
 SYSTEM_ENV_COPY=".env.system"
 # What this run wrote into the user's config directory, all of it taken back
-# when the move is undone (and nothing that was there before).
+# when the move is undone (nothing was there before: the preflight refuses
+# one).
 COPIED_STATE_FILES=""
 # A state file is a few KB at most: anything bigger is not one.
 STATE_FILE_MAX=16777216
@@ -931,6 +937,20 @@ preflight_system_takeover() {
     if [ -e "$CONFIG_DIR/TOKEN" ] || [ -L "$CONFIG_DIR/TOKEN" ]; then
         exit_with_error "$CONFIG_DIR/TOKEN exists: this user already has a user-level installation. If an earlier --from-system stopped once the system installation was removed, that TOKEN is the agent's identity: start it with $INSTALL_DIR/start.sh. Otherwise remove it first with fivenines_uninstall_user.sh."
     fi
+    # An installation here with its config elsewhere (FIVENINES_CONFIG_DIR):
+    # its agent would be replaced while it runs, and the move start a second.
+    # A start.sh for this config directory, with no TOKEN there, starts no
+    # agent: what an earlier --from-system left when it was undone.
+    if { [ -e "$INSTALL_DIR/start.sh" ] || [ -L "$INSTALL_DIR/start.sh" ]; } \
+        && ! grep -qxF "export CONFIG_DIR=\"$CONFIG_DIR\"" "$INSTALL_DIR/start.sh" 2>/dev/null; then
+        exit_with_error "$INSTALL_DIR/start.sh exists, for another config directory: this user already has a user-level installation there. Remove it first with fivenines_uninstall_user.sh (with the FIVENINES_INSTALL_DIR and FIVENINES_CONFIG_DIR it was installed with)."
+    fi
+    # Any other state file would be replaced, and deleted if the move is undone.
+    for state_file in $STATE_FILES "$SYSTEM_ENV_COPY"; do
+        if [ -e "$CONFIG_DIR/$state_file" ] || [ -L "$CONFIG_DIR/$state_file" ]; then
+            exit_with_error "$CONFIG_DIR/$state_file exists, left by an earlier installation: the move would replace it, and delete it if undone. Move it aside and re-run."
+        fi
+    done
     if ! command -v sudo > /dev/null 2>&1; then
         exit_with_error "--from-system needs sudo, to read, stop and remove the system installation."
     fi
@@ -1037,12 +1057,22 @@ restart_system_agent() {
     if [ "${FIVENINES_TEST_MODE:-}" = "1" ]; then
         return 0
     fi
+    restart_rc=0
     as_root '
         if [ -f /etc/systemd/system/fivenines-agent.service ] && command -v systemctl > /dev/null 2>&1; then
             systemctl start fivenines-agent.service
         elif [ -f /etc/init.d/fivenines-agent ] && command -v rc-service > /dev/null 2>&1; then
             rc-service fivenines-agent start
-        fi' || print_warning "Could not start the system agent again: sudo systemctl start fivenines-agent (or rc-service fivenines-agent start)"
+        else
+            exit 3
+        fi' || restart_rc=$?
+    case "$restart_rc" in
+        0) ;;
+        # fivenines_uninstall.sh removes the service definition before the
+        # TOKEN: cut between the two, it leaves an identity no service starts.
+        3) print_warning "The system agent was not started again: its service definition is gone, while its TOKEN is still in $SYSTEM_CONFIG_DIR. Finish removing it with fivenines_uninstall.sh (as root), then re-run --from-system." ;;
+        *) print_warning "Could not start the system agent again: sudo systemctl start fivenines-agent (or rc-service fivenines-agent start)" ;;
+    esac
 }
 
 # A move that fails, or is interrupted, between the system agent's stop and
@@ -1126,6 +1156,10 @@ take_over_system_install() {
         && as_root 'pgrep -f "^/opt/fivenines/" > /dev/null 2>&1'; then
         exit_with_error "The system agent still runs. Stop and disable it (sudo systemctl disable fivenines-agent; sudo systemctl stop fivenines-agent), then start this one with $INSTALL_DIR/start.sh, and add '@reboot $INSTALL_DIR/start.sh' to your crontab (crontab -e). Its identity is in $CONFIG_DIR."
     fi
+    # The system installation is gone: what is left (start the agent, add its
+    # @reboot line) takes seconds, and cut halfway it would leave an agent
+    # running with no boot entry, and a message saying to start it again.
+    trap '' INT TERM HUP
     echo ""
 }
 
@@ -1139,7 +1173,9 @@ add_reboot_entry() {
     fi
     reboot_entries=$(crontab -l 2>/dev/null || true)
     start_spellings "$INSTALL_DIR" "$HOME"
-    if printf '%s\n' "$reboot_entries" | grep -qF -e "$START_SPELLING_1" -e "$START_SPELLING_2" \
+    # A line commented out starts nothing.
+    if printf '%s\n' "$reboot_entries" | grep -v '^[[:space:]]*#' \
+        | grep -qF -e "$START_SPELLING_1" -e "$START_SPELLING_2" \
         -e "$START_SPELLING_3" -e "$START_SPELLING_4"; then
         print_success "Your crontab already starts the agent at boot"
         return 0
@@ -1240,7 +1276,7 @@ REBOOT_ENTRY_ADDED=0
 if [ "$FROM_SYSTEM" = "1" ] && add_reboot_entry; then
     REBOOT_ENTRY_ADDED=1
 fi
-# --from-system armed it in take_over_system_install: the move is complete.
+# --from-system set it in take_over_system_install: the move is complete.
 trap - INT TERM HUP
 print_final_instructions
 

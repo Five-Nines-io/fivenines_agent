@@ -911,8 +911,12 @@ matches a `*` across argument boundaries, which is why the mdadm rule spells
 `/dev/md[0-9]` out three times instead of `--detail *`: that would also match
 `--detail /dev/md0 --stop /dev/md1`. It covers `md0` to `md999`, the kernel's
 names; an array the kernel names otherwise (`CREATE names=yes` in
-`mdadm.conf`) needs its own `--detail /dev/<name>` entry. Rules written for an
-earlier agent with the bare commands keep working.
+`mdadm.conf`) needs its own `--detail /dev/<name>` entry.
+
+An earlier version of this README gave the bare `/sbin/mdadm` and
+`/usr/bin/fail2ban-client` rules: if your sudoers files still have one,
+replace it with the rules above. The setup and update scripts warn while sudo
+still lists one for the `fivenines` account.
 
 The WireGuard rule pins the **exact command**, on purpose: `sudo` matches the
 full argument list, so this grants one read-only dump and denies `wg set` and

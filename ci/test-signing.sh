@@ -635,7 +635,7 @@ check "fivenines_update.sh writes the sudoers rules before it restarts the agent
 check "fivenines_setup.sh --from-user: checks, stop, state, sudoers rules, service, then removal" \
   "$(in_order "$ROOT/fivenines_setup.sh" 'Testing connectivity...' '    stop_user_agent ||' '  import_user_state ||' '  write_sudoers_rules || SUDOERS_SKIPPED=1' '      setup_systemd' '  remove_user_installation')" "yes"
 check "fivenines_update_user.sh rewrites its control scripts before it stops the agent" \
-  "$(in_order "$ROOT/fivenines_update_user.sh" '  write_control_scripts' 'echo "Stopping agent..."')" "yes"
+  "$(in_order "$ROOT/fivenines_update_user.sh" 'write_control_scripts || exit_with_error' 'echo "Stopping agent..."')" "yes"
 # The $INSTALL_DIR in the pattern is the literal text of a redirection.
 # shellcheck disable=SC2016
 check "fivenines_update_user.sh never writes start.sh" \
@@ -881,15 +881,18 @@ chmod 755 "$MOVE/svcbin/systemctl"
 sed "s|/etc/systemd/system/|$MOVE/units/|g;s|\"^/opt/fivenines/\"|\"^$MOVE/opt/\"|g" \
   "$MOVE/takeover.sh" > "$MOVE/takeover_stop.sh"
 # Runs take_over_system_install outside test mode; $1 is fail, signal or
-# nothing, for the stop. Prints its status.
+# nothing, for the stop, or after, for a TERM once it returned; $2 is the
+# uninstaller's body (default: it removes the TOKEN and the unit). Prints its
+# status.
 from_system_stop() {
   rm -rf "$MOVE/cfg" "$MOVE/stage" "$MOVE/units"
   mkdir -p "$MOVE/cfg" "$MOVE/stage" "$MOVE/units"
   : > "$MOVE/svc.log"
   : > "$MOVE/units/fivenines-agent.service"
   printf 'per-host-token-0001' > "$MOVE/sys/TOKEN"
-  printf '%s\n' "rm -f '$MOVE/sys/TOKEN' '$MOVE/units/fivenines-agent.service'" \
-    > "$MOVE/stage/fivenines_uninstall.sh"
+  _uninstaller="rm -f '$MOVE/sys/TOKEN' '$MOVE/units/fivenines-agent.service'"
+  if [ -n "${2:-}" ]; then _uninstaller=$2; fi
+  printf '%s\n' "$_uninstaller" > "$MOVE/stage/fivenines_uninstall.sh"
   (
     # shellcheck source=/dev/null
     . "$MOVE/takeover_stop.sh"
@@ -908,6 +911,10 @@ from_system_stop() {
     MOVE_RUNNER=$(sh -c 'echo "$PPID"')
     export MOVE_RUNNER
     take_over_system_install > "$MOVE/out" 2>&1
+    if [ "$1" = after ]; then
+      kill -TERM "$MOVE_RUNNER"
+      echo "survived" >> "$MOVE/out"
+    fi
   )
   echo "$?"
 }
@@ -917,7 +924,55 @@ check "--from-system moves nothing when the system agent's stop fails" \
 check "--from-system ignores a signal during the system agent's stop, and completes the move" \
   "$(from_system_stop signal)|$(cat "$MOVE/cfg/TOKEN" 2>/dev/null)|$(test -e "$MOVE/sys/TOKEN" && echo kept)|$(tr '\n' '|' < "$MOVE/svc.log")" \
   "0|per-host-token-0001||systemctl stop fivenines-agent.service|"
+# Value: protects=once the system installation is gone, a signal cannot cut the start of the moved agent or its @reboot line, nor print a message saying to start it a second time;
+#   fails_when=take_over_system_install returns with the abort trap still armed;
+#   why_new=the checks above signal before the uninstaller ran; seam=none; no_claim=start_agent itself (skipped here)
+check "--from-system ignores a signal once the system installation is gone" \
+  "$(from_system_stop after)|$(grep -c '^survived$' "$MOVE/out")|$(grep -c 'Stopped after' "$MOVE/out")" "0|1|0"
+# Value: protects=an uninstaller that removed the unit but not the TOKEN leaves the copy taken back and a warning that the system agent was not started again;
+#   fails_when=restart_system_agent goes back to an if/elif that succeeds when neither service definition exists;
+#   why_new=the other checks keep the unit or remove both; seam=as above; no_claim=the OpenRC branch
+check "--from-system says the system agent is not started again once its unit is gone" \
+  "$(from_system_stop "" "rm -f '$MOVE/units/fivenines-agent.service'")|$(grep -c 'its service definition is gone' "$MOVE/out")|$(move_names "$MOVE/cfg")|$(cat "$MOVE/sys/TOKEN")" \
+  "1|1||per-host-token-0001"
 rm -rf "$MOVE/units"
+
+# --from-system preflight: an installation, or any state file, already in
+# this user's directories is refused before anything changes.
+# Value: protects=--from-system never overwrites a user-level start.sh or state file, nor deletes one when it is undone;
+#   fails_when=the preflight goes back to checking only CONFIG_DIR/TOKEN, or refuses the start.sh an undone move left for this config directory;
+#   why_new=no test ran the preflight's refusals; seam=none; no_claim=the sudo and verification steps after them
+sed -n '/^STATE_FILES=/p;/^SYSTEM_ENV_COPY=/p;/^exit_with_error()/,/^}/p;/^preflight_system_takeover()/,/^}/p' \
+  "$ROOT/fivenines_setup_user.sh" > "$MOVE/presys.sh"
+# Runs the preflight with FILE ($1, under the install or config directory)
+# holding the line $2, and prints its status, whether it refused FILE, and
+# whether it went on to sudo (a stub that fails).
+from_system_preflight() {
+  rm -rf "$MOVE/pinst" "$MOVE/pcfg"
+  mkdir -p "$MOVE/pinst" "$MOVE/pcfg"
+  printf '%s\n' "${2:-}" > "$MOVE/$1"
+  (
+    # shellcheck source=/dev/null
+    . "$MOVE/presys.sh"
+    # Called by the preflight once its refusals passed.
+    # shellcheck disable=SC2317,SC2329
+    sudo() { return 1; }
+    INSTALL_DIR="$MOVE/pinst"
+    CONFIG_DIR="$MOVE/pcfg"
+    preflight_system_takeover > "$MOVE/out" 2>&1
+  )
+  printf '%s|%s|%s' "$?" "$(grep -c "$MOVE/$1 exists" "$MOVE/out")" "$(grep -c 'sudo did not authenticate' "$MOVE/out")"
+}
+if [ "$(id -u)" != "0" ]; then
+  check "--from-system refuses a start.sh for another config directory" \
+    "$(from_system_preflight pinst/start.sh 'export CONFIG_DIR="/elsewhere"')" "1|1|0"
+  check "--from-system goes on over the start.sh an undone move left" \
+    "$(from_system_preflight pinst/start.sh "export CONFIG_DIR=\"$MOVE/pcfg\"")" "1|0|1"
+  check "--from-system refuses a MACHINE_ID already in its config directory" \
+    "$(from_system_preflight pcfg/MACHINE_ID)" "1|1|0"
+  check "--from-system refuses a .env.system already in its config directory" \
+    "$(from_system_preflight pcfg/.env.system)" "1|1|0"
+fi
 
 # --from-user: rollback_user_takeover outside test mode, as exit_with_contact
 # runs it when the import or the service failed, signalled again during the
@@ -956,6 +1011,88 @@ _rc=$?
 check "--from-user rolls back what it installed, then the service, then restarts the user-level agent, through a second signal" \
   "$_rc|$(move_names "$MOVE/etc")|$(tr '\n' '|' < "$MOVE/svc.log")|$(grep -c 'runs again, unchanged' "$MOVE/out")" \
   "0|.env last_capture_id |systemctl stop fivenines-agent.service|systemctl disable fivenines-agent.service|start.sh||1"
+
+# --from-user: exit_with_contact, the exit of every failure, rolls the move
+# back once the user-level agent was stopped.
+# Value: protects=a failure after the user-level agent stopped puts it back;
+#   fails_when=exit_with_contact stops calling rollback_user_takeover when TAKEOVER_ROLLBACK=1, or calls it before;
+#   why_new=the check above calls rollback_user_takeover directly; seam=rollback_user_takeover is a stub here; no_claim=what it does
+sed -n '/^exit_with_contact()/,/^}/p' "$ROOT/fivenines_setup.sh" > "$MOVE/ewc.sh"
+ewc_run() {
+  (
+    # shellcheck source=/dev/null
+    . "$MOVE/ewc.sh"
+    # Called through exit_with_contact.
+    # shellcheck disable=SC2317,SC2329
+    rollback_user_takeover() { echo "rolled back"; }
+    TAKEOVER_ROLLBACK=$1
+    exit_with_contact "failed"
+  ) 2>&1 | grep -c '^rolled back$'
+}
+check "a --from-user failure rolls back once the user-level agent was stopped, and only then" \
+  "$(ewc_run 1)|$(ewc_run 0)" "1|0"
+
+# --from-user: import_user_state outside test mode, through the su stub (it
+# prints a PAM line first), with /etc/fivenines_agent rewritten to a scratch
+# directory and chown stubbed: a test that is not root cannot give a file away.
+# Value: protects=--from-user writes the user's state with the directory root's alone, gives it back, records each file before writing it so a rollback takes back a TOKEN whose chown failed, and refuses a symlinked or empty state file;
+#   fails_when=IMPORTED_STATE_FILES is appended after the writes again, the directory is not made root-only around them or not given back, or a symlink or an empty TOKEN is carried;
+#   why_new=the harness and test-distro import only plain files through a real chown; seam=/etc/fivenines_agent rewritten, chown stubbed;
+#   no_claim=that the files end up owned by fivenines, or the ownership semantics a real chown enforces
+sed -n '/^STATE_FILES=/p;/^STATE_FILE_MAX=/p;/^as_user()/,/^}/p;/^decode_state()/,/^}/p
+        /^import_user_state()/,/^}/p;/^rollback_user_takeover()/,/^}/p' "$ROOT/fivenines_setup.sh" \
+  | sed "s|/etc/fivenines_agent|$MOVE/etc2|g" > "$MOVE/import.sh"
+mkdir -p "$MOVE/chownbin" "$MOVE/iuc"
+cat > "$MOVE/chownbin/chown" << EOF
+#!/bin/sh
+echo "chown \$*" >> "$MOVE/chown.log"
+[ "\$2" != "\${MOVE_CHOWN_FAILS:-}" ]
+EOF
+chmod 755 "$MOVE/chownbin/chown"
+# Runs import_user_state from $MOVE/iuc into an empty $MOVE/etc2, and the
+# rollback when it fails; a chown of $1 fails. Prints its status.
+from_user_import() {
+  rm -rf "$MOVE/etc2" "$MOVE/istage"
+  mkdir -p "$MOVE/etc2" "$MOVE/istage"
+  : > "$MOVE/chown.log"
+  (
+    # shellcheck source=/dev/null
+    . "$MOVE/import.sh"
+    FIVENINES_TEST_MODE=1
+    FROM_USER_NAME=alice
+    USER_CONFIG_DIR="$MOVE/iuc"
+    USER_INSTALL_DIR="$MOVE/rbinst"
+    WORK_DIR="$MOVE/istage"
+    IMPORTED_STATE_FILES=""
+    MOVE_CHOWN_FAILS="${1:-}"
+    export MOVE_CHOWN_FAILS
+    # The chown stub, for this run only.
+    # shellcheck disable=SC2030,SC2031
+    PATH="$MOVE/chownbin:$PATH"
+    import_user_state > "$MOVE/out" 2>&1 || rollback_user_takeover >> "$MOVE/out" 2>&1
+  )
+  echo "$?"
+}
+printf 'per-host-token-0001' > "$MOVE/iuc/TOKEN"
+printf '0b5e2d5c-6f1a-4c3e-9d2b-7a8f1e4c5d6a\n' > "$MOVE/iuc/MACHINE_ID"
+printf 'nginx\n' > "$MOVE/iuc/journal_units.allow"
+_rc=$(from_user_import)
+check "--from-user writes the user's state with the directory root's alone, then gives it back" \
+  "$_rc|$(move_names "$MOVE/etc2")|$(cat "$MOVE/etc2/TOKEN")|$(head -n 1 "$MOVE/chown.log")|$(tail -n 1 "$MOVE/chown.log")|$(move_mode "$MOVE/etc2")" \
+  "0|MACHINE_ID TOKEN journal_units.allow |per-host-token-0001|chown 0:0 $MOVE/etc2|chown fivenines:fivenines $MOVE/etc2|750"
+check "--from-user takes back a TOKEN whose chown failed, and gives the directory back" \
+  "$(from_user_import "$MOVE/etc2/TOKEN")|$(move_names "$MOVE/etc2")|$(move_mode "$MOVE/etc2")|$(grep -c 'Could not install' "$MOVE/out")" \
+  "0||750|1"
+mv "$MOVE/iuc/journal_units.allow" "$MOVE/iuc.allow"
+ln -s "$MOVE/iuc.allow" "$MOVE/iuc/journal_units.allow"
+check "--from-user stops at a symlinked allowlist, and carries nothing" \
+  "$(from_user_import)|$(move_names "$MOVE/etc2")|$(grep -c 'journal_units.allow is not a regular file' "$MOVE/out")" \
+  "0||1"
+rm -f "$MOVE/iuc/journal_units.allow"
+: > "$MOVE/iuc/TOKEN"
+check "--from-user stops at an empty TOKEN, and carries nothing" \
+  "$(from_user_import)|$(move_names "$MOVE/etc2")|$(grep -c 'TOKEN is empty' "$MOVE/out")" \
+  "0||1"
 
 # --from-user: remove_user_installation, as fivenines_setup.sh runs it once
 # the service started, on an installation whose directories hold other files.
@@ -1039,6 +1176,8 @@ check "--from-system adds its @reboot line after the user's own" \
 # shellcheck disable=SC2016
 check "--from-system adds no second line for a start.sh the crontab already runs" \
   "$(reboot_entry '@reboot ${HOME}/.local/fivenines/start.sh')" '0|@reboot ${HOME}/.local/fivenines/start.sh|'
+check "--from-system adds its line when the crontab has it only commented out" \
+  "$(reboot_entry '#@reboot ~/.local/fivenines/start.sh')" "0|#@reboot ~/.local/fivenines/start.sh|@reboot $MOVE_HOME/.local/fivenines/start.sh|"
 
 # fivenines_uninstall_user.sh, run whole from a scratch copy (it deletes
 # itself) and confirmed with y, on an installation under a scratch HOME.
@@ -1084,12 +1223,13 @@ check "fivenines_uninstall_user.sh stops its agent with an anchored pattern only
 
 # The control scripts write_control_scripts generates (fivenines_setup_user.sh,
 # and fivenines_update_user.sh over an existing installation), run against a
-# fake agent in a directory whose name holds a space, a + and a dot, beside
-# what an unanchored or unescaped pattern would also have matched: the same
-# agent in "inst aab.c" (+ unescaped) and "inst a+bxc" (. unescaped), and a
-# tail -f of a file in the agent's own directory (no anchor).
+# fake agent in a directory whose name holds a space, a +, a dot, both quotes
+# and a dollar sign, beside what an unanchored or unescaped pattern would also
+# have matched: the same agent where the + reads as "a" (+ unescaped) and
+# where the dot reads as "x" (. unescaped), and a tail -f of a file in the
+# agent's own directory (no anchor).
 # Value: protects=stop.sh, status.sh and refresh.sh act only on the agent run from their own install dir, whatever its path holds;
-#   fails_when=the scripts match the binary name anywhere again, the pattern loses its anchor or an escape, or its quoting breaks on a space;
+#   fails_when=the scripts match the binary name anywhere again, the pattern loses its anchor or an escape, or its quoting breaks on a space or a quote;
 #   why_new=no repo test runs the control scripts: test-distro checks only the update's exit code and the TOKEN; seam=none;
 #   no_claim=start.sh, or stop.sh's fallback to agent.pid on a host without pgrep
 if [ -z "$REAL_PGREP" ] || ! command -v bash > /dev/null 2>&1 || ! command -v ps > /dev/null 2>&1; then
@@ -1129,7 +1269,7 @@ else
   move_alive() {
     kill -0 "$1" 2> /dev/null && [ "$(ps -o stat= -p "$1" 2>/dev/null | cut -c1)" != "Z" ]
   }
-  CTL_DIR="$MOVE/inst a+b.c"
+  CTL_DIR="$MOVE/inst a+b.c o'b\"\$x"
   : > "$MOVE/refused"
   (
     # shellcheck source=/dev/null
@@ -1139,8 +1279,8 @@ else
     write_control_scripts > /dev/null
   )
   MOVE_AGENT=$(move_start agent "$CTL_DIR")
-  MOVE_TWIN=$(move_start agent "$MOVE/inst aab.c")
-  MOVE_ODD=$(move_start agent "$MOVE/inst a+bxc")
+  MOVE_TWIN=$(move_start agent "$MOVE/inst aab.c o'b\"\$x")
+  MOVE_ODD=$(move_start agent "$MOVE/inst a+bxc o'b\"\$x")
   MOVE_DECOY=$(move_start tail "$CTL_DIR/fivenines-agent-linux-amd64/agent.log")
   MOVE_PIDS="$MOVE_AGENT $MOVE_TWIN $MOVE_ODD $MOVE_DECOY"
   check "status.sh finds its own agent" \
@@ -1246,6 +1386,76 @@ fi
 
 PATH=$MOVE_SAVED_PATH
 fi
+
+# --with-sudoers: write_sudoers_rules's entries for the md arrays
+# /proc/mdstat lists under other names than md0-md999, with /proc/mdstat,
+# /etc/sudoers and /etc/sudoers.d rewritten to scratch files.
+# Value: protects=an md array named with a dash or a dot gets its exact --detail entry, a name with a character a rule cannot carry gets none;
+#   fails_when=the name check goes back to [A-Za-z0-9_] only, or lets a comma or a wildcard into a rule;
+#   why_new=no test image has an md array; seam=paths rewritten, visudo, chown and sudoers_tool_path overridden;
+#   no_claim=that a real visudo accepts the entries (test-sudo-mail checks the md0-md999 ones)
+SUD="$WORK/sudoers-md"
+mkdir -p "$SUD/sudoers.d" "$SUD/work"
+printf '%s\n' 'Personalities : [raid1]' 'md0 : active raid1 sdb1[1] sda1[0]' \
+  'md_data-1 : active raid1 sdd1[1] sdc1[0]' 'md_home.0 : active raid1 sdf1[1] sde1[0]' \
+  'md_a,b : active raid1 sdh1[1] sdg1[0]' 'unused devices: <none>' > "$SUD/mdstat"
+: > "$SUD/sudoers"
+sed -n '/^write_sudoers_rules()/,/^}/p' "$ROOT/fivenines_common.sh" \
+  | sed "s|/proc/mdstat|$SUD/mdstat|g; s|/etc/sudoers.d|$SUD/sudoers.d|g; s|/etc/sudoers|$SUD/sudoers|g" \
+  > "$SUD/write.sh"
+# Runs the rewritten write_sudoers_rules, mdadm the only tool found.
+md_rules_run() {
+  (
+    # shellcheck source=/dev/null
+    . "$SUD/write.sh"
+    # Called by write_sudoers_rules.
+    # shellcheck disable=SC2317,SC2329
+    sudoers_tool_path() { [ "$1" = mdadm ] && echo /sbin/mdadm; }
+    # shellcheck disable=SC2317,SC2329
+    visudo() { return 0; }
+    # shellcheck disable=SC2317,SC2329
+    chown() { return 0; }
+    WORK_DIR="$SUD/work"
+    write_sudoers_rules > "$SUD/out" 2>&1
+  )
+}
+md_rules_run
+check "--with-sudoers gives an md array named with a dash or a dot its exact --detail entry, and none to a name with a comma" \
+  "$(grep '^fivenines' "$SUD/sudoers.d/fivenines" 2>/dev/null | grep -o ', /sbin/mdadm --detail /dev/md_[^,]*' | tr '\n' '|')|$(grep -c 'No sudoers entry for /dev/md_a,b' "$SUD/out")" \
+  ", /sbin/mdadm --detail /dev/md_data-1|, /sbin/mdadm --detail /dev/md_home.0||1"
+
+# warn_unpinned_sudoers_rules, over a fixed sudo -l -U listing.
+# Value: protects=a bare mdadm or fail2ban-client rule sudo lists for the fivenines account is named at every install and update, a pinned one never;
+#   fails_when=a bare item at the end of a line or before a comma is missed, or an item with arguments is named;
+#   why_new=new function; seam=sudo and id overridden; no_claim=real sudo's listing format (ci/test-sudo-mail.sh checks it)
+sed -n '/^warn_unpinned_sudoers_rules()/,/^}/p' "$ROOT/fivenines_common.sh" > "$SUD/unpinned.sh"
+# Prints what warn_unpinned_sudoers_rules says over the listing in $1.
+unpinned_run() {
+  _listing=$1
+  (
+    # shellcheck source=/dev/null
+    . "$SUD/unpinned.sh"
+    # Called by warn_unpinned_sudoers_rules.
+    # shellcheck disable=SC2317,SC2329
+    sudo() {
+      printf '%s\n' 'Matching Defaults entries for fivenines on host:' \
+        '    env_reset, mail_badpass, secure_path=/usr/local/sbin\:/usr/sbin\:/sbin' '' \
+        'User fivenines may run the following commands on host:'
+      cat "$_listing"
+    }
+    # shellcheck disable=SC2317,SC2329
+    id() { return 0; }
+    warn_unpinned_sudoers_rules
+  ) 2>&1
+}
+printf '%s\n' '    (ALL) NOPASSWD: /usr/sbin/smartctl' '    (ALL) NOPASSWD: /sbin/mdadm' \
+  '    (ALL) NOPASSWD: /usr/sbin/smartctl, /usr/bin/fail2ban-client ' > "$SUD/bare"
+printf '%s\n' '    (ALL) NOPASSWD: /usr/sbin/smartctl' \
+  '    (ALL) NOPASSWD: /sbin/mdadm --version, /sbin/mdadm --detail /dev/md[0-9], /sbin/mdadm --detail /dev/md_data-1' \
+  '    (ALL) NOPASSWD: /usr/bin/fail2ban-client version, /usr/bin/fail2ban-client status, /usr/bin/fail2ban-client status *' \
+  '    (root) NOPASSWD: NOLOG_OUTPUT: /usr/bin/wg show all dump' > "$SUD/pinned"
+check "the bare mdadm and fail2ban-client rules sudo lists are named, the pinned ones are not" \
+  "$(unpinned_run "$SUD/bare" | grep -c 'run /sbin/mdadm /usr/bin/fail2ban-client with any arguments')|$(unpinned_run "$SUD/pinned")" "1|"
 
 # --with-sudoers: the paths a rule may name (fivenines_common.sh, held to its
 # copies in fivenines_setup.sh and fivenines_update.sh by ci/build-scripts.sh).

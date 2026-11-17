@@ -358,7 +358,9 @@ verify_from_manifest() {
 # shellcheck disable=SC2120
 verification_preflight() {
     # "$1" is "with-startup-files" when the caller also installs a startup
-    # definition (the two SYSTEM scripts). Those always go through the signed
+    # definition (the two SYSTEM scripts), or runs one of the release's
+    # scripts as root (fivenines_setup_user.sh --from-system and its
+    # fivenines_uninstall.sh). Those always go through the signed
     # manifest -- install_verified_release_file ignores FIVENINES_AGENT_SHA256,
     # which pins the TARBALL only -- so a pinned digest does not exempt them,
     # or the preflight would pass and the refusal would land after the agent
@@ -556,11 +558,14 @@ agent_pattern() {
 # these scripts so an existing installation gets them; never start.sh, which
 # carries the config directory the installation was made with.
 write_control_scripts() {
-    control_log="$INSTALL_DIR/agent.log"
-    control_pattern=$(agent_pattern "$INSTALL_DIR")
+    # Every path goes into the scripts single-quoted, its own single quotes
+    # written as '\'', so a directory name of any spelling stays one word.
+    control_dir="'$(printf '%s' "$INSTALL_DIR" | sed "s/'/'\\\\''/g")'"
+    control_log="'$(printf '%s' "$INSTALL_DIR/agent.log" | sed "s/'/'\\\\''/g")'"
+    control_pattern="'$(agent_pattern "$INSTALL_DIR" | sed "s/'/'\\\\''/g")'"
     control_find=$(cat << EOF
-PIDS=\$(pgrep -f '$control_pattern' 2>/dev/null)
-AGENT_PID=\$(cat "$INSTALL_DIR/agent.pid" 2>/dev/null)
+PIDS=\$(pgrep -f $control_pattern 2>/dev/null)
+AGENT_PID=\$(cat $control_dir/agent.pid 2>/dev/null)
 case "\$AGENT_PID" in
     ''|*[!0-9]*) ;;
     *)
@@ -579,7 +584,7 @@ EOF
 #!/bin/bash
 # Stop the Fivenines agent: every process running this installation's agent.
 $control_find
-rm -f "$INSTALL_DIR/agent.pid"
+rm -f $control_dir/agent.pid
 if [ -n "\$PIDS" ] && kill \$PIDS 2>/dev/null; then
     echo "Agent stopped (PID: \$PIDS)"
 else
@@ -595,10 +600,10 @@ EOF
 $control_find
 if [ -n "\$PIDS" ]; then
     echo "Agent is running (PID: \$PIDS)"
-    echo "Log file: $control_log"
+    echo "Log file: "$control_log
     echo ""
     echo "Last 10 log lines:"
-    tail -10 "$control_log" 2>/dev/null || echo "(no log yet)"
+    tail -10 $control_log 2>/dev/null || echo "(no log yet)"
 else
     echo "Agent is not running"
 fi
@@ -609,7 +614,7 @@ EOF
     cat > "$INSTALL_DIR/logs.sh" << EOF
 #!/bin/bash
 # View Fivenines agent logs
-tail -f "$control_log"
+tail -f $control_log
 EOF
     chmod +x "$INSTALL_DIR/logs.sh"
     print_success "Created logs.sh"
@@ -631,18 +636,12 @@ EOF
 # The installation's own control scripts are rewritten first, so this update
 # stops the agent with the current stop.sh, and an installation made before
 # they found the agent by its path gets them (start.sh is left as it is).
-if [ -d "$INSTALL_DIR" ]; then
-  write_control_scripts
-fi
+write_control_scripts || exit_with_error "Could not rewrite the control scripts in $INSTALL_DIR."
 
 # Stop the agent if running (skip in test mode)
 if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
   echo "Stopping agent..."
-  if [ -f "$INSTALL_DIR/stop.sh" ]; then
-      "$INSTALL_DIR/stop.sh" 2>/dev/null || true
-  else
-      pkill -f "$(agent_pattern "$INSTALL_DIR")" 2>/dev/null || true
-  fi
+  "$INSTALL_DIR/stop.sh" 2>/dev/null || true
   sleep 1
   print_success "Agent stopped"
 else

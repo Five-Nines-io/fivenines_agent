@@ -309,6 +309,31 @@ else
   done
   IFS=$old_ifs
 fi
+# warn_unpinned_sudoers_rules (fivenines_common.sh), over this sudo's own
+# sudo -l -U listing: the pinned rules above are never named, the bare rules
+# an earlier README gave are.
+unpinned() {
+  ( . /src/fivenines_common.sh; warn_unpinned_sudoers_rules ) 2>&1
+}
+out=$(unpinned)
+if [ -z "$out" ]; then echo "    ok   no bare-rule warning for the pinned rules"
+else echo "    FAIL a bare-rule warning for the pinned rules: $out"; fail=1; fi
+printf '%s\n' 'fivenines ALL=(ALL) NOPASSWD: /usr/sbin/mdadm' \
+  'fivenines ALL=(ALL) NOPASSWD: /usr/sbin/smartctl, /usr/bin/fail2ban-client' > /etc/sudoers.d/fivenines-bare
+chmod 440 /etc/sudoers.d/fivenines-bare
+out=$(unpinned)
+case "$out" in
+  *"run /usr/bin/fail2ban-client /usr/sbin/mdadm with any arguments"*)
+    echo "    ok   the bare mdadm and fail2ban-client rules are named" ;;
+  *)
+    if [ "$flavor" = sudo-rs ] && [ -z "$out" ]; then
+      echo "    info this sudo lists no other user's rules (sudo -l -U): no bare-rule warning"
+    else
+      echo "    FAIL the bare rules are not named: '$out'"; fail=1
+    fi
+    ;;
+esac
+rm -f /etc/sudoers.d/fivenines-bare
 clear_mails
 
 exit "$fail"

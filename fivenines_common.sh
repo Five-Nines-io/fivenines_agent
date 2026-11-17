@@ -319,7 +319,9 @@ verify_from_manifest() {
 # shellcheck disable=SC2120
 verification_preflight() {
     # "$1" is "with-startup-files" when the caller also installs a startup
-    # definition (the two SYSTEM scripts). Those always go through the signed
+    # definition (the two SYSTEM scripts), or runs one of the release's
+    # scripts as root (fivenines_setup_user.sh --from-system and its
+    # fivenines_uninstall.sh). Those always go through the signed
     # manifest -- install_verified_release_file ignores FIVENINES_AGENT_SHA256,
     # which pins the TARBALL only -- so a pinned digest does not exempt them,
     # or the preflight would pass and the refusal would land after the agent
@@ -628,7 +630,8 @@ write_sudoers_rules() {
                 for sudoers_md in $(awk '/^md/ { print $1 }' /proc/mdstat 2>/dev/null); do
                     case "$sudoers_md" in
                         md[0-9] | md[0-9][0-9] | md[0-9][0-9][0-9]) ;;
-                        *[!A-Za-z0-9_]*)
+                        # A dash and a dot need no escaping in a rule.
+                        *[!A-Za-z0-9_.-]* | . | ..)
                             print_warning "No sudoers entry for /dev/${sudoers_md}: its name holds a character a rule cannot carry as is."
                             ;;
                         *) sudoers_rule="${sudoers_rule}, ${sudoers_path} --detail /dev/${sudoers_md}" ;;
@@ -702,6 +705,24 @@ write_sudoers_rules() {
     print_success "Wrote ${sudoers_file} (${sudoers_rules} rule(s))"
     if ! grep -Eq '^[[:space:]]*[#@]includedir[[:space:]]+/etc/sudoers\.d/?[[:space:]]*$' /etc/sudoers 2>/dev/null; then
         print_warning "/etc/sudoers has no includedir line for /etc/sudoers.d: sudo ignores ${sudoers_file} until it does."
+    fi
+    return 0
+}
+
+# An earlier README gave the fivenines account bare mdadm and fail2ban-client
+# rules, which let it run code as root (mdadm --monitor --program,
+# fail2ban-client set JAIL action ...). Said at every install and update while
+# sudo still lists one; the operator's sudoers files are never edited.
+warn_unpinned_sudoers_rules() {
+    command -v sudo > /dev/null 2>&1 || return 0
+    id fivenines > /dev/null 2>&1 || return 0
+    # sudo -l -U lists each rule's commands after its tags, comma-separated:
+    # a bare one is a path followed by a comma or the end of the line.
+    unpinned_rules=$(sudo -n -l -U fivenines 2>/dev/null \
+        | grep -oE '(: |, )/[^ ,]*/(mdadm|fail2ban-client)(,|[[:space:]]*$)' \
+        | sed 's/^[:,] //; s/[,[:space:]]*$//' | sort -u | tr '\n' ' ')
+    if [ -n "$unpinned_rules" ]; then
+        print_warning "sudo lets the fivenines account run ${unpinned_rules}with any arguments (a rule from an earlier version of the README): that lets it run code as root. Replace it with the rules of the README's Full Monitoring section, which name the commands the agent runs, or remove it and re-run with --with-sudoers."
     fi
     return 0
 }
