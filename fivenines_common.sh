@@ -717,10 +717,17 @@ warn_unpinned_sudoers_rules() {
     command -v sudo > /dev/null 2>&1 || return 0
     id fivenines > /dev/null 2>&1 || return 0
     # sudo -l -U lists each rule's commands after its tags, comma-separated:
-    # a bare one is a path followed by a comma or the end of the line.
-    unpinned_rules=$(sudo -n -l -U fivenines 2>/dev/null \
-        | grep -oE '(: |, )/[^ ,]*/(mdadm|fail2ban-client)(,|[[:space:]]*$)' \
-        | sed 's/^[:,] //; s/[,[:space:]]*$//' | sort -u | tr '\n' ' ')
+    # one item per line, a bare one is a path with nothing after it. Run once
+    # the agent is back: a sudoers backend that hangs (sssd, LDAP) delays only
+    # the end of the script, and timeout bounds it where there is one.
+    unpinned_rules=$( { if command -v timeout > /dev/null 2>&1; then
+            timeout 10 sudo -n -l -U fivenines
+        else
+            sudo -n -l -U fivenines
+        fi; } 2>/dev/null \
+        | awk '{ n = split($0, item, ", "); for (i = 1; i <= n; i++) print item[i] }' \
+        | grep -oE '(^|: )/[^ ,]*/(mdadm|fail2ban-client)[[:space:]]*$' \
+        | sed 's/^: //; s/[[:space:]]*$//' | sort -u | tr '\n' ' ')
     if [ -n "$unpinned_rules" ]; then
         print_warning "sudo lets the fivenines account run ${unpinned_rules}with any arguments (a rule from an earlier version of the README): that lets it run code as root. Replace it with the rules of the README's Full Monitoring section, which name the commands the agent runs, or remove it and re-run with --with-sudoers."
     fi

@@ -635,7 +635,11 @@ check "fivenines_update.sh writes the sudoers rules before it restarts the agent
 check "fivenines_setup.sh --from-user: checks, stop, state, sudoers rules, service, then removal" \
   "$(in_order "$ROOT/fivenines_setup.sh" 'Testing connectivity...' '    stop_user_agent ||' '  import_user_state ||' '  write_sudoers_rules || SUDOERS_SKIPPED=1' '      setup_systemd' '  remove_user_installation')" "yes"
 check "fivenines_update_user.sh rewrites its control scripts before it stops the agent" \
-  "$(in_order "$ROOT/fivenines_update_user.sh" 'write_control_scripts || exit_with_error' 'echo "Stopping agent..."')" "yes"
+  "$(in_order "$ROOT/fivenines_update_user.sh" 'print_success "Created refresh.sh"' 'write_control_scripts' 'echo "Stopping agent..."')" "yes"
+# In an AND-OR list (|| exit_with_error, || true) set -e would no longer stop
+# the update at a control script it failed to write.
+check "fivenines_update_user.sh calls write_control_scripts as a plain command, under set -e" \
+  "$(grep -cx 'write_control_scripts' "$ROOT/fivenines_update_user.sh")" "1"
 # The $INSTALL_DIR in the pattern is the literal text of a redirection.
 # shellcheck disable=SC2016
 check "fivenines_update_user.sh never writes start.sh" \
@@ -929,12 +933,12 @@ check "--from-system ignores a signal during the system agent's stop, and comple
 #   why_new=the checks above signal before the uninstaller ran; seam=none; no_claim=start_agent itself (skipped here)
 check "--from-system ignores a signal once the system installation is gone" \
   "$(from_system_stop after)|$(grep -c '^survived$' "$MOVE/out")|$(grep -c 'Stopped after' "$MOVE/out")" "0|1|0"
-# Value: protects=an uninstaller that removed the unit but not the TOKEN leaves the copy taken back and a warning that the system agent was not started again;
-#   fails_when=restart_system_agent goes back to an if/elif that succeeds when neither service definition exists;
+# Value: protects=an uninstaller that removed the unit but not the TOKEN leaves the copy taken back and a warning that the system agent was not started again, which says to re-run the move, never to remove the system installation (it holds the only TOKEN left);
+#   fails_when=restart_system_agent goes back to an if/elif that succeeds when neither service definition exists, or its advice names the uninstaller;
 #   why_new=the other checks keep the unit or remove both; seam=as above; no_claim=the OpenRC branch
 check "--from-system says the system agent is not started again once its unit is gone" \
-  "$(from_system_stop "" "rm -f '$MOVE/units/fivenines-agent.service'")|$(grep -c 'its service definition is gone' "$MOVE/out")|$(move_names "$MOVE/cfg")|$(cat "$MOVE/sys/TOKEN")" \
-  "1|1||per-host-token-0001"
+  "$(from_system_stop "" "rm -f '$MOVE/units/fivenines-agent.service'")|$(grep 'its service definition is gone' "$MOVE/out" | grep -c 'Re-run --from-system')|$(grep 'its service definition is gone' "$MOVE/out" | grep -c 'uninstall')|$(move_names "$MOVE/cfg")|$(cat "$MOVE/sys/TOKEN")" \
+  "1|1|0||per-host-token-0001"
 rm -rf "$MOVE/units"
 
 # --from-system preflight: an installation, or any state file, already in
@@ -1426,7 +1430,7 @@ check "--with-sudoers gives an md array named with a dash or a dot its exact --d
 
 # warn_unpinned_sudoers_rules, over a fixed sudo -l -U listing.
 # Value: protects=a bare mdadm or fail2ban-client rule sudo lists for the fivenines account is named at every install and update, a pinned one never;
-#   fails_when=a bare item at the end of a line or before a comma is missed, or an item with arguments is named;
+#   fails_when=a bare item at the end of a line, before a comma or right after another bare one is missed, or an item with arguments is named;
 #   why_new=new function; seam=sudo and id overridden; no_claim=real sudo's listing format (ci/test-sudo-mail.sh checks it)
 sed -n '/^warn_unpinned_sudoers_rules()/,/^}/p' "$ROOT/fivenines_common.sh" > "$SUD/unpinned.sh"
 # Prints what warn_unpinned_sudoers_rules says over the listing in $1.
@@ -1445,17 +1449,21 @@ unpinned_run() {
     }
     # shellcheck disable=SC2317,SC2329
     id() { return 0; }
+    # timeout runs the sudo above, not a sudo binary.
+    # shellcheck disable=SC2317,SC2329
+    timeout() { shift; "$@"; }
     warn_unpinned_sudoers_rules
   ) 2>&1
 }
 printf '%s\n' '    (ALL) NOPASSWD: /usr/sbin/smartctl' '    (ALL) NOPASSWD: /sbin/mdadm' \
   '    (ALL) NOPASSWD: /usr/sbin/smartctl, /usr/bin/fail2ban-client ' > "$SUD/bare"
+printf '%s\n' '    (ALL) NOPASSWD: /sbin/mdadm, /usr/bin/fail2ban-client' > "$SUD/adjacent"
 printf '%s\n' '    (ALL) NOPASSWD: /usr/sbin/smartctl' \
   '    (ALL) NOPASSWD: /sbin/mdadm --version, /sbin/mdadm --detail /dev/md[0-9], /sbin/mdadm --detail /dev/md_data-1' \
   '    (ALL) NOPASSWD: /usr/bin/fail2ban-client version, /usr/bin/fail2ban-client status, /usr/bin/fail2ban-client status *' \
   '    (root) NOPASSWD: NOLOG_OUTPUT: /usr/bin/wg show all dump' > "$SUD/pinned"
 check "the bare mdadm and fail2ban-client rules sudo lists are named, the pinned ones are not" \
-  "$(unpinned_run "$SUD/bare" | grep -c 'run /sbin/mdadm /usr/bin/fail2ban-client with any arguments')|$(unpinned_run "$SUD/pinned")" "1|"
+  "$(unpinned_run "$SUD/bare" | grep -c 'run /sbin/mdadm /usr/bin/fail2ban-client with any arguments')|$(unpinned_run "$SUD/adjacent" | grep -c 'run /sbin/mdadm /usr/bin/fail2ban-client with any arguments')|$(unpinned_run "$SUD/pinned")" "1|1|"
 
 # --with-sudoers: the paths a rule may name (fivenines_common.sh, held to its
 # copies in fivenines_setup.sh and fivenines_update.sh by ci/build-scripts.sh).

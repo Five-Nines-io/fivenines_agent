@@ -636,7 +636,8 @@ EOF
 # The installation's own control scripts are rewritten first, so this update
 # stops the agent with the current stop.sh, and an installation made before
 # they found the agent by its path gets them (start.sh is left as it is).
-write_control_scripts || exit_with_error "Could not rewrite the control scripts in $INSTALL_DIR."
+# A plain call: under set -e a failed write ends the update before the stop.
+write_control_scripts
 
 # Stop the agent if running (skip in test mode)
 if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then

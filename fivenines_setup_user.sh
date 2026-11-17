@@ -1070,7 +1070,7 @@ restart_system_agent() {
         0) ;;
         # fivenines_uninstall.sh removes the service definition before the
         # TOKEN: cut between the two, it leaves an identity no service starts.
-        3) print_warning "The system agent was not started again: its service definition is gone, while its TOKEN is still in $SYSTEM_CONFIG_DIR. Finish removing it with fivenines_uninstall.sh (as root), then re-run --from-system." ;;
+        3) print_warning "The system agent was not started again: its service definition is gone, while its TOKEN is still in $SYSTEM_CONFIG_DIR. Re-run --from-system to finish the move: it carries that TOKEN over again (removing the system installation first would lose it)." ;;
         *) print_warning "Could not start the system agent again: sudo systemctl start fivenines-agent (or rc-service fivenines-agent start)" ;;
     esac
 }
