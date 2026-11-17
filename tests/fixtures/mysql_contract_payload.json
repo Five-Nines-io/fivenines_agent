@@ -3,8 +3,11 @@
   "agent_min_version": "1.15.0",
   "_agent_min_version_note": "MINOR bump: Galera adds a new user-facing capability (cluster-state gauges + the server-side galera_cluster_degraded trigger). Released main is 1.13.1; the only PRs pushed above it are 1.14.0 (Docker image-inventory #102) and 1.14.1 (TSDB #103), so 1.15.0 is the next free minor. MySQL has NO server version gate (no FEATURES_SUPPORTED_VERSIONS entry -- it is purely config-driven, mysql_enabled defaults false), so nothing gates on this number; it exists only to date the payload.",
   "galera_contract": "The Galera keys are the whitelisted subset of SHOW GLOBAL STATUS LIKE 'wsrep%', merged into the SAME data['mysql'] object as the base metrics (no new payload object, no new config). Galera detection: the agent reads the global wsrep_on variable with max_connections/version and sends the wsrep statement only when it is ON; otherwise every wsrep_* key is simply ABSENT (no-data server-side, not null). A plain MariaDB answers the wsrep statement too (see scenario mariadb_without_galera): agents up to 1.24.0 shipped its 'Disconnected' cluster of size 0, which the server must not read as a degraded cluster. The reachable payload therefore carries 'galera' (agent 1.24.1+): true on a Galera node, false otherwise; ABSENT when the variables could not be read (unknown, like an older agent). The server clears any Galera state it stored for the host on galera false (a plain MariaDB an older agent reported), and keeps it on galera true without wsrep_* keys (a Galera node whose wsrep statement failed this tick) and when the key is absent. The galera_healthy and galera_degraded payloads were checked against a real 3-node MariaDB 11.8.9 cluster (healthy; then two nodes SIGKILLed: non-Primary, size 1, local state 0/Initialized, ready OFF, connected ON). The keys are likewise ABSENT when the reachability envelope reports unreachable/config_error -- the probe fails before the wsrep statement runs, so the payload is envelope-only. Never fabricate: a wsrep_* numeric that fails to parse (NULL / garbage), a non-finite float (inf/nan/overflow -- these would serialize as invalid Infinity/NaN JSON and poison the whole tick), and a present-but-blank status string are all OMITTED, not sent as null or empty. Every shipped float is therefore finite. All values are instantaneous gauges/status -- nothing to rate; ints/floats are parsed to native types, non-blank status strings ship verbatim. Same absent-vs-null discipline as the rest of the reachable/error envelope from #488.",
+  "replication_contract": "Since agent 1.24.2 (#304), data['mysql']['replication'] is a LIST, one entry per replication channel, sorted by channel name: {channel, lag_seconds, io_running, sql_running, running}. channel is MySQL's Channel_Name or MariaDB's Connection_name ('' = the default channel, and the only one of a server without channels; at most 64 characters, NUL removed); lag_seconds is Seconds_Behind_Source/_Master (int, null when the server reports NULL, i.e. a thread stopped; MySQL reports 0 for a channel whose IO thread is still connecting, measured, so health is `running`, not the lag); io_running/sql_running are the threads' 'Yes' (a 'Connecting' IO thread is false); running is both. At most 256 channels (MySQL's own limit); the agent's 1 MB read cap per connection can bound them first, since MySQL repeats the server-wide Executed_Gtid_Set in every channel row: a GTID replica with many channels or source UUIDs then reads with is_replica and replication ABSENT (the agent logs the read-cap error), never a short list. Agents up to 1.24.1 shipped ONE object of the same keys without channel, built from the LAST channel listed on MySQL and from the default connection alone on MariaDB (its plain statement lists no other; with only named connections it listed none, so the agent reported is_replica false): the server must keep reading that object for older agents. A server that only reads the object sees no replication series from a newer agent, so the server change ships first. Statements: the first of SHOW ALL REPLICAS STATUS, SHOW ALL SLAVES STATUS, SHOW REPLICA STATUS, SHOW SLAVE STATUS that answers, on every server: MariaDB lists every connection with the SHOW ALL forms (10.5.1+, 10.0+), MySQL every channel with SHOW REPLICA STATUS (SHOW SLAVE STATUS before 8.0.22; removed in 8.4), MariaDB 5.5 (no multi-source) answers SHOW SLAVE STATUS only. A failure other than a syntax error (a missing privilege, an interrupted statement) leaves is_replica and replication ABSENT for that tick, never a shorter list. Checked against real MySQL 8.4.10 and MariaDB 10.11.19 replicas with three channels (scenarios multi_source_replica and mariadb_multi_source_replica). Group Replication's own channels are never listed: on a 2-member MySQL 8.4.10 group SHOW REPLICA STATUS returned no row in any of 14 states (primary, secondary, recovering, stopped, restarted; measured), so a GR member that has no ordinary channel reads is_replica false (not measured on 8.0).",
   "field_contract": {
-    "_base": "reachable/connections/queries/slow_queries/aborted_connects/uptime/innodb_buffer_pool_hit_ratio/innodb_buffer_pool_usage_pct/max_connections/version/is_replica/replication are the pre-#107 MySQL payload (PR #88); unchanged here and included so the round-trip pins the WHOLE data['mysql'] object, not just the Galera delta.",
+    "_base": "reachable/connections/queries/slow_queries/aborted_connects/uptime/innodb_buffer_pool_hit_ratio/innodb_buffer_pool_usage_pct/max_connections/version/is_replica are the pre-#107 MySQL payload (PR #88); unchanged here and included so the round-trip pins the WHOLE data['mysql'] object, not just the Galera delta. replication changed shape with #304, see replication_contract.",
+    "is_replica": "Whether the replication-status statement listed at least one channel (bool). ABSENT when that statement could not be read (the account lacks REPLICATION CLIENT on MySQL, SLAVE MONITOR on MariaDB 10.5.9+): unknown, keep what is stored.",
+    "replication": "Present only when is_replica is true: a LIST with one entry per replication channel, sorted by channel (see replication_contract). Absent on a replica listing more than 256 channels (is_replica true, no list: never a short one).",
     "galera": "Whether the server is a Galera node: its global wsrep_on variable read ON (bool, agent 1.24.1+). false = not a Galera node: clear any stored Galera state. Absent = the variables could not be read, or an older agent: unknown, keep what is stored. Never present on the unreachable envelope.",
     "wsrep_cluster_size": "wsrep_cluster_size -- number of nodes in the component this node sees (int). A drop below the configured size is the split-brain / lost-quorum signal.",
     "wsrep_cluster_status": "wsrep_cluster_status verbatim -- 'Primary' when the node is in the primary component; anything else ('non-Primary', 'Disconnected') means it cannot serve writes. Drives galera_cluster_degraded server-side.",
@@ -23,7 +26,7 @@
       "results": {
         "SHOW GLOBAL STATUS": {"columns": ["Variable_name", "Value"], "rows": [["Threads_connected", "24"], ["Queries", "9876543"], ["Slow_queries", "4"], ["Aborted_connects", "2"], ["Uptime", "172800"], ["Innodb_buffer_pool_reads", "2000"], ["Innodb_buffer_pool_read_requests", "5000000"], ["Innodb_buffer_pool_pages_total", "8192"], ["Innodb_buffer_pool_pages_free", "1024"]]},
         "SHOW GLOBAL VARIABLES WHERE Variable_name IN ('max_connections', 'version', 'wsrep_on')": {"columns": ["Variable_name", "Value"], "rows": [["max_connections", "512"], ["version", "10.11.6-MariaDB-log"], ["wsrep_on", "ON"]]},
-        "SHOW REPLICA STATUS": {"columns": ["Replica_IO_State", "Seconds_Behind_Source", "Replica_IO_Running", "Replica_SQL_Running"], "rows": []},
+        "SHOW ALL REPLICAS STATUS": {"columns": ["Connection_name", "Slave_IO_State", "Seconds_Behind_Master", "Slave_IO_Running", "Slave_SQL_Running"], "rows": []},
         "SHOW GLOBAL STATUS LIKE 'wsrep%'": {"columns": ["Variable_name", "Value"], "rows": [["wsrep_protocol_version", "10"], ["wsrep_cluster_size", "3"], ["wsrep_cluster_status", "Primary"], ["wsrep_local_state", "4"], ["wsrep_local_state_comment", "Synced"], ["wsrep_ready", "ON"], ["wsrep_connected", "ON"], ["wsrep_flow_control_paused", "0.012"], ["wsrep_local_recv_queue_avg", "0.05"], ["wsrep_provider_name", "Galera"]]}
       },
       "payload": {
@@ -54,7 +57,7 @@
       "results": {
         "SHOW GLOBAL STATUS": {"columns": ["Variable_name", "Value"], "rows": [["Threads_connected", "5"], ["Queries", "42"], ["Slow_queries", "0"], ["Aborted_connects", "9"], ["Uptime", "120"], ["Innodb_buffer_pool_reads", "10"], ["Innodb_buffer_pool_read_requests", "100"], ["Innodb_buffer_pool_pages_total", "1024"], ["Innodb_buffer_pool_pages_free", "512"]]},
         "SHOW GLOBAL VARIABLES WHERE Variable_name IN ('max_connections', 'version', 'wsrep_on')": {"columns": ["Variable_name", "Value"], "rows": [["max_connections", "151"], ["version", "10.6.16-MariaDB"], ["wsrep_on", "ON"]]},
-        "SHOW REPLICA STATUS": {"columns": ["Replica_IO_State", "Seconds_Behind_Source", "Replica_IO_Running", "Replica_SQL_Running"], "rows": []},
+        "SHOW ALL REPLICAS STATUS": {"columns": ["Connection_name", "Slave_IO_State", "Seconds_Behind_Master", "Slave_IO_Running", "Slave_SQL_Running"], "rows": []},
         "SHOW GLOBAL STATUS LIKE 'wsrep%'": {"columns": ["Variable_name", "Value"], "rows": [["wsrep_cluster_size", "1"], ["wsrep_cluster_status", "non-Primary"], ["wsrep_local_state", "0"], ["wsrep_local_state_comment", "Initialized"], ["wsrep_ready", "OFF"], ["wsrep_connected", "ON"], ["wsrep_flow_control_paused", "0.87"], ["wsrep_local_recv_queue_avg", "3.5"]]}
       },
       "payload": {
@@ -103,11 +106,11 @@
       }
     },
     "mariadb_without_galera": {
-      "description": "A plain MariaDB with no Galera (wsrep_on OFF, wsrep_provider none: the default install). MariaDB 10.1+ is built with wsrep and answers SHOW GLOBAL STATUS LIKE 'wsrep%' all the same -- the 17 rows below were MEASURED on 10.11.19 (11.8.9 answers the same, wsrep_cluster_conf_id -1) -- with wsrep_cluster_status 'Disconnected', wsrep_ready 'OFF' and wsrep_cluster_size 0, which agents up to 1.24.0 shipped and the server read as a degraded Galera cluster. The agent now reads wsrep_on with the variables and sends the wsrep statement only when it is ON, so no wsrep_* key is emitted. Servers must clear stored Galera state on a reachable payload that carries `version` (the variables, wsrep_on included, were read) and no wsrep_* key: that server is not a Galera node -- keeping the last stored values, as an absent key otherwise means, would keep the 'Disconnected' cluster older agents stored for every plain MariaDB forever. Servers still receiving those keys from older agents can tell them apart: exactly wsrep_cluster_size 0, wsrep_cluster_status, wsrep_ready and wsrep_connected, with NO wsrep_local_state -- the provider's own status, present on every Galera node (MEASURED on a 3-node MariaDB 11.8.9 cluster, synced, joining and without quorum); a size of 0 alone proves nothing, since a joining Galera node reports it too.",
+      "description": "A plain MariaDB with no Galera (wsrep_on OFF, wsrep_provider none: the default install). MariaDB 10.1+ is built with wsrep and answers SHOW GLOBAL STATUS LIKE 'wsrep%' all the same -- the 17 rows below were MEASURED on 10.11.19 (11.8.9 answers the same, wsrep_cluster_conf_id -1) -- with wsrep_cluster_status 'Disconnected', wsrep_ready 'OFF' and wsrep_cluster_size 0, which agents up to 1.24.0 shipped and the server read as a degraded Galera cluster. The agent now reads wsrep_on with the variables and sends the wsrep statement only when it is ON, so no wsrep_* key is emitted. Servers clear stored Galera state on a reachable payload with `galera: false` (this scenario; no wsrep_* key is ever sent with it): that server is not a Galera node, and keeping the stored values would keep the 'Disconnected' cluster older agents stored for every plain MariaDB forever. `galera: true` without wsrep_* keys (a Galera node whose wsrep statement failed or was cut by the deadline this tick), or an absent `galera` (an older agent, or the variables unread), keeps it: a reachable payload carrying `version` and no wsrep_* key proves nothing, since a Galera node whose wsrep statement fails sends exactly that. Servers still receiving those keys from older agents can tell them apart: exactly wsrep_cluster_size 0, wsrep_cluster_status 'Disconnected', wsrep_ready 'OFF' and wsrep_connected 'OFF', with NO wsrep_local_state -- the provider's own status, present on every Galera node (MEASURED on a 3-node MariaDB 11.8.9 cluster, synced, joining and without quorum); a size of 0 alone proves nothing, since a joining Galera node reports it too.",
       "results": {
         "SHOW GLOBAL STATUS": {"columns": ["Variable_name", "Value"], "rows": [["Threads_connected", "3"], ["Queries", "8120"], ["Slow_queries", "0"], ["Aborted_connects", "1"], ["Uptime", "7200"], ["Innodb_buffer_pool_reads", "180"], ["Innodb_buffer_pool_read_requests", "9000"], ["Innodb_buffer_pool_pages_total", "8064"], ["Innodb_buffer_pool_pages_free", "7770"]]},
         "SHOW GLOBAL VARIABLES WHERE Variable_name IN ('max_connections', 'version', 'wsrep_on')": {"columns": ["Variable_name", "Value"], "rows": [["max_connections", "151"], ["version", "10.11.19-MariaDB"], ["wsrep_on", "OFF"]]},
-        "SHOW REPLICA STATUS": {"columns": ["Slave_IO_State", "Seconds_Behind_Master", "Slave_IO_Running", "Slave_SQL_Running"], "rows": []},
+        "SHOW ALL REPLICAS STATUS": {"columns": ["Connection_name", "Slave_IO_State", "Seconds_Behind_Master", "Slave_IO_Running", "Slave_SQL_Running"], "rows": []},
         "SHOW GLOBAL STATUS LIKE 'wsrep%'": {"columns": ["Variable_name", "Value"], "rows": [["wsrep", "0"], ["wsrep_applier_thread_count", "0"], ["wsrep_cluster_capabilities", ""], ["wsrep_cluster_conf_id", "18446744073709551615"], ["wsrep_cluster_size", "0"], ["wsrep_cluster_state_uuid", ""], ["wsrep_cluster_status", "Disconnected"], ["wsrep_connected", "OFF"], ["wsrep_local_bf_aborts", "0"], ["wsrep_local_index", "18446744073709551615"], ["wsrep_provider_capabilities", ""], ["wsrep_provider_name", ""], ["wsrep_provider_vendor", ""], ["wsrep_provider_version", ""], ["wsrep_ready", "OFF"], ["wsrep_rollbacker_thread_count", "0"], ["wsrep_thread_count", "0"]]}
       },
       "payload": {
@@ -123,6 +126,96 @@
         "version": "10.11.19-MariaDB",
         "galera": false,
         "is_replica": false
+      }
+    },
+    "multi_source_replica": {
+      "description": "A MySQL 8.4 multi-source replica with three channels (#304): the default channel '' healthy, channel 'a' with its SQL thread stopped (STOP REPLICA SQL_THREAD FOR CHANNEL 'a'), channel 'b' pointed at a dead source, its IO thread Connecting. CAPTURED on MySQL 8.4.10 (2026-11-17, a lab replica of two real sources; replication rows trimmed to the columns shown, STATUS rows to the keys the agent reads), and the payload's replication list equals what the agent produced live against that replica. SHOW REPLICA STATUS lists every channel on MySQL, ordered by name here too; agents up to 1.24.1 shipped one object built from the LAST row only ('b' here), so a stopped channel listed before it was invisible. Note 'b': MySQL reports Seconds_Behind_Source 0, not NULL, for a channel whose IO thread is still connecting (measured) -- lag_seconds 0 with running false.",
+      "results": {
+        "SHOW GLOBAL STATUS": {"columns": ["Variable_name", "Value"], "rows": [["Threads_connected", "1"], ["Queries", "282"], ["Slow_queries", "0"], ["Aborted_connects", "0"], ["Uptime", "588"], ["Innodb_buffer_pool_reads", "851"], ["Innodb_buffer_pool_read_requests", "33353"], ["Innodb_buffer_pool_pages_total", "4096"], ["Innodb_buffer_pool_pages_free", "3004"]]},
+        "SHOW GLOBAL VARIABLES WHERE Variable_name IN ('max_connections', 'version', 'wsrep_on')": {"columns": ["Variable_name", "Value"], "rows": [["max_connections", "151"], ["version", "8.4.10"]]},
+        "SHOW REPLICA STATUS": {"columns": ["Replica_IO_State", "Source_Host", "Source_Port", "Replica_IO_Running", "Replica_SQL_Running", "Seconds_Behind_Source", "Last_IO_Errno", "Channel_Name"], "rows": [["Waiting for source to send event", "127.0.0.1", "13386", "Yes", "Yes", "0", "0", ""], ["Waiting for source to send event", "127.0.0.1", "13385", "Yes", "No", null, "0", "a"], ["Connecting to source", "127.0.0.1", "1", "Connecting", "Yes", "0", "2003", "b"]]}
+      },
+      "payload": {
+        "reachable": true,
+        "connections": 1,
+        "queries": 282,
+        "slow_queries": 0,
+        "aborted_connects": 0,
+        "uptime": 588,
+        "innodb_buffer_pool_hit_ratio": 97.45,
+        "innodb_buffer_pool_usage_pct": 26.66,
+        "max_connections": 151,
+        "version": "8.4.10",
+        "galera": false,
+        "is_replica": true,
+        "replication": [
+          {
+            "channel": "",
+            "lag_seconds": 0,
+            "io_running": true,
+            "sql_running": true,
+            "running": true
+          },
+          {
+            "channel": "a",
+            "lag_seconds": null,
+            "io_running": true,
+            "sql_running": false,
+            "running": false
+          },
+          {
+            "channel": "b",
+            "lag_seconds": 0,
+            "io_running": false,
+            "sql_running": true,
+            "running": false
+          }
+        ]
+      }
+    },
+    "mariadb_multi_source_replica": {
+      "description": "The same topology on MariaDB 10.11.19 (CAPTURED 2026-11-17 like multi_source_replica): connections '', 'a' (STOP SLAVE 'a' SQL_THREAD) and 'b' (dead source, IO Connecting). MariaDB lists every connection only with SHOW ALL REPLICAS STATUS (10.5.1+; SHOW ALL SLAVES STATUS since 10.0), named in its Connection_name column; plain SHOW REPLICA/SLAVE STATUS lists the default connection alone, and an EMPTY set when the replica has only named connections (measured), so agents up to 1.24.1 reported the default connection only here (healthy, hiding 'a' and 'b') and a replica with only named connections as is_replica false. MariaDB reports Seconds_Behind_Master NULL for the connecting 'b'.",
+      "results": {
+        "SHOW GLOBAL STATUS": {"columns": ["Variable_name", "Value"], "rows": [["Threads_connected", "1"], ["Queries", "960"], ["Slow_queries", "0"], ["Aborted_connects", "0"], ["Uptime", "573"], ["Innodb_buffer_pool_reads", "165"], ["Innodb_buffer_pool_read_requests", "3456"], ["Innodb_buffer_pool_pages_total", "4056"], ["Innodb_buffer_pool_pages_free", "3747"]]},
+        "SHOW GLOBAL VARIABLES WHERE Variable_name IN ('max_connections', 'version', 'wsrep_on')": {"columns": ["Variable_name", "Value"], "rows": [["max_connections", "151"], ["version", "10.11.19-MariaDB-log"], ["wsrep_on", "OFF"]]},
+        "SHOW ALL REPLICAS STATUS": {"columns": ["Connection_name", "Slave_SQL_State", "Slave_IO_State", "Master_Host", "Master_Port", "Slave_IO_Running", "Slave_SQL_Running", "Seconds_Behind_Master", "Last_IO_Errno"], "rows": [["", "Slave has read all relay log; waiting for more updates", "Waiting for master to send event", "127.0.0.1", "13313", "Yes", "Yes", "0", "0"], ["a", "", "Waiting for master to send event", "127.0.0.1", "13312", "Yes", "No", null, "0"], ["b", "Slave has read all relay log; waiting for more updates", "Connecting to master", "127.0.0.1", "1", "Connecting", "Yes", null, "2003"]]}
+      },
+      "payload": {
+        "reachable": true,
+        "connections": 1,
+        "queries": 960,
+        "slow_queries": 0,
+        "aborted_connects": 0,
+        "uptime": 573,
+        "innodb_buffer_pool_hit_ratio": 95.23,
+        "innodb_buffer_pool_usage_pct": 7.62,
+        "max_connections": 151,
+        "version": "10.11.19-MariaDB-log",
+        "galera": false,
+        "is_replica": true,
+        "replication": [
+          {
+            "channel": "",
+            "lag_seconds": 0,
+            "io_running": true,
+            "sql_running": true,
+            "running": true
+          },
+          {
+            "channel": "a",
+            "lag_seconds": null,
+            "io_running": true,
+            "sql_running": false,
+            "running": false
+          },
+          {
+            "channel": "b",
+            "lag_seconds": null,
+            "io_running": false,
+            "sql_running": true,
+            "running": false
+          }
+        ]
       }
     },
     "unreachable": {
