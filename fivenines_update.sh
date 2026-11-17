@@ -591,6 +591,12 @@ sudoers_tool_path() {
     if [ -z "$tool_path" ]; then
         return 1
     fi
+    # Without find nothing can be checked, so nothing is granted (minimal
+    # container images, rockylinux:8's among them, ship no findutils).
+    if ! command -v find > /dev/null 2>&1; then
+        print_warning "No sudoers rule for ${tool_path}: find (findutils) is not installed, so who can change it cannot be checked." >&2
+        return 1
+    fi
     if ! root_only_chain "$tool_path"; then
         print_warning "No sudoers rule for ${tool_path}: a user other than root can change what it runs." >&2
         return 1
@@ -663,14 +669,15 @@ write_sudoers_rules() {
                 # own exact entry: without one the agent's --detail would be
                 # refused on every collection, and on Debian and Ubuntu sudo
                 # mails root each refusal. One created later needs this run
-                # again.
+                # again. Every array listed gets its exact entry, md0 too:
+                # sudo-rs (Ubuntu 25.10 on) matches no [0-9] class, so there
+                # only the arrays listed now can be read.
                 sudoers_rule="fivenines ALL=(ALL) NOPASSWD: ${sudoers_path} --version, ${sudoers_path} --detail /dev/md[0-9], ${sudoers_path} --detail /dev/md[0-9][0-9], ${sudoers_path} --detail /dev/md[0-9][0-9][0-9]"
                 # One array name per line, never a space (awk prints the first
                 # field), so the words are the names.
                 # shellcheck disable=SC2013
                 for sudoers_md in $(awk '/^md/ { print $1 }' /proc/mdstat 2>/dev/null); do
                     case "$sudoers_md" in
-                        md[0-9] | md[0-9][0-9] | md[0-9][0-9][0-9]) ;;
                         # A dash and a dot need no escaping in a rule.
                         *[!A-Za-z0-9_.-]* | . | ..)
                             print_warning "No sudoers entry for /dev/${sudoers_md}: its name holds a character a rule cannot carry as is."

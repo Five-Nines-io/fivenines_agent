@@ -924,7 +924,10 @@ matches a `*` across argument boundaries, which is why the mdadm rule spells
 `/dev/md[0-9]` out three times instead of `--detail *`: that would also match
 `--detail /dev/md0 --stop /dev/md1`. It covers `md0` to `md999`, the kernel's
 names; an array the kernel names otherwise (`CREATE names=yes` in
-`mdadm.conf`) needs its own `--detail /dev/<name>` entry.
+`mdadm.conf`) needs its own `--detail /dev/<name>` entry. sudo-rs (the
+default sudo from Ubuntu 25.10) matches no `[0-9]` class: there, list each
+array as `--detail /dev/md0` and so on, and add one when you create an array
+(`--with-sudoers` writes an exact entry for every array `/proc/mdstat` lists).
 
 An earlier version of this README gave the bare `/sbin/mdadm` and
 `/usr/bin/fail2ban-client` rules: if your sudoers files still have one,
@@ -961,9 +964,11 @@ sudo's usual `secure_path` finds (`/usr/local/sbin`, `/usr/local/bin`,
 can change: the file, every directory above it, and every symbolic link on
 the way and its target, root's and writable by no one else. The mdadm rule
 also gets one exact `--detail /dev/<name>` entry for each array
-`/proc/mdstat` lists under a name other than `md0`-`md999` (`CREATE names=yes`,
-`md_d0`); an array created later under such a name needs the command run again,
-or the agent's read of it is refused, which on Debian and Ubuntu mails root.
+`/proc/mdstat` lists, whatever its name (`md0`, `md_d0`, `CREATE names=yes`).
+An array created later needs the command run again when its name is not
+`md0`-`md999`, and under sudo-rs whatever its name (sudo-rs matches no `[0-9]`
+class); otherwise the agent's read of it is refused, which on Debian and
+Ubuntu mails root.
 Each rule is checked with the host's `visudo` on its own, and one this sudo
 rejects is left out with a warning rather than written. A `/etc/sudoers.d/fivenines` you wrote
 yourself is never touched: the installer marks its own with a first comment

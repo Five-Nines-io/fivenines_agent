@@ -53,7 +53,7 @@ install_test_deps() {
     apk add --no-cache python3 wget shadow openssl sudo
   elif command -v dnf > /dev/null 2>&1; then
     # Fedora / Rocky 9+
-    dnf install -y -q python3 wget util-linux openssl sudo
+    dnf install -y -q python3 wget util-linux openssl sudo findutils
   elif command -v yum > /dev/null 2>&1; then
     # CentOS 7
     yum install -y -q python3 wget openssl sudo

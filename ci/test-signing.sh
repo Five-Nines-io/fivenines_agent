@@ -1442,13 +1442,13 @@ fi
 PATH=$MOVE_SAVED_PATH
 fi
 
-# --with-sudoers: write_sudoers_rules's entries for the md arrays
-# /proc/mdstat lists under other names than md0-md999, with /proc/mdstat,
+# --with-sudoers: write_sudoers_rules's exact entries for the md arrays
+# /proc/mdstat lists (md0 among them, for sudo-rs), with /proc/mdstat,
 # /etc/sudoers and /etc/sudoers.d rewritten to scratch files.
 # Value: protects=an md array named with a dash or a dot gets its exact --detail entry, a name with a character a rule cannot carry gets none;
 #   fails_when=the name check goes back to [A-Za-z0-9_] only, or lets a comma or a wildcard into a rule;
 #   why_new=no test image has an md array; seam=paths rewritten, visudo, chown and sudoers_tool_path overridden;
-#   no_claim=that a real visudo accepts the entries (test-sudo-mail checks the md0-md999 ones)
+#   no_claim=that a real visudo accepts the entries (test-sudo-mail checks the md0-md999 patterns on classic sudo)
 SUD="$WORK/sudoers-md"
 mkdir -p "$SUD/sudoers.d" "$SUD/work"
 printf '%s\n' 'Personalities : [raid1]' 'md0 : active raid1 sdb1[1] sda1[0]' \
@@ -1479,6 +1479,11 @@ md_rules_run() {
 md_rules_run
 check "--with-sudoers gives every command of the account root's HOME, before its rules" \
   "$(grep -v '^#' "$SUD/sudoers.d/fivenines" 2>/dev/null | head -n 1)" "Defaults:fivenines always_set_home"
+# Value: protects=every listed array gets its exact --detail entry, md0 included, which is all sudo-rs can match (no [0-9] class);
+#   fails_when=md0-md999 names are skipped again because the [0-9] patterns cover them on classic sudo;
+#   why_new=sudo-rs ignores the patterns; seam=as above; no_claim=what sudo-rs matches (ci/test-sudo-mail.sh)
+check "--with-sudoers gives md0 its exact --detail entry too, for sudo-rs" \
+  "$(grep '^fivenines' "$SUD/sudoers.d/fivenines" 2>/dev/null | grep -c ', /sbin/mdadm --detail /dev/md0,\|, /sbin/mdadm --detail /dev/md0$')" "1"
 check "--with-sudoers gives an md array named with a dash or a dot its exact --detail entry, and none to a name with a comma" \
   "$(grep '^fivenines' "$SUD/sudoers.d/fivenines" 2>/dev/null | grep -o ', /sbin/mdadm --detail /dev/md_[^,]*' | tr '\n' '|')|$(grep -c 'No sudoers entry for /dev/md_a,b' "$SUD/out")" \
   ", /sbin/mdadm --detail /dev/md_data-1|, /sbin/mdadm --detail /dev/md_home.0||1"
@@ -1563,6 +1568,12 @@ chmod 755 "$MOVE/userbin/sh"
   fi
   _out=$(sudoers_tool_path fivenines-no-such-tool-170 2>&1)
   check "a tool that is not installed gets no rule" "$?|$_out" "1|"
+  # A host with no find (rockylinux:8's image ships no findutils): nothing
+  # can be checked, so nothing is granted, and the warning says why. PATH is
+  # empty only for that call; the lookup tests the files themselves.
+  _out=$(PATH=/nonexistent sudoers_tool_path sh 2>&1)
+  check "a host with no find gets no rule, and is told find is missing" \
+    "$?|$(printf '%s' "$_out" | grep -c 'find (findutils) is not installed')" "1|1"
   # The checks above ran in this subshell: carry their counts out.
   echo "$PASS $FAIL" > "$MOVE/counts"
 )

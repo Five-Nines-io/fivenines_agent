@@ -96,6 +96,9 @@ if [ ! -f /etc/sudoers ]; then
   printf 'root ALL=(ALL:ALL) ALL\n%%sudo ALL=(ALL:ALL) ALL\n@includedir /etc/sudoers.d\n' > /etc/sudoers
   chmod 440 /etc/sudoers
 fi
+# The mode sudo installs it with (ubuntu:26.04's sudo-rs image has 0644,
+# which visudo -c refuses).
+chmod 440 /etc/sudoers
 echo "  $(sudo --version 2>&1 | head -1)"
 
 # Every mail sudo sends lands in /var/tmp/mails.
@@ -297,6 +300,12 @@ else
     want=$(printf '%s' "$argv" | sed 's|^/[^ ]*/||')
     out=$(sudo_as_fivenines "$argv")
     if [ "$out" = "$want" ]; then echo "    ok   --with-sudoers: fivenines runs $argv"
+    elif [ "$flavor" = sudo-rs ] && [ -z "$out" ] && case "$argv" in *" --detail /dev/md"*) true ;; *) false ;; esac \
+      && ! grep -qw "${argv##*/}" /proc/mdstat 2>/dev/null; then
+      # sudo-rs matches no [0-9] class: --detail runs only for the arrays
+      # /proc/mdstat listed when the rules were written, and this one is not
+      # listed (an array that is gets an exact entry, and must run).
+      echo "    info --with-sudoers: sudo-rs matches no [0-9] class, so $argv runs only for an array listed at write time"
     else echo "    FAIL --with-sudoers: fivenines cannot run $argv: '$out' $(cat /tmp/sudo.err)"; fail=1; fi
   done
   IFS=$old_ifs
