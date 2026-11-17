@@ -30,6 +30,8 @@ import pytest
 from fivenines_agent import mysql
 from fivenines_agent.bounded import WorkerTimeout
 from fivenines_agent.mysql import (
+    ALL_REPLICAS_STATUS_SQL,
+    ALL_SLAVES_STATUS_SQL,
     GALERA_STATUS_SQL,
     REPLICA_STATUS_SQL,
     SLAVE_STATUS_SQL,
@@ -41,7 +43,7 @@ from fivenines_agent.mysql import (
     _best_effort,
     _buffer_pool_hit_ratio,
     _buffer_pool_usage_pct,
-    _build_replication,
+    _build_channel,
     _classify,
     _close,
     _code,
@@ -173,6 +175,67 @@ NULL_LAG_COLUMNS = [
 ]
 NULL_LAG_REPLICA = [(None, "Yes", "No")]
 
+# A multi-source MySQL replica (#304): channel "a" has its SQL thread stopped,
+# "b" is healthy and listed last, which is all the old payload showed.
+MYSQL8_CHANNEL_COLUMNS = [
+    "Replica_IO_State",
+    "Seconds_Behind_Source",
+    "Replica_IO_Running",
+    "Replica_SQL_Running",
+    "Channel_Name",
+]
+MYSQL8_CHANNELS = [
+    ("Waiting for source to send event", None, "Yes", "No", "a"),
+    ("Waiting for source to send event", "3", "Yes", "Yes", "b"),
+]
+MYSQL8_CHANNELS_PAYLOAD = [
+    {
+        "channel": "a",
+        "lag_seconds": None,
+        "io_running": True,
+        "sql_running": False,
+        "running": False,
+    },
+    {
+        "channel": "b",
+        "lag_seconds": 3,
+        "io_running": True,
+        "sql_running": True,
+        "running": True,
+    },
+]
+
+# MariaDB's SHOW ALL REPLICAS STATUS: every connection, named in its first
+# column; "" is the default connection, listed by the plain statement alone.
+MARIADB_ALL_COLUMNS = [
+    "Connection_name",
+    "Slave_SQL_State",
+    "Slave_IO_State",
+    "Seconds_Behind_Master",
+    "Slave_IO_Running",
+    "Slave_SQL_Running",
+]
+MARIADB_ALL = [
+    ("b", "", "Connecting to master", None, "Connecting", "Yes"),
+    ("", "Slave has read all relay log", "Waiting for master", "0", "Yes", "Yes"),
+]
+MARIADB_ALL_PAYLOAD = [
+    {
+        "channel": "",
+        "lag_seconds": 0,
+        "io_running": True,
+        "sql_running": True,
+        "running": True,
+    },
+    {
+        "channel": "b",
+        "lag_seconds": None,
+        "io_running": False,
+        "sql_running": True,
+        "running": False,
+    },
+]
+
 # Healthy Galera node. Carries two non-whitelisted rows (wsrep_protocol_version,
 # wsrep_provider_name) to prove the whitelist drops everything else.
 GALERA_WSREP = [
@@ -210,15 +273,17 @@ def server_results(
 ):
     """FakeMySQL results for one healthy server. `variables` and `wsrep` are
     rows or a scripted reply (error()/hang()/drop()); `replica` is a scripted
-    reply, by default an empty SHOW REPLICA STATUS (not a replica)."""
+    reply, by default an empty one (not a replica), to SHOW REPLICA STATUS, or
+    SHOW ALL REPLICAS STATUS when `variables` name a MariaDB version."""
 
     def reply(value):
         return status(value) if isinstance(value, list) else value
 
+    mariadb = isinstance(variables, list) and "MariaDB" in dict(variables)["version"]
     return {
         STATUS_SQL: status(status_rows),
         VARIABLES_SQL: reply(variables),
-        REPLICA_STATUS_SQL: (
+        (ALL_REPLICAS_STATUS_SQL if mariadb else REPLICA_STATUS_SQL): (
             replica if replica is not None else rows(MYSQL8_REPLICA_COLUMNS, [])
         ),
         GALERA_STATUS_SQL: reply(wsrep if wsrep is not None else []),
@@ -413,9 +478,10 @@ def test_add_variable_metrics_omits_absent():
     assert metrics == {}
 
 
-def test_build_replication_mysql8():
+def test_build_channel_mysql8():
     row = dict(zip(MYSQL8_REPLICA_COLUMNS, MYSQL8_REPLICA[0]))
-    assert _build_replication(row) == {
+    assert _build_channel(row) == {
+        "channel": "",  # no Channel_Name column: the default channel
         "lag_seconds": 5,
         "io_running": True,
         "sql_running": True,
@@ -423,9 +489,10 @@ def test_build_replication_mysql8():
     }
 
 
-def test_build_replication_mariadb():
+def test_build_channel_mariadb():
     row = dict(zip(MARIADB_REPLICA_COLUMNS, MARIADB_REPLICA[0]))
-    assert _build_replication(row) == {
+    assert _build_channel(row) == {
+        "channel": "",
         "lag_seconds": 0,
         "io_running": True,
         "sql_running": True,
@@ -433,14 +500,30 @@ def test_build_replication_mariadb():
     }
 
 
-def test_build_replication_null_lag_not_running():
-    repl = _build_replication(dict(zip(NULL_LAG_COLUMNS, NULL_LAG_REPLICA[0])))
+def test_build_channel_null_lag_not_running():
+    repl = _build_channel(dict(zip(NULL_LAG_COLUMNS, NULL_LAG_REPLICA[0])))
     assert repl == {
+        "channel": "",
         "lag_seconds": None,
         "io_running": True,
         "sql_running": False,
         "running": False,
     }
+
+
+@pytest.mark.parametrize(
+    "row,expected",
+    [
+        ({"Channel_Name": "source_b"}, "source_b"),
+        ({"Connection_name": "source_b"}, "source_b"),
+        ({"Channel_Name": ""}, ""),
+        ({"Channel_Name": None}, ""),
+        ({"Channel_Name": "a\x00b"}, "ab"),
+        ({"Channel_Name": "x" * 300}, "x" * mysql.CHANNEL_NAME_MAX),
+    ],
+)
+def test_build_channel_name(row, expected):
+    assert _build_channel(row)["channel"] == expected
 
 
 def test_add_galera_metrics_whitelist_and_types():
@@ -945,73 +1028,241 @@ def test_best_effort_returns_none_on_any_failure():
     assert _best_effort(conn, "UNKNOWN") is None  # syntax error
 
 
+MYSQL = {"version": "8.4.10"}
+MARIADB = {"version": "10.11.19-MariaDB"}
+ALL_FORMS = [ALL_REPLICAS_STATUS_SQL, ALL_SLAVES_STATUS_SQL]
+DENIED = pymysql.err.OperationalError(
+    1227, "Access denied; you need (at least one of) the SUPER, SLAVE MONITOR"
+)
+
+
 def test_get_replication_mysql8_replica():
+    """MySQL rejects both SHOW ALL forms as syntax: not sent again for an hour."""
     conn = FakeConnection(
         {REPLICA_STATUS_SQL: (MYSQL8_REPLICA_COLUMNS, MYSQL8_REPLICA)}
     )
-    is_replica, repl = _get_replication(conn)
+    is_replica, channels = _get_replication(conn, MYSQL)
     assert is_replica is True
-    assert repl["lag_seconds"] == 5
+    assert [channel["lag_seconds"] for channel in channels] == [5]
+    assert conn.queries == ALL_FORMS + [REPLICA_STATUS_SQL]
+    conn.queries.clear()
+    _get_replication(conn, MYSQL)
     assert conn.queries == [REPLICA_STATUS_SQL]
 
 
 def test_get_replication_falls_back_to_slave():
+    """MySQL before 8.0.22 rejects REPLICA too."""
     conn = FakeConnection(
         {SLAVE_STATUS_SQL: (MARIADB_REPLICA_COLUMNS, MARIADB_REPLICA)}
     )
-    is_replica, repl = _get_replication(conn)
+    variables = {"version": "5.7.44-log"}
+    is_replica, channels = _get_replication(conn, variables)
     assert is_replica is True
-    assert repl["lag_seconds"] == 0
-    assert conn.queries == [REPLICA_STATUS_SQL, SLAVE_STATUS_SQL]
+    assert [channel["lag_seconds"] for channel in channels] == [0]
+    assert conn.queries == ALL_FORMS + [REPLICA_STATUS_SQL, SLAVE_STATUS_SQL]
+    conn.queries.clear()
+    _get_replication(conn, variables)
+    assert conn.queries == [SLAVE_STATUS_SQL]
 
 
-def test_get_replication_remembers_working_verb():
-    """An old server rejects REPLICA: after the first fallback, SLAVE leads,
-    and once the server is upgraded REPLICA takes the lead back."""
+def test_get_replication_a_new_version_is_asked_afresh():
+    """The statements a server rejected are forgotten when its version
+    string changes (an upgrade, or another server at that address)."""
     old = FakeConnection({SLAVE_STATUS_SQL: (MARIADB_REPLICA_COLUMNS, [])})
-    _get_replication(old)
-    old.queries.clear()
-    assert _get_replication(old) == (False, None)
-    assert old.queries == [SLAVE_STATUS_SQL]
-
+    _get_replication(old, {"version": "5.7.44-log"})
     upgraded = FakeConnection({REPLICA_STATUS_SQL: (MYSQL8_REPLICA_COLUMNS, [])})
-    assert _get_replication(upgraded) == (False, None)
-    assert upgraded.queries == [SLAVE_STATUS_SQL, REPLICA_STATUS_SQL]
-    upgraded.queries.clear()
-    _get_replication(upgraded)
-    assert upgraded.queries == [REPLICA_STATUS_SQL]
+    assert _get_replication(upgraded, MYSQL) == (False, None)
+    assert upgraded.queries == ALL_FORMS + [REPLICA_STATUS_SQL]
+
+
+def test_get_replication_mariadb_lists_every_connection():
+    """MariaDB's plain statement lists only the default connection (#304)."""
+    conn = FakeConnection(
+        {
+            ALL_REPLICAS_STATUS_SQL: (MARIADB_ALL_COLUMNS, MARIADB_ALL),
+            REPLICA_STATUS_SQL: (MARIADB_REPLICA_COLUMNS, MARIADB_REPLICA),
+        }
+    )
+    assert _get_replication(conn, MARIADB) == (True, MARIADB_ALL_PAYLOAD)
+    assert conn.queries == [ALL_REPLICAS_STATUS_SQL]
+
+
+def test_get_replication_mariadb_before_10_5_1():
+    conn = FakeConnection({ALL_SLAVES_STATUS_SQL: (MARIADB_ALL_COLUMNS, MARIADB_ALL)})
+    variables = {"version": "10.4.34-MariaDB"}
+    assert _get_replication(conn, variables) == (True, MARIADB_ALL_PAYLOAD)
+    assert conn.queries == ALL_FORMS
+    conn.queries.clear()
+    _get_replication(conn, variables)
+    assert conn.queries == [ALL_SLAVES_STATUS_SQL]
+
+
+def test_get_replication_mariadb_5_5_has_one_connection():
+    """MariaDB 5.5 (CentOS 7) has neither SHOW ALL form, nor multi-source."""
+    conn = FakeConnection(
+        {SLAVE_STATUS_SQL: (MARIADB_REPLICA_COLUMNS, MARIADB_REPLICA)}
+    )
+    is_replica, channels = _get_replication(conn, {"version": "5.5.68-MariaDB"})
+    assert (is_replica, [channel["channel"] for channel in channels]) == (True, [""])
+    assert conn.queries == ALL_FORMS + [REPLICA_STATUS_SQL, SLAVE_STATUS_SQL]
+
+
+def test_get_replication_an_older_server_never_pins_mariadb():
+    """Review of #304: the old memo kept SHOW SLAVE STATUS, which an older
+    server at the address had answered, first on the MariaDB 10.x there; its
+    plain statement listed the default connection alone (reproduced on
+    10.11.19), and none on a replica with only named connections."""
+    old = FakeConnection({SLAVE_STATUS_SQL: (MARIADB_REPLICA_COLUMNS, MARIADB_REPLICA)})
+    _get_replication(old, {"version": "5.5.68-MariaDB"})
+    named_only = FakeConnection(
+        {
+            ALL_REPLICAS_STATUS_SQL: (MARIADB_ALL_COLUMNS, MARIADB_ALL),
+            SLAVE_STATUS_SQL: (MARIADB_REPLICA_COLUMNS, []),
+        }
+    )
+    assert _get_replication(named_only, MARIADB) == (True, MARIADB_ALL_PAYLOAD)
+
+
+def test_get_replication_a_faked_version_changes_nothing():
+    """MariaDB lets an operator set its version string (to look like a MySQL
+    an application wants): the statements do not depend on it."""
+    conn = FakeConnection(
+        {
+            ALL_REPLICAS_STATUS_SQL: (MARIADB_ALL_COLUMNS, MARIADB_ALL),
+            REPLICA_STATUS_SQL: (MARIADB_REPLICA_COLUMNS, MARIADB_REPLICA),
+        }
+    )
+    assert _get_replication(conn, {"version": "8.0.36"}) == (
+        True,
+        MARIADB_ALL_PAYLOAD,
+    )
 
 
 def test_get_replication_not_a_replica():
     conn = FakeConnection({REPLICA_STATUS_SQL: (MYSQL8_REPLICA_COLUMNS, [])})
-    assert _get_replication(conn) == (False, None)
+    assert _get_replication(conn, MYSQL) == (False, None)
 
 
-def test_get_replication_undetermined_when_both_fail():
-    denied = pymysql.err.OperationalError(
-        1227, "Access denied; you need REPLICATION CLIENT"
-    )
-    conn = FakeConnection({REPLICA_STATUS_SQL: denied, SLAVE_STATUS_SQL: denied})
-    assert _get_replication(conn) == (None, None)
+def test_get_replication_stops_at_a_refusal():
+    """The same privilege covers every statement: a refusal ends the section
+    for the tick, and the next tick sends only that statement again."""
+    mariadb = FakeConnection({ALL_REPLICAS_STATUS_SQL: DENIED})
+    assert _get_replication(mariadb, MARIADB) == (None, None)
+    assert mariadb.queries == [ALL_REPLICAS_STATUS_SQL]
+    mysql8 = FakeConnection({REPLICA_STATUS_SQL: DENIED, SLAVE_STATUS_SQL: DENIED})
+    assert _get_replication(mysql8, MYSQL) == (None, None)
+    assert mysql8.queries == ALL_FORMS + [REPLICA_STATUS_SQL]
+    mysql8.queries.clear()
+    assert _get_replication(mysql8, MYSQL) == (None, None)
+    assert mysql8.queries == [REPLICA_STATUS_SQL]
 
 
-def test_get_replication_reads_the_last_channel():
-    """Multi-source replication lists one row per channel; the CLI path's
-    \\G parse let the last row win, and the payload keeps that."""
-    channels = [
-        ("a", "10.0.0.1", "1", "Yes", "Yes"),
-        ("b", "10.0.0.2", None, "Yes", "No"),
-    ]
-    conn = FakeConnection({REPLICA_STATUS_SQL: (MYSQL8_REPLICA_COLUMNS, channels)})
-    assert _get_replication(conn) == (
-        True,
+def test_get_replication_a_transient_failure_is_not_remembered():
+    """An interrupted statement (KILL QUERY, max_statement_time) ends the
+    section for the tick, never falls back to a statement listing fewer
+    channels, and is sent again next tick."""
+    interrupted = pymysql.err.OperationalError(1317, "Query execution was interrupted")
+    conn = FakeConnection(
         {
-            "lag_seconds": None,
-            "io_running": True,
-            "sql_running": False,
-            "running": False,
-        },
+            ALL_REPLICAS_STATUS_SQL: interrupted,
+            SLAVE_STATUS_SQL: (MARIADB_REPLICA_COLUMNS, MARIADB_REPLICA),
+        }
     )
+    assert _get_replication(conn, MARIADB) == (None, None)
+    conn.results[ALL_REPLICAS_STATUS_SQL] = (MARIADB_ALL_COLUMNS, MARIADB_ALL)
+    assert _get_replication(conn, MARIADB) == (True, MARIADB_ALL_PAYLOAD)
+    assert conn.queries == [ALL_REPLICAS_STATUS_SQL, ALL_REPLICAS_STATUS_SQL]
+
+
+def test_get_replication_er_syntax_error_counts_as_a_rejection():
+    conn = FakeConnection(
+        {
+            ALL_REPLICAS_STATUS_SQL: pymysql.err.ProgrammingError(
+                1149, "You have an error in your SQL syntax"
+            ),
+            REPLICA_STATUS_SQL: (MYSQL8_REPLICA_COLUMNS, MYSQL8_REPLICA),
+        }
+    )
+    is_replica, _ = _get_replication(conn, MYSQL)
+    assert is_replica is True
+    conn.queries.clear()
+    _get_replication(conn, MYSQL)
+    assert conn.queries == [REPLICA_STATUS_SQL]
+
+
+def test_get_replication_rejections_are_per_target():
+    """Another server with the same version string (MariaDB lets an operator
+    set it) never inherits what the first one rejected."""
+    mysql8 = FakeConnection({REPLICA_STATUS_SQL: (MYSQL8_REPLICA_COLUMNS, [])})
+    _get_replication(mysql8, {"version": "8.0.30"}, (None, "db1", 3306))
+    mariadb = FakeConnection(
+        {ALL_REPLICAS_STATUS_SQL: (MARIADB_ALL_COLUMNS, MARIADB_ALL)}
+    )
+    target = (None, "db2", 3306)
+    assert _get_replication(mariadb, {"version": "8.0.30"}, target) == (
+        True,
+        MARIADB_ALL_PAYLOAD,
+    )
+
+
+def test_get_replication_rejections_are_forgotten_after_an_hour(monkeypatch):
+    """Review of #304 (Codex): one tick of forged rejections (whatever listens
+    on the port while the server is down, with its version string) must not
+    stop the replication section until the agent restarts."""
+    clock = [1000.0]
+    monkeypatch.setattr(mysql.time, "monotonic", lambda: clock[0])
+    forged = FakeConnection({})  # every statement: 1064
+    assert _get_replication(forged, MYSQL) == (None, None)
+    real = FakeConnection({REPLICA_STATUS_SQL: (MYSQL8_REPLICA_COLUMNS, [])})
+    clock[0] += mysql.REJECTION_RETRY_INTERVAL - 1
+    assert _get_replication(real, MYSQL) == (None, None)
+    assert real.queries == []  # still held back
+    clock[0] += 1
+    assert _get_replication(real, MYSQL) == (False, None)
+    assert real.queries == ALL_FORMS + [REPLICA_STATUS_SQL]
+
+
+def test_get_replication_every_statement_rejected():
+    """A server that knows none of them (a proxy, another engine): nothing
+    is sent again for an hour while its target and version string stay the
+    same."""
+    conn = FakeConnection({})
+    assert _get_replication(conn, MYSQL) == (None, None)
+    assert len(conn.queries) == 4
+    assert _get_replication(conn, MYSQL) == (None, None)
+    assert len(conn.queries) == 4
+
+
+def test_get_replication_reports_every_channel():
+    """#304: the payload showed only the last channel listed, here a healthy
+    one, while the first had its SQL thread stopped. Sorted by name."""
+    conn = FakeConnection(
+        {REPLICA_STATUS_SQL: (MYSQL8_CHANNEL_COLUMNS, MYSQL8_CHANNELS[::-1])}
+    )
+    assert _get_replication(conn, MYSQL) == (True, MYSQL8_CHANNELS_PAYLOAD)
+
+
+def test_get_replication_past_the_channel_cap_reports_none(monkeypatch):
+    """More channels than MAX_CHANNELS: a replica, but no short list. Logged
+    at error once."""
+    monkeypatch.setattr(mysql, "MAX_CHANNELS", 1)
+    logged = []
+    monkeypatch.setattr(
+        mysql,
+        "log",
+        lambda message, level: "channels listed" in message and logged.append(level),
+    )
+    conn = FakeConnection(
+        {REPLICA_STATUS_SQL: (MYSQL8_CHANNEL_COLUMNS, MYSQL8_CHANNELS)}
+    )
+    assert _get_replication(conn, MYSQL) == (True, None)
+    assert _get_replication(conn, MYSQL) == (True, None)
+    assert logged == ["error", "debug"]
+    # Value: protects=a list of exactly MAX_CHANNELS ships whole;
+    # fails_when=the cap check becomes >=; why_new=only an over-cap list was
+    # tested; seam=none; no_claim=a real 256-channel replica
+    monkeypatch.setattr(mysql, "MAX_CHANNELS", len(MYSQL8_CHANNELS))
+    assert _get_replication(conn, MYSQL) == (True, MYSQL8_CHANNELS_PAYLOAD)
 
 
 # ---------------------------------------------------------------------------
@@ -1036,12 +1287,15 @@ def test_metrics_mysql8_full_payload_one_connection():
         "version": "8.0.36",
         "galera": False,
         "is_replica": True,
-        "replication": {
-            "lag_seconds": 5,
-            "io_running": True,
-            "sql_running": True,
-            "running": True,
-        },
+        "replication": [
+            {
+                "channel": "",
+                "lag_seconds": 5,
+                "io_running": True,
+                "sql_running": True,
+                "running": True,
+            }
+        ],
     }
     # One connection for the whole collection, closed with COM_QUIT.
     assert server.connections == 1
@@ -1050,6 +1304,8 @@ def test_metrics_mysql8_full_payload_one_connection():
         "SET NAMES utf8mb4",
         STATUS_SQL,
         VARIABLES_SQL,
+        ALL_REPLICAS_STATUS_SQL,  # rejected as syntax by MySQL: once an hour
+        ALL_SLAVES_STATUS_SQL,
         REPLICA_STATUS_SQL,
     ]  # no wsrep statement: MySQL has no wsrep_on
     assert server.user == "monitor"
@@ -1057,20 +1313,59 @@ def test_metrics_mysql8_full_payload_one_connection():
     assert server.connect_attrs["program_name"] == "fivenines-agent"
 
 
-def test_metrics_mariadb_full_payload_via_slave_fallback():
+def test_metrics_mariadb_full_payload_lists_every_connection():
     results = server_results(
         status_rows=MARIADB_STATUS,
         variables=MARIADB_VARS,
-        replica=error(1064, "You have an error in your SQL syntax", b"42000"),
+        replica=rows(MARIADB_ALL_COLUMNS, MARIADB_ALL),
     )
-    results[SLAVE_STATUS_SQL] = rows(MARIADB_REPLICA_COLUMNS, MARIADB_REPLICA)
+    # The default connection alone: never sent to MariaDB.
+    results[REPLICA_STATUS_SQL] = rows(MARIADB_REPLICA_COLUMNS, MARIADB_REPLICA)
     with FakeMySQL(results=results) as server:
         result = tcp(server)
     assert result["version"] == "10.11.6-MariaDB"
     assert result["innodb_buffer_pool_hit_ratio"] == 100.0
     assert result["innodb_buffer_pool_usage_pct"] == 0.0
     assert result["is_replica"] is True
-    assert result["replication"]["lag_seconds"] == 0
+    assert result["replication"] == MARIADB_ALL_PAYLOAD
+    assert server.queries[-1] == ALL_REPLICAS_STATUS_SQL
+
+
+def test_metrics_mariadb_5_5_via_slave_fallback():
+    variables = [("max_connections", "151"), ("version", "5.5.68-MariaDB")]
+    results = server_results(variables=variables)
+    del results[ALL_REPLICAS_STATUS_SQL]
+    results[SLAVE_STATUS_SQL] = rows(MARIADB_REPLICA_COLUMNS, MARIADB_REPLICA)
+    with FakeMySQL(results=results) as server:
+        result = tcp(server)
+    assert result["is_replica"] is True
+    assert [channel["lag_seconds"] for channel in result["replication"]] == [0]
+
+
+def test_metrics_multi_source_replica_reports_every_channel():
+    """#304, end to end: the stopped channel is no longer hidden."""
+    results = server_results(replica=rows(MYSQL8_CHANNEL_COLUMNS, MYSQL8_CHANNELS))
+    with FakeMySQL(results=results) as server:
+        result = tcp(server)
+    assert result["is_replica"] is True
+    assert result["replication"] == MYSQL8_CHANNELS_PAYLOAD
+
+
+def test_metrics_rejections_are_kept_per_target_end_to_end():
+    """Review of #304: the target goes from the collection down to the
+    rejection memory. A MySQL rejects the SHOW ALL forms; a MariaDB at
+    another address, faking the same version string, must still be asked
+    them (dropping the target sent it SHOW REPLICA STATUS, which lists its
+    default connection alone)."""
+    variables = [("max_connections", "151"), ("version", "8.0.30")]
+    mariadb_results = server_results(
+        variables=variables, replica=rows(MARIADB_REPLICA_COLUMNS, MARIADB_REPLICA)
+    )
+    mariadb_results[ALL_REPLICAS_STATUS_SQL] = rows(MARIADB_ALL_COLUMNS, MARIADB_ALL)
+    with FakeMySQL(results=server_results(variables=variables)) as mysql8:
+        assert tcp(mysql8)["is_replica"] is False
+    with FakeMySQL(results=mariadb_results) as mariadb:
+        assert tcp(mariadb)["replication"] == MARIADB_ALL_PAYLOAD
 
 
 def test_metrics_null_lag_replica():
@@ -1078,8 +1373,8 @@ def test_metrics_null_lag_replica():
     with FakeMySQL(results=results) as server:
         result = tcp(server)
     assert result["is_replica"] is True
-    assert result["replication"]["lag_seconds"] is None
-    assert result["replication"]["running"] is False
+    assert result["replication"][0]["lag_seconds"] is None
+    assert result["replication"][0]["running"] is False
 
 
 def test_metrics_variables_failure_stays_reachable():
@@ -1434,6 +1729,51 @@ def test_localhost_tcp_failure_names_sockets_the_agent_may_not_see(monkeypatch):
     assert "socket" not in plain
 
 
+def test_a_refused_login_names_sockets_the_agent_may_not_see(monkeypatch):
+    """#305: localhost:3306 dialed TCP for want of a visible socket and the
+    server refused the login, as it does an account bound to the socket
+    ('user'@'localhost' under skip_name_resolve, unix_socket)."""
+    hidden = mysql._DEFAULT_SOCKETS[2]
+    real_stat = os.stat
+
+    def stat(path, *args, **kwargs):
+        if path == hidden:
+            raise PermissionError(13, "Permission denied")
+        if path in mysql._DEFAULT_SOCKETS:
+            raise FileNotFoundError(2, "No such file or directory")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(mysql, "_HAS_UNIX_SOCKETS", True)
+    monkeypatch.setattr(mysql.os, "stat", stat)
+    tcp_3306 = (None, "127.0.0.1", 3306)
+    refused = pymysql.err.OperationalError(
+        1698, "Access denied for user 'root'@'localhost'"
+    )
+    hint = (
+        f"; the agent may not look for a socket at {hidden} (permission"
+        " denied): configure the socket path if the account logs in through it"
+    )
+    assert _detail(refused, tcp_3306) == (
+        "ERROR 1698: Access denied for user 'root'@'localhost'" + hint
+    )
+    # After a TLS failure, its note stays next to the error it explains.
+    refused.after_tls_failure = "[SSL] unsupported protocol"
+    assert _detail(refused, tcp_3306) == (
+        "ERROR 1698: Access denied for user 'root'@'localhost' (after the TLS"
+        " handshake failed: [SSL] unsupported protocol)" + hint
+    )
+    # Not a refused login, or not localhost:3306 over TCP: no hint.
+    lost = pymysql.err.OperationalError(2013, "Lost connection to MySQL server")
+    assert _detail(lost, tcp_3306) == "ERROR 2013: Lost connection to MySQL server"
+    denied = pymysql.err.OperationalError(1045, "Access denied")
+    assert _detail(denied, (None, "db", 3306)) == "ERROR 1045: Access denied"
+    assert _detail(denied, ("/run/mysqld/mysqld.sock", None, None)) == (
+        "ERROR 1045: Access denied"
+    )
+    monkeypatch.setattr(mysql, "_HAS_UNIX_SOCKETS", False)
+    assert _detail(denied, tcp_3306) == "ERROR 1045: Access denied"
+
+
 @needs_unix_sockets
 def test_configured_socket_missing_is_connection_refused(short_dir):
     path = os.path.join(short_dir, "gone.sock")
@@ -1712,7 +2052,7 @@ def test_an_endless_reply_is_cut_at_the_read_cap():
     listener.close()
     assert result["reachable"] is False
     assert result["error"] == "error"
-    assert "exceeded 1048576 bytes" in result["error_detail"]
+    assert "read more than 1048576 bytes" in result["error_detail"]
     assert sent[0] < 32 << 20  # refused at the 16 MB header, not read
 
 
@@ -1724,7 +2064,7 @@ def test_the_read_cap_is_checked_before_reading():
     conn = cls.__new__(cls)
     conn._sock = None
     conn._rfile = rfile = MagicMock()
-    with pytest.raises(pymysql.err.OperationalError, match="exceeded"):
+    with pytest.raises(pymysql.err.OperationalError, match="read more than"):
         conn._read_bytes(mysql.MAX_READ_BYTES + 1)
     rfile.read.assert_not_called()
     rfile.close.assert_called_once()  # the connection is closed
@@ -1751,7 +2091,8 @@ def test_a_best_effort_reply_past_the_read_cap_is_logged_at_error(monkeypatch):
     errors = [message for level, message in logged if level == "error"]
     assert errors == [
         f"MySQL statement skipped ({REPLICA_STATUS_SQL}): (2013, 'Lost connection"
-        " to MySQL server: its reply exceeded 4096 bytes')"
+        " to MySQL server: this connection read more than 4096 bytes'); the"
+        " sections after it are skipped"
     ]  # once per statement, then at debug
 
 
@@ -1764,8 +2105,8 @@ def test_a_large_result_set_is_cut_at_the_read_cap(monkeypatch):
     assert result == {
         "reachable": False,
         "error": "error",
-        "error_detail": "ERROR 2013: Lost connection to MySQL server: its reply"
-        " exceeded 4096 bytes",
+        "error_detail": "ERROR 2013: Lost connection to MySQL server: this"
+        " connection read more than 4096 bytes",
     }
 
 
@@ -1923,6 +2264,35 @@ def test_a_repeated_unexpected_failure_logs_at_error_once(monkeypatch):
     assert logged == ["error", "debug", "error", "error"]
 
 
+def test_a_deadline_cut_after_the_probe_is_a_success_for_the_log(monkeypatch):
+    """#305: a tick the deadline cut after the probe answered ships a payload,
+    so the same unexpected failure after it is an error again."""
+    outcomes = iter([ValueError("a"), "cut", ValueError("a")])
+
+    def bounded(fn, timeout, name=None):
+        outcome = next(outcomes)
+        if outcome == "cut":
+            fn()  # the probe answered
+            raise WorkerTimeout(MagicMock(is_alive=lambda: False), timeout)
+        raise outcome
+
+    def collect(host, port, user, password, database, socket_path, progress):
+        progress["metrics"] = {"reachable": True}
+
+    logged = []
+    monkeypatch.setattr(mysql, "call_bounded", bounded)
+    monkeypatch.setattr(mysql, "_collect", collect)
+    monkeypatch.setattr(
+        mysql, "log", lambda message, level="info": logged.append((level, message))
+    )
+    results = [mysql_metrics(host="127.0.0.1") for _ in range(3)]
+    assert results[1] == {"reachable": True}
+    assert [level for level, message in logged if "failed" in message] == [
+        "error",
+        "error",
+    ]
+
+
 def test_exception_without_text_names_its_type(monkeypatch):
     def boom(fn, timeout, name=None):
         raise KeyError()
@@ -1979,16 +2349,22 @@ def _fixture_connect(scenario):
     return connect
 
 
-@pytest.mark.parametrize(
-    "name",
-    [
-        "galera_healthy",
-        "galera_degraded",
-        "non_galera",
-        "mariadb_without_galera",
-        "unreachable",
-    ],
-)
+_SCENARIOS = [
+    "galera_healthy",
+    "galera_degraded",
+    "non_galera",
+    "mariadb_without_galera",
+    "multi_source_replica",
+    "mariadb_multi_source_replica",
+    "unreachable",
+]
+
+
+def test_every_fixture_scenario_is_round_tripped():
+    assert sorted(_load_fixture()["scenarios"]) == sorted(_SCENARIOS)
+
+
+@pytest.mark.parametrize("name", _SCENARIOS)
 def test_contract_fixture_round_trip(name, monkeypatch):
     """SHARED FIXTURE (cross-repo contract): fixtures/mysql_contract_payload.json.
 
@@ -1998,7 +2374,8 @@ def test_contract_fixture_round_trip(name, monkeypatch):
       "connect_error" raised for the default socket);
     - fivenines-server: spec/requests/api_collect_mysql_spec.rb posts
       scenario["payload"] under data["mysql"] and asserts Ingesters::Mysql
-      handles the Galera-present / absent / unreachable-envelope shapes.
+      handles the Galera-present / absent / unreachable-envelope shapes and
+      the per-channel replication list (#304).
 
     Change the payload shape only in lockstep with the server spec and its
     byte-identical fixture copy.
