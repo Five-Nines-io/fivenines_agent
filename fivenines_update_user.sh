@@ -358,7 +358,9 @@ verify_from_manifest() {
 # shellcheck disable=SC2120
 verification_preflight() {
     # "$1" is "with-startup-files" when the caller also installs a startup
-    # definition (the two SYSTEM scripts). Those always go through the signed
+    # definition (the two SYSTEM scripts), or runs one of the release's
+    # scripts as root (fivenines_setup_user.sh --from-system and its
+    # fivenines_uninstall.sh). Those always go through the signed
     # manifest -- install_verified_release_file ignores FIVENINES_AGENT_SHA256,
     # which pins the TARBALL only -- so a pinned digest does not exempt them,
     # or the preflight would pass and the refusal would land after the agent
@@ -533,14 +535,114 @@ select_agent_binary || exit_with_error "No agent binary runs on this host -- not
 # shellcheck disable=SC2119
 verification_preflight || exit_with_error "Cannot verify a release on this host -- nothing was changed and the agent is still running."
 
+# The pgrep -f pattern for an agent run from INSTALL_DIR: anchored on the
+# agent's own path (start.sh runs it by that path), so neither another user's
+# agent nor a shell or a tail -f that merely names a file in that directory
+# ever matches, with the regex characters a path may hold (/home/a+b) escaped.
+agent_pattern() {
+    printf '^%s/fivenines-agent-' "$(printf '%s' "$1" | sed 's/[][\.*^$+?(){}|]/\\&/g')"
+}
+
+# stop.sh, status.sh, logs.sh and refresh.sh. They find the agent two ways:
+# by its path (agent_pattern; they used to look for the binary name anywhere
+# in any command line, so status.sh could report another user's agent and
+# stop.sh or refresh.sh signal it), and by the PID start.sh recorded, when that
+# process is an agent. The second catches an agent started under another
+# spelling of this directory (a trailing slash, a symlink): start.sh keeps the
+# spelling it was written with, while fivenines_update_user.sh rewrites these
+# scripts with the one it was given -- a stop.sh trusting the path alone said
+# "not running", and the update started a second agent with the same
+# identity. The recorded PID is taken only when /proc shows an agent binary
+# as its argv[0], so a PID the system has since reused (by a tail -f of the
+# agent's log, say) is never signalled. The update rewrites
+# these scripts so an existing installation gets them; never start.sh, which
+# carries the config directory the installation was made with.
+write_control_scripts() {
+    # Every path goes into the scripts single-quoted, its own single quotes
+    # written as '\'', so a directory name of any spelling stays one word.
+    control_dir="'$(printf '%s' "$INSTALL_DIR" | sed "s/'/'\\\\''/g")'"
+    control_log="'$(printf '%s' "$INSTALL_DIR/agent.log" | sed "s/'/'\\\\''/g")'"
+    control_pattern="'$(agent_pattern "$INSTALL_DIR" | sed "s/'/'\\\\''/g")'"
+    control_find=$(cat << EOF
+PIDS=\$(pgrep -f $control_pattern 2>/dev/null)
+AGENT_PID=\$(cat $control_dir/agent.pid 2>/dev/null)
+case "\$AGENT_PID" in
+    ''|*[!0-9]*) ;;
+    *)
+        if tr '\0' '\n' < "/proc/\$AGENT_PID/cmdline" 2>/dev/null | head -n 1 \\
+            | grep -q '/fivenines-agent-[^/]*/fivenines-agent-[^/]*\$'; then
+            PIDS="\$PIDS \$AGENT_PID"
+        fi
+        ;;
+esac
+PIDS=\$(printf '%s\n' \$PIDS | sort -un | tr '\n' ' ')
+PIDS=\${PIDS% }
+EOF
+)
+
+    cat > "$INSTALL_DIR/stop.sh" << EOF
+#!/bin/bash
+# Stop the Fivenines agent: every process running this installation's agent.
+$control_find
+rm -f $control_dir/agent.pid
+if [ -n "\$PIDS" ] && kill \$PIDS 2>/dev/null; then
+    echo "Agent stopped (PID: \$PIDS)"
+else
+    echo "Agent not running"
+fi
+EOF
+    chmod +x "$INSTALL_DIR/stop.sh"
+    print_success "Created stop.sh"
+
+    cat > "$INSTALL_DIR/status.sh" << EOF
+#!/bin/bash
+# Check Fivenines agent status
+$control_find
+if [ -n "\$PIDS" ]; then
+    echo "Agent is running (PID: \$PIDS)"
+    echo "Log file: "$control_log
+    echo ""
+    echo "Last 10 log lines:"
+    tail -10 $control_log 2>/dev/null || echo "(no log yet)"
+else
+    echo "Agent is not running"
+fi
+EOF
+    chmod +x "$INSTALL_DIR/status.sh"
+    print_success "Created status.sh"
+
+    cat > "$INSTALL_DIR/logs.sh" << EOF
+#!/bin/bash
+# View Fivenines agent logs
+tail -f $control_log
+EOF
+    chmod +x "$INSTALL_DIR/logs.sh"
+    print_success "Created logs.sh"
+
+    cat > "$INSTALL_DIR/refresh.sh" << EOF
+#!/bin/bash
+# Refresh agent capabilities (after permission changes)
+$control_find
+if [ -n "\$PIDS" ] && kill -HUP \$PIDS 2>/dev/null; then
+    echo "Sent SIGHUP to agent (PID: \$PIDS) - capabilities will refresh"
+else
+    echo "Agent is not running"
+fi
+EOF
+    chmod +x "$INSTALL_DIR/refresh.sh"
+    print_success "Created refresh.sh"
+}
+
+# The installation's own control scripts are rewritten first, so this update
+# stops the agent with the current stop.sh, and an installation made before
+# they found the agent by its path gets them (start.sh is left as it is).
+# A plain call: under set -e a failed write ends the update before the stop.
+write_control_scripts
+
 # Stop the agent if running (skip in test mode)
 if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
   echo "Stopping agent..."
-  if [ -f "$INSTALL_DIR/stop.sh" ]; then
-      "$INSTALL_DIR/stop.sh" 2>/dev/null || true
-  else
-      pkill -f "$BINARY_NAME" 2>/dev/null || true
-  fi
+  "$INSTALL_DIR/stop.sh" 2>/dev/null || true
   sleep 1
   print_success "Agent stopped"
 else
@@ -609,7 +711,7 @@ if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
 
   sleep 2
 
-  if pgrep -f "$BINARY_NAME" > /dev/null; then
+  if pgrep -f "$(agent_pattern "$INSTALL_DIR")" > /dev/null; then
       print_success "Agent is running"
   else
       print_warning "Agent may have failed to start. Check: $INSTALL_DIR/logs.sh"

@@ -96,6 +96,9 @@ if [ ! -f /etc/sudoers ]; then
   printf 'root ALL=(ALL:ALL) ALL\n%%sudo ALL=(ALL:ALL) ALL\n@includedir /etc/sudoers.d\n' > /etc/sudoers
   chmod 440 /etc/sudoers
 fi
+# The mode sudo installs it with (ubuntu:26.04's sudo-rs image has 0644,
+# which visudo -c refuses).
+chmod 440 /etc/sudoers
 echo "  $(sudo --version 2>&1 | head -1)"
 
 # Every mail sudo sends lands in /var/tmp/mails.
@@ -209,6 +212,145 @@ as admin python3 /work/probe.py smartctl=refused fail2ban-client=refused nvme=re
 n=$(mails); clear_mails
 if [ "$n" -le "$gate_mails" ]; then echo "    ok   admin-group user: 2 runs of 15 probes, $n mail(s) (at most $gate_mails)"
 else echo "    FAIL admin-group user: 2 runs of 15 probes, $n mails (at most $gate_mails)"; fail=1; fi
+
+# --with-sudoers: write_sudoers_rules (fivenines_common.sh) against this
+# image's real visudo and sudo. What it writes must parse, run exactly the
+# commands it names for the fivenines account, and nothing else; a file it
+# did not write must be left alone.
+for tool in /usr/sbin/smartctl /usr/bin/fail2ban-client /usr/sbin/mdadm /usr/bin/wg; do
+  printf '#!/bin/sh\necho "%s $*"\n' "${tool##*/}" > "$tool"
+  chmod 755 "$tool"
+done
+# as fivenines, sudo -n ARGV: prints what the tool printed (its name and
+# arguments), or nothing when sudo refused. stderr is kept for the message:
+# sudo can warn there and still run the command.
+sudo_as_fivenines() {
+  # The argv is deliberately word-split into the command and its arguments.
+  # shellcheck disable=SC2086
+  as fivenines sudo -n $1 2>/tmp/sudo.err
+}
+if [ "$flavor" = sudo-rs ] && ! command -v visudo >/dev/null 2>&1; then
+  for candidate in /usr/bin/visudo-rs /usr/lib/cargo/bin/visudo; do
+    if [ -x "$candidate" ]; then
+      ln -sf "$candidate" /usr/local/bin/visudo
+      break
+    fi
+  done
+fi
+with_sudoers() {
+  (
+    . /src/fivenines_common.sh
+    WORK_DIR=$(mktemp -d)
+    write_sudoers_rules
+  ) > /tmp/with-sudoers.out 2>&1
+}
+operator_rule=$(cat /etc/sudoers.d/fivenines)
+with_sudoers
+rc=$?
+if [ "$rc" -ne 0 ] && [ "$(cat /etc/sudoers.d/fivenines)" = "$operator_rule" ] \
+  && grep -q 'was not written by this installer' /tmp/with-sudoers.out; then
+  echo "    ok   --with-sudoers leaves an operator's /etc/sudoers.d/fivenines alone"
+elif [ "$rc" -ne 0 ] && [ "$flavor" = sudo-rs ] && grep -q 'no visudo' /tmp/with-sudoers.out \
+  && [ "$(cat /etc/sudoers.d/fivenines)" = "$operator_rule" ]; then
+  echo "    info --with-sudoers: sudo-rs here has no visudo, so the operator's file is not even looked at"
+else
+  echo "    FAIL --with-sudoers and an operator's /etc/sudoers.d/fivenines (rc $rc)"; cat /tmp/with-sudoers.out; fail=1
+fi
+rm -f /etc/sudoers.d/fivenines
+with_sudoers
+rc=$?
+sed 's/^/      | /' /tmp/with-sudoers.out
+if [ "$rc" -ne 0 ] && [ "$flavor" = sudo-rs ] && grep -q 'no visudo' /tmp/with-sudoers.out; then
+  echo "    info --with-sudoers: sudo-rs here has no visudo, so it writes nothing"
+elif [ "$rc" -ne 0 ]; then
+  echo "    FAIL --with-sudoers wrote nothing (rc $rc)"; fail=1
+else
+  if visudo -c >/dev/null 2>&1; then echo "    ok   --with-sudoers: visudo -c is clean"
+  else echo "    FAIL --with-sudoers: visudo -c"; visudo -c; fail=1; fi
+  if grep -qx 'Defaults:fivenines always_set_home' /etc/sudoers.d/fivenines; then
+    echo "    ok   --with-sudoers: the account's commands get root's HOME"
+  elif [ "$flavor" = sudo-rs ]; then
+    echo "    info --with-sudoers: this sudo's visudo rejects always_set_home (sudo-rs sets the target's HOME anyway)"
+  else
+    echo "    FAIL --with-sudoers: no always_set_home line"; fail=1
+  fi
+  # Per tool, what the agent runs. A tool's rule is one line, written whole
+  # or not at all: real sudo must take all four; sudo-rs may reject one (a
+  # tag or an argument pattern it does not support), which is then said.
+  allowed=""
+  for tool in smartctl mdadm fail2ban-client wg; do
+    case $tool in
+      smartctl) argvs="/usr/sbin/smartctl -i -A -H -l ssd /dev/sda|/usr/sbin/smartctl --version" ;;
+      mdadm) argvs="/usr/sbin/mdadm --version|/usr/sbin/mdadm --detail /dev/md0|/usr/sbin/mdadm --detail /dev/md127" ;;
+      fail2ban-client) argvs="/usr/bin/fail2ban-client version|/usr/bin/fail2ban-client status|/usr/bin/fail2ban-client status sshd" ;;
+      wg) argvs="/usr/bin/wg show all dump" ;;
+    esac
+    if grep -qE "NOPASSWD:.* [^ ]*/$tool( |\$)" /etc/sudoers.d/fivenines; then
+      allowed="$allowed|$argvs"
+    elif [ "$flavor" = sudo-rs ]; then
+      echo "    info --with-sudoers: this sudo's visudo rejects the $tool rule, so it is not written"
+    else
+      echo "    FAIL --with-sudoers: no $tool rule written"; fail=1
+    fi
+  done
+  old_ifs=$IFS
+  IFS='|'
+  for argv in ${allowed#|}; do
+    IFS=$old_ifs
+    want=$(printf '%s' "$argv" | sed 's|^/[^ ]*/||')
+    out=$(sudo_as_fivenines "$argv")
+    if [ "$out" = "$want" ]; then echo "    ok   --with-sudoers: fivenines runs $argv"
+    elif [ "$flavor" = sudo-rs ] && [ -z "$out" ] && case "$argv" in *" --detail /dev/md"*) true ;; *) false ;; esac \
+      && ! grep -qw "${argv##*/}" /proc/mdstat 2>/dev/null; then
+      # sudo-rs matches no [0-9] class: --detail runs only for the arrays
+      # /proc/mdstat listed when the rules were written, and this one is not
+      # listed (an array that is gets an exact entry, and must run).
+      echo "    info --with-sudoers: sudo-rs matches no [0-9] class, so $argv runs only for an array listed at write time"
+    else echo "    FAIL --with-sudoers: fivenines cannot run $argv: '$out' $(cat /tmp/sudo.err)"; fail=1; fi
+  done
+  IFS=$old_ifs
+  # What the rules must never allow: each of these runs a command as root or
+  # changes the host. "--detail /dev/md0 --stop /dev/md0" is what a wildcard
+  # after --detail would have let through.
+  denied="/usr/bin/wg set wg0 private-key /dev/null|/bin/sh -c id"
+  denied="$denied|/usr/sbin/mdadm --monitor --scan --program /bin/sh"
+  denied="$denied|/usr/sbin/mdadm --detail /dev/md0 --stop /dev/md0"
+  denied="$denied|/usr/bin/fail2ban-client set sshd banip 192.0.2.1"
+  IFS='|'
+  for argv in $denied; do
+    IFS=$old_ifs
+    out=$(sudo_as_fivenines "$argv")
+    if [ -n "$out" ]; then echo "    FAIL --with-sudoers: fivenines may run $argv: '$out'"; fail=1
+    else echo "    ok   --with-sudoers: fivenines may not run $argv"; fi
+  done
+  IFS=$old_ifs
+fi
+# warn_unpinned_sudoers_rules (fivenines_common.sh), over this sudo's own
+# sudo -l -U listing: the pinned rules above are never named, the bare rules
+# an earlier README gave are.
+unpinned() {
+  ( . /src/fivenines_common.sh; warn_unpinned_sudoers_rules ) 2>&1
+}
+out=$(unpinned)
+if [ -z "$out" ]; then echo "    ok   no bare-rule warning for the pinned rules"
+else echo "    FAIL a bare-rule warning for the pinned rules: $out"; fail=1; fi
+printf '%s\n' 'fivenines ALL=(ALL) NOPASSWD: /usr/sbin/mdadm' \
+  'fivenines ALL=(ALL) NOPASSWD: /usr/sbin/smartctl, /usr/bin/fail2ban-client' > /etc/sudoers.d/fivenines-bare
+chmod 440 /etc/sudoers.d/fivenines-bare
+out=$(unpinned)
+case "$out" in
+  *"run /usr/bin/fail2ban-client /usr/sbin/mdadm with any arguments"*)
+    echo "    ok   the bare mdadm and fail2ban-client rules are named" ;;
+  *)
+    if [ "$flavor" = sudo-rs ] && [ -z "$out" ]; then
+      echo "    info this sudo lists no other user's rules (sudo -l -U): no bare-rule warning"
+    else
+      echo "    FAIL the bare rules are not named: '$out'"; fail=1
+    fi
+    ;;
+esac
+rm -f /etc/sudoers.d/fivenines-bare
+clear_mails
 
 exit "$fail"
 EOF
