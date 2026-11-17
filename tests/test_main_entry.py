@@ -166,6 +166,7 @@ def test_version_in_a_fresh_interpreter_loads_no_collector_module(script):
         "requests",
         "docker",
         "pg8000",
+        "pymysql",
     ]
     probe = (
         "import sys\n"
@@ -331,15 +332,19 @@ def test_distro_test_checks_the_optional_modules_each_build_checks():
     )
     assert "libvirt" in linux and "libvirt" in alpine
     assert "proxmoxer.backends.https" in alpine  # bundled on Alpine since 1.21.6
-    # pymongo is a main dependency the agent imports only inside the mongodb
-    # collector (#258): every artifact bundles it, so every build proves it,
-    # the Windows build included.
-    assert synology == ["pymongo"]
-    assert "pymongo" in linux and "pymongo" in alpine
+    # pymongo and pymysql are main dependencies the agent imports only inside
+    # the mongodb (#258) and mysql collectors: every artifact bundles them, so
+    # every build proves them, the Windows build included.
+    # pymysql swallows an ImportError of cryptography (RSA authentication for
+    # caching_sha2_password over TCP without TLS): the builds import it too.
+    rsa = "cryptography.hazmat.primitives.asymmetric.padding"
+    assert synology == ["pymongo", "pymysql", rsa]
     windows = (REPO_ROOT / "py2exe_windows.ps1").read_text(encoding="utf-8")
-    assert re.search(
-        r"^& \$exePath --check-imports .*\bpymongo\b", windows, re.MULTILINE
-    )
+    for driver in ("pymongo", "pymysql", rsa):
+        assert driver in linux and driver in alpine
+        assert re.search(
+            rf"^& \$exePath --check-imports .*\b{driver}\b", windows, re.MULTILINE
+        )
     # Value: protects=the Windows build proves win32service, which the
     # windows_services collector and its probe import only inside a function;
     # fails_when=win32service is dropped from py2exe_windows.ps1's
