@@ -217,7 +217,7 @@ else echo "    FAIL admin-group user: 2 runs of 15 probes, $n mails (at most $ga
 # image's real visudo and sudo. What it writes must parse, run exactly the
 # commands it names for the fivenines account, and nothing else; a file it
 # did not write must be left alone.
-for tool in /usr/sbin/smartctl /usr/bin/fail2ban-client /usr/sbin/mdadm /usr/bin/wg; do
+for tool in /usr/sbin/smartctl /usr/sbin/nvme /usr/bin/fail2ban-client /usr/sbin/mdadm /usr/bin/wg; do
   printf '#!/bin/sh\necho "%s $*"\n' "${tool##*/}" > "$tool"
   chmod 755 "$tool"
 done
@@ -237,9 +237,17 @@ if [ "$flavor" = sudo-rs ] && ! command -v visudo >/dev/null 2>&1; then
     fi
   done
 fi
+# write_sudoers_rules reads the md arrays and NVMe controllers from a fake
+# /proc/mdstat and /sys/class/nvme: the container has none, and their exact
+# entries are what sudo-rs (no [0-9] class) runs.
+mkdir -p /tmp/fake-nvme/nvme0 /tmp/fake-nvme/nvme12
+printf '%s\n' 'Personalities : [raid1]' 'md0 : active raid1 sdb1[1] sda1[0]' \
+  'md127 : active raid1 sdd1[1] sdc1[0]' 'unused devices: <none>' > /tmp/fake-mdstat
+sed 's|/proc/mdstat|/tmp/fake-mdstat|g; s|/sys/class/nvme|/tmp/fake-nvme|g' \
+  /src/fivenines_common.sh > /tmp/fivenines_common.sh
 with_sudoers() {
   (
-    . /src/fivenines_common.sh
+    . /tmp/fivenines_common.sh
     WORK_DIR=$(mktemp -d)
     write_sudoers_rules
   ) > /tmp/with-sudoers.out 2>&1
@@ -274,20 +282,24 @@ else
   else
     echo "    FAIL --with-sudoers: no always_set_home line"; fail=1
   fi
-  # Per tool, what the agent runs. A tool's rule is one line, written whole
-  # or not at all: real sudo must take all four; sudo-rs may reject one (a
-  # tag or an argument pattern it does not support), which is then said.
+  # Per tool, what the agent runs. A tool gets an exact line and, for mdadm,
+  # nvme and fail2ban-client, a line of patterns, each written whole or not at
+  # all: real sudo must take all five tools; sudo-rs may reject the wg rule
+  # (no NOLOG_OUTPUT tag) and, after 0.2.15, every pattern line.
   allowed=""
-  for tool in smartctl mdadm fail2ban-client wg; do
+  for tool in smartctl nvme mdadm fail2ban-client wg; do
     case $tool in
       smartctl) argvs="/usr/sbin/smartctl -i -A -H -l ssd /dev/sda|/usr/sbin/smartctl --version" ;;
+      nvme) argvs="/usr/sbin/nvme version|/usr/sbin/nvme smart-log /dev/nvme0 -o json|/usr/sbin/nvme smart-log /dev/nvme12 -o json" ;;
       mdadm) argvs="/usr/sbin/mdadm --version|/usr/sbin/mdadm --detail /dev/md0|/usr/sbin/mdadm --detail /dev/md127" ;;
       fail2ban-client) argvs="/usr/bin/fail2ban-client version|/usr/bin/fail2ban-client status|/usr/bin/fail2ban-client status sshd" ;;
       wg) argvs="/usr/bin/wg show all dump" ;;
     esac
     if grep -qE "NOPASSWD:.* [^ ]*/$tool( |\$)" /etc/sudoers.d/fivenines; then
       allowed="$allowed|$argvs"
-    elif [ "$flavor" = sudo-rs ]; then
+    elif [ "$flavor" = sudo-rs ] && [ "$tool" = wg ]; then
+      # sudo-rs has no NOLOG_OUTPUT tag. Every other tool keeps at least its
+      # exact line, the patterns being on a line of their own.
       echo "    info --with-sudoers: this sudo's visudo rejects the $tool rule, so it is not written"
     else
       echo "    FAIL --with-sudoers: no $tool rule written"; fail=1
@@ -300,12 +312,11 @@ else
     want=$(printf '%s' "$argv" | sed 's|^/[^ ]*/||')
     out=$(sudo_as_fivenines "$argv")
     if [ "$out" = "$want" ]; then echo "    ok   --with-sudoers: fivenines runs $argv"
-    elif [ "$flavor" = sudo-rs ] && [ -z "$out" ] && case "$argv" in *" --detail /dev/md"*) true ;; *) false ;; esac \
-      && ! grep -qw "${argv##*/}" /proc/mdstat 2>/dev/null; then
-      # sudo-rs matches no [0-9] class: --detail runs only for the arrays
-      # /proc/mdstat listed when the rules were written, and this one is not
-      # listed (an array that is gets an exact entry, and must run).
-      echo "    info --with-sudoers: sudo-rs matches no [0-9] class, so $argv runs only for an array listed at write time"
+    elif [ "$flavor" = sudo-rs ] && [ "$argv" = "/usr/bin/fail2ban-client status sshd" ] \
+      && ! grep -qF '/usr/bin/fail2ban-client status *' /etc/sudoers.d/fivenines; then
+      # Only the pattern line allows a jail, and a sudo-rs that refuses
+      # patterns rejected it: the agent then reads the summary but no jail.
+      echo "    info --with-sudoers: this sudo-rs rejects the status * line, so no jail is read"
     else echo "    FAIL --with-sudoers: fivenines cannot run $argv: '$out' $(cat /tmp/sudo.err)"; fail=1; fi
   done
   IFS=$old_ifs
@@ -316,6 +327,7 @@ else
   denied="$denied|/usr/sbin/mdadm --monitor --scan --program /bin/sh"
   denied="$denied|/usr/sbin/mdadm --detail /dev/md0 --stop /dev/md0"
   denied="$denied|/usr/bin/fail2ban-client set sshd banip 192.0.2.1"
+  denied="$denied|/usr/sbin/nvme format /dev/nvme0|/usr/sbin/nvme smart-log /dev/nvme0 -o json /dev/nvme1"
   IFS='|'
   for argv in $denied; do
     IFS=$old_ifs
@@ -335,12 +347,13 @@ out=$(unpinned)
 if [ -z "$out" ]; then echo "    ok   no bare-rule warning for the pinned rules"
 else echo "    FAIL a bare-rule warning for the pinned rules: $out"; fail=1; fi
 printf '%s\n' 'fivenines ALL=(ALL) NOPASSWD: /usr/sbin/mdadm' \
-  'fivenines ALL=(ALL) NOPASSWD: /usr/sbin/smartctl, /usr/bin/fail2ban-client' > /etc/sudoers.d/fivenines-bare
+  'fivenines ALL=(ALL) NOPASSWD: /usr/sbin/smartctl, /usr/bin/fail2ban-client' \
+  'fivenines ALL=(root) NOPASSWD: /usr/sbin/nvme *' > /etc/sudoers.d/fivenines-bare
 chmod 440 /etc/sudoers.d/fivenines-bare
 out=$(unpinned)
 case "$out" in
-  *"run /usr/bin/fail2ban-client /usr/sbin/mdadm with any arguments"*)
-    echo "    ok   the bare mdadm and fail2ban-client rules are named" ;;
+  *"run /usr/bin/fail2ban-client /usr/sbin/mdadm /usr/sbin/nvme with any arguments"*)
+    echo "    ok   the bare mdadm and fail2ban-client rules, and nvme *, are named" ;;
   *)
     if [ "$flavor" = sudo-rs ] && [ -z "$out" ]; then
       echo "    info this sudo lists no other user's rules (sudo -l -U): no bare-rule warning"

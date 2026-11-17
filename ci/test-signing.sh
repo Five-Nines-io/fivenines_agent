@@ -1450,16 +1450,16 @@ fi
 #   why_new=no test image has an md array; seam=paths rewritten, visudo, chown and sudoers_tool_path overridden;
 #   no_claim=that a real visudo accepts the entries (test-sudo-mail checks the md0-md999 patterns on classic sudo)
 SUD="$WORK/sudoers-md"
-mkdir -p "$SUD/sudoers.d" "$SUD/work"
+mkdir -p "$SUD/sudoers.d" "$SUD/work" "$SUD/nvme-class/nvme0" "$SUD/nvme-class/nvme12" "$SUD/nvme-class/nvme100"
 printf '%s\n' 'Personalities : [raid1]' 'md0 : active raid1 sdb1[1] sda1[0]' \
   'md_data-1 : active raid1 sdd1[1] sdc1[0]' 'md_home.0 : active raid1 sdf1[1] sde1[0]' \
   'md_a,b : active raid1 sdh1[1] sdg1[0]' 'unused devices: <none>' > "$SUD/mdstat"
 : > "$SUD/sudoers"
 sed -n '/^write_sudoers_rules()/,/^}/p' "$ROOT/fivenines_common.sh" \
-  | sed "s|/proc/mdstat|$SUD/mdstat|g; s|/etc/sudoers.d|$SUD/sudoers.d|g; s|/etc/sudoers|$SUD/sudoers|g" \
+  | sed "s|/proc/mdstat|$SUD/mdstat|g; s|/sys/class/nvme|$SUD/nvme-class|g; s|/etc/sudoers.d|$SUD/sudoers.d|g; s|/etc/sudoers|$SUD/sudoers|g" \
   > "$SUD/write.sh"
-# Runs the rewritten write_sudoers_rules, mdadm the only tool found, or no
-# tool at all with $1 none.
+# Runs the rewritten write_sudoers_rules, mdadm and nvme the only tools found,
+# or no tool at all with $1 none.
 md_rules_run() {
   _md_tools=${1:-}
   (
@@ -1467,7 +1467,14 @@ md_rules_run() {
     . "$SUD/write.sh"
     # Called by write_sudoers_rules.
     # shellcheck disable=SC2317,SC2329
-    sudoers_tool_path() { [ "$1" = mdadm ] && [ "$_md_tools" != none ] && echo /sbin/mdadm; }
+    sudoers_tool_path() {
+      [ "$_md_tools" != none ] || return 1
+      case "$1" in
+        mdadm) echo /sbin/mdadm ;;
+        nvme) echo /usr/sbin/nvme ;;
+        *) return 1 ;;
+      esac
+    }
     # shellcheck disable=SC2317,SC2329
     visudo() { return 0; }
     # shellcheck disable=SC2317,SC2329
@@ -1482,6 +1489,17 @@ check "--with-sudoers gives every command of the account root's HOME, before its
 # Value: protects=every listed array gets its exact --detail entry, md0 included, which is all sudo-rs can match (no [0-9] class);
 #   fails_when=md0-md999 names are skipped again because the [0-9] patterns cover them on classic sudo;
 #   why_new=sudo-rs ignores the patterns; seam=as above; no_claim=what sudo-rs matches (ci/test-sudo-mail.sh)
+# Value: protects=nvme gets only the agent's two commands (version, smart-log as JSON on a controller), never format, sanitize or firmware, plus an exact entry per controller the kernel lists, for sudo-rs;
+#   fails_when=the nvme rule goes bare or takes a "*", or the exact entries stop following /sys/class/nvme;
+#   why_new=no test image has an NVMe controller; seam=as above; no_claim=that sudo-rs accepts the rule (ci/test-sudo-mail.sh)
+check "--with-sudoers holds nvme to version and smart-log, with an exact entry per controller listed" \
+  "$(grep '/usr/sbin/nvme' "$SUD/sudoers.d/fivenines" 2>/dev/null | tr '\n' '|')" \
+  "fivenines ALL=(ALL) NOPASSWD: /usr/sbin/nvme version, /usr/sbin/nvme smart-log /dev/nvme0 -o json, /usr/sbin/nvme smart-log /dev/nvme12 -o json|fivenines ALL=(ALL) NOPASSWD: /usr/sbin/nvme smart-log /dev/nvme[0-9] -o json, /usr/sbin/nvme smart-log /dev/nvme[1-9][0-9] -o json|"
+# Value: protects=the exact entries never share a line with a pattern, so a sudo-rs that refuses patterns in arguments (ad74f0a) rejects only the pattern line;
+#   fails_when=the [0-9] or * entries go back on the line with --version / version;
+#   why_new=sudo-rs refusing a bracket is not released yet, so no image can show it; seam=as above; no_claim=which sudo-rs release refuses it
+check "--with-sudoers puts every pattern on a line of its own, apart from the exact entries" \
+  "$(grep '^fivenines' "$SUD/sudoers.d/fivenines" | grep -e ' --version' -e ' version' | grep -c '\[\|\*')|$(grep -c '^fivenines ALL=(ALL) NOPASSWD: /sbin/mdadm --detail /dev/md\[0-9\], ' "$SUD/sudoers.d/fivenines")" "0|1"
 check "--with-sudoers gives md0 its exact --detail entry too, for sudo-rs" \
   "$(grep '^fivenines' "$SUD/sudoers.d/fivenines" 2>/dev/null | grep -c ', /sbin/mdadm --detail /dev/md0,\|, /sbin/mdadm --detail /dev/md0$')" "1"
 check "--with-sudoers gives an md array named with a dash or a dot its exact --detail entry, and none to a name with a comma" \
@@ -1524,12 +1542,21 @@ unpinned_run() {
 printf '%s\n' '    (ALL) NOPASSWD: /usr/sbin/smartctl' '    (ALL) NOPASSWD: /sbin/mdadm' \
   '    (ALL) NOPASSWD: /usr/sbin/smartctl, /usr/bin/fail2ban-client ' > "$SUD/bare"
 printf '%s\n' '    (ALL) NOPASSWD: /sbin/mdadm, /usr/bin/fail2ban-client' > "$SUD/adjacent"
+# What the fivenines settings page used to give: a lone "*" is any argument.
+printf '%s\n' '    (root) NOPASSWD: /usr/sbin/nvme *' '    (root) NOPASSWD: /usr/sbin/smartctl *' \
+  '    (root) NOPASSWD: /usr/sbin/mdadm *' '    (root) NOPASSWD: /usr/bin/fail2ban-client *' > "$SUD/starred"
 printf '%s\n' '    (ALL) NOPASSWD: /usr/sbin/smartctl' \
   '    (ALL) NOPASSWD: /sbin/mdadm --version, /sbin/mdadm --detail /dev/md[0-9], /sbin/mdadm --detail /dev/md_data-1' \
+  '    (ALL) NOPASSWD: /usr/sbin/nvme version, /usr/sbin/nvme smart-log /dev/nvme[0-9] -o json, /usr/sbin/nvme smart-log /dev/nvme0 -o json' \
   '    (ALL) NOPASSWD: /usr/bin/fail2ban-client version, /usr/bin/fail2ban-client status, /usr/bin/fail2ban-client status *' \
   '    (root) NOPASSWD: NOLOG_OUTPUT: /usr/bin/wg show all dump' > "$SUD/pinned"
 check "the bare mdadm and fail2ban-client rules sudo lists are named, the pinned ones are not" \
   "$(unpinned_run "$SUD/bare" | grep -c 'run /sbin/mdadm /usr/bin/fail2ban-client with any arguments')|$(unpinned_run "$SUD/adjacent" | grep -c 'run /sbin/mdadm /usr/bin/fail2ban-client with any arguments')|$(unpinned_run "$SUD/pinned")" "1|1|"
+# Value: protects=the "mdadm *", "fail2ban-client *" and "nvme *" rules the fivenines settings page gave are named too, "smartctl *" (what --with-sudoers grants anyway) is not;
+#   fails_when=only a bare path counts as unpinned again, or a pinned "status *" item is named;
+#   why_new=those rules carry a trailing "*" the bare-path match missed; seam=as above; no_claim=real sudo's listing (ci/test-sudo-mail.sh)
+check "the settings page's starred mdadm, fail2ban-client and nvme rules are named, smartctl's is not" \
+  "$(unpinned_run "$SUD/starred" | grep -c 'run /usr/bin/fail2ban-client /usr/sbin/mdadm /usr/sbin/nvme with any arguments')" "1"
 
 # --with-sudoers: the paths a rule may name (fivenines_common.sh, held to its
 # copies in fivenines_setup.sh and fivenines_update.sh by ci/build-scripts.sh).
