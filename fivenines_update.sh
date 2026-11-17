@@ -1,6 +1,12 @@
 #!/bin/sh
 # This script is used to update the fivenines agent
 #
+# Usage: sudo bash fivenines_update.sh [--with-sudoers]
+#
+#   --with-sudoers  Also write /etc/sudoers.d/fivenines: the README's sudoers rules
+#                   for the monitoring tools installed here (smartctl, mdadm,
+#                   fail2ban-client, wg), each checked with visudo first.
+#
 # Environment variables:
 #   FIVENINES_AGENT_URL    - Custom download URL for the agent tarball (e.g., pre-release
 #                            builds). Unverified unless FIVENINES_AGENT_SHA256 is also set.
@@ -512,6 +518,222 @@ install_verified_release_file() {
     return 0
 }
 
+# --with-sudoers (fivenines_setup.sh, fivenines_update.sh): the README's "Full
+# Monitoring" sudoers rules, written for the monitoring tools this host has.
+#
+# Owned by root and writable by nobody else? find prints the path only when
+# every test holds. A symlink's own mode is always 0777: root_only_chain
+# follows links instead of asking this about them.
+root_only_path() {
+    [ -n "$(find "$1" -prune -user 0 ! -perm -020 ! -perm -002 2>/dev/null)" ]
+}
+
+# Can only root change what PATH resolves to? Every component from PATH up to
+# /, and through each symbolic link met on the way (a root-owned link, then
+# its target, the same way), is root's and writable by no one else. A link
+# anywhere in the chain -- /usr/bin/wg -> /etc/alternatives/wg -> ... -- is
+# itself replaceable by whoever can write to the directory holding it, so
+# resolving the path first (readlink -f) would skip exactly those directories.
+# Each link is followed in a subshell (sh has no local variables), at most 40
+# deep, the kernel's own limit. The walk up ends at / or //, which POSIX lets
+# dirname return for a path that starts with two slashes, and after 4096
+# steps whatever happens.
+root_only_chain() {
+    if [ "${2:-0}" -gt 40 ]; then
+        return 1
+    fi
+    chain_path="$1"
+    chain_steps=0
+    while :; do
+        chain_steps=$((chain_steps + 1))
+        if [ "$chain_steps" -gt 4096 ]; then
+            return 1
+        fi
+        if [ -L "$chain_path" ]; then
+            if [ -z "$(find "$chain_path" -prune -user 0 2>/dev/null)" ]; then
+                return 1
+            fi
+            chain_target=$(readlink "$chain_path") || return 1
+            case "$chain_target" in
+                /*) ;;
+                *)
+                    chain_dir=$(dirname "$chain_path")
+                    chain_target="${chain_dir%/}/${chain_target}"
+                    ;;
+            esac
+            ( root_only_chain "$chain_target" $((${2:-0} + 1)) ) || return 1
+        elif ! root_only_path "$chain_path"; then
+            return 1
+        fi
+        case "$chain_path" in
+            / | //) return 0 ;;
+        esac
+        chain_path=$(dirname "$chain_path")
+    done
+}
+
+# The path a rule for TOOL names, or nothing and a non-zero status when TOOL is
+# not installed, or when anyone but root could change what that path runs
+# (root_only_chain): a rule there would hand root to whoever can. Looked up in
+# sudo's usual secure_path, in its order, rather than in the caller's PATH (su
+# without - keeps a PATH with no sbin). Warnings go to stderr: the path is
+# this function's output.
+sudoers_tool_path() {
+    tool_path=""
+    for tool_dir in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+        if [ -f "${tool_dir}/$1" ] && [ -x "${tool_dir}/$1" ]; then
+            tool_path="${tool_dir}/$1"
+            break
+        fi
+    done
+    if [ -z "$tool_path" ]; then
+        return 1
+    fi
+    if ! root_only_chain "$tool_path"; then
+        print_warning "No sudoers rule for ${tool_path}: a user other than root can change what it runs." >&2
+        return 1
+    fi
+    printf '%s' "$tool_path"
+}
+
+# Writes /etc/sudoers.d/fivenines. Each rule is written only if this host's
+# visudo accepts it ON ITS OWN, so a rule one sudo does not understand (an old
+# sudo, sudo-rs) costs that rule, never a file that breaks sudo for everyone.
+# A file at that path whose first line is not the marker was written by the
+# operator and is never touched; fivenines_uninstall.sh removes only a file
+# that starts with the marker. Returns non-zero when nothing was written: the
+# caller says so and carries on, since the agent runs without these rules.
+write_sudoers_rules() {
+    sudoers_file="/etc/sudoers.d/fivenines"
+    sudoers_marker="# Managed by the fivenines agent installer (--with-sudoers)"
+
+    if ! command -v visudo > /dev/null 2>&1; then
+        print_warning "--with-sudoers: sudo is not installed here (no visudo), so no rule was written."
+        return 1
+    fi
+    if [ ! -d /etc/sudoers.d ]; then
+        print_warning "--with-sudoers: /etc/sudoers.d does not exist, so no rule was written."
+        return 1
+    fi
+    if [ -e "$sudoers_file" ] || [ -L "$sudoers_file" ]; then
+        if ! head -n 1 "$sudoers_file" 2>/dev/null | grep -qxF "$sudoers_marker"; then
+            print_warning "--with-sudoers: ${sudoers_file} was not written by this installer, so it was left as it is."
+            return 1
+        fi
+    fi
+
+    sudoers_staged="${WORK_DIR}/sudoers"
+    sudoers_one="${WORK_DIR}/sudoers.rule"
+    rm -f "$sudoers_staged" "$sudoers_one"
+    if ! printf '%s\n%s\n' "$sudoers_marker" \
+        "# The monitoring commands of the fivenines agent (README, Full Monitoring)." \
+        > "$sudoers_staged"; then
+        return 1
+    fi
+    sudoers_rules=0
+    for sudoers_tool in smartctl mdadm fail2ban-client wg; do
+        sudoers_path=$(sudoers_tool_path "$sudoers_tool") || continue
+        # Each tool that can run code or change the host given other
+        # arguments is held to the argv the agent runs. sudo matches a
+        # wildcard across argument boundaries, so a pattern that must not
+        # reach a further argument has no '*'.
+        case "$sudoers_tool" in
+            mdadm)
+                # raid_storage.py: --version, and --detail on /dev/<name> for
+                # each md line of /proc/mdstat. "--detail *" would also match
+                # "--detail /dev/md0 --stop /dev/md1" (misc mode takes an
+                # action per device), and a bare rule allows --monitor
+                # --program, which runs a command as root. An array the kernel
+                # names otherwise (CREATE names=yes, md_d0, md1000) gets its
+                # own exact entry: without one the agent's --detail would be
+                # refused on every collection, and on Debian and Ubuntu sudo
+                # mails root each refusal. One created later needs this run
+                # again.
+                sudoers_rule="fivenines ALL=(ALL) NOPASSWD: ${sudoers_path} --version, ${sudoers_path} --detail /dev/md[0-9], ${sudoers_path} --detail /dev/md[0-9][0-9], ${sudoers_path} --detail /dev/md[0-9][0-9][0-9]"
+                # One array name per line, never a space (awk prints the first
+                # field), so the words are the names.
+                # shellcheck disable=SC2013
+                for sudoers_md in $(awk '/^md/ { print $1 }' /proc/mdstat 2>/dev/null); do
+                    case "$sudoers_md" in
+                        md[0-9] | md[0-9][0-9] | md[0-9][0-9][0-9]) ;;
+                        *[!A-Za-z0-9_]*)
+                            print_warning "No sudoers entry for /dev/${sudoers_md}: its name holds a character a rule cannot carry as is."
+                            ;;
+                        *) sudoers_rule="${sudoers_rule}, ${sudoers_path} --detail /dev/${sudoers_md}" ;;
+                    esac
+                done
+                ;;
+            fail2ban-client)
+                # fail2ban.py: version, status, status JAIL. A bare rule allows
+                # "set JAIL action ... actionban CMD", which runs CMD as root;
+                # anything after status only reaches the read-only status.
+                sudoers_rule="fivenines ALL=(ALL) NOPASSWD: ${sudoers_path} version, ${sudoers_path} status, ${sudoers_path} status *"
+                ;;
+            wg)
+                # The exact argv wireguard.py runs, never wg alone, which would
+                # let the agent reconfigure every tunnel. NOLOG_OUTPUT keeps
+                # the keys the dump prints out of an I/O log.
+                sudoers_rule="fivenines ALL=(root) NOPASSWD:NOLOG_OUTPUT: ${sudoers_path} show all dump"
+                ;;
+            *)
+                # smartctl: the agent passes options and a device that vary by
+                # drive, so the rule names none. It runs no command and writes
+                # no file, but it can change a drive's settings (-s, --set,
+                # -t): the README says so.
+                sudoers_rule="fivenines ALL=(ALL) NOPASSWD: ${sudoers_path}"
+                ;;
+        esac
+        rm -f "$sudoers_one"
+        printf '%s\n' "$sudoers_rule" > "$sudoers_one" && chmod 440 "$sudoers_one"
+        if visudo -cf "$sudoers_one" > /dev/null 2>&1; then
+            printf '%s\n' "$sudoers_rule" >> "$sudoers_staged"
+            sudoers_rules=$((sudoers_rules + 1))
+            print_success "sudoers rule: ${sudoers_rule}"
+        else
+            print_warning "This host's visudo rejects '${sudoers_rule}': not written."
+        fi
+    done
+    rm -f "$sudoers_one"
+
+    if [ "$sudoers_rules" -eq 0 ]; then
+        print_warning "--with-sudoers: none of smartctl, mdadm, fail2ban-client or wg is usable here, so no rule was written."
+        rm -f "$sudoers_staged"
+        return 1
+    fi
+    chmod 440 "$sudoers_staged"
+    if ! visudo -cf "$sudoers_staged" > /dev/null 2>&1; then
+        print_warning "--with-sudoers: visudo rejects the rules together, so none was written."
+        rm -f "$sudoers_staged"
+        return 1
+    fi
+
+    # Landed like install_verified_release_file lands a unit: through a
+    # sibling in the destination directory, renamed into place. sudo skips
+    # every name in /etc/sudoers.d that contains a dot, so it never reads the
+    # sibling half-written, and a file created there gets the directory's
+    # SELinux type (sudo cannot read one labelled as /tmp).
+    sudoers_new="${sudoers_file}.fivenines-new"
+    rm -f "$sudoers_new"
+    if ! cp "$sudoers_staged" "$sudoers_new" || ! chown 0:0 "$sudoers_new" \
+        || ! chmod 440 "$sudoers_new"; then
+        rm -f "$sudoers_staged" "$sudoers_new"
+        return 1
+    fi
+    rm -f "$sudoers_staged"
+    if command -v restorecon > /dev/null 2>&1; then
+        restorecon "$sudoers_new" > /dev/null 2>&1 || true
+    fi
+    if ! mv -f "$sudoers_new" "$sudoers_file"; then
+        rm -f "$sudoers_new"
+        return 1
+    fi
+    print_success "Wrote ${sudoers_file} (${sudoers_rules} rule(s))"
+    if ! grep -Eq '^[[:space:]]*[#@]includedir[[:space:]]+/etc/sudoers\.d/?[[:space:]]*$' /etc/sudoers 2>/dev/null; then
+        print_warning "/etc/sudoers has no includedir line for /etc/sudoers.d: sudo ignores ${sudoers_file} until it does."
+    fi
+    return 0
+}
+
 detect_libc() {
     # Check ldd first - if it explicitly reports glibc or musl, trust that
     LDD_OUTPUT=$(ldd --version 2>&1 || true)
@@ -608,6 +830,17 @@ agent_is_running() {
     systemctl is-active --quiet fivenines-agent.service
   fi
 }
+
+# Any other argument is ignored, as every argument was before --with-sudoers
+# existed (a token passed out of habit must not stop an update), and said
+# without its value: that token would otherwise land in a job's log.
+WITH_SUDOERS=0
+for arg in "$@"; do
+  case "$arg" in
+    --with-sudoers) WITH_SUDOERS=1 ;;
+    *) print_warning "Ignoring an argument this script does not take (usage: sudo bash fivenines_update.sh [--with-sudoers])" ;;
+  esac
+done
 
 # Detect system type
 SYSTEM_TYPE=$(detect_system)
@@ -781,6 +1014,13 @@ if command -v restorecon >/dev/null 2>&1; then
   restorecon -Rv "$INSTALL_DIR" 2>/dev/null || true
 fi
 
+# Before the restart, so the agent's first capability probe sees them. Not
+# fatal: the agent runs without them, as it did before this update.
+SUDOERS_SKIPPED=0
+if [ "$WITH_SUDOERS" = "1" ]; then
+  write_sudoers_rules || SUDOERS_SKIPPED=1
+fi
+
 # Update service file and restart (skip in test mode)
 if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
   print_warning "Updating the service file..."
@@ -853,6 +1093,10 @@ printf '%b\n' "${BLUE}==========================================================
 printf '%b\n' "${BLUE}  Update Complete!${NC}"
 printf '%b\n' "${BLUE}===============================================================${NC}"
 echo ""
+if [ "$SUDOERS_SKIPPED" = "1" ]; then
+  print_warning "No sudoers rule was written (see above). The README's Full Monitoring section lists them."
+  echo ""
+fi
 
 # Remove the update script
 rm -f fivenines_update.sh 2>/dev/null || true

@@ -4,6 +4,15 @@
 # For environments without root access (shared hosting, managed VPS, etc.)
 #
 # Usage: bash fivenines_setup_user.sh YOUR_TOKEN
+#        bash fivenines_setup_user.sh --from-system
+#
+#   --from-system  Move this host's system installation (fivenines_setup.sh) to a
+#                  user-level installation for the user running this script. The
+#                  agent keeps its token, machine id and state, so the dashboard
+#                  keeps the same host. Needs sudo, to read, stop and remove the
+#                  system installation (with the release's fivenines_uninstall.sh,
+#                  verified against its signed manifest). Adds an @reboot line to
+#                  your crontab, since the system agent started at boot. Not on UNRAID.
 #
 # Environment variables:
 #   FIVENINES_AGENT_URL    - Custom download URL for the agent tarball (e.g., feature branch builds).
@@ -37,6 +46,8 @@ GITHUB_RELEASES_URL="https://github.com/Five-Nines-io/fivenines_agent/releases/l
 INSTALL_DIR="${FIVENINES_INSTALL_DIR:-$HOME/.local/fivenines}"
 CONFIG_DIR="${FIVENINES_CONFIG_DIR:-$HOME/.config/fivenines_agent}"
 LOG_FILE="$INSTALL_DIR/agent.log"
+# Never inherited from the environment: ensure_work_dir creates it.
+WORK_DIR=""
 
 # Colors for output
 RED='\033[0;31m'
@@ -561,6 +572,16 @@ save_token() {
     echo ""
 }
 
+# One private work directory per run, removed on exit (--from-system needs it
+# before the agent is downloaded).
+ensure_work_dir() {
+    if [ -n "${WORK_DIR:-}" ]; then
+        return 0
+    fi
+    WORK_DIR=$(make_work_dir) || exit_with_error "Failed to create a private temporary directory"
+    trap 'rm -rf "$WORK_DIR"' EXIT
+}
+
 download_agent() {
     echo "Downloading agent..."
 
@@ -570,8 +591,7 @@ download_agent() {
     # somewhere only this process can reach. The CI harness still pre-places
     # a tarball at the old path, which is copied in rather than used in place.
     preplaced_tarball="/tmp/${tarball_name}"
-    WORK_DIR=$(make_work_dir) || exit_with_error "Failed to create a private temporary directory"
-    trap 'rm -rf "$WORK_DIR"' EXIT
+    ensure_work_dir
     tarball_path="${WORK_DIR}/${tarball_name}"
 
     # Only download_with_fallback sets this; an empty value means the tarball
@@ -638,6 +658,120 @@ test_connectivity() {
     echo ""
 }
 
+# The pgrep -f pattern for an agent run from INSTALL_DIR: anchored on the
+# agent's own path (start.sh runs it by that path), so neither another user's
+# agent nor a shell or a tail -f that merely names a file in that directory
+# ever matches, with the regex characters a path may hold (/home/a+b) escaped.
+agent_pattern() {
+    printf '^%s/fivenines-agent-' "$(printf '%s' "$1" | sed 's/[][\.*^$+?(){}|]/\\&/g')"
+}
+
+# stop.sh, status.sh, logs.sh and refresh.sh. They find the agent two ways:
+# by its path (agent_pattern; they used to look for the binary name anywhere
+# in any command line, so status.sh could report another user's agent and
+# stop.sh or refresh.sh signal it), and by the PID start.sh recorded, when that
+# process is an agent. The second catches an agent started under another
+# spelling of this directory (a trailing slash, a symlink): start.sh keeps the
+# spelling it was written with, while fivenines_update_user.sh rewrites these
+# scripts with the one it was given -- a stop.sh trusting the path alone said
+# "not running", and the update started a second agent with the same
+# identity. The recorded PID is taken only when /proc shows an agent binary
+# as its argv[0], so a PID the system has since reused (by a tail -f of the
+# agent's log, say) is never signalled. The update rewrites
+# these scripts so an existing installation gets them; never start.sh, which
+# carries the config directory the installation was made with.
+write_control_scripts() {
+    control_log="$INSTALL_DIR/agent.log"
+    control_pattern=$(agent_pattern "$INSTALL_DIR")
+    control_find=$(cat << EOF
+PIDS=\$(pgrep -f '$control_pattern' 2>/dev/null)
+AGENT_PID=\$(cat "$INSTALL_DIR/agent.pid" 2>/dev/null)
+case "\$AGENT_PID" in
+    ''|*[!0-9]*) ;;
+    *)
+        if tr '\0' '\n' < "/proc/\$AGENT_PID/cmdline" 2>/dev/null | head -n 1 \\
+            | grep -q '/fivenines-agent-[^/]*/fivenines-agent-[^/]*\$'; then
+            PIDS="\$PIDS \$AGENT_PID"
+        fi
+        ;;
+esac
+PIDS=\$(printf '%s\n' \$PIDS | sort -un | tr '\n' ' ')
+PIDS=\${PIDS% }
+EOF
+)
+
+    cat > "$INSTALL_DIR/stop.sh" << EOF
+#!/bin/bash
+# Stop the Fivenines agent: every process running this installation's agent.
+$control_find
+rm -f "$INSTALL_DIR/agent.pid"
+if [ -n "\$PIDS" ] && kill \$PIDS 2>/dev/null; then
+    echo "Agent stopped (PID: \$PIDS)"
+else
+    echo "Agent not running"
+fi
+EOF
+    chmod +x "$INSTALL_DIR/stop.sh"
+    print_success "Created stop.sh"
+
+    cat > "$INSTALL_DIR/status.sh" << EOF
+#!/bin/bash
+# Check Fivenines agent status
+$control_find
+if [ -n "\$PIDS" ]; then
+    echo "Agent is running (PID: \$PIDS)"
+    echo "Log file: $control_log"
+    echo ""
+    echo "Last 10 log lines:"
+    tail -10 "$control_log" 2>/dev/null || echo "(no log yet)"
+else
+    echo "Agent is not running"
+fi
+EOF
+    chmod +x "$INSTALL_DIR/status.sh"
+    print_success "Created status.sh"
+
+    cat > "$INSTALL_DIR/logs.sh" << EOF
+#!/bin/bash
+# View Fivenines agent logs
+tail -f "$control_log"
+EOF
+    chmod +x "$INSTALL_DIR/logs.sh"
+    print_success "Created logs.sh"
+
+    cat > "$INSTALL_DIR/refresh.sh" << EOF
+#!/bin/bash
+# Refresh agent capabilities (after permission changes)
+$control_find
+if [ -n "\$PIDS" ] && kill -HUP \$PIDS 2>/dev/null; then
+    echo "Sent SIGHUP to agent (PID: \$PIDS) - capabilities will refresh"
+else
+    echo "Agent is not running"
+fi
+EOF
+    chmod +x "$INSTALL_DIR/refresh.sh"
+    print_success "Created refresh.sh"
+}
+
+# How a crontab line can name INSTALL_DIR's start.sh: the absolute path the
+# installers print and, when INSTALL_DIR is under HOME, the ~/ form the README
+# shows and its $HOME/ and ${HOME}/ forms. Sets START_SPELLING_1 to _4 (all
+# four the absolute path when INSTALL_DIR is not under HOME).
+start_spellings() {
+    START_SPELLING_1="$1/start.sh"
+    START_SPELLING_2="$START_SPELLING_1"
+    START_SPELLING_3="$START_SPELLING_1"
+    START_SPELLING_4="$START_SPELLING_1"
+    start_rel="${1#"$2"/}"
+    if [ -n "$2" ] && [ "$start_rel" != "$1" ]; then
+        # The tilde and the dollar signs are the literal text of the line.
+        # shellcheck disable=SC2088
+        START_SPELLING_2="~/$start_rel/start.sh"
+        START_SPELLING_3="\$HOME/$start_rel/start.sh"
+        START_SPELLING_4="\${HOME}/$start_rel/start.sh"
+    fi
+}
+
 create_run_script() {
     echo "Creating helper scripts..."
 
@@ -654,75 +788,7 @@ EOF
     chmod +x "$INSTALL_DIR/start.sh"
     print_success "Created start.sh"
 
-    # Create stop script
-    cat > "$INSTALL_DIR/stop.sh" << EOF
-#!/bin/bash
-# Stop the Fivenines agent
-if [ -f "$INSTALL_DIR/agent.pid" ]; then
-    PID=\$(cat "$INSTALL_DIR/agent.pid")
-    if kill -0 "\$PID" 2>/dev/null; then
-        kill "\$PID"
-        rm -f "$INSTALL_DIR/agent.pid"
-        echo "Agent stopped (PID: \$PID)"
-    else
-        echo "Agent not running (stale PID file)"
-        rm -f "$INSTALL_DIR/agent.pid"
-    fi
-else
-    # Try to find by process name
-    PID=\$(pgrep -f "$BINARY_NAME" 2>/dev/null | head -1)
-    if [ -n "\$PID" ]; then
-        kill "\$PID"
-        echo "Agent stopped (PID: \$PID)"
-    else
-        echo "Agent not running"
-    fi
-fi
-EOF
-    chmod +x "$INSTALL_DIR/stop.sh"
-    print_success "Created stop.sh"
-
-    # Create status script
-    cat > "$INSTALL_DIR/status.sh" << EOF
-#!/bin/bash
-# Check Fivenines agent status
-PID=\$(pgrep -f "$BINARY_NAME" 2>/dev/null | head -1)
-if [ -n "\$PID" ]; then
-    echo "Agent is running (PID: \$PID)"
-    echo "Log file: $LOG_FILE"
-    echo ""
-    echo "Last 10 log lines:"
-    tail -10 "$LOG_FILE" 2>/dev/null || echo "(no log yet)"
-else
-    echo "Agent is not running"
-fi
-EOF
-    chmod +x "$INSTALL_DIR/status.sh"
-    print_success "Created status.sh"
-
-    # Create logs script
-    cat > "$INSTALL_DIR/logs.sh" << EOF
-#!/bin/bash
-# View Fivenines agent logs
-tail -f "$LOG_FILE"
-EOF
-    chmod +x "$INSTALL_DIR/logs.sh"
-    print_success "Created logs.sh"
-
-    # Create refresh script (SIGHUP)
-    cat > "$INSTALL_DIR/refresh.sh" << EOF
-#!/bin/bash
-# Refresh agent capabilities (after permission changes)
-PID=\$(pgrep -f "$BINARY_NAME" 2>/dev/null | head -1)
-if [ -n "\$PID" ]; then
-    kill -HUP "\$PID"
-    echo "Sent SIGHUP to agent (PID: \$PID) - capabilities will refresh"
-else
-    echo "Agent is not running"
-fi
-EOF
-    chmod +x "$INSTALL_DIR/refresh.sh"
-    print_success "Created refresh.sh"
+    write_control_scripts
 
     echo ""
 }
@@ -735,7 +801,7 @@ start_agent() {
     # Wait a moment and check if it's running
     sleep 2
 
-    if pgrep -f "$BINARY_NAME" > /dev/null; then
+    if pgrep -f "$(agent_pattern "$INSTALL_DIR")" > /dev/null; then
         print_success "Agent is running"
     else
         print_warning "Agent may have failed to start. Check logs:"
@@ -769,11 +835,322 @@ print_final_instructions() {
     echo "  $INSTALL_DIR/logs.sh     - View agent logs"
     echo "  $INSTALL_DIR/refresh.sh  - Refresh capabilities (after permission changes)"
     echo ""
-    print_crontab_instructions
+    if [ "$FROM_SYSTEM" = "1" ]; then
+        echo "The system agent now runs as this user-level installation, with the"
+        echo "same token and machine id: the dashboard keeps the same host."
+        echo ""
+    fi
+    if [ "${REBOOT_ENTRY_ADDED:-0}" != "1" ]; then
+        print_crontab_instructions
+    fi
     printf '%b\n' "${YELLOW}Note:${NC} Some features (SMART, RAID) are unavailable without sudo."
     echo ""
     echo "Happy monitoring!"
     echo ""
+}
+
+# ---------------------------------------------------------------------------
+# --from-system: move the system installation (fivenines_setup.sh) to this
+# user-level one.
+#
+# The user-level agent takes over the system agent's identity -- its TOKEN
+# (the per-host token it swapped the enrollment token for) and its MACHINE_ID
+# -- and its state, so the dashboard keeps the same host instead of enrolling
+# a second one. The system agent is stopped before its state is read and
+# before this one starts (two agents with one identity would report as one
+# host, twice). The system installation is removed by the release's own
+# fivenines_uninstall.sh, so this script carries no second copy of what that
+# takes; it runs as root, so it is verified before anything changes.
+# ---------------------------------------------------------------------------
+
+# What the agent keeps in its config directory that the new installation
+# carries over: see fivenines_setup.sh, which carries the same files the other
+# way (ci/build-scripts.sh keeps the two lines equal).
+STATE_FILES="TOKEN MACHINE_ID last_capture_id journal_units.allow"
+# Not carried as such: /etc/fivenines_agent belongs to the fivenines account
+# (0750, so the agent can write its state), so its .env is that account's
+# choice, and loaded into this user's agent it would pick the environment of a
+# process run by a user who can use sudo. It is copied as .env.system, which
+# nothing reads, for the user to review. image_inventory_done is only a cache:
+# each image is scanned once again.
+SYSTEM_ENV_COPY=".env.system"
+# What this run wrote into the user's config directory, all of it taken back
+# when the move is undone (and nothing that was there before).
+COPIED_STATE_FILES=""
+# A state file is a few KB at most: anything bigger is not one.
+STATE_FILE_MAX=16777216
+SYSTEM_CONFIG_DIR="/etc/fivenines_agent"
+
+# as_root SCRIPT [ARG...]: run SCRIPT with sh through sudo, with the ARGs as
+# $1, $2... They are never pasted into SCRIPT, so a path is never parsed as
+# shell code.
+as_root() {
+    as_root_script="$1"
+    shift
+    sudo sh -c "$as_root_script" sh "$@"
+}
+
+# A user-level install on a host that runs the system agent too: both would
+# run, as two hosts. Not refused (it may be deliberate), but said, with the
+# way to move it instead.
+hint_system_installation() {
+    if [ -d "$SYSTEM_CONFIG_DIR" ]; then
+        print_warning "This host has a system installation of the agent ($SYSTEM_CONFIG_DIR): this one would run beside it, as another host."
+        print_warning "To move the system agent to this user instead, keeping its host: bash fivenines_setup_user.sh --from-system"
+        echo ""
+    fi
+}
+
+fetch_system_uninstaller() {
+    UNINSTALLER="${WORK_DIR}/fivenines_uninstall.sh"
+    # The test harness pre-places it, like the tarball. Any local user can
+    # create a file in /tmp, and this one runs as root: only one owned by root
+    # or by this user, and writable by no one else, is taken.
+    if [ "${FIVENINES_TEST_MODE:-}" = "1" ] && [ -f /tmp/fivenines_uninstall.sh ] \
+        && [ -n "$(find /tmp/fivenines_uninstall.sh -prune \( -user 0 -o -user "$(id -u)" \) ! -perm -020 ! -perm -002 2>/dev/null)" ]; then
+        print_warning "Using pre-placed fivenines_uninstall.sh (test mode)"
+        cp /tmp/fivenines_uninstall.sh "$UNINSTALLER"
+        return
+    fi
+    download_with_fallback "fivenines_uninstall.sh" "$UNINSTALLER" || return 1
+    if [ "${FIVENINES_SKIP_VERIFY:-}" = "1" ]; then
+        print_warning "FIVENINES_SKIP_VERIFY=1 - fivenines_uninstall.sh will run as root UNVERIFIED."
+        return 0
+    fi
+    verify_from_manifest "$UNINSTALLER" "fivenines_uninstall.sh"
+}
+
+# Before anything is installed, so a refusal leaves the host as it was.
+preflight_system_takeover() {
+    if [ "$(id -u)" = "0" ]; then
+        exit_with_error "Run --from-system as the user the agent is to run as, not as root."
+    fi
+    if [ -f /etc/unraid-version ]; then
+        exit_with_error "--from-system is not supported on UNRAID."
+    fi
+    if [ -e "$CONFIG_DIR/TOKEN" ] || [ -L "$CONFIG_DIR/TOKEN" ]; then
+        exit_with_error "$CONFIG_DIR/TOKEN exists: this user already has a user-level installation. If an earlier --from-system stopped once the system installation was removed, that TOKEN is the agent's identity: start it with $INSTALL_DIR/start.sh. Otherwise remove it first with fivenines_uninstall_user.sh."
+    fi
+    if ! command -v sudo > /dev/null 2>&1; then
+        exit_with_error "--from-system needs sudo, to read, stop and remove the system installation."
+    fi
+    if ! command -v base64 > /dev/null 2>&1; then
+        exit_with_error "--from-system needs base64 (coreutils or busybox) to carry the agent's state over."
+    fi
+    echo "Moving the system installation needs sudo: to read its token, then stop and remove it."
+    sudo -v || exit_with_error "sudo did not authenticate: nothing was changed."
+    # The quoted $1 is as_root's argument, expanded by root's shell.
+    # shellcheck disable=SC2016
+    if ! as_root 'test -f "$1" && test -s "$1"' "$SYSTEM_CONFIG_DIR/TOKEN"; then
+        exit_with_error "No system installation found: $SYSTEM_CONFIG_DIR/TOKEN is missing or empty."
+    fi
+    ensure_work_dir
+    fetch_system_uninstaller || exit_with_error "Could not get a verified fivenines_uninstall.sh: nothing was changed."
+    print_success "Moving the system installation to the user-level installation of $(id -un) ($INSTALL_DIR)"
+    echo ""
+}
+
+# su and sudo can print to stdout before the command does (a PAM session
+# module: RHEL's postlogin runs pam_lastlog with showfailed, which reports
+# failed logins), so a state file crosses over base64-encoded between two
+# marker lines, and only what lies between them is kept. base64's alphabet has
+# no dash, so no encoded line can read as a marker. fivenines_setup.sh
+# carries the same function, for su (ci/build-scripts.sh keeps them equal).
+decode_state() {
+    if ! grep -qx 'fivenines-state-end' "$1"; then
+        return 1
+    fi
+    sed -n '/^fivenines-state-begin$/,/^fivenines-state-end$/p' "$1" | sed '1d;$d' | base64 -d > "$2"
+}
+
+# Read each state file through sudo, after the system agent stopped (it may
+# have just swapped its token), then put it in this user's config directory.
+# A file that exists but is not a regular file, or cannot be read, stops the
+# move rather than being dropped: a journal allowlist left behind would let
+# the agent read every unit's journal.
+copy_system_state() {
+    state_stash="${WORK_DIR}/system_state"
+    mkdir "$state_stash" || return 1
+    for state_file in $STATE_FILES .env; do
+        state_rc=0
+        # shellcheck disable=SC2016
+        as_root '
+            if [ ! -e "$1" ] && [ ! -L "$1" ]; then exit 3; fi
+            if [ -L "$1" ] || [ ! -f "$1" ]; then exit 4; fi
+            echo "fivenines-state-begin"
+            head -c "$2" -- "$1" | base64
+            echo "fivenines-state-end"' "$SYSTEM_CONFIG_DIR/$state_file" "$((STATE_FILE_MAX + 1))" \
+            > "$state_stash/$state_file.b64" || state_rc=$?
+        if [ "$state_rc" -eq 0 ] \
+            && ! decode_state "$state_stash/$state_file.b64" "$state_stash/$state_file"; then
+            state_rc=5
+        fi
+        rm -f "${state_stash:?}/${state_file:?}.b64"
+        case "$state_rc" in
+            0) ;;
+            3)
+                continue
+                ;;
+            4)
+                print_error "$SYSTEM_CONFIG_DIR/$state_file is not a regular file: fix or remove it, then re-run."
+                return 1
+                ;;
+            *)
+                print_error "Could not read $SYSTEM_CONFIG_DIR/$state_file."
+                return 1
+                ;;
+        esac
+        if [ "$(wc -c < "$state_stash/$state_file")" -gt "$STATE_FILE_MAX" ]; then
+            print_error "$SYSTEM_CONFIG_DIR/$state_file is larger than any agent state file."
+            return 1
+        fi
+    done
+    if [ ! -s "$state_stash/TOKEN" ]; then
+        print_error "$SYSTEM_CONFIG_DIR/TOKEN is empty."
+        return 1
+    fi
+    for state_file in $STATE_FILES .env; do
+        if [ ! -f "$state_stash/$state_file" ]; then
+            continue
+        fi
+        state_dest="$state_file"
+        if [ "$state_file" = ".env" ]; then
+            state_dest="$SYSTEM_ENV_COPY"
+        fi
+        COPIED_STATE_FILES="$COPIED_STATE_FILES $state_dest"
+        if ! (umask 077 && cp "$state_stash/$state_file" "$CONFIG_DIR/$state_dest") \
+            || ! chmod 600 "$CONFIG_DIR/$state_dest"; then
+            print_error "Could not write $CONFIG_DIR/$state_dest."
+            return 1
+        fi
+        if [ "$state_file" = ".env" ]; then
+            print_warning "$SYSTEM_CONFIG_DIR/.env was copied to $CONFIG_DIR/$SYSTEM_ENV_COPY, which the agent does not read: the fivenines account could write it. Review it, and rename it to .env if you need it."
+        else
+            print_success "Carried over $state_file"
+        fi
+    done
+}
+
+# What the service's own start would do; used to put the system agent back
+# when the move fails before anything was removed.
+restart_system_agent() {
+    if [ "${FIVENINES_TEST_MODE:-}" = "1" ]; then
+        return 0
+    fi
+    as_root '
+        if [ -f /etc/systemd/system/fivenines-agent.service ] && command -v systemctl > /dev/null 2>&1; then
+            systemctl start fivenines-agent.service
+        elif [ -f /etc/init.d/fivenines-agent ] && command -v rc-service > /dev/null 2>&1; then
+            rc-service fivenines-agent start
+        fi' || print_warning "Could not start the system agent again: sudo systemctl start fivenines-agent (or rc-service fivenines-agent start)"
+}
+
+# A move that fails, or is interrupted, between the system agent's stop and
+# its removal: take back what was copied (no second copy of that identity is
+# left behind), and start the system agent again.
+abort_system_takeover() {
+    trap '' INT TERM HUP
+    # The copy is taken back only when the system installation still has its
+    # TOKEN. Once the uninstaller removed it, the copy is the agent's only
+    # identity: kept, and said. When sudo cannot tell either way, kept too:
+    # a second copy on disk can be removed, a lost identity cannot be rebuilt.
+    # shellcheck disable=SC2016
+    if as_root 'test -e "$1/TOKEN"' "$SYSTEM_CONFIG_DIR"; then
+        for state_file in $COPIED_STATE_FILES; do
+            rm -f "${CONFIG_DIR:?}/${state_file:?}"
+        done
+        restart_system_agent
+        exit_with_error "$1"
+    fi
+    # shellcheck disable=SC2016
+    if as_root '! test -e "$1/TOKEN"' "$SYSTEM_CONFIG_DIR"; then
+        exit_with_error "Stopped after the system installation was removed: the agent's identity is now in $CONFIG_DIR. Start the agent with $INSTALL_DIR/start.sh, and add '@reboot $INSTALL_DIR/start.sh' to your crontab (crontab -e)."
+    fi
+    exit_with_error "Stopped, and sudo could not tell whether $SYSTEM_CONFIG_DIR/TOKEN still exists. If it does, remove what was copied to $CONFIG_DIR and start the system agent again; if it does not, start this one with $INSTALL_DIR/start.sh."
+}
+
+# Once this installation is in place (not started).
+take_over_system_install() {
+    # Not interrupted halfway: stopped, the system agent would stay stopped,
+    # nothing yet armed to start it again.
+    trap '' INT TERM HUP
+    if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
+        print_warning "Stopping the system agent..."
+        as_root '
+            if [ -f /etc/systemd/system/fivenines-agent.service ] && command -v systemctl > /dev/null 2>&1; then
+                systemctl stop fivenines-agent.service
+            elif [ -f /etc/init.d/fivenines-agent ] && command -v rc-service > /dev/null 2>&1; then
+                rc-service fivenines-agent stop
+            fi' || exit_with_error "Could not stop the system agent: nothing was moved."
+    else
+        print_warning "Skipping the system agent stop (test mode)"
+    fi
+
+    # Armed until the end of the run: before the uninstaller removed the
+    # system TOKEN, an interrupt takes the copy back and restarts the system
+    # agent; after it, it keeps the copy and says how to start this agent.
+    trap 'abort_system_takeover "Interrupted: the system installation was not changed."' INT TERM HUP
+
+    if ! copy_system_state; then
+        abort_system_takeover "Could not carry the system agent's state over: the system installation was not changed."
+    fi
+
+    print_warning "Removing the system installation..."
+    # The verified uninstaller still sits in this user's private work
+    # directory: only this user's own processes could have rewritten it since,
+    # and those could as well wrap sudo itself (an alias, PATH) -- the trust
+    # the README's own wget && sudo bash commands rest on.
+    # shellcheck disable=SC2016
+    if ! as_root 'cd "$1" && FIVENINES_TEST_MODE="$2" sh ./fivenines_uninstall.sh' \
+        "$WORK_DIR" "${FIVENINES_TEST_MODE:-}"; then
+        print_warning "fivenines_uninstall.sh reported an error."
+    fi
+    # The system TOKEN must be gone, not merely the agent stopped: a service
+    # that still has it would start at boot beside this agent, with the same
+    # identity. Then the copy is taken back, and the identity stays where it
+    # was. A sudo that fails reads as not gone.
+    # shellcheck disable=SC2016
+    if ! as_root '! test -e "$1/TOKEN"' "$SYSTEM_CONFIG_DIR"; then
+        abort_system_takeover "fivenines_uninstall.sh did not remove the system installation: what was copied was taken back, and the system agent restarted if it could be. Check it (sudo systemctl status fivenines-agent), fix what failed, and re-run."
+    fi
+    # Past this point the identity lives only in this user's config, so a
+    # leftover service definition is said, never undone: without its TOKEN it
+    # cannot start.
+    if ! as_root '! test -e /etc/systemd/system/fivenines-agent.service && ! test -e /etc/init.d/fivenines-agent'; then
+        print_warning "The fivenines-agent service definition is still installed (it cannot start without its TOKEN): remove it with fivenines_uninstall.sh."
+    fi
+    # Never two agents with one identity: if the system agent survived its
+    # removal, this one is installed but not started.
+    # shellcheck disable=SC2016
+    if [ "${FIVENINES_TEST_MODE:-}" != "1" ] \
+        && as_root 'pgrep -f "^/opt/fivenines/" > /dev/null 2>&1'; then
+        exit_with_error "The system agent still runs. Stop and disable it (sudo systemctl disable fivenines-agent; sudo systemctl stop fivenines-agent), then start this one with $INSTALL_DIR/start.sh, and add '@reboot $INSTALL_DIR/start.sh' to your crontab (crontab -e). Its identity is in $CONFIG_DIR."
+    fi
+    echo ""
+}
+
+# The system agent started at boot; this one does too, from the crontab line
+# print_crontab_instructions describes.
+add_reboot_entry() {
+    reboot_line="@reboot $INSTALL_DIR/start.sh"
+    if ! command -v crontab > /dev/null 2>&1; then
+        print_warning "No crontab command here, so nothing starts the agent at boot."
+        return 1
+    fi
+    reboot_entries=$(crontab -l 2>/dev/null || true)
+    start_spellings "$INSTALL_DIR" "$HOME"
+    if printf '%s\n' "$reboot_entries" | grep -qF -e "$START_SPELLING_1" -e "$START_SPELLING_2" \
+        -e "$START_SPELLING_3" -e "$START_SPELLING_4"; then
+        print_success "Your crontab already starts the agent at boot"
+        return 0
+    fi
+    if { if [ -n "$reboot_entries" ]; then printf '%s\n' "$reboot_entries"; fi; printf '%s\n' "$reboot_line"; } | crontab -; then
+        print_success "Added to your crontab: $reboot_line"
+        echo ""
+        return 0
+    fi
+    print_warning "Could not add the @reboot line to your crontab."
+    return 1
 }
 
 # Test mode: skip network calls and service management for CI testing
@@ -784,18 +1161,39 @@ fi
 # Main execution
 print_banner
 
-# Check token argument
-if [ $# -eq 0 ]; then
+usage() {
     echo "Usage: bash $0 YOUR_TOKEN"
+    echo "       bash $0 --from-system"
     echo ""
     echo "Get your token from https://fivenines.io"
     exit 1
-fi
+}
 
-TOKEN="$1"
-
+# Only this exact word is an option: anything else is the token, since a
+# token may itself start with a dash.
+TOKEN=""
+FROM_SYSTEM=0
+POSITIONAL_COUNT=0
+for arg in "$@"; do
+    case "$arg" in
+        --from-system) FROM_SYSTEM=1 ;;
+        *)
+            POSITIONAL_COUNT=$((POSITIONAL_COUNT + 1))
+            if [ "$POSITIONAL_COUNT" -eq 1 ]; then
+                TOKEN="$arg"
+            fi
+            ;;
+    esac
+done
+if [ "$FROM_SYSTEM" = "1" ]; then
+    # The token comes from the system installation.
+    if [ "$POSITIONAL_COUNT" -gt 0 ]; then
+        usage
+    fi
+elif [ -z "$TOKEN" ]; then
+    usage
 # Validate token format (basic check)
-if [ ${#TOKEN} -lt 10 ]; then
+elif [ ${#TOKEN} -lt 10 ]; then
     exit_with_error "Token seems too short. Please check your token."
 fi
 
@@ -805,10 +1203,24 @@ check_requirements
 select_agent_binary || exit_with_error "No agent binary runs on this host -- nothing was installed."
 
 # Refuse early if this host cannot verify a release at all (issue #154).
-# shellcheck disable=SC2119
-verification_preflight || exit_with_error "Cannot verify a release on this host -- nothing was installed."
+# --from-system also runs the release's fivenines_uninstall.sh as root, which
+# is verified against the signed manifest even when FIVENINES_AGENT_SHA256
+# pins the tarball: the scope the system installers pass for their startup
+# definitions.
+PREFLIGHT_SCOPE=""
+if [ "$FROM_SYSTEM" = "1" ]; then
+    PREFLIGHT_SCOPE="with-startup-files"
+fi
+verification_preflight "$PREFLIGHT_SCOPE" || exit_with_error "Cannot verify a release on this host -- nothing was installed."
+if [ "$FROM_SYSTEM" = "1" ]; then
+    preflight_system_takeover
+else
+    hint_system_installation
+fi
 create_directories
-save_token "$TOKEN"
+if [ "$FROM_SYSTEM" != "1" ]; then
+    save_token "$TOKEN"
+fi
 if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
   test_connectivity
 else
@@ -816,11 +1228,20 @@ else
 fi
 download_agent
 create_run_script
+if [ "$FROM_SYSTEM" = "1" ]; then
+    take_over_system_install
+fi
 if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
   start_agent
 else
   print_warning "Skipping agent startup (test mode)"
 fi
+REBOOT_ENTRY_ADDED=0
+if [ "$FROM_SYSTEM" = "1" ] && add_reboot_entry; then
+    REBOOT_ENTRY_ADDED=1
+fi
+# --from-system armed it in take_over_system_install: the move is complete.
+trap - INT TERM HUP
 print_final_instructions
 
 # Clean up script

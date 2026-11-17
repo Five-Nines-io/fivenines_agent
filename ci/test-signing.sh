@@ -20,6 +20,12 @@
 # 32-bit userland no release ships for is refused instead of handed a build it
 # cannot run (issue #170).
 #
+# And it runs the helpers that move an installation between the user-level
+# and the system installers (--from-user, --from-system) and pick the tools
+# --with-sudoers writes rules for, on the cases ci/test-distro.sh and
+# ci/test-sudo-mail.sh cannot reach without root, with su, sudo, crontab,
+# pgrep and pkill stubbed on PATH.
+#
 # Usage: sh ci/test-signing.sh
 
 set -u
@@ -463,7 +469,7 @@ printf 'test-token-arch-170' > "$ARCH_BOX/config/TOKEN"
 REAL_UNAME=$(command -v uname)
 ARCH_STUBS="mkdir useradd adduser addgroup usermod getent chown chmod tee cp mv rm ln tar
 wget curl systemctl rc-service rc-update pkill pgrep su sudo ping mktemp
-restorecon semodule sleep bash nohup"
+restorecon semodule sleep bash nohup crontab visudo"
 for _stub in $ARCH_STUBS; do
   printf '#!/bin/sh\necho %s >> "%s"\nexit 1\n' "$_stub" "$ARCH_BOX/touched" > "$ARCH_BOX/bin/$_stub"
 done
@@ -512,6 +518,776 @@ for _script in fivenines_setup.sh fivenines_update.sh fivenines_setup_user.sh fi
     "exit=$_rc refused=$(grep -c 'Unsupported architecture: armv7l' "$ARCH_BOX/out") touched=$(tr '\n' ' ' < "$ARCH_BOX/touched")" \
     "exit=1 refused=1 touched="
 done
+
+# The same refusal, before any su, sudo, crontab or visudo, when an installer
+# is asked to move an installation (--from-user, --from-system) or to write
+# sudoers rules (--with-sudoers).
+for _run in "fivenines_setup.sh --from-user someone --with-sudoers" \
+  "fivenines_update.sh --with-sudoers" \
+  "fivenines_setup_user.sh --from-system"; do
+  _script=${_run%% *}
+  cp "$ROOT/$_script" "$ARCH_BOX/run/$_script"
+  : > "$ARCH_BOX/touched"
+  (
+    cd "$ARCH_BOX/run" || exit 99
+    # The arguments after the script name are deliberately word-split.
+    # shellcheck disable=SC2086
+    HOME="$ARCH_BOX" FIVENINES_INSTALL_DIR="$ARCH_BOX/install" FIVENINES_CONFIG_DIR="$ARCH_BOX/config" \
+      PATH="$ARCH_BOX/bin:$PATH" sh "./$_script" ${_run#* } > "$ARCH_BOX/out" 2>&1
+  )
+  _rc=$?
+  check "${_run} on armv7l refuses and touches nothing" \
+    "exit=$_rc refused=$(grep -c 'Unsupported architecture: armv7l' "$ARCH_BOX/out") touched=$(tr '\n' ' ' < "$ARCH_BOX/touched")" \
+    "exit=1 refused=1 touched="
+done
+
+# The argument parsers of the same three scripts, in the same box: each run
+# stops at its usage text or at the armv7l refusal, the latter proving the
+# parser let it through, and touches nothing either way.
+# Value: protects=only the exact option words are options (a token may start with a dash), --from-user takes one word at most, --from-system none;
+#   fails_when=a getopts-style parser rejects a dash token, --from-user or --from-system accepts extra words, or the update stops on an argument it does not know;
+#   why_new=the loops above pass only well-formed argument lists; seam=none;
+#   no_claim=what a script does once past its parser
+for _case in "fivenines_setup.sh -token-with-a-dash-170|refused" \
+  "fivenines_setup.sh --from-user someone extra|usage" \
+  "fivenines_setup.sh --with-sudoers|usage" \
+  "fivenines_setup_user.sh -token-with-a-dash-170|refused" \
+  "fivenines_setup_user.sh --from-system test-token-arch-170|usage" \
+  "fivenines_update.sh --bogus --with-sudoers|ignored"; do
+  _run=${_case%|*}
+  _script=${_run%% *}
+  case ${_case##*|} in
+    usage) _want="exit=1 usage=1 refused=0 ignored=0 echoed=0 touched=" ;;
+    refused) _want="exit=1 usage=0 refused=1 ignored=0 echoed=0 touched=" ;;
+    *) _want="exit=1 usage=0 refused=1 ignored=1 echoed=0 touched=" ;;
+  esac
+  cp "$ROOT/$_script" "$ARCH_BOX/run/$_script"
+  : > "$ARCH_BOX/touched"
+  (
+    cd "$ARCH_BOX/run" || exit 99
+    # The arguments after the script name are deliberately word-split.
+    # shellcheck disable=SC2086
+    HOME="$ARCH_BOX" FIVENINES_INSTALL_DIR="$ARCH_BOX/install" FIVENINES_CONFIG_DIR="$ARCH_BOX/config" \
+      PATH="$ARCH_BOX/bin:$PATH" sh "./$_script" ${_run#* } > "$ARCH_BOX/out" 2>&1
+  )
+  _rc=$?
+  check "${_run}: ${_case##*|}" \
+    "exit=$_rc usage=$(grep -c '^Usage:' "$ARCH_BOX/out") refused=$(grep -c 'Unsupported architecture: armv7l' "$ARCH_BOX/out") ignored=$(grep -c "Ignoring an argument this script does not take" "$ARCH_BOX/out") echoed=$(grep -c -e '--bogus' "$ARCH_BOX/out") touched=$(tr '\n' ' ' < "$ARCH_BOX/touched")" \
+    "$_want"
+done
+
+# fivenines_update.sh past its parser: --with-sudoers is recognised among
+# words it does not know, and write_sudoers_rules runs, its failure noted but
+# never fatal. Both blocks are top-level code, run from the script itself
+# (found by their first lines; a block that is no longer found runs nothing,
+# and every check below fails).
+# Value: protects=the update recognises --with-sudoers among unknown words and calls write_sudoers_rules only then, noting a failure without stopping;
+#   fails_when=the --with-sudoers case or the call is dropped, the call ignores the flag, or a failed write stops the update;
+#   why_new=the parser check above asserts only the --bogus warning; seam=none;
+#   no_claim=what write_sudoers_rules writes (test-sudo-mail, test-distro)
+UPD_ARGS=$(sed -n '/^WITH_SUDOERS=0$/,/^done$/p' "$ROOT/fivenines_update.sh")
+UPD_CALL=$(sed -n '/^SUDOERS_SKIPPED=0$/,/^fi$/p' "$ROOT/fivenines_update.sh")
+# Runs the two blocks with ARGS; write_sudoers_rules returns STATUS.
+upd_run() {
+  _upd_status=$1
+  shift
+  (
+    # Both are called through the evaluated blocks.
+    # shellcheck disable=SC2317,SC2329
+    print_warning() { echo "warning: $1"; }
+    # shellcheck disable=SC2317,SC2329
+    write_sudoers_rules() { echo "write_sudoers_rules called"; return "$_upd_status"; }
+    eval "$UPD_ARGS"
+    eval "$UPD_CALL"
+    echo "with=${WITH_SUDOERS:-unset} skipped=${SUDOERS_SKIPPED:-unset}"
+  ) 2>&1 | tr '\n' '|'
+}
+check "fivenines_update.sh --bogus --with-sudoers: one warning, then the rules are written" \
+  "$(upd_run 0 --bogus --with-sudoers)" \
+  "warning: Ignoring an argument this script does not take (usage: sudo bash fivenines_update.sh [--with-sudoers])|write_sudoers_rules called|with=1 skipped=0|"
+check "fivenines_update.sh --with-sudoers: a failed write is noted, not fatal" \
+  "$(upd_run 1 --with-sudoers)" "write_sudoers_rules called|with=1 skipped=1|"
+check "fivenines_update.sh without --with-sudoers writes no rule" "$(upd_run 0)" "with=0 skipped=0|"
+
+# Where each step sits: test mode, which ci/test-distro.sh runs, skips every
+# service start and stop, so only the scripts' own order shows it.
+# Value: protects=the rules are written before the agent (re)starts, --from-user stops and reads the user agent only after every check and removes it only once the service started, and the user update rewrites its control scripts before stopping the agent and never writes start.sh;
+#   fails_when=a refactor moves one of these steps, or the update writes start.sh; seam=none;
+#   why_new=test mode hides the order from every other test; no_claim=what each step does
+# Prints yes when every pattern in $2... is found in file $1, each on a later
+# line than the one before.
+in_order() {
+  _in_file=$1
+  shift
+  _in_line=0
+  for _in_pat in "$@"; do
+    _in_found=$(awk -v start="$_in_line" -v pat="$_in_pat" 'NR > start && index($0, pat) { print NR; exit }' "$_in_file")
+    if [ -z "$_in_found" ]; then
+      echo "no (missing after line $_in_line: $_in_pat)"
+      return
+    fi
+    _in_line=$_in_found
+  done
+  echo yes
+}
+check "fivenines_update.sh writes the sudoers rules before it restarts the agent" \
+  "$(in_order "$ROOT/fivenines_update.sh" 'write_sudoers_rules || SUDOERS_SKIPPED=1' 'Restarting fivenines-agent service')" "yes"
+check "fivenines_setup.sh --from-user: checks, stop, state, sudoers rules, service, then removal" \
+  "$(in_order "$ROOT/fivenines_setup.sh" 'Testing connectivity...' '    stop_user_agent ||' '  import_user_state ||' '  write_sudoers_rules || SUDOERS_SKIPPED=1' '      setup_systemd' '  remove_user_installation')" "yes"
+check "fivenines_update_user.sh rewrites its control scripts before it stops the agent" \
+  "$(in_order "$ROOT/fivenines_update_user.sh" '  write_control_scripts' 'echo "Stopping agent..."')" "yes"
+# The $INSTALL_DIR in the pattern is the literal text of a redirection.
+# shellcheck disable=SC2016
+check "fivenines_update_user.sh never writes start.sh" \
+  "$(grep -c '> "\$INSTALL_DIR/start.sh"' "$ROOT/fivenines_update_user.sh")" "0"
+
+# ---------------------------------------------------------------------------
+# Moving an installation (--from-user, --from-system) and --with-sudoers.
+# Also ahead of the openssl gate: they need nothing but sh and base64, plus
+# bash, pgrep and ps for the control scripts.
+#
+# ci/test-distro.sh plays both moves for real but in test mode, which skips
+# every agent start and stop, with nothing unusual in either config
+# directory; ci/test-sudo-mail.sh runs write_sudoers_rules with root-owned
+# tools only. The helpers are run here, from the scripts themselves, on what
+# those cannot reach without root: what a move reads, carries and removes,
+# which processes the control scripts signal, and which tool paths may get a
+# sudoers rule. su, sudo, crontab, pgrep and pkill are stubs on PATH (none is
+# a shell builtin), and nothing runs unless each is the one found: the real
+# crontab would rewrite this user's own, and the pgrep and pkill stubs pass
+# on only a pattern anchored inside this run's scratch directory, so a broken
+# pattern can never reach another process.
+# ---------------------------------------------------------------------------
+MOVE_NAME="move$$x"
+MOVE="$WORK/$MOVE_NAME"
+MOVE_BIN="$MOVE/bin"
+mkdir -p "$MOVE_BIN"
+: > "$MOVE/refused"
+REAL_PGREP=$(command -v pgrep 2>/dev/null || true)
+REAL_PKILL=$(command -v pkill 2>/dev/null || true)
+# Every $ below is meant for the stubs, except the paths baked into them.
+for _tool in pgrep pkill; do
+  if [ "$_tool" = pgrep ]; then _real=$REAL_PGREP; else _real=$REAL_PKILL; fi
+  cat > "$MOVE_BIN/$_tool" << EOF
+#!/bin/sh
+for _last; do :; done
+case "\$_last" in
+  "^/"*"/${MOVE_NAME}/"*) [ -n "$_real" ] && exec "$_real" "\$@" ;;
+esac
+echo "$_tool \$_last" >> "$MOVE/refused"
+exit 3
+EOF
+done
+# su -s SHELL -c COMMAND USER [ARG...], the way as_user calls it: COMMAND runs
+# with sh, as this user, the ARGs as its \$0, \$1... A PAM session module may
+# print first (RHEL's pam_lastlog showfailed), so this one does.
+cat > "$MOVE_BIN/su" << 'EOF'
+#!/bin/sh
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -s) shift 2 ;;
+    -c) _cmd=$2; shift 2 ;;
+    *) shift; break ;;
+  esac
+done
+echo "There was 1 failed login attempt since the last successful login."
+exec /bin/sh -c "$_cmd" "$@"
+EOF
+cat > "$MOVE_BIN/sudo" << 'EOF'
+#!/bin/sh
+echo "We trust you have received the usual lecture from the local System Administrator."
+exec "$@"
+EOF
+cat > "$MOVE_BIN/crontab" << EOF
+#!/bin/sh
+case "\$1" in
+  -l) [ -f "$MOVE/crontab" ] || { echo "no crontab for this user" >&2; exit 1; }; cat "$MOVE/crontab" ;;
+  -) cat > "$MOVE/crontab" ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod 755 "$MOVE_BIN/"*
+# The stub list is deliberately word-split, and the $ in the inline script is
+# meant for the child shell.
+# shellcheck disable=SC2016
+MOVE_UNSHADOWED=$(PATH="$MOVE_BIN:$PATH" sh -c '
+  for _stub in su sudo crontab pgrep pkill; do
+    [ "$(command -v "$_stub")" = "$0/$_stub" ] || printf "%s " "$_stub"
+  done' "$MOVE_BIN")
+PATH="$MOVE_BIN:$PATH" pgrep -f "" > /dev/null 2>&1
+_rc=$?
+PATH="$MOVE_BIN:$PATH" pkill -f "$MOVE/" > /dev/null 2>&1
+_rc="$_rc $?"
+check "the move stubs shadow su, sudo, crontab, pgrep and pkill, which refuse an empty or unanchored pattern" \
+  "${MOVE_UNSHADOWED}|rc=${_rc}|$(tr '\n' ' ' < "$MOVE/refused")" "|rc=3 3|pgrep  pkill $MOVE/ "
+: > "$MOVE/refused"
+
+if [ -n "$MOVE_UNSHADOWED" ]; then
+  echo "  (the move helpers are not run: a stub is not the command found)"
+else
+MOVE_SAVED_PATH=$PATH
+PATH="$MOVE_BIN:$PATH"
+
+# --from-system: copy_system_state, as fivenines_setup_user.sh runs it, with
+# its own lists of what to carry.
+# Value: protects=--from-system carries TOKEN, MACHINE_ID and the journal allowlist byte-exact, owner-only, .env only as the unread .env.system, and nothing else;
+#   fails_when=a carried list changes, decode_state stops cutting at its markers, the root-side read follows a symlink or skips it as absent, or an empty TOKEN passes;
+#   why_new=test-distro Test 13 copies plain files through a sudo that prints nothing, and never meets a link or an empty TOKEN; seam=none;
+#   no_claim=that the reads run as root, or that the system agent was stopped first
+sed -n '/^STATE_FILES=/p;/^SYSTEM_ENV_COPY=/p;/^COPIED_STATE_FILES=/p;/^STATE_FILE_MAX=/p
+        /^as_root()/,/^}/p;/^decode_state()/,/^}/p;/^copy_system_state()/,/^}/p' \
+  "$ROOT/fivenines_setup_user.sh" > "$MOVE/from_system.sh"
+# The names in a directory, dot files included, in byte order.
+move_names() {
+  for _n in "$1"/.[!.]* "$1"/*; do
+    if [ -e "$_n" ] || [ -L "$_n" ]; then printf '%s\n' "${_n##*/}"; fi
+  done | LC_ALL=C sort | tr '\n' ' '
+}
+# GNU stat first, BSD stat second.
+move_mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null; }
+# Runs copy_system_state from $MOVE/sys into an empty $MOVE/cfg, and prints
+# its status.
+from_system_copy() {
+  rm -rf "$MOVE/cfg" "$MOVE/stage"
+  mkdir -p "$MOVE/cfg" "$MOVE/stage"
+  (
+    # shellcheck source=/dev/null
+    . "$MOVE/from_system.sh"
+    SYSTEM_CONFIG_DIR="$MOVE/sys"
+    CONFIG_DIR="$MOVE/cfg"
+    WORK_DIR="$MOVE/stage"
+    copy_system_state > "$MOVE/out" 2>&1
+  )
+  echo "$?"
+}
+mkdir -p "$MOVE/sys"
+printf 'per-host-token-0001' > "$MOVE/sys/TOKEN"
+printf '0b5e2d5c-6f1a-4c3e-9d2b-7a8f1e4c5d6a\n' > "$MOVE/sys/MACHINE_ID"
+printf 'nginx\n*.timer\n' > "$MOVE/sys/journal_units.allow"
+printf 'API_URL=https://api.example.invalid\n' > "$MOVE/sys/.env"
+printf '{"sha256:ab":true}' > "$MOVE/sys/image_inventory_done"
+printf '{}' > "$MOVE/sys/sudo_refusals"
+_rc=$(from_system_copy)
+_differ=""
+_modes=""
+for _f in TOKEN MACHINE_ID journal_units.allow .env:.env.system; do
+  cmp -s "$MOVE/sys/${_f%%:*}" "$MOVE/cfg/${_f##*:}" || _differ="${_differ}${_f} "
+  _modes="${_modes}$(move_mode "$MOVE/cfg/${_f##*:}") "
+done
+check "--from-system carries the identity and the allowlist, .env only as .env.system, and nothing else" \
+  "rc=$_rc|$(move_names "$MOVE/cfg")" \
+  "rc=0|.env.system MACHINE_ID TOKEN journal_units.allow "
+check "--from-system carries each file byte for byte, past what sudo printed first" "$_differ" ""
+check "--from-system writes each file owner-only" "$_modes" "600 600 600 600 "
+check "--from-system says why .env was not carried as .env" "$(grep -c 'which the agent does not read' "$MOVE/out")" "1"
+
+mv "$MOVE/sys/journal_units.allow" "$MOVE/allow.real"
+printf 'not the allowlist\n' > "$MOVE/elsewhere"
+ln -s "$MOVE/elsewhere" "$MOVE/sys/journal_units.allow"
+check "--from-system stops at a symlinked allowlist, and carries nothing" \
+  "$(from_system_copy)|$(grep -c 'journal_units.allow is not a regular file' "$MOVE/out")|$(move_names "$MOVE/cfg")" \
+  "1|1|"
+rm -f "$MOVE/sys/journal_units.allow"
+mv "$MOVE/allow.real" "$MOVE/sys/journal_units.allow"
+
+: > "$MOVE/sys/TOKEN"
+check "--from-system stops at an empty TOKEN, and carries nothing" \
+  "$(from_system_copy)|$(grep -c 'TOKEN is empty' "$MOVE/out")|$(move_names "$MOVE/cfg")" \
+  "1|1|"
+
+# A transfer cut short (su or sudo killed mid-way) has no end marker: it must
+# not decode as a shorter file.
+printf 'fivenines-state-begin\n%s\n' "$(printf 'per-host-token-0001' | base64)" > "$MOVE/cut.b64"
+(
+  # shellcheck source=/dev/null
+  . "$MOVE/from_system.sh"
+  decode_state "$MOVE/cut.b64" "$MOVE/cut.out"
+)
+check "decode_state refuses a transfer with no end marker" "$?" "1"
+
+# --from-system: take_over_system_install, when the release's uninstaller
+# leaves the system TOKEN behind (it failed half-way), and when it removes it.
+# Value: protects=a --from-system whose uninstaller leaves the system TOKEN takes back every file it copied, so one identity never lives in two places;
+#   fails_when=the TOKEN-gone check after the uninstaller is dropped, or abort_system_takeover stops removing what was copied;
+#   why_new=test-distro Test 13 only runs the real uninstaller, which removes the TOKEN; seam=none;
+#   no_claim=the stop and restart of the system agent (skipped in test mode), or an interrupted move
+sed -n '/^STATE_FILES=/p;/^SYSTEM_ENV_COPY=/p;/^COPIED_STATE_FILES=/p;/^STATE_FILE_MAX=/p
+        /^exit_with_error()/,/^}/p;/^as_root()/,/^}/p;/^decode_state()/,/^}/p
+        /^copy_system_state()/,/^}/p;/^restart_system_agent()/,/^}/p
+        /^abort_system_takeover()/,/^}/p;/^take_over_system_install()/,/^}/p' \
+  "$ROOT/fivenines_setup_user.sh" > "$MOVE/takeover.sh"
+# Runs take_over_system_install, in test mode, with $1 as the body of the
+# release's uninstaller, and prints its status.
+from_system_takeover() {
+  rm -rf "$MOVE/cfg" "$MOVE/stage"
+  mkdir -p "$MOVE/cfg" "$MOVE/stage"
+  printf '%s\n' "$1" > "$MOVE/stage/fivenines_uninstall.sh"
+  (
+    # shellcheck source=/dev/null
+    . "$MOVE/takeover.sh"
+    FIVENINES_TEST_MODE=1
+    SYSTEM_CONFIG_DIR="$MOVE/sys"
+    CONFIG_DIR="$MOVE/cfg"
+    WORK_DIR="$MOVE/stage"
+    INSTALL_DIR="$MOVE/inst"
+    # This subshell's PID, for an uninstaller that interrupts the move.
+    MOVE_RUNNER=$(sh -c 'echo "$PPID"')
+    export MOVE_RUNNER
+    take_over_system_install > "$MOVE/out" 2>&1
+  )
+  echo "$?"
+}
+printf 'per-host-token-0001' > "$MOVE/sys/TOKEN"
+check "--from-system takes back what it copied when the uninstaller leaves the system TOKEN" \
+  "$(from_system_takeover 'echo pretend uninstall')|$(grep -c 'did not remove the system installation' "$MOVE/out")|$(move_names "$MOVE/cfg")|$(cat "$MOVE/sys/TOKEN")" \
+  "1|1||per-host-token-0001"
+check "--from-system keeps what it copied once the uninstaller removed the system TOKEN" \
+  "$(from_system_takeover "rm -f '$MOVE/sys/TOKEN'")|$(cat "$MOVE/cfg/TOKEN" 2>/dev/null)" \
+  "0|per-host-token-0001"
+# Interrupted once the uninstaller removed the system TOKEN: the copy is then
+# the agent's only identity, and must stay (it was deleted before).
+# Value: protects=an interrupted --from-system never deletes the copy once the system TOKEN is gone, and says how to start the agent;
+#   fails_when=abort_system_takeover takes the copy back without checking that the system TOKEN still exists;
+#   why_new=the checks above end without a signal; seam=none; no_claim=a signal during the system agent's stop (ignored there)
+printf 'per-host-token-0001' > "$MOVE/sys/TOKEN"
+# The $ are for the uninstaller's shell.
+# shellcheck disable=SC2016
+check "--from-system interrupted after the uninstaller keeps the only identity, and says how to start it" \
+  "$(from_system_takeover "rm -f '$MOVE/sys/TOKEN'; kill -INT \"\$MOVE_RUNNER\"")|$(cat "$MOVE/cfg/TOKEN" 2>/dev/null)|$(grep -c "the agent's identity is now in" "$MOVE/out")" \
+  "1|per-host-token-0001|1"
+
+# A systemctl that logs each call, fails a stop when MOVE_STOP_FAILS is set,
+# and interrupts the move during a stop when MOVE_STOP_SIGNAL is set. A stop
+# logs whether $MOVE/etc still holds a TOKEN.
+mkdir -p "$MOVE/svcbin"
+cat > "$MOVE/svcbin/systemctl" << EOF
+#!/bin/sh
+_t=""
+[ -e "$MOVE/etc/TOKEN" ] && _t=" with TOKEN"
+echo "systemctl \$*\$_t" >> "$MOVE/svc.log"
+if [ "\$1" = stop ]; then
+  [ -n "\${MOVE_STOP_SIGNAL:-}" ] && kill -INT "\$MOVE_RUNNER"
+  [ -z "\${MOVE_STOP_FAILS:-}" ]
+fi
+EOF
+chmod 755 "$MOVE/svcbin/systemctl"
+
+# --from-system outside test mode: the system agent's stop, with the unit and
+# the agent's path moved into the scratch directory.
+# Value: protects=a --from-system whose system agent stop fails moves nothing, and a signal during that stop neither cuts the move nor leaves the agent stopped with nothing armed;
+#   fails_when=a failed stop goes on to copy the identity, or take_over_system_install stops ignoring INT/TERM/HUP during the stop;
+#   why_new=every other run of the move is in test mode, which skips the stop; seam=/etc/systemd/system and ^/opt/fivenines/ are rewritten to the scratch directory;
+#   no_claim=the OpenRC branch, a real systemd, or the restart after an abort
+sed "s|/etc/systemd/system/|$MOVE/units/|g;s|\"^/opt/fivenines/\"|\"^$MOVE/opt/\"|g" \
+  "$MOVE/takeover.sh" > "$MOVE/takeover_stop.sh"
+# Runs take_over_system_install outside test mode; $1 is fail, signal or
+# nothing, for the stop. Prints its status.
+from_system_stop() {
+  rm -rf "$MOVE/cfg" "$MOVE/stage" "$MOVE/units"
+  mkdir -p "$MOVE/cfg" "$MOVE/stage" "$MOVE/units"
+  : > "$MOVE/svc.log"
+  : > "$MOVE/units/fivenines-agent.service"
+  printf 'per-host-token-0001' > "$MOVE/sys/TOKEN"
+  printf '%s\n' "rm -f '$MOVE/sys/TOKEN' '$MOVE/units/fivenines-agent.service'" \
+    > "$MOVE/stage/fivenines_uninstall.sh"
+  (
+    # shellcheck source=/dev/null
+    . "$MOVE/takeover_stop.sh"
+    unset FIVENINES_TEST_MODE
+    case "$1" in
+      fail) MOVE_STOP_FAILS=1 && export MOVE_STOP_FAILS ;;
+      signal) MOVE_STOP_SIGNAL=1 && export MOVE_STOP_SIGNAL ;;
+    esac
+    SYSTEM_CONFIG_DIR="$MOVE/sys"
+    CONFIG_DIR="$MOVE/cfg"
+    WORK_DIR="$MOVE/stage"
+    INSTALL_DIR="$MOVE/inst"
+    # The systemctl stub, for this run only.
+    # shellcheck disable=SC2030,SC2031
+    PATH="$MOVE/svcbin:$PATH"
+    MOVE_RUNNER=$(sh -c 'echo "$PPID"')
+    export MOVE_RUNNER
+    take_over_system_install > "$MOVE/out" 2>&1
+  )
+  echo "$?"
+}
+check "--from-system moves nothing when the system agent's stop fails" \
+  "$(from_system_stop fail)|$(grep -c 'Could not stop the system agent: nothing was moved' "$MOVE/out")|$(move_names "$MOVE/cfg")|$(cat "$MOVE/sys/TOKEN" 2>/dev/null)|$(tr '\n' '|' < "$MOVE/svc.log")" \
+  "1|1||per-host-token-0001|systemctl stop fivenines-agent.service|"
+check "--from-system ignores a signal during the system agent's stop, and completes the move" \
+  "$(from_system_stop signal)|$(cat "$MOVE/cfg/TOKEN" 2>/dev/null)|$(test -e "$MOVE/sys/TOKEN" && echo kept)|$(tr '\n' '|' < "$MOVE/svc.log")" \
+  "0|per-host-token-0001||systemctl stop fivenines-agent.service|"
+rm -rf "$MOVE/units"
+
+# --from-user: rollback_user_takeover outside test mode, as exit_with_contact
+# runs it when the import or the service failed, signalled again during the
+# service stop.
+# Value: protects=a failed --from-user removes only the files it installed, before it stops and disables the service, then starts the user-level agent again, even when signalled meanwhile;
+#   fails_when=the rollback deletes a state file it did not install, stops the service before removing what it installed, stops ignoring INT/TERM/HUP, or no longer restarts the user-level agent;
+#   why_new=the harness and test-distro roll back only in test mode, which skips the service and the restart; seam=/etc/fivenines_agent is rewritten to the scratch directory;
+#   no_claim=the OpenRC branch, a real systemd, or that the restart runs as the user (su is a stub)
+sed -n '/^STATE_FILES=/p;/^as_user()/,/^}/p;/^rollback_user_takeover()/,/^}/p' "$ROOT/fivenines_setup.sh" \
+  | sed "s|/etc/fivenines_agent|$MOVE/etc|g" > "$MOVE/rollback.sh"
+mkdir -p "$MOVE/etc" "$MOVE/rbinst"
+for _f in TOKEN MACHINE_ID last_capture_id .env; do
+  printf '%s\n' "$_f" > "$MOVE/etc/$_f"
+done
+printf '#!/bin/sh\necho start.sh >> %s\n' "'$MOVE/svc.log'" > "$MOVE/rbinst/start.sh"
+chmod 755 "$MOVE/rbinst/start.sh"
+: > "$MOVE/svc.log"
+(
+  # shellcheck source=/dev/null
+  . "$MOVE/rollback.sh"
+  unset FIVENINES_TEST_MODE
+  MOVE_STOP_SIGNAL=1
+  export MOVE_STOP_SIGNAL
+  SYSTEM_TYPE=systemd
+  FROM_USER_NAME=alice
+  USER_INSTALL_DIR="$MOVE/rbinst"
+  IMPORTED_STATE_FILES=" TOKEN MACHINE_ID"
+  # The systemctl stub, for this run only.
+  # shellcheck disable=SC2030,SC2031
+  PATH="$MOVE/svcbin:$PATH"
+  MOVE_RUNNER=$(sh -c 'echo "$PPID"')
+  export MOVE_RUNNER
+  rollback_user_takeover > "$MOVE/out" 2>&1
+)
+_rc=$?
+check "--from-user rolls back what it installed, then the service, then restarts the user-level agent, through a second signal" \
+  "$_rc|$(move_names "$MOVE/etc")|$(tr '\n' '|' < "$MOVE/svc.log")|$(grep -c 'runs again, unchanged' "$MOVE/out")" \
+  "0|.env last_capture_id |systemctl stop fivenines-agent.service|systemctl disable fivenines-agent.service|start.sh||1"
+
+# --from-user: remove_user_installation, as fivenines_setup.sh runs it once
+# the service started, on an installation whose directories hold other files.
+# Value: protects=--from-user removes only what fivenines_setup_user.sh created, keeps .env and other files, and drops only the crontab lines starting it;
+#   fails_when=the removal goes back to rm -rf of a directory, removes .env, or the crontab filter misses a spelling of start.sh or drops a line naming fivenines;
+#   why_new=test-distro Test 12 removes an installation that holds nothing else, on an image with no crontab; seam=none;
+#   no_claim=that it runs as the user (su is a stub here), or that the service started first
+sed -n '/^STATE_FILES=/p;/^as_user()/,/^}/p;/^start_spellings()/,/^}/p
+        /^remove_user_installation()/,/^}/p' "$ROOT/fivenines_setup.sh" > "$MOVE/from_user.sh"
+MOVE_HOME="$MOVE/home/alice"
+MOVE_UI="$MOVE_HOME/.local/fivenines"
+MOVE_UC="$MOVE_HOME/.config/fivenines_agent"
+mkdir -p "$MOVE_UI/fivenines-agent-linux-amd64" "$MOVE_UC"
+for _f in start.sh stop.sh status.sh logs.sh refresh.sh agent.pid agent.log \
+  fivenines-agent-linux-amd64/fivenines-agent-linux-amd64; do
+  : > "$MOVE_UI/$_f"
+done
+printf 'the operator keeps notes here\n' > "$MOVE_UI/notes.txt"
+for _f in TOKEN MACHINE_ID last_capture_id journal_units.allow image_inventory_done sudo_refusals .env; do
+  printf '%s\n' "$_f" > "$MOVE_UC/$_f"
+done
+# The ~, $HOME and ${HOME} spellings are the literal text of crontab lines.
+# shellcheck disable=SC2016
+printf '%s\n' '0 * * * * echo other' "@reboot $MOVE_UI/start.sh" \
+  '@reboot ~/.local/fivenines/start.sh' '@reboot $HOME/.local/fivenines/start.sh' \
+  '@reboot ${HOME}/.local/fivenines/start.sh' '0 3 * * * /usr/local/bin/fivenines-db-backup' \
+  > "$MOVE/crontab"
+(
+  # shellcheck source=/dev/null
+  . "$MOVE/from_user.sh"
+  FROM_USER_NAME=alice
+  FROM_USER_HOME="$MOVE_HOME"
+  USER_INSTALL_DIR="$MOVE_UI"
+  USER_CONFIG_DIR="$MOVE_UC"
+  remove_user_installation > "$MOVE/out" 2>&1
+)
+check "--from-user removes the installer's files only, and keeps .env" \
+  "$(move_names "$MOVE_UI")|$(move_names "$MOVE_UC")|$(grep -c '^Kept ' "$MOVE/out")" \
+  "notes.txt |.env |2"
+check "--from-user drops the crontab lines that start it, however spelled, and only those" \
+  "$(tr '\n' '|' < "$MOVE/crontab")" "0 * * * * echo other|0 3 * * * /usr/local/bin/fivenines-db-backup|"
+# Value: protects=--from-user removes every file the user-level scripts write in their install directory;
+#   fails_when=fivenines_setup_user.sh or fivenines_update_user.sh starts writing another $INSTALL_DIR file and remove_user_installation's list is not updated;
+#   why_new=the removal check above creates its files from the same list it checks; seam=none;
+#   no_claim=a file named through another variable than $INSTALL_DIR
+# $INSTALL_DIR is the literal text searched for.
+# shellcheck disable=SC2016
+_written=$(grep -ho '\$INSTALL_DIR/[A-Za-z0-9_.-]*' "$ROOT/fivenines_setup_user.sh" "$ROOT/fivenines_update_user.sh" \
+  | sed 's|^\$INSTALL_DIR/||;s|\.*$||' | grep . | LC_ALL=C sort -u | tr '\n' ' ')
+_removed=$(sed -n '/^remove_user_installation()/,/^}/s/^ *for name in \(start\.sh .*\); do$/\1/p' "$ROOT/fivenines_setup.sh" \
+  | tr ' ' '\n' | grep . | LC_ALL=C sort -u | tr '\n' ' ')
+check "--from-user removes every file the user-level scripts write in their install directory" "$_removed" "$_written"
+
+# --from-system: add_reboot_entry, the @reboot line that starts the moved
+# agent at boot, as the system service did.
+# Value: protects=--from-system adds one @reboot line for its start.sh after the user's own lines, and none when one (any spelling) is already there;
+#   fails_when=the already-there check is dropped (two agents with one identity at boot), or the user's lines are lost or a blank line is added;
+#   why_new=no test-distro image has a crontab command, so Test 13 takes the no-crontab branch; seam=none;
+#   no_claim=what cron does with the line at boot
+sed -n '/^start_spellings()/,/^}/p;/^add_reboot_entry()/,/^}/p' \
+  "$ROOT/fivenines_setup_user.sh" > "$MOVE/reboot.sh"
+# Runs add_reboot_entry for an installation in ~/.local/fivenines over the
+# crontab $1 (- for none), and prints its status and the crontab after it.
+reboot_entry() {
+  rm -f "$MOVE/crontab"
+  if [ "$1" != "-" ]; then printf '%s\n' "$1" > "$MOVE/crontab"; fi
+  (
+    # shellcheck source=/dev/null
+    . "$MOVE/reboot.sh"
+    HOME="$MOVE_HOME"
+    INSTALL_DIR="$MOVE_HOME/.local/fivenines"
+    add_reboot_entry > /dev/null 2>&1
+  )
+  printf '%s|%s' "$?" "$(tr '\n' '|' < "$MOVE/crontab" 2>/dev/null)"
+}
+check "--from-system starts the agent at boot for a user with no crontab" \
+  "$(reboot_entry -)" "0|@reboot $MOVE_HOME/.local/fivenines/start.sh|"
+check "--from-system adds its @reboot line after the user's own" \
+  "$(reboot_entry '0 * * * * echo other')" "0|0 * * * * echo other|@reboot $MOVE_HOME/.local/fivenines/start.sh|"
+# The ${HOME} is the literal text of the crontab line.
+# shellcheck disable=SC2016
+check "--from-system adds no second line for a start.sh the crontab already runs" \
+  "$(reboot_entry '@reboot ${HOME}/.local/fivenines/start.sh')" '0|@reboot ${HOME}/.local/fivenines/start.sh|'
+
+# fivenines_uninstall_user.sh, run whole from a scratch copy (it deletes
+# itself) and confirmed with y, on an installation under a scratch HOME.
+# Value: protects=the user uninstaller drops only this installation's crontab lines and signals only an agent run from its own directory;
+#   fails_when=it goes back to grep -v fivenines on the crontab, or to pkill -f on the binary name or another unanchored pattern;
+#   why_new=test-distro Test 11 runs it in test mode, which skips the stop, on an image with no crontab; seam=none;
+#   no_claim=the removal of its two directories, which this branch does not change
+MOVE_CAROL="$MOVE/home/carol"
+mkdir -p "$MOVE_CAROL/.local/fivenines" "$MOVE_CAROL/.config/fivenines_agent" "$MOVE/run"
+printf 'per-host-token-0001' > "$MOVE_CAROL/.config/fivenines_agent/TOKEN"
+printf '#!/bin/sh\necho stop.sh >> "%s"\n' "$MOVE/stopped" > "$MOVE_CAROL/.local/fivenines/stop.sh"
+printf '#!/bin/bash\nexport CONFIG_DIR="%s"\n' "$MOVE_CAROL/.config/fivenines_agent" > "$MOVE_CAROL/.local/fivenines/start.sh"
+chmod 755 "$MOVE_CAROL/.local/fivenines/stop.sh" "$MOVE_CAROL/.local/fivenines/start.sh"
+# Without a start.sh where it looks (an installation made with another
+# FIVENINES_INSTALL_DIR), it refuses before touching anything.
+# Value: protects=the user uninstaller never deletes a config dir (TOKEN) when it cannot find the installation that uses it;
+#   fails_when=the start.sh check is dropped; why_new=new refusal; seam=none; no_claim=the message text
+cp "$ROOT/fivenines_uninstall_user.sh" "$MOVE/run/fivenines_uninstall_user.sh"
+(
+  cd "$MOVE/run" || exit 99
+  printf 'y\n' | HOME="$MOVE_CAROL" FIVENINES_TEST_MODE="" \
+    FIVENINES_INSTALL_DIR="$MOVE_CAROL/elsewhere" FIVENINES_CONFIG_DIR="$MOVE_CAROL/.config/fivenines_agent" \
+    sh ./fivenines_uninstall_user.sh > "$MOVE/out" 2>&1
+)
+check "fivenines_uninstall_user.sh refuses an install dir with no start.sh, and keeps the TOKEN" \
+  "$?|$(cat "$MOVE_CAROL/.config/fivenines_agent/TOKEN" 2>/dev/null)" "1|per-host-token-0001"
+# shellcheck disable=SC2016
+printf '%s\n' '0 * * * * echo other' "@reboot $MOVE_CAROL/.local/fivenines/start.sh" \
+  '@reboot ~/.local/fivenines/start.sh' '@reboot $HOME/.local/fivenines/start.sh' \
+  '0 3 * * * /usr/local/bin/fivenines-db-backup' > "$MOVE/crontab"
+cp "$ROOT/fivenines_uninstall_user.sh" "$MOVE/run/fivenines_uninstall_user.sh"
+: > "$MOVE/refused"
+(
+  cd "$MOVE/run" || exit 99
+  printf 'y\n' | HOME="$MOVE_CAROL" FIVENINES_TEST_MODE="" \
+    FIVENINES_INSTALL_DIR="$MOVE_CAROL/.local/fivenines" FIVENINES_CONFIG_DIR="$MOVE_CAROL/.config/fivenines_agent" \
+    sh ./fivenines_uninstall_user.sh > "$MOVE/out" 2>&1
+)
+check "fivenines_uninstall_user.sh drops the crontab lines that start it, and only those" \
+  "$?|$(tr '\n' '|' < "$MOVE/crontab")" "0|0 * * * * echo other|0 3 * * * /usr/local/bin/fivenines-db-backup|"
+check "fivenines_uninstall_user.sh stops its agent with an anchored pattern only" \
+  "$(cat "$MOVE/stopped" 2>/dev/null)|$(cat "$MOVE/refused")" "stop.sh|"
+
+# The control scripts write_control_scripts generates (fivenines_setup_user.sh,
+# and fivenines_update_user.sh over an existing installation), run against a
+# fake agent in a directory whose name holds a space, a + and a dot, beside
+# what an unanchored or unescaped pattern would also have matched: the same
+# agent in "inst aab.c" (+ unescaped) and "inst a+bxc" (. unescaped), and a
+# tail -f of a file in the agent's own directory (no anchor).
+# Value: protects=stop.sh, status.sh and refresh.sh act only on the agent run from their own install dir, whatever its path holds;
+#   fails_when=the scripts match the binary name anywhere again, the pattern loses its anchor or an escape, or its quoting breaks on a space;
+#   why_new=no repo test runs the control scripts: test-distro checks only the update's exit code and the TOKEN; seam=none;
+#   no_claim=start.sh, or stop.sh's fallback to agent.pid on a host without pgrep
+if [ -z "$REAL_PGREP" ] || ! command -v bash > /dev/null 2>&1 || ! command -v ps > /dev/null 2>&1; then
+  echo "  (the control scripts are not run: no pgrep, bash or ps here)"
+else
+  sed -n '/^agent_pattern()/,/^}/p;/^write_control_scripts()/,/^}/p' \
+    "$ROOT/fivenines_setup_user.sh" > "$MOVE/control.sh"
+  MOVE_PIDS=""
+  trap 'kill $MOVE_PIDS 2> /dev/null; rm -rf "$WORK"' EXIT
+  # Starts DIR's fake agent, or a tail -f of FILE, detached (so a stopped one
+  # is reaped at once), and prints its PID once its command line is in place.
+  # The agent ignores SIGHUP, which refresh.sh sends, and runs under its own
+  # path as argv[0], as start.sh runs the real one.
+  move_start() {
+    # The $ in the single-quoted scripts are meant for the child shells.
+    # shellcheck disable=SC2016
+    if [ "$1" = agent ]; then
+      _cmd="$2/fivenines-agent-linux-amd64/fivenines-agent-linux-amd64"
+      mkdir -p "$2/fivenines-agent-linux-amd64"
+      printf '#!/bin/bash\ntrap "" HUP\nexec -a "$0" sleep 300\n' > "$_cmd"
+      chmod 755 "$_cmd"
+      _pid=$(sh -c '"$0" > /dev/null 2>&1 & echo $!' "$_cmd")
+      _cmd="$_cmd 300"
+    else
+      : > "$2"
+      _pid=$(sh -c 'tail -f "$0" > /dev/null 2>&1 & echo $!' "$2")
+      _cmd="tail -f $2"
+    fi
+    _tries=0
+    while [ "$(ps -ww -o args= -p "$_pid" 2>/dev/null)" != "$_cmd" ] && [ "$_tries" -lt 10 ]; do
+      sleep 1
+      _tries=$((_tries + 1))
+    done
+    printf '%s' "$_pid"
+  }
+  # A PID still running, not a zombie waiting to be reaped.
+  move_alive() {
+    kill -0 "$1" 2> /dev/null && [ "$(ps -o stat= -p "$1" 2>/dev/null | cut -c1)" != "Z" ]
+  }
+  CTL_DIR="$MOVE/inst a+b.c"
+  : > "$MOVE/refused"
+  (
+    # shellcheck source=/dev/null
+    . "$MOVE/control.sh"
+    INSTALL_DIR="$CTL_DIR"
+    mkdir -p "$INSTALL_DIR"
+    write_control_scripts > /dev/null
+  )
+  MOVE_AGENT=$(move_start agent "$CTL_DIR")
+  MOVE_TWIN=$(move_start agent "$MOVE/inst aab.c")
+  MOVE_ODD=$(move_start agent "$MOVE/inst a+bxc")
+  MOVE_DECOY=$(move_start tail "$CTL_DIR/fivenines-agent-linux-amd64/agent.log")
+  MOVE_PIDS="$MOVE_AGENT $MOVE_TWIN $MOVE_ODD $MOVE_DECOY"
+  check "status.sh finds its own agent" \
+    "$(bash "$CTL_DIR/status.sh" 2>&1 | head -n 1)" "Agent is running (PID: $MOVE_AGENT)"
+  check "refresh.sh signals its own agent" \
+    "$(bash "$CTL_DIR/refresh.sh" 2>&1)" \
+    "Sent SIGHUP to agent (PID: $MOVE_AGENT) - capabilities will refresh"
+  check "stop.sh stops its own agent" \
+    "$(bash "$CTL_DIR/stop.sh" 2>&1)" "Agent stopped (PID: $MOVE_AGENT)"
+  _tries=0
+  while move_alive "$MOVE_AGENT" && [ "$_tries" -lt 5 ]; do
+    sleep 1
+    _tries=$((_tries + 1))
+  done
+  _alive=""
+  for _pid in $MOVE_PIDS; do
+    if move_alive "$_pid"; then _alive="${_alive}yes "; else _alive="${_alive}no "; fi
+  done
+  check "stop.sh spares the other installations and a tail -f of its own directory" \
+    "$_alive" "no yes yes yes "
+  check "status.sh then reports no agent" \
+    "$(bash "$CTL_DIR/status.sh" 2>&1)" "Agent is not running"
+  check "the control scripts asked pgrep only for anchored patterns" "$(cat "$MOVE/refused")" ""
+
+  # An agent start.sh started under another spelling of the install dir (a
+  # trailing slash here; a symlink does the same): its command line escapes
+  # the path pattern, so only the PID start.sh recorded finds it.
+  # fivenines_update_user.sh rewrites stop.sh with the spelling it was given,
+  # while start.sh keeps its own, and the update then starts the agent again.
+  # Value: protects=stop.sh stops the agent start.sh recorded even when it was started under another spelling of the install dir;
+  #   fails_when=stop.sh trusts only the path pattern when pgrep exists (the update then starts a second agent with the same identity);
+  #   why_new=the checks above start every agent under the dir's own spelling; seam=none;
+  #   no_claim=a symlinked dir (same mechanism, not set up here)
+  # The PID start.sh recorded is read through /proc (Linux only, like the
+  # agent); elsewhere both checks are left out, not failed.
+  if [ -r /proc/self/cmdline ]; then
+    MOVE_SPELLED=$(move_start agent "$CTL_DIR/")
+    MOVE_PIDS="$MOVE_PIDS $MOVE_SPELLED"
+    printf '%s\n' "$MOVE_SPELLED" > "$CTL_DIR/agent.pid"
+    check "stop.sh stops the agent start.sh recorded under another spelling of its directory" \
+      "$(bash "$CTL_DIR/stop.sh" 2>&1)" "Agent stopped (PID: $MOVE_SPELLED)"
+    _tries=0
+    while move_alive "$MOVE_SPELLED" && [ "$_tries" -lt 5 ]; do
+      sleep 1
+      _tries=$((_tries + 1))
+    done
+    check "that agent is gone" "$(move_alive "$MOVE_SPELLED" && echo alive)" ""
+    # A recorded PID the system has reused: a tail -f whose last argument reads
+    # like an agent binary's path, which only the argv[0]-only check tells apart.
+    # Value: protects=stop.sh never signals a recorded PID whose argv[0] is not an agent binary;
+    #   fails_when=the /proc check is dropped or widened to the whole command line;
+    #   why_new=the fallback above is new, and a PID file outlives its process; seam=none;
+    #   no_claim=a reused PID that is another fivenines agent
+    mkdir -p "$CTL_DIR/fivenines-agent-decoy"
+    MOVE_REUSED=$(move_start tail "$CTL_DIR/fivenines-agent-decoy/fivenines-agent-decoy")
+    MOVE_PIDS="$MOVE_PIDS $MOVE_REUSED"
+    printf '%s\n' "$MOVE_REUSED" > "$CTL_DIR/agent.pid"
+    check "stop.sh spares a reused PID whose argv[0] is not an agent" \
+      "$(bash "$CTL_DIR/stop.sh" 2>&1)|$(move_alive "$MOVE_REUSED" && echo alive)" "Agent not running|alive"
+  else
+    echo "  (the agent.pid checks are not run: no /proc here)"
+  fi
+
+  # --from-user: stop_user_agent, which must stop every agent run from the
+  # installation before its state is read, including one start.sh did not
+  # record (there is no stop.sh here at all).
+  # Value: protects=--from-user stops every agent run from the user's install dir, spares a tail -f of it, and never signals with a pattern not anchored on a path;
+  #   fails_when=the pgrep/pkill loop or its anchored-pattern guard is dropped;
+  #   why_new=test-distro Test 12 runs the move in test mode, which skips this stop; seam=none;
+  #   no_claim=the refusal when an agent survives SIGKILL, or that it runs as the user (su is a stub here)
+  sed -n '/^as_user()/,/^}/p;/^agent_pattern()/,/^}/p;/^stop_user_agent()/,/^}/p' \
+    "$ROOT/fivenines_setup.sh" > "$MOVE/stop_user.sh"
+  STOP_DIR="$MOVE/home/bob/.local/fivenines"
+  : > "$MOVE/refused"
+  MOVE_STRAY=$(move_start agent "$STOP_DIR")
+  MOVE_STRAY_DECOY=$(move_start tail "$STOP_DIR/fivenines-agent-linux-amd64/agent.log")
+  MOVE_PIDS="$MOVE_PIDS $MOVE_STRAY $MOVE_STRAY_DECOY"
+  # Runs stop_user_agent on the installation $1, and prints its status.
+  stop_user() {
+    (
+      # shellcheck source=/dev/null
+      . "$MOVE/stop_user.sh"
+      FROM_USER_NAME=bob
+      USER_INSTALL_DIR="$1"
+      stop_user_agent > /dev/null 2>&1
+    )
+    echo "$?"
+  }
+  _rc=$(stop_user "$STOP_DIR")
+  _alive=""
+  for _pid in $MOVE_STRAY $MOVE_STRAY_DECOY; do
+    if move_alive "$_pid"; then _alive="${_alive}yes "; else _alive="${_alive}no "; fi
+  done
+  check "--from-user stops an agent start.sh did not record, and spares a tail -f of its directory" \
+    "rc=$_rc|$_alive|$(cat "$MOVE/refused")" "rc=0|no yes |"
+  check "--from-user stops nothing for an installation path that is not absolute" \
+    "$(stop_user relative/fivenines)|$(cat "$MOVE/refused")" "1|"
+  # Only the PIDs started above.
+  # shellcheck disable=SC2086
+  kill $MOVE_PIDS 2> /dev/null
+  trap 'rm -rf "$WORK"' EXIT
+fi
+
+PATH=$MOVE_SAVED_PATH
+fi
+
+# --with-sudoers: the paths a rule may name (fivenines_common.sh, held to its
+# copies in fivenines_setup.sh and fivenines_update.sh by ci/build-scripts.sh).
+# Value: protects=a sudoers rule never names a tool whose link chain or directories a user other than root can change, nor one found through the caller's PATH;
+#   fails_when=root_only_chain resolves links first (readlink -f), root_only_path drops its write-bit tests, or sudoers_tool_path searches the caller's PATH;
+#   why_new=test-sudo-mail and test-distro only ever offer it root-owned tools in root-only directories; seam=none;
+#   no_claim=either write bit on its own, or a non-root link or file inside root-only directories (each needs root to set up)
+sed -n '/^root_only_path()/,/^}/p;/^root_only_chain()/,/^}/p;/^sudoers_tool_path()/,/^}/p' \
+  "$COMMON" > "$MOVE/sudoers_paths.sh"
+mkdir -p "$MOVE/userbin"
+ln -s /bin/sh "$MOVE/userbin/sh-link"
+printf '#!/bin/sh\n' > "$MOVE/userbin/sh"
+chmod 755 "$MOVE/userbin/sh"
+(
+  # shellcheck source=/dev/null
+  . "$MOVE/sudoers_paths.sh"
+  if [ -n "$(find / -prune -user 0 2>/dev/null)" ] && [ -n "$(find /bin/sh -prune -user 0 2>/dev/null)" ]; then
+    root_only_chain /bin/sh
+    check "a root-owned tool in root-only directories may get a rule" "$?" "0"
+    _found=$(PATH="$MOVE/userbin:$PATH" sudoers_tool_path sh 2> /dev/null)
+    case "$_found" in
+      "$MOVE"/*|"") _found="not found in secure_path: '$_found'" ;;
+      /usr/local/sbin/sh|/usr/local/bin/sh|/usr/sbin/sh|/usr/bin/sh|/sbin/sh|/bin/sh) _found=secure_path ;;
+    esac
+    check "sudoers_tool_path looks in sudo's secure_path, not the caller's PATH" "$_found" "secure_path"
+  else
+    echo "  (the root-owned cases are not run: / or /bin/sh is not owned by root here)"
+  fi
+  root_only_chain "$MOVE/userbin/sh-link"
+  check "a link another user owns gets no rule, though its target is root's" "$?" "1"
+  if [ ! -L /tmp ] && [ -n "$(find /tmp -prune -user 0 -perm -002 2>/dev/null)" ]; then
+    root_only_chain /tmp
+    check "a root-owned directory anyone can write to gets no rule" "$?" "1"
+  else
+    echo "  (the world-writable case is not run: /tmp is not a root-owned, world-writable directory here)"
+  fi
+  _out=$(sudoers_tool_path fivenines-no-such-tool-170 2>&1)
+  check "a tool that is not installed gets no rule" "$?|$_out" "1|"
+  # The checks above ran in this subshell: carry their counts out.
+  echo "$PASS $FAIL" > "$MOVE/counts"
+)
+read -r PASS FAIL < "$MOVE/counts"
 
 if ! command -v openssl > /dev/null 2>&1; then
   echo "openssl not available - skipping the signed cases"
@@ -955,9 +1731,10 @@ check "a failed mv leaves nothing staged" \
 # SHA256SUMS in the first place. The mirror double above is synthetic, so
 # dropping a cp or an upload line would leave this harness at 40/40 while
 # every GitHub-fallback install hard-fails on "not listed in the published
-# SHA256SUMS".
+# SHA256SUMS". fivenines_uninstall.sh likewise: fivenines_setup_user.sh
+# --from-system verifies it before running it as root.
 WORKFLOW="$ROOT/.github/workflows/build-release.yml"
-for asset in fivenines-agent.service fivenines-agent.openrc fivenines_script.sh; do
+for asset in fivenines-agent.service fivenines-agent.openrc fivenines_script.sh fivenines_uninstall.sh; do
   check "${asset} is staged into both release jobs" \
     "$(grep -c "cp ${asset} release/" "$WORKFLOW")" "2"
   check "${asset} is uploaded by both release jobs" \
