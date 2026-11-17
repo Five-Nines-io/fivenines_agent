@@ -2486,10 +2486,12 @@ since PostgreSQL 14 (agent **1.20.5+**).
 
 ### MySQL / MariaDB
 
-Collects metrics via the `mysql`/`mariadb` client CLI (unix socket or TCP;
-`MYSQL_PWD` keeps the password out of the process list). Works with MySQL 8 and
-MariaDB. Reports a reachability status so the dashboard can tell an outage apart
-from a credentials problem. Available in agent version **1.11.4+**:
+Collects metrics over one connection per collection, with a driver built into
+the agent: no `mysql` client is needed on the host (agents up to 1.24.0 ran the
+`mysql`/`mariadb` client and reported nothing where it was not installed). Works
+with MySQL 8+ and MariaDB. Reports a reachability status so the dashboard can tell
+an outage apart from a credentials problem. Available in agent version
+**1.11.4+**:
 
 - Reachable / unreachable / config-error status with the underlying error
 - Connections and `max_connections`; queries, slow queries, aborted connects
@@ -2500,11 +2502,42 @@ from a credentials problem. Available in agent version **1.11.4+**:
   `SHOW SLAVE STATUS` fallback for MariaDB / MySQL < 8.0.22)
 - Galera / wsrep cluster state on MariaDB/MySQL Galera nodes (cluster size and
   status, local state, ready/connected, flow-control pause and receive-queue
-  averages). Detection is implicit: a non-Galera server reports no wsrep data,
-  so these keys are simply absent. Available in agent version **1.15.0+**.
+  averages), read only when the server's `wsrep_on` is `ON`: on any other
+  server these keys are simply absent. Available in agent version **1.15.0+**;
+  before the collector moved to its built-in driver, a MariaDB without Galera
+  also reported a "Disconnected" cluster of size 0.
 
-Requires a `mysql` (or `mariadb`) client on the host and appropriate database
-credentials.
+Requires a database account. It needs no privilege for the status, version,
+connection and Galera metrics; replication status needs `REPLICATION CLIENT` on
+MySQL and `SLAVE MONITOR` on MariaDB 10.5+ (where `REPLICATION CLIENT` became
+`BINLOG MONITOR`, which does not cover it). Without it the replication section
+is simply left out:
+
+```sql
+CREATE USER 'fivenines'@'localhost' IDENTIFIED BY 'a-strong-password';
+GRANT REPLICATION CLIENT ON *.* TO 'fivenines'@'localhost';  -- MySQL
+GRANT SLAVE MONITOR ON *.* TO 'fivenines'@'localhost';       -- MariaDB 10.5+
+```
+
+Where it connects follows what the `mysql` and `mariadb` clients did:
+
+- `localhost` (the default) means the local server's **unix socket** when one
+  exists at the distributions' default paths (`/run/mysqld/mysqld.sock`,
+  `/var/run/mysqld/mysqld.sock`, `/var/lib/mysql/mysql.sock`,
+  `/run/mysql/mysql.sock`, `/var/run/mysql/mysql.sock`) and the port is 3306,
+  and TCP to `127.0.0.1` on that port otherwise -- a MySQL running in Docker
+  with its port published, or a second instance on another port. The agent
+  does not read `my.cnf`: a socket moved elsewhere, or a server on another
+  port that is only reachable through its socket (the `mysql` client used the
+  socket for `localhost` whatever the port), must be configured as the socket
+  path.
+- Any other host is reached over TCP.
+- TLS is used when the server offers it, without certificate verification,
+  as the `mysql` client does by default. A server whose TLS the agent cannot
+  negotiate (only TLS 1.0/1.1) is read without TLS.
+- Accounts using an authentication plugin that sends the password in clear
+  (`mysql_clear_password`, or `dialog` for PAM) only work through the unix
+  socket. MariaDB accounts using `ed25519` are not supported.
 
 ### MongoDB
 
