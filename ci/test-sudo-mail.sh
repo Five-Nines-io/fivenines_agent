@@ -264,6 +264,13 @@ elif [ "$rc" -ne 0 ]; then
 else
   if visudo -c >/dev/null 2>&1; then echo "    ok   --with-sudoers: visudo -c is clean"
   else echo "    FAIL --with-sudoers: visudo -c"; visudo -c; fail=1; fi
+  if grep -qx 'Defaults:fivenines always_set_home' /etc/sudoers.d/fivenines; then
+    echo "    ok   --with-sudoers: the account's commands get root's HOME"
+  elif [ "$flavor" = sudo-rs ]; then
+    echo "    info --with-sudoers: this sudo's visudo rejects always_set_home (sudo-rs sets the target's HOME anyway)"
+  else
+    echo "    FAIL --with-sudoers: no always_set_home line"; fail=1
+  fi
   # Per tool, what the agent runs. A tool's rule is one line, written whole
   # or not at all: real sudo must take all four; sudo-rs may reject one (a
   # tag or an argument pattern it does not support), which is then said.

@@ -808,6 +808,16 @@ printf 'fivenines-state-begin\n%s\n' "$(printf 'per-host-token-0001' | base64)" 
   decode_state "$MOVE/cut.b64" "$MOVE/cut.out"
 )
 check "decode_state refuses a transfer with no end marker" "$?" "1"
+# Output printed before the data with no newline: the begin marker is not on
+# a line of its own, and the file must not decode as an empty one.
+printf 'Last login: somewhere%s\n%s\nfivenines-state-end\n' 'fivenines-state-begin' \
+  "$(printf 'per-host-token-0001' | base64)" > "$MOVE/nobegin.b64"
+(
+  # shellcheck source=/dev/null
+  . "$MOVE/from_system.sh"
+  decode_state "$MOVE/nobegin.b64" "$MOVE/nobegin.out"
+)
+check "decode_state refuses a transfer whose begin marker is not on a line of its own" "$?" "1"
 
 # --from-system: take_over_system_install, when the release's uninstaller
 # leaves the system TOKEN behind (it failed half-way), and when it removes it.
@@ -936,6 +946,12 @@ check "--from-system ignores a signal once the system installation is gone" \
 # Value: protects=an uninstaller that removed the unit but not the TOKEN leaves the copy taken back and a warning that the system agent was not started again, which says to re-run the move, never to remove the system installation (it holds the only TOKEN left);
 #   fails_when=restart_system_agent goes back to an if/elif that succeeds when neither service definition exists, or its advice names the uninstaller;
 #   why_new=the other checks keep the unit or remove both; seam=as above; no_claim=the OpenRC branch
+# Value: protects=an undone --from-system enables the system agent again before starting it (the uninstaller disables it before it removes the TOKEN);
+#   fails_when=restart_system_agent only starts the service;
+#   why_new=the other checks run in test mode, or stop before the restart; seam=as above; no_claim=the OpenRC branch
+check "--from-system enables and starts the system agent again when its TOKEN stays" \
+  "$(from_system_stop "" "echo pretend uninstall")|$(grep -c 'did not remove the system installation' "$MOVE/out")|$(tr '\n' '|' < "$MOVE/svc.log")" \
+  "1|1|systemctl stop fivenines-agent.service|systemctl enable fivenines-agent.service|systemctl start fivenines-agent.service|"
 check "--from-system says the system agent is not started again once its unit is gone" \
   "$(from_system_stop "" "rm -f '$MOVE/units/fivenines-agent.service'")|$(grep 'its service definition is gone' "$MOVE/out" | grep -c 'Re-run --from-system')|$(grep 'its service definition is gone' "$MOVE/out" | grep -c 'uninstall')|$(move_names "$MOVE/cfg")|$(cat "$MOVE/sys/TOKEN")" \
   "1|1|0||per-host-token-0001"
@@ -1015,6 +1031,41 @@ _rc=$?
 check "--from-user rolls back what it installed, then the service, then restarts the user-level agent, through a second signal" \
   "$_rc|$(move_names "$MOVE/etc")|$(tr '\n' '|' < "$MOVE/svc.log")|$(grep -c 'runs again, unchanged' "$MOVE/out")" \
   "0|.env last_capture_id |systemctl stop fivenines-agent.service|systemctl disable fivenines-agent.service|start.sh||1"
+
+# --from-user preflight: the argument it was given is never printed (a token
+# passed out of habit would land in a job log), and the user side must have
+# pgrep, which the stop needs to wait for the agent.
+# Value: protects=--from-user never echoes a token given in place of a user name, and refuses a user with no pgrep before anything stops;
+#   fails_when=an error message repeats FROM_USER_NAME, or the pgrep check is dropped (the state would be read while the agent may still write it);
+#   why_new=the parser checks above stop at the usage line; seam=as_user is a function here;
+#   no_claim=the checks after pgrep, or that the user's PATH under env -i is the one su gives
+sed -n '/^STATE_FILES=/p;/^exit_with_contact()/,/^}/p;/^resolve_takeover_user()/,/^}/p
+        /^preflight_user_takeover()/,/^}/p' "$ROOT/fivenines_setup.sh" > "$MOVE/preuser.sh"
+# Runs the preflight for user $1, with as_user failing on a command that
+# names pgrep when $2 is nopgrep. Prints its status and output on one line.
+from_user_preflight() {
+  (
+    # shellcheck source=/dev/null
+    . "$MOVE/preuser.sh"
+    # Called by the preflight.
+    # shellcheck disable=SC2317,SC2329
+    as_user() {
+      case "$1" in *pgrep*) [ "$_preuser_pgrep" != nopgrep ] ;; *) return 0 ;; esac
+    }
+    _preuser_pgrep=${2:-}
+    FROM_USER_NAME=$1
+    SYSTEM_TYPE=systemd
+    # Test mode skips the stop, and so the check: $3 sets it.
+    FIVENINES_TEST_MODE=${3:-}
+    preflight_user_takeover
+  ) 2>&1 | tr '\n' ' '
+}
+check "--from-user never repeats an argument that is not a user name" \
+  "$(from_user_preflight 'tok:ab12cd34ef56' | grep -c 'ab12cd34ef56')|$(from_user_preflight 'tok-ab12cd34ef56' | grep -c 'ab12cd34ef56')" "0|0"
+if [ ! -e /etc/fivenines_agent ] && command -v base64 > /dev/null 2>&1 && command -v setsid > /dev/null 2>&1; then
+  check "--from-user refuses a user with no pgrep, and goes on with one, or in test mode" \
+    "$(from_user_preflight "$(id -un)" nopgrep | grep -c 'needs pgrep')|$(from_user_preflight "$(id -un)" | grep -c 'Moving the user-level installation')|$(from_user_preflight "$(id -un)" nopgrep 1 | grep -c 'Moving the user-level installation')" "1|1|1"
+fi
 
 # --from-user: exit_with_contact, the exit of every failure, rolls the move
 # back once the user-level agent was stopped.
@@ -1407,14 +1458,16 @@ printf '%s\n' 'Personalities : [raid1]' 'md0 : active raid1 sdb1[1] sda1[0]' \
 sed -n '/^write_sudoers_rules()/,/^}/p' "$ROOT/fivenines_common.sh" \
   | sed "s|/proc/mdstat|$SUD/mdstat|g; s|/etc/sudoers.d|$SUD/sudoers.d|g; s|/etc/sudoers|$SUD/sudoers|g" \
   > "$SUD/write.sh"
-# Runs the rewritten write_sudoers_rules, mdadm the only tool found.
+# Runs the rewritten write_sudoers_rules, mdadm the only tool found, or no
+# tool at all with $1 none.
 md_rules_run() {
+  _md_tools=${1:-}
   (
     # shellcheck source=/dev/null
     . "$SUD/write.sh"
     # Called by write_sudoers_rules.
     # shellcheck disable=SC2317,SC2329
-    sudoers_tool_path() { [ "$1" = mdadm ] && echo /sbin/mdadm; }
+    sudoers_tool_path() { [ "$1" = mdadm ] && [ "$_md_tools" != none ] && echo /sbin/mdadm; }
     # shellcheck disable=SC2317,SC2329
     visudo() { return 0; }
     # shellcheck disable=SC2317,SC2329
@@ -1424,9 +1477,17 @@ md_rules_run() {
   )
 }
 md_rules_run
+check "--with-sudoers gives every command of the account root's HOME, before its rules" \
+  "$(grep -v '^#' "$SUD/sudoers.d/fivenines" 2>/dev/null | head -n 1)" "Defaults:fivenines always_set_home"
 check "--with-sudoers gives an md array named with a dash or a dot its exact --detail entry, and none to a name with a comma" \
   "$(grep '^fivenines' "$SUD/sudoers.d/fivenines" 2>/dev/null | grep -o ', /sbin/mdadm --detail /dev/md_[^,]*' | tr '\n' '|')|$(grep -c 'No sudoers entry for /dev/md_a,b' "$SUD/out")" \
   ", /sbin/mdadm --detail /dev/md_data-1|, /sbin/mdadm --detail /dev/md_home.0||1"
+# Value: protects=a rerun that finds no tool it may grant withdraws the file an earlier run wrote, whose rules may name a tool that is no longer root's alone;
+#   fails_when=the no-rule branch leaves /etc/sudoers.d/fivenines in place;
+#   why_new=the check above writes a file; seam=as above; no_claim=an operator's file, which the marker check before it already leaves alone
+md_rules_run none
+check "--with-sudoers removes its earlier file when no tool may be granted any more" \
+  "$([ -e "$SUD/sudoers.d/fivenines" ] && echo kept)|$(grep -c 'removed .*which an earlier run wrote' "$SUD/out")" "|1"
 
 # warn_unpinned_sudoers_rules, over a fixed sudo -l -U listing.
 # Value: protects=a bare mdadm or fail2ban-client rule sudo lists for the fivenines account is named at every install and update, a pinned one never;

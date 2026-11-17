@@ -604,6 +604,19 @@ write_sudoers_rules() {
         > "$sudoers_staged"; then
         return 1
     fi
+    # fail2ban-client is a Python script: where sudo keeps the caller's HOME
+    # (Ubuntu before 19.10, or env_keep += HOME), Python runs the .pth files
+    # of the account's ~/.local as root, whatever the rule's arguments.
+    # always_set_home gives every command it runs through sudo root's HOME.
+    sudoers_defaults="Defaults:fivenines always_set_home"
+    rm -f "$sudoers_one"
+    printf '%s\n' "$sudoers_defaults" > "$sudoers_one" && chmod 440 "$sudoers_one"
+    if visudo -cf "$sudoers_one" > /dev/null 2>&1; then
+        printf '%s\n' "$sudoers_defaults" >> "$sudoers_staged"
+        print_success "sudoers default: ${sudoers_defaults}"
+    else
+        print_warning "This host's visudo rejects '${sudoers_defaults}': not written."
+    fi
     sudoers_rules=0
     for sudoers_tool in smartctl mdadm fail2ban-client wg; do
         sudoers_path=$(sudoers_tool_path "$sudoers_tool") || continue
@@ -673,6 +686,15 @@ write_sudoers_rules() {
     if [ "$sudoers_rules" -eq 0 ]; then
         print_warning "--with-sudoers: none of smartctl, mdadm, fail2ban-client or wg is usable here, so no rule was written."
         rm -f "$sudoers_staged"
+        # An earlier run's file would keep granting a tool this run refused
+        # (one that anyone but root can now change): it goes too.
+        if [ -e "$sudoers_file" ]; then
+            if rm -f "$sudoers_file"; then
+                print_warning "--with-sudoers: removed ${sudoers_file}, which an earlier run wrote."
+            else
+                print_warning "--with-sudoers: could not remove ${sudoers_file}, which an earlier run wrote: remove it."
+            fi
+        fi
         return 1
     fi
     chmod 440 "$sudoers_staged"

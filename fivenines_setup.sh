@@ -658,6 +658,19 @@ write_sudoers_rules() {
         > "$sudoers_staged"; then
         return 1
     fi
+    # fail2ban-client is a Python script: where sudo keeps the caller's HOME
+    # (Ubuntu before 19.10, or env_keep += HOME), Python runs the .pth files
+    # of the account's ~/.local as root, whatever the rule's arguments.
+    # always_set_home gives every command it runs through sudo root's HOME.
+    sudoers_defaults="Defaults:fivenines always_set_home"
+    rm -f "$sudoers_one"
+    printf '%s\n' "$sudoers_defaults" > "$sudoers_one" && chmod 440 "$sudoers_one"
+    if visudo -cf "$sudoers_one" > /dev/null 2>&1; then
+        printf '%s\n' "$sudoers_defaults" >> "$sudoers_staged"
+        print_success "sudoers default: ${sudoers_defaults}"
+    else
+        print_warning "This host's visudo rejects '${sudoers_defaults}': not written."
+    fi
     sudoers_rules=0
     for sudoers_tool in smartctl mdadm fail2ban-client wg; do
         sudoers_path=$(sudoers_tool_path "$sudoers_tool") || continue
@@ -727,6 +740,15 @@ write_sudoers_rules() {
     if [ "$sudoers_rules" -eq 0 ]; then
         print_warning "--with-sudoers: none of smartctl, mdadm, fail2ban-client or wg is usable here, so no rule was written."
         rm -f "$sudoers_staged"
+        # An earlier run's file would keep granting a tool this run refused
+        # (one that anyone but root can now change): it goes too.
+        if [ -e "$sudoers_file" ]; then
+            if rm -f "$sudoers_file"; then
+                print_warning "--with-sudoers: removed ${sudoers_file}, which an earlier run wrote."
+            else
+                print_warning "--with-sudoers: could not remove ${sudoers_file}, which an earlier run wrote: remove it."
+            fi
+        fi
         return 1
     fi
     chmod 440 "$sudoers_staged"
@@ -1155,7 +1177,7 @@ resolve_takeover_user() {
   fi
   case "$FROM_USER_NAME" in
     -*|*:*|*/*)
-      exit_with_contact "Not a user name: $FROM_USER_NAME"
+      exit_with_contact "--from-user takes a user name, and that argument is not one (no token is needed: the user's own is carried over)."
       ;;
   esac
   passwd_line=$(getent passwd "$FROM_USER_NAME" 2>/dev/null \
@@ -1163,7 +1185,7 @@ resolve_takeover_user() {
   passwd_line=$(printf '%s\n' "$passwd_line" | head -n 1)
   FROM_USER_HOME=$(printf '%s' "$passwd_line" | cut -d: -f6)
   if [ -z "$FROM_USER_HOME" ]; then
-    exit_with_contact "There is no user named $FROM_USER_NAME on this host."
+    exit_with_contact "No user of the name given to --from-user exists on this host (it takes a user name, not a token: the user's own token is carried over)."
   fi
   # getent also answers a uid; su is given the name.
   FROM_USER_NAME=$(printf '%s' "$passwd_line" | cut -d: -f1)
@@ -1197,6 +1219,11 @@ preflight_user_takeover() {
   fi
   if ! as_user 'exit 0'; then
     exit_with_contact "Cannot run a command as $FROM_USER_NAME with su."
+  fi
+  # Without it the stop could not wait for the agent to exit, and its state
+  # would be read while it may still write it. Test mode skips the stop.
+  if [ "${FIVENINES_TEST_MODE:-}" != "1" ] && ! as_user 'command -v pgrep > /dev/null 2>&1'; then
+    exit_with_contact "--from-user needs pgrep (procps or busybox) for $FROM_USER_NAME, to wait for the user-level agent to stop."
   fi
   # The installation's own start.sh is what ties the two directories
   # together. Without it (FIVENINES_INSTALL_DIR not passed again), the running
@@ -1293,7 +1320,9 @@ stop_user_agent() {
 # no dash, so no encoded line can read as a marker. fivenines_setup_user.sh
 # carries the same function, for sudo (ci/build-scripts.sh keeps them equal).
 decode_state() {
-    if ! grep -qx 'fivenines-state-end' "$1"; then
+    # Both markers on lines of their own: output printed before the data with
+    # no newline would hide the first, and an empty file would read as one.
+    if ! grep -qx 'fivenines-state-begin' "$1" || ! grep -qx 'fivenines-state-end' "$1"; then
         return 1
     fi
     sed -n '/^fivenines-state-begin$/,/^fivenines-state-end$/p' "$1" | sed '1d;$d' | base64 -d > "$2"

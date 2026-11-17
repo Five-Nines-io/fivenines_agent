@@ -893,6 +893,7 @@ The agent runs as the `fivenines` user and automatically detects available monit
 For full monitoring capabilities, add the following to `/etc/sudoers.d/fivenines`:
 
 ```
+Defaults:fivenines always_set_home
 fivenines ALL=(ALL) NOPASSWD: /usr/sbin/smartctl
 fivenines ALL=(ALL) NOPASSWD: /sbin/mdadm --version, /sbin/mdadm --detail /dev/md[0-9], /sbin/mdadm --detail /dev/md[0-9][0-9], /sbin/mdadm --detail /dev/md[0-9][0-9][0-9]
 ```
@@ -903,6 +904,11 @@ Two optional rules, only if you monitor these features:
 fivenines ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client version, /usr/bin/fail2ban-client status, /usr/bin/fail2ban-client status *
 fivenines ALL=(root) NOPASSWD:NOLOG_OUTPUT: /usr/bin/wg show all dump
 ```
+
+The `Defaults` line gives the commands the account runs through sudo root's
+`HOME`: `fail2ban-client` is a Python script, and where sudo keeps the
+caller's `HOME` (Ubuntu before 19.10, or `env_keep += HOME`) Python would run
+the files the account put in its own `~/.local` as root.
 
 The mdadm and fail2ban rules name the commands the agent runs, and nothing
 else: a rule for the bare command would let the account run code as root

@@ -977,7 +977,9 @@ preflight_system_takeover() {
 # no dash, so no encoded line can read as a marker. fivenines_setup.sh
 # carries the same function, for su (ci/build-scripts.sh keeps them equal).
 decode_state() {
-    if ! grep -qx 'fivenines-state-end' "$1"; then
+    # Both markers on lines of their own: output printed before the data with
+    # no newline would hide the first, and an empty file would read as one.
+    if ! grep -qx 'fivenines-state-begin' "$1" || ! grep -qx 'fivenines-state-end' "$1"; then
         return 1
     fi
     sed -n '/^fivenines-state-begin$/,/^fivenines-state-end$/p' "$1" | sed '1d;$d' | base64 -d > "$2"
@@ -1053,6 +1055,8 @@ copy_system_state() {
 
 # What the service's own start would do; used to put the system agent back
 # when the move fails before anything was removed.
+# fivenines_uninstall.sh disables the service before it removes the TOKEN:
+# undone between the two, the agent is enabled again, not only started.
 restart_system_agent() {
     if [ "${FIVENINES_TEST_MODE:-}" = "1" ]; then
         return 0
@@ -1060,8 +1064,10 @@ restart_system_agent() {
     restart_rc=0
     as_root '
         if [ -f /etc/systemd/system/fivenines-agent.service ] && command -v systemctl > /dev/null 2>&1; then
+            systemctl enable fivenines-agent.service > /dev/null 2>&1 || true
             systemctl start fivenines-agent.service
         elif [ -f /etc/init.d/fivenines-agent ] && command -v rc-service > /dev/null 2>&1; then
+            rc-update add fivenines-agent default > /dev/null 2>&1 || true
             rc-service fivenines-agent start
         else
             exit 3
