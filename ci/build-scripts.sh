@@ -41,8 +41,10 @@ verification_preflight verify_from_manifest verify_agent_tarball"
 # OpenRC init script, UNRAID boot script), so only they carry the helper that
 # verifies one before it lands. Checked in its own list rather than added to
 # the one above, which would report it "MISSING" from the user scripts that
-# have no business installing a service at all.
-SYSTEM_FUNCTIONS="install_verified_release_file"
+# have no business installing a service at all. The --with-sudoers helpers
+# are system-only for the same reason: they write a root-read sudoers file.
+SYSTEM_FUNCTIONS="install_verified_release_file root_only_path root_only_chain sudoers_tool_path \
+write_sudoers_rules warn_unpinned_sudoers_rules"
 
 ALL_SCRIPTS="$SCRIPT_DIR/fivenines_setup.sh \
 $SCRIPT_DIR/fivenines_update.sh \
@@ -136,6 +138,63 @@ for func in $PAIR_FUNCTIONS; do
     check_function_pair "$func" \
         "$SCRIPT_DIR/fivenines_setup_user.sh" "$SCRIPT_DIR/fivenines_update_user.sh"
 done
+
+# How a state file crosses su (--from-user) and sudo (--from-system): one
+# decoder, so a fix to it cannot reach one direction only.
+check_function_pair decode_state \
+    "$SCRIPT_DIR/fivenines_setup.sh" "$SCRIPT_DIR/fivenines_setup_user.sh"
+
+# How every script finds a user-level agent (agent_pattern: anchored on its
+# path, so nothing else is signalled), writes the scripts that find it
+# (write_control_scripts, rewritten by the update), and finds the crontab
+# line that starts it (start_spellings). fivenines_setup_user.sh holds the
+# reference copy of each.
+for script in fivenines_setup.sh fivenines_update_user.sh fivenines_uninstall_user.sh; do
+    check_function_pair agent_pattern \
+        "$SCRIPT_DIR/fivenines_setup_user.sh" "$SCRIPT_DIR/$script"
+done
+for script in fivenines_setup.sh fivenines_uninstall_user.sh; do
+    check_function_pair start_spellings \
+        "$SCRIPT_DIR/fivenines_setup_user.sh" "$SCRIPT_DIR/$script"
+done
+check_function_pair write_control_scripts \
+    "$SCRIPT_DIR/fivenines_setup_user.sh" "$SCRIPT_DIR/fivenines_update_user.sh"
+
+# Constants two scripts must agree on, each a whole line. STATE_FILES and
+# STATE_FILE_MAX: what fivenines_setup.sh --from-user and
+# fivenines_setup_user.sh --from-system carry from one installation to the
+# other -- a file one direction drops (the journal allowlist) widens what the
+# agent may read. The sudoers marker: fivenines_uninstall.sh removes
+# /etc/sudoers.d/fivenines only when its first line is the one
+# write_sudoers_rules wrote.
+check_line_pair() {
+    label="$1"
+    a_line="$2"
+    b_line="$3"
+    where="$4"
+
+    if [ -z "$a_line" ] || [ -z "$b_line" ]; then
+        echo "MISSING: ${label} in ${where}"
+        ERRORS=$((ERRORS + 1))
+    elif [ "$a_line" != "$b_line" ]; then
+        echo "WARNING: ${label} differs between ${where}"
+        ERRORS=$((ERRORS + 1))
+    else
+        echo "OK: ${label} matches across ${where}"
+    fi
+}
+
+for const in STATE_FILES STATE_FILE_MAX; do
+    check_line_pair "$const" \
+        "$(grep "^${const}=" "$SCRIPT_DIR/fivenines_setup.sh")" \
+        "$(grep "^${const}=" "$SCRIPT_DIR/fivenines_setup_user.sh")" \
+        "fivenines_setup.sh / fivenines_setup_user.sh"
+done
+
+check_line_pair "the sudoers marker" \
+    "$(sed -n 's/^    sudoers_marker="\(.*\)"$/\1/p' "$COMMON")" \
+    "$(sed -n 's/^SUDOERS_MARKER="\(.*\)"$/\1/p' "$SCRIPT_DIR/fivenines_uninstall.sh")" \
+    "fivenines_common.sh / fivenines_uninstall.sh"
 
 if [ "$ERRORS" -gt 0 ]; then
     echo ""

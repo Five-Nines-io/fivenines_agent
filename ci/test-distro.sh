@@ -31,7 +31,8 @@ TARBALL_PATH="/tmp/${BINARY_NAME}.tar.gz"
 # API server and wget satisfies the downloader that fivenines_setup_user.sh
 # requires. openssl is what verification_preflight looks for -- busybox has no
 # openssl applet, so an Alpine image without the package cannot check a release
-# signature at all. The frozen binary needs none of them -- that is what tests
+# signature at all. sudo is what fivenines_setup_user.sh --from-system runs the
+# system side through, and its visudo is what --with-sudoers checks rules with. The frozen binary needs none of them -- that is what tests
 # 1 to 7 prove.
 #
 # Best-effort by design, because an EOL image's package metadata rots: when a
@@ -49,13 +50,13 @@ TARBALL_PATH="/tmp/${BINARY_NAME}.tar.gz"
 install_test_deps() {
   if command -v apk > /dev/null 2>&1; then
     # Alpine
-    apk add --no-cache python3 wget shadow openssl
+    apk add --no-cache python3 wget shadow openssl sudo
   elif command -v dnf > /dev/null 2>&1; then
     # Fedora / Rocky 9+
-    dnf install -y -q python3 wget util-linux openssl
+    dnf install -y -q python3 wget util-linux openssl sudo findutils
   elif command -v yum > /dev/null 2>&1; then
     # CentOS 7
-    yum install -y -q python3 wget openssl
+    yum install -y -q python3 wget openssl sudo
   elif command -v apt-get > /dev/null 2>&1; then
     # Debian / Ubuntu. Check-Valid-Until=false accepts an expired Release file,
     # which is the difference between a usable and an unusable EOL image; it is
@@ -64,7 +65,7 @@ install_test_deps() {
     # test). The option is repeated inline rather than held in a variable so
     # that the lint job sees no unquoted word splitting.
     apt-get -o Acquire::Check-Valid-Until=false update -qq \
-      && apt-get -o Acquire::Check-Valid-Until=false install -y -qq python3 wget openssl
+      && apt-get -o Acquire::Check-Valid-Until=false install -y -qq python3 wget openssl sudo
   else
     echo "no supported package manager found"
     return 1
@@ -484,6 +485,14 @@ if [ -f "$USER_TOKEN_FILE" ]; then
 fi
 
 if [ "$(id -u)" = "0" ] && id testuser > /dev/null 2>&1 && [ -d "$USER_INSTALL_DIR" ]; then
+  # An installation made before the control scripts found the agent by its
+  # path: the update must rewrite them, and never start.sh, which carries the
+  # config directory the installation was made with.
+  # Value: protects=the user update rewrites stop/status/refresh with the anchored pattern and leaves start.sh byte-identical;
+  #   fails_when=the update stops calling write_control_scripts, or rewrites start.sh; seam=none;
+  #   why_new=this test checked only the exit code and the TOKEN; no_claim=that the rewritten stop.sh stops an agent (test mode starts none)
+  START_SUM_BEFORE=$(cksum < "$USER_INSTALL_DIR/start.sh" 2>/dev/null)
+  printf '#!/bin/bash\n# an older status.sh\npgrep -f fivenines-agent | head -1\n' > "$USER_INSTALL_DIR/status.sh"
   if timeout 120 su -s /bin/sh testuser -c "
     export FIVENINES_TEST_MODE=1
     export FIVENINES_AGENT_SHA256='${FIVENINES_AGENT_SHA256}'
@@ -501,6 +510,18 @@ if [ "$(id -u)" = "0" ] && id testuser > /dev/null 2>&1 && [ -d "$USER_INSTALL_D
       fi
     else
       record_result "user-update" "FAIL" "TOKEN file missing after update"
+    fi
+    if [ -n "$START_SUM_BEFORE" ] \
+      && [ "$(cksum < "$USER_INSTALL_DIR/start.sh" 2>/dev/null)" = "$START_SUM_BEFORE" ] \
+      && grep -qF "pgrep -f '^" "$USER_INSTALL_DIR/status.sh" \
+      && grep -qF "pgrep -f '^" "$USER_INSTALL_DIR/stop.sh" \
+      && grep -qF "pgrep -f '^" "$USER_INSTALL_DIR/refresh.sh"; then
+      record_result "user-update-control-scripts" "PASS" "control scripts rewritten, start.sh unchanged"
+    else
+      record_result "user-update-control-scripts" "FAIL" "see the output below"
+      echo "--- status.sh after the update ---"
+      cat "$USER_INSTALL_DIR/status.sh" 2>&1 || true
+      echo "--- start.sh checksum: before '$START_SUM_BEFORE', after '$(cksum < "$USER_INSTALL_DIR/start.sh" 2>&1)' ---"
     fi
   else
     record_result "user-update" "FAIL" "exit code $?"
@@ -535,6 +556,153 @@ if [ "$(id -u)" = "0" ] && id testuser > /dev/null 2>&1 && [ -d "$USER_INSTALL_D
   fi
 else
   record_result "user-uninstall" "SKIP" "user install not completed"
+fi
+
+# ---------------------------------------------------------------
+# Test 12: user-level -> system (fivenines_setup.sh --from-user)
+# ---------------------------------------------------------------
+echo ""
+echo "=== Test 12: user-level -> system (--from-user) ==="
+
+# The state a running agent leaves behind, carried both ways (Test 13).
+MOVE_TOKEN="test-token-move-ci-0001"
+MOVE_MACHINE_ID="0b5e2d5c-6f1a-4c3e-9d2b-7a8f1e4c5d6a"
+SYSTEM_CONFIG_DIR="/etc/fivenines_agent"
+SUDOERS_FILE="/etc/sudoers.d/fivenines"
+MOVED_TO_SYSTEM=0
+
+# Root-owned stand-ins for two monitored tools, so --with-sudoers has rules to
+# write for this image's real visudo to check. Only where the name is free.
+# With /usr/sbin a link to bin (Fedora 42), the rules name /usr/sbin for both:
+# the installer looks there first, as secure_path does.
+for fake_tool in /usr/sbin/smartctl /usr/bin/wg; do
+  if [ ! -e "$fake_tool" ] && [ -d "${fake_tool%/*}" ]; then
+    printf '#!/bin/sh\necho "%s $*"\n' "${fake_tool##*/}" > "$fake_tool"
+    chmod 755 "$fake_tool"
+  fi
+done
+
+# fivenines_uninstall.sh (Test 8) removes /etc/fivenines_agent and the
+# fivenines user through sudo, so on an image where sudo could not be
+# installed (an EOL image whose mirrors are gone) they are still there, and
+# --from-user would rightly refuse to replace an existing system install (or
+# any state file it left). This container is thrown away: clear what Test 8
+# could not.
+if [ -e "$SYSTEM_CONFIG_DIR" ] && [ "$(id -u)" = "0" ]; then
+  rm -rf "${SYSTEM_CONFIG_DIR:?}" /opt/fivenines
+  userdel -r fivenines > /dev/null 2>&1 || deluser fivenines > /dev/null 2>&1 || true
+fi
+
+make_tarball
+if [ "$(id -u)" != "0" ] || ! id testuser > /dev/null 2>&1; then
+  record_result "user-to-system" "SKIP" "cannot create test user"
+elif ! command -v wget > /dev/null 2>&1 && ! command -v curl > /dev/null 2>&1; then
+  record_result "user-to-system" "SKIP" "no wget/curl in image"
+else
+  chmod 644 "$TARBALL_PATH" 2>/dev/null || true
+  timeout 120 su -s /bin/sh testuser -c "
+    export FIVENINES_TEST_MODE=1
+    export FIVENINES_AGENT_SHA256='${FIVENINES_AGENT_SHA256}'
+    export FIVENINES_INSTALL_DIR='${USER_INSTALL_DIR}'
+    export FIVENINES_CONFIG_DIR='${USER_CONFIG_DIR}'
+    sh '${SCRIPTS_DIR}/fivenines_setup_user.sh' '${MOVE_TOKEN}' &&
+      printf '%s' '${MOVE_MACHINE_ID}' > '${USER_CONFIG_DIR}/MACHINE_ID' &&
+      printf 'nginx\n' > '${USER_CONFIG_DIR}/journal_units.allow'
+  " > "${OUTPUT_DIR}/move_user_setup_output" 2>&1
+
+  # No FIVENINES_INSTALL_DIR / FIVENINES_CONFIG_DIR: the defaults under
+  # testuser's home, read from the passwd entry, are the paths above.
+  make_tarball
+  if timeout 120 sh "${SCRIPTS_DIR}/fivenines_setup.sh" --from-user testuser --with-sudoers \
+      > "${OUTPUT_DIR}/move_to_system_output" 2>&1 \
+    && [ "$(cat "$SYSTEM_CONFIG_DIR/TOKEN" 2>/dev/null)" = "$MOVE_TOKEN" ] \
+    && [ "$(cat "$SYSTEM_CONFIG_DIR/MACHINE_ID" 2>/dev/null)" = "$MOVE_MACHINE_ID" ] \
+    && [ "$(cat "$SYSTEM_CONFIG_DIR/journal_units.allow" 2>/dev/null)" = "nginx" ] \
+    && [ "$(stat -c '%U %a' "$SYSTEM_CONFIG_DIR/TOKEN" 2>/dev/null)" = "fivenines 600" ] \
+    && [ "$(stat -c '%U %a' "$SYSTEM_CONFIG_DIR/journal_units.allow" 2>/dev/null)" = "root 644" ] \
+    && [ ! -e "$USER_INSTALL_DIR" ] && [ ! -e "$USER_CONFIG_DIR" ]; then
+    record_result "user-to-system" "PASS" "token, machine id and allowlist carried, user-level files removed"
+    MOVED_TO_SYSTEM=1
+  else
+    record_result "user-to-system" "FAIL" "see the output below"
+    echo "--- user setup output ---"
+    cat "${OUTPUT_DIR}/move_user_setup_output" 2>/dev/null || true
+    echo "--- --from-user output ---"
+    cat "${OUTPUT_DIR}/move_to_system_output" 2>/dev/null || true
+    ls -la "$SYSTEM_CONFIG_DIR" "$USER_INSTALL_DIR" "$USER_CONFIG_DIR" 2>&1 || true
+    echo "--- end output ---"
+  fi
+fi
+
+# --with-sudoers, against this image's real visudo.
+SUDOERS_WRITTEN=0
+if [ "$MOVED_TO_SYSTEM" != "1" ]; then
+  record_result "with-sudoers" "SKIP" "user-to-system did not pass"
+elif ! command -v visudo > /dev/null 2>&1; then
+  record_result "with-sudoers" "SKIP" "no sudo in image"
+elif [ "$(head -n 1 "$SUDOERS_FILE" 2>/dev/null)" = "# Managed by the fivenines agent installer (--with-sudoers)" ] \
+  && grep -qxF "fivenines ALL=(ALL) NOPASSWD: /usr/sbin/smartctl" "$SUDOERS_FILE" \
+  && grep -qxE 'fivenines ALL=\(root\) NOPASSWD:NOLOG_OUTPUT: /usr/s?bin/wg show all dump' "$SUDOERS_FILE" \
+  && [ "$(stat -c '%U %a' "$SUDOERS_FILE" 2>/dev/null)" = "root 440" ] \
+  && visudo -c > /dev/null 2>&1; then
+  record_result "with-sudoers" "PASS" "rules written, visudo -c clean"
+  SUDOERS_WRITTEN=1
+else
+  record_result "with-sudoers" "FAIL" "see the output below"
+  echo "--- ${SUDOERS_FILE} ---"
+  cat "$SUDOERS_FILE" 2>&1 || true
+  ls -l "$SUDOERS_FILE" 2>&1 || true
+  visudo -c 2>&1 || true
+  grep -i sudoers "${OUTPUT_DIR}/move_to_system_output" 2>/dev/null || true
+  echo "--- end output ---"
+fi
+
+# ---------------------------------------------------------------
+# Test 13: system -> user-level (fivenines_setup_user.sh --from-system)
+# ---------------------------------------------------------------
+echo ""
+echo "=== Test 13: system -> user-level (--from-system) ==="
+
+if [ "$MOVED_TO_SYSTEM" != "1" ]; then
+  record_result "system-to-user" "SKIP" "user-to-system did not pass"
+elif ! command -v sudo > /dev/null 2>&1; then
+  record_result "system-to-user" "SKIP" "no sudo in image"
+else
+  # testuser may use sudo without a password, the way an operator's account
+  # does at a terminal; and without a tty, which CentOS 7 requires by default.
+  printf 'testuser ALL=(ALL) NOPASSWD: ALL\nDefaults:testuser !requiretty\n' >> /etc/sudoers
+  printf '{"sha256:ci":true}' > "$SYSTEM_CONFIG_DIR/image_inventory_done"
+  printf 'API_URL=api.example.invalid\n' > "$SYSTEM_CONFIG_DIR/.env"
+  # In test mode the release's uninstaller is taken from here, like the tarball.
+  cp "${SCRIPTS_DIR}/fivenines_uninstall.sh" /tmp/fivenines_uninstall.sh
+  chmod 644 /tmp/fivenines_uninstall.sh
+  make_tarball
+  chmod 644 "$TARBALL_PATH" 2>/dev/null || true
+  if timeout 120 su -s /bin/sh testuser -c "
+    export FIVENINES_TEST_MODE=1
+    export FIVENINES_AGENT_SHA256='${FIVENINES_AGENT_SHA256}'
+    export FIVENINES_INSTALL_DIR='${USER_INSTALL_DIR}'
+    export FIVENINES_CONFIG_DIR='${USER_CONFIG_DIR}'
+    sh '${SCRIPTS_DIR}/fivenines_setup_user.sh' --from-system
+  " > "${OUTPUT_DIR}/move_to_user_output" 2>&1 \
+    && [ "$(cat "$USER_CONFIG_DIR/TOKEN" 2>/dev/null)" = "$MOVE_TOKEN" ] \
+    && [ "$(cat "$USER_CONFIG_DIR/MACHINE_ID" 2>/dev/null)" = "$MOVE_MACHINE_ID" ] \
+    && [ "$(cat "$USER_CONFIG_DIR/journal_units.allow" 2>/dev/null)" = "nginx" ] \
+    && [ ! -e "$USER_CONFIG_DIR/image_inventory_done" ] && [ ! -e "$USER_CONFIG_DIR/.env" ] \
+    && [ "$(cat "$USER_CONFIG_DIR/.env.system" 2>/dev/null)" = "API_URL=api.example.invalid" ] \
+    && [ "$(stat -c '%U %a' "$USER_CONFIG_DIR/TOKEN" 2>/dev/null)" = "testuser 600" ] \
+    && [ -x "$USER_INSTALL_DIR/start.sh" ] \
+    && [ ! -e "$SYSTEM_CONFIG_DIR" ] && ! id fivenines > /dev/null 2>&1 \
+    && { [ "$SUDOERS_WRITTEN" = "0" ] || [ ! -e "$SUDOERS_FILE" ]; }; then
+    record_result "system-to-user" "PASS" "state carried (.env only as .env.system), system installation and its sudoers rules removed"
+  else
+    record_result "system-to-user" "FAIL" "see the output below"
+    echo "--- --from-system output ---"
+    cat "${OUTPUT_DIR}/move_to_user_output" 2>/dev/null || true
+    ls -la "$SYSTEM_CONFIG_DIR" "$USER_CONFIG_DIR" 2>&1 || true
+    ls -l "$SUDOERS_FILE" 2>&1 || true
+    echo "--- end output ---"
+  fi
 fi
 
 # ---------------------------------------------------------------

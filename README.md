@@ -17,6 +17,7 @@ hardware such as 32-bit Raspberry Pi OS on a Pi 4 or 5), **Windows** (Server
 - [Installation](#installation)
   - [Standard Installation (Linux)](#standard-installation-linux)
   - [User-Level Installation (No Sudo/Root Access)](#user-level-installation-no-sudoroot-access)
+  - [Switching Between User-Level and System Installation](#switching-between-user-level-and-system-installation)
   - [Windows Installation](#windows-installation)
   - [Alpine Linux (OpenRC)](#alpine-linux-openrc)
   - [UNRAID](#unraid)
@@ -135,6 +136,63 @@ To auto-start on reboot, add to crontab (`crontab -e`):
 ```
 
 > **Note:** User-level installation has limited monitoring capabilities. Features requiring sudo (SMART, RAID, fail2ban, WireGuard) are unavailable unless you add a sudoers rule naming your own user. See [Permissions](#permissions) section.
+
+### Switching Between User-Level and System Installation
+
+Either installation can be moved to the other. The move keeps the agent's
+identity -- its token and machine id -- and its state (the journal allowlist,
+the capture nonce), so the dashboard keeps the same host and its history
+instead of enrolling a second one. The
+agent being replaced is stopped before the new one starts, and its files are
+removed only once the new one is in place.
+
+**User-level to system** (by the user whose installation it is, with sudo):
+
+```bash
+wget -T 3 -q -O fivenines_setup.sh https://releases.fivenines.io/latest/fivenines_setup.sh && sudo bash fivenines_setup.sh --from-user
+```
+
+`--from-user` moves the installation of the user who ran `sudo`; name another
+one with `--from-user USER`. Add `--with-sudoers` to also write the sudoers
+rules of [Full Monitoring](#full-monitoring-recommended), which is what the
+system installation is usually for. An installation made with
+`FIVENINES_INSTALL_DIR` or `FIVENINES_CONFIG_DIR` needs the same values here
+(`sudo FIVENINES_INSTALL_DIR=... FIVENINES_CONFIG_DIR=... bash fivenines_setup.sh --from-user`).
+Every file in the user's home is read and removed as that user, never as root,
+with none of root's environment and away from root's terminal (the user's own
+`stop.sh` runs during the move). A `.env` is not carried into the system
+installation, whose agent runs with more access than the user has (an `API_URL`
+there would send it to another server): it stays where it is, and the script
+says so. If the move fails after the user-level agent stopped, or is
+interrupted, the script stops the service again and restarts the user-level
+agent, unchanged.
+
+**System to user-level** (as the user the agent is to run as; sudo is needed
+to read, stop and remove the system installation):
+
+```bash
+wget -T 3 -q -O fivenines_setup_user.sh https://releases.fivenines.io/latest/fivenines_setup_user.sh && bash fivenines_setup_user.sh --from-system
+```
+
+The system installation is removed by the release's `fivenines_uninstall.sh`,
+checked against the signed `SHA256SUMS` before it runs as root. Its `.env` is
+copied as `.env.system`, which the agent does not read: `/etc/fivenines_agent`
+belongs to the `fivenines` account, so review it, and rename it to `.env` if you
+need it. If the system agent's token is still there afterwards, or the move is
+interrupted before the uninstaller removed it, the move is undone and the
+system agent restarted (if the uninstaller had already removed its service,
+the script says so, and to run `--from-system` again to finish the move);
+interrupted after, the script keeps the agent's identity
+in your config directory and says how to start it. An `@reboot` line is added
+to your crontab, since the system agent started at boot. The
+sudoers rules `--with-sudoers` wrote go with the system installation; rules you
+wrote yourself in `/etc/sudoers.d/fivenines` stay, naming a user that no longer
+exists, so remove them.
+
+Neither move runs on UNRAID. Both refuse, before changing anything, when the
+destination already has an installation, or a state file (`TOKEN`,
+`MACHINE_ID`...) an earlier one left there: remove that installation first,
+or move the file aside.
 
 ### Windows Installation
 
@@ -691,7 +749,8 @@ Releases older than v1.19.1 have no attestation, and `gh` reports
 
 The digest and signature layers apply to the same set of files: the agent
 tarball **and** the systemd unit, OpenRC init script and UNRAID boot script the
-installer puts in place as root.
+installer puts in place as root, plus the release's `fivenines_uninstall.sh`
+that `fivenines_setup_user.sh --from-system` runs as root.
 
 #### Installing a custom or pre-release build
 
@@ -721,7 +780,9 @@ startup definitions still come from the release and are still checked against
 the signed `SHA256SUMS`, so a pinned digest does not exempt that host from
 needing `openssl` -- pair it with `FIVENINES_ALLOW_UNSIGNED=1` on a minimal
 image. A user-level install has no startup definition to fetch, so a pinned
-digest is enough there.
+digest is enough there -- except `fivenines_setup_user.sh --from-system`,
+which also fetches the release's `fivenines_uninstall.sh` and checks it
+against the signed `SHA256SUMS` before running it as root.
 
 | Variable | Effect |
 |----------|--------|
@@ -769,6 +830,13 @@ wget -T 3 -q -O fivenines_uninstall.sh https://releases.fivenines.io/latest/five
 ```bash
 wget -T 3 -q -O fivenines_uninstall_user.sh https://releases.fivenines.io/latest/fivenines_uninstall_user.sh && bash fivenines_uninstall_user.sh
 ```
+
+It stops only the agent run from its own installation directory and removes
+only the crontab lines that start it (with its path written as is, or under
+`~/` or `$HOME/`). An installation made with `FIVENINES_INSTALL_DIR` or
+`FIVENINES_CONFIG_DIR` needs the same values here: without a `start.sh` where it
+looks, the script refuses rather than delete a config directory whose agent it
+cannot find.
 
 ### Windows Removal
 
@@ -832,16 +900,39 @@ The agent runs as the `fivenines` user and automatically detects available monit
 For full monitoring capabilities, add the following to `/etc/sudoers.d/fivenines`:
 
 ```
+Defaults:fivenines always_set_home
 fivenines ALL=(ALL) NOPASSWD: /usr/sbin/smartctl
-fivenines ALL=(ALL) NOPASSWD: /sbin/mdadm
+fivenines ALL=(ALL) NOPASSWD: /sbin/mdadm --version, /sbin/mdadm --detail /dev/md[0-9], /sbin/mdadm --detail /dev/md[0-9][0-9], /sbin/mdadm --detail /dev/md[0-9][0-9][0-9]
 ```
 
 Two optional rules, only if you monitor these features:
 
 ```
-fivenines ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client
+fivenines ALL=(ALL) NOPASSWD: /usr/bin/fail2ban-client version, /usr/bin/fail2ban-client status, /usr/bin/fail2ban-client status *
 fivenines ALL=(root) NOPASSWD:NOLOG_OUTPUT: /usr/bin/wg show all dump
 ```
+
+The `Defaults` line gives the commands the account runs through sudo root's
+`HOME`: `fail2ban-client` is a Python script, and where sudo keeps the
+caller's `HOME` (Ubuntu before 19.10, or `env_keep += HOME`) Python would run
+the files the account put in its own `~/.local` as root.
+
+The mdadm and fail2ban rules name the commands the agent runs, and nothing
+else: a rule for the bare command would let the account run code as root
+(`mdadm --monitor --program`, `fail2ban-client set <jail> action ...`). sudo
+matches a `*` across argument boundaries, which is why the mdadm rule spells
+`/dev/md[0-9]` out three times instead of `--detail *`: that would also match
+`--detail /dev/md0 --stop /dev/md1`. It covers `md0` to `md999`, the kernel's
+names; an array the kernel names otherwise (`CREATE names=yes` in
+`mdadm.conf`) needs its own `--detail /dev/<name>` entry. sudo-rs (the
+default sudo from Ubuntu 25.10) matches no `[0-9]` class: there, list each
+array as `--detail /dev/md0` and so on, and add one when you create an array
+(`--with-sudoers` writes an exact entry for every array `/proc/mdstat` lists).
+
+An earlier version of this README gave the bare `/sbin/mdadm` and
+`/usr/bin/fail2ban-client` rules: if your sudoers files still have one,
+replace it with the rules above. The setup and update scripts warn while sudo
+still lists one for the `fivenines` account.
 
 The WireGuard rule pins the **exact command**, on purpose: `sudo` matches the
 full argument list, so this grants one read-only dump and denies `wg set` and
@@ -857,6 +948,37 @@ I/O log would capture that output to disk before the agent ever sees it. The
 agent itself never stores or transmits those keys. Keep the tag even if you do
 not log I/O today -- it costs nothing and survives someone enabling it later.
 (Needs sudo 1.8.7+, which every supported distribution ships.)
+
+The installer can write these rules for you, with `--with-sudoers` on
+`fivenines_setup.sh` (a new installation, or a move with `--from-user`) or on
+`fivenines_update.sh` (an existing installation):
+
+```bash
+wget -T 3 -q -O fivenines_update.sh https://releases.fivenines.io/latest/fivenines_update.sh && sudo bash fivenines_update.sh --with-sudoers
+```
+
+It writes `/etc/sudoers.d/fivenines` with the rules above for each of
+smartctl, mdadm, fail2ban-client and wg installed on the host, naming the path
+sudo's usual `secure_path` finds (`/usr/local/sbin`, `/usr/local/bin`,
+`/usr/sbin`, `/usr/bin`, `/sbin`, `/bin`), and only for a tool that only root
+can change: the file, every directory above it, and every symbolic link on
+the way and its target, root's and writable by no one else. The mdadm rule
+also gets one exact `--detail /dev/<name>` entry for each array
+`/proc/mdstat` lists, whatever its name (`md0`, `md_d0`, `CREATE names=yes`).
+An array created later needs the command run again when its name is not
+`md0`-`md999`, and under sudo-rs whatever its name (sudo-rs matches no `[0-9]`
+class); otherwise the agent's read of it is refused, which on Debian and
+Ubuntu mails root.
+Each rule is checked with the host's `visudo` on its own, and one this sudo
+rejects is left out with a warning rather than written. A `/etc/sudoers.d/fivenines` you wrote
+yourself is never touched: the installer marks its own with a first comment
+line, and `fivenines_uninstall.sh` removes only a marked one. Each
+`--with-sudoers` run rewrites a marked file, and removes it when none of the
+four tools may get a rule any more. smartctl is the
+one tool left without an argument list: the agent's options and devices vary
+by drive. It runs no command and writes no file, but the rule lets the account
+change a drive's settings (`smartctl -s`, `--set`, or start a self-test with
+`-t`).
 
 Check the binary paths on your distribution and adjust if needed
 (`command -v wg`, `command -v smartctl`); `wg` is `/usr/bin/wg` on

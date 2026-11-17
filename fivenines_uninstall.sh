@@ -143,6 +143,19 @@ else
   echo "/etc/fivenines_agent directory does not exist."
 fi
 
+# Remove the sudoers rules the installer wrote (--with-sudoers), recognised by
+# their first line. A file without it was written by the operator: it is left,
+# and said, since its rules name the user removed below.
+SUDOERS_MARKER="# Managed by the fivenines agent installer (--with-sudoers)"
+if [ -f /etc/sudoers.d/fivenines ]; then
+  if head -n 1 /etc/sudoers.d/fivenines | grep -qxF "$SUDOERS_MARKER"; then
+    echo "Removing /etc/sudoers.d/fivenines..."
+    rm -f /etc/sudoers.d/fivenines
+  else
+    echo "/etc/sudoers.d/fivenines was not written by the installer: left in place (its rules name the fivenines user)."
+  fi
+fi
+
 # Remove the system user for the agent
 if id -u fivenines >/dev/null 2>&1; then
   echo "Removing system user fivenines..."

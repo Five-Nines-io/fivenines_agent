@@ -3,6 +3,21 @@
 # Fivenines Agent Setup Script
 # Works on standard Linux systems (systemd), OpenRC (Alpine), and UNRAID
 #
+# Usage:
+#   sudo bash fivenines_setup.sh TOKEN [--with-sudoers]
+#   sudo bash fivenines_setup.sh --from-user [USER] [--with-sudoers]
+#
+#   --from-user [USER]  Move USER's user-level installation (fivenines_setup_user.sh;
+#                       default: the user who ran sudo) to this system installation.
+#                       The system agent keeps its token, machine id and state, so the
+#                       dashboard keeps the same host; the user-level agent is stopped
+#                       and its files removed. If it was installed with
+#                       FIVENINES_INSTALL_DIR / FIVENINES_CONFIG_DIR, pass the same
+#                       values. Not on UNRAID.
+#   --with-sudoers      Write /etc/sudoers.d/fivenines: the README's sudoers rules for
+#                       the monitoring tools installed here (smartctl, mdadm,
+#                       fail2ban-client, wg), each checked with visudo first.
+#
 # Environment variables:
 #   FIVENINES_AGENT_URL    - Custom download URL for the agent tarball (e.g., pre-release
 #                            builds). Unverified unless FIVENINES_AGENT_SHA256 is also set.
@@ -87,6 +102,11 @@ download_with_fallback() {
 
 exit_with_contact() {
   print_error "$1"
+  # --from-user stopped the user-level agent: put it back rather than leave
+  # the host unmonitored (see rollback_user_takeover).
+  if [ "${TAKEOVER_ROLLBACK:-0}" = "1" ]; then
+    rollback_user_takeover
+  fi
   echo ""
   echo "For assistance, contact: sebastien@fivenines.io"
   exit 1
@@ -353,7 +373,9 @@ verify_from_manifest() {
 # shellcheck disable=SC2120
 verification_preflight() {
     # "$1" is "with-startup-files" when the caller also installs a startup
-    # definition (the two SYSTEM scripts). Those always go through the signed
+    # definition (the two SYSTEM scripts), or runs one of the release's
+    # scripts as root (fivenines_setup_user.sh --from-system and its
+    # fivenines_uninstall.sh). Those always go through the signed
     # manifest -- install_verified_release_file ignores FIVENINES_AGENT_SHA256,
     # which pins the TARBALL only -- so a pinned digest does not exempt them,
     # or the preflight would pass and the refusal would land after the agent
@@ -520,6 +542,277 @@ install_verified_release_file() {
     if ! mv "$staging_dest" "$dest"; then
         rm -f "$staging_dest"
         return 1
+    fi
+    return 0
+}
+
+# --with-sudoers (fivenines_setup.sh, fivenines_update.sh): the README's "Full
+# Monitoring" sudoers rules, written for the monitoring tools this host has.
+#
+# Owned by root and writable by nobody else? find prints the path only when
+# every test holds. A symlink's own mode is always 0777: root_only_chain
+# follows links instead of asking this about them.
+root_only_path() {
+    [ -n "$(find "$1" -prune -user 0 ! -perm -020 ! -perm -002 2>/dev/null)" ]
+}
+
+# Can only root change what PATH resolves to? Every component from PATH up to
+# /, and through each symbolic link met on the way (a root-owned link, then
+# its target, the same way), is root's and writable by no one else. A link
+# anywhere in the chain -- /usr/bin/wg -> /etc/alternatives/wg -> ... -- is
+# itself replaceable by whoever can write to the directory holding it, so
+# resolving the path first (readlink -f) would skip exactly those directories.
+# Each link is followed in a subshell (sh has no local variables), at most 40
+# deep, the kernel's own limit. The walk up ends at / or //, which POSIX lets
+# dirname return for a path that starts with two slashes, and after 4096
+# steps whatever happens.
+root_only_chain() {
+    if [ "${2:-0}" -gt 40 ]; then
+        return 1
+    fi
+    chain_path="$1"
+    chain_steps=0
+    while :; do
+        chain_steps=$((chain_steps + 1))
+        if [ "$chain_steps" -gt 4096 ]; then
+            return 1
+        fi
+        if [ -L "$chain_path" ]; then
+            if [ -z "$(find "$chain_path" -prune -user 0 2>/dev/null)" ]; then
+                return 1
+            fi
+            chain_target=$(readlink "$chain_path") || return 1
+            case "$chain_target" in
+                /*) ;;
+                *)
+                    chain_dir=$(dirname "$chain_path")
+                    chain_target="${chain_dir%/}/${chain_target}"
+                    ;;
+            esac
+            ( root_only_chain "$chain_target" $((${2:-0} + 1)) ) || return 1
+        elif ! root_only_path "$chain_path"; then
+            return 1
+        fi
+        case "$chain_path" in
+            / | //) return 0 ;;
+        esac
+        chain_path=$(dirname "$chain_path")
+    done
+}
+
+# The path a rule for TOOL names, or nothing and a non-zero status when TOOL is
+# not installed, or when anyone but root could change what that path runs
+# (root_only_chain): a rule there would hand root to whoever can. Looked up in
+# sudo's usual secure_path, in its order, rather than in the caller's PATH (su
+# without - keeps a PATH with no sbin). Warnings go to stderr: the path is
+# this function's output.
+sudoers_tool_path() {
+    tool_path=""
+    for tool_dir in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+        if [ -f "${tool_dir}/$1" ] && [ -x "${tool_dir}/$1" ]; then
+            tool_path="${tool_dir}/$1"
+            break
+        fi
+    done
+    if [ -z "$tool_path" ]; then
+        return 1
+    fi
+    # Without find nothing can be checked, so nothing is granted (minimal
+    # container images, rockylinux:8's among them, ship no findutils).
+    if ! command -v find > /dev/null 2>&1; then
+        print_warning "No sudoers rule for ${tool_path}: find (findutils) is not installed, so who can change it cannot be checked." >&2
+        return 1
+    fi
+    if ! root_only_chain "$tool_path"; then
+        print_warning "No sudoers rule for ${tool_path}: a user other than root can change what it runs." >&2
+        return 1
+    fi
+    printf '%s' "$tool_path"
+}
+
+# Writes /etc/sudoers.d/fivenines. Each rule is written only if this host's
+# visudo accepts it ON ITS OWN, so a rule one sudo does not understand (an old
+# sudo, sudo-rs) costs that rule, never a file that breaks sudo for everyone.
+# A file at that path whose first line is not the marker was written by the
+# operator and is never touched; fivenines_uninstall.sh removes only a file
+# that starts with the marker. Returns non-zero when nothing was written: the
+# caller says so and carries on, since the agent runs without these rules.
+write_sudoers_rules() {
+    sudoers_file="/etc/sudoers.d/fivenines"
+    sudoers_marker="# Managed by the fivenines agent installer (--with-sudoers)"
+
+    if ! command -v visudo > /dev/null 2>&1; then
+        print_warning "--with-sudoers: sudo is not installed here (no visudo), so no rule was written."
+        return 1
+    fi
+    if [ ! -d /etc/sudoers.d ]; then
+        print_warning "--with-sudoers: /etc/sudoers.d does not exist, so no rule was written."
+        return 1
+    fi
+    if [ -e "$sudoers_file" ] || [ -L "$sudoers_file" ]; then
+        if ! head -n 1 "$sudoers_file" 2>/dev/null | grep -qxF "$sudoers_marker"; then
+            print_warning "--with-sudoers: ${sudoers_file} was not written by this installer, so it was left as it is."
+            return 1
+        fi
+    fi
+
+    sudoers_staged="${WORK_DIR}/sudoers"
+    sudoers_one="${WORK_DIR}/sudoers.rule"
+    rm -f "$sudoers_staged" "$sudoers_one"
+    if ! printf '%s\n%s\n' "$sudoers_marker" \
+        "# The monitoring commands of the fivenines agent (README, Full Monitoring)." \
+        > "$sudoers_staged"; then
+        return 1
+    fi
+    # fail2ban-client is a Python script: where sudo keeps the caller's HOME
+    # (Ubuntu before 19.10, or env_keep += HOME), Python runs the .pth files
+    # of the account's ~/.local as root, whatever the rule's arguments.
+    # always_set_home gives every command it runs through sudo root's HOME.
+    sudoers_defaults="Defaults:fivenines always_set_home"
+    rm -f "$sudoers_one"
+    printf '%s\n' "$sudoers_defaults" > "$sudoers_one" && chmod 440 "$sudoers_one"
+    if visudo -cf "$sudoers_one" > /dev/null 2>&1; then
+        printf '%s\n' "$sudoers_defaults" >> "$sudoers_staged"
+        print_success "sudoers default: ${sudoers_defaults}"
+    else
+        print_warning "This host's visudo rejects '${sudoers_defaults}': not written."
+    fi
+    sudoers_rules=0
+    for sudoers_tool in smartctl mdadm fail2ban-client wg; do
+        sudoers_path=$(sudoers_tool_path "$sudoers_tool") || continue
+        # Each tool that can run code or change the host given other
+        # arguments is held to the argv the agent runs. sudo matches a
+        # wildcard across argument boundaries, so a pattern that must not
+        # reach a further argument has no '*'.
+        case "$sudoers_tool" in
+            mdadm)
+                # raid_storage.py: --version, and --detail on /dev/<name> for
+                # each md line of /proc/mdstat. "--detail *" would also match
+                # "--detail /dev/md0 --stop /dev/md1" (misc mode takes an
+                # action per device), and a bare rule allows --monitor
+                # --program, which runs a command as root. An array the kernel
+                # names otherwise (CREATE names=yes, md_d0, md1000) gets its
+                # own exact entry: without one the agent's --detail would be
+                # refused on every collection, and on Debian and Ubuntu sudo
+                # mails root each refusal. One created later needs this run
+                # again. Every array listed gets its exact entry, md0 too:
+                # sudo-rs (Ubuntu 25.10 on) matches no [0-9] class, so there
+                # only the arrays listed now can be read.
+                sudoers_rule="fivenines ALL=(ALL) NOPASSWD: ${sudoers_path} --version, ${sudoers_path} --detail /dev/md[0-9], ${sudoers_path} --detail /dev/md[0-9][0-9], ${sudoers_path} --detail /dev/md[0-9][0-9][0-9]"
+                # One array name per line, never a space (awk prints the first
+                # field), so the words are the names.
+                # shellcheck disable=SC2013
+                for sudoers_md in $(awk '/^md/ { print $1 }' /proc/mdstat 2>/dev/null); do
+                    case "$sudoers_md" in
+                        # A dash and a dot need no escaping in a rule.
+                        *[!A-Za-z0-9_.-]* | . | ..)
+                            print_warning "No sudoers entry for /dev/${sudoers_md}: its name holds a character a rule cannot carry as is."
+                            ;;
+                        *) sudoers_rule="${sudoers_rule}, ${sudoers_path} --detail /dev/${sudoers_md}" ;;
+                    esac
+                done
+                ;;
+            fail2ban-client)
+                # fail2ban.py: version, status, status JAIL. A bare rule allows
+                # "set JAIL action ... actionban CMD", which runs CMD as root;
+                # anything after status only reaches the read-only status.
+                sudoers_rule="fivenines ALL=(ALL) NOPASSWD: ${sudoers_path} version, ${sudoers_path} status, ${sudoers_path} status *"
+                ;;
+            wg)
+                # The exact argv wireguard.py runs, never wg alone, which would
+                # let the agent reconfigure every tunnel. NOLOG_OUTPUT keeps
+                # the keys the dump prints out of an I/O log.
+                sudoers_rule="fivenines ALL=(root) NOPASSWD:NOLOG_OUTPUT: ${sudoers_path} show all dump"
+                ;;
+            *)
+                # smartctl: the agent passes options and a device that vary by
+                # drive, so the rule names none. It runs no command and writes
+                # no file, but it can change a drive's settings (-s, --set,
+                # -t): the README says so.
+                sudoers_rule="fivenines ALL=(ALL) NOPASSWD: ${sudoers_path}"
+                ;;
+        esac
+        rm -f "$sudoers_one"
+        printf '%s\n' "$sudoers_rule" > "$sudoers_one" && chmod 440 "$sudoers_one"
+        if visudo -cf "$sudoers_one" > /dev/null 2>&1; then
+            printf '%s\n' "$sudoers_rule" >> "$sudoers_staged"
+            sudoers_rules=$((sudoers_rules + 1))
+            print_success "sudoers rule: ${sudoers_rule}"
+        else
+            print_warning "This host's visudo rejects '${sudoers_rule}': not written."
+        fi
+    done
+    rm -f "$sudoers_one"
+
+    if [ "$sudoers_rules" -eq 0 ]; then
+        print_warning "--with-sudoers: none of smartctl, mdadm, fail2ban-client or wg is usable here, so no rule was written."
+        rm -f "$sudoers_staged"
+        # An earlier run's file would keep granting a tool this run refused
+        # (one that anyone but root can now change): it goes too.
+        if [ -e "$sudoers_file" ]; then
+            if rm -f "$sudoers_file"; then
+                print_warning "--with-sudoers: removed ${sudoers_file}, which an earlier run wrote."
+            else
+                print_warning "--with-sudoers: could not remove ${sudoers_file}, which an earlier run wrote: remove it."
+            fi
+        fi
+        return 1
+    fi
+    chmod 440 "$sudoers_staged"
+    if ! visudo -cf "$sudoers_staged" > /dev/null 2>&1; then
+        print_warning "--with-sudoers: visudo rejects the rules together, so none was written."
+        rm -f "$sudoers_staged"
+        return 1
+    fi
+
+    # Landed like install_verified_release_file lands a unit: through a
+    # sibling in the destination directory, renamed into place. sudo skips
+    # every name in /etc/sudoers.d that contains a dot, so it never reads the
+    # sibling half-written, and a file created there gets the directory's
+    # SELinux type (sudo cannot read one labelled as /tmp).
+    sudoers_new="${sudoers_file}.fivenines-new"
+    rm -f "$sudoers_new"
+    if ! cp "$sudoers_staged" "$sudoers_new" || ! chown 0:0 "$sudoers_new" \
+        || ! chmod 440 "$sudoers_new"; then
+        rm -f "$sudoers_staged" "$sudoers_new"
+        return 1
+    fi
+    rm -f "$sudoers_staged"
+    if command -v restorecon > /dev/null 2>&1; then
+        restorecon "$sudoers_new" > /dev/null 2>&1 || true
+    fi
+    if ! mv -f "$sudoers_new" "$sudoers_file"; then
+        rm -f "$sudoers_new"
+        return 1
+    fi
+    print_success "Wrote ${sudoers_file} (${sudoers_rules} rule(s))"
+    if ! grep -Eq '^[[:space:]]*[#@]includedir[[:space:]]+/etc/sudoers\.d/?[[:space:]]*$' /etc/sudoers 2>/dev/null; then
+        print_warning "/etc/sudoers has no includedir line for /etc/sudoers.d: sudo ignores ${sudoers_file} until it does."
+    fi
+    return 0
+}
+
+# An earlier README gave the fivenines account bare mdadm and fail2ban-client
+# rules, which let it run code as root (mdadm --monitor --program,
+# fail2ban-client set JAIL action ...). Said at every install and update while
+# sudo still lists one; the operator's sudoers files are never edited.
+warn_unpinned_sudoers_rules() {
+    command -v sudo > /dev/null 2>&1 || return 0
+    id fivenines > /dev/null 2>&1 || return 0
+    # sudo -l -U lists each rule's commands after its tags, comma-separated:
+    # one item per line, a bare one is a path with nothing after it. Run once
+    # the agent is back: a sudoers backend that hangs (sssd, LDAP) delays only
+    # the end of the script, and timeout bounds it where there is one.
+    unpinned_rules=$( { if command -v timeout > /dev/null 2>&1; then
+            timeout 10 sudo -n -l -U fivenines
+        else
+            sudo -n -l -U fivenines
+        fi; } 2>/dev/null \
+        | awk '{ n = split($0, item, ", "); for (i = 1; i <= n; i++) print item[i] }' \
+        | grep -oE '(^|: )/[^ ,]*/(mdadm|fail2ban-client)[[:space:]]*$' \
+        | sed 's/^: //; s/[[:space:]]*$//' | sort -u | tr '\n' ' ')
+    if [ -n "$unpinned_rules" ]; then
+        print_warning "sudo lets the fivenines account run ${unpinned_rules}with any arguments (a rule from an earlier version of the README): that lets it run code as root. Replace it with the rules of the README's Full Monitoring section, which name the commands the agent runs, or remove it and re-run with --with-sudoers."
     fi
     return 0
 }
@@ -826,6 +1119,393 @@ setup_openrc() {
   print_success "OpenRC service installed and started successfully"
 }
 
+# ---------------------------------------------------------------------------
+# --from-user: move a user-level installation (fivenines_setup_user.sh) to
+# this system installation.
+#
+# The system agent takes over the user-level agent's identity -- its TOKEN
+# (the per-host token it swapped the enrollment token for) and its MACHINE_ID
+# -- and its state, so the dashboard keeps the same host instead of enrolling
+# a second one. The user-level agent is stopped before the service starts (two
+# agents with one identity would report as one host, twice), and its files are
+# removed only once the service has started.
+#
+# Everything on the user's side is done AS THAT USER (as_user), never as root:
+# their home is theirs to change, so a root read of their TOKEN, or a root rm
+# of their files, would follow any symlink they put there.
+# ---------------------------------------------------------------------------
+
+# What the agent keeps in its config directory that the new installation
+# carries over: its identity (TOKEN, MACHINE_ID), the capture nonce that keeps
+# a capture command from firing twice, and the operator's journal allowlist
+# (dropping it would WIDEN what the agent may read; it can only narrow what the
+# server's list allows, so a user's copy grants nothing). ci/build-scripts.sh
+# keeps this line equal to the one in fivenines_setup_user.sh.
+#
+# Not carried INTO the system installation, since the user wrote them and the
+# system agent runs with more access than they have: .env (it is loaded into
+# the agent's environment: API_URL alone would send the system agent, its
+# journal access and its sudo rules, to a server of the user's choosing; it is
+# left in place, and said), image_inventory_done (it would let them mark an
+# image as scanned; it is only a cache, rebuilt by scanning each image once),
+# and sudo_refusals (what sudo told another account).
+STATE_FILES="TOKEN MACHINE_ID last_capture_id journal_units.allow"
+# A state file is a few KB at most: anything bigger is not one.
+STATE_FILE_MAX=16777216
+
+# as_user SCRIPT [ARG...]: run SCRIPT with sh as the user being moved, with
+# the ARGs as $1, $2... They are never pasted into SCRIPT, so a path is never
+# parsed as shell code. SCRIPT can run the user's own stop.sh and start.sh, so
+# it gets nothing of root's but PATH: no other variable of root's environment
+# (env -i: a credential exported in root's shell would reach the user's code
+# and the agent restarted), and no terminal (setsid, stdin from /dev/null,
+# output through files in a root-only directory): with the admin's terminal,
+# a process the user left behind could push keystrokes into root's shell
+# (TIOCSTI) or read what the admin types next.
+as_user() {
+  as_user_script="$1"
+  shift
+  as_user_tmp=$(mktemp -d) || return 1
+  as_user_rc=0
+  env -i PATH="$PATH" setsid su -s /bin/sh -c "cd / && ${as_user_script}" "$FROM_USER_NAME" sh "$@" \
+    < /dev/null > "$as_user_tmp/out" 2> "$as_user_tmp/err" || as_user_rc=$?
+  cat "$as_user_tmp/out"
+  cat "$as_user_tmp/err" >&2
+  rm -rf "${as_user_tmp:?}"
+  return "$as_user_rc"
+}
+
+resolve_takeover_user() {
+  if [ -z "$FROM_USER_NAME" ]; then
+    FROM_USER_NAME="${SUDO_USER:-}"
+  fi
+  if [ -z "$FROM_USER_NAME" ]; then
+    exit_with_contact "Name the user whose installation to move: fivenines_setup.sh --from-user USER"
+  fi
+  case "$FROM_USER_NAME" in
+    -*|*:*|*/*)
+      exit_with_contact "--from-user takes a user name, and that argument is not one (no token is needed: the user's own is carried over)."
+      ;;
+  esac
+  passwd_line=$(getent passwd "$FROM_USER_NAME" 2>/dev/null \
+    || awk -F: -v name="$FROM_USER_NAME" '$1 == name' /etc/passwd 2>/dev/null)
+  passwd_line=$(printf '%s\n' "$passwd_line" | head -n 1)
+  FROM_USER_HOME=$(printf '%s' "$passwd_line" | cut -d: -f6)
+  if [ -z "$FROM_USER_HOME" ]; then
+    exit_with_contact "No user of the name given to --from-user exists on this host (it takes a user name, not a token: the user's own token is carried over)."
+  fi
+  # getent also answers a uid; su is given the name.
+  FROM_USER_NAME=$(printf '%s' "$passwd_line" | cut -d: -f1)
+  # The variables, and defaults, fivenines_setup_user.sh installs with.
+  USER_INSTALL_DIR="${FIVENINES_INSTALL_DIR:-$FROM_USER_HOME/.local/fivenines}"
+  USER_CONFIG_DIR="${FIVENINES_CONFIG_DIR:-$FROM_USER_HOME/.config/fivenines_agent}"
+}
+
+# Before anything is installed, so a refusal leaves the host as it was.
+preflight_user_takeover() {
+  resolve_takeover_user
+  if [ "$SYSTEM_TYPE" = "unraid" ]; then
+    exit_with_contact "--from-user is not supported on UNRAID."
+  fi
+  # Its identity would be overwritten, and its host left with no agent.
+  if [ -e /etc/fivenines_agent/TOKEN ]; then
+    exit_with_contact "A system installation already exists (/etc/fivenines_agent/TOKEN). Remove it with fivenines_uninstall.sh first, or keep it and remove the user-level one with fivenines_uninstall_user.sh."
+  fi
+  # Any other state file there would be replaced by the user's, and deleted
+  # if the move is undone.
+  for state_file in $STATE_FILES; do
+    if [ -e "/etc/fivenines_agent/$state_file" ] || [ -L "/etc/fivenines_agent/$state_file" ]; then
+      exit_with_contact "/etc/fivenines_agent/$state_file exists, left by an earlier installation: the move would replace it with the one of $FROM_USER_NAME, and delete it if undone. Move it aside (or remove /etc/fivenines_agent, if no agent uses it) and re-run."
+    fi
+  done
+  if ! command -v base64 > /dev/null 2>&1; then
+    exit_with_contact "--from-user needs base64 (coreutils or busybox) to carry the agent's state over."
+  fi
+  if ! command -v setsid > /dev/null 2>&1; then
+    exit_with_contact "--from-user needs setsid (util-linux or busybox), to run $FROM_USER_NAME's scripts away from this terminal."
+  fi
+  if ! as_user 'exit 0'; then
+    exit_with_contact "Cannot run a command as $FROM_USER_NAME with su."
+  fi
+  # Without it the stop could not wait for the agent to exit, and its state
+  # would be read while it may still write it. Test mode skips the stop.
+  if [ "${FIVENINES_TEST_MODE:-}" != "1" ] && ! as_user 'command -v pgrep > /dev/null 2>&1'; then
+    exit_with_contact "--from-user needs pgrep (procps or busybox) for $FROM_USER_NAME, to wait for the user-level agent to stop."
+  fi
+  # The installation's own start.sh is what ties the two directories
+  # together. Without it (FIVENINES_INSTALL_DIR not passed again), the running
+  # agent could not be found to be stopped, and would go on beside the
+  # service with the same identity. The quoted $1 and $2 are as_user's
+  # arguments, expanded by the user's shell.
+  # shellcheck disable=SC2016
+  if ! as_user 'test -f "$1/TOKEN" && test -s "$1/TOKEN" && test -f "$2/start.sh" \
+      && grep -qxF "export CONFIG_DIR=\"$1\"" "$2/start.sh"' "$USER_CONFIG_DIR" "$USER_INSTALL_DIR"; then
+    exit_with_contact "No user-level installation of $FROM_USER_NAME found in $USER_INSTALL_DIR with its config in $USER_CONFIG_DIR (a TOKEN, and a start.sh naming that config directory). If it was installed with FIVENINES_INSTALL_DIR or FIVENINES_CONFIG_DIR, pass the same values: sudo FIVENINES_INSTALL_DIR=... FIVENINES_CONFIG_DIR=... bash fivenines_setup.sh --from-user"
+  fi
+  print_success "Moving the user-level installation of $FROM_USER_NAME ($USER_INSTALL_DIR) to a system installation"
+}
+
+# A plain install by a user who already runs a user-level agent: both would
+# run, as two hosts. Not refused (it may be deliberate), but said, with the
+# way to move it instead.
+hint_user_installation() {
+  if [ -z "${SUDO_USER:-}" ]; then
+    return 0
+  fi
+  hint_home=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
+  if [ -n "$hint_home" ] && [ -f "$hint_home/.config/fivenines_agent/TOKEN" ]; then
+    print_warning "$SUDO_USER has a user-level agent ($hint_home/.local/fivenines): it keeps running beside this one, as another host."
+    print_warning "To move it to a system installation instead, keeping its host: sudo bash fivenines_setup.sh --from-user"
+  fi
+}
+
+# The pgrep -f pattern for an agent run from INSTALL_DIR: anchored on the
+# agent's own path (start.sh runs it by that path), so neither another user's
+# agent nor a shell or a tail -f that merely names a file in that directory
+# ever matches, with the regex characters a path may hold (/home/a+b) escaped.
+agent_pattern() {
+    printf '^%s/fivenines-agent-' "$(printf '%s' "$1" | sed 's/[][\.*^$+?(){}|]/\\&/g')"
+}
+
+# How a crontab line can name INSTALL_DIR's start.sh: the absolute path the
+# installers print and, when INSTALL_DIR is under HOME, the ~/ form the README
+# shows and its $HOME/ and ${HOME}/ forms. Sets START_SPELLING_1 to _4 (all
+# four the absolute path when INSTALL_DIR is not under HOME).
+start_spellings() {
+    START_SPELLING_1="$1/start.sh"
+    START_SPELLING_2="$START_SPELLING_1"
+    START_SPELLING_3="$START_SPELLING_1"
+    START_SPELLING_4="$START_SPELLING_1"
+    start_rel="${1#"$2"/}"
+    if [ -n "$2" ] && [ "$start_rel" != "$1" ]; then
+        # The tilde and the dollar signs are the literal text of the line.
+        # shellcheck disable=SC2088
+        START_SPELLING_2="~/$start_rel/start.sh"
+        START_SPELLING_3="\$HOME/$start_rel/start.sh"
+        START_SPELLING_4="\${HOME}/$start_rel/start.sh"
+    fi
+}
+
+# stop.sh first (it kills the PID it recorded), then any agent still running
+# from that installation, as the user, so no other user's process can be hit.
+# The pattern is anchored: start.sh runs the agent by its path, so its command
+# line STARTS with it, while a shell or a tail -f that merely names a file in
+# that directory does not.
+stop_user_agent() {
+  print_warning "Stopping the user-level agent of $FROM_USER_NAME..."
+  # shellcheck disable=SC2016
+  as_user '
+    pattern="$2"
+    # Never an empty or unanchored pattern: pkill -f "" signals every process
+    # of the user.
+    case "$pattern" in
+      "^/"?*) ;;
+      *) exit 1 ;;
+    esac
+    if [ -x "$1/stop.sh" ]; then
+      "$1/stop.sh" > /dev/null 2>&1 || true
+    fi
+    command -v pgrep > /dev/null 2>&1 || exit 0
+    tries=0
+    while pgrep -f "$pattern" > /dev/null 2>&1; do
+      tries=$((tries + 1))
+      if [ "$tries" -gt 10 ]; then
+        pkill -KILL -f "$pattern" > /dev/null 2>&1 || true
+        sleep 1
+        break
+      fi
+      pkill -f "$pattern" > /dev/null 2>&1 || true
+      sleep 1
+    done
+    ! pgrep -f "$pattern" > /dev/null 2>&1' "$USER_INSTALL_DIR" "$(agent_pattern "$USER_INSTALL_DIR")"
+}
+
+# su and sudo can print to stdout before the command does (a PAM session
+# module: RHEL's postlogin runs pam_lastlog with showfailed, which reports
+# failed logins), so a state file crosses over base64-encoded between two
+# marker lines, and only what lies between them is kept. base64's alphabet has
+# no dash, so no encoded line can read as a marker. fivenines_setup_user.sh
+# carries the same function, for sudo (ci/build-scripts.sh keeps them equal).
+decode_state() {
+    # Both markers on lines of their own: output printed before the data with
+    # no newline would hide the first, and an empty file would read as one.
+    if ! grep -qx 'fivenines-state-begin' "$1" || ! grep -qx 'fivenines-state-end' "$1"; then
+        return 1
+    fi
+    sed -n '/^fivenines-state-begin$/,/^fivenines-state-end$/p' "$1" | sed '1d;$d' | base64 -d > "$2"
+}
+
+# After the user-level agent stopped (it may have just swapped its token):
+# read each state file as the user, then install it for the fivenines user.
+# A file that exists but is not a regular file, or cannot be read, stops the
+# move rather than being dropped: a journal allowlist left behind would let
+# the agent read every unit's journal.
+import_user_state() {
+  state_stash="${WORK_DIR}/user_state"
+  mkdir "$state_stash" || return 1
+  for state_file in $STATE_FILES; do
+    # shellcheck disable=SC2016
+    as_user '
+      if [ ! -e "$1" ] && [ ! -L "$1" ]; then exit 3; fi
+      if [ -L "$1" ] || [ ! -f "$1" ] || [ ! -r "$1" ]; then exit 4; fi
+      echo "fivenines-state-begin"
+      head -c "$2" -- "$1" | base64
+      echo "fivenines-state-end"' "$USER_CONFIG_DIR/$state_file" "$((STATE_FILE_MAX + 1))" \
+      > "$state_stash/$state_file.b64"
+    state_rc=$?
+    if [ "$state_rc" -eq 0 ] \
+      && ! decode_state "$state_stash/$state_file.b64" "$state_stash/$state_file"; then
+      state_rc=5
+    fi
+    rm -f "${state_stash:?}/${state_file:?}.b64"
+    case "$state_rc" in
+      0) ;;
+      3)
+        continue
+        ;;
+      4)
+        print_error "$USER_CONFIG_DIR/$state_file is not a regular file $FROM_USER_NAME can read: fix or remove it, then re-run."
+        return 1
+        ;;
+      *)
+        print_error "Could not read $USER_CONFIG_DIR/$state_file as $FROM_USER_NAME."
+        return 1
+        ;;
+    esac
+    if [ "$(wc -c < "$state_stash/$state_file")" -gt "$STATE_FILE_MAX" ]; then
+      print_error "$USER_CONFIG_DIR/$state_file is larger than any agent state file."
+      return 1
+    fi
+  done
+  if [ ! -s "$state_stash/TOKEN" ]; then
+    print_error "$USER_CONFIG_DIR/TOKEN is empty."
+    return 1
+  fi
+  # Root writes these by name, and /etc/fivenines_agent belongs to the
+  # fivenines account: while it does, the directory is root's alone, so no
+  # process of that account can put a link where root writes, or swap a file
+  # between its cp and its chown.
+  if ! chown 0:0 /etc/fivenines_agent || ! chmod 700 /etc/fivenines_agent; then
+    print_error "Could not make /etc/fivenines_agent root-only while its state is written."
+    return 1
+  fi
+  state_rc=0
+  for state_file in $STATE_FILES; do
+    if [ ! -f "$state_stash/$state_file" ]; then
+      continue
+    fi
+    state_dest="/etc/fivenines_agent/$state_file"
+    # The operator's allowlist: the agent reads it and never writes it (the
+    # README has it written with sudo tee).
+    if [ "$state_file" = "journal_units.allow" ]; then
+      state_owner="0:0"
+      state_mode=644
+    else
+      state_owner="fivenines:fivenines"
+      state_mode=600
+    fi
+    # Recorded before it is written, so a rollback takes back a file whose
+    # chown or chmod failed, or that a signal cut short.
+    IMPORTED_STATE_FILES="$IMPORTED_STATE_FILES $state_file"
+    rm -f "${state_dest:?}"
+    if ! (umask 077 && cp "$state_stash/$state_file" "$state_dest") \
+      || ! chown "$state_owner" "$state_dest" || ! chmod "$state_mode" "$state_dest"; then
+      print_error "Could not install $state_dest."
+      state_rc=1
+      break
+    fi
+    print_success "Carried over $state_file"
+  done
+  if ! chown fivenines:fivenines /etc/fivenines_agent || ! chmod 750 /etc/fivenines_agent; then
+    print_error "Could not give /etc/fivenines_agent back to the fivenines account."
+    state_rc=1
+  fi
+  if [ "$state_rc" -ne 0 ]; then
+    return 1
+  fi
+  if command -v restorecon > /dev/null 2>&1; then
+    restorecon -R /etc/fivenines_agent > /dev/null 2>&1 || true
+  fi
+  # shellcheck disable=SC2016
+  if as_user 'test -e "$1/.env"' "$USER_CONFIG_DIR"; then
+    print_warning "$USER_CONFIG_DIR/.env was not carried over: it would configure the system agent from a file $FROM_USER_NAME controls. It stays in place; review it, and copy what you need to /etc/fivenines_agent/.env."
+  fi
+}
+
+# A move that failed after the user-level agent was stopped: remove the
+# identity copied for the service (so it cannot start later as a second copy
+# of that host) -- only what import_user_state installed --, stop and disable
+# the service, and start the user-level agent again, whose files were not
+# touched. A second signal is ignored: cut halfway, the rollback could leave
+# the service enabled with the identity and the user-level agent stopped.
+rollback_user_takeover() {
+  trap '' INT TERM HUP
+  TAKEOVER_ROLLBACK=0
+  print_warning "Putting the user-level agent of $FROM_USER_NAME back..."
+  for state_file in $IMPORTED_STATE_FILES; do
+    rm -f "/etc/fivenines_agent/${state_file:?}"
+  done
+  if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
+    if [ "$SYSTEM_TYPE" = "openrc" ]; then
+      rc-service fivenines-agent stop > /dev/null 2>&1 || true
+      rc-update del fivenines-agent default > /dev/null 2>&1 || true
+    else
+      systemctl stop fivenines-agent.service > /dev/null 2>&1 || true
+      systemctl disable fivenines-agent.service > /dev/null 2>&1 || true
+    fi
+  fi
+  # shellcheck disable=SC2016
+  if [ "${FIVENINES_TEST_MODE:-}" != "1" ] \
+    && as_user '"$1/start.sh"' "$USER_INSTALL_DIR" > /dev/null 2>&1; then
+    print_warning "The user-level agent of $FROM_USER_NAME runs again, unchanged."
+  else
+    print_warning "Start the user-level agent again as $FROM_USER_NAME: $USER_INSTALL_DIR/start.sh"
+  fi
+}
+
+# Once the service has started. Only the files fivenines_setup_user.sh
+# creates are removed, and each directory only once nothing else is left in
+# it, so a directory FIVENINES_INSTALL_DIR pointed at keeps everything else.
+# Failures are warnings: the system agent already runs.
+remove_user_installation() {
+  # The @reboot line, however it names start.sh (the README writes ~/...).
+  start_spellings "$USER_INSTALL_DIR" "$FROM_USER_HOME"
+  # shellcheck disable=SC2016
+  if ! as_user '
+    command -v crontab > /dev/null 2>&1 || exit 0
+    entries=$(crontab -l 2>/dev/null) || exit 0
+    printf "%s\n" "$entries" | grep -qF -e "$1" -e "$2" -e "$3" -e "$4" || exit 0
+    printf "%s\n" "$entries" | grep -vF -e "$1" -e "$2" -e "$3" -e "$4" | crontab -' \
+    "$START_SPELLING_1" "$START_SPELLING_2" "$START_SPELLING_3" "$START_SPELLING_4"; then
+    print_warning "Could not remove $USER_INSTALL_DIR/start.sh from the crontab of $FROM_USER_NAME: remove it with crontab -e."
+  fi
+  # shellcheck disable=SC2016
+  if as_user '
+    rc=0
+    for name in start.sh stop.sh status.sh logs.sh refresh.sh agent.pid agent.log; do
+      rm -f -- "${1:?}/${name:?}" || rc=1
+    done
+    for agent_dir in "$1"/fivenines-agent-*; do
+      if [ -d "$agent_dir" ] && [ ! -L "$agent_dir" ]; then
+        rm -rf -- "${agent_dir:?}" || rc=1
+      fi
+    done
+    for name in $3 image_inventory_done sudo_refusals; do
+      rm -f -- "${2:?}/${name:?}" || rc=1
+    done
+    for dir in "$1" "$2"; do
+      rmdir -- "$dir" 2> /dev/null || true
+      if [ -e "$dir" ]; then
+        echo "Kept $dir: it holds other files."
+      fi
+    done
+    exit "$rc"' "$USER_INSTALL_DIR" "$USER_CONFIG_DIR" "$STATE_FILES"; then
+    print_success "Removed the user-level installation of $FROM_USER_NAME"
+  else
+    print_warning "Some files of the user-level installation of $FROM_USER_NAME could not be removed (see above): remove them as $FROM_USER_NAME. The system agent runs; do not start the user-level one."
+  fi
+}
+
 # Test mode: skip network calls and service management for CI testing
 if [ "${FIVENINES_TEST_MODE:-}" = "1" ]; then
   print_warning "WARNING: Test mode enabled - skipping network checks and service management"
@@ -834,10 +1514,45 @@ fi
 # Main execution starts here
 print_banner
 
-# Check that token parameter is present
-if [ $# -eq 0 ] ; then
-  echo "Usage: ./setup.sh CLIENT_TOKEN"
+usage() {
+  echo "Usage: sudo bash fivenines_setup.sh TOKEN [--with-sudoers]"
+  echo "       sudo bash fivenines_setup.sh --from-user [USER] [--with-sudoers]"
   exit 1
+}
+
+# Only these exact words are options: anything else is the token (or, with
+# --from-user, the user name), since a token may itself start with a dash.
+TOKEN=""
+FROM_USER=0
+FROM_USER_NAME=""
+WITH_SUDOERS=0
+# Never inherited from the environment: set only once the user-level agent
+# was stopped, and it makes exit_with_contact undo the move.
+TAKEOVER_ROLLBACK=0
+IMPORTED_STATE_FILES=""
+POSITIONAL_COUNT=0
+for arg in "$@"; do
+  case "$arg" in
+    --from-user) FROM_USER=1 ;;
+    --with-sudoers) WITH_SUDOERS=1 ;;
+    *)
+      POSITIONAL_COUNT=$((POSITIONAL_COUNT + 1))
+      if [ "$POSITIONAL_COUNT" -eq 1 ]; then
+        TOKEN="$arg"
+      fi
+      ;;
+  esac
+done
+if [ "$FROM_USER" = "1" ]; then
+  # The token comes from the user-level installation; the one word allowed
+  # is the user's name.
+  if [ "$POSITIONAL_COUNT" -gt 1 ]; then
+    usage
+  fi
+  FROM_USER_NAME="$TOKEN"
+  TOKEN=""
+elif [ -z "$TOKEN" ]; then
+  usage
 fi
 
 # Check if running as root (use `id -u` for BusyBox/ash compatibility)
@@ -856,6 +1571,12 @@ verification_preflight "with-startup-files" || exit_with_contact "Cannot verify 
 # Detect system type
 SYSTEM_TYPE=$(detect_system)
 print_success "Detected system type: $SYSTEM_TYPE"
+
+if [ "$FROM_USER" = "1" ]; then
+  preflight_user_takeover
+else
+  hint_user_installation
+fi
 
 # SELinux contexts are configured after agent extraction (see setup_selinux_contexts)
 
@@ -890,15 +1611,19 @@ mkdir -p /etc/fivenines_agent
 # MACHINE_ID, and nothing outside root/fivenines needs to read it.
 chown fivenines:fivenines /etc/fivenines_agent
 chmod 750 /etc/fivenines_agent
-# Save the client token in appropriate location
-if [ "$SYSTEM_TYPE" = "unraid" ]; then
+# Save the client token in appropriate location. With --from-user the token
+# is the user-level agent's, carried over once that agent has stopped
+# (import_user_state).
+if [ "$FROM_USER" = "1" ]; then
+  :
+elif [ "$SYSTEM_TYPE" = "unraid" ]; then
   mkdir -p /boot/config/custom/fivenines_agent
-  printf '%s' "$1" | tee /boot/config/custom/fivenines_agent/TOKEN > /dev/null
+  printf '%s' "$TOKEN" | tee /boot/config/custom/fivenines_agent/TOKEN > /dev/null
   chown fivenines:fivenines /boot/config/custom/fivenines_agent/TOKEN
   chmod 600 /boot/config/custom/fivenines_agent/TOKEN
 else
   # Use standard location for other systems
-  printf '%s' "$1" | tee /etc/fivenines_agent/TOKEN > /dev/null
+  printf '%s' "$TOKEN" | tee /etc/fivenines_agent/TOKEN > /dev/null
   chown fivenines:fivenines /etc/fivenines_agent/TOKEN
   chmod 600 /etc/fivenines_agent/TOKEN
 fi
@@ -1009,11 +1734,36 @@ else
   print_warning "Skipping connectivity test (test mode)"
 fi
 
+# --from-user: the user-level agent stops only now, once everything that can
+# fail on its own (download, checks, extraction, connectivity) has passed, and
+# its state is read after it stopped. From here a failure puts it back
+# (exit_with_contact -> rollback_user_takeover).
+if [ "$FROM_USER" = "1" ]; then
+  # Not interrupted halfway (a few seconds at most): stopped, the agent would
+  # stay stopped, the move not yet armed to put it back.
+  trap '' INT TERM HUP
+  if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
+    stop_user_agent || exit_with_contact "Could not stop the user-level agent of $FROM_USER_NAME, so nothing was moved. Stop it ($USER_INSTALL_DIR/stop.sh, as $FROM_USER_NAME) and re-run."
+  else
+    print_warning "Skipping the user-level agent stop (test mode)"
+  fi
+  TAKEOVER_ROLLBACK=1
+  # From here an interrupted move is a failed one: put the user-level agent back.
+  trap 'exit_with_contact "Interrupted."' INT TERM HUP
+  import_user_state || exit_with_contact "Could not carry the state of $FROM_USER_NAME's agent over."
+fi
+
+# Before the service starts, so the agent's first capability probe sees them.
+SUDOERS_SKIPPED=0
+if [ "$WITH_SUDOERS" = "1" ]; then
+  write_sudoers_rules || SUDOERS_SKIPPED=1
+fi
+
 # Setup based on system type (skip service management in test mode)
 if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
   case "$SYSTEM_TYPE" in
     "unraid")
-      setup_unraid "$1"
+      setup_unraid "$TOKEN"
       ;;
     "openrc")
       setup_openrc
@@ -1029,12 +1779,29 @@ else
   print_warning "Skipping service setup (test mode)"
 fi
 
+if [ "$FROM_USER" = "1" ]; then
+  TAKEOVER_ROLLBACK=0
+  trap - INT TERM HUP
+  remove_user_installation
+fi
+
 # Final output
 echo ""
 printf '%b\n' "${BLUE}===============================================================${NC}"
 printf '%b\n' "${BLUE}  Installation Complete!${NC}"
 printf '%b\n' "${BLUE}===============================================================${NC}"
 echo ""
+
+if [ "$FROM_USER" = "1" ]; then
+  echo "The user-level agent of $FROM_USER_NAME now runs as this system installation,"
+  echo "with the same token and machine id: the dashboard keeps the same host."
+  echo ""
+fi
+if [ "$SUDOERS_SKIPPED" = "1" ]; then
+  print_warning "No sudoers rule was written (see above). The README's Full Monitoring section lists them."
+  echo ""
+fi
+warn_unpinned_sudoers_rules
 
 if [ "$SYSTEM_TYPE" = "unraid" ]; then
   echo "The agent is now running and will automatically start when your UNRAID server boots."

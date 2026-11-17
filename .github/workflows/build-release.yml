@@ -957,6 +957,9 @@ jobs:
           cp fivenines-agent.service release/
           cp fivenines-agent.openrc release/
           cp fivenines_script.sh release/
+          # Run as root by fivenines_setup_user.sh --from-system, which
+          # verifies it like the startup definitions, on either mirror.
+          cp fivenines_uninstall.sh release/
           ls -la release/
 
           # Resolve SPK filenames for download URLs
@@ -1106,6 +1109,7 @@ jobs:
             release/fivenines-agent.service
             release/fivenines-agent.openrc
             release/fivenines_script.sh
+            release/fivenines_uninstall.sh
             release/SHA256SUMS
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -1189,6 +1193,9 @@ jobs:
           cp fivenines-agent.service release/
           cp fivenines-agent.openrc release/
           cp fivenines_script.sh release/
+          # Run as root by fivenines_setup_user.sh --from-system, which
+          # verifies it like the startup definitions, on either mirror.
+          cp fivenines_uninstall.sh release/
           ls -la release/
 
       - name: Extract version from tag
@@ -1327,6 +1334,7 @@ jobs:
             release/fivenines-agent.service
             release/fivenines-agent.openrc
             release/fivenines_script.sh
+            release/fivenines_uninstall.sh
             release/SHA256SUMS
             release/SHA256SUMS.sig
         env:
