@@ -13,7 +13,7 @@ Run against a local or containerized server, e.g.:
         poetry run pytest tests/test_mysql_integration.py -v
 
 The same with mariadb:11.8 (MARIADB_ROOT_PASSWORD). A dedicated MYSQL_USER
-needs REPLICATION CLIENT (MySQL) or SLAVE MONITOR (MariaDB 10.5+) for the
+needs REPLICATION CLIENT (MySQL) or SLAVE MONITOR (MariaDB 10.5.9+) for the
 is_replica assertion. MYSQL_SOCKET adds the
 unix-socket path; MYSQL_UTF8_USER / MYSQL_UTF8_PASSWORD an account whose
 password holds non-ASCII characters (CREATE USER ... IDENTIFIED BY over a
@@ -46,6 +46,10 @@ def _assert_metrics(result):
     for key in ("connections", "queries", "uptime", "max_connections", "version"):
         assert key in result, (key, result)
     assert "is_replica" in result, result
+    if result["is_replica"]:
+        # One entry per replication channel, sorted by name (#304).
+        channels = [channel["channel"] for channel in result["replication"]]
+        assert channels == sorted(channels), result
 
 
 def test_real_server_over_tcp_is_reachable_with_metrics():

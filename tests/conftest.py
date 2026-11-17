@@ -37,12 +37,13 @@ from fivenines_agent.cache import TTLCache
 @pytest.fixture(autouse=True)
 def _reset_process_caches():
     packages_module._packages_cache = TTLCache()
-    mysql_module._replica_status_sql = mysql_module.REPLICA_STATUS_SQL
+    mysql_module._rejected_statements = (None, 0.0, frozenset())
     mysql_module._stalled_worker = None
     mysql_module._plaintext_until.clear()
     mysql_module._last_logged_error = None
     mysql_module._tls_failures.clear()
     mysql_module._read_cap_reported.clear()
+    mysql_module._channel_cap_reported = False
     raid_module._mdadm_version = None
     fail2ban_module._version_cache = None
     gpu_module._nvml_ready = False

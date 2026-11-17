@@ -2620,8 +2620,11 @@ an outage apart from a credentials problem. Available in agent version
   (raw counters; the dashboard derives rates)
 - Uptime and server version
 - InnoDB buffer-pool hit ratio and usage (computed)
-- Replication status and lag for replicas (`SHOW REPLICA STATUS` with a
-  `SHOW SLAVE STATUS` fallback for MariaDB / MySQL < 8.0.22)
+- Replication status and lag for replicas, per replication channel, so a
+  multi-source replica reports every source (`SHOW REPLICA STATUS` on MySQL,
+  `SHOW ALL REPLICAS STATUS` on MariaDB, with the older spellings as
+  fallbacks). Agents up to 1.24.1 reported only the last channel listed (on
+  MariaDB, only the default connection)
 - Galera / wsrep cluster state on MariaDB/MySQL Galera nodes (cluster size and
   status, local state, ready/connected, flow-control pause and receive-queue
   averages), read only when the server's `wsrep_on` is `ON`: on any other
@@ -2631,14 +2634,15 @@ an outage apart from a credentials problem. Available in agent version
 
 Requires a database account. It needs no privilege for the status, version,
 connection and Galera metrics; replication status needs `REPLICATION CLIENT` on
-MySQL and `SLAVE MONITOR` on MariaDB 10.5+ (where `REPLICATION CLIENT` became
-`BINLOG MONITOR`, which does not cover it). Without it the replication section
-is simply left out:
+MySQL and on MariaDB before 10.5, and `SLAVE MONITOR` on MariaDB 10.5.9+ (where
+`REPLICATION CLIENT` became `BINLOG MONITOR`, which does not cover it). MariaDB
+10.5.2 to 10.5.8 have no `SLAVE MONITOR` and need `REPLICATION SLAVE ADMIN`
+instead. Without it the replication section is simply left out:
 
 ```sql
 CREATE USER 'fivenines'@'localhost' IDENTIFIED BY 'a-strong-password';
-GRANT REPLICATION CLIENT ON *.* TO 'fivenines'@'localhost';  -- MySQL
-GRANT SLAVE MONITOR ON *.* TO 'fivenines'@'localhost';       -- MariaDB 10.5+
+GRANT REPLICATION CLIENT ON *.* TO 'fivenines'@'localhost';  -- MySQL, MariaDB < 10.5
+GRANT SLAVE MONITOR ON *.* TO 'fivenines'@'localhost';       -- MariaDB 10.5.9+
 ```
 
 Where it connects follows what the `mysql` and `mariadb` clients did:

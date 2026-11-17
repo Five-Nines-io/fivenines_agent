@@ -151,18 +151,61 @@ VARIABLES_SQL = (
     " ('max_connections', 'version', 'wsrep_on')"
 )
 
-# MySQL 8.0.22+ spelling first, then the MariaDB / older-MySQL alias. We try
-# REPLICA and fall back to SLAVE on any error (older servers reject REPLICA
-# with a syntax error).
+# Replication status, one row per replication channel (#304). MySQL lists
+# every channel with SHOW REPLICA STATUS (8.0.22+; SHOW SLAVE STATUS before,
+# removed in 8.4). MariaDB lists only its default connection there, and an
+# empty set on a replica with only named connections (measured on 10.11):
+# every connection takes SHOW ALL REPLICAS STATUS (10.5.1+) or SHOW ALL SLAVES
+# STATUS (10.0+); MariaDB 5.5 (CentOS 7) has neither, nor multi-source. So
+# every server is sent them in this order and the first that answers wins
+# (_get_replication), whatever its version string says: MariaDB lets an
+# operator set it. A statement the server rejects as syntax is not sent again
+# for up to REJECTION_RETRY_INTERVAL while the target and its version string
+# stay the same (_rejected_statements). Any other failure (a missing
+# privilege, an interrupted statement, a lost connection) ends the section for
+# that tick: the next statement could answer with fewer channels (MariaDB's
+# plain one), and one privilege covers all four.
 REPLICA_STATUS_SQL = "SHOW REPLICA STATUS"
 SLAVE_STATUS_SQL = "SHOW SLAVE STATUS"
+ALL_REPLICAS_STATUS_SQL = "SHOW ALL REPLICAS STATUS"
+ALL_SLAVES_STATUS_SQL = "SHOW ALL SLAVES STATUS"
+REPLICA_STATUS_STATEMENTS = (
+    ALL_REPLICAS_STATUS_SQL,
+    ALL_SLAVES_STATUS_SQL,
+    REPLICA_STATUS_SQL,
+    SLAVE_STATUS_SQL,
+)
 
-# Which replication-status spelling this server accepts, remembered across
-# ticks, so a server that rejects REPLICA (pre-8.0.22 MySQL / pre-10.5
-# MariaDB) is not sent a statement that fails on every tick. Reset to the
-# preferred spelling whenever the memoized one stops working (server upgrade
-# mid-run).
-_replica_status_sql = REPLICA_STATUS_SQL
+# The statement does not exist on this server: ER_PARSE_ERROR, ER_SYNTAX_ERROR.
+_SYNTAX_ERRORS = frozenset({1064, 1149})
+
+# How long the statements a server rejected as syntax are not sent again, at
+# most (seconds, counted from the first tick with that target and version
+# string): a MySQL is sent the two SHOW ALL forms once an hour, not every
+# tick. A forged rejection (whatever listens on a TCP target while the server
+# is down, with its version string; a localhost config is TCP too when no
+# default socket exists: Windows, Docker, another port) affects the section
+# for at most that long once the server is back: no section when all four
+# were rejected, else a MariaDB's default connection alone, which reads
+# is_replica false on a replica with only named connections.
+REJECTION_RETRY_INTERVAL = 3600
+
+# ((target, version string), monotonic time they are forgotten, the
+# replication-status statements that server rejected as syntax).
+_rejected_statements: tuple = (None, 0.0, frozenset())
+
+# Channels shipped at most (MySQL's own limit is 256 channels); a server
+# listing more ships no channel at all, never a short list. MAX_READ_BYTES can
+# bound them first: MySQL repeats the server-wide Executed_Gtid_Set in every
+# channel row, so a GTID replica with many channels or source UUIDs can pass
+# it, and then the section is left out with the read-cap error logged.
+MAX_CHANNELS = 256
+
+# A channel name's length cap (MySQL and MariaDB both allow 64 characters).
+CHANNEL_NAME_MAX = 64
+
+# Set once a channel list past MAX_CHANNELS was logged at error.
+_channel_cap_reported = False
 
 # Galera / wsrep cluster state (issue #107). One extra statement on the same
 # connection as the rest of the collector, sent only when the server's global
@@ -227,10 +270,15 @@ _stalled_worker = None
 _plaintext_until: dict = {}
 
 # {target: TLS handshakes failed in a row whose retry without TLS worked}
-# (one entry at most); any other outcome of a connection with TLS resets it.
+# (one entry at most). A connection with TLS that works, or that fails for
+# any other reason than its handshake (a refused login included), resets it.
+# A handshake failure whose retry without TLS fails too leaves it as it is,
+# neither counted nor reset: an account that requires TLS, whose retry is
+# refused, never turns TLS off.
 _tls_failures: dict = {}
 
-# The statements whose reply passed MAX_READ_BYTES, logged at error once each.
+# The statements during which a connection passed MAX_READ_BYTES, logged at
+# error once each.
 _read_cap_reported: set = set()
 
 # The last unexpected failure logged at error level: one that repeats every
@@ -253,7 +301,9 @@ def _connection_class(pymysql):
 
     _read_bytes is PyMySQL's one read primitive (packet headers and payloads
     alike); the budget is checked before the read, so a header announcing a
-    16 MB payload is refused without allocating it.
+    16 MB payload is refused without allocating it. It counts everything the
+    connection read: the handshake and every earlier statement too, so the
+    statement that crosses it is not necessarily the large one.
     """
 
     class CappedConnection(pymysql.connections.Connection):
@@ -265,10 +315,10 @@ def _connection_class(pymysql):
                 self._force_close()
                 error = pymysql.err.OperationalError(
                     _CR_SERVER_LOST,
-                    "Lost connection to MySQL server: its reply exceeded"
-                    f" {MAX_READ_BYTES} bytes",
+                    "Lost connection to MySQL server: this connection read"
+                    f" more than {MAX_READ_BYTES} bytes",
                 )
-                error.read_cap = True  # _best_effort logs it at error
+                error.read_cap = True  # _attempt logs it at error
                 raise error
             return super()._read_bytes(num_bytes)
 
@@ -508,39 +558,56 @@ def _connect_detail(target, os_error):
         return (
             f"ERROR {_CR_UNKNOWN_HOST}: Unknown MySQL server host '{host}' ({reason})"
         )
-    detail = (
+    return (
         f"ERROR {_CR_CONN_HOST_ERROR}: Can't connect to MySQL server on"
         f" '{host}:{port}' ({reason})"
+    ) + _hidden_sockets(target, "the server listens there")
+
+
+def _hidden_sockets(target, condition):
+    """A hint naming the default sockets the agent may not look at, or "".
+
+    localhost:3306 dials TCP when no default socket could be seen; a socket
+    the agent may not stat (SELinux, a 0750 /var/lib/mysql) is then missed
+    silently. What fails next is the connection when the server does not
+    listen on TCP, or the login when the account is bound to the socket: a
+    'user'@'localhost' account under skip_name_resolve (1045, 1130) or a
+    unix_socket one (1698). Shown for a configured 127.0.0.1:3306 too, where
+    the advice holds as well.
+    """
+    unix_socket, host, port = target
+    if unix_socket or host != "127.0.0.1" or port != DEFAULT_PORT:
+        return ""
+    if not _HAS_UNIX_SOCKETS:
+        return ""
+    hidden = [path for path in _DEFAULT_SOCKETS if _is_socket(path) is None]
+    if not hidden:
+        return ""
+    return (
+        f"; the agent may not look for a socket at {', '.join(hidden)}"
+        f" (permission denied): configure the socket path if {condition}"
     )
-    if host == "127.0.0.1" and port == DEFAULT_PORT and _HAS_UNIX_SOCKETS:
-        # localhost:3306 dials TCP when no default socket could be seen: say
-        # which ones the agent may not look at (SELinux, a 0750
-        # /var/lib/mysql). Shown for a configured 127.0.0.1:3306 too, where
-        # the advice holds as well.
-        hidden = [path for path in _DEFAULT_SOCKETS if _is_socket(path) is None]
-        if hidden:
-            detail += (
-                f"; the agent may not look for a socket at {', '.join(hidden)}"
-                " (permission denied): configure the socket path if the server"
-                " listens there"
-            )
-    return detail
 
 
 def _detail(exc, target):
     """error_detail for a failed connection or probe, naming the TLS failure
-    that caused a retry without TLS (_open)."""
+    that caused a retry without TLS (_open), and for a refused login the
+    default sockets the agent may not look at (_hidden_sockets)."""
     os_error = _os_error(exc)
+    hint = ""
     if _code(exc) == _CR_CONN_HOST_ERROR and os_error is not None:
-        detail = _connect_detail(target, os_error)
-    elif len(exc.args) == 2 and _code(exc) is not None:
-        detail = f"ERROR {exc.args[0]}: {exc.args[1]}"
+        detail = _connect_detail(target, os_error)  # with its own hint
     else:
-        detail = str(exc) or type(exc).__name__
+        if len(exc.args) == 2 and _code(exc) is not None:
+            detail = f"ERROR {exc.args[0]}: {exc.args[1]}"
+        else:
+            detail = str(exc) or type(exc).__name__
+        if _classify(exc) == "auth_failed":
+            hint = _hidden_sockets(target, "the account logs in through it")
     tls_error = getattr(exc, "after_tls_failure", None)
     if tls_error:
         detail += f" (after the TLS handshake failed: {tls_error})"
-    return detail
+    return detail + hint
 
 
 def _missing_package_detail(exc):
@@ -576,21 +643,33 @@ def _rows(conn, sql):
         return names, cursor.fetchall()
 
 
-def _best_effort(conn, sql):
-    """_rows(), or None when the statement fails for any reason.
+def _attempt(conn, sql):
+    """(_rows(), None), or (None, the exception) when the statement fails for
+    any reason.
 
-    A reply past MAX_READ_BYTES is logged at error, once per statement: unlike
-    a denied statement, no grant brings that section back.
+    A statement during which the connection passed MAX_READ_BYTES is logged
+    at error, once per statement: unlike a denied statement, no grant brings
+    that section back. The connection is closed then, so the statements after
+    it fail too, logged at debug: the error line says they are skipped (only
+    here: the same error on the probe fails the whole tick).
     """
     try:
-        return _rows(conn, sql)
+        return _rows(conn, sql), None
     except Exception as e:  # denied, unsupported, connection lost: drop the section
         level = "debug"
-        if getattr(e, "read_cap", False) and sql not in _read_cap_reported:
-            _read_cap_reported.add(sql)
-            level = "error"
-        log(f"MySQL statement skipped ({sql}): {log_safe(e)}", level)
-        return None
+        note = ""
+        if getattr(e, "read_cap", False):
+            note = "; the sections after it are skipped"
+            if sql not in _read_cap_reported:
+                _read_cap_reported.add(sql)
+                level = "error"
+        log(f"MySQL statement skipped ({sql}): {log_safe(e)}{note}", level)
+        return None, e
+
+
+def _best_effort(conn, sql):
+    """_rows(), or None when the statement fails for any reason (_attempt)."""
+    return _attempt(conn, sql)[0]
 
 
 def _status_map(rows):
@@ -756,18 +835,22 @@ def _galera_enabled(variables):
     return variables.get("wsrep_on", "").upper() in ("ON", "1")
 
 
-def _build_replication(row):
-    """Build the replication payload from a parsed SHOW REPLICA/SLAVE STATUS row.
+def _build_channel(row):
+    """One channel's entry from a parsed replication-status row.
 
     Reads both the MySQL 8 (`Replica_*`, `Seconds_Behind_Source`) and MariaDB /
     older-MySQL (`Slave_*`, `Seconds_Behind_Master`) spellings. A NULL lag
-    (replication broken) parses to None; `running` is the AND of both threads,
-    which is already False in the broken case.
+    (a thread stopped) parses to None; `running` is the AND of both threads.
+    The name is MySQL's Channel_Name or MariaDB's Connection_name, "" for
+    the default channel; a server with no such column (MySQL 5.6, MariaDB
+    5.5) has only that one, so it reads "" too.
     """
     io_running = _yes(_first(row, "Replica_IO_Running", "Slave_IO_Running"))
     sql_running = _yes(_first(row, "Replica_SQL_Running", "Slave_SQL_Running"))
     lag = _to_int(_first(row, "Seconds_Behind_Source", "Seconds_Behind_Master"))
+    name = _first(row, "Channel_Name", "Connection_name") or ""
     return {
+        "channel": scrub_str(name, CHANNEL_NAME_MAX),
         "lag_seconds": lag,
         "io_running": io_running,
         "sql_running": sql_running,
@@ -775,38 +858,53 @@ def _build_replication(row):
     }
 
 
-def _get_replication(conn):
-    """Return (is_replica, replication_dict).
+def _get_replication(conn, variables, target=None):
+    """Return (is_replica, channels).
 
-    Tries SHOW REPLICA STATUS (MySQL 8.0.22+ / MariaDB 10.5+), falling back to
-    SHOW SLAVE STATUS on any error (older servers reject REPLICA). Returns:
-      (None, None)  -- status unreadable (both statements failed, e.g. the user
-                       lacks REPLICATION CLIENT); undetermined.
-      (False, None) -- statement succeeded, no rows: not a replica.
-      (True, {...}) -- replica; dict has lag_seconds/io_running/sql_running/running.
+    `variables` are the server's (VARIABLES_SQL): its version string and the
+    `target` (_target) key the statements it rejected (see
+    REPLICA_STATUS_SQL). Returns:
+      (None, None)  -- status unreadable (a statement failed for another
+                       reason than syntax, e.g. the user lacks REPLICATION
+                       CLIENT, or every statement was rejected); undetermined.
+      (False, None) -- a statement answered with no rows: not a replica.
+      (True, [...]) -- replica: one _build_channel entry per channel, sorted
+                       by name.
+      (True, None)  -- replica, but more than MAX_CHANNELS channels listed.
 
     A failure here never flips reachable; it only drops the replication section
     (mirrors the PostgreSQL collector's per-view degradation).
     """
-    global _replica_status_sql
-    first = _replica_status_sql
-    second = SLAVE_STATUS_SQL if first == REPLICA_STATUS_SQL else REPLICA_STATUS_SQL
-    result = _best_effort(conn, first)
-    if result is None:
-        result = _best_effort(conn, second)
-        if result is not None:
-            # The fallback spelling is the one this server speaks; lead with
-            # it next tick instead of re-running the failing one forever.
-            _replica_status_sql = second
+    global _rejected_statements, _channel_cap_reported
+    key = (target, variables.get("version", ""))
+    now = time.monotonic()
+    if _rejected_statements[0] != key or now >= _rejected_statements[1]:
+        _rejected_statements = (key, now + REJECTION_RETRY_INTERVAL, frozenset())
+    result = None
+    for sql in REPLICA_STATUS_STATEMENTS:
+        if sql in _rejected_statements[2]:
+            continue
+        result, error = _attempt(conn, sql)
+        if result is not None or _code(error) not in _SYNTAX_ERRORS:
+            break
+        key, until, rejected = _rejected_statements
+        _rejected_statements = (key, until, rejected | {sql})
     if result is None:
         return None, None
     names, rows = result
     if not rows:
         return False, None
-    # One row per replication channel (MySQL multi-source). The CLI path read
-    # the \G output of every row into one dict, so the LAST row won; reading
-    # that row keeps the payload as it was.
-    return True, _build_replication(dict(zip(names, map(_text, rows[-1]))))
+    if len(rows) > MAX_CHANNELS:
+        level = "debug" if _channel_cap_reported else "error"
+        _channel_cap_reported = True
+        log(
+            f"MySQL replication: {len(rows)} channels listed, more than"
+            f" {MAX_CHANNELS}: none is reported",
+            level,
+        )
+        return True, None
+    channels = [_build_channel(dict(zip(names, map(_text, row)))) for row in rows]
+    return True, sorted(channels, key=lambda channel: channel["channel"])
 
 
 def _failure(category, detail):
@@ -818,9 +916,10 @@ def _failure(category, detail):
     return result
 
 
-def _read_metrics(conn, metrics):
+def _read_metrics(conn, metrics, target=None):
     """Add every best-effort statement's section to `metrics`, the probe's
-    payload, on the same connection.
+    payload, on the same connection (`target`, _target's, keys what the
+    replication section remembers about the server).
 
     Each section is merged whole (one dict.update), so a copy taken by
     mysql_metrics when the deadline cuts the collection holds whole sections.
@@ -838,8 +937,8 @@ def _read_metrics(conn, metrics):
         section["galera"] = _galera_enabled(variables)
     metrics.update(section)
 
-    # Best-effort: replication (REPLICA -> SLAVE fallback, MySQL 8 + MariaDB).
-    is_replica, replication = _get_replication(conn)
+    # Best-effort: replication, every channel (see REPLICA_STATUS_SQL).
+    is_replica, replication = _get_replication(conn, variables, target)
     section = {}
     if is_replica is not None:
         section["is_replica"] = is_replica
@@ -881,7 +980,7 @@ def _collect(host, port, user, password, database, socket_path, progress):
         metrics: dict = {"reachable": True}
         _add_status_metrics(metrics, _status_map(status_rows))
         progress["metrics"] = metrics
-        return _read_metrics(conn, metrics)
+        return _read_metrics(conn, metrics, target)
     finally:
         _close(conn)
 
@@ -938,7 +1037,9 @@ def mysql_metrics(
             # bounded each statement alone). One C-level copy: the worker
             # merges whole sections into it meanwhile. Should that worker
             # still run at the next tick (a statement slower than the tick
-            # interval), that tick reads the timeout envelope above.
+            # interval), that tick reads the timeout envelope above. A
+            # success, for the failure logged once below.
+            _last_logged_error = None
             return dict(metrics)
         return _failure("timeout", _STALLED_MESSAGE.format(COLLECT_DEADLINE))
     except Exception as e:
