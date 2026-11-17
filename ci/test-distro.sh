@@ -156,14 +156,14 @@ fi
 # load on this distro's libc. --check-imports does, and unlike the dry-run below
 # it needs no python3 in the image. It also imports the optional modules the
 # variant's build bundles (the agent imports them under try/except ImportError
-# or only inside a collector, so a libvirt or a pymongo that does not load on
-# this libc would otherwise just disable the QEMU or MongoDB collector): keep each list in step with CHECK_IMPORTS in py2exe.sh and
+# or only inside a collector, so a libvirt, a pymongo or a pymysql that does not load on
+# this libc would otherwise just disable the QEMU, MongoDB or MySQL collector): keep each list in step with CHECK_IMPORTS in py2exe.sh and
 # py2exe_alpine.sh. stderr stays out of the PASS row: the results table goes
 # through printf '%b', where a stray warning line would break the table and a
 # literal \c would cut the rest of the report.
 case "$BINARY_VARIANT" in
-  linux-*) CHECK_IMPORTS="pymongo libvirt pynvml proxmoxer.backends.https systemd_watchdog" ;;
-  alpine-*) CHECK_IMPORTS="pymongo libvirt pynvml proxmoxer.backends.https" ;;
+  linux-*) CHECK_IMPORTS="pymongo pymysql cryptography.hazmat.primitives.asymmetric.padding libvirt pynvml proxmoxer.backends.https systemd_watchdog" ;;
+  alpine-*) CHECK_IMPORTS="pymongo pymysql cryptography.hazmat.primitives.asymmetric.padding libvirt pynvml proxmoxer.backends.https" ;;
   *) CHECK_IMPORTS="" ;;
 esac
 # shellcheck disable=SC2086 # CHECK_IMPORTS is a word list
