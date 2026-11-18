@@ -38,16 +38,18 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# The message is printed as it is (%s): through %b, a backslash sequence in a
+# path it names (a directory another account chose) became an escape.
 print_success() {
-    printf '%b\n' "${GREEN}[+]${NC} $1"
+    printf '%b%s\n' "${GREEN}[+]${NC} " "$1"
 }
 
 print_warning() {
-    printf '%b\n' "${YELLOW}[!]${NC} $1"
+    printf '%b%s\n' "${YELLOW}[!]${NC} " "$1"
 }
 
 print_error() {
-    printf '%b\n' "${RED}[-]${NC} $1"
+    printf '%b%s\n' "${RED}[-]${NC} " "$1"
 }
 
 exit_with_error() {
@@ -574,15 +576,50 @@ root_only_chain() {
     done
 }
 
-# The path a rule for TOOL names, or nothing and a non-zero status when TOOL is
-# not installed, or when anyone but root could change what that path runs
-# (root_only_chain): a rule there would hand root to whoever can. Looked up in
-# sudo's usual secure_path, in its order, rather than in the caller's PATH (su
-# without - keeps a PATH with no sbin). Warnings go to stderr: the path is
-# this function's output.
+# Where sudo looks up the commands the agent runs by name: this host's
+# secure_path, as its sudo reports it to root (sudo -V, in the C locale since
+# the line is translated). RHEL-family sudoers set /sbin:/bin:/usr/sbin:/usr/bin,
+# with no /usr/local, so a rule naming a copy there would never match what
+# sudo runs. A sudo that reports none (no secure_path, or sudo-rs, whose -V
+# prints only its version) searches the caller's PATH: the agent's, systemd's
+# default for a service, the list below. Bounded like
+# warn_unpinned_sudoers_rules: a sudoers backend that hangs must not hold the
+# install.
+sudo_secure_path() {
+    secure_path=$( { if command -v timeout > /dev/null 2>&1; then
+            LC_ALL=C timeout 10 sudo -V
+        else
+            LC_ALL=C sudo -V
+        fi; } 2>/dev/null \
+        | sed -n "s/^Value to override user's \$PATH with: //p" | head -n 1)
+    if [ -z "$secure_path" ]; then
+        secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    fi
+    printf '%s' "$secure_path"
+}
+
+# sudoers_tool_path TOOL [SECURE_PATH]: the path a rule for TOOL names, or
+# nothing and a non-zero status when TOOL is not installed, or when anyone but
+# root could change what that path runs (root_only_chain): a rule there would
+# hand root to whoever can. Looked up in sudo's secure_path (SECURE_PATH, which
+# write_sudoers_rules reads once for every tool: sudo -V parses the sudoers
+# sources, LDAP included, while the agent may be stopped; else
+# sudo_secure_path), in its order, rather than in the caller's PATH (su
+# without - keeps a PATH with no sbin); an entry that is not an absolute
+# directory ("." or empty) is skipped. Split in the shell itself, with no tool
+# that a bare PATH could lack. Warnings go to stderr: the path is this
+# function's output.
 sudoers_tool_path() {
     tool_path=""
-    for tool_dir in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+    tool_dirs="${2:-$(sudo_secure_path)}:"
+    while [ -n "$tool_dirs" ]; do
+        tool_dir=${tool_dirs%%:*}
+        tool_dirs=${tool_dirs#*:}
+        case "$tool_dir" in
+            /*) ;;
+            *) continue ;;
+        esac
+        tool_dir=${tool_dir%/}
         if [ -f "${tool_dir}/$1" ] && [ -x "${tool_dir}/$1" ]; then
             tool_path="${tool_dir}/$1"
             break
@@ -638,22 +675,30 @@ write_sudoers_rules() {
         > "$sudoers_staged"; then
         return 1
     fi
-    # fail2ban-client is a Python script: where sudo keeps the caller's HOME
-    # (Ubuntu before 19.10, or env_keep += HOME), Python runs the .pth files
-    # of the account's ~/.local as root, whatever the rule's arguments.
-    # always_set_home gives every command it runs through sudo root's HOME.
-    sudoers_defaults="Defaults:fivenines always_set_home"
-    rm -f "$sudoers_one"
-    printf '%s\n' "$sudoers_defaults" > "$sudoers_one" && chmod 440 "$sudoers_one"
-    if visudo -cf "$sudoers_one" > /dev/null 2>&1; then
-        printf '%s\n' "$sudoers_defaults" >> "$sudoers_staged"
-        print_success "sudoers default: ${sudoers_defaults}"
-    else
-        print_warning "This host's visudo rejects '${sudoers_defaults}': not written."
-    fi
+    # always_set_home: fail2ban-client is a Python script, and where sudo
+    # keeps the caller's HOME (Ubuntu before 19.10, or env_keep += HOME),
+    # Python runs the .pth files of the account's ~/.local as root, whatever
+    # the rule's arguments; this gives every command it runs through sudo
+    # root's HOME. !requiretty: early RHEL 7 shipped "Defaults requiretty",
+    # and a long-lived host keeps it (/etc/sudoers is %config(noreplace)),
+    # under which sudo refuses every command run with no terminal, the
+    # agent's included. Written whether or not one is set here: it can come
+    # from an included file or from LDAP, and does nothing where none is. A
+    # user's Defaults apply after the global ones, whatever the file order.
+    for sudoers_defaults in "Defaults:fivenines always_set_home" "Defaults:fivenines !requiretty"; do
+        rm -f "$sudoers_one"
+        printf '%s\n' "$sudoers_defaults" > "$sudoers_one" && chmod 440 "$sudoers_one"
+        if visudo -cf "$sudoers_one" > /dev/null 2>&1; then
+            printf '%s\n' "$sudoers_defaults" >> "$sudoers_staged"
+            print_success "sudoers default: ${sudoers_defaults}"
+        else
+            print_warning "This host's visudo rejects '${sudoers_defaults}': not written."
+        fi
+    done
     sudoers_rules=0
+    sudoers_secure_path=$(sudo_secure_path)
     for sudoers_tool in smartctl nvme mdadm fail2ban-client wg; do
-        sudoers_path=$(sudoers_tool_path "$sudoers_tool") || continue
+        sudoers_path=$(sudoers_tool_path "$sudoers_tool" "$sudoers_secure_path") || continue
         # Each tool that can run code or change the host given other
         # arguments is held to the argv the agent runs. sudo matches a
         # wildcard across argument boundaries, so a pattern that must not

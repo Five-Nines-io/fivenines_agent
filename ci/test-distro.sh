@@ -401,12 +401,21 @@ fi
 echo ""
 echo "=== Test 8: System uninstall ==="
 
-if timeout 120 sh "${SCRIPTS_DIR}/fivenines_uninstall.sh" > "${OUTPUT_DIR}/uninstall_output" 2>&1; then
+# Run as root with no sudo, as on a minimal image (#302): a sudo that fails
+# comes first on PATH. The uninstaller runs as root and needs none, and must
+# remove the configuration (its TOKEN) and the account, or say it did not.
+NO_SUDO_DIR=$(mktemp -d)
+printf '#!/bin/sh\necho "sudo: not found" >&2\nexit 127\n' > "$NO_SUDO_DIR/sudo"
+chmod 755 "$NO_SUDO_DIR/sudo"
+if PATH="$NO_SUDO_DIR:$PATH" timeout 120 sh "${SCRIPTS_DIR}/fivenines_uninstall.sh" > "${OUTPUT_DIR}/uninstall_output" 2>&1; then
   # Verify cleanup
-  if [ ! -d "/etc/fivenines_agent" ] || [ ! -d "$INSTALL_DIR" ]; then
-    record_result "system-uninstall" "PASS" "cleaned up"
+  if [ ! -e "/etc/fivenines_agent" ] && ! id fivenines > /dev/null 2>&1; then
+    record_result "system-uninstall" "PASS" "cleaned up, without sudo"
   else
-    record_result "system-uninstall" "PASS" "script completed"
+    record_result "system-uninstall" "FAIL" "/etc/fivenines_agent or the fivenines user left behind"
+    echo "--- uninstall output ---"
+    cat "${OUTPUT_DIR}/uninstall_output" 2>/dev/null || true
+    echo "--- end output ---"
   fi
 else
   record_result "system-uninstall" "FAIL" "exit code $?"
@@ -547,7 +556,14 @@ if [ "$(id -u)" = "0" ] && id testuser > /dev/null 2>&1 && [ -d "$USER_INSTALL_D
     export FIVENINES_CONFIG_DIR='${USER_CONFIG_DIR}'
     sh '${SCRIPTS_DIR}/fivenines_uninstall_user.sh'
   " > "${OUTPUT_DIR}/user_uninstall_output" 2>&1; then
-    record_result "user-uninstall" "PASS" ""
+    # Both directories held only the installation: nothing is kept.
+    if [ ! -e "$USER_INSTALL_DIR" ] && [ ! -e "$USER_CONFIG_DIR" ]; then
+      record_result "user-uninstall" "PASS" ""
+    else
+      record_result "user-uninstall" "FAIL" "a directory was kept"
+      ls -la "$USER_INSTALL_DIR" "$USER_CONFIG_DIR" 2>&1 || true
+      cat "${OUTPUT_DIR}/user_uninstall_output" 2>/dev/null || true
+    fi
   else
     record_result "user-uninstall" "FAIL" "exit code $?"
     echo "--- user uninstall output ---"
@@ -573,8 +589,11 @@ MOVED_TO_SYSTEM=0
 
 # Root-owned stand-ins for two monitored tools, so --with-sudoers has rules to
 # write for this image's real visudo to check. Only where the name is free.
-# With /usr/sbin a link to bin (Fedora 42), the rules name /usr/sbin for both:
-# the installer looks there first, as secure_path does.
+# A rule names the copy the image's own secure_path finds first (#308): on a
+# merged /usr, /sbin/smartctl where it starts with /sbin (CentOS 7, Rocky),
+# /usr/sbin for both where /usr/sbin is a link to bin (Fedora 42). sudo
+# matches the rule to what it runs by inode as well, so any spelling of the
+# same file is the tool.
 for fake_tool in /usr/sbin/smartctl /usr/bin/wg; do
   if [ ! -e "$fake_tool" ] && [ -d "${fake_tool%/*}" ]; then
     printf '#!/bin/sh\necho "%s $*"\n' "${fake_tool##*/}" > "$fake_tool"
@@ -582,16 +601,6 @@ for fake_tool in /usr/sbin/smartctl /usr/bin/wg; do
   fi
 done
 
-# fivenines_uninstall.sh (Test 8) removes /etc/fivenines_agent and the
-# fivenines user through sudo, so on an image where sudo could not be
-# installed (an EOL image whose mirrors are gone) they are still there, and
-# --from-user would rightly refuse to replace an existing system install (or
-# any state file it left). This container is thrown away: clear what Test 8
-# could not.
-if [ -e "$SYSTEM_CONFIG_DIR" ] && [ "$(id -u)" = "0" ]; then
-  rm -rf "${SYSTEM_CONFIG_DIR:?}" /opt/fivenines
-  userdel -r fivenines > /dev/null 2>&1 || deluser fivenines > /dev/null 2>&1 || true
-fi
 
 make_tarball
 if [ "$(id -u)" != "0" ] || ! id testuser > /dev/null 2>&1; then
@@ -611,9 +620,10 @@ else
   " > "${OUTPUT_DIR}/move_user_setup_output" 2>&1
 
   # No FIVENINES_INSTALL_DIR / FIVENINES_CONFIG_DIR: the defaults under
-  # testuser's home, read from the passwd entry, are the paths above.
+  # testuser's home, read from the passwd entry, are the paths above. Root
+  # moves another user's installation, with no terminal: --yes confirms it.
   make_tarball
-  if timeout 120 sh "${SCRIPTS_DIR}/fivenines_setup.sh" --from-user testuser --with-sudoers \
+  if timeout 120 sh "${SCRIPTS_DIR}/fivenines_setup.sh" --from-user testuser --yes --with-sudoers \
       > "${OUTPUT_DIR}/move_to_system_output" 2>&1 \
     && [ "$(cat "$SYSTEM_CONFIG_DIR/TOKEN" 2>/dev/null)" = "$MOVE_TOKEN" ] \
     && [ "$(cat "$SYSTEM_CONFIG_DIR/MACHINE_ID" 2>/dev/null)" = "$MOVE_MACHINE_ID" ] \
@@ -641,8 +651,9 @@ if [ "$MOVED_TO_SYSTEM" != "1" ]; then
 elif ! command -v visudo > /dev/null 2>&1; then
   record_result "with-sudoers" "SKIP" "no sudo in image"
 elif [ "$(head -n 1 "$SUDOERS_FILE" 2>/dev/null)" = "# Managed by the fivenines agent installer (--with-sudoers)" ] \
-  && grep -qxF "fivenines ALL=(ALL) NOPASSWD: /usr/sbin/smartctl" "$SUDOERS_FILE" \
-  && grep -qxE 'fivenines ALL=\(root\) NOPASSWD:NOLOG_OUTPUT: /usr/s?bin/wg show all dump' "$SUDOERS_FILE" \
+  && grep -qxE 'fivenines ALL=\(ALL\) NOPASSWD: (/usr)?/s?bin/smartctl' "$SUDOERS_FILE" \
+  && grep -qxE 'fivenines ALL=\(root\) NOPASSWD:NOLOG_OUTPUT: (/usr)?/s?bin/wg show all dump' "$SUDOERS_FILE" \
+  && grep -qx 'Defaults:fivenines !requiretty' "$SUDOERS_FILE" \
   && [ "$(stat -c '%U %a' "$SUDOERS_FILE" 2>/dev/null)" = "root 440" ] \
   && visudo -c > /dev/null 2>&1; then
   record_result "with-sudoers" "PASS" "rules written, visudo -c clean"

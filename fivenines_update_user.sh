@@ -39,16 +39,18 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
+# The message is printed as it is (%s): through %b, a backslash sequence in a
+# path it names (a directory another account chose) became an escape.
 print_success() {
-    printf '%b\n' "${GREEN}[+]${NC} $1"
+    printf '%b%s\n' "${GREEN}[+]${NC} " "$1"
 }
 
 print_warning() {
-    printf '%b\n' "${YELLOW}[!]${NC} $1"
+    printf '%b%s\n' "${YELLOW}[!]${NC} " "$1"
 }
 
 print_error() {
-    printf '%b\n' "${RED}[-]${NC} $1"
+    printf '%b%s\n' "${RED}[-]${NC} " "$1"
 }
 
 exit_with_error() {
@@ -552,11 +554,14 @@ agent_pattern() {
 # spelling it was written with, while fivenines_update_user.sh rewrites these
 # scripts with the one it was given -- a stop.sh trusting the path alone said
 # "not running", and the update started a second agent with the same
-# identity. The recorded PID is taken only when /proc shows an agent binary
-# as its argv[0], so a PID the system has since reused (by a tail -f of the
-# agent's log, say) is never signalled. The update rewrites
-# these scripts so an existing installation gets them; never start.sh, which
-# carries the config directory the installation was made with.
+# identity. The recorded PID is taken only when the binary it runs
+# (/proc/PID/exe, resolved) is one of this installation's own (resolved with
+# pwd -P), so neither a PID the system has since reused (by a tail -f of the
+# agent's log, say) nor another installation's agent under the same account,
+# which a command-line shape matched (#324), is ever signalled; /proc/PID/exe
+# reads only for this user's own processes. The update rewrites these scripts
+# so an existing installation gets them; never start.sh, which carries the
+# config directory the installation was made with.
 write_control_scripts() {
     # Every path goes into the scripts single-quoted, its own single quotes
     # written as '\'', so a directory name of any spelling stays one word.
@@ -569,9 +574,12 @@ AGENT_PID=\$(cat $control_dir/agent.pid 2>/dev/null)
 case "\$AGENT_PID" in
     ''|*[!0-9]*) ;;
     *)
-        if tr '\0' '\n' < "/proc/\$AGENT_PID/cmdline" 2>/dev/null | head -n 1 \\
-            | grep -q '/fivenines-agent-[^/]*/fivenines-agent-[^/]*\$'; then
-            PIDS="\$PIDS \$AGENT_PID"
+        AGENT_EXE=\$(readlink -f "/proc/\$AGENT_PID/exe" 2>/dev/null)
+        AGENT_HOME=\$(cd $control_dir 2>/dev/null && pwd -P)
+        if [ -n "\$AGENT_EXE" ] && [ -n "\$AGENT_HOME" ]; then
+            case "\$AGENT_EXE" in
+                "\$AGENT_HOME"/fivenines-agent-*/fivenines-agent-*) PIDS="\$PIDS \$AGENT_PID" ;;
+            esac
         fi
         ;;
 esac
