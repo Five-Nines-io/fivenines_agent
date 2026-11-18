@@ -285,12 +285,15 @@ else
   # requiretty (early RHEL 7's sudoers) refuses every sudo run with no
   # terminal, the agent's included (#309). This container gives none: with a
   # global "Defaults requiretty", alice (a NOPASSWD rule, no !requiretty) is
-  # refused, and fivenines still runs its commands.
+  # refused, and fivenines still runs its commands. Set where that sudoers
+  # sets it, near the top, before its #includedir: sudo applies Defaults in
+  # the order it reads them (measured: one appended after the include wins
+  # over the account's !requiretty, on every sudo of the matrix).
   if grep -qx 'Defaults:fivenines !requiretty' /etc/sudoers.d/fivenines; then
     echo "    ok   --with-sudoers: the account's commands run with no terminal"
     if [ "$flavor" = sudo ]; then
       cp /etc/sudoers /tmp/sudoers.saved
-      echo 'Defaults requiretty' >> /etc/sudoers
+      { echo 'Defaults requiretty'; cat /tmp/sudoers.saved; } > /etc/sudoers
       if ! visudo -c > /dev/null 2>&1; then
         echo "    info this sudo does not know requiretty: not checked"
       else

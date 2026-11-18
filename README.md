@@ -963,7 +963,10 @@ caller's `HOME` (Ubuntu before 19.10, or `env_keep += HOME`) Python would run
 the files the account put in its own `~/.local` as root. The second matters
 on an older RHEL/CentOS 7 whose `/etc/sudoers` still sets `Defaults
 requiretty`: sudo then refuses every command run without a terminal, which is
-how the agent runs them. It does nothing where requiretty is not set.
+how the agent runs them. It does nothing where requiretty is not set. sudo
+applies `Defaults` lines in the order it reads them, so it works where
+requiretty is set before the `#includedir` line (as that RHEL 7 file does),
+not where a file read after `/etc/sudoers.d/fivenines` sets it again.
 
 The mdadm and fail2ban rules name the commands the agent runs, and nothing
 else: a rule for the bare command would let the account run code as root
