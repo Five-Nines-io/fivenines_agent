@@ -107,6 +107,11 @@ download_with_fallback() {
 
 exit_with_contact() {
   print_error "$1"
+  # A call run as the user that this exit cut short (a signal's trap runs
+  # during its wait) is ended first, before the rollback runs its own.
+  if [ -n "${AS_USER_PENDING_PID:-}" ]; then
+    end_pending_as_user
+  fi
   # --from-user stopped the user-level agent: put it back rather than leave
   # the host unmonitored (see rollback_user_takeover). Before that stop, take
   # back what the move created of the system installation (#311), a second
@@ -1257,6 +1262,10 @@ USER_CONFIG_FILES="TOKEN MACHINE_ID last_capture_id journal_units.allow image_in
 # bound, a stop.sh that never returns kept the root installer waiting for
 # good, Ctrl-C included (#307).
 AS_USER_TIMEOUT=60
+# The removal of the user-level installation gets longer (it deletes the
+# agent's directories, a large agent.log, on what may be a slow home): cut
+# short, part of it stayed behind after a move that had succeeded.
+AS_USER_REMOVAL_TIMEOUT=600
 
 # as_user SCRIPT [ARG...]: run SCRIPT with sh as the user being moved, with
 # the ARGs as $1, $2... They are never pasted into SCRIPT, so a path is never
@@ -1315,8 +1324,12 @@ as_user() {
   ) > /dev/null 2>&1 &
   as_user_watcher=$!
   as_user_rc=0
+  AS_USER_PENDING_PID=$as_user_pid
+  AS_USER_PENDING_WATCHER=$as_user_watcher
+  AS_USER_PENDING_TMP=$as_user_tmp
   # Its stderr is the shell's notice of a job killed by a signal.
   wait "$as_user_pid" 2> /dev/null || as_user_rc=$?
+  AS_USER_PENDING_PID=""
   : > "$as_user_tmp/done"
   if [ -e "$as_user_tmp/timeout" ]; then
     # What survived the TERM, if su ended before the watcher's KILL.
@@ -1342,6 +1355,23 @@ as_user() {
   return "$as_user_rc"
 }
 
+# The as_user call a signal's trap interrupted (its wait cut short, the
+# trap's exit_with_contact running instead; the trap is set after the
+# preflight and the stop runs with the signals ignored, so this is one of
+# import_user_state's reads):
+# its group is ended now, TERM then KILL, and its watcher with it, so nothing
+# the user's side still runs for this move is left beside the rollback's own
+# calls, nor a watcher that would signal it later.
+end_pending_as_user() {
+  : > "$AS_USER_PENDING_TMP/done"
+  kill -TERM "-$AS_USER_PENDING_PID" 2> /dev/null
+  sleep 1
+  kill -KILL "-$AS_USER_PENDING_PID" 2> /dev/null
+  kill -KILL "$AS_USER_PENDING_WATCHER" 2> /dev/null
+  rm -rf "${AS_USER_PENDING_TMP:?}"
+  AS_USER_PENDING_PID=""
+}
+
 # own_agents DIR, defined in the scripts as_user runs: the PIDs of this
 # user's own processes (/proc/PID is theirs) that run an agent binary of the
 # installation in DIR, found by the binary each runs (agent_exe) under DIR
@@ -1360,19 +1390,25 @@ as_user() {
 # agent started under another group (newgrp docker, sg) reads as nothing
 # there, so for a process named like the agent (comm, the first 15 bytes of
 # its binary's name, read without the process's memory lock and without
-# touching any file system: a wedged process or a dead mount cannot stall
-# the scan) its command line's first word stands in, as it is. That word is
-# the user's own process's: the callers check -O, and it is checked again
-# once read, so a PID reused meanwhile by another user's process is not
-# taken. Every read redirects its errors first: a process that exits
-# mid-scan prints nothing.
+# touching any file system: an unrelated process that is wedged, or on a dead
+# mount, is never read further) its command line's first word stands in,
+# resolved like DIR (cd, pwd -P), so an agent started under another spelling
+# of its directory is found too. That word is the user's own process's: the
+# callers check -O, and it is checked again once read, so a PID reused
+# meanwhile by another user's process is not taken. Every read redirects its
+# errors first: a process that exits mid-scan prints nothing.
 # shellcheck disable=SC2016
 OWN_AGENTS_FN='agent_exe() {
   readlink "$1/exe" 2> /dev/null && return 0
   [ "$(cat "$1/comm" 2> /dev/null)" = "fivenines-agent" ] || return 1
   own_arg0=$(tr "\000" "\n" 2> /dev/null < "$1/cmdline" | head -n 1)
-  [ -n "$own_arg0" ] && [ -O "$1" ] || return 1
-  printf "%s\n" "$own_arg0"
+  case "$own_arg0" in
+    /*/*) ;;
+    *) return 1 ;;
+  esac
+  own_dir=$(cd "${own_arg0%/*}" 2> /dev/null && pwd -P) || return 1
+  [ -O "$1" ] || return 1
+  printf "%s\n" "$own_dir/${own_arg0##*/}"
 }
 own_agents() {
   own_home=$(cd "$1" 2> /dev/null && pwd -P) || return 0
@@ -1380,8 +1416,7 @@ own_agents() {
     [ -O "$own_proc" ] || continue
     own_exe=$(agent_exe "$own_proc") || continue
     case "$own_exe" in
-      "$own_home"/fivenines-agent-*/fivenines-agent-* | "$1"/fivenines-agent-*/fivenines-agent-*)
-        printf "%s\n" "${own_proc#/proc/}" ;;
+      "$own_home"/fivenines-agent-*/fivenines-agent-*) printf "%s\n" "${own_proc#/proc/}" ;;
     esac
   done
 }
@@ -1460,25 +1495,24 @@ preflight_user_takeover() {
   # but this installation (a second user-level installation, made with
   # another FIVENINES_INSTALL_DIR): the move stops only this one, and that one
   # would go on reporting with the TOKEN the service takes over, one host
-  # reported twice (#317). Found by its binary (/proc/PID/exe, so a command
-  # line made to look like another cannot hide it), its config directory read
-  # from its environment; one whose environment cannot be read counts. Paths
-  # are compared resolved, so a symlinked spelling of this installation is
-  # this one. The exe link is read as the kernel writes it (no readlink -f,
-  # which fails on " (deleted)"), so an agent whose installation was deleted
-  # under it still counts. Not agent_exe's fallback: for an agent started
-  # under another group the kernel hides the environment as well as the exe
-  # link, so its config directory cannot be told, and counting it would
-  # refuse the move for a second installation with its own (a known limit:
-  # such an agent with this config directory is not seen).
+  # reported twice (#317). Found by its binary (agent_exe: the exe link as
+  # the kernel writes it, so an agent whose installation was deleted under it
+  # counts, or for one started under another group, whose exe link the
+  # kernel hides, its command line; a command line made to look like the
+  # agent's cannot hide another binary), its config directory read from its
+  # environment. Where the kernel hides that too (another group, again), the
+  # config directory its installation's start.sh exports stands in: counted
+  # blindly, a second installation's agent with its own config directory
+  # refused the move. One with neither counts. Paths are compared resolved,
+  # so a symlinked spelling of this installation is this one.
   # shellcheck disable=SC2016
-  other_agents=$(as_user '
+  other_agents=$(as_user "$OWN_AGENTS_FN"'
     want=$(cd "$1" 2> /dev/null && pwd -P) || exit 0
     here=$(cd "$2" 2> /dev/null && pwd -P) || here=""
     found=0
     for proc in /proc/[0-9]*; do
       [ -O "$proc" ] || continue
-      exe=$(readlink "$proc/exe" 2> /dev/null) || continue
+      exe=$(agent_exe "$proc") || continue
       case "$exe" in
         */fivenines-agent-*/fivenines-agent-*) ;;
         *) continue ;;
@@ -1492,6 +1526,12 @@ preflight_user_takeover() {
         cfg=$(printf "%s\n" "$envs" | sed -n "s/^CONFIG_DIR=//p" | head -n 1)
         [ -n "$cfg" ] || continue
         [ "$(cd "$cfg" 2> /dev/null && pwd -P)" = "$want" ] || continue
+      else
+        inst=${exe%/fivenines-agent-*/fivenines-agent-*}
+        cfg=$(sed -n "s/^export CONFIG_DIR=\"\(.*\)\"\$/\1/p" "$inst/start.sh" 2> /dev/null | head -n 1)
+        if [ -n "$cfg" ]; then
+          [ "$(cd "$cfg" 2> /dev/null && pwd -P)" = "$want" ] || continue
+        fi
       fi
       printf "fivenines-other-agent: %s (PID %s)\n" "$exe" "${proc#/proc/}"
       found=1
@@ -1538,35 +1578,92 @@ cleanup_on_exit() {
   fi
 }
 
-# One run of this script at a time (#322): two moves at once both passed the
-# preflight before either imported, and the second replaced the TOKEN and
-# MACHINE_ID the first wrote, while both removed their user-level
-# installation. Taken before the preflight looks at the destination. The lock
-# is a symbolic link whose target is this run's PID, made in one step by ln,
-# which fails when it exists: no window where it exists without its PID. One
-# whose run is gone (killed before its EXIT trap) is taken over, once.
-acquire_setup_lock() {
-  lock_parent=/etc
-  if [ -d /run ]; then
-    lock_parent=/run
-  fi
-  lock_path="$lock_parent/fivenines_setup.lock"
-  lock_tries=0
-  while ! ln -s "$$" "$lock_path" 2> /dev/null; do
+# The script, run as root with the holder's PID as $1, that takes the lock
+# serialising the runs that change the system installation (#322):
+# fivenines_setup.sh, fivenines_update.sh and fivenines_setup_user.sh
+# --from-system (two moves at once both passed the preflight before either
+# imported, the second replacing the TOKEN and MACHINE_ID the first wrote;
+# an update during a move restarted the agent the move had stopped). The lock
+# is a symbolic link whose target is the holder's PID, made in one step by
+# ln, which fails when it exists: no window where it exists without its PID.
+# One whose holder is gone (killed before its EXIT trap) is taken over, once,
+# under a second link made the same way (.takeover), and only while the lock
+# still names that holder: two runs that found it stale at once could
+# otherwise both take it, the second removing the first's fresh lock. Prints
+# the lock's path (exit 0), or its holder and path (exit 1). Identical in the
+# three scripts (ci/build-scripts.sh).
+setup_lock_script() {
+    cat << 'SETUP_LOCK_EOF'
+lock_path=/etc/fivenines_setup.lock
+if [ -d /run ]; then
+    lock_path=/run/fivenines_setup.lock
+fi
+# A directory there would take the link inside it (ln -s DIR), and every run
+# would believe it held the lock.
+if [ -d "$lock_path" ] && [ ! -L "$lock_path" ]; then
+    printf 'unknown %s\n' "$lock_path"
+    exit 1
+fi
+lock_tries=0
+while ! ln -s "$1" "$lock_path" 2> /dev/null; do
     lock_tries=$((lock_tries + 1))
     lock_pid=$(readlink "$lock_path" 2> /dev/null)
     case "$lock_pid" in
-      "" | *[!0-9]*) ;;
+        "")
+            # Released between the two: tried again, once.
+            if [ "$lock_tries" -le 1 ] && [ ! -L "$lock_path" ]; then
+                continue
+            fi
+            ;;
+        *[!0-9]*) ;;
+        *)
+            if [ "$lock_tries" -le 1 ] && ! kill -0 "$lock_pid" 2> /dev/null \
+                && ln -s "$1" "$lock_path.takeover" 2> /dev/null; then
+                if [ "$(readlink "$lock_path" 2> /dev/null)" = "$lock_pid" ]; then
+                    rm -f "$lock_path"
+                fi
+                rm -f "$lock_path.takeover"
+                continue
+            fi
+            ;;
+    esac
+    printf '%s %s\n' "${lock_pid:-unknown}" "$lock_path"
+    exit 1
+done
+# Made by this run, not inside a directory that appeared meanwhile.
+if [ "$(readlink "$lock_path" 2> /dev/null)" != "$1" ]; then
+    if [ -L "$lock_path/$1" ]; then
+        rm -f "$lock_path/$1"
+    fi
+    printf 'unknown %s\n' "$lock_path"
+    exit 1
+fi
+printf '%s\n' "$lock_path"
+SETUP_LOCK_EOF
+}
+
+# One run at a time (setup_lock_script), taken before the preflight looks at
+# the destination.
+acquire_setup_lock() {
+  lock_rc=0
+  lock_out=$(sh -c "$(setup_lock_script)" sh "$$") || lock_rc=$?
+  if [ "$lock_rc" -ne 0 ]; then
+    case "$lock_out" in
+      [0-9]*" /"*)
+        lock_path=${lock_out#* }
+        exit_with_contact "Another fivenines installer holds $lock_path (PID ${lock_out%% *}): wait for it to end and re-run. If none runs, remove $lock_path (and $lock_path.takeover, if there is one)."
+        ;;
       *)
-        if [ "$lock_tries" -le 1 ] && ! kill -0 "$lock_pid" 2> /dev/null; then
-          rm -f "$lock_path"
-          continue
-        fi
+        lock_path=${lock_out##* }
+        case "$lock_path" in
+          /*) ;;
+          *) lock_path="/run/fivenines_setup.lock (/etc/fivenines_setup.lock without /run)" ;;
+        esac
+        exit_with_contact "Could not take the setup lock $lock_path: it could not be made there (a read-only /run), or something other than a lock is there. If no fivenines installer runs, remove it and re-run."
         ;;
     esac
-    exit_with_contact "Another run of fivenines_setup.sh holds $lock_path (PID ${lock_pid:-unknown}): wait for it to end and re-run. If none runs, remove $lock_path."
-  done
-  SETUP_LOCK="$lock_path"
+  fi
+  SETUP_LOCK="$lock_out"
   trap cleanup_on_exit EXIT
 }
 
@@ -1828,14 +1925,45 @@ rollback_user_takeover() {
   for state_file in $IMPORTED_STATE_FILES; do
     rm -f "/etc/fivenines_agent/${state_file:?}"
   done
+  # A service that does not stop still runs with the identity: then neither
+  # is the user-level agent started again (two agents, one host reported
+  # twice) nor the system installation taken back from under it.
+  rollback_service_stopped=1
   if [ "${FIVENINES_TEST_MODE:-}" != "1" ] && [ "$SERVICE_SET_UP" = "1" ]; then
     if [ "$SYSTEM_TYPE" = "openrc" ]; then
       rc-service fivenines-agent stop > /dev/null 2>&1 || true
       rc-update del fivenines-agent default > /dev/null 2>&1 || true
+      # 3 is OpenRC's "stopped"; anything else, an error included, is not --
+      # unless its init script never landed (rc-service then answers 1,
+      # "does not exist"): nothing runs as that service.
+      if [ -e /etc/init.d/fivenines-agent ]; then
+        rollback_status=0
+        rc-service fivenines-agent status > /dev/null 2>&1 || rollback_status=$?
+        if [ "$rollback_status" != "3" ]; then
+          rollback_service_stopped=0
+        fi
+      fi
     else
       systemctl stop fivenines-agent.service > /dev/null 2>&1 || true
       systemctl disable fivenines-agent.service > /dev/null 2>&1 || true
+      # Not booted with systemd (a container, a chroot): nothing runs as the
+      # service. Otherwise the state systemd reports, read by show, which
+      # loads the unit by path: a unit dropped after the disable above, or
+      # one that never landed, reads inactive, on systemd 219 too, whose
+      # is-active says "unknown" for that and for any bus error alike. A
+      # systemctl that cannot reach systemd (the stop failed the same way)
+      # prints nothing: not stopped.
+      if [ -d /run/systemd/system ]; then
+        case "$(systemctl show -p ActiveState fivenines-agent.service 2> /dev/null)" in
+          ActiveState=inactive | ActiveState=failed) ;;
+          *) rollback_service_stopped=0 ;;
+        esac
+      fi
     fi
+  fi
+  if [ "$rollback_service_stopped" = "0" ]; then
+    print_warning "The fivenines-agent service did not stop: it runs with the identity of the user-level agent of $FROM_USER_NAME, which was not started again, and the system installation was left in place. Stop the service (systemctl stop fivenines-agent, or rc-service fivenines-agent stop), remove it with fivenines_uninstall.sh, then start the user-level agent again as $FROM_USER_NAME: $USER_INSTALL_DIR/start.sh"
+    return 0
   fi
   if [ "$UNDO_SYSTEM_INSTALL" = "1" ]; then
     UNDO_SYSTEM_INSTALL=0
@@ -1883,8 +2011,11 @@ remove_user_installation() {
       print_warning "Could not stop it: stop it as $FROM_USER_NAME ($USER_INSTALL_DIR/stop.sh), or it goes on reporting beside the system agent, as the same host."
     fi
   fi
+  removal_rc=0
+  as_user_bound=$AS_USER_TIMEOUT
+  AS_USER_TIMEOUT=$AS_USER_REMOVAL_TIMEOUT
   # shellcheck disable=SC2016
-  if as_user '
+  as_user '
     rc=0
     for name in $3; do
       rm -f -- "${1:?}/${name:?}" || rc=1
@@ -1908,7 +2039,9 @@ remove_user_installation() {
         echo "Kept $dir: it still holds $(ls -A -- "$dir" 2> /dev/null | head -n 10 | tr "\n" " ")"
       fi
     done
-    exit "$rc"' "$USER_INSTALL_DIR" "$USER_CONFIG_DIR" "$USER_INSTALL_FILES" "$USER_CONFIG_FILES"; then
+    exit "$rc"' "$USER_INSTALL_DIR" "$USER_CONFIG_DIR" "$USER_INSTALL_FILES" "$USER_CONFIG_FILES" || removal_rc=$?
+  AS_USER_TIMEOUT=$as_user_bound
+  if [ "$removal_rc" = "0" ]; then
     print_success "Removed the user-level installation of $FROM_USER_NAME"
   else
     print_warning "Some files of the user-level installation of $FROM_USER_NAME could not be removed (see above): remove them as $FROM_USER_NAME. The system agent runs; do not start the user-level one."
@@ -1940,7 +2073,9 @@ ASSUME_YES=0
 # set only once the user-level agent was stopped, and makes exit_with_contact
 # undo the move; UNDO_SYSTEM_INSTALL, from the --from-user preflight until the
 # service runs, makes it take back what the CREATED_* records name (#311).
-# WORK_DIR and SETUP_LOCK are what cleanup_on_exit removes.
+# WORK_DIR and SETUP_LOCK are what cleanup_on_exit removes; AS_USER_PENDING_PID
+# names the as_user call a signal interrupted.
+AS_USER_PENDING_PID=""
 TAKEOVER_ROLLBACK=0
 IMPORTED_STATE_FILES=""
 UNDO_SYSTEM_INSTALL=0

@@ -176,7 +176,9 @@ is, and the script says so. If the move fails, or is interrupted, the script
 takes back what it created of the system installation (the service, the
 `fivenines` account, its directories, the sudoers rules it wrote) and restarts
 the user-level agent, unchanged -- unless that agent was signalled and has not
-exited yet, in which case it says how to start it once it has. A crontab entry
+exited yet, in which case it says how to start it once it has, or the new
+service does not stop, in which case it leaves the service and the system
+installation in place and says how to stop and remove them first. A crontab entry
 that starts the user-level agent again during the move is removed, and the
 agent stopped again, before its files go.
 
@@ -188,10 +190,13 @@ wget -T 3 -q -O fivenines_setup_user.sh https://releases.fivenines.io/latest/fiv
 ```
 
 The agent is checked to run as you (a home mounted `noexec` would stop it)
-before anything of the system installation is touched. The system
+before anything of the system installation is touched; if it does not, what
+the script installed for you is removed again. The system
 installation is removed by the release's `fivenines_uninstall.sh`, checked
 against the signed `SHA256SUMS` before it runs as root. Its state is copied by
-root into your private work directory, never through sudo's output, which
+root into a directory of root's own, which you can read a file from but not
+write to, then by you into your private work directory, never through sudo's
+output, which
 sudo's I/O log (`Defaults log_output`) would keep. Its `.env` is copied as
 `.env.system`, which the agent does not read: `/etc/fivenines_agent` belongs to
 the `fivenines` account, so review it, and rename it to `.env` if you need it.
@@ -212,9 +217,10 @@ naming a user that no longer exists, so remove them.
 Neither move runs on UNRAID. Both refuse, before changing anything, when the
 destination already has an installation, or a state file (`TOKEN`,
 `MACHINE_ID`...) an earlier one left there: remove that installation first,
-or move the file aside. `fivenines_setup.sh` runs one at a time: a second run
-started meanwhile is refused (a lock in `/run`, taken over when the run that
-held it is gone).
+or move the file aside. `fivenines_setup.sh`, `fivenines_update.sh` and
+`fivenines_setup_user.sh --from-system` run one at a time: one started while
+another runs is refused (a lock in `/run`, taken over when the run that held it
+is gone).
 
 ### Windows Installation
 

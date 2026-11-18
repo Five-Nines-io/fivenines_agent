@@ -155,6 +155,19 @@ for script in fivenines_setup.sh fivenines_uninstall_user.sh; do
 done
 check_function_pair write_control_scripts \
     "$SCRIPT_DIR/fivenines_setup_user.sh" "$SCRIPT_DIR/fivenines_update_user.sh"
+check_function_pair agent_started \
+    "$SCRIPT_DIR/fivenines_setup_user.sh" "$SCRIPT_DIR/fivenines_update_user.sh"
+
+# The setup lock (#322): one run at a time of the three scripts that change
+# the system installation. The script that takes it runs as root (through
+# sudo in fivenines_setup_user.sh), and the two root scripts release it the
+# same way: three copies of one lock, which must not drift into two.
+for script in fivenines_update.sh fivenines_setup_user.sh; do
+    check_function_pair setup_lock_script \
+        "$SCRIPT_DIR/fivenines_setup.sh" "$SCRIPT_DIR/$script"
+done
+check_function_pair cleanup_on_exit \
+    "$SCRIPT_DIR/fivenines_setup.sh" "$SCRIPT_DIR/fivenines_update.sh"
 
 # Constants two scripts must agree on, each a whole line. STATE_FILES and
 # STATE_FILE_MAX: what fivenines_setup.sh --from-user and
@@ -197,6 +210,12 @@ for const in USER_INSTALL_FILES USER_CONFIG_FILES; do
         "$(grep "^${const}=" "$SCRIPT_DIR/fivenines_uninstall_user.sh")" \
         "fivenines_setup.sh / fivenines_uninstall_user.sh"
 done
+# And what fivenines_setup_user.sh --from-system takes back when the agent it
+# extracted cannot run.
+check_line_pair USER_INSTALL_FILES \
+    "$(grep "^USER_INSTALL_FILES=" "$SCRIPT_DIR/fivenines_setup.sh")" \
+    "$(grep "^USER_INSTALL_FILES=" "$SCRIPT_DIR/fivenines_setup_user.sh")" \
+    "fivenines_setup.sh / fivenines_setup_user.sh"
 
 check_line_pair "the sudoers marker" \
     "$(sed -n 's/^    sudoers_marker="\(.*\)"$/\1/p' "$COMMON")" \

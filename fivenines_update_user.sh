@@ -706,6 +706,21 @@ print_success "Updated agent binary"
 # Remove backup
 rm -rf "$INSTALL_DIR/${BINARY_NAME}.old" 2>/dev/null || true
 
+# Does the agent start.sh just started still run? The PID it recorded, when
+# that process runs this installation's binary (/proc/PID/exe, readable for
+# this user's own processes only): a pgrep of its path also counted another
+# user's process started under that path, and a run that failed read as one
+# that started.
+agent_started() {
+    started_pid=$(cat "$INSTALL_DIR/agent.pid" 2> /dev/null) || return 1
+    case "$started_pid" in
+        "" | *[!0-9]*) return 1 ;;
+    esac
+    started_exe=$(readlink -f "/proc/$started_pid/exe" 2> /dev/null) || return 1
+    [ -n "$started_exe" ] \
+        && [ "$started_exe" = "$(readlink -f "$INSTALL_DIR/$BINARY_NAME/$BINARY_NAME" 2> /dev/null)" ]
+}
+
 # Start the agent (skip in test mode)
 if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
   echo "Starting agent..."
@@ -714,12 +729,15 @@ if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
   else
       export CONFIG_DIR="$CONFIG_DIR"
       nohup "$INSTALL_DIR/$BINARY_NAME/$BINARY_NAME" >> "$INSTALL_DIR/agent.log" 2>&1 &
+      echo $! > "$INSTALL_DIR/agent.pid"
       echo "Agent started (PID: $!)"
   fi
 
   sleep 2
 
-  if pgrep -f "$(agent_pattern "$INSTALL_DIR")" > /dev/null; then
+  # By the PID start.sh recorded, and the binary it runs: a pgrep of the
+  # installation's path also counted any user's process started under it.
+  if agent_started; then
       print_success "Agent is running"
   else
       print_warning "Agent may have failed to start. Check: $INSTALL_DIR/logs.sh"

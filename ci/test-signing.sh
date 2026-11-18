@@ -696,6 +696,23 @@ check "fivenines_setup.sh takes its lock after the architecture and verification
   "$(in_order "$ROOT/fivenines_setup.sh" 'select_agent_binary || exit_with_contact' 'verification_preflight "with-startup-files" ||' 'acquire_setup_lock' '  preflight_user_takeover')" "yes"
 check "fivenines_setup_user.sh --from-system runs the extracted agent before it takes over the system installation" \
   "$(in_order "$ROOT/fivenines_setup_user.sh" 'download_agent' '    check_agent_runs' '    take_over_system_install')" "yes"
+# Value: protects=fivenines_update.sh and --from-system take the setup lock before they change anything (an update stopped and restarted the agent a move had stopped), --from-system once sudo authenticated; the removal of the user-level installation gets its own bound, given back after; the user update reads the agent it started by its PID and binary, never by a pgrep of the path;
+#   fails_when=a lock moves after the first change or is dropped, the removal's bound is not restored, or the post-start check goes back to pgrep;
+#   why_new=new; seam=none; no_claim=what each step does
+check "fivenines_update.sh takes the setup lock after its checks, before it stops the agent" \
+  "$(in_order "$ROOT/fivenines_update.sh" 'verification_preflight "with-startup-files" ||' 'acquire_setup_lock' 'Stopping fivenines-agent service')" "yes"
+# The $ are the scripts' own text.
+# shellcheck disable=SC2016
+check "fivenines_setup_user.sh --from-system takes the setup lock once sudo authenticated, before it reads the system installation" \
+  "$(in_order "$ROOT/fivenines_setup_user.sh" '    sudo -v ||' '    acquire_setup_lock' '"$SYSTEM_CONFIG_DIR/TOKEN"; then')" "yes"
+# The $ are the scripts' own text.
+# shellcheck disable=SC2016
+check "--from-user removes the user-level installation under its own bound, and gives the usual one back" \
+  "$(in_order "$ROOT/fivenines_setup.sh" '  AS_USER_TIMEOUT=$AS_USER_REMOVAL_TIMEOUT' '    for name in $3; do' '  AS_USER_TIMEOUT=$as_user_bound' 'Removed the user-level installation of')" "yes"
+# The $ are the scripts' own text.
+# shellcheck disable=SC2016
+check "fivenines_update_user.sh reads the agent it started by agent.pid and its binary, never by a pgrep of its path" \
+  "$(in_order "$ROOT/fivenines_update_user.sh" 'echo $! > "$INSTALL_DIR/agent.pid"' '  if agent_started; then')|$(grep -c 'pgrep -f "$(agent_pattern' "$ROOT/fivenines_update_user.sh")" "yes|0"
 # Value: protects=a --from-user that fails takes back what it created: the records are made before each piece, the undo is armed from the preflight until the service runs, and a failed stop arms the rollback (#311, #316); a --from-system whose agent did not start ends in an error once its @reboot line is added (#315);
 #   fails_when=a record, an arming or a disarming moves or is dropped (test mode, which CI runs, skips the stop and the service);
 #   why_new=the functions are unit-tested, their call sites in the main flow are not; seam=none; no_claim=what each step does
@@ -769,9 +786,13 @@ echo "There was 1 failed login attempt since the last successful login."
 exec /bin/sh -c "$_cmd" "$@"
 EOF
 # What the command prints goes to the caller AND to sudo-io.log, as sudo's
-# I/O log keeps it under "Defaults log_output" (#318).
+# I/O log keeps it under "Defaults log_output" (#318). -n is taken, -v
+# authenticates, and every command's arguments go to sudo-args.log.
 cat > "$MOVE_BIN/sudo" << EOF
 #!/bin/sh
+while [ "\${1:-}" = -n ]; do shift; done
+[ "\${1:-}" = -v ] && exit 0
+printf '%s\n' "\$*" >> "$MOVE/sudo-args.log"
 echo "We trust you have received the usual lecture from the local System Administrator."
 _out=\$(mktemp)
 "\$@" > "\$_out"
@@ -888,8 +909,9 @@ move_gone() {
 #   why_new=test-distro Test 13 copies plain files through a sudo that prints nothing, and never meets a link or an empty TOKEN; seam=none;
 #   no_claim=that the reads run as root, or that the system agent was stopped first
 sed -n '/^STATE_FILES=/p;/^SYSTEM_ENV_COPY=/p;/^COPIED_STATE_FILES=/p;/^STATE_FILE_MAX=/p
-        /^as_root()/,/^}/p;/^copy_system_state()/,/^}/p' \
-  "$ROOT/fivenines_setup_user.sh" > "$MOVE/from_system.sh"
+        /^as_root()/,/^}/p;/^copy_system_state()/,/^}/p;/^copy_system_state_files()/,/^}/p' \
+  "$ROOT/fivenines_setup_user.sh" | sed "s|/tmp/fivenines-state\.|$MOVE/rs/fivenines-state.|g" > "$MOVE/from_system.sh"
+mkdir -p "$MOVE/rs"
 # The names in a directory, dot files included, in byte order.
 move_names() {
   for _n in "$1"/.[!.]* "$1"/*; do
@@ -914,6 +936,18 @@ done
 exec $(command -v readlink) "\$@"
 EOF
 chmod 755 "$MOVE/noexebin/readlink"
+# And a tr that cannot read another process's environment, as the kernel
+# answers for such a process too.
+mkdir -p "$MOVE/noenvbin"
+cat > "$MOVE/noenvbin/tr" << EOF
+#!/bin/sh
+case "\$(readlink /proc/\$\$/fd/0 2> /dev/null)" in
+  /proc/self/*) ;;
+  /proc/*/environ) exit 1 ;;
+esac
+exec $(command -v tr) "\$@"
+EOF
+chmod 755 "$MOVE/noenvbin/tr"
 mkdir -p "$MOVE/growbin"
 # A wc that reads the user's MACHINE_ID, and the system's, as 1 byte long: a
 # file that grew past STATE_FILE_MAX once its size was read. Every other
@@ -933,6 +967,7 @@ from_system_copy() {
   rm -rf "$MOVE/cfg" "$MOVE/stage"
   mkdir -p "$MOVE/cfg" "$MOVE/stage"
   : > "$MOVE/sudo-io.log"
+  : > "$MOVE/sudo-args.log"
   (
     # shellcheck source=/dev/null
     . "$MOVE/from_system.sh"
@@ -967,6 +1002,16 @@ check "--from-system carries the identity and the allowlist, .env only as .env.s
 check "--from-system carries each file byte for byte, whatever sudo printed" "$_differ" ""
 check "--from-system writes each file owner-only" "$_modes" "600 600 600 600 "
 check "--from-system says why .env was not carried as .env" "$(grep -c 'which the agent does not read' "$MOVE/out")" "1"
+# Root writes, and hands over, each copy in a directory it made itself, never
+# by name in this user's work directory, where a link planted between two of
+# root's steps (by any process of the user's) chose what root wrote or
+# chowned; that directory is gone once the copy is done.
+# Value: protects=no root write or chown of --from-system names a path in the user's directories, and root's own directory for the copies is removed;
+#   fails_when=root copies straight into the user's work directory again, or the stage is left behind;
+#   why_new=the checks above look only at what lands; seam=sudo logs every command it runs (the stub runs it as this user);
+#   no_claim=that root made the directory (mktemp -d as root, 0711)
+check "--from-system makes root copy into a directory of its own, never into the user's, and removes it" \
+  "$(grep -c "$MOVE/stage" "$MOVE/sudo-args.log")|$(grep -c "$MOVE/rs/fivenines-state" "$MOVE/sudo-args.log" | grep -c '^[1-9]')|$(move_names "$MOVE/rs")" "0|1|"
 check "--from-system carries no state through sudo's output, which sudo's I/O log keeps (#318)" \
   "$(grep -c -e 'per-host-token-0001' -e "$(printf 'per-host-token-0001' | base64)" -e 'API_URL' "$MOVE/sudo-io.log")" "0"
 # A file larger than any state file stops the move before it is copied.
@@ -978,8 +1023,8 @@ check "--from-system stops at a state file larger than STATE_FILE_MAX, and carri
 #   why_new=the check above refuses a file at its size check; seam=a wc on PATH that reads the system's MACHINE_ID as 1 byte;
 #   no_claim=a real concurrent writer
 check "--from-system stops at a state file grown past STATE_FILE_MAX since its size was read, and copies none of it" \
-  "$(from_system_copy 30 grown)|$(grep -c 'MACHINE_ID is larger than any agent state file' "$MOVE/out")|$(move_names "$MOVE/cfg")|$([ -e "$MOVE/stage/system_state/MACHINE_ID" ] && echo copied)" \
-  "1|1||"
+  "$(from_system_copy 30 grown)|$(grep -c 'MACHINE_ID is larger than any agent state file' "$MOVE/out")|$(move_names "$MOVE/cfg")|$([ -e "$MOVE/stage/system_state/MACHINE_ID" ] && echo copied)|$(move_names "$MOVE/rs")" \
+  "1|1|||"
 
 mv "$MOVE/sys/journal_units.allow" "$MOVE/allow.real"
 printf 'not the allowlist\n' > "$MOVE/elsewhere"
@@ -1025,9 +1070,9 @@ check "decode_state refuses a transfer whose begin marker is not on a line of it
 #   no_claim=the stop and restart of the system agent (skipped in test mode), or an interrupted move
 sed -n '/^STATE_FILES=/p;/^SYSTEM_ENV_COPY=/p;/^COPIED_STATE_FILES=/p;/^STATE_FILE_MAX=/p
         /^exit_with_error()/,/^}/p;/^as_root()/,/^}/p;/^shell_quote()/,/^}/p;/^reboot_line()/,/^}/p;/^reboot_advice()/,/^}/p
-        /^copy_system_state()/,/^}/p;/^restart_system_agent()/,/^}/p
+        /^copy_system_state()/,/^}/p;/^copy_system_state_files()/,/^}/p;/^restart_system_agent()/,/^}/p
         /^abort_system_takeover()/,/^}/p;/^take_over_system_install()/,/^}/p' \
-  "$ROOT/fivenines_setup_user.sh" > "$MOVE/takeover.sh"
+  "$ROOT/fivenines_setup_user.sh" | sed "s|/tmp/fivenines-state\.|$MOVE/rs/fivenines-state.|g" > "$MOVE/takeover.sh"
 # Runs take_over_system_install, in test mode, with $1 as the body of the
 # release's uninstaller, and prints its status.
 from_system_takeover() {
@@ -1051,8 +1096,25 @@ from_system_takeover() {
 }
 printf 'per-host-token-0001' > "$MOVE/sys/TOKEN"
 check "--from-system takes back what it copied when the uninstaller leaves the system TOKEN" \
-  "$(from_system_takeover 'echo pretend uninstall')|$(grep -c 'did not remove the system installation' "$MOVE/out")|$(move_names "$MOVE/cfg")|$(cat "$MOVE/sys/TOKEN")" \
-  "1|1||per-host-token-0001"
+  "$(from_system_takeover 'echo pretend uninstall')|$(grep -c 'did not remove the system installation' "$MOVE/out")|$(move_names "$MOVE/cfg")|$(cat "$MOVE/sys/TOKEN")|$(grep -c 'put back as it was' "$MOVE/out")" \
+  "1|1||per-host-token-0001|1"
+# What --from-system tells the user to add to the crontab when it cannot: the
+# @reboot line, or, for a path a crontab line cannot carry (a %), to start it
+# from a script of their own.
+# Value: protects=the advice --from-system prints ends every failure message with a line that works, or says why there is none;
+#   fails_when=reboot_advice prints a line for a path cron would cut at its %, or loses its fallback;
+#   why_new=no test read the advice; seam=none; no_claim=the messages built around it
+reboot_advice_for() {
+  (
+    # shellcheck source=/dev/null
+    . "$MOVE/takeover.sh"
+    INSTALL_DIR=$1
+    reboot_advice
+  )
+}
+check "--from-system advises the @reboot line, or a script of the user's own for a path with a %" \
+  "$(reboot_advice_for /home/u/agent)#$(reboot_advice_for '/home/u/50%agent')" \
+  "add this line to your crontab (crontab -e): @reboot /home/u/agent/start.sh#start /home/u/50%agent/start.sh at boot from a script of your own (its path holds a % or a new line, which a crontab line cannot carry)"
 check "--from-system keeps what it copied once the uninstaller removed the system TOKEN" \
   "$(from_system_takeover "rm -f '$MOVE/sys/TOKEN'")|$(cat "$MOVE/cfg/TOKEN" 2>/dev/null)" \
   "0|per-host-token-0001"
@@ -1071,7 +1133,14 @@ check "--from-system interrupted after the uninstaller keeps the only identity, 
 # A systemctl that logs each call, fails a stop when MOVE_STOP_FAILS is set,
 # and interrupts the move during a stop when MOVE_STOP_SIGNAL is set. A stop
 # logs whether $MOVE/etc still holds a TOKEN. is-enabled and is-active answer
-# no when MOVE_DISABLED and MOVE_INACTIVE are set; their calls are not logged.
+# no when MOVE_DISABLED and MOVE_INACTIVE are set, and is-active too once a
+# stop succeeded (svc.stopped, removed by each run), printing the state as
+# systemctl does without --quiet; show -p ActiveState prints it as
+# ActiveState=... With MOVE_ISACTIVE_BROKEN set (a systemctl that cannot
+# reach systemd) both print nothing and fail -- except is-active under
+# MOVE_SYSTEMD219, which says "unknown" for a bus error as for a unit it no
+# longer has loaded, as systemd 219 does; their calls are not logged. rc-service logs its calls too; a stop fails with
+# MOVE_STOP_FAILS, and status answers 3 once a stop succeeded.
 # An id that answers MOVE_FIVENINES_UID for the fivenines account, which this
 # host need not have.
 mkdir -p "$MOVE/svcbin"
@@ -1079,16 +1148,53 @@ cat > "$MOVE/svcbin/systemctl" << EOF
 #!/bin/sh
 case "\$1" in
   is-enabled) [ -z "\${MOVE_DISABLED:-}" ]; exit ;;
-  is-active) [ -z "\${MOVE_INACTIVE:-}" ]; exit ;;
+  is-active)
+    if [ -n "\${MOVE_ISACTIVE_BROKEN:-}" ]; then
+      [ -n "\${MOVE_SYSTEMD219:-}" ] && [ "\$2" != --quiet ] && echo unknown
+      exit 1
+    fi
+    if [ -z "\${MOVE_INACTIVE:-}" ] && [ ! -e "$MOVE/svc.stopped" ]; then
+      [ "\$2" = --quiet ] || echo active
+      exit 0
+    fi
+    if [ "\$2" != --quiet ]; then
+      if [ -n "\${MOVE_SYSTEMD219:-}" ]; then echo unknown; else echo inactive; fi
+    fi
+    exit 3
+    ;;
+  show)
+    [ -n "\${MOVE_ISACTIVE_BROKEN:-}" ] && exit 1
+    if [ -z "\${MOVE_INACTIVE:-}" ] && [ ! -e "$MOVE/svc.stopped" ]; then
+      echo ActiveState=active
+    else
+      echo ActiveState=inactive
+    fi
+    exit 0
+    ;;
 esac
 _t=""
 [ -e "$MOVE/etc/TOKEN" ] && _t=" with TOKEN"
 echo "systemctl \$*\$_t" >> "$MOVE/svc.log"
 if [ "\$1" = stop ]; then
   [ -n "\${MOVE_STOP_SIGNAL:-}" ] && kill -INT "\$MOVE_RUNNER"
-  [ -z "\${MOVE_STOP_FAILS:-}" ]
+  [ -z "\${MOVE_STOP_FAILS:-}" ] || exit 1
+  : > "$MOVE/svc.stopped"
 fi
 EOF
+cat > "$MOVE/svcbin/rc-service" << EOF
+#!/bin/sh
+echo "rc-service \$*" >> "$MOVE/svc.log"
+case "\$2" in
+  stop)
+    [ -z "\${MOVE_STOP_FAILS:-}" ] || exit 1
+    : > "$MOVE/svc.stopped"
+    ;;
+  status) [ -e "$MOVE/svc.stopped" ] && exit 3 ;;
+esac
+exit 0
+EOF
+printf '#!/bin/sh\necho "rc-update $*" >> "%s"\n' "$MOVE/svc.log" > "$MOVE/svcbin/rc-update"
+chmod 755 "$MOVE/svcbin/rc-service" "$MOVE/svcbin/rc-update"
 cat > "$MOVE/svcbin/id" << EOF
 #!/bin/sh
 if [ "\$*" = "-u fivenines" ]; then
@@ -1117,6 +1223,7 @@ from_system_stop() {
   rm -rf "$MOVE/cfg" "$MOVE/stage" "$MOVE/units"
   mkdir -p "$MOVE/cfg" "$MOVE/stage" "$MOVE/units"
   : > "$MOVE/svc.log"
+  rm -f "$MOVE/svc.stopped"
   : > "$MOVE/units/fivenines-agent.service"
   printf 'per-host-token-0001' > "$MOVE/sys/TOKEN"
   _uninstaller="rm -f '$MOVE/sys/TOKEN' '$MOVE/units/fivenines-agent.service'"
@@ -1209,16 +1316,23 @@ rm -rf "$MOVE/units"
 #   fails_when=check_agent_runs is dropped or stops failing on an exec error, or agent_started goes back to a pgrep of the path;
 #   why_new=test-distro runs the move in test mode, which never starts the agent; seam=a script and a copy of sleep stand for the binary;
 #   no_claim=a real noexec mount
-sed -n '/^exit_with_error()/,/^}/p;/^check_agent_runs()/,/^}/p;/^agent_started()/,/^}/p' \
+sed -n '/^USER_INSTALL_FILES=/p;/^exit_with_error()/,/^}/p;/^first_missing_dir()/,/^}/p;/^remove_made_dirs()/,/^}/p
+        /^check_agent_runs()/,/^}/p;/^agent_started()/,/^}/p' \
   "$ROOT/fivenines_setup_user.sh" > "$MOVE/agent_runs.sh"
 AR_DIR="$MOVE/arinst"
 mkdir -p "$AR_DIR/fivenines-agent-linux-amd64"
-# Prints check_agent_runs's status and whether it said why.
+# Prints check_agent_runs's status and whether it said why, for the
+# installation in $1 (default AR_DIR) and its config directory ($AR_CFG, or
+# $1.cfg); $2 and $3, when given, are the topmost directories this run made
+# for each.
 agent_runs() {
   (
     # shellcheck source=/dev/null
     . "$MOVE/agent_runs.sh"
-    INSTALL_DIR="$AR_DIR"
+    INSTALL_DIR="${1:-$AR_DIR}"
+    CONFIG_DIR="${AR_CFG:-${1:-$AR_DIR}.cfg}"
+    CREATED_USER_INSTALL_TOP=${2:-}
+    CREATED_USER_CONFIG_TOP=${3:-}
     BINARY_NAME=fivenines-agent-linux-amd64
     check_agent_runs > "$MOVE/out" 2>&1
   )
@@ -1229,6 +1343,33 @@ chmod 755 "$AR_DIR/fivenines-agent-linux-amd64/fivenines-agent-linux-amd64"
 check "--from-system goes on when the extracted agent runs" "$(agent_runs)" "0|0"
 chmod 644 "$AR_DIR/fivenines-agent-linux-amd64/fivenines-agent-linux-amd64"
 check "--from-system stops, before the system installation, when the extracted agent cannot run" "$(agent_runs)" "1|1"
+# And takes back what it wrote of an installation that cannot run here: the
+# agent and the control scripts, and the directories it made, once empty;
+# a file of the user's stays, and so does its directory.
+# Value: protects=a --from-system stopped by an agent that cannot run leaves no installation behind that cannot run;
+#   fails_when=check_agent_runs stops removing the agent or the control scripts, or removes a directory it did not make or a file it did not write;
+#   why_new=the check above looks only at the refusal; seam=a non-executable script stands for the binary;
+#   no_claim=a real noexec mount
+rm -rf "$MOVE/arbase" "$MOVE/armade-cfg" "$MOVE/arkeep" "$MOVE/arkeep.cfg" "$MOVE/arshared"
+# Made under an empty directory that was there before (arbase): the chain
+# stops at the topmost one this run made. Its config directory elsewhere,
+# made before: only the install chain can take armade away.
+mkdir -p "$MOVE/arbase" "$MOVE/armade-cfg" "$MOVE/arkeep.cfg" "$MOVE/arshared/cfg"
+for _ar in "$MOVE/arbase/armade/sub/inst" "$MOVE/arkeep" "$MOVE/arshared/inst"; do
+  mkdir -p "$_ar/fivenines-agent-linux-amd64"
+  : > "$_ar/fivenines-agent-linux-amd64/fivenines-agent-linux-amd64"
+  for _f in start.sh stop.sh status.sh logs.sh refresh.sh; do : > "$_ar/$_f"; done
+done
+: > "$MOVE/arkeep/notes.txt"
+: > "$MOVE/arkeep/agent.log"
+check "--from-system takes back the installation it wrote when its agent cannot run, and only that" \
+  "$(AR_CFG="$MOVE/armade-cfg" agent_runs "$MOVE/arbase/armade/sub/inst" "$MOVE/arbase/armade")|$([ -e "$MOVE/arbase/armade" ] && echo made)$([ -d "$MOVE/arbase" ] && echo base)$([ -d "$MOVE/armade-cfg" ] && echo cfg)|$(agent_runs "$MOVE/arkeep")|$(move_names "$MOVE/arkeep")|$([ -d "$MOVE/arkeep.cfg" ] && echo cfg)" \
+  "1|1|basecfg|1|1|agent.log notes.txt |cfg"
+# Both directories made under one parent this run made too: it goes once
+# both are gone, whichever is removed first.
+check "--from-system takes back a parent it made for both directories" \
+  "$(AR_CFG="$MOVE/arshared/cfg" agent_runs "$MOVE/arshared/inst" "$MOVE/arshared" "$MOVE/arshared/cfg")|$([ -e "$MOVE/arshared" ] && echo shared)" \
+  "1|1|"
 if [ -n "$MOVE_SLEEP" ]; then
   # Prints agent_started's status.
   agent_started_status() {
@@ -1258,9 +1399,9 @@ fi
 # Value: protects=two runs of fivenines_setup.sh never overlap: a held lock refuses a second run, a dead run's lock is taken over, and a run releases its own lock (and work directory) on exit;
 #   fails_when=the lock stops being atomic, a live holder is overridden, a dead one's lock blocks for good, or the EXIT trap no longer releases it;
 #   why_new=new lock; seam=paths rewritten; no_claim=a reused PID (the message says how to remove the lock)
-sed -n '/^exit_with_contact()/,/^}/p;/^cleanup_on_exit()/,/^}/p;/^acquire_setup_lock()/,/^}/p' \
+sed -n '/^exit_with_contact()/,/^}/p;/^cleanup_on_exit()/,/^}/p;/^setup_lock_script()/,/^}/p;/^acquire_setup_lock()/,/^}/p' \
   "$ROOT/fivenines_setup.sh" \
-  | sed "s|/run|$MOVE/lockrun|g;s|lock_parent=/etc|lock_parent=$MOVE/locketc|" > "$MOVE/lock.sh"
+  | sed "s|/run|$MOVE/lockrun|g;s|/etc/fivenines_setup.lock|$MOVE/locketc/fivenines_setup.lock|g" > "$MOVE/lock.sh"
 mkdir -p "$MOVE/lockrun" "$MOVE/locketc"
 MOVE_LOCK="$MOVE/lockrun/fivenines_setup.lock"
 # Takes the lock in a subshell with a work directory, and prints its status,
@@ -1291,8 +1432,101 @@ rm -f "$MOVE/lockheld"
 ln -s "$$" "$MOVE_LOCK"
 _held=$(lock_run)
 check "fivenines_setup.sh refuses while another run holds the lock, and leaves it" \
-  "$_held|$(grep -c 'Another run of fivenines_setup.sh holds' "$MOVE/out")" "1||work|$$|1"
+  "$_held|$(grep -c "Another fivenines installer holds $MOVE_LOCK (PID $$)" "$MOVE/out")" "1||work|$$|1"
 rm -rf "$MOVE_LOCK" "$MOVE/lockwork"
+# Two runs that find the same dead holder: the takeover is made under its own
+# link, so while one run holds it the other takes nothing over -- it used to
+# remove the lock the first had just taken, and both ran.
+# Value: protects=a stale lock is taken over by one run only, and a takeover in progress is never undone by a second run;
+#   fails_when=the takeover goes back to a bare rm -f, or ignores the .takeover link;
+#   why_new=the checks above have one run at a time; seam=paths rewritten, the other run's takeover link made by hand;
+#   no_claim=the interleaving itself (the re-check under the takeover link is read, not raced)
+ln -s "$_dead" "$MOVE_LOCK"
+ln -s "$$" "$MOVE_LOCK.takeover"
+_held=$(lock_run)
+check "fivenines_setup.sh takes over no stale lock while another run's takeover is in progress" \
+  "$_held|$(readlink "$MOVE_LOCK.takeover")" "1||work|$_dead|$$"
+rm -rf "$MOVE_LOCK" "$MOVE_LOCK.takeover" "$MOVE/lockwork"
+# A directory at the lock's path would take the link inside it (ln -s DIR),
+# and every run believe it held the lock: refused, nothing made inside.
+# Value: protects=a directory at the lock's path never lets two runs believe they hold the lock;
+#   fails_when=both the directory check before ln and the read-back after it are dropped (either alone refuses it);
+#   why_new=the lock's path was a link or nothing in every check above; seam=paths rewritten;
+#   no_claim=a directory that appears between the check and ln (the read-back covers it, like the case below)
+mkdir -p "$MOVE_LOCK"
+_held=$(lock_run)
+check "fivenines_setup.sh refuses a directory at the lock's path, and makes nothing inside it" \
+  "$_held|$(grep -c "Could not take the setup lock $MOVE_LOCK: it could not be made" "$MOVE/out")|$(move_names "$MOVE_LOCK")" "1||work||1|"
+rm -rf "$MOVE_LOCK" "$MOVE/lockwork"
+# A symbolic link to a directory there passes the directory check (it is a
+# link), and ln makes its link inside the directory: only the read-back
+# after ln sees that, removes it, and refuses.
+# Value: protects=a link to a directory at the lock's path never lets a run believe it holds the lock, and leaves nothing in that directory;
+#   fails_when=the read-back after ln, or its removal of the link made inside, is dropped;
+#   why_new=the directory check above refuses a plain directory before ln; seam=paths rewritten;
+#   no_claim=the race it also covers
+mkdir -p "$MOVE/locktarget"
+ln -s "$MOVE/locktarget" "$MOVE_LOCK"
+_held=$(lock_run)
+check "fivenines_setup.sh refuses a link to a directory at the lock's path, and leaves nothing in that directory" \
+  "$_held|$(grep -c "Could not take the setup lock $MOVE_LOCK: it could not be made" "$MOVE/out")|$(move_names "$MOVE/locktarget")" "1||work|$MOVE/locktarget|1|"
+rm -rf "$MOVE_LOCK" "$MOVE/locktarget" "$MOVE/lockwork"
+# A lock that cannot be made at all (not root, a read-only /run) is said as
+# such, not as a run that holds it.
+# Value: protects=a lock that cannot be made is never reported as one another installer holds;
+#   fails_when=the two refusals share one message again;
+#   why_new=the checks above can always make the lock; seam=the lock's directory made read-only;
+#   no_claim=a real read-only /run
+if [ "$(id -u)" != "0" ]; then
+  chmod 555 "$MOVE/lockrun"
+  _held=$(lock_run)
+  chmod 755 "$MOVE/lockrun"
+  check "fivenines_setup.sh says when it cannot make the lock at all" \
+    "$_held|$(grep -c "Could not take the setup lock $MOVE_LOCK: it could not be made" "$MOVE/out")|$(grep -c 'Another fivenines installer holds' "$MOVE/out")" "1||work||1|0"
+  rm -rf "$MOVE/lockwork"
+fi
+# fivenines_setup_user.sh --from-system takes the same lock through sudo,
+# and releases it through sudo -n on exit, only while it is still its own.
+# Value: protects=--from-system and fivenines_setup.sh never run at once, and --from-system releases the lock it took;
+#   fails_when=--from-system stops taking the lock, takes it as the user, or leaves it behind;
+#   why_new=the lock was fivenines_setup.sh's alone; seam=sudo is the stub (it runs as this user), paths rewritten;
+#   no_claim=that sudo runs it as root
+sed -n '/^exit_with_error()/,/^}/p;/^as_root()/,/^}/p;/^cleanup_on_exit()/,/^}/p;/^setup_lock_script()/,/^}/p;/^acquire_setup_lock()/,/^}/p' \
+  "$ROOT/fivenines_setup_user.sh" \
+  | sed "s|/run|$MOVE/lockrun|g;s|/etc/fivenines_setup.lock|$MOVE/locketc/fivenines_setup.lock|g" > "$MOVE/lock_user.sh"
+lock_user_run() {
+  : > "$MOVE/sudo-args.log"
+  rm -f "$MOVE/lockheld"
+  (
+    # shellcheck source=/dev/null
+    . "$MOVE/lock_user.sh"
+    WORK_DIR=""
+    ROOT_STAGE=""
+    SETUP_LOCK=""
+    # The sudo stub, for this run only.
+    # shellcheck disable=SC2030,SC2031
+    PATH="$MOVE_BIN:$PATH"
+    acquire_setup_lock > "$MOVE/out" 2>&1
+    readlink "$MOVE_LOCK" > "$MOVE/lockheld"
+  )
+  # The $1 is the release command's own text.
+  # shellcheck disable=SC2016
+  printf '%s|%s|%s|%s' "$?" "$([ -s "$MOVE/lockheld" ] && echo held)" \
+    "$([ -L "$MOVE_LOCK" ] && readlink "$MOVE_LOCK")" "$(grep -cF '&& rm -f "$1"' "$MOVE/sudo-args.log")"
+}
+rm -f "$MOVE_LOCK" "$MOVE/lockheld"
+check "fivenines_setup_user.sh takes the setup lock through sudo, and releases it through sudo on exit" "$(lock_user_run)" "0|held||1"
+ln -s "$$" "$MOVE_LOCK"
+check "fivenines_setup_user.sh refuses while another run holds the setup lock, and leaves it" \
+  "$(lock_user_run)|$(grep -c 'Another fivenines installer holds' "$MOVE/out")" "1||$$|0|1"
+rm -f "$MOVE_LOCK"
+# A sudo that will not run the lock's script: said as such.
+mkdir -p "$MOVE/nosudobin"
+printf '#!/bin/sh\nexit 1\n' > "$MOVE/nosudobin/sudo"
+chmod 755 "$MOVE/nosudobin/sudo"
+_held=$(MOVE_BIN="$MOVE/nosudobin" lock_user_run)
+check "fivenines_setup_user.sh says when sudo did not run the setup lock" \
+  "$_held|$(grep -c 'sudo did not run it' "$MOVE/out")|$(grep -c 'Another fivenines installer holds' "$MOVE/out")" "1|||0|1|0"
 
 # --from-system preflight: an installation, or any state file, already in
 # this user's directories is refused before anything changes.
@@ -1341,7 +1575,7 @@ fi
 sed -n '/^STATE_FILES=/p;/^AS_USER_TIMEOUT=/p;/^as_user()/,/^}/p;/^OWN_AGENTS_FN=/,/^'"'"'$/p
         /^undo_system_install()/,/^}/p;/^rollback_user_takeover()/,/^}/p' \
   "$ROOT/fivenines_setup.sh" \
-  | sed "s|/etc/fivenines_agent|$MOVE/etc|g;s|/opt/fivenines|$MOVE/rbopt|g;s|/etc/sudoers.d/fivenines|$MOVE/rbsudoers|g;s|/etc/group|$MOVE/rbgroup|g" \
+  | sed "s|/etc/fivenines_agent|$MOVE/etc|g;s|/opt/fivenines|$MOVE/rbopt|g;s|/etc/sudoers.d/fivenines|$MOVE/rbsudoers|g;s|/etc/group|$MOVE/rbgroup|g;s|/etc/init.d/fivenines-agent|$MOVE/rbinit|g;s|/run/systemd/system|$MOVE/rbbooted|g" \
   > "$MOVE/rollback.sh"
 mkdir -p "$MOVE/rbinst" "$MOVE/acctbin"
 printf '#!/bin/sh\necho start.sh >> %s\n' "'$MOVE/svc.log'" > "$MOVE/rbinst/start.sh"
@@ -1367,6 +1601,10 @@ rollback_run() {
   : > "$MOVE/rbunit"
   printf 'root:x:0:\nfivenines:x:999:\n' > "$MOVE/rbgroup"
   : > "$MOVE/svc.log"
+  rm -f "$MOVE/svc.stopped" "$MOVE/rbinit"
+  # Booted with systemd, but for notbooted.
+  rm -rf "$MOVE/rbbooted"
+  [ "$1" = notbooted ] || mkdir -p "$MOVE/rbbooted"
   (
     # shellcheck source=/dev/null
     . "$MOVE/rollback.sh"
@@ -1374,6 +1612,11 @@ rollback_run() {
     MOVE_STOP_SIGNAL=1
     export MOVE_STOP_SIGNAL
     SYSTEM_TYPE=systemd
+    case "$1" in
+      openrc-*) SYSTEM_TYPE=openrc ;;
+    esac
+    # The init script landed, for the OpenRC branch.
+    if [ "$1" = openrc-stuck ]; then : > "$MOVE/rbinit"; fi
     FROM_USER_NAME=alice
     USER_INSTALL_DIR="$MOVE/rbinst"
     IMPORTED_STATE_FILES=""
@@ -1386,12 +1629,30 @@ rollback_run() {
     CREATED_ACCOUNT=0
     CREATED_GROUP=0
     case "$1" in
-      imported | created)
+      imported | created | stuck | broken | unloaded | broken219 | notbooted | openrc-*)
         IMPORTED_STATE_FILES=" TOKEN MACHINE_ID"
         SERVICE_SET_UP=1
         ;;
     esac
-    if [ "$1" = created ]; then
+    case "$1" in
+      stuck | broken | broken219 | notbooted | openrc-*)
+        MOVE_STOP_FAILS=1
+        export MOVE_STOP_FAILS
+        ;;
+    esac
+    case "$1" in
+      unloaded | broken219)
+        MOVE_SYSTEMD219=1
+        export MOVE_SYSTEMD219
+        ;;
+    esac
+    case "$1" in
+      broken | broken219 | notbooted)
+        MOVE_ISACTIVE_BROKEN=1
+        export MOVE_ISACTIVE_BROKEN
+        ;;
+    esac
+    if [ "$1" = created ] || [ "$1" = stuck ] || [ "$1" = broken ]; then
       UNDO_SYSTEM_INSTALL=1
       CREATED_UNIT="$MOVE/rbunit"
       CREATED_SUDOERS=1
@@ -1419,6 +1680,48 @@ check "--from-user rolls back what it installed, then the service, then restarts
 check "--from-user rolls back what the move created of the system installation, and only that" \
   "$(rollback_run created)|$([ -e "$MOVE/etc" ] && echo etc)$([ -e "$MOVE/rbopt" ] && echo opt)$([ -e "$MOVE/rbsudoers" ] && echo sudoers)$([ -e "$MOVE/rbunit" ] && echo unit)|$(tr '\n' '|' < "$MOVE/svc.log")" \
   "0||systemctl stop fivenines-agent.service|systemctl disable fivenines-agent.service|systemctl daemon-reload|userdel fivenines|groupdel fivenines|start.sh|"
+# A service that does not stop runs with the identity: no user-level agent
+# is started beside it, nothing is taken back from under it, and the
+# operator is told what to do.
+# Value: protects=a rollback never leaves two agents with one identity, nor removes a running service's files;
+#   fails_when=the rollback stops checking that the service stopped;
+#   why_new=every rollback above stops the service; seam=a systemctl stop that fails;
+#   no_claim=the OpenRC branch
+check "--from-user restarts nothing and takes nothing back when the service does not stop, and says so" \
+  "$(rollback_run stuck)|$([ -e "$MOVE/rbopt" ] && echo opt)$([ -e "$MOVE/rbunit" ] && echo unit)|$(tr '\n' '|' < "$MOVE/svc.log")|$(grep -c 'service did not stop' "$MOVE/out")" \
+  "0|optunit|systemctl stop fivenines-agent.service|systemctl disable fivenines-agent.service||1"
+# A systemctl that cannot reach systemd fails the stop and the state read
+# alike: that is no stopped service.
+# Value: protects=an unreadable service state is never read as a stopped service;
+#   fails_when=the check goes back to is-active's exit code;
+#   why_new=the check above reads a state systemctl reported; seam=an is-active that prints nothing and fails;
+#   no_claim=the OpenRC branch (exit 3 alone reads as stopped there)
+check "--from-user reads a service whose state systemctl cannot read as one that did not stop" \
+  "$(rollback_run broken)|$([ -e "$MOVE/rbopt" ] && echo opt)|$(grep -c 'start.sh' "$MOVE/svc.log")|$(grep -c 'service did not stop' "$MOVE/out")" \
+  "0|opt|0|1"
+# systemd 219 (CentOS 7) says "unknown" of a unit it no longer has loaded,
+# as after the disable: a stopped service, the rollback goes on. OpenRC:
+# status 3 alone is stopped, unless the init script never landed.
+# Value: protects=the rollback reads a stopped service as stopped on systemd 219 and on an OpenRC host whose init script never landed, and a running one as running;
+#   fails_when=unknown or a missing init script reads as a service that did not stop (the user-level agent is then left stopped), or a failed OpenRC stop as a stopped one;
+#   why_new=the checks above are systemd's inactive and an unreadable state; seam=systemctl, rc-service and rc-update stubs, the init script's path rewritten;
+#   no_claim=a real systemd 219 or OpenRC
+check "--from-user reads a unit systemd 219 calls unknown as stopped, and goes on" \
+  "$(rollback_run unloaded)|$(grep -c 'start.sh' "$MOVE/svc.log")|$(grep -c 'service did not stop' "$MOVE/out")" "0|1|0"
+# systemd 219's is-active says "unknown" for a bus error too: the state is
+# read with show, which prints nothing then. A host not booted with systemd
+# (a container, a chroot) runs nothing as the service.
+# Value: protects=a bus error on systemd 219 never reads as a stopped service, and a host not booted with systemd never as a running one;
+#   fails_when=the state goes back to is-active's output, or the booted check is dropped;
+#   why_new=the checks above are a reachable systemd; seam=as above, /run/systemd/system rewritten;
+#   no_claim=a real systemd 219
+check "--from-user reads a systemd 219 bus error as a service that did not stop" \
+  "$(rollback_run broken219)|$(grep -c 'start.sh' "$MOVE/svc.log")|$(grep -c 'service did not stop' "$MOVE/out")" "0|0|1"
+check "--from-user on a host not booted with systemd reads the service as stopped, and goes on" \
+  "$(rollback_run notbooted)|$(grep -c 'start.sh' "$MOVE/svc.log")|$(grep -c 'service did not stop' "$MOVE/out")" "0|1|0"
+check "--from-user on OpenRC reads a service whose init script never landed as stopped, and one that does not stop as running" \
+  "$(rollback_run openrc-gone)|$(grep -c 'start.sh' "$MOVE/svc.log")|$(grep -c 'service did not stop' "$MOVE/out")#$(rollback_run openrc-stuck)|$(grep -c 'start.sh' "$MOVE/svc.log")|$(grep -c 'service did not stop' "$MOVE/out")" \
+  "0|1|0#0|0|1"
 check "--from-user keeps what the move did not create, and leaves alone a service it did not set up" \
   "$(rollback_run stopping)|$(move_names "$MOVE/etc")|$([ -e "$MOVE/rbopt" ] && echo opt)$([ -e "$MOVE/rbsudoers" ] && echo sudoers)$([ -e "$MOVE/rbunit" ] && echo unit)|$(tr '\n' '|' < "$MOVE/svc.log")" \
   "0|.env MACHINE_ID TOKEN last_capture_id |optsudoersunit|start.sh|"
@@ -1441,7 +1744,7 @@ fi
 #   why_new=the parser checks above stop at the usage line; seam=as_user is a function here;
 #   no_claim=the checks after it, or a real /proc mounted with hidepid
 sed -n '/^STATE_FILES=/p;/^exit_with_contact()/,/^}/p;/^resolve_takeover_user()/,/^}/p
-        /^preflight_user_takeover()/,/^}/p' "$ROOT/fivenines_setup.sh" > "$MOVE/preuser.sh"
+        /^OWN_AGENTS_FN=/,/^'"'"'$/p;/^preflight_user_takeover()/,/^}/p' "$ROOT/fivenines_setup.sh" > "$MOVE/preuser.sh"
 # Runs the preflight for user $1, with as_user failing on a command that
 # reads /proc/self/exe when $2 is noproc. Prints its status and output on one
 # line.
@@ -1480,7 +1783,7 @@ fi
 #   why_new=test-distro runs only the successful move, and the armv7l stub box stops before the preflight; seam=/etc/fivenines_agent rewritten;
 #   no_claim=the confirmation prompt at a terminal (no terminal here), or root's su
 sed -n '/^STATE_FILES=/p;/^AS_USER_TIMEOUT=/p;/^as_user()/,/^}/p;/^exit_with_contact()/,/^}/p
-        /^resolve_takeover_user()/,/^}/p;/^preflight_user_takeover()/,/^}/p' "$ROOT/fivenines_setup.sh" \
+        /^OWN_AGENTS_FN=/,/^'"'"'$/p;/^resolve_takeover_user()/,/^}/p;/^preflight_user_takeover()/,/^}/p' "$ROOT/fivenines_setup.sh" \
   | sed "s|/etc/fivenines_agent|$MOVE/petc|g" > "$MOVE/preuser_real.sh"
 PRE_UI="$MOVE/preinst"
 PRE_UC="$MOVE/precfg"
@@ -1543,19 +1846,32 @@ if command -v base64 > /dev/null 2>&1 && command -v setsid > /dev/null 2>&1; the
     MOVE_ELSEWHERE=$(move_start agent "$MOVE/elsewhere-inst" "CONFIG_DIR=$PRE_UC")
     check "--from-user refuses while another installation's agent uses the same config directory" \
       "$(from_user_preflight_real | grep -c "Another agent of $(id -un) uses $PRE_UC")" "1"
-    # The same agent, its binary unreadable as one started under another
-    # group's would be: the kernel then hides its environment too, so its
-    # config directory cannot be told, and it is not counted (a known limit:
-    # counting it would refuse the move for a second installation with its
-    # own config directory).
-    # Value: protects=--from-user does not refuse because of an agent whose exe link the kernel hides, whose config directory it cannot know;
-    #   fails_when=the scan takes agent_exe's command-line fallback;
-    #   why_new=the check above reads every exe link; seam=a readlink on PATH that cannot read /proc/*/exe;
-    #   no_claim=a real newgrp (the stub box has no second group to start a process under), or a hidden environment (the stub hides only the exe link)
-    # The stub, for this run only.
+    # The same agent, as one started under another group would read: its
+    # binary hidden (it is found by its command line), then its environment
+    # too (its installation's start.sh tells its config directory). One whose
+    # start.sh names another config directory goes on; one with no start.sh
+    # counts.
+    # Value: protects=--from-user sees another agent of the user's started under another group, and tells its config directory from its start.sh when the kernel hides its environment;
+    #   fails_when=the scan drops agent_exe's command-line fallback, counts every agent whose environment it cannot read, or stops counting one it cannot place;
+    #   why_new=the check above reads every exe link and environment; seam=a readlink that cannot read /proc/*/exe, and a tr that cannot read /proc/*/environ;
+    #   no_claim=a real newgrp (the stub box has no second group to start a process under)
+    # The stubs, for these runs only.
     # shellcheck disable=SC2030,SC2031
-    check "--from-user goes on beside an agent whose binary it cannot read" \
-      "$( (PATH="$MOVE/noexebin:$PATH"; from_user_preflight_real) | grep -c 'Moving the user-level installation')" "1"
+    check "--from-user refuses while another agent whose binary cannot be read uses the same config directory" \
+      "$( (PATH="$MOVE/noexebin:$PATH"; from_user_preflight_real) | grep -c "Another agent of $(id -un) uses $PRE_UC")" "1"
+    printf 'export CONFIG_DIR="%s"\n' "$PRE_UC" > "$MOVE/elsewhere-inst/start.sh"
+    # shellcheck disable=SC2030,SC2031
+    check "--from-user refuses while an agent it can read neither the binary nor the environment of names the same config in its start.sh" \
+      "$( (PATH="$MOVE/noenvbin:$MOVE/noexebin:$PATH"; from_user_preflight_real) | grep -c "Another agent of $(id -un) uses $PRE_UC")" "1"
+    printf 'export CONFIG_DIR="%s"\n' "$MOVE/elsewhere-cfg" > "$MOVE/elsewhere-inst/start.sh"
+    mkdir -p "$MOVE/elsewhere-cfg"
+    # shellcheck disable=SC2030,SC2031
+    check "--from-user goes on beside such an agent whose start.sh names another config directory" \
+      "$( (PATH="$MOVE/noenvbin:$MOVE/noexebin:$PATH"; from_user_preflight_real) | grep -c 'Moving the user-level installation')" "1"
+    rm -f "$MOVE/elsewhere-inst/start.sh"
+    # shellcheck disable=SC2030,SC2031
+    check "--from-user refuses while such an agent has no start.sh to tell its config directory" \
+      "$( (PATH="$MOVE/noenvbin:$MOVE/noexebin:$PATH"; from_user_preflight_real) | grep -c "Another agent of $(id -un) uses $PRE_UC")" "1"
     kill "$MOVE_ELSEWHERE" 2> /dev/null
     move_gone "$MOVE_ELSEWHERE"
     # An agent whose installation was deleted under it: its exe link ends in
@@ -1730,7 +2046,7 @@ check "--from-user stops at an empty TOKEN, and carries nothing" \
 #   fails_when=the removal goes back to rm -rf of a directory, removes .env, the crontab filter misses a spelling of start.sh or drops a line naming fivenines, or the second stop is dropped;
 #   why_new=test-distro Test 12 removes an installation that holds nothing else, on an image with no crontab, in test mode; seam=none;
 #   no_claim=that it runs as the user (su is a stub here), or that the service started first
-sed -n '/^STATE_FILES=/p;/^USER_INSTALL_FILES=/p;/^USER_CONFIG_FILES=/p;/^AS_USER_TIMEOUT=/p
+sed -n '/^STATE_FILES=/p;/^USER_INSTALL_FILES=/p;/^USER_CONFIG_FILES=/p;/^AS_USER_TIMEOUT=/p;/^AS_USER_REMOVAL_TIMEOUT=/p
         /^as_user()/,/^}/p;/^OWN_AGENTS_FN=/,/^'"'"'$/p;/^start_spellings()/,/^}/p
         /^stop_user_agent()/,/^}/p;/^remove_user_installation()/,/^}/p' "$ROOT/fivenines_setup.sh" > "$MOVE/from_user.sh"
 MOVE_HOME="$MOVE/home/alice"
@@ -2214,6 +2530,27 @@ else
   check "--from-user stops an agent of the user's whose binary it cannot read, by its command line, and spares another process with that command line" \
     "$_rc|$(move_alive "$MOVE_OTHERGID" && echo alive)|$(move_alive "$MOVE_NOTAGENT" && echo alive)" "0||alive"
   kill "$MOVE_OTHERGID" "$MOVE_NOTAGENT" 2> /dev/null
+  # Started through another spelling of the directory (a symlink) as well:
+  # its command line names that spelling, resolved before it is compared.
+  # Value: protects=the command-line fallback finds an agent started under another spelling of the installation's directory;
+  #   fails_when=agent_exe stops resolving the command line's directory;
+  #   why_new=the agent above was started by the directory's own spelling; seam=as above;
+  #   no_claim=a real newgrp
+  MOVE_OTHERGID=$(move_start agent "$MOVE/home/bob/agent-link")
+  _rc=$( (
+    # shellcheck source=/dev/null
+    . "$MOVE/stop_user.sh"
+    FROM_USER_NAME=bob
+    USER_INSTALL_DIR="$STOP_DIR"
+    # The stub, for this run only.
+    # shellcheck disable=SC2030,SC2031
+    PATH="$MOVE/noexebin:$PATH"
+    stop_user_agent > /dev/null 2>&1
+    echo "$?"
+  ) )
+  check "--from-user stops an agent whose binary it cannot read, started through a symlink to its directory" \
+    "$_rc|$(move_alive "$MOVE_OTHERGID" && echo alive)" "0|"
+  kill "$MOVE_OTHERGID" 2> /dev/null
 
   # as_user ends what it runs after AS_USER_TIMEOUT, its whole process group,
   # and fails with 124 (#307): the stop runs with INT, TERM and HUP ignored,
@@ -2266,9 +2603,10 @@ else
   #   fails_when=the watcher stops checking that the main shell still runs;
   #   why_new=new; seam=AS_USER_TIMEOUT lowered; no_claim=PID reuse itself (the command is left running instead)
   # The $ are for the child shell. gstack-timing-ok: the check at 5s needs only to come after the 2s bound.
+  mkdir -p "$MOVE/gone-work"
   # shellcheck disable=SC2016
-  setsid sh -c '. "$1"; FROM_USER_NAME=bob; AS_USER_TIMEOUT=2
-    as_user "sleep \"\$1\"" 3021 > /dev/null 2>&1' sh "$MOVE/stop_user.sh" &
+  setsid sh -c '. "$1"; FROM_USER_NAME=bob; AS_USER_TIMEOUT=2; WORK_DIR=$2
+    as_user "sleep \"\$1\"" 3021 > /dev/null 2>&1' sh "$MOVE/stop_user.sh" "$MOVE/gone-work" &
   _gone=$!
   sleep 1
   kill -KILL "$_gone" 2> /dev/null
@@ -2277,6 +2615,34 @@ else
   # shellcheck disable=SC2009
   _left=$(ps -eo pid,args | awk '$2 == "sleep" && $3 == "3021" { print $1 }')
   check "as_user's watcher signals nothing once its run is gone" "$([ -n "$_left" ] && echo running)" "running"
+  # shellcheck disable=SC2086
+  [ -n "$_left" ] && kill $_left 2> /dev/null
+  # A signal while a call waits: its trap's exit ends that call (its group)
+  # before the rollback runs its own, so an interrupted stop.sh, or the
+  # stop's loop, never goes on beside the rollback (it could kill the agent
+  # the rollback's start.sh started again).
+  # Value: protects=an as_user call a signal interrupted is ended before exit_with_contact's rollback runs;
+  #   fails_when=exit_with_contact stops ending the pending call, or as_user stops recording it;
+  #   why_new=new; seam=the rollback is a stub that reports whether the interrupted command still runs; no_claim=util-linux su
+  sed -n '/^AS_USER_TIMEOUT=/p;/^exit_with_contact()/,/^}/p;/^as_user()/,/^}/p;/^end_pending_as_user()/,/^}/p' \
+    "$ROOT/fivenines_setup.sh" > "$MOVE/pending.sh"
+  rm -f "$MOVE/pending.out"
+  # The $ are for the child shell. gstack-timing-ok: the signal at 1s only has to come while the 30s command runs.
+  # shellcheck disable=SC2016
+  setsid sh -c '. "$1"; FROM_USER_NAME=bob; AS_USER_TIMEOUT=30; WORK_DIR=$3; TAKEOVER_ROLLBACK=1; PENDING_OUT=$2
+    print_error() { :; }
+    rollback_user_takeover() {
+      if ps -eo args | grep -qx "sleep 3041"; then echo "still running" > "$PENDING_OUT"; else echo "ended" > "$PENDING_OUT"; fi
+    }
+    trap "exit_with_contact interrupted" HUP
+    as_user "sleep \"\$1\"" 3041 > /dev/null 2>&1' sh "$MOVE/pending.sh" "$MOVE/pending.out" "$MOVE/gone-work" &
+  _pend=$!
+  sleep 1
+  kill -HUP "$_pend" 2> /dev/null
+  wait "$_pend" 2> /dev/null
+  check "a signal during an as_user call ends that call before the rollback runs" "$(cat "$MOVE/pending.out" 2> /dev/null)" "ended"
+  # shellcheck disable=SC2009
+  _left=$(ps -eo pid,args | awk '$2 == "sleep" && $3 == "3041" { print $1 }')
   # shellcheck disable=SC2086
   [ -n "$_left" ] && kill $_left 2> /dev/null
   # What the user's side prints reaches root's terminal with its control
@@ -2338,6 +2704,9 @@ md_rules_run() {
     visudo() { return 0; }
     # shellcheck disable=SC2317,SC2329
     chown() { return 0; }
+    # Not the host's own sudo -V.
+    # shellcheck disable=SC2317,SC2329
+    sudo_secure_path() { echo /usr/sbin:/usr/bin:/sbin:/bin; }
     WORK_DIR="$SUD/work"
     write_sudoers_rules > "$SUD/out" 2>&1
   )

@@ -48,6 +48,14 @@ CONFIG_DIR="${FIVENINES_CONFIG_DIR:-$HOME/.config/fivenines_agent}"
 LOG_FILE="$INSTALL_DIR/agent.log"
 # Never inherited from the environment: ensure_work_dir creates it.
 WORK_DIR=""
+# Never inherited either: what cleanup_on_exit takes back, through sudo -n --
+# root's directory for the state copies, and the setup lock --, and the
+# topmost directory create_directories made for each (mkdir -p), which
+# check_agent_runs removes again, once empty.
+ROOT_STAGE=""
+SETUP_LOCK=""
+CREATED_USER_INSTALL_TOP=""
+CREATED_USER_CONFIG_TOP=""
 
 # Colors for output
 RED='\033[0;31m'
@@ -554,12 +562,39 @@ select_agent_binary() {
     return 0
 }
 
+# The topmost directory mkdir -p would create for $1 (empty when it exists).
+first_missing_dir() {
+    missing_dir="$1"
+    missing_top=""
+    while [ -n "$missing_dir" ] && [ ! -d "$missing_dir" ]; do
+        missing_top="$missing_dir"
+        missing_dir=$(dirname -- "$missing_dir")
+    done
+    printf '%s' "$missing_top"
+}
+
+# Removes $1 and each parent up to $2, the topmost one this run made, each
+# only once empty (rmdir); one already gone is passed over, so a second run
+# reaches a parent another chain emptied since.
+remove_made_dirs() {
+    made_dir="$1"
+    while [ -n "$2" ]; do
+        if [ -e "$made_dir" ] || [ -L "$made_dir" ]; then
+            rmdir -- "$made_dir" 2> /dev/null || break
+        fi
+        [ "$made_dir" != "$2" ] || break
+        made_dir=$(dirname -- "$made_dir")
+    done
+}
+
 create_directories() {
     echo "Creating directories..."
 
+    CREATED_USER_INSTALL_TOP=$(first_missing_dir "$INSTALL_DIR")
     mkdir -p "$INSTALL_DIR"
     print_success "Install directory: $INSTALL_DIR"
 
+    CREATED_USER_CONFIG_TOP=$(first_missing_dir "$CONFIG_DIR")
     mkdir -p "$CONFIG_DIR"
     print_success "Config directory: $CONFIG_DIR"
 
@@ -576,6 +611,25 @@ save_token() {
     echo ""
 }
 
+# Run on every exit: the private work directory and, for --from-system,
+# root's directory for the state copies and the setup lock (when it is still
+# this run's), both through sudo -n: at the end of a long run sudo may want a
+# password again, and the exit never waits for one (the lock is then taken
+# over as stale by the next run, and /tmp is cleaned at boot).
+cleanup_on_exit() {
+    if [ -n "${ROOT_STAGE:-}" ]; then
+        # shellcheck disable=SC2016
+        sudo -n sh -c 'rm -rf -- "$1"' sh "$ROOT_STAGE" > /dev/null 2>&1 || true
+    fi
+    if [ -n "${SETUP_LOCK:-}" ]; then
+        # shellcheck disable=SC2016
+        sudo -n sh -c '[ "$(readlink "$1")" = "$2" ] && rm -f "$1"' sh "$SETUP_LOCK" "$$" > /dev/null 2>&1 || true
+    fi
+    if [ -n "${WORK_DIR:-}" ]; then
+        rm -rf "$WORK_DIR"
+    fi
+}
+
 # One private work directory per run, removed on exit (--from-system needs it
 # before the agent is downloaded).
 ensure_work_dir() {
@@ -583,7 +637,7 @@ ensure_work_dir() {
         return 0
     fi
     WORK_DIR=$(make_work_dir) || exit_with_error "Failed to create a private temporary directory"
-    trap 'rm -rf "$WORK_DIR"' EXIT
+    trap cleanup_on_exit EXIT
 }
 
 download_agent() {
@@ -961,6 +1015,10 @@ COPIED_STATE_FILES=""
 # A state file is a few KB at most: anything bigger is not one.
 STATE_FILE_MAX=16777216
 SYSTEM_CONFIG_DIR="/etc/fivenines_agent"
+# What a user-level installation's directory holds (fivenines_setup.sh
+# removes the same after --from-user; ci/build-scripts.sh keeps the lines
+# equal): what check_agent_runs takes back when the agent cannot run here.
+USER_INSTALL_FILES="start.sh stop.sh status.sh logs.sh refresh.sh agent.pid agent.log"
 
 # as_root SCRIPT [ARG...]: run SCRIPT with sh through sudo, with the ARGs as
 # $1, $2... They are never pasted into SCRIPT, so a path is never parsed as
@@ -969,6 +1027,93 @@ as_root() {
     as_root_script="$1"
     shift
     sudo sh -c "$as_root_script" sh "$@"
+}
+
+# The script, run as root with the holder's PID as $1, that takes the lock
+# serialising the runs that change the system installation (#322):
+# fivenines_setup.sh, fivenines_update.sh and fivenines_setup_user.sh
+# --from-system (two moves at once both passed the preflight before either
+# imported, the second replacing the TOKEN and MACHINE_ID the first wrote;
+# an update during a move restarted the agent the move had stopped). The lock
+# is a symbolic link whose target is the holder's PID, made in one step by
+# ln, which fails when it exists: no window where it exists without its PID.
+# One whose holder is gone (killed before its EXIT trap) is taken over, once,
+# under a second link made the same way (.takeover), and only while the lock
+# still names that holder: two runs that found it stale at once could
+# otherwise both take it, the second removing the first's fresh lock. Prints
+# the lock's path (exit 0), or its holder and path (exit 1). Identical in the
+# three scripts (ci/build-scripts.sh).
+setup_lock_script() {
+    cat << 'SETUP_LOCK_EOF'
+lock_path=/etc/fivenines_setup.lock
+if [ -d /run ]; then
+    lock_path=/run/fivenines_setup.lock
+fi
+# A directory there would take the link inside it (ln -s DIR), and every run
+# would believe it held the lock.
+if [ -d "$lock_path" ] && [ ! -L "$lock_path" ]; then
+    printf 'unknown %s\n' "$lock_path"
+    exit 1
+fi
+lock_tries=0
+while ! ln -s "$1" "$lock_path" 2> /dev/null; do
+    lock_tries=$((lock_tries + 1))
+    lock_pid=$(readlink "$lock_path" 2> /dev/null)
+    case "$lock_pid" in
+        "")
+            # Released between the two: tried again, once.
+            if [ "$lock_tries" -le 1 ] && [ ! -L "$lock_path" ]; then
+                continue
+            fi
+            ;;
+        *[!0-9]*) ;;
+        *)
+            if [ "$lock_tries" -le 1 ] && ! kill -0 "$lock_pid" 2> /dev/null \
+                && ln -s "$1" "$lock_path.takeover" 2> /dev/null; then
+                if [ "$(readlink "$lock_path" 2> /dev/null)" = "$lock_pid" ]; then
+                    rm -f "$lock_path"
+                fi
+                rm -f "$lock_path.takeover"
+                continue
+            fi
+            ;;
+    esac
+    printf '%s %s\n' "${lock_pid:-unknown}" "$lock_path"
+    exit 1
+done
+# Made by this run, not inside a directory that appeared meanwhile.
+if [ "$(readlink "$lock_path" 2> /dev/null)" != "$1" ]; then
+    if [ -L "$lock_path/$1" ]; then
+        rm -f "$lock_path/$1"
+    fi
+    printf 'unknown %s\n' "$lock_path"
+    exit 1
+fi
+printf '%s\n' "$lock_path"
+SETUP_LOCK_EOF
+}
+
+# One run at a time with fivenines_setup.sh and fivenines_update.sh
+# (setup_lock_script, run as root), taken once sudo authenticated and before
+# anything of the system installation is read.
+acquire_setup_lock() {
+    lock_rc=0
+    lock_out=$(as_root "$(setup_lock_script)" "$$") || lock_rc=$?
+    lock_out=$(printf '%s\n' "$lock_out" | tail -n 1)
+    if [ "$lock_rc" -ne 0 ]; then
+        case "$lock_out" in
+            [0-9]*" /"*)
+                lock_path=${lock_out#* }
+                exit_with_error "Another fivenines installer holds $lock_path (PID ${lock_out%% *}): wait for it to end and re-run. If none runs, remove $lock_path (and $lock_path.takeover, if there is one) with sudo."
+                ;;
+            "") exit_with_error "Could not take the setup lock: sudo did not run it (--from-system needs sudo to run sh as root)." ;;
+            *)
+                exit_with_error "Could not take the setup lock ${lock_out##* }: it could not be made there (a read-only /run), or something other than a lock is there. If no fivenines installer runs, remove it with sudo and re-run."
+                ;;
+        esac
+    fi
+    SETUP_LOCK="$lock_out"
+    trap cleanup_on_exit EXIT
 }
 
 # A user-level install on a host that runs the system agent too: both would
@@ -1031,6 +1176,7 @@ preflight_system_takeover() {
     fi
     echo "Moving the system installation needs sudo: to read its token, then stop and remove it."
     sudo -v || exit_with_error "sudo did not authenticate: nothing was changed."
+    acquire_setup_lock
     # The quoted $1 is as_root's argument, expanded by root's shell.
     # shellcheck disable=SC2016
     if ! as_root 'test -f "$1" && test -s "$1"' "$SYSTEM_CONFIG_DIR/TOKEN"; then
@@ -1042,10 +1188,15 @@ preflight_system_takeover() {
     echo ""
 }
 
-# Each state file is copied by root, through sudo, into a directory of its own
-# inside this user's private work directory, and handed over (chown) to this
-# user, who checks it and puts it in the config directory, after the system
-# agent stopped (it may have just swapped its token). Read through sudo's
+# Each state file is copied by root, through sudo, into a directory of root's
+# own (ROOT_STAGE: made by mktemp -d, 0711, so this user can reach a file in it
+# but not list it, nor put anything there), and handed over (chown) to this
+# user, who copies it into its private work directory, checks it and puts it
+# in the config directory, after the system agent stopped (it may have just
+# swapped its token). Root writes, and chowns, nothing by name in a directory
+# this user controls: there a link this user's processes planted between two
+# of root's steps would have made root write, or hand over, a file of its
+# choosing. Read through sudo's
 # stdout instead, it was recorded by sudo's I/O log under "Defaults
 # log_output" (audited hosts, often shipped off the host): the TOKEN, and with
 # it the host's configuration and every service credential it carries (#318).
@@ -1055,6 +1206,27 @@ preflight_system_takeover() {
 copy_system_state() {
     state_stash="${WORK_DIR}/system_state"
     mkdir "$state_stash" || return 1
+    # The path goes through sudo's output: it names nothing secret. The $ are
+    # for root's shell.
+    # shellcheck disable=SC2016
+    ROOT_STAGE=$(as_root 'umask 077 && stage=$(mktemp -d /tmp/fivenines-state.XXXXXX) && chmod 711 "$stage" && printf "%s\n" "$stage"' | tail -n 1)
+    case "$ROOT_STAGE" in
+        /tmp/fivenines-state.?*) ;;
+        *)
+            ROOT_STAGE=""
+            print_error "Could not make a directory for root's copies of the state files."
+            return 1
+            ;;
+    esac
+    copy_rc=0
+    copy_system_state_files || copy_rc=$?
+    # shellcheck disable=SC2016
+    as_root 'rm -rf -- "$1"' "$ROOT_STAGE" > /dev/null 2>&1 || true
+    ROOT_STAGE=""
+    return "$copy_rc"
+}
+
+copy_system_state_files() {
     for state_file in $STATE_FILES .env; do
         state_rc=0
         # shellcheck disable=SC2016
@@ -1069,13 +1241,14 @@ copy_system_state() {
             if [ "$size" -gt "$3" ]; then exit 6; fi
             umask 077
             # At most one byte past the limit is read: the file may have grown
-            # since its size was read, and root must not copy it whole.
+            # since its size was read, and root must not copy it whole. $2 is
+            # in the directory root made for these copies.
             rm -f "$2" && head -c "$(($3 + 1))" -- "$1" > "$2" || exit 5
             size=$(wc -c < "$2") || exit 5
             size=${size##* }
             if [ "$size" -gt "$3" ]; then rm -f "$2"; exit 6; fi
             chown "$4" "$2" || exit 5' \
-            "$SYSTEM_CONFIG_DIR/$state_file" "$state_stash/$state_file" "$STATE_FILE_MAX" "$(id -u)" \
+            "$SYSTEM_CONFIG_DIR/$state_file" "$ROOT_STAGE/$state_file" "$STATE_FILE_MAX" "$(id -u)" \
             > /dev/null || state_rc=$?
         case "$state_rc" in
             0) ;;
@@ -1095,8 +1268,9 @@ copy_system_state() {
                 return 1
                 ;;
         esac
-        # What root copied, as this user reads it.
-        if [ ! -f "$state_stash/$state_file" ] || [ ! -r "$state_stash/$state_file" ] \
+        # What root copied, as this user reads it, into its own directory.
+        if ! (umask 077 && cp -- "$ROOT_STAGE/$state_file" "$state_stash/$state_file") \
+            || [ ! -f "$state_stash/$state_file" ] || [ ! -r "$state_stash/$state_file" ] \
             || [ "$(wc -c < "$state_stash/$state_file")" -gt "$STATE_FILE_MAX" ]; then
             print_error "Could not read $SYSTEM_CONFIG_DIR/$state_file."
             return 1
@@ -1205,6 +1379,22 @@ check_agent_runs() {
     if "$INSTALL_DIR/$BINARY_NAME/$BINARY_NAME" --version > /dev/null 2>&1; then
         return 0
     fi
+    # Nothing of this installation can run here: what this run wrote of it
+    # (the agent, the control scripts create_run_script wrote, never the
+    # agent.pid and agent.log only an agent writes) goes, and each directory
+    # it made, once empty, so a re-run elsewhere leaves nothing behind here.
+    rm -rf -- "${INSTALL_DIR:?}/${BINARY_NAME:?}"
+    for install_file in $USER_INSTALL_FILES; do
+        case "$install_file" in
+            agent.pid | agent.log) continue ;;
+        esac
+        rm -f -- "${INSTALL_DIR:?}/${install_file:?}"
+    done
+    remove_made_dirs "$INSTALL_DIR" "$CREATED_USER_INSTALL_TOP"
+    remove_made_dirs "$CONFIG_DIR" "$CREATED_USER_CONFIG_TOP"
+    # A directory made for both (a parent they share, or a config directory
+    # inside the install one) is empty only now.
+    remove_made_dirs "$INSTALL_DIR" "$CREATED_USER_INSTALL_TOP"
     exit_with_error "The agent extracted to $INSTALL_DIR/$BINARY_NAME does not run as $(id -un) (is that file system mounted noexec?), so the system installation was not changed. Install it in a directory where this user may run programs (FIVENINES_INSTALL_DIR), and re-run."
 }
 
@@ -1281,7 +1471,7 @@ take_over_system_install() {
     # was. A sudo that fails reads as not gone.
     # shellcheck disable=SC2016
     if ! as_root '! test -e "$1/TOKEN"' "$SYSTEM_CONFIG_DIR"; then
-        abort_system_takeover "fivenines_uninstall.sh did not remove the system installation: what was copied was taken back, and the system agent restarted if it could be. Check it (sudo systemctl status fivenines-agent), fix what failed, and re-run."
+        abort_system_takeover "fivenines_uninstall.sh did not remove the system installation: what was copied was taken back, and the system agent put back as it was (see above). Check it (sudo systemctl status fivenines-agent), fix what failed, and re-run."
     fi
     # Past this point the identity lives only in this user's config, so a
     # leftover service definition is said, never undone: without its TOKEN it
