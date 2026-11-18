@@ -282,6 +282,39 @@ else
   else
     echo "    FAIL --with-sudoers: no always_set_home line"; fail=1
   fi
+  # requiretty (early RHEL 7's sudoers) refuses every sudo run with no
+  # terminal, the agent's included (#309). This container gives none: with a
+  # global "Defaults requiretty", alice (a NOPASSWD rule, no !requiretty) is
+  # refused, and fivenines still runs its commands. Set where that sudoers
+  # sets it, near the top, before its #includedir: sudo applies Defaults in
+  # the order it reads them (measured: one appended after the include wins
+  # over the account's !requiretty, on every sudo of the matrix).
+  if grep -qx 'Defaults:fivenines !requiretty' /etc/sudoers.d/fivenines; then
+    echo "    ok   --with-sudoers: the account's commands run with no terminal"
+    if [ "$flavor" = sudo ]; then
+      cp /etc/sudoers /tmp/sudoers.saved
+      { echo 'Defaults requiretty'; cat /tmp/sudoers.saved; } > /etc/sudoers
+      if ! visudo -c > /dev/null 2>&1; then
+        echo "    info this sudo does not know requiretty: not checked"
+      else
+        if [ -n "$(as alice sudo -n /usr/sbin/smartctl --version 2>/dev/null)" ]; then
+          echo "    info premise: requiretty did not refuse alice here (a terminal?)"
+        else
+          echo "    ok   premise: requiretty refuses an account without !requiretty"
+        fi
+        out=$(sudo_as_fivenines "/usr/sbin/smartctl --version")
+        if [ "$out" = "smartctl --version" ]; then echo "    ok   --with-sudoers: fivenines runs smartctl under requiretty"
+        else echo "    FAIL --with-sudoers: fivenines cannot run smartctl under requiretty: '$out' $(cat /tmp/sudo.err)"; fail=1; fi
+      fi
+      cp /tmp/sudoers.saved /etc/sudoers
+      chmod 440 /etc/sudoers
+      clear_mails
+    fi
+  elif [ "$flavor" = sudo-rs ]; then
+    echo "    info --with-sudoers: this sudo's visudo rejects !requiretty (sudo-rs has no requiretty)"
+  else
+    echo "    FAIL --with-sudoers: no !requiretty line"; fail=1
+  fi
   # Per tool, what the agent runs. A tool gets an exact line and, for mdadm,
   # nvme and fail2ban-client, a line of patterns, each written whole or not at
   # all: real sudo must take all five tools; sudo-rs may reject the wg rule
@@ -337,6 +370,29 @@ else
   done
   IFS=$old_ifs
 fi
+# sudoers_tool_path (fivenines_common.sh) names the copy sudo itself runs: the
+# first in this host's secure_path, read from sudo -V (#308). Rocky's
+# /sbin:/bin:/usr/sbin:/usr/bin has no /usr/local, so a copy there must not get
+# the rule. Expected: the first directory of the secure_path /etc/sudoers sets
+# (systemd's default PATH where it sets none) that holds the tool.
+for dir in /usr/local/sbin /usr/sbin; do
+  printf '#!/bin/sh\n' > "$dir/fivenines-sp-probe"
+  chmod 755 "$dir/fivenines-sp-probe"
+done
+sp=$(sed -n 's/^[[:space:]]*Defaults[[:space:]][[:space:]]*secure_path[[:space:]]*=[[:space:]]*//p' /etc/sudoers | tr -d '"' | head -n 1)
+[ -n "$sp" ] || sp=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+want=""
+old_ifs=$IFS
+IFS=:
+for dir in $sp; do
+  if [ -z "$want" ] && [ -x "$dir/fivenines-sp-probe" ]; then want="$dir/fivenines-sp-probe"; fi
+done
+IFS=$old_ifs
+got=$( . /src/fivenines_common.sh; sudoers_tool_path fivenines-sp-probe 2>/dev/null )
+if [ "$got" = "$want" ]; then echo "    ok   --with-sudoers: a rule names $got, secure_path's first ($sp)"
+else echo "    FAIL --with-sudoers: a rule names '$got', secure_path ($sp) runs '$want'"; fail=1; fi
+rm -f /usr/local/sbin/fivenines-sp-probe /usr/sbin/fivenines-sp-probe
+
 # warn_unpinned_sudoers_rules (fivenines_common.sh), over this sudo's own
 # sudo -l -U listing: the pinned rules above are never named, the bare rules
 # an earlier README gave are.

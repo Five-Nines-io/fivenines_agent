@@ -153,19 +153,34 @@ wget -T 3 -q -O fivenines_setup.sh https://releases.fivenines.io/latest/fivenine
 ```
 
 `--from-user` moves the installation of the user who ran `sudo`; name another
-one with `--from-user USER`. Add `--with-sudoers` to also write the sudoers
-rules of [Full Monitoring](#full-monitoring-recommended), which is what the
-system installation is usually for. An installation made with
+one with `--from-user USER`. The system agent keeps that installation's token,
+so the host goes on reporting to, and taking its configuration from, the
+fivenines account the token belongs to -- and the token is a file the user
+controls. Moving another user's installation (or running the script as root
+directly) is therefore confirmed: the script asks at the terminal, and without
+one refuses unless `--yes` is given. Add `--with-sudoers` to also write the
+sudoers rules of [Full Monitoring](#full-monitoring-recommended), which is
+what the system installation is usually for. An installation made with
 `FIVENINES_INSTALL_DIR` or `FIVENINES_CONFIG_DIR` needs the same values here
-(`sudo FIVENINES_INSTALL_DIR=... FIVENINES_CONFIG_DIR=... bash fivenines_setup.sh --from-user`).
-Every file in the user's home is read and removed as that user, never as root,
-with none of root's environment and away from root's terminal (the user's own
-`stop.sh` runs during the move). A `.env` is not carried into the system
-installation, whose agent runs with more access than the user has (an `API_URL`
-there would send it to another server): it stays where it is, and the script
-says so. If the move fails after the user-level agent stopped, or is
-interrupted, the script stops the service again and restarts the user-level
-agent, unchanged.
+(`sudo FIVENINES_INSTALL_DIR=... FIVENINES_CONFIG_DIR=... bash fivenines_setup.sh --from-user`),
+and the move refuses while another agent of the user uses the same config
+directory from another install directory (it would go on reporting as the same
+host). Every file in the user's home is read and removed as that user, never
+as root, with none of root's environment and away from root's terminal (the
+user's own `stop.sh` runs during the move, and is stopped after a minute).
+Only the user's own processes that run the installation's agent binary count
+as their agent. A `.env` is not carried
+into the system installation, whose agent runs with more access than the user
+has (an `API_URL` there would send it to another server): it stays where it
+is, and the script says so. If the move fails, or is interrupted, the script
+takes back what it created of the system installation (the service, the
+`fivenines` account, its directories, the sudoers rules it wrote) and restarts
+the user-level agent, unchanged -- unless that agent was signalled and has not
+exited yet, in which case it says how to start it once it has, or the new
+service does not stop, in which case it leaves the service and the system
+installation in place and says how to stop and remove them first. A crontab entry
+that starts the user-level agent again during the move is removed, and the
+agent stopped again, before its files go.
 
 **System to user-level** (as the user the agent is to run as; sudo is needed
 to read, stop and remove the system installation):
@@ -174,25 +189,38 @@ to read, stop and remove the system installation):
 wget -T 3 -q -O fivenines_setup_user.sh https://releases.fivenines.io/latest/fivenines_setup_user.sh && bash fivenines_setup_user.sh --from-system
 ```
 
-The system installation is removed by the release's `fivenines_uninstall.sh`,
-checked against the signed `SHA256SUMS` before it runs as root. Its `.env` is
-copied as `.env.system`, which the agent does not read: `/etc/fivenines_agent`
-belongs to the `fivenines` account, so review it, and rename it to `.env` if you
-need it. If the system agent's token is still there afterwards, or the move is
+The agent is checked to run as you (a home mounted `noexec` would stop it)
+before anything of the system installation is touched; if it does not, what
+the script installed for you is removed again. The system
+installation is removed by the release's `fivenines_uninstall.sh`, checked
+against the signed `SHA256SUMS` before it runs as root. Its state is copied by
+root into a directory of root's own, which you can read a file from but not
+write to, then by you into your private work directory, never through sudo's
+output, which
+sudo's I/O log (`Defaults log_output`) would keep. Its `.env` is copied as
+`.env.system`, which the agent does not read: `/etc/fivenines_agent` belongs to
+the `fivenines` account, so review it, and rename it to `.env` if you need it.
+If the system agent's token is still there afterwards, or the move is
 interrupted before the uninstaller removed it, the move is undone and the
-system agent restarted (if the uninstaller had already removed its service,
-the script says so, and to run `--from-system` again to finish the move);
-interrupted after, the script keeps the agent's identity
-in your config directory and says how to start it. An `@reboot` line is added
-to your crontab, since the system agent started at boot. The
-sudoers rules `--with-sudoers` wrote go with the system installation; rules you
-wrote yourself in `/etc/sudoers.d/fivenines` stay, naming a user that no longer
-exists, so remove them.
+system agent put back as it was: started again if it ran, enabled again if it
+was enabled (if the uninstaller had already removed its service, the script
+says so, and to run `--from-system` again to finish the move); interrupted
+after, the script keeps the agent's identity in your config directory and says
+how to start it. An `@reboot` line is added to your crontab, since the system
+agent started at boot, unless one already runs `start.sh`; your crontab is
+left untouched when it cannot be read, and a path with a `%` (cron's newline)
+gets no line. If the agent does not start, the script says so and exits with
+an error. The sudoers rules `--with-sudoers` wrote go with the system
+installation; rules you wrote yourself in `/etc/sudoers.d/fivenines` stay,
+naming a user that no longer exists, so remove them.
 
 Neither move runs on UNRAID. Both refuse, before changing anything, when the
 destination already has an installation, or a state file (`TOKEN`,
 `MACHINE_ID`...) an earlier one left there: remove that installation first,
-or move the file aside.
+or move the file aside. `fivenines_setup.sh`, `fivenines_update.sh` and
+`fivenines_setup_user.sh --from-system` run one at a time: one started while
+another runs is refused (a lock in `/run`, taken over when the run that held it
+is gone).
 
 ### Windows Installation
 
@@ -825,6 +853,11 @@ iwr https://releases.fivenines.io/latest/fivenines_update.ps1 -OutFile update.ps
 wget -T 3 -q -O fivenines_uninstall.sh https://releases.fivenines.io/latest/fivenines_uninstall.sh && sudo bash fivenines_uninstall.sh
 ```
 
+The script must run as root and needs no `sudo` of its own: on a host
+without sudo, run it from a root shell (`bash fivenines_uninstall.sh`). It
+exits with an error when it could not remove the service, the configuration
+directory (with the agent's token) or the `fivenines` account.
+
 ### User-Level Removal (no sudo/root)
 
 ```bash
@@ -833,10 +866,14 @@ wget -T 3 -q -O fivenines_uninstall_user.sh https://releases.fivenines.io/latest
 
 It stops only the agent run from its own installation directory and removes
 only the crontab lines that start it (with its path written as is, or under
-`~/` or `$HOME/`). An installation made with `FIVENINES_INSTALL_DIR` or
-`FIVENINES_CONFIG_DIR` needs the same values here: without a `start.sh` where it
-looks, the script refuses rather than delete a config directory whose agent it
-cannot find.
+`~/` or `$HOME/`). It removes only the files the installer and the agent write
+(the helper scripts, the agent, its log, `TOKEN`, `MACHINE_ID` and the other
+state files, `.env`), then each directory if nothing else is left in it: one
+that holds other files (`FIVENINES_INSTALL_DIR=$HOME/bin`) is kept, and the
+script says what it still holds. An installation made with
+`FIVENINES_INSTALL_DIR` or `FIVENINES_CONFIG_DIR` needs the same values here:
+without a `start.sh` where it looks, the script refuses rather than delete a
+config directory whose agent it cannot find.
 
 ### Windows Removal
 
@@ -901,6 +938,7 @@ For full monitoring capabilities, add the following to `/etc/sudoers.d/fivenines
 
 ```
 Defaults:fivenines always_set_home
+Defaults:fivenines !requiretty
 fivenines ALL=(ALL) NOPASSWD: /usr/sbin/smartctl
 fivenines ALL=(ALL) NOPASSWD: /usr/sbin/nvme version
 fivenines ALL=(ALL) NOPASSWD: /usr/sbin/nvme smart-log /dev/nvme[0-9] -o json, /usr/sbin/nvme smart-log /dev/nvme[1-9][0-9] -o json
@@ -925,10 +963,16 @@ lines out and list each device instead: `/sbin/mdadm --detail /dev/md0`,
 appears. Without `fail2ban-client status *`, the agent reads the fail2ban
 summary but no jail.
 
-The `Defaults` line gives the commands the account runs through sudo root's
-`HOME`: `fail2ban-client` is a Python script, and where sudo keeps the
+The first `Defaults` line gives the commands the account runs through sudo
+root's `HOME`: `fail2ban-client` is a Python script, and where sudo keeps the
 caller's `HOME` (Ubuntu before 19.10, or `env_keep += HOME`) Python would run
-the files the account put in its own `~/.local` as root.
+the files the account put in its own `~/.local` as root. The second matters
+on an older RHEL/CentOS 7 whose `/etc/sudoers` still sets `Defaults
+requiretty`: sudo then refuses every command run without a terminal, which is
+how the agent runs them. It does nothing where requiretty is not set. sudo
+applies `Defaults` lines in the order it reads them, so it works where
+requiretty is set before the `#includedir` line (as that RHEL 7 file does),
+not where a file read after `/etc/sudoers.d/fivenines` sets it again.
 
 The mdadm and fail2ban rules name the commands the agent runs, and nothing
 else: a rule for the bare command would let the account run code as root
@@ -978,11 +1022,13 @@ wget -T 3 -q -O fivenines_update.sh https://releases.fivenines.io/latest/fivenin
 ```
 
 It writes `/etc/sudoers.d/fivenines` with the rules above for each of
-smartctl, nvme, mdadm, fail2ban-client and wg installed on the host, naming the path
-sudo's usual `secure_path` finds (`/usr/local/sbin`, `/usr/local/bin`,
-`/usr/sbin`, `/usr/bin`, `/sbin`, `/bin`), and only for a tool that only root
-can change: the file, every directory above it, and every symbolic link on
-the way and its target, root's and writable by no one else. The mdadm and
+smartctl, nvme, mdadm, fail2ban-client and wg installed on the host, naming the
+path sudo itself runs: the first one found in this host's `secure_path`, as
+`sudo -V` reports it (on RHEL-family hosts `/sbin:/bin:/usr/sbin:/usr/bin`,
+with no `/usr/local`), or in `/usr/local/sbin`, `/usr/local/bin`, `/usr/sbin`,
+`/usr/bin`, `/sbin`, `/bin` when sudo reports none; and only for a tool that
+only root can change: the file, every directory above it, and every symbolic
+link on the way and its target, root's and writable by no one else. The mdadm and
 nvme rules also get one exact entry for each array `/proc/mdstat` lists,
 whatever its name (`md0`, `md_d0`, `CREATE names=yes`), and for each
 controller `/sys/class/nvme` lists, on the line without patterns. An array

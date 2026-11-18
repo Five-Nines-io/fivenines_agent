@@ -38,16 +38,18 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# The message is printed as it is (%s): through %b, a backslash sequence in a
+# path it names (a directory another account chose) became an escape.
 print_success() {
-    printf '%b\n' "${GREEN}[+]${NC} $1"
+    printf '%b%s\n' "${GREEN}[+]${NC} " "$1"
 }
 
 print_warning() {
-    printf '%b\n' "${YELLOW}[!]${NC} $1"
+    printf '%b%s\n' "${YELLOW}[!]${NC} " "$1"
 }
 
 print_error() {
-    printf '%b\n' "${RED}[-]${NC} $1"
+    printf '%b%s\n' "${RED}[-]${NC} " "$1"
 }
 
 exit_with_error() {
@@ -574,15 +576,50 @@ root_only_chain() {
     done
 }
 
-# The path a rule for TOOL names, or nothing and a non-zero status when TOOL is
-# not installed, or when anyone but root could change what that path runs
-# (root_only_chain): a rule there would hand root to whoever can. Looked up in
-# sudo's usual secure_path, in its order, rather than in the caller's PATH (su
-# without - keeps a PATH with no sbin). Warnings go to stderr: the path is
-# this function's output.
+# Where sudo looks up the commands the agent runs by name: this host's
+# secure_path, as its sudo reports it to root (sudo -V, in the C locale since
+# the line is translated). RHEL-family sudoers set /sbin:/bin:/usr/sbin:/usr/bin,
+# with no /usr/local, so a rule naming a copy there would never match what
+# sudo runs. A sudo that reports none (no secure_path, or sudo-rs, whose -V
+# prints only its version) searches the caller's PATH: the agent's, systemd's
+# default for a service, the list below. Bounded like
+# warn_unpinned_sudoers_rules: a sudoers backend that hangs must not hold the
+# install.
+sudo_secure_path() {
+    secure_path=$( { if command -v timeout > /dev/null 2>&1; then
+            LC_ALL=C timeout 10 sudo -V
+        else
+            LC_ALL=C sudo -V
+        fi; } 2>/dev/null \
+        | sed -n "s/^Value to override user's \$PATH with: //p" | head -n 1)
+    if [ -z "$secure_path" ]; then
+        secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    fi
+    printf '%s' "$secure_path"
+}
+
+# sudoers_tool_path TOOL [SECURE_PATH]: the path a rule for TOOL names, or
+# nothing and a non-zero status when TOOL is not installed, or when anyone but
+# root could change what that path runs (root_only_chain): a rule there would
+# hand root to whoever can. Looked up in sudo's secure_path (SECURE_PATH, which
+# write_sudoers_rules reads once for every tool: sudo -V parses the sudoers
+# sources, LDAP included, while the agent may be stopped; else
+# sudo_secure_path), in its order, rather than in the caller's PATH (su
+# without - keeps a PATH with no sbin); an entry that is not an absolute
+# directory ("." or empty) is skipped. Split in the shell itself, with no tool
+# that a bare PATH could lack. Warnings go to stderr: the path is this
+# function's output.
 sudoers_tool_path() {
     tool_path=""
-    for tool_dir in /usr/local/sbin /usr/local/bin /usr/sbin /usr/bin /sbin /bin; do
+    tool_dirs="${2:-$(sudo_secure_path)}:"
+    while [ -n "$tool_dirs" ]; do
+        tool_dir=${tool_dirs%%:*}
+        tool_dirs=${tool_dirs#*:}
+        case "$tool_dir" in
+            /*) ;;
+            *) continue ;;
+        esac
+        tool_dir=${tool_dir%/}
         if [ -f "${tool_dir}/$1" ] && [ -x "${tool_dir}/$1" ]; then
             tool_path="${tool_dir}/$1"
             break
@@ -638,22 +675,30 @@ write_sudoers_rules() {
         > "$sudoers_staged"; then
         return 1
     fi
-    # fail2ban-client is a Python script: where sudo keeps the caller's HOME
-    # (Ubuntu before 19.10, or env_keep += HOME), Python runs the .pth files
-    # of the account's ~/.local as root, whatever the rule's arguments.
-    # always_set_home gives every command it runs through sudo root's HOME.
-    sudoers_defaults="Defaults:fivenines always_set_home"
-    rm -f "$sudoers_one"
-    printf '%s\n' "$sudoers_defaults" > "$sudoers_one" && chmod 440 "$sudoers_one"
-    if visudo -cf "$sudoers_one" > /dev/null 2>&1; then
-        printf '%s\n' "$sudoers_defaults" >> "$sudoers_staged"
-        print_success "sudoers default: ${sudoers_defaults}"
-    else
-        print_warning "This host's visudo rejects '${sudoers_defaults}': not written."
-    fi
+    # always_set_home: fail2ban-client is a Python script, and where sudo
+    # keeps the caller's HOME (Ubuntu before 19.10, or env_keep += HOME),
+    # Python runs the .pth files of the account's ~/.local as root, whatever
+    # the rule's arguments; this gives every command it runs through sudo
+    # root's HOME. !requiretty: early RHEL 7 shipped "Defaults requiretty",
+    # and a long-lived host keeps it (/etc/sudoers is %config(noreplace)),
+    # under which sudo refuses every command run with no terminal, the
+    # agent's included. Written whether or not one is set here: it can come
+    # from an included file or from LDAP, and does nothing where none is. A
+    # user's Defaults apply after the global ones, whatever the file order.
+    for sudoers_defaults in "Defaults:fivenines always_set_home" "Defaults:fivenines !requiretty"; do
+        rm -f "$sudoers_one"
+        printf '%s\n' "$sudoers_defaults" > "$sudoers_one" && chmod 440 "$sudoers_one"
+        if visudo -cf "$sudoers_one" > /dev/null 2>&1; then
+            printf '%s\n' "$sudoers_defaults" >> "$sudoers_staged"
+            print_success "sudoers default: ${sudoers_defaults}"
+        else
+            print_warning "This host's visudo rejects '${sudoers_defaults}': not written."
+        fi
+    done
     sudoers_rules=0
+    sudoers_secure_path=$(sudo_secure_path)
     for sudoers_tool in smartctl nvme mdadm fail2ban-client wg; do
-        sudoers_path=$(sudoers_tool_path "$sudoers_tool") || continue
+        sudoers_path=$(sudoers_tool_path "$sudoers_tool" "$sudoers_secure_path") || continue
         # Each tool that can run code or change the host given other
         # arguments is held to the argv the agent runs. sudo matches a
         # wildcard across argument boundaries, so a pattern that must not
@@ -909,6 +954,107 @@ printf '%b\n' "${BLUE}  Fivenines Agent - System Update${NC}"
 printf '%b\n' "${BLUE}===============================================================${NC}"
 echo ""
 
+# The script, run as root with the holder's PID as $1, that takes the lock
+# serialising the runs that change the system installation (#322):
+# fivenines_setup.sh, fivenines_update.sh and fivenines_setup_user.sh
+# --from-system (two moves at once both passed the preflight before either
+# imported, the second replacing the TOKEN and MACHINE_ID the first wrote;
+# an update during a move restarted the agent the move had stopped). The lock
+# is a symbolic link whose target is the holder's PID, made in one step by
+# ln, which fails when it exists: no window where it exists without its PID.
+# One whose holder is gone (killed before its EXIT trap) is taken over, once,
+# under a second link made the same way (.takeover), and only while the lock
+# still names that holder: two runs that found it stale at once could
+# otherwise both take it, the second removing the first's fresh lock. Prints
+# the lock's path (exit 0), or its holder and path (exit 1). Identical in the
+# three scripts (ci/build-scripts.sh).
+setup_lock_script() {
+    cat << 'SETUP_LOCK_EOF'
+lock_path=/etc/fivenines_setup.lock
+if [ -d /run ]; then
+    lock_path=/run/fivenines_setup.lock
+fi
+# A directory there would take the link inside it (ln -s DIR), and every run
+# would believe it held the lock.
+if [ -d "$lock_path" ] && [ ! -L "$lock_path" ]; then
+    printf 'unknown %s\n' "$lock_path"
+    exit 1
+fi
+lock_tries=0
+while ! ln -s "$1" "$lock_path" 2> /dev/null; do
+    lock_tries=$((lock_tries + 1))
+    lock_pid=$(readlink "$lock_path" 2> /dev/null)
+    case "$lock_pid" in
+        "")
+            # Released between the two: tried again, once.
+            if [ "$lock_tries" -le 1 ] && [ ! -L "$lock_path" ]; then
+                continue
+            fi
+            ;;
+        *[!0-9]*) ;;
+        *)
+            if [ "$lock_tries" -le 1 ] && ! kill -0 "$lock_pid" 2> /dev/null \
+                && ln -s "$1" "$lock_path.takeover" 2> /dev/null; then
+                if [ "$(readlink "$lock_path" 2> /dev/null)" = "$lock_pid" ]; then
+                    rm -f "$lock_path"
+                fi
+                rm -f "$lock_path.takeover"
+                continue
+            fi
+            ;;
+    esac
+    printf '%s %s\n' "${lock_pid:-unknown}" "$lock_path"
+    exit 1
+done
+# Made by this run, not inside a directory that appeared meanwhile.
+if [ "$(readlink "$lock_path" 2> /dev/null)" != "$1" ]; then
+    if [ -L "$lock_path/$1" ]; then
+        rm -f "$lock_path/$1"
+    fi
+    printf 'unknown %s\n' "$lock_path"
+    exit 1
+fi
+printf '%s\n' "$lock_path"
+SETUP_LOCK_EOF
+}
+
+# One run at a time with fivenines_setup.sh and fivenines_setup_user.sh
+# --from-system (setup_lock_script): an update during a move restarted the
+# agent the move had stopped. Taken before the agent is stopped.
+acquire_setup_lock() {
+  lock_rc=0
+  lock_out=$(sh -c "$(setup_lock_script)" sh "$$") || lock_rc=$?
+  if [ "$lock_rc" -ne 0 ]; then
+    case "$lock_out" in
+      [0-9]*" /"*)
+        lock_path=${lock_out#* }
+        exit_with_error "Another fivenines installer holds $lock_path (PID ${lock_out%% *}): wait for it to end and re-run. If none runs, remove $lock_path (and $lock_path.takeover, if there is one). Nothing was changed."
+        ;;
+      *)
+        lock_path=${lock_out##* }
+        case "$lock_path" in
+          /*) ;;
+          *) lock_path="/run/fivenines_setup.lock (/etc/fivenines_setup.lock without /run)" ;;
+        esac
+        exit_with_error "Could not take the setup lock $lock_path: it could not be made there (not run as root, a read-only /run), or something other than a lock is there. If no fivenines installer runs, remove it and re-run. Nothing was changed."
+        ;;
+    esac
+  fi
+  SETUP_LOCK="$lock_out"
+  trap cleanup_on_exit EXIT
+}
+
+# Run on every exit once the lock is taken: the private work directory, and
+# the lock, when it is still this run's.
+cleanup_on_exit() {
+  if [ -n "${WORK_DIR:-}" ]; then
+    rm -rf "$WORK_DIR"
+  fi
+  if [ -n "${SETUP_LOCK:-}" ] && [ "$(readlink "$SETUP_LOCK" 2> /dev/null)" = "$$" ]; then
+    rm -f "$SETUP_LOCK"
+  fi
+}
+
 # Is the agent process actually up? Used to report the truth after a failed
 # service-definition update, where the difference between "restarted on the
 # old unit" and "your host is not monitored" is the whole message.
@@ -919,6 +1065,10 @@ agent_is_running() {
     systemctl is-active --quiet fivenines-agent.service
   fi
 }
+
+# Never inherited from the environment: what cleanup_on_exit removes.
+WORK_DIR=""
+SETUP_LOCK=""
 
 # Any other argument is ignored, as every argument was before --with-sudoers
 # existed (a token passed out of habit must not stop an update), and said
@@ -967,6 +1117,8 @@ select_agent_binary || exit_with_error "No agent binary runs on this host -- not
 # update attempt (issue #154).
 verification_preflight "with-startup-files" || exit_with_error "Cannot verify a release on this host -- nothing was changed and the agent is still running."
 
+acquire_setup_lock
+
 # stop the agent (skip in test mode)
 if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
   print_warning "Stopping fivenines-agent service..."
@@ -1009,7 +1161,6 @@ TARBALL_NAME="${BINARY_NAME}.tar.gz"
 # verified-then-extracted file is one nothing else can swap underneath us.
 PREPLACED_TARBALL="/tmp/${TARBALL_NAME}"
 WORK_DIR=$(make_work_dir) || exit_with_error "Failed to create a private temporary directory"
-trap 'rm -rf "$WORK_DIR"' EXIT
 TARBALL_PATH="${WORK_DIR}/${TARBALL_NAME}"
 AGENT_DIR="${INSTALL_DIR}/${BINARY_NAME}"
 AGENT_EXECUTABLE="${AGENT_DIR}/${BINARY_NAME}"

@@ -43,8 +43,8 @@ verification_preflight verify_from_manifest verify_agent_tarball"
 # the one above, which would report it "MISSING" from the user scripts that
 # have no business installing a service at all. The --with-sudoers helpers
 # are system-only for the same reason: they write a root-read sudoers file.
-SYSTEM_FUNCTIONS="install_verified_release_file root_only_path root_only_chain sudoers_tool_path \
-write_sudoers_rules warn_unpinned_sudoers_rules"
+SYSTEM_FUNCTIONS="install_verified_release_file root_only_path root_only_chain sudo_secure_path \
+sudoers_tool_path write_sudoers_rules warn_unpinned_sudoers_rules"
 
 ALL_SCRIPTS="$SCRIPT_DIR/fivenines_setup.sh \
 $SCRIPT_DIR/fivenines_update.sh \
@@ -139,17 +139,13 @@ for func in $PAIR_FUNCTIONS; do
         "$SCRIPT_DIR/fivenines_setup_user.sh" "$SCRIPT_DIR/fivenines_update_user.sh"
 done
 
-# How a state file crosses su (--from-user) and sudo (--from-system): one
-# decoder, so a fix to it cannot reach one direction only.
-check_function_pair decode_state \
-    "$SCRIPT_DIR/fivenines_setup.sh" "$SCRIPT_DIR/fivenines_setup_user.sh"
-
-# How every script finds a user-level agent (agent_pattern: anchored on its
-# path, so nothing else is signalled), writes the scripts that find it
+# How the user scripts find a user-level agent (agent_pattern: anchored on
+# its path, so nothing else is signalled; fivenines_setup.sh --from-user goes
+# by the binary each process runs instead, own_agents), writes the scripts that find it
 # (write_control_scripts, rewritten by the update), and finds the crontab
 # line that starts it (start_spellings). fivenines_setup_user.sh holds the
 # reference copy of each.
-for script in fivenines_setup.sh fivenines_update_user.sh fivenines_uninstall_user.sh; do
+for script in fivenines_update_user.sh fivenines_uninstall_user.sh; do
     check_function_pair agent_pattern \
         "$SCRIPT_DIR/fivenines_setup_user.sh" "$SCRIPT_DIR/$script"
 done
@@ -159,6 +155,19 @@ for script in fivenines_setup.sh fivenines_uninstall_user.sh; do
 done
 check_function_pair write_control_scripts \
     "$SCRIPT_DIR/fivenines_setup_user.sh" "$SCRIPT_DIR/fivenines_update_user.sh"
+check_function_pair agent_started \
+    "$SCRIPT_DIR/fivenines_setup_user.sh" "$SCRIPT_DIR/fivenines_update_user.sh"
+
+# The setup lock (#322): one run at a time of the three scripts that change
+# the system installation. The script that takes it runs as root (through
+# sudo in fivenines_setup_user.sh), and the two root scripts release it the
+# same way: three copies of one lock, which must not drift into two.
+for script in fivenines_update.sh fivenines_setup_user.sh; do
+    check_function_pair setup_lock_script \
+        "$SCRIPT_DIR/fivenines_setup.sh" "$SCRIPT_DIR/$script"
+done
+check_function_pair cleanup_on_exit \
+    "$SCRIPT_DIR/fivenines_setup.sh" "$SCRIPT_DIR/fivenines_update.sh"
 
 # Constants two scripts must agree on, each a whole line. STATE_FILES and
 # STATE_FILE_MAX: what fivenines_setup.sh --from-user and
@@ -190,6 +199,23 @@ for const in STATE_FILES STATE_FILE_MAX; do
         "$(grep "^${const}=" "$SCRIPT_DIR/fivenines_setup_user.sh")" \
         "fivenines_setup.sh / fivenines_setup_user.sh"
 done
+
+# What a user-level installation consists of: the files fivenines_setup.sh
+# --from-user and fivenines_uninstall_user.sh remove, and nothing else in the
+# two directories (#313). A file one of them forgets is left behind; one only
+# it lists, a file of the user's removed by the other.
+for const in USER_INSTALL_FILES USER_CONFIG_FILES; do
+    check_line_pair "$const" \
+        "$(grep "^${const}=" "$SCRIPT_DIR/fivenines_setup.sh")" \
+        "$(grep "^${const}=" "$SCRIPT_DIR/fivenines_uninstall_user.sh")" \
+        "fivenines_setup.sh / fivenines_uninstall_user.sh"
+done
+# And what fivenines_setup_user.sh --from-system takes back when the agent it
+# extracted cannot run.
+check_line_pair USER_INSTALL_FILES \
+    "$(grep "^USER_INSTALL_FILES=" "$SCRIPT_DIR/fivenines_setup.sh")" \
+    "$(grep "^USER_INSTALL_FILES=" "$SCRIPT_DIR/fivenines_setup_user.sh")" \
+    "fivenines_setup.sh / fivenines_setup_user.sh"
 
 check_line_pair "the sudoers marker" \
     "$(sed -n 's/^    sudoers_marker="\(.*\)"$/\1/p' "$COMMON")" \

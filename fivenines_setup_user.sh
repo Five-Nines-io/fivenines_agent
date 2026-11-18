@@ -48,6 +48,14 @@ CONFIG_DIR="${FIVENINES_CONFIG_DIR:-$HOME/.config/fivenines_agent}"
 LOG_FILE="$INSTALL_DIR/agent.log"
 # Never inherited from the environment: ensure_work_dir creates it.
 WORK_DIR=""
+# Never inherited either: what cleanup_on_exit takes back, through sudo -n --
+# root's directory for the state copies, and the setup lock --, and the
+# topmost directory create_directories made for each (mkdir -p), which
+# check_agent_runs removes again, once empty.
+ROOT_STAGE=""
+SETUP_LOCK=""
+CREATED_USER_INSTALL_TOP=""
+CREATED_USER_CONFIG_TOP=""
 
 # Colors for output
 RED='\033[0;31m'
@@ -64,16 +72,18 @@ print_banner() {
     echo ""
 }
 
+# The message is printed as it is (%s): through %b, a backslash sequence in a
+# path it names (a directory another account chose) became an escape.
 print_success() {
-    printf '%b\n' "${GREEN}[+]${NC} $1"
+    printf '%b%s\n' "${GREEN}[+]${NC} " "$1"
 }
 
 print_warning() {
-    printf '%b\n' "${YELLOW}[!]${NC} $1"
+    printf '%b%s\n' "${YELLOW}[!]${NC} " "$1"
 }
 
 print_error() {
-    printf '%b\n' "${RED}[-]${NC} $1"
+    printf '%b%s\n' "${RED}[-]${NC} " "$1"
 }
 
 exit_with_error() {
@@ -552,12 +562,39 @@ select_agent_binary() {
     return 0
 }
 
+# The topmost directory mkdir -p would create for $1 (empty when it exists).
+first_missing_dir() {
+    missing_dir="$1"
+    missing_top=""
+    while [ -n "$missing_dir" ] && [ ! -d "$missing_dir" ]; do
+        missing_top="$missing_dir"
+        missing_dir=$(dirname -- "$missing_dir")
+    done
+    printf '%s' "$missing_top"
+}
+
+# Removes $1 and each parent up to $2, the topmost one this run made, each
+# only once empty (rmdir); one already gone is passed over, so a second run
+# reaches a parent another chain emptied since.
+remove_made_dirs() {
+    made_dir="$1"
+    while [ -n "$2" ]; do
+        if [ -e "$made_dir" ] || [ -L "$made_dir" ]; then
+            rmdir -- "$made_dir" 2> /dev/null || break
+        fi
+        [ "$made_dir" != "$2" ] || break
+        made_dir=$(dirname -- "$made_dir")
+    done
+}
+
 create_directories() {
     echo "Creating directories..."
 
+    CREATED_USER_INSTALL_TOP=$(first_missing_dir "$INSTALL_DIR")
     mkdir -p "$INSTALL_DIR"
     print_success "Install directory: $INSTALL_DIR"
 
+    CREATED_USER_CONFIG_TOP=$(first_missing_dir "$CONFIG_DIR")
     mkdir -p "$CONFIG_DIR"
     print_success "Config directory: $CONFIG_DIR"
 
@@ -574,6 +611,25 @@ save_token() {
     echo ""
 }
 
+# Run on every exit: the private work directory and, for --from-system,
+# root's directory for the state copies and the setup lock (when it is still
+# this run's), both through sudo -n: at the end of a long run sudo may want a
+# password again, and the exit never waits for one (the lock is then taken
+# over as stale by the next run, and /tmp is cleaned at boot).
+cleanup_on_exit() {
+    if [ -n "${ROOT_STAGE:-}" ]; then
+        # shellcheck disable=SC2016
+        sudo -n sh -c 'rm -rf -- "$1"' sh "$ROOT_STAGE" > /dev/null 2>&1 || true
+    fi
+    if [ -n "${SETUP_LOCK:-}" ]; then
+        # shellcheck disable=SC2016
+        sudo -n sh -c '[ "$(readlink "$1")" = "$2" ] && rm -f "$1"' sh "$SETUP_LOCK" "$$" > /dev/null 2>&1 || true
+    fi
+    if [ -n "${WORK_DIR:-}" ]; then
+        rm -rf "$WORK_DIR"
+    fi
+}
+
 # One private work directory per run, removed on exit (--from-system needs it
 # before the agent is downloaded).
 ensure_work_dir() {
@@ -581,7 +637,7 @@ ensure_work_dir() {
         return 0
     fi
     WORK_DIR=$(make_work_dir) || exit_with_error "Failed to create a private temporary directory"
-    trap 'rm -rf "$WORK_DIR"' EXIT
+    trap cleanup_on_exit EXIT
 }
 
 download_agent() {
@@ -677,11 +733,14 @@ agent_pattern() {
 # spelling it was written with, while fivenines_update_user.sh rewrites these
 # scripts with the one it was given -- a stop.sh trusting the path alone said
 # "not running", and the update started a second agent with the same
-# identity. The recorded PID is taken only when /proc shows an agent binary
-# as its argv[0], so a PID the system has since reused (by a tail -f of the
-# agent's log, say) is never signalled. The update rewrites
-# these scripts so an existing installation gets them; never start.sh, which
-# carries the config directory the installation was made with.
+# identity. The recorded PID is taken only when the binary it runs
+# (/proc/PID/exe, resolved) is one of this installation's own (resolved with
+# pwd -P), so neither a PID the system has since reused (by a tail -f of the
+# agent's log, say) nor another installation's agent under the same account,
+# which a command-line shape matched (#324), is ever signalled; /proc/PID/exe
+# reads only for this user's own processes. The update rewrites these scripts
+# so an existing installation gets them; never start.sh, which carries the
+# config directory the installation was made with.
 write_control_scripts() {
     # Every path goes into the scripts single-quoted, its own single quotes
     # written as '\'', so a directory name of any spelling stays one word.
@@ -694,9 +753,12 @@ AGENT_PID=\$(cat $control_dir/agent.pid 2>/dev/null)
 case "\$AGENT_PID" in
     ''|*[!0-9]*) ;;
     *)
-        if tr '\0' '\n' < "/proc/\$AGENT_PID/cmdline" 2>/dev/null | head -n 1 \\
-            | grep -q '/fivenines-agent-[^/]*/fivenines-agent-[^/]*\$'; then
-            PIDS="\$PIDS \$AGENT_PID"
+        AGENT_EXE=\$(readlink -f "/proc/\$AGENT_PID/exe" 2>/dev/null)
+        AGENT_HOME=\$(cd $control_dir 2>/dev/null && pwd -P)
+        if [ -n "\$AGENT_EXE" ] && [ -n "\$AGENT_HOME" ]; then
+            case "\$AGENT_EXE" in
+                "\$AGENT_HOME"/fivenines-agent-*/fivenines-agent-*) PIDS="\$PIDS \$AGENT_PID" ;;
+            esac
         fi
         ;;
 esac
@@ -760,13 +822,16 @@ EOF
 
 # How a crontab line can name INSTALL_DIR's start.sh: the absolute path the
 # installers print and, when INSTALL_DIR is under HOME, the ~/ form the README
-# shows and its $HOME/ and ${HOME}/ forms. Sets START_SPELLING_1 to _4 (all
-# four the absolute path when INSTALL_DIR is not under HOME).
+# shows and its $HOME/ and ${HOME}/ forms; and the absolute path as it reads
+# between single quotes, each ' written '\'' (shell_quote, the way
+# add_reboot_entry writes a path that needs quoting, #319). Sets
+# START_SPELLING_1 to _5 (each the absolute path when it has no other form).
 start_spellings() {
     START_SPELLING_1="$1/start.sh"
     START_SPELLING_2="$START_SPELLING_1"
     START_SPELLING_3="$START_SPELLING_1"
     START_SPELLING_4="$START_SPELLING_1"
+    START_SPELLING_5=$(printf '%s' "$START_SPELLING_1" | sed "s/'/'\\\\''/g")
     start_rel="${1#"$2"/}"
     if [ -n "$2" ] && [ "$start_rel" != "$1" ]; then
         # The tilde and the dollar signs are the literal text of the line.
@@ -798,6 +863,23 @@ EOF
     echo ""
 }
 
+# Does the agent start.sh just started still run? The PID it recorded, when
+# that process runs this installation's binary (/proc/PID/exe, readable for
+# this user's own processes only): a pgrep of its path also counted another
+# user's process started under that path, and a run that failed read as one
+# that started.
+agent_started() {
+    started_pid=$(cat "$INSTALL_DIR/agent.pid" 2> /dev/null) || return 1
+    case "$started_pid" in
+        "" | *[!0-9]*) return 1 ;;
+    esac
+    started_exe=$(readlink -f "/proc/$started_pid/exe" 2> /dev/null) || return 1
+    [ -n "$started_exe" ] \
+        && [ "$started_exe" = "$(readlink -f "$INSTALL_DIR/$BINARY_NAME/$BINARY_NAME" 2> /dev/null)" ]
+}
+
+# Non-zero when the agent is not running two seconds after start.sh: a plain
+# install only warns, --from-system fails (#315).
 start_agent() {
     echo "Starting agent..."
 
@@ -806,14 +888,56 @@ start_agent() {
     # Wait a moment and check if it's running
     sleep 2
 
-    if pgrep -f "$(agent_pattern "$INSTALL_DIR")" > /dev/null; then
+    if agent_started; then
         print_success "Agent is running"
-    else
-        print_warning "Agent may have failed to start. Check logs:"
-        echo "  $INSTALL_DIR/logs.sh"
+        echo ""
+        return 0
     fi
-
+    print_warning "Agent may have failed to start. Check logs:"
+    echo "  $INSTALL_DIR/logs.sh"
     echo ""
+    return 1
+}
+
+# The shell word for $1: as it is when it holds only characters no shell reads
+# specially, else between single quotes, each ' written '\''. cron hands a
+# crontab line to sh, so an unquoted path with a space ran its first word
+# (#319).
+shell_quote() {
+    case "$1" in
+        "" | *[!A-Za-z0-9_./+-]*)
+            printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+            ;;
+        *)
+            printf '%s' "$1"
+            ;;
+    esac
+}
+
+# The @reboot line that starts this installation, or nothing and a non-zero
+# status when its path holds a % or a new line: cron reads a % as the end of
+# the command (and the escape differs: cronie and Vixie cron take \%, while
+# BusyBox's crond keeps the backslash), and a new line ends a crontab line.
+reboot_line() {
+    case "$INSTALL_DIR" in
+        *%* | *"
+"*)
+            return 1
+            ;;
+    esac
+    printf '@reboot %s' "$(shell_quote "$INSTALL_DIR/start.sh")"
+}
+
+# What a message tells the user to do so the agent starts at boot, ending it:
+# add the @reboot line (last, so it can be copied whole), or, when its path
+# cannot be carried by one (reboot_line), start it from a script of their own;
+# never the raw line, which cron would misread.
+reboot_advice() {
+    if reboot_advice_line=$(reboot_line); then
+        printf 'add this line to your crontab (crontab -e): %s' "$reboot_advice_line"
+    else
+        printf 'start %s at boot from a script of your own (its path holds a %% or a new line, which a crontab line cannot carry)' "$INSTALL_DIR/start.sh"
+    fi
 }
 
 print_crontab_instructions() {
@@ -824,7 +948,12 @@ print_crontab_instructions() {
     echo "To automatically start the agent when your server reboots,"
     echo "add this line to your crontab (run: crontab -e):"
     echo ""
-    printf '%b\n' "${GREEN}@reboot $INSTALL_DIR/start.sh${NC}"
+    if crontab_line=$(reboot_line); then
+        printf '%b%s%b\n' "$GREEN" "$crontab_line" "$NC"
+    else
+        echo "  (the path $INSTALL_DIR holds a % or a new line, which a crontab line"
+        echo "  cannot carry as is: start $INSTALL_DIR/start.sh from a script of your own)"
+    fi
     echo ""
 }
 
@@ -886,6 +1015,10 @@ COPIED_STATE_FILES=""
 # A state file is a few KB at most: anything bigger is not one.
 STATE_FILE_MAX=16777216
 SYSTEM_CONFIG_DIR="/etc/fivenines_agent"
+# What a user-level installation's directory holds (fivenines_setup.sh
+# removes the same after --from-user; ci/build-scripts.sh keeps the lines
+# equal): what check_agent_runs takes back when the agent cannot run here.
+USER_INSTALL_FILES="start.sh stop.sh status.sh logs.sh refresh.sh agent.pid agent.log"
 
 # as_root SCRIPT [ARG...]: run SCRIPT with sh through sudo, with the ARGs as
 # $1, $2... They are never pasted into SCRIPT, so a path is never parsed as
@@ -894,6 +1027,93 @@ as_root() {
     as_root_script="$1"
     shift
     sudo sh -c "$as_root_script" sh "$@"
+}
+
+# The script, run as root with the holder's PID as $1, that takes the lock
+# serialising the runs that change the system installation (#322):
+# fivenines_setup.sh, fivenines_update.sh and fivenines_setup_user.sh
+# --from-system (two moves at once both passed the preflight before either
+# imported, the second replacing the TOKEN and MACHINE_ID the first wrote;
+# an update during a move restarted the agent the move had stopped). The lock
+# is a symbolic link whose target is the holder's PID, made in one step by
+# ln, which fails when it exists: no window where it exists without its PID.
+# One whose holder is gone (killed before its EXIT trap) is taken over, once,
+# under a second link made the same way (.takeover), and only while the lock
+# still names that holder: two runs that found it stale at once could
+# otherwise both take it, the second removing the first's fresh lock. Prints
+# the lock's path (exit 0), or its holder and path (exit 1). Identical in the
+# three scripts (ci/build-scripts.sh).
+setup_lock_script() {
+    cat << 'SETUP_LOCK_EOF'
+lock_path=/etc/fivenines_setup.lock
+if [ -d /run ]; then
+    lock_path=/run/fivenines_setup.lock
+fi
+# A directory there would take the link inside it (ln -s DIR), and every run
+# would believe it held the lock.
+if [ -d "$lock_path" ] && [ ! -L "$lock_path" ]; then
+    printf 'unknown %s\n' "$lock_path"
+    exit 1
+fi
+lock_tries=0
+while ! ln -s "$1" "$lock_path" 2> /dev/null; do
+    lock_tries=$((lock_tries + 1))
+    lock_pid=$(readlink "$lock_path" 2> /dev/null)
+    case "$lock_pid" in
+        "")
+            # Released between the two: tried again, once.
+            if [ "$lock_tries" -le 1 ] && [ ! -L "$lock_path" ]; then
+                continue
+            fi
+            ;;
+        *[!0-9]*) ;;
+        *)
+            if [ "$lock_tries" -le 1 ] && ! kill -0 "$lock_pid" 2> /dev/null \
+                && ln -s "$1" "$lock_path.takeover" 2> /dev/null; then
+                if [ "$(readlink "$lock_path" 2> /dev/null)" = "$lock_pid" ]; then
+                    rm -f "$lock_path"
+                fi
+                rm -f "$lock_path.takeover"
+                continue
+            fi
+            ;;
+    esac
+    printf '%s %s\n' "${lock_pid:-unknown}" "$lock_path"
+    exit 1
+done
+# Made by this run, not inside a directory that appeared meanwhile.
+if [ "$(readlink "$lock_path" 2> /dev/null)" != "$1" ]; then
+    if [ -L "$lock_path/$1" ]; then
+        rm -f "$lock_path/$1"
+    fi
+    printf 'unknown %s\n' "$lock_path"
+    exit 1
+fi
+printf '%s\n' "$lock_path"
+SETUP_LOCK_EOF
+}
+
+# One run at a time with fivenines_setup.sh and fivenines_update.sh
+# (setup_lock_script, run as root), taken once sudo authenticated and before
+# anything of the system installation is read.
+acquire_setup_lock() {
+    lock_rc=0
+    lock_out=$(as_root "$(setup_lock_script)" "$$") || lock_rc=$?
+    lock_out=$(printf '%s\n' "$lock_out" | tail -n 1)
+    if [ "$lock_rc" -ne 0 ]; then
+        case "$lock_out" in
+            [0-9]*" /"*)
+                lock_path=${lock_out#* }
+                exit_with_error "Another fivenines installer holds $lock_path (PID ${lock_out%% *}): wait for it to end and re-run. If none runs, remove $lock_path (and $lock_path.takeover, if there is one) with sudo."
+                ;;
+            "") exit_with_error "Could not take the setup lock: sudo did not run it (--from-system needs sudo to run sh as root)." ;;
+            *)
+                exit_with_error "Could not take the setup lock ${lock_out##* }: it could not be made there (a read-only /run), or something other than a lock is there. If no fivenines installer runs, remove it with sudo and re-run."
+                ;;
+        esac
+    fi
+    SETUP_LOCK="$lock_out"
+    trap cleanup_on_exit EXIT
 }
 
 # A user-level install on a host that runs the system agent too: both would
@@ -954,11 +1174,9 @@ preflight_system_takeover() {
     if ! command -v sudo > /dev/null 2>&1; then
         exit_with_error "--from-system needs sudo, to read, stop and remove the system installation."
     fi
-    if ! command -v base64 > /dev/null 2>&1; then
-        exit_with_error "--from-system needs base64 (coreutils or busybox) to carry the agent's state over."
-    fi
     echo "Moving the system installation needs sudo: to read its token, then stop and remove it."
     sudo -v || exit_with_error "sudo did not authenticate: nothing was changed."
+    acquire_setup_lock
     # The quoted $1 is as_root's argument, expanded by root's shell.
     # shellcheck disable=SC2016
     if ! as_root 'test -f "$1" && test -s "$1"' "$SYSTEM_CONFIG_DIR/TOKEN"; then
@@ -970,44 +1188,68 @@ preflight_system_takeover() {
     echo ""
 }
 
-# su and sudo can print to stdout before the command does (a PAM session
-# module: RHEL's postlogin runs pam_lastlog with showfailed, which reports
-# failed logins), so a state file crosses over base64-encoded between two
-# marker lines, and only what lies between them is kept. base64's alphabet has
-# no dash, so no encoded line can read as a marker. fivenines_setup.sh
-# carries the same function, for su (ci/build-scripts.sh keeps them equal).
-decode_state() {
-    # Both markers on lines of their own: output printed before the data with
-    # no newline would hide the first, and an empty file would read as one.
-    if ! grep -qx 'fivenines-state-begin' "$1" || ! grep -qx 'fivenines-state-end' "$1"; then
-        return 1
-    fi
-    sed -n '/^fivenines-state-begin$/,/^fivenines-state-end$/p' "$1" | sed '1d;$d' | base64 -d > "$2"
-}
-
-# Read each state file through sudo, after the system agent stopped (it may
-# have just swapped its token), then put it in this user's config directory.
-# A file that exists but is not a regular file, or cannot be read, stops the
-# move rather than being dropped: a journal allowlist left behind would let
-# the agent read every unit's journal.
+# Each state file is copied by root, through sudo, into a directory of root's
+# own (ROOT_STAGE: made by mktemp -d, 0711, so this user can reach a file in it
+# but not list it, nor put anything there), and handed over (chown) to this
+# user, who copies it into its private work directory, checks it and puts it
+# in the config directory, after the system agent stopped (it may have just
+# swapped its token). Root writes, and chowns, nothing by name in a directory
+# this user controls: there a link this user's processes planted between two
+# of root's steps would have made root write, or hand over, a file of its
+# choosing. Read through sudo's
+# stdout instead, it was recorded by sudo's I/O log under "Defaults
+# log_output" (audited hosts, often shipped off the host): the TOKEN, and with
+# it the host's configuration and every service credential it carries (#318).
+# A file that exists but is not a regular file stops the move rather than
+# being dropped: a journal allowlist left behind would let the agent read
+# every unit's journal.
 copy_system_state() {
     state_stash="${WORK_DIR}/system_state"
     mkdir "$state_stash" || return 1
+    # The path goes through sudo's output: it names nothing secret. The $ are
+    # for root's shell.
+    # shellcheck disable=SC2016
+    ROOT_STAGE=$(as_root 'umask 077 && stage=$(mktemp -d /tmp/fivenines-state.XXXXXX) && chmod 711 "$stage" && printf "%s\n" "$stage"' | tail -n 1)
+    case "$ROOT_STAGE" in
+        /tmp/fivenines-state.?*) ;;
+        *)
+            ROOT_STAGE=""
+            print_error "Could not make a directory for root's copies of the state files."
+            return 1
+            ;;
+    esac
+    copy_rc=0
+    copy_system_state_files || copy_rc=$?
+    # shellcheck disable=SC2016
+    as_root 'rm -rf -- "$1"' "$ROOT_STAGE" > /dev/null 2>&1 || true
+    ROOT_STAGE=""
+    return "$copy_rc"
+}
+
+copy_system_state_files() {
     for state_file in $STATE_FILES .env; do
         state_rc=0
         # shellcheck disable=SC2016
         as_root '
             if [ ! -e "$1" ] && [ ! -L "$1" ]; then exit 3; fi
             if [ -L "$1" ] || [ ! -f "$1" ]; then exit 4; fi
-            echo "fivenines-state-begin"
-            head -c "$2" -- "$1" | base64
-            echo "fivenines-state-end"' "$SYSTEM_CONFIG_DIR/$state_file" "$((STATE_FILE_MAX + 1))" \
-            > "$state_stash/$state_file.b64" || state_rc=$?
-        if [ "$state_rc" -eq 0 ] \
-            && ! decode_state "$state_stash/$state_file.b64" "$state_stash/$state_file"; then
-            state_rc=5
-        fi
-        rm -f "${state_stash:?}/${state_file:?}.b64"
+            size=$(wc -c < "$1") || exit 5
+            size=${size##* }
+            case "$size" in
+                "" | *[!0-9]*) exit 5 ;;
+            esac
+            if [ "$size" -gt "$3" ]; then exit 6; fi
+            umask 077
+            # At most one byte past the limit is read: the file may have grown
+            # since its size was read, and root must not copy it whole. $2 is
+            # in the directory root made for these copies.
+            rm -f "$2" && head -c "$(($3 + 1))" -- "$1" > "$2" || exit 5
+            size=$(wc -c < "$2") || exit 5
+            size=${size##* }
+            if [ "$size" -gt "$3" ]; then rm -f "$2"; exit 6; fi
+            chown "$4" "$2" || exit 5' \
+            "$SYSTEM_CONFIG_DIR/$state_file" "$ROOT_STAGE/$state_file" "$STATE_FILE_MAX" "$(id -u)" \
+            > /dev/null || state_rc=$?
         case "$state_rc" in
             0) ;;
             3)
@@ -1017,13 +1259,20 @@ copy_system_state() {
                 print_error "$SYSTEM_CONFIG_DIR/$state_file is not a regular file: fix or remove it, then re-run."
                 return 1
                 ;;
+            6)
+                print_error "$SYSTEM_CONFIG_DIR/$state_file is larger than any agent state file."
+                return 1
+                ;;
             *)
                 print_error "Could not read $SYSTEM_CONFIG_DIR/$state_file."
                 return 1
                 ;;
         esac
-        if [ "$(wc -c < "$state_stash/$state_file")" -gt "$STATE_FILE_MAX" ]; then
-            print_error "$SYSTEM_CONFIG_DIR/$state_file is larger than any agent state file."
+        # What root copied, as this user reads it, into its own directory.
+        if ! (umask 077 && cp -- "$ROOT_STAGE/$state_file" "$state_stash/$state_file") \
+            || [ ! -f "$state_stash/$state_file" ] || [ ! -r "$state_stash/$state_file" ] \
+            || [ "$(wc -c < "$state_stash/$state_file")" -gt "$STATE_FILE_MAX" ]; then
+            print_error "Could not read $SYSTEM_CONFIG_DIR/$state_file."
             return 1
         fi
     done
@@ -1054,26 +1303,42 @@ copy_system_state() {
 }
 
 # What the service's own start would do; used to put the system agent back
-# when the move fails before anything was removed.
-# fivenines_uninstall.sh disables the service before it removes the TOKEN:
-# undone between the two, the agent is enabled again, not only started.
+# when the move fails before anything was removed. Only what was so before
+# the move: started again only if it ran, and enabled again only if it was
+# enabled (fivenines_uninstall.sh disables the service before it removes the
+# TOKEN, so undone between the two it is enabled again, not only started),
+# so an undone move never brings back a system agent the operator had stopped
+# or disabled (#325).
 restart_system_agent() {
     if [ "${FIVENINES_TEST_MODE:-}" = "1" ]; then
         return 0
     fi
     restart_rc=0
+    # shellcheck disable=SC2016
     as_root '
         if [ -f /etc/systemd/system/fivenines-agent.service ] && command -v systemctl > /dev/null 2>&1; then
-            systemctl enable fivenines-agent.service > /dev/null 2>&1 || true
-            systemctl start fivenines-agent.service
+            if [ "$1" = 1 ]; then
+                systemctl enable fivenines-agent.service > /dev/null 2>&1 || true
+            fi
+            if [ "$2" = 1 ]; then
+                systemctl start fivenines-agent.service
+            fi
         elif [ -f /etc/init.d/fivenines-agent ] && command -v rc-service > /dev/null 2>&1; then
-            rc-update add fivenines-agent default > /dev/null 2>&1 || true
-            rc-service fivenines-agent start
+            if [ "$1" = 1 ]; then
+                rc-update add fivenines-agent default > /dev/null 2>&1 || true
+            fi
+            if [ "$2" = 1 ]; then
+                rc-service fivenines-agent start
+            fi
         else
             exit 3
-        fi' || restart_rc=$?
+        fi' "$SYSTEM_AGENT_ENABLED" "$SYSTEM_AGENT_ACTIVE" || restart_rc=$?
     case "$restart_rc" in
-        0) ;;
+        0)
+            if [ "$SYSTEM_AGENT_ACTIVE" != "1" ]; then
+                print_warning "The system agent was not running before the move: it was left stopped."
+            fi
+            ;;
         # fivenines_uninstall.sh removes the service definition before the
         # TOKEN: cut between the two, it leaves an identity no service starts.
         3) print_warning "The system agent was not started again: its service definition is gone, while its TOKEN is still in $SYSTEM_CONFIG_DIR. Re-run --from-system to finish the move: it carries that TOKEN over again (removing the system installation first would lose it)." ;;
@@ -1100,9 +1365,37 @@ abort_system_takeover() {
     fi
     # shellcheck disable=SC2016
     if as_root '! test -e "$1/TOKEN"' "$SYSTEM_CONFIG_DIR"; then
-        exit_with_error "Stopped after the system installation was removed: the agent's identity is now in $CONFIG_DIR. Start the agent with $INSTALL_DIR/start.sh, and add '@reboot $INSTALL_DIR/start.sh' to your crontab (crontab -e)."
+        exit_with_error "Stopped after the system installation was removed: the agent's identity is now in $CONFIG_DIR. Start the agent with $INSTALL_DIR/start.sh, and $(reboot_advice)"
     fi
     exit_with_error "Stopped, and sudo could not tell whether $SYSTEM_CONFIG_DIR/TOKEN still exists. If it does, remove what was copied to $CONFIG_DIR and start the system agent again; if it does not, start this one with $INSTALL_DIR/start.sh."
+}
+
+# The agent this run extracted must run as this user before the system
+# installation is removed (#315): a home mounted noexec (common on hardened
+# hosts), or any other exec failure, ended in a removed system installation
+# and a run that read as a success while the host no longer reported.
+# --version exits before the agent module is imported.
+check_agent_runs() {
+    if "$INSTALL_DIR/$BINARY_NAME/$BINARY_NAME" --version > /dev/null 2>&1; then
+        return 0
+    fi
+    # Nothing of this installation can run here: what this run wrote of it
+    # (the agent, the control scripts create_run_script wrote, never the
+    # agent.pid and agent.log only an agent writes) goes, and each directory
+    # it made, once empty, so a re-run elsewhere leaves nothing behind here.
+    rm -rf -- "${INSTALL_DIR:?}/${BINARY_NAME:?}"
+    for install_file in $USER_INSTALL_FILES; do
+        case "$install_file" in
+            agent.pid | agent.log) continue ;;
+        esac
+        rm -f -- "${INSTALL_DIR:?}/${install_file:?}"
+    done
+    remove_made_dirs "$INSTALL_DIR" "$CREATED_USER_INSTALL_TOP"
+    remove_made_dirs "$CONFIG_DIR" "$CREATED_USER_CONFIG_TOP"
+    # A directory made for both (a parent they share, or a config directory
+    # inside the install one) is empty only now.
+    remove_made_dirs "$INSTALL_DIR" "$CREATED_USER_INSTALL_TOP"
+    exit_with_error "The agent extracted to $INSTALL_DIR/$BINARY_NAME does not run as $(id -un) (is that file system mounted noexec?), so the system installation was not changed. Install it in a directory where this user may run programs (FIVENINES_INSTALL_DIR), and re-run."
 }
 
 # Once this installation is in place (not started).
@@ -1110,7 +1403,38 @@ take_over_system_install() {
     # Not interrupted halfway: stopped, the system agent would stay stopped,
     # nothing yet armed to start it again.
     trap '' INT TERM HUP
+    # What an undone move restores (#325), and the uid of the system agent's
+    # account, recorded before the uninstaller removes it: its processes are
+    # told from any other user's by it (#306). When sudo cannot tell, the
+    # service is taken as it is by default, enabled and running.
+    SYSTEM_AGENT_ENABLED=1
+    SYSTEM_AGENT_ACTIVE=1
+    SYSTEM_AGENT_UID=""
     if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
+        system_agent_state=0
+        # shellcheck disable=SC2016
+        as_root '
+            state=0
+            if [ -f /etc/systemd/system/fivenines-agent.service ] && command -v systemctl > /dev/null 2>&1; then
+                systemctl is-enabled --quiet fivenines-agent.service 2> /dev/null || state=$((state + 1))
+                systemctl is-active --quiet fivenines-agent.service 2> /dev/null || state=$((state + 2))
+            elif [ -f /etc/init.d/fivenines-agent ] && command -v rc-service > /dev/null 2>&1; then
+                rc-update show default 2> /dev/null | grep -q fivenines-agent || state=$((state + 1))
+                rc-service fivenines-agent status > /dev/null 2>&1 || state=$((state + 2))
+            fi
+            exit $((10 + state))' > /dev/null 2>&1 || system_agent_state=$?
+        case "$system_agent_state" in
+            11) SYSTEM_AGENT_ENABLED=0 ;;
+            12) SYSTEM_AGENT_ACTIVE=0 ;;
+            13)
+                SYSTEM_AGENT_ENABLED=0
+                SYSTEM_AGENT_ACTIVE=0
+                ;;
+        esac
+        SYSTEM_AGENT_UID=$(as_root 'id -u fivenines' 2> /dev/null | tail -n 1)
+        case "$SYSTEM_AGENT_UID" in
+            "" | *[!0-9]*) SYSTEM_AGENT_UID="" ;;
+        esac
         print_warning "Stopping the system agent..."
         as_root '
             if [ -f /etc/systemd/system/fivenines-agent.service ] && command -v systemctl > /dev/null 2>&1; then
@@ -1147,7 +1471,7 @@ take_over_system_install() {
     # was. A sudo that fails reads as not gone.
     # shellcheck disable=SC2016
     if ! as_root '! test -e "$1/TOKEN"' "$SYSTEM_CONFIG_DIR"; then
-        abort_system_takeover "fivenines_uninstall.sh did not remove the system installation: what was copied was taken back, and the system agent restarted if it could be. Check it (sudo systemctl status fivenines-agent), fix what failed, and re-run."
+        abort_system_takeover "fivenines_uninstall.sh did not remove the system installation: what was copied was taken back, and the system agent put back as it was (see above). Check it (sudo systemctl status fivenines-agent), fix what failed, and re-run."
     fi
     # Past this point the identity lives only in this user's config, so a
     # leftover service definition is said, never undone: without its TOKEN it
@@ -1156,11 +1480,21 @@ take_over_system_install() {
         print_warning "The fivenines-agent service definition is still installed (it cannot start without its TOKEN): remove it with fivenines_uninstall.sh."
     fi
     # Never two agents with one identity: if the system agent survived its
-    # removal, this one is installed but not started.
+    # removal, this one is installed but not started. Only a process of the
+    # system agent's account counts (#306): any local user can start one whose
+    # command line starts with /opt/fivenines/, which kept this agent from
+    # starting once the system installation was gone. With that uid unknown,
+    # any process does.
     # shellcheck disable=SC2016
-    if [ "${FIVENINES_TEST_MODE:-}" != "1" ] \
-        && as_root 'pgrep -f "^/opt/fivenines/" > /dev/null 2>&1'; then
-        exit_with_error "The system agent still runs. Stop and disable it (sudo systemctl disable fivenines-agent; sudo systemctl stop fivenines-agent), then start this one with $INSTALL_DIR/start.sh, and add '@reboot $INSTALL_DIR/start.sh' to your crontab (crontab -e). Its identity is in $CONFIG_DIR."
+    if [ "${FIVENINES_TEST_MODE:-}" != "1" ] && as_root '
+        for pid in $(pgrep -f "^/opt/fivenines/" 2> /dev/null); do
+            uid=$(awk "/^Uid:/ { print \$2; exit }" "/proc/$pid/status" 2> /dev/null)
+            if [ -z "$1" ] || [ "$uid" = "$1" ]; then
+                exit 0
+            fi
+        done
+        exit 1' "$SYSTEM_AGENT_UID" > /dev/null 2>&1; then
+        exit_with_error "The system agent still runs. This agent's identity is in $CONFIG_DIR. Stop and disable the system agent (sudo systemctl disable fivenines-agent; sudo systemctl stop fivenines-agent), then start this one with $INSTALL_DIR/start.sh, and $(reboot_advice)"
     fi
     # The system installation is gone: what is left (start the agent, add its
     # @reboot line) takes seconds, and cut halfway it would leave an agent
@@ -1170,24 +1504,66 @@ take_over_system_install() {
 }
 
 # The system agent started at boot; this one does too, from the crontab line
-# print_crontab_instructions describes.
+# print_crontab_instructions describes. Already there when an @reboot line
+# runs start.sh, in any of its spellings, as a word of its own (#320): a line
+# that merely names it (a backup cp of it, a commented-out line) starts
+# nothing. And the crontab is written only once it was read: crontab -l fails
+# with "no crontab for USER" (BusyBox: "No such file or directory") when there
+# is none, and any other failure (a transient error, cron.deny) read as an
+# empty crontab, which the write then replaced with the @reboot line alone
+# (#321).
 add_reboot_entry() {
-    reboot_line="@reboot $INSTALL_DIR/start.sh"
     if ! command -v crontab > /dev/null 2>&1; then
         print_warning "No crontab command here, so nothing starts the agent at boot."
         return 1
     fi
-    reboot_entries=$(crontab -l 2>/dev/null || true)
+    if ! new_reboot_line=$(reboot_line); then
+        print_warning "Not added to your crontab: the path $INSTALL_DIR holds a % or a new line, which a crontab line cannot carry as is."
+        return 1
+    fi
+    ensure_work_dir
+    if reboot_entries=$(LC_ALL=C crontab -l 2> "$WORK_DIR/crontab.err"); then
+        :
+    elif grep -qi -e 'no crontab for' -e 'No such file or directory' "$WORK_DIR/crontab.err"; then
+        reboot_entries=""
+    else
+        print_warning "Could not read your crontab ($(head -n 1 "$WORK_DIR/crontab.err")): it was left as it is, and nothing starts the agent at boot."
+        return 1
+    fi
     start_spellings "$INSTALL_DIR" "$HOME"
-    # A line commented out starts nothing.
-    if printf '%s\n' "$reboot_entries" | grep -v '^[[:space:]]*#' \
-        | grep -qF -e "$START_SPELLING_1" -e "$START_SPELLING_2" \
-        -e "$START_SPELLING_3" -e "$START_SPELLING_4"; then
+    # The spellings go through the environment: awk -v would read the
+    # backslashes a path may hold as escapes.
+    if printf '%s\n' "$reboot_entries" | S1="$START_SPELLING_1" S2="$START_SPELLING_2" \
+        S3="$START_SPELLING_3" S4="$START_SPELLING_4" S5="$START_SPELLING_5" awk '
+        # Does cmd run s, as a word of its own: preceded by nothing, a blank,
+        # an opening quote or a shell separator, and followed likewise?
+        function runs(cmd, s,    rest, i, before, after) {
+            rest = cmd
+            while (s != "" && (i = index(rest, s)) > 0) {
+                before = (i > 1) ? substr(rest, i - 1, 1) : ""
+                after = substr(rest, i + length(s), 1)
+                if ((before == "" || index(" \t;&|(\"\047", before) > 0) \
+                    && (after == "" || index(" \t;&|)<>\"\047", after) > 0)) {
+                    return 1
+                }
+                rest = substr(rest, i + 1)
+            }
+            return 0
+        }
+        $1 == "@reboot" {
+            cmd = $0
+            sub(/^[ \t]*@reboot[ \t]+/, "", cmd)
+            if (runs(cmd, ENVIRON["S1"]) || runs(cmd, ENVIRON["S2"]) || runs(cmd, ENVIRON["S3"]) \
+                || runs(cmd, ENVIRON["S4"]) || runs(cmd, ENVIRON["S5"])) {
+                found = 1
+            }
+        }
+        END { exit !found }'; then
         print_success "Your crontab already starts the agent at boot"
         return 0
     fi
-    if { if [ -n "$reboot_entries" ]; then printf '%s\n' "$reboot_entries"; fi; printf '%s\n' "$reboot_line"; } | crontab -; then
-        print_success "Added to your crontab: $reboot_line"
+    if { if [ -n "$reboot_entries" ]; then printf '%s\n' "$reboot_entries"; fi; printf '%s\n' "$new_reboot_line"; } | crontab -; then
+        print_success "Added to your crontab: $new_reboot_line"
         echo ""
         return 0
     fi
@@ -1271,10 +1647,14 @@ fi
 download_agent
 create_run_script
 if [ "$FROM_SYSTEM" = "1" ]; then
+    check_agent_runs
     take_over_system_install
 fi
+AGENT_START_FAILED=0
 if [ "${FIVENINES_TEST_MODE:-}" != "1" ]; then
-  start_agent
+  if ! start_agent; then
+      AGENT_START_FAILED=1
+  fi
 else
   print_warning "Skipping agent startup (test mode)"
 fi
@@ -1284,6 +1664,15 @@ if [ "$FROM_SYSTEM" = "1" ] && add_reboot_entry; then
 fi
 # --from-system set it in take_over_system_install: the move is complete.
 trap - INT TERM HUP
+# The system installation is gone: an agent that did not start here is a
+# host no longer reporting, so the run fails rather than end in success
+# (#315). Its @reboot line was added all the same.
+if [ "$FROM_SYSTEM" = "1" ] && [ "$AGENT_START_FAILED" = "1" ]; then
+    if [ "$REBOOT_ENTRY_ADDED" = "1" ]; then
+        exit_with_error "The system installation was removed, but this agent did not start: its identity is in $CONFIG_DIR. Check $INSTALL_DIR/logs.sh, fix what failed, and start it with $INSTALL_DIR/start.sh (your crontab starts it at boot)."
+    fi
+    exit_with_error "The system installation was removed, but this agent did not start: its identity is in $CONFIG_DIR. Check $INSTALL_DIR/logs.sh, fix what failed, start it with $INSTALL_DIR/start.sh, and $(reboot_advice)"
+fi
 print_final_instructions
 
 # Clean up script
