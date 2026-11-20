@@ -426,9 +426,13 @@ things differ:
   from the WMI Storage namespace for the drive inventory -- friendly name, media
   type, bus type, size, serial, health and operational status -- and merges in
   `MSFT_StorageReliabilityCounter` for temperature, power-on hours, read/write
-  error counts and SSD wear. It runs as a short-lived `Get-CimInstance`
-  subprocess with a hard 5s timeout, so a wedged WMI service cannot stall a
-  collection tick.
+  error counts and SSD wear. Each disk also carries its disk number, the N
+  of its `PhysicalDriveN` disk I/O row, read from `MSFT_Disk` and reported
+  only when both classes agree it is the same disk, so a VHD or VHDX file
+  attached as a disk (bus type "File Backed Virtual": profile containers on a
+  multi-session host, MSIX app attach) can be told apart from the machine's
+  own storage. It runs as a short-lived `Get-CimInstance` subprocess with a
+  hard 5s timeout, so a wedged WMI service cannot stall a collection tick.
 - **Windows services** (the counterpart to the systemd units) lists every
   Windows service with its state (running, stopped, paused...), start type
   (automatic, manual, disabled), the "delayed start" and "trigger start" flags

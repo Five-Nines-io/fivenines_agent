@@ -1,0 +1,486 @@
+{
+  "description": "Shared Windows disk-health contract fixture between fivenines-agent and fivenines-server. Source of truth: fivenines-agent tests/fixtures/disk_health_contract_payload.json, asserted end-to-end by tests/test_disk_health_windows.py::test_contract_fixture_round_trip -- each scenario's 'wmi' is what the collector's two PowerShell processes print ('physical': MSFT_PhysicalDisk and MSFT_Disk read in one process, as {PhysicalDisk, Disk}; 'reliability': MSFT_StorageReliabilityCounter; null for a process that failed), and the dispatcher's output for config {'disk_health': true} on Windows must equal scenario['payload']. 'wmi' is an agent-side input the server ignores. The server ingests data['disk_health'] == payload['disk_health'] BESIDE data['io'] from the same tick. Change the payload shape only in lockstep with the server spec and its byte-identical fixture copy.",
+  "agent_min_version": "1.25.0",
+  "_agent_min_version_note": "The first agent release carrying DiskNumber (the next MINOR after 1.24.2; confirm when the release is cut). Nothing gates on it: an older agent sends the same rows without the DiskNumber key, which reads as unknown.",
+  "null_contract": "data['disk_health'] ABSENT means not reported (the flag off, a non-Windows host, or the disk_health capability probed false). null means the collection failed this tick: the MSFT_PhysicalDisk read failed or ran past the agent's 5s bound (a cold Storage WMI provider right after boot can). Neither says anything about any disk.",
+  "entry_contract": "One row per MSFT_PhysicalDisk instance. EXISTING KEYS, unchanged from earlier agents: FriendlyName, MediaType, HealthStatus, OperationalStatus (a list), Size, SerialNumber (null for a disk image), BusType, SpindleSpeed, ObjectId, verbatim from WMI, and 'reliability' (MSFT_StorageReliabilityCounter's row, nested) when one matched. Enumerations are INTEGERS (Get-CimInstance values; checked under Windows PowerShell 5.1 -NoProfile): the Get-PhysicalDisk cmdlet's strings ('File Backed Virtual') are never sent. BusType: 7 USB, 8 RAID, 10 SAS, 11 SATA, 15 File Backed Virtual, 17 NVMe (MSFT_PhysicalDisk's enumeration). NEW KEY DiskNumber: the N of the io row key 'PhysicalDriveN' for this disk (psutil names the per-disk io rows PhysicalDrive0 to PhysicalDrive32 and has no row for a higher N), an integer, or null when the agent cannot confirm it. The agent reads it from MSFT_Disk.Number and reports it only when that row is the same disk: MSFT_PhysicalDisk.DeviceId spells the number (the join the Storage module's Get-PhysicalDisk | Get-Disk makes) and both rows carry the same non-empty UniqueId. null: a Storage Spaces pool member (no MSFT_Disk row), the MSFT_Disk read failed, or no UniqueId to confirm with. Never guess a number for a null: keep that row's io as it is. FILE-BACKED DISKS: a VHD or VHDX file attached as a disk (profile containers attached at each sign-in on a multi-session host, MSIX app attach packages, an image mounted by hand) is BusType 15 and has an io row like any disk; to leave it out, drop the io row PhysicalDrive<DiskNumber> for each row with BusType 15 and an integer DiskNumber, in the SAME payload only: disk numbers are reused as soon as an image is detached (checked on Windows: a detached image's number went to the next one attached), so a number from another tick may name another disk. An image attached or detached between the two reads of one tick can still mismatch for that tick. The agent drops no row itself, and never reads MSFT_Disk.Location (for a profile container, a file path holding a user name).",
+  "scenarios": [
+    {
+      "name": "multi_session_host_profile_containers",
+      "comment": "A session host: its NVMe system disk (reliability counters merged) and a SATA data disk, plus three attached disk images, all BusType 15: an application package (MSIX app attach) as disk 2 and two signed-in users' profile containers as disks 3 and 4. Rows come in WMI's order, not by number. The io rows of this tick are PhysicalDrive0 to PhysicalDrive4; the server leaves out PhysicalDrive2, PhysicalDrive3 and PhysicalDrive4.",
+      "wmi": {
+        "physical": {
+          "PhysicalDisk": [
+            {
+              "FriendlyName": "Example NVMe SSD 1TB",
+              "MediaType": 4,
+              "HealthStatus": 0,
+              "OperationalStatus": [
+                2
+              ],
+              "Size": 1000204886016,
+              "SerialNumber": "0025_385B_71B0_E0F1.",
+              "BusType": 17,
+              "SpindleSpeed": 0,
+              "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{a1c3e7f0-1b2d-4e5f-8a9b-0c1d2e3f4a5b}\"",
+              "DeviceId": "0",
+              "UniqueId": "eui.0025385B71B0E0F1"
+            },
+            {
+              "FriendlyName": "Msft Virtual Disk",
+              "MediaType": 0,
+              "HealthStatus": 0,
+              "OperationalStatus": [
+                2
+              ],
+              "Size": 32212254720,
+              "SerialNumber": null,
+              "BusType": 15,
+              "SpindleSpeed": 0,
+              "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{d4f6b0c3-4e5a-4b8c-9d2e-3f4a5b6c7d8e}\"",
+              "DeviceId": "3",
+              "UniqueId": "600224800000000000000000000A0003"
+            },
+            {
+              "FriendlyName": "Example SATA HDD 4TB",
+              "MediaType": 3,
+              "HealthStatus": 0,
+              "OperationalStatus": [
+                2
+              ],
+              "Size": 4000787030016,
+              "SerialNumber": "ZDH1A2B3",
+              "BusType": 11,
+              "SpindleSpeed": 7200,
+              "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{b2d4f8a1-2c3e-4f6a-9b0c-1d2e3f4a5b6c}\"",
+              "DeviceId": "1",
+              "UniqueId": "5000C500A1B2C3D4"
+            },
+            {
+              "FriendlyName": "Msft Virtual Disk",
+              "MediaType": 0,
+              "HealthStatus": 0,
+              "OperationalStatus": [
+                2
+              ],
+              "Size": 1073741824,
+              "SerialNumber": null,
+              "BusType": 15,
+              "SpindleSpeed": 0,
+              "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{c3e5a9b2-3d4f-4a7b-8c1d-2e3f4a5b6c7d}\"",
+              "DeviceId": "2",
+              "UniqueId": "600224800000000000000000000A0002"
+            },
+            {
+              "FriendlyName": "Msft Virtual Disk",
+              "MediaType": 0,
+              "HealthStatus": 0,
+              "OperationalStatus": [
+                2
+              ],
+              "Size": 32212254720,
+              "SerialNumber": null,
+              "BusType": 15,
+              "SpindleSpeed": 0,
+              "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{e5a7c1d4-5f6b-4c9d-8e3f-4a5b6c7d8e9f}\"",
+              "DeviceId": "4",
+              "UniqueId": "600224800000000000000000000A0004"
+            }
+          ],
+          "Disk": [
+            {
+              "Number": 3,
+              "UniqueId": "600224800000000000000000000A0003"
+            },
+            {
+              "Number": 2,
+              "UniqueId": "600224800000000000000000000A0002"
+            },
+            {
+              "Number": 4,
+              "UniqueId": "600224800000000000000000000A0004"
+            },
+            {
+              "Number": 1,
+              "UniqueId": "5000C500A1B2C3D4"
+            },
+            {
+              "Number": 0,
+              "UniqueId": "eui.0025385B71B0E0F1"
+            }
+          ]
+        },
+        "reliability": [
+          {
+            "DeviceId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{a1c3e7f0-1b2d-4e5f-8a9b-0c1d2e3f4a5b}\"",
+            "Temperature": 38,
+            "TemperatureMax": 70,
+            "PowerOnHours": 8123,
+            "ReadErrorsTotal": 0,
+            "ReadErrorsCorrected": 0,
+            "ReadErrorsUncorrected": 0,
+            "WriteErrorsTotal": 0,
+            "WriteErrorsCorrected": 0,
+            "WriteErrorsUncorrected": 0,
+            "Wear": 3
+          }
+        ]
+      },
+      "payload": {
+        "disk_health": [
+          {
+            "FriendlyName": "Example NVMe SSD 1TB",
+            "MediaType": 4,
+            "HealthStatus": 0,
+            "OperationalStatus": [
+              2
+            ],
+            "Size": 1000204886016,
+            "SerialNumber": "0025_385B_71B0_E0F1.",
+            "BusType": 17,
+            "SpindleSpeed": 0,
+            "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{a1c3e7f0-1b2d-4e5f-8a9b-0c1d2e3f4a5b}\"",
+            "DiskNumber": 0,
+            "reliability": {
+              "DeviceId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{a1c3e7f0-1b2d-4e5f-8a9b-0c1d2e3f4a5b}\"",
+              "Temperature": 38,
+              "TemperatureMax": 70,
+              "PowerOnHours": 8123,
+              "ReadErrorsTotal": 0,
+              "ReadErrorsCorrected": 0,
+              "ReadErrorsUncorrected": 0,
+              "WriteErrorsTotal": 0,
+              "WriteErrorsCorrected": 0,
+              "WriteErrorsUncorrected": 0,
+              "Wear": 3
+            }
+          },
+          {
+            "FriendlyName": "Msft Virtual Disk",
+            "MediaType": 0,
+            "HealthStatus": 0,
+            "OperationalStatus": [
+              2
+            ],
+            "Size": 32212254720,
+            "SerialNumber": null,
+            "BusType": 15,
+            "SpindleSpeed": 0,
+            "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{d4f6b0c3-4e5a-4b8c-9d2e-3f4a5b6c7d8e}\"",
+            "DiskNumber": 3
+          },
+          {
+            "FriendlyName": "Example SATA HDD 4TB",
+            "MediaType": 3,
+            "HealthStatus": 0,
+            "OperationalStatus": [
+              2
+            ],
+            "Size": 4000787030016,
+            "SerialNumber": "ZDH1A2B3",
+            "BusType": 11,
+            "SpindleSpeed": 7200,
+            "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{b2d4f8a1-2c3e-4f6a-9b0c-1d2e3f4a5b6c}\"",
+            "DiskNumber": 1
+          },
+          {
+            "FriendlyName": "Msft Virtual Disk",
+            "MediaType": 0,
+            "HealthStatus": 0,
+            "OperationalStatus": [
+              2
+            ],
+            "Size": 1073741824,
+            "SerialNumber": null,
+            "BusType": 15,
+            "SpindleSpeed": 0,
+            "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{c3e5a9b2-3d4f-4a7b-8c1d-2e3f4a5b6c7d}\"",
+            "DiskNumber": 2
+          },
+          {
+            "FriendlyName": "Msft Virtual Disk",
+            "MediaType": 0,
+            "HealthStatus": 0,
+            "OperationalStatus": [
+              2
+            ],
+            "Size": 32212254720,
+            "SerialNumber": null,
+            "BusType": 15,
+            "SpindleSpeed": 0,
+            "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{e5a7c1d4-5f6b-4c9d-8e3f-4a5b6c7d8e9f}\"",
+            "DiskNumber": 4
+          }
+        ]
+      }
+    },
+    {
+      "name": "single_disk_rows_collapsed",
+      "comment": "One disk. ConvertTo-Json collapses a one-row result into an object: the agent builds its lists with @() so a single row stays a list (checked on Windows PowerShell 5.1), but it accepts the collapsed form for each of the three lists, which this scenario serves. The payload is a list of one row all the same.",
+      "wmi": {
+        "physical": {
+          "PhysicalDisk": {
+            "FriendlyName": "Example NVMe SSD 512GB",
+            "MediaType": 4,
+            "HealthStatus": 0,
+            "OperationalStatus": [
+              2
+            ],
+            "Size": 512110190592,
+            "SerialNumber": "E823_8FA6_BF53_0001_001B_448B_4A1D_2C3E.",
+            "BusType": 17,
+            "SpindleSpeed": 0,
+            "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{f6b8d2e5-6a7c-4dae-9f4a-5b6c7d8e9f0a}\"",
+            "DeviceId": "0",
+            "UniqueId": "eui.E8238FA6BF530001001B448B4A1D2C3E"
+          },
+          "Disk": {
+            "Number": 0,
+            "UniqueId": "eui.E8238FA6BF530001001B448B4A1D2C3E"
+          }
+        },
+        "reliability": {
+          "DeviceId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{f6b8d2e5-6a7c-4dae-9f4a-5b6c7d8e9f0a}\"",
+          "Temperature": 41,
+          "TemperatureMax": 75,
+          "PowerOnHours": 15210,
+          "ReadErrorsTotal": 0,
+          "ReadErrorsCorrected": 0,
+          "ReadErrorsUncorrected": 0,
+          "WriteErrorsTotal": 0,
+          "WriteErrorsCorrected": 0,
+          "WriteErrorsUncorrected": 0,
+          "Wear": 7
+        }
+      },
+      "payload": {
+        "disk_health": [
+          {
+            "FriendlyName": "Example NVMe SSD 512GB",
+            "MediaType": 4,
+            "HealthStatus": 0,
+            "OperationalStatus": [
+              2
+            ],
+            "Size": 512110190592,
+            "SerialNumber": "E823_8FA6_BF53_0001_001B_448B_4A1D_2C3E.",
+            "BusType": 17,
+            "SpindleSpeed": 0,
+            "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{f6b8d2e5-6a7c-4dae-9f4a-5b6c7d8e9f0a}\"",
+            "DiskNumber": 0,
+            "reliability": {
+              "DeviceId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{f6b8d2e5-6a7c-4dae-9f4a-5b6c7d8e9f0a}\"",
+              "Temperature": 41,
+              "TemperatureMax": 75,
+              "PowerOnHours": 15210,
+              "ReadErrorsTotal": 0,
+              "ReadErrorsCorrected": 0,
+              "ReadErrorsUncorrected": 0,
+              "WriteErrorsTotal": 0,
+              "WriteErrorsCorrected": 0,
+              "WriteErrorsUncorrected": 0,
+              "Wear": 7
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "storage_spaces_pool_members",
+      "comment": "Two HDDs in a Storage Spaces pool. A pool member keeps its MSFT_PhysicalDisk row and its PhysicalDriveN io row, but Windows exposes no MSFT_Disk row for it, so its number cannot be confirmed: DiskNumber null. The pool's virtual disk is disk 3 (an io row PhysicalDrive3, BusType 16 Spaces in MSFT_Disk) and is not a physical disk: it has no disk_health row.",
+      "wmi": {
+        "physical": {
+          "PhysicalDisk": [
+            {
+              "FriendlyName": "Example SATA HDD 8TB",
+              "MediaType": 3,
+              "HealthStatus": 0,
+              "OperationalStatus": [
+                2
+              ],
+              "Size": 8001563222016,
+              "SerialNumber": "ZA1B2C3D",
+              "BusType": 11,
+              "SpindleSpeed": 7200,
+              "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{1b2c3d4e-8c9d-4fc0-9b6c-7d8e9f0a1b2c}\"",
+              "DeviceId": "1",
+              "UniqueId": "5000C500B1C2D3E4"
+            },
+            {
+              "FriendlyName": "Example SAS SSD 960GB",
+              "MediaType": 4,
+              "HealthStatus": 0,
+              "OperationalStatus": [
+                2
+              ],
+              "Size": 960197124096,
+              "SerialNumber": "S3F2NX0K400123",
+              "BusType": 10,
+              "SpindleSpeed": 0,
+              "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{0a1b2c3d-7b8c-4ebf-8a5b-6c7d8e9f0a1b}\"",
+              "DeviceId": "0",
+              "UniqueId": "5002538B0A1C2D3E"
+            },
+            {
+              "FriendlyName": "Example SATA HDD 8TB",
+              "MediaType": 3,
+              "HealthStatus": 0,
+              "OperationalStatus": [
+                2
+              ],
+              "Size": 8001563222016,
+              "SerialNumber": "ZA1B2C3E",
+              "BusType": 11,
+              "SpindleSpeed": 7200,
+              "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{2c3d4e5f-9d0e-4ad1-8c7d-8e9f0a1b2c3d}\"",
+              "DeviceId": "2",
+              "UniqueId": "5000C500B1C2D3E5"
+            }
+          ],
+          "Disk": [
+            {
+              "Number": 3,
+              "UniqueId": "0000000000000000000000000000B003"
+            },
+            {
+              "Number": 0,
+              "UniqueId": "5002538B0A1C2D3E"
+            }
+          ]
+        },
+        "reliability": []
+      },
+      "payload": {
+        "disk_health": [
+          {
+            "FriendlyName": "Example SATA HDD 8TB",
+            "MediaType": 3,
+            "HealthStatus": 0,
+            "OperationalStatus": [
+              2
+            ],
+            "Size": 8001563222016,
+            "SerialNumber": "ZA1B2C3D",
+            "BusType": 11,
+            "SpindleSpeed": 7200,
+            "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{1b2c3d4e-8c9d-4fc0-9b6c-7d8e9f0a1b2c}\"",
+            "DiskNumber": null
+          },
+          {
+            "FriendlyName": "Example SAS SSD 960GB",
+            "MediaType": 4,
+            "HealthStatus": 0,
+            "OperationalStatus": [
+              2
+            ],
+            "Size": 960197124096,
+            "SerialNumber": "S3F2NX0K400123",
+            "BusType": 10,
+            "SpindleSpeed": 0,
+            "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{0a1b2c3d-7b8c-4ebf-8a5b-6c7d8e9f0a1b}\"",
+            "DiskNumber": 0
+          },
+          {
+            "FriendlyName": "Example SATA HDD 8TB",
+            "MediaType": 3,
+            "HealthStatus": 0,
+            "OperationalStatus": [
+              2
+            ],
+            "Size": 8001563222016,
+            "SerialNumber": "ZA1B2C3E",
+            "BusType": 11,
+            "SpindleSpeed": 7200,
+            "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{2c3d4e5f-9d0e-4ad1-8c7d-8e9f0a1b2c3d}\"",
+            "DiskNumber": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "msft_disk_unreadable",
+      "comment": "The MSFT_Disk read failed inside the PowerShell process (Disk is null) and the reliability process failed: every disk is still reported, with DiskNumber null and no reliability. null is UNKNOWN this tick, not 'not a file-backed disk'.",
+      "wmi": {
+        "physical": {
+          "PhysicalDisk": [
+            {
+              "FriendlyName": "Example NVMe SSD 1TB",
+              "MediaType": 4,
+              "HealthStatus": 0,
+              "OperationalStatus": [
+                2
+              ],
+              "Size": 1000204886016,
+              "SerialNumber": "0025_385B_71B0_E0F1.",
+              "BusType": 17,
+              "SpindleSpeed": 0,
+              "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{a1c3e7f0-1b2d-4e5f-8a9b-0c1d2e3f4a5b}\"",
+              "DeviceId": "0",
+              "UniqueId": "eui.0025385B71B0E0F1"
+            },
+            {
+              "FriendlyName": "Msft Virtual Disk",
+              "MediaType": 0,
+              "HealthStatus": 0,
+              "OperationalStatus": [
+                2
+              ],
+              "Size": 32212254720,
+              "SerialNumber": null,
+              "BusType": 15,
+              "SpindleSpeed": 0,
+              "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{d4f6b0c3-4e5a-4b8c-9d2e-3f4a5b6c7d8e}\"",
+              "DeviceId": "3",
+              "UniqueId": "600224800000000000000000000A0003"
+            }
+          ],
+          "Disk": null
+        },
+        "reliability": null
+      },
+      "payload": {
+        "disk_health": [
+          {
+            "FriendlyName": "Example NVMe SSD 1TB",
+            "MediaType": 4,
+            "HealthStatus": 0,
+            "OperationalStatus": [
+              2
+            ],
+            "Size": 1000204886016,
+            "SerialNumber": "0025_385B_71B0_E0F1.",
+            "BusType": 17,
+            "SpindleSpeed": 0,
+            "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{a1c3e7f0-1b2d-4e5f-8a9b-0c1d2e3f4a5b}\"",
+            "DiskNumber": null
+          },
+          {
+            "FriendlyName": "Msft Virtual Disk",
+            "MediaType": 0,
+            "HealthStatus": 0,
+            "OperationalStatus": [
+              2
+            ],
+            "Size": 32212254720,
+            "SerialNumber": null,
+            "BusType": 15,
+            "SpindleSpeed": 0,
+            "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{d4f6b0c3-4e5a-4b8c-9d2e-3f4a5b6c7d8e}\"",
+            "DiskNumber": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "collection_failed",
+      "comment": "The MSFT_PhysicalDisk read failed (the process exits non-zero; a timeout past 5s reads the same): disk_health is null. The reliability process is not run.",
+      "wmi": {
+        "physical": null,
+        "reliability": []
+      },
+      "payload": {
+        "disk_health": null
+      }
+    }
+  ]
+}

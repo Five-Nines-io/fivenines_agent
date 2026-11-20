@@ -91,6 +91,42 @@ jobs:
             --cov-report=xml:coverage-windows.xml `
             --cov-report=term-missing
 
+      # disk_health's DiskNumber against the real WMI classes: two disk images
+      # attached the way a multi-session host attaches profile containers
+      # (diskpart, and Mount-DiskImage then initialized and formatted), and
+      # each must come back as BusType 15 under the N of its PhysicalDriveN
+      # io row. No Hyper-V needed. ci/windows-disk-number-check.py gives the
+      # Storage WMI provider three tries, since its first query after boot
+      # can run past the collector's 5s bound.
+      - name: Verify disk_health numbers attached disk images
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:RUNNER_TEMP 'disk-images'
+          New-Item -ItemType Directory $dir | Out-Null
+          $script = Join-Path $dir 'diskpart.txt'
+          @("create vdisk file=$dir\raw.vhdx maximum=64 type=expandable",
+            "select vdisk file=$dir\raw.vhdx",
+            "attach vdisk",
+            "create vdisk file=$dir\profile.vhdx maximum=128 type=expandable") | Set-Content $script -Encoding ascii
+          diskpart /s $script | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "diskpart exited $LASTEXITCODE" }
+          try {
+            Mount-DiskImage -ImagePath "$dir\profile.vhdx" | Out-Null
+            $profileDisk = (Get-DiskImage -ImagePath "$dir\profile.vhdx" | Get-Disk).Number
+            Initialize-Disk -Number $profileDisk -PartitionStyle GPT
+            New-Partition -DiskNumber $profileDisk -UseMaximumSize -AssignDriveLetter |
+              Format-Volume -FileSystem NTFS -Confirm:$false | Out-Null
+            $numbers = @('raw.vhdx', 'profile.vhdx' | ForEach-Object { (Get-DiskImage -ImagePath "$dir\$_").Number })
+            Write-Host "image disk numbers: $($numbers -join ', ')"
+            poetry run python ci/windows-disk-number-check.py @numbers
+            if ($LASTEXITCODE -ne 0) { throw "disk_health did not number the attached images" }
+          } finally {
+            'raw.vhdx', 'profile.vhdx' | ForEach-Object {
+              Dismount-DiskImage -ImagePath "$dir\$_" -ErrorAction SilentlyContinue | Out-Null
+            }
+          }
+
       # The MSI's password generator, exercised against the real PowerShell.
       # The bug this guards used to fail roughly one install in 770 - rare
       # enough to look like CI flake, frequent enough to be a customer's
