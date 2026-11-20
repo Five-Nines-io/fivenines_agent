@@ -5,7 +5,7 @@ a wedged WMI service can't stall the collection tick, and the agent doesn't
 need to pull pywin32 into this collector to make WMI calls. Reliability
 counters (``MSFT_StorageReliabilityCounter``) are merged into each physical
 disk record so the backend sees temperature, power-on hours, error counts,
-and wear in one structure.
+and wear in one structure. The provider serves them to administrators only.
 
 Each disk also carries ``DiskNumber``, the N of the ``PhysicalDriveN`` key its
 ``io`` row is reported under (psutil's ``disk_io_counters(perdisk=True)``), so
@@ -57,13 +57,39 @@ _PHYSICAL_DISK_QUERY = (
 # Read for the join only, never sent.
 _JOIN_KEYS = ("DeviceId", "UniqueId")
 
-_RELIABILITY_QUERY = (
-    "Get-CimInstance -Namespace root/Microsoft/Windows/Storage "
-    "-ClassName MSFT_StorageReliabilityCounter | "
-    "Select-Object DeviceId, Temperature, TemperatureMax, PowerOnHours, "
+# The counters are reached through the MSFT_PhysicalDiskToStorageReliabilityCounter
+# association, one physical disk at a time: enumerating the class directly
+# returns no row (checked on Windows Server 2025, as an administrator), and a
+# counter's own DeviceId is the short disk id ("0"), which names no disk row.
+# Each counter is emitted next to its disk's ObjectId, the join key. Image disks
+# (BusType 15) are skipped: a session host attaches dozens and they carry no
+# counters worth reading. The walk stops after RELIABILITY_BUDGET_MS and each
+# association call has a 1s operation timeout, so it ends inside the 5s bound
+# with what it has; one disk's failure skips that disk only. A non-administrator
+# (the MSI's service account) is refused the counters by the provider: the
+# association returns nothing and no row carries reliability.
+RELIABILITY_BUDGET_MS = 2500
+
+_COUNTER_FIELDS = (
+    "DeviceId, Temperature, TemperatureMax, PowerOnHours, "
     "ReadErrorsTotal, ReadErrorsCorrected, ReadErrorsUncorrected, "
-    "WriteErrorsTotal, WriteErrorsCorrected, WriteErrorsUncorrected, Wear | "
-    "ConvertTo-Json -Compress -Depth 3"
+    "WriteErrorsTotal, WriteErrorsCorrected, WriteErrorsUncorrected, Wear"
+)
+
+_RELIABILITY_QUERY = (
+    "$ErrorActionPreference = 'Stop'; "
+    "$sw = [Diagnostics.Stopwatch]::StartNew(); "
+    "$ns = 'root/Microsoft/Windows/Storage'; "
+    "$pairs = New-Object System.Collections.ArrayList; "
+    "foreach ($pd in @(Get-CimInstance -Namespace $ns -ClassName MSFT_PhysicalDisk)) { "
+    f"if ($sw.ElapsedMilliseconds -ge {RELIABILITY_BUDGET_MS}) {{ break }}; "
+    "if ($pd.BusType -eq 15) { continue }; "
+    "try { foreach ($rc in @(Get-CimAssociatedInstance -InputObject $pd "
+    "-ResultClassName MSFT_StorageReliabilityCounter -OperationTimeoutSec 1)) { "
+    "[void]$pairs.Add([pscustomobject]@{ ObjectId = $pd.ObjectId; "
+    f"Counter = ($rc | Select-Object {_COUNTER_FIELDS}) }}) }} }} "
+    "catch { } }; "
+    "@($pairs) | ConvertTo-Json -Compress -Depth 4"
 )
 
 
@@ -156,6 +182,26 @@ def _disk_number(disk, confirmed):
     return number if disk.get("UniqueId") == unique_id else None
 
 
+def _counters_by_object_id(pairs):
+    """Map a physical disk's ObjectId to its reliability counter row.
+
+    Each pair is {ObjectId, Counter} from the association walk. An ObjectId
+    met twice is ambiguous and left out, rather than giving a disk another
+    disk's counters.
+    """
+    seen = {}
+    for pair in pairs:
+        if not isinstance(pair, dict):
+            continue
+        object_id, counter = pair.get("ObjectId"), pair.get("Counter")
+        if not isinstance(object_id, str) or not object_id:
+            continue
+        if not isinstance(counter, dict):
+            continue
+        seen.setdefault(object_id, []).append(counter)
+    return {oid: rows[0] for oid, rows in seen.items() if len(rows) == 1}
+
+
 @debug("disk_health_windows")
 def disk_health_windows():
     """Collect Windows disk health + reliability counters.
@@ -163,8 +209,8 @@ def disk_health_windows():
     Returns None on non-Windows hosts and on a hard WMI failure. On success,
     returns a list of dicts (one per physical disk) with MSFT_PhysicalDisk
     fields plus ``DiskNumber`` (int, or None when it cannot be confirmed),
-    augmented by a ``reliability`` sub-dict from
-    MSFT_StorageReliabilityCounter when matched by DeviceId/ObjectId.
+    augmented by a ``reliability`` sub-dict, the disk's
+    MSFT_StorageReliabilityCounter row, when one was read for its ObjectId.
     """
     if not is_windows():
         return None
@@ -180,12 +226,9 @@ def disk_health_windows():
         return None
     confirmed = _confirmed_numbers(_rows(result.get("Disk")) or [])
 
-    counters = _rows(_run_powershell(_RELIABILITY_QUERY)) or []
-    counter_by_id = {
-        c.get("DeviceId"): c
-        for c in counters
-        if isinstance(c, dict) and c.get("DeviceId") is not None
-    }
+    counter_by_object_id = _counters_by_object_id(
+        _rows(_run_powershell(_RELIABILITY_QUERY)) or []
+    )
 
     for disk in disks:
         if not isinstance(disk, dict):
@@ -193,11 +236,8 @@ def disk_health_windows():
         disk["DiskNumber"] = _disk_number(disk, confirmed)
         for key in _JOIN_KEYS:
             disk.pop(key, None)
-        # Try matching reliability counters by ObjectId, then SerialNumber.
-        # The exact join key varies by Windows version; both are accepted.
-        for key in (disk.get("ObjectId"), disk.get("SerialNumber")):
-            if key and key in counter_by_id:
-                disk["reliability"] = counter_by_id[key]
-                break
+        object_id = disk.get("ObjectId")
+        if isinstance(object_id, str) and object_id in counter_by_object_id:
+            disk["reliability"] = counter_by_object_id[object_id]
 
     return disks

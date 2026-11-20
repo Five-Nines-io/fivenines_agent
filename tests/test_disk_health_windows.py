@@ -41,9 +41,10 @@ def _collect(physical, counters=None):
     """disk_health_windows() on 'Windows', each query served its JSON."""
 
     def fake_run(query):
-        if "MSFT_PhysicalDisk" in query:
-            return physical
-        return counters
+        # The reliability query walks MSFT_PhysicalDisk too: test it first.
+        if "MSFT_StorageReliabilityCounter" in query:
+            return counters
+        return physical
 
     with patch.object(dhw, "is_windows", return_value=True), patch.object(
         dhw, "_run_powershell", side_effect=fake_run
@@ -356,6 +357,36 @@ def test_cloned_images_sharing_a_unique_id_keep_their_own_numbers():
 # --- reliability merge ---
 
 
+def _pair(object_id, **counter):
+    return {"ObjectId": object_id, "Counter": counter}
+
+
+def test_reliability_query_walks_the_association_per_disk():
+    """Enumerating MSFT_StorageReliabilityCounter returns no row on Windows:
+    the counters are read through each physical disk's association, image
+    disks skipped, inside a budget, a disk's failure skipping that disk only."""
+    q = dhw._RELIABILITY_QUERY
+    assert "-ClassName MSFT_StorageReliabilityCounter" not in q
+    assert "Get-CimAssociatedInstance -InputObject $pd" in q
+    assert "-ResultClassName MSFT_StorageReliabilityCounter -OperationTimeoutSec 1" in q
+    assert "if ($pd.BusType -eq 15) { continue }" in q
+    assert dhw.RELIABILITY_BUDGET_MS < WMI_TIMEOUT_SECONDS * 1000
+    assert (
+        f"if ($sw.ElapsedMilliseconds -ge {dhw.RELIABILITY_BUDGET_MS}) {{ break }}" in q
+    )
+    assert "catch { }" in q
+    assert "ObjectId = $pd.ObjectId" in q
+
+
+def test_reliability_counter_keys_are_unchanged():
+    """The nested reliability dict keeps the keys earlier agents selected."""
+    assert dhw._COUNTER_FIELDS == (
+        "DeviceId, Temperature, TemperatureMax, PowerOnHours, "
+        "ReadErrorsTotal, ReadErrorsCorrected, ReadErrorsUncorrected, "
+        "WriteErrorsTotal, WriteErrorsCorrected, WriteErrorsUncorrected, Wear"
+    )
+
+
 def test_disk_health_windows_returns_disks_without_reliability_when_counters_fail():
     """If reliability query fails, disks still come back without the merge."""
     result = _collect({"PhysicalDisk": [_pd("0", "eui.A")], "Disk": []}, None)
@@ -364,30 +395,63 @@ def test_disk_health_windows_returns_disks_without_reliability_when_counters_fai
 
 
 def test_disk_health_windows_merges_reliability_by_object_id():
+    """A counter's own DeviceId is the short disk id ("0"): the join is the
+    disk's ObjectId the association walk emitted next to it."""
     counters = [
-        {"DeviceId": "obj-0", "Temperature": 45, "PowerOnHours": 1234, "Wear": 5}
+        _pair("obj-1", DeviceId="1", Temperature=50),
+        _pair("obj-0", DeviceId="0", Temperature=45, PowerOnHours=1234, Wear=5),
     ]
-    result = _collect({"PhysicalDisk": [_pd("0", "eui.A")], "Disk": []}, counters)
-    assert result[0]["reliability"]["Temperature"] == 45
-    assert result[0]["reliability"]["PowerOnHours"] == 1234
-
-
-def test_disk_health_windows_merges_reliability_by_serial_number_fallback():
-    """When ObjectId doesn't match, SerialNumber is the secondary join key."""
-    counters = [{"DeviceId": "SN0", "Temperature": 30}]
-    result = _collect({"PhysicalDisk": [_pd("0", "eui.A")], "Disk": []}, counters)
-    assert result[0]["reliability"]["Temperature"] == 30
+    result = _collect(
+        {"PhysicalDisk": [_pd("0", "eui.A"), _pd("1", "eui.B")], "Disk": []}, counters
+    )
+    assert result[0]["reliability"] == {
+        "DeviceId": "0",
+        "Temperature": 45,
+        "PowerOnHours": 1234,
+        "Wear": 5,
+    }
+    assert result[1]["reliability"]["Temperature"] == 50
 
 
 def test_disk_health_windows_merges_a_single_counter_collapsed_into_an_object():
-    counters = {"DeviceId": "obj-0", "Temperature": 41}
+    counters = _pair("obj-0", DeviceId="0", Temperature=41)
     result = _collect({"PhysicalDisk": [_pd("0", "eui.A")], "Disk": []}, counters)
     assert result[0]["reliability"]["Temperature"] == 41
 
 
+def test_a_counter_met_twice_for_one_disk_is_not_attached():
+    counters = [_pair("obj-0", Temperature=41), _pair("obj-0", Temperature=99)]
+    result = _collect({"PhysicalDisk": [_pd("0", "eui.A")], "Disk": []}, counters)
+    assert "reliability" not in result[0]
+
+
+@pytest.mark.parametrize(
+    "pair",
+    [
+        "not-a-dict",
+        {"ObjectId": None, "Counter": {"Temperature": 1}},
+        {"ObjectId": "", "Counter": {"Temperature": 1}},
+        {"ObjectId": ["obj-0"], "Counter": {"Temperature": 1}},
+        {"ObjectId": "obj-0", "Counter": None},
+        {"ObjectId": "obj-0", "Counter": [{"Temperature": 1}]},
+    ],
+)
+def test_malformed_counter_pairs_are_skipped(pair):
+    result = _collect({"PhysicalDisk": [_pd("0", "eui.A")], "Disk": []}, [pair])
+    assert "reliability" not in result[0]
+
+
+def test_a_disk_with_an_unhashable_object_id_gets_no_counter():
+    disk = _pd("0", "eui.A", ObjectId=["obj-0"])
+    result = _collect(
+        {"PhysicalDisk": [disk], "Disk": []}, [_pair("obj-0", Temperature=1)]
+    )
+    assert "reliability" not in result[0]
+
+
 def test_disk_health_windows_ignores_non_dict_disk_entries():
     """Defensive: a malformed disk entry doesn't crash the merge loop."""
-    counters = [{"DeviceId": "obj-0", "Temperature": 40}]
+    counters = [_pair("obj-0", Temperature=40)]
     result = _collect(
         {"PhysicalDisk": ["not-a-dict", _pd("0", "eui.A")], "Disk": []}, counters
     )
@@ -397,7 +461,7 @@ def test_disk_health_windows_ignores_non_dict_disk_entries():
 
 def test_disk_health_windows_handles_no_counter_match():
     """A disk with no matching reliability entry stays bare, no error."""
-    counters = [{"DeviceId": "obj-other", "Temperature": 50}]
+    counters = [_pair("obj-other", Temperature=50)]
     result = _collect({"PhysicalDisk": [_pd("0", "eui.A")], "Disk": []}, counters)
     assert "reliability" not in result[0]
 

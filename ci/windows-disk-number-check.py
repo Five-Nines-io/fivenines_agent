@@ -10,9 +10,12 @@ integer) and DiskNumber equal to it, and psutil's per-disk I/O must have a
 PhysicalDrive<number> row for it: the join the server relies on. Every disk
 must be numbered (the runner has no Storage Spaces pool), and every row must
 carry exactly the keys agents sent before DiskNumber existed, plus DiskNumber.
+The rows carrying reliability counters must be exactly the non-image disks
+the Storage cmdlets (Get-StorageReliabilityCounter) give counters to.
 """
 
 import json
+import subprocess
 import sys
 import time
 
@@ -33,6 +36,25 @@ KEYS = {
     "ObjectId",
     "DiskNumber",
 }
+
+
+def _disks_with_counters():
+    """ObjectIds of the non-image disks Get-StorageReliabilityCounter serves."""
+    script = (
+        "Get-PhysicalDisk | Where-Object { $_.BusType -ne 'File Backed Virtual' } | "
+        "ForEach-Object { if ($_ | Get-StorageReliabilityCounter "
+        "-ErrorAction SilentlyContinue) { $_.ObjectId } } | ConvertTo-Json -Compress"
+    )
+    out = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    if not out:
+        return set()
+    parsed = json.loads(out)
+    return {parsed} if isinstance(parsed, str) else set(parsed)
 
 
 def main(expected):
@@ -84,6 +106,18 @@ def main(expected):
             failures.append(
                 f"attached image disk {n}: expected one BusType 15 row, got {match}"
             )
+    # Reliability counters: every disk the Storage cmdlets give counters to
+    # (images aside) must carry them, and no other. A runner whose virtual
+    # disks have no counters checks the "none" side only.
+    expected_counters = _disks_with_counters()
+    got_counters = {r["ObjectId"] for r in rows if "reliability" in r}
+    print(
+        f"reliability: cmdlets {len(expected_counters)}, collector {len(got_counters)}"
+    )
+    if got_counters != expected_counters:
+        failures.append(
+            f"reliability on {sorted(got_counters)}, cmdlets give {sorted(expected_counters)}"
+        )
     if failures:
         sys.exit("\n".join(failures))
     print(
