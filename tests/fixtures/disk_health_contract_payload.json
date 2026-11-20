@@ -1,13 +1,13 @@
 {
-  "description": "Shared Windows disk-health contract fixture between fivenines-agent and fivenines-server. Source of truth: fivenines-agent tests/fixtures/disk_health_contract_payload.json, asserted end-to-end by tests/test_disk_health_windows.py::test_contract_fixture_round_trip -- each scenario's 'wmi' is what the collector's two PowerShell processes print ('physical': MSFT_PhysicalDisk and MSFT_Disk read in one process, as {PhysicalDisk, Disk}; 'reliability': MSFT_StorageReliabilityCounter; null for a process that failed), and the dispatcher's output for config {'disk_health': true} on Windows must equal scenario['payload']. 'wmi' is an agent-side input the server ignores. The server ingests data['disk_health'] == payload['disk_health'] BESIDE data['io'] from the same tick. Change the payload shape only in lockstep with the server spec and its byte-identical fixture copy.",
+  "description": "Shared Windows disk-health contract fixture between fivenines-agent and fivenines-server. Source of truth: fivenines-agent tests/fixtures/disk_health_contract_payload.json, asserted end-to-end by tests/test_disk_health_windows.py::test_contract_fixture_round_trip -- each scenario's 'wmi' is what the collector's two PowerShell processes print ('physical': MSFT_PhysicalDisk and MSFT_Disk read in one process, as {PhysicalDisk, Disk}; 'reliability': each physical disk's MSFT_StorageReliabilityCounter, read through its association, as {ObjectId of the disk, Counter}; null for a process that failed), and the dispatcher's output for config {'disk_health': true} on Windows must equal scenario['payload']. 'wmi' is an agent-side input the server ignores. The server ingests data['disk_health'] == payload['disk_health'] BESIDE data['io'] from the same tick. Change the payload shape only in lockstep with the server spec and its byte-identical fixture copy.",
   "agent_min_version": "1.25.0",
   "_agent_min_version_note": "The first agent release carrying DiskNumber (the next MINOR after 1.24.2; confirm when the release is cut). Nothing gates on it: an older agent sends the same rows without the DiskNumber key, which reads as unknown.",
   "null_contract": "data['disk_health'] ABSENT means not reported (the flag off, a non-Windows host, or the disk_health capability probed false). null means the collection failed this tick: the MSFT_PhysicalDisk read failed, or the process ran past the agent's 5s bound (a cold Storage WMI provider right after boot can). The MSFT_Disk read that gives DiskNumber never causes a null: it is skipped once the MSFT_PhysicalDisk read has used 2.5s, runs under a 1s operation timeout, and its failure is caught; each case only makes every DiskNumber null that tick. Neither ABSENT nor null says anything about any disk.",
-  "entry_contract": "One row per MSFT_PhysicalDisk instance. EXISTING KEYS, unchanged from earlier agents: FriendlyName, MediaType, HealthStatus, OperationalStatus (a list), Size, SerialNumber (null for a disk image), BusType, SpindleSpeed, ObjectId, verbatim from WMI, and 'reliability' (MSFT_StorageReliabilityCounter's row, nested) when one matched. Enumerations are INTEGERS (Get-CimInstance values; checked under Windows PowerShell 5.1 -NoProfile): the Get-PhysicalDisk cmdlet's strings ('File Backed Virtual') are never sent. BusType: 7 USB, 8 RAID, 10 SAS, 11 SATA, 15 File Backed Virtual, 17 NVMe (MSFT_PhysicalDisk's enumeration). NEW KEY DiskNumber: the N of the io row key 'PhysicalDriveN' for this disk (psutil names the per-disk io rows PhysicalDrive0 to PhysicalDrive32 and has no row for a higher N), an integer, or null when the agent cannot confirm it. The agent reads it from MSFT_Disk.Number and reports it only when that row is the same disk: MSFT_PhysicalDisk.DeviceId spells the number (the join the Storage module's Get-PhysicalDisk | Get-Disk makes) and both rows carry the same non-empty UniqueId. null: a Storage Spaces pool member (no MSFT_Disk row), the MSFT_Disk read failed, or no UniqueId to confirm with. Never guess a number for a null: keep that row's io as it is. FILE-BACKED DISKS: a VHD or VHDX file attached as a disk (profile containers attached at each sign-in on a multi-session host, MSIX app attach packages, an image mounted by hand) is BusType 15 and has an io row like any disk; to leave it out, drop the io row PhysicalDrive<DiskNumber> for each row with BusType 15 and an integer DiskNumber, in the SAME payload only: disk numbers are reused as soon as an image is detached (checked on Windows: a detached image's number went to the next one attached), so a number from another tick may name another disk. An image attached or detached between the two reads of one tick can still mismatch for that tick. The agent drops no row itself, and never reads MSFT_Disk.Location (for a profile container, a file path holding a user name).",
+  "entry_contract": "One row per MSFT_PhysicalDisk instance. EXISTING KEYS, unchanged from earlier agents: FriendlyName, MediaType, HealthStatus, OperationalStatus (a list), Size, SerialNumber (null for a disk image), BusType, SpindleSpeed, ObjectId, verbatim from WMI, and 'reliability' (the disk's MSFT_StorageReliabilityCounter row, nested, with the same keys as before: DeviceId -- the short disk id, \"0\" -- Temperature, TemperatureMax, PowerOnHours, Read/WriteErrorsTotal/Corrected/Uncorrected, Wear) when one was read. It is absent for an image disk (BusType 15, not read), when the read ran out of time, and on every disk when the agent's account is not an administrator: the Storage provider serves the counters to administrators only, and the MSI's service account is not one. Absent says nothing about the disk's health. Agents up to 1.24.2 never attached it: they enumerated the class (which returns no row) and joined on keys a counter does not carry. Enumerations are INTEGERS (Get-CimInstance values; checked under Windows PowerShell 5.1 -NoProfile): the Get-PhysicalDisk cmdlet's strings ('File Backed Virtual') are never sent. BusType: 7 USB, 8 RAID, 10 SAS, 11 SATA, 15 File Backed Virtual, 17 NVMe (MSFT_PhysicalDisk's enumeration). NEW KEY DiskNumber: the N of the io row key 'PhysicalDriveN' for this disk (psutil names the per-disk io rows PhysicalDrive0 to PhysicalDrive32 and has no row for a higher N), an integer, or null when the agent cannot confirm it. The agent reads it from MSFT_Disk.Number and reports it only when that row is the same disk: MSFT_PhysicalDisk.DeviceId spells the number (the join the Storage module's Get-PhysicalDisk | Get-Disk makes) and both rows carry the same non-empty UniqueId. null: a Storage Spaces pool member (no MSFT_Disk row), the MSFT_Disk read failed, or no UniqueId to confirm with. Never guess a number for a null: keep that row's io as it is. FILE-BACKED DISKS: a VHD or VHDX file attached as a disk (profile containers attached at each sign-in on a multi-session host, MSIX app attach packages, an image mounted by hand) is BusType 15 and has an io row like any disk; to leave it out, drop the io row PhysicalDrive<DiskNumber> for each row with BusType 15 and an integer DiskNumber, in the SAME payload only: disk numbers are reused as soon as an image is detached (checked on Windows: a detached image's number went to the next one attached), so a number from another tick may name another disk. An image attached or detached between the two reads of one tick can still mismatch for that tick. The agent drops no row itself, and never reads MSFT_Disk.Location (for a profile container, a file path holding a user name).",
   "scenarios": [
     {
       "name": "multi_session_host_profile_containers",
-      "comment": "A session host: its NVMe system disk (reliability counters merged) and a SATA data disk, plus three attached disk images, all BusType 15: an application package (MSIX app attach) as disk 2 and two signed-in users' profile containers as disks 3 and 4. Rows come in WMI's order, not by number. The io rows of this tick are PhysicalDrive0 to PhysicalDrive4; the server leaves out PhysicalDrive2, PhysicalDrive3 and PhysicalDrive4.",
+      "comment": "A session host: its NVMe system disk (reliability counters read, as an administrator) and a SATA data disk, plus three attached disk images, all BusType 15: an application package (MSIX app attach) as disk 2 and two signed-in users' profile containers as disks 3 and 4. Rows come in WMI's order, not by number. The io rows of this tick are PhysicalDrive0 to PhysicalDrive4; the server leaves out PhysicalDrive2, PhysicalDrive3 and PhysicalDrive4.",
       "wmi": {
         "physical": {
           "PhysicalDisk": [
@@ -112,17 +112,20 @@
         },
         "reliability": [
           {
-            "DeviceId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{a1c3e7f0-1b2d-4e5f-8a9b-0c1d2e3f4a5b}\"",
-            "Temperature": 38,
-            "TemperatureMax": 70,
-            "PowerOnHours": 8123,
-            "ReadErrorsTotal": 0,
-            "ReadErrorsCorrected": 0,
-            "ReadErrorsUncorrected": 0,
-            "WriteErrorsTotal": 0,
-            "WriteErrorsCorrected": 0,
-            "WriteErrorsUncorrected": 0,
-            "Wear": 3
+            "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{a1c3e7f0-1b2d-4e5f-8a9b-0c1d2e3f4a5b}\"",
+            "Counter": {
+              "DeviceId": "0",
+              "Temperature": 38,
+              "TemperatureMax": 70,
+              "PowerOnHours": 8123,
+              "ReadErrorsTotal": 0,
+              "ReadErrorsCorrected": 0,
+              "ReadErrorsUncorrected": 0,
+              "WriteErrorsTotal": 0,
+              "WriteErrorsCorrected": 0,
+              "WriteErrorsUncorrected": 0,
+              "Wear": 3
+            }
           }
         ]
       },
@@ -142,7 +145,7 @@
             "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{a1c3e7f0-1b2d-4e5f-8a9b-0c1d2e3f4a5b}\"",
             "DiskNumber": 0,
             "reliability": {
-              "DeviceId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{a1c3e7f0-1b2d-4e5f-8a9b-0c1d2e3f4a5b}\"",
+              "DeviceId": "0",
               "Temperature": 38,
               "TemperatureMax": 70,
               "PowerOnHours": 8123,
@@ -240,17 +243,20 @@
           }
         },
         "reliability": {
-          "DeviceId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{f6b8d2e5-6a7c-4dae-9f4a-5b6c7d8e9f0a}\"",
-          "Temperature": 41,
-          "TemperatureMax": 75,
-          "PowerOnHours": 15210,
-          "ReadErrorsTotal": 0,
-          "ReadErrorsCorrected": 0,
-          "ReadErrorsUncorrected": 0,
-          "WriteErrorsTotal": 0,
-          "WriteErrorsCorrected": 0,
-          "WriteErrorsUncorrected": 0,
-          "Wear": 7
+          "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{f6b8d2e5-6a7c-4dae-9f4a-5b6c7d8e9f0a}\"",
+          "Counter": {
+            "DeviceId": "0",
+            "Temperature": 41,
+            "TemperatureMax": 75,
+            "PowerOnHours": 15210,
+            "ReadErrorsTotal": 0,
+            "ReadErrorsCorrected": 0,
+            "ReadErrorsUncorrected": 0,
+            "WriteErrorsTotal": 0,
+            "WriteErrorsCorrected": 0,
+            "WriteErrorsUncorrected": 0,
+            "Wear": 7
+          }
         }
       },
       "payload": {
@@ -269,7 +275,7 @@
             "ObjectId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{f6b8d2e5-6a7c-4dae-9f4a-5b6c7d8e9f0a}\"",
             "DiskNumber": 0,
             "reliability": {
-              "DeviceId": "{1}\\\\HOST\\root/Microsoft/Windows/Storage/Providers_v2\\SPACES_PhysicalDisk.ObjectId=\"{5e1f0c2a-0000-4000-8000-00000000c0de}:PD:{f6b8d2e5-6a7c-4dae-9f4a-5b6c7d8e9f0a}\"",
+              "DeviceId": "0",
               "Temperature": 41,
               "TemperatureMax": 75,
               "PowerOnHours": 15210,

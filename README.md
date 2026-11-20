@@ -426,7 +426,9 @@ things differ:
   from the WMI Storage namespace for the drive inventory -- friendly name, media
   type, bus type, size, serial, health and operational status -- and merges in
   `MSFT_StorageReliabilityCounter` for temperature, power-on hours, read/write
-  error counts and SSD wear. Each disk also carries its disk number, the N
+  error counts and SSD wear. Windows serves those counters to administrators
+  only: under the MSI's service account, which is not one, the inventory and
+  health status are reported without them. Each disk also carries its disk number, the N
   of its `PhysicalDriveN` disk I/O row, read from `MSFT_Disk` and reported
   only when both classes agree it is the same disk, so a VHD or VHDX file
   attached as a disk (bus type "File Backed Virtual": profile containers on a
@@ -1123,7 +1125,7 @@ The agent works without sudo, but these features will be unavailable (this is al
 | Ceph cluster status | `ceph` CLI + read-only cephx keyring (no sudo) |
 | Docker image vulnerability scanning | same Docker socket as container metrics (no extra privilege) |
 | HAProxy stats socket | read access to the socket (e.g. `/run/haproxy/admin.sock`); the HTTP CSV endpoint needs none |
-| Windows disk health | WMI `root\Microsoft\Windows\Storage` read access (delegated by the MSI) |
+| Windows disk health | WMI `root\Microsoft\Windows\Storage` read access (delegated by the MSI); reliability counters (temperature, wear) need an administrator account |
 | Windows services | Service Control Manager connect + enumerate access; a service whose security settings deny the account the status read is left out of the list |
 | Windows software inventory | `HKLM\...\Uninstall` registry read access |
 
