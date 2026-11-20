@@ -27,18 +27,29 @@ from fivenines_agent.subprocess_utils import get_clean_env
 WMI_TIMEOUT_SECONDS = 5
 
 # One process, two classes. MSFT_PhysicalDisk failing is the collector failing
-# (Stop turns it into a non-zero exit); MSFT_Disk failing only leaves every
-# DiskNumber unknown (Disk is null). DeviceId and UniqueId are read for the
-# join and dropped before the rows are sent. Both lists are built with @() so
-# a single row stays a list, but the parser accepts the collapsed form too.
+# (Stop turns it into a non-zero exit). MSFT_Disk must never cost the rows:
+# it is skipped when MSFT_PhysicalDisk has already used MSFT_DISK_SKIP_AFTER_MS
+# of the script (a cold or busy Storage provider), it is asked for its two
+# properties only with a 1s operation timeout, and its failure is caught; each
+# case leaves Disk null, so every DiskNumber reads unknown and the rows still
+# go out. DeviceId and UniqueId are read for the join and dropped before the
+# rows are sent; MSFT_Disk.Location is never requested. Both lists are built
+# with @() so a single row stays a list, but the parser accepts the collapsed
+# form too.
+MSFT_DISK_SKIP_AFTER_MS = 2500
+
 _PHYSICAL_DISK_QUERY = (
     "$ErrorActionPreference = 'Stop'; "
+    "$sw = [Diagnostics.Stopwatch]::StartNew(); "
     "$ns = 'root/Microsoft/Windows/Storage'; "
     "$physical = @(Get-CimInstance -Namespace $ns -ClassName MSFT_PhysicalDisk | "
     "Select-Object FriendlyName, MediaType, HealthStatus, OperationalStatus, "
     "Size, SerialNumber, BusType, SpindleSpeed, ObjectId, DeviceId, UniqueId); "
-    "try { $disks = @(Get-CimInstance -Namespace $ns -ClassName MSFT_Disk | "
-    "Select-Object Number, UniqueId) } catch { $disks = $null }; "
+    "$disks = $null; "
+    f"if ($sw.ElapsedMilliseconds -lt {MSFT_DISK_SKIP_AFTER_MS}) {{ "
+    "try { $disks = @(Get-CimInstance -Namespace $ns -ClassName MSFT_Disk "
+    "-Property Number, UniqueId -OperationTimeoutSec 1 | "
+    "Select-Object Number, UniqueId) } catch { $disks = $null } }; "
     "@{ PhysicalDisk = $physical; Disk = $disks } | "
     "ConvertTo-Json -Compress -Depth 4"
 )

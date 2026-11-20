@@ -168,6 +168,17 @@ def test_query_reads_both_classes_in_one_process():
     assert "catch { $disks = $null }" in q
 
 
+def test_query_never_lets_msft_disk_cost_the_rows():
+    """MSFT_Disk is skipped once MSFT_PhysicalDisk has used the budget, asked
+    for its two properties only, under a 1s operation timeout: a slow read
+    leaves Disk null rather than pushing the process past the 5s bound."""
+    q = dhw._PHYSICAL_DISK_QUERY
+    assert dhw.MSFT_DISK_SKIP_AFTER_MS < WMI_TIMEOUT_SECONDS * 1000
+    assert f"if ($sw.ElapsedMilliseconds -lt {dhw.MSFT_DISK_SKIP_AFTER_MS})" in q
+    assert "-Property Number, UniqueId -OperationTimeoutSec 1" in q
+    assert q.index("$disks = $null;") < q.index("if ($sw.")
+
+
 def test_collector_spawns_two_processes_at_most():
     with patch.object(dhw, "is_windows", return_value=True), patch.object(
         dhw.subprocess,

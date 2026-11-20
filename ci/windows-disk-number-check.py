@@ -14,6 +14,7 @@ carry exactly the keys agents sent before DiskNumber existed, plus DiskNumber.
 
 import json
 import sys
+import time
 
 import psutil
 
@@ -37,9 +38,15 @@ KEYS = {
 def main(expected):
     rows = None
     # The Storage WMI provider's first query after boot can take seconds: the
-    # collector's 5s bound may cut it, so give it three ticks.
-    for _ in range(3):
+    # collector's 5s bound may cut it, so give it three ticks, and print each
+    # one's time so a slow query shows in the log.
+    for attempt in range(1, 4):
+        started = time.monotonic()
         rows = disk_health_windows()
+        elapsed = time.monotonic() - started
+        print(
+            f"attempt {attempt}: {elapsed:.2f}s, {'ok' if rows is not None else 'None'}"
+        )
         if rows is not None:
             break
     if rows is None:
