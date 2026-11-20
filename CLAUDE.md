@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 fivenines-agent is a monitoring agent that collects server metrics and sends them to the fivenines API (https://fivenines.io). The agent runs continuously, probing system capabilities and collecting various metrics at configurable intervals.
 
+Decision records live in `docs/decisions/`. `0001-rust-port-foundations.md` (accepted, #173) settles the foundations of the Rust port tracked in #169: where the code lives, platform scope and order, glibc vs musl, toolchain and MSRV, concurrency, libvirt, Windows, and how long the Python and Rust agents are supported side by side.
+
 ## Development Commands
 
 ### Setup
